@@ -10,8 +10,8 @@ SERVICE_NAME="${ZENITHDOCK_AGENT_SERVICE:-zenithbot-agent.service}"
 if [[ -z "$REMOTE_HOST" ]]; then
   cat >&2 <<'USAGE'
 Usage:
-  ZENITHDOCK_REMOTE_HOST=<ssh-host> ./deploy.sh
-  ./deploy.sh <ssh-host>
+  ZENITHDOCK_REMOTE_HOST=<ssh-host> ./server/deploy.sh
+  ./server/deploy.sh <ssh-host>
 
 Optional:
   ZENITHDOCK_REMOTE_APP_DIR=<remote-app-dir>

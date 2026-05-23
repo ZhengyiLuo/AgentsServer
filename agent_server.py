@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
@@ -82,6 +83,7 @@ MAX_HANDOFF_DIGEST_CHARS = int(os.environ.get("ZENITHBOT_HANDOFF_DIGEST_CHARS", 
 DEFAULT_SESSION_EVENT_LIMIT = int(os.environ.get("ZENITHBOT_SESSION_EVENT_LIMIT", "100"))
 MAX_EVENT_RESPONSE_LIMIT = int(os.environ.get("ZENITHBOT_MAX_EVENT_RESPONSE_LIMIT", "1000"))
 AGENT_TOKEN = os.environ.get("ZENITHDOCK_AGENT_TOKEN") or os.environ.get("ZENITHBOT_AGENT_TOKEN") or ""
+API_CONTRACT_VERSION = 2
 SESSION_ORDER_STEP = 1000.0
 
 SYSTEM_PROMPT = """\
@@ -223,6 +225,19 @@ def existing_cwd(requested: str | None) -> str:
     return "/tmp"
 
 
+def server_identity() -> str:
+    machine = ""
+    for path in (Path("/etc/machine-id"), Path("/var/lib/dbus/machine-id")):
+        with suppress(Exception):
+            machine = path.read_text(encoding="utf-8").strip()
+            if machine:
+                break
+    if not machine:
+        machine = os.uname().nodename
+    payload = f"{machine}|{STATE_DIR.resolve()}".encode("utf-8", errors="ignore")
+    return hashlib.sha256(payload).hexdigest()[:24]
+
+
 def ensure_dirs(session_id: str | None = None) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     FILES_ROOT.mkdir(parents=True, exist_ok=True)
@@ -358,6 +373,15 @@ class TurnRequest(BaseModel):
     backend: str | None = None
     model: str | None = None
     effort: str | None = None
+
+
+class UpdateQueuedTurnRequest(BaseModel):
+    prompt: str | None = None
+    file_ids: list[str] | None = None
+
+
+class MoveQueuedTurnRequest(BaseModel):
+    direction: str
 
 
 class ForkSessionRequest(BaseModel):
@@ -878,6 +902,7 @@ STOP_REQUESTS: set[str] = set()
 STOPPED_RUNS: set[str] = set()
 ACTIVE_LOCK = asyncio.Lock()
 QUEUED_TURNS: dict[str, deque[dict[str, Any]]] = {}
+RUN_NOW_TURNS: dict[str, dict[str, Any]] = {}
 QUEUE_LOCK = asyncio.Lock()
 
 LOG_PATH_SUFFIXES = {
@@ -924,6 +949,9 @@ def should_bump_session_updated_at(event_type: str, event: dict[str, Any]) -> bo
         "turn_started",
         "turn_queued",
         "turn_unqueued",
+        "turn_queue_updated",
+        "turn_queue_reordered",
+        "turn_queue_run_now",
         "file_uploaded",
         "job_created",
         "job_deferred",
@@ -1022,6 +1050,126 @@ async def unqueue_turn(session_id: str, queued_id: str) -> dict[str, Any]:
     }
 
 
+def queue_positions(queue: deque[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {"queued_id": str(item.get("queued_id") or ""), "position": idx + 1}
+        for idx, item in enumerate(queue)
+    ]
+
+
+async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedTurnRequest) -> dict[str, Any]:
+    if session_id not in STORE.sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    updated: dict[str, Any] | None = None
+    async with QUEUE_LOCK:
+        queue = QUEUED_TURNS.get(session_id)
+        if queue:
+            for idx, item in enumerate(queue):
+                if item.get("queued_id") == queued_id:
+                    if req.prompt is not None:
+                        prompt = req.prompt.strip()
+                        if not prompt:
+                            raise HTTPException(status_code=400, detail="prompt is empty")
+                        item["prompt"] = prompt
+                    if req.file_ids is not None:
+                        item["file_ids"] = list(req.file_ids)
+                    updated = dict(item)
+                    updated["position"] = idx + 1
+                    break
+
+    if updated is None:
+        raise HTTPException(status_code=404, detail="queued turn not found")
+
+    await append_event(session_id, "turn_queue_updated", {
+        "queued_id": queued_id,
+        "backend": updated.get("backend") or STORE.sessions[session_id].get("backend") or DEFAULT_BACKEND,
+        "prompt": updated.get("prompt") or "",
+        "file_ids": list(updated.get("file_ids") or []),
+        "position": updated.get("position"),
+    })
+    return {"ok": True, "queued_id": queued_id, "item": updated}
+
+
+async def move_queued_turn(session_id: str, queued_id: str, req: MoveQueuedTurnRequest) -> dict[str, Any]:
+    if session_id not in STORE.sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+    direction = req.direction.strip().lower()
+    if direction not in {"up", "down"}:
+        raise HTTPException(status_code=400, detail="direction must be up or down")
+
+    moved: dict[str, Any] | None = None
+    positions: list[dict[str, Any]] = []
+    async with QUEUE_LOCK:
+        queue = QUEUED_TURNS.get(session_id)
+        if queue:
+            items = list(queue)
+            idx = next((i for i, item in enumerate(items) if item.get("queued_id") == queued_id), None)
+            if idx is not None:
+                new_idx = idx - 1 if direction == "up" else idx + 1
+                new_idx = max(0, min(len(items) - 1, new_idx))
+                if new_idx != idx:
+                    items[idx], items[new_idx] = items[new_idx], items[idx]
+                    QUEUED_TURNS[session_id] = deque(items)
+                    moved = dict(items[new_idx])
+                else:
+                    moved = dict(items[idx])
+                positions = queue_positions(QUEUED_TURNS[session_id])
+
+    if moved is None:
+        raise HTTPException(status_code=404, detail="queued turn not found")
+
+    await append_event(session_id, "turn_queue_reordered", {
+        "queued_id": queued_id,
+        "direction": direction,
+        "positions": positions,
+    })
+    return {"ok": True, "queued_id": queued_id, "positions": positions}
+
+
+async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]:
+    if session_id not in STORE.sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    selected: dict[str, Any] | None = None
+    remaining: int
+    async with QUEUE_LOCK:
+        queue = QUEUED_TURNS.get(session_id)
+        if queue:
+            kept: deque[dict[str, Any]] = deque()
+            for item in queue:
+                if selected is None and item.get("queued_id") == queued_id:
+                    selected = item
+                    continue
+                kept.append(item)
+            if kept:
+                QUEUED_TURNS[session_id] = kept
+                remaining = len(kept)
+            else:
+                QUEUED_TURNS.pop(session_id, None)
+                remaining = 0
+        else:
+            remaining = 0
+        if selected is not None:
+            RUN_NOW_TURNS[session_id] = selected
+
+    if selected is None:
+        raise HTTPException(status_code=404, detail="queued turn not found")
+
+    await append_event(session_id, "turn_queue_run_now", {
+        "queued_id": queued_id,
+        "backend": selected.get("backend") or STORE.sessions[session_id].get("backend") or DEFAULT_BACKEND,
+        "prompt": selected.get("prompt") or "",
+        "file_ids": list(selected.get("file_ids") or []),
+        "message": "Queued message moved to the front and current turn interrupted.",
+        "remaining": remaining,
+    })
+    stop_result = await stop_turn(session_id, emit_event=False, schedule_queue=False)
+    if not stop_result.get("stopped") and not stop_result.get("pending"):
+        schedule_next_queued_turn(session_id)
+    return {"ok": True, "queued_id": queued_id, "interrupted": bool(stop_result.get("stopped"))}
+
+
 async def requeue_turn_front(session_id: str, item: dict[str, Any]) -> None:
     async with QUEUE_LOCK:
         queue = QUEUED_TURNS.setdefault(session_id, deque())
@@ -1035,10 +1183,12 @@ async def retry_next_queued_turn_later(session_id: str, delay_seconds: int | Non
 
 async def start_next_queued_turn(session_id: str) -> None:
     async with QUEUE_LOCK:
-        queue = QUEUED_TURNS.get(session_id)
-        item = queue.popleft() if queue else None
-        if queue is not None and not queue:
-            QUEUED_TURNS.pop(session_id, None)
+        item = RUN_NOW_TURNS.pop(session_id, None)
+        if item is None:
+            queue = QUEUED_TURNS.get(session_id)
+            item = queue.popleft() if queue else None
+            if queue is not None and not queue:
+                QUEUED_TURNS.pop(session_id, None)
     if not item:
         return
 
@@ -1075,6 +1225,66 @@ async def start_next_queued_turn(session_id: str) -> None:
 
 def schedule_next_queued_turn(session_id: str) -> None:
     asyncio.create_task(start_next_queued_turn(session_id))
+
+
+def rebuild_queued_turns_from_events() -> int:
+    rebuilt = 0
+    for session_id, sess in STORE.sessions.items():
+        path = events_path(session_id)
+        if not path.exists():
+            continue
+        pending: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
+        for line in path.open("r", encoding="utf-8", errors="ignore"):
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except Exception:
+                continue
+            queued_id = str(event.get("queued_id") or "")
+            event_type = str(event.get("type") or "")
+            if event_type == "turn_queued" and queued_id:
+                pending[queued_id] = {
+                    "queued_id": queued_id,
+                    "prompt": event.get("prompt") or "",
+                    "file_ids": list(event.get("file_ids") or []),
+                    "backend": event.get("backend") or sess.get("backend"),
+                    "model": sess.get("model"),
+                    "effort": sess.get("effort"),
+                    "created_at": event.get("ts") or now_iso(),
+                    "position": int(event.get("position") or (len(order) + 1)),
+                }
+                if queued_id not in order:
+                    order.append(queued_id)
+            elif event_type in {"turn_queue_updated", "turn_queue_run_now"} and queued_id in pending:
+                if event.get("prompt") is not None:
+                    pending[queued_id]["prompt"] = event.get("prompt") or ""
+                if event.get("file_ids") is not None:
+                    pending[queued_id]["file_ids"] = list(event.get("file_ids") or [])
+                if event_type == "turn_queue_run_now" and queued_id in order:
+                    order.remove(queued_id)
+                    order.insert(0, queued_id)
+            elif event_type == "turn_queue_reordered":
+                positions = event.get("positions") or []
+                try:
+                    ordered = sorted(
+                        [item for item in positions if item.get("queued_id") in pending],
+                        key=lambda item: int(item.get("position") or 0),
+                    )
+                    seen = [str(item.get("queued_id")) for item in ordered]
+                    order = seen + [qid for qid in order if qid not in seen]
+                except Exception:
+                    pass
+            elif event_type in {"turn_started", "turn_unqueued"} and queued_id:
+                pending.pop(queued_id, None)
+                if queued_id in order:
+                    order.remove(queued_id)
+        items = [pending[qid] for qid in order if qid in pending and str(pending[qid].get("prompt") or "").strip()]
+        if items:
+            QUEUED_TURNS[session_id] = deque(items)
+            rebuilt += len(items)
+    return rebuilt
 
 
 async def terminate_process_tree(proc: asyncio.subprocess.Process, *, grace: float = STOP_GRACE_SECONDS) -> bool:
@@ -2849,15 +3059,40 @@ def parse_claude_help_catalog() -> dict[str, Any]:
     effort_options: list[dict[str, str]] = []
     model_source = "claude --help"
     effort_source = "claude --help"
+    default_model = (
+        os.environ.get("CLAUDE_MODEL")
+        or os.environ.get("ANTHROPIC_MODEL")
+        or os.environ.get("ZENITHBOT_CLAUDE_MODEL")
+        or "sonnet"
+    )
+    default_effort = os.environ.get("CLAUDE_EFFORT") or os.environ.get("ZENITHBOT_CLAUDE_EFFORT") or ""
     try:
         help_text = run_catalog_command(["claude", "--help"])
     except Exception as exc:
         logger.warning("claude model discovery failed: %s", exc)
         return {
-            "models": [server_default_runtime_option()],
-            "efforts": [server_default_runtime_option()],
+            "models": unique_runtime_options(
+                [
+                    runtime_option("sonnet", "Sonnet"),
+                    runtime_option("opus", "Opus"),
+                    runtime_option("haiku", "Haiku"),
+                ],
+                title_model_label(default_model),
+            ),
+            "efforts": unique_runtime_options(
+                [
+                    runtime_option("low", "Low"),
+                    runtime_option("medium", "Medium"),
+                    runtime_option("high", "High"),
+                    runtime_option("xhigh", "XHigh"),
+                    runtime_option("max", "Max"),
+                ],
+                title_effort_label(default_effort) if default_effort else "",
+            ),
             "model_source": f"{model_source} failed",
             "effort_source": f"{effort_source} failed",
+            "default_model": default_model,
+            "default_effort": default_effort or None,
         }
 
     model_match = re.search(r"--model <model>.*?\((?:e\.g\.\s*)?([^)]+)\)", help_text, re.IGNORECASE | re.DOTALL)
@@ -2865,6 +3100,8 @@ def parse_claude_help_catalog() -> dict[str, Any]:
         aliases = re.findall(r"'([^']+)'", model_match.group(1))
         for alias in aliases:
             model_options.append(runtime_option(alias, title_model_label(alias)))
+    for alias in ("sonnet", "opus", "haiku"):
+        model_options.append(runtime_option(alias, title_model_label(alias)))
 
     effort_match = re.search(r"--effort <level>.*?\(([^)]+)\)", help_text, re.IGNORECASE)
     if effort_match:
@@ -2874,12 +3111,12 @@ def parse_claude_help_catalog() -> dict[str, Any]:
                 effort_options.append(runtime_option(clean, title_effort_label(clean)))
 
     return {
-        "models": unique_runtime_options(model_options),
-        "efforts": unique_runtime_options(effort_options),
+        "models": unique_runtime_options(model_options, title_model_label(default_model)),
+        "efforts": unique_runtime_options(effort_options, title_effort_label(default_effort) if default_effort else ""),
         "model_source": model_source,
         "effort_source": effort_source,
-        "default_model": os.environ.get("CLAUDE_MODEL") or os.environ.get("ANTHROPIC_MODEL") or None,
-        "default_effort": os.environ.get("CLAUDE_EFFORT") or None,
+        "default_model": default_model,
+        "default_effort": default_effort or None,
     }
 
 
@@ -3587,9 +3824,10 @@ async def lifespan(app: FastAPI):
     await STORE.load()
     await JOBS.load()
     ensure_dirs()
+    rebuilt_queue_count = rebuild_queued_turns_from_events()
     JOBS.start_scheduler()
     host_monitor_task = asyncio.create_task(host_monitor_loop())
-    logger.info("agent server ready state=%s sessions=%d jobs=%d", STATE_DIR, len(STORE.sessions), len(JOBS.jobs))
+    logger.info("agent server ready state=%s sessions=%d jobs=%d queued=%d", STATE_DIR, len(STORE.sessions), len(JOBS.jobs), rebuilt_queue_count)
     try:
         yield
     finally:
@@ -3626,6 +3864,8 @@ async def health() -> dict[str, Any]:
     pressure = host_pressure_snapshot()
     return {
         "ok": True,
+        "api_contract_version": API_CONTRACT_VERSION,
+        "server_identity": server_identity(),
         "state_dir": str(STATE_DIR),
         "default_backend": DEFAULT_BACKEND,
         "default_cwd": existing_cwd(DEFAULT_CWD),
@@ -3916,8 +4156,27 @@ async def delete_queued_turn(session_id: str, queued_id: str) -> dict[str, Any]:
     return await unqueue_turn(session_id, queued_id)
 
 
+@app.patch("/api/sessions/{session_id}/queue/{queued_id}")
+async def patch_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedTurnRequest) -> dict[str, Any]:
+    return await update_queued_turn(session_id, queued_id, req)
+
+
+@app.post("/api/sessions/{session_id}/queue/{queued_id}/move")
+async def post_move_queued_turn(session_id: str, queued_id: str, req: MoveQueuedTurnRequest) -> dict[str, Any]:
+    return await move_queued_turn(session_id, queued_id, req)
+
+
+@app.post("/api/sessions/{session_id}/queue/{queued_id}/run-now")
+async def post_run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]:
+    return await run_queued_turn_now(session_id, queued_id)
+
+
 @app.post("/api/sessions/{session_id}/stop")
-async def stop_turn(session_id: str) -> dict[str, Any]:
+async def stop_turn_endpoint(session_id: str) -> dict[str, Any]:
+    return await stop_turn(session_id)
+
+
+async def stop_turn(session_id: str, *, emit_event: bool = True, schedule_queue: bool = True) -> dict[str, Any]:
     async with ACTIVE_LOCK:
         active = ACTIVE.get(session_id)
         busy = session_id in BUSY_SESSIONS
@@ -3929,19 +4188,23 @@ async def stop_turn(session_id: str) -> dict[str, Any]:
             STOP_REQUESTS.add(session_id)
     if not active:
         if busy:
-            await append_event(session_id, "turn_stopped", {
-                "run_id": None,
-                "message": "Stop requested before the agent process was ready.",
-            })
+            if emit_event:
+                await append_event(session_id, "turn_stopped", {
+                    "run_id": None,
+                    "message": "Stop requested before the agent process was ready.",
+                })
             return {"ok": True, "stopped": True, "pending": True}
+        if schedule_queue:
+            schedule_next_queued_turn(session_id)
         return {"ok": True, "stopped": False}
     proc = active.get("proc") if active else None
     if proc:
         await terminate_process_tree(proc)
-    await append_event(session_id, "turn_stopped", {
-        "run_id": active.get("run_id") if active else None,
-        "backend": active.get("backend") if active else None,
-    })
+    if emit_event:
+        await append_event(session_id, "turn_stopped", {
+            "run_id": active.get("run_id") if active else None,
+            "backend": active.get("backend") if active else None,
+        })
     return {"ok": True, "stopped": True}
 
 

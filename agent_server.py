@@ -58,6 +58,8 @@ if DEFAULT_BACKEND not in VALID_BACKENDS:
 
 REQUEST_TIMEOUT_SECONDS = int(os.environ.get("ZENITHBOT_REQUEST_TIMEOUT_SECONDS", "86400"))
 CODEX_APP_SERVER_TIMEOUT_SECONDS = int(os.environ.get("ZENITHBOT_CODEX_APP_SERVER_TIMEOUT_SECONDS", "30"))
+CODEX_HISTORY_FALLBACK_SILENCE_SECONDS = float(os.environ.get("ZENITHBOT_CODEX_HISTORY_FALLBACK_SILENCE_SECONDS", "8"))
+CODEX_HISTORY_FALLBACK_POLL_SECONDS = float(os.environ.get("ZENITHBOT_CODEX_HISTORY_FALLBACK_POLL_SECONDS", "1"))
 RUNTIME_CATALOG_TIMEOUT_SECONDS = float(os.environ.get("ZENITHBOT_RUNTIME_CATALOG_TIMEOUT_SECONDS", "6"))
 JOB_SCHEDULER_INTERVAL_SECONDS = float(os.environ.get("ZENITHBOT_JOB_SCHEDULER_INTERVAL_SECONDS", "5"))
 JOB_BUSY_RETRY_SECONDS = int(os.environ.get("ZENITHBOT_JOB_BUSY_RETRY_SECONDS", "60"))
@@ -2703,6 +2705,229 @@ def provider_history(sess: dict[str, Any], limit: int | None) -> tuple[Path | No
     return None, []
 
 
+def parse_iso_timestamp_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    clean = str(value).strip()
+    if clean.endswith("Z"):
+        clean = clean[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(clean)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def json_loads_object(value: Any) -> Any:
+    if isinstance(value, str):
+        with suppress(Exception):
+            parsed = json.loads(value)
+            if isinstance(parsed, (dict, list)):
+                return parsed
+    return value
+
+
+def codex_tool_from_history_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    call_id = str(payload.get("call_id") or payload.get("id") or f"tool_{uuid.uuid4().hex[:8]}")
+    name = str(payload.get("name") or "tool")
+    namespace = str(payload.get("namespace") or "").strip()
+    display_name = f"{namespace}.{name}" if namespace else name
+    arguments = payload.get("arguments")
+    if arguments is None and "input" in payload:
+        arguments = payload.get("input")
+    return {
+        "id": call_id,
+        "name": display_name,
+        "input": json_loads_object(arguments) if arguments is not None else {},
+    }
+
+
+async def emit_codex_history_record(
+    session_id: str,
+    run_id: str,
+    record: dict[str, Any],
+    text_parts: list[str],
+    seen_texts: set[str],
+    seen_reasoning: set[str],
+    seen_tool_started: set[str],
+    seen_tool_finished: set[str],
+    current_tools: dict[str, dict[str, Any]],
+) -> bool:
+    payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+    payload_type = str(payload.get("type") or "")
+    emitted = False
+
+    async def emit_text(text: str) -> None:
+        nonlocal emitted
+        clean = clean_assistant_text(text)
+        if not clean or clean in seen_texts:
+            return
+        seen_texts.add(clean)
+        text_parts.append(clean)
+        await append_event(session_id, "assistant_text", {"run_id": run_id, "text": clean})
+        emitted = True
+
+    async def emit_reasoning(text: str) -> None:
+        nonlocal emitted
+        clean = str(text or "").strip()
+        if not clean or clean in seen_reasoning:
+            return
+        seen_reasoning.add(clean)
+        await append_event(session_id, "reasoning_summary", {"run_id": run_id, "text": clean})
+        emitted = True
+
+    if record.get("type") == "event_msg":
+        if payload_type == "agent_message":
+            await emit_text(str(payload.get("message") or ""))
+        elif payload_type == "agent_reasoning":
+            await emit_reasoning(str(payload.get("text") or ""))
+        elif payload_type == "task_complete":
+            await emit_text(str(payload.get("last_agent_message") or ""))
+        elif payload_type in {"mcp_tool_call_end", "patch_apply_end"}:
+            call_id = str(payload.get("call_id") or f"tool_{uuid.uuid4().hex[:8]}")
+            if call_id in seen_tool_finished:
+                return emitted
+            seen_tool_finished.add(call_id)
+            tool = current_tools.pop(call_id, None)
+            output = payload.get("stdout")
+            if output is None:
+                result = payload.get("result")
+                output = json.dumps(result, ensure_ascii=False) if result is not None else ""
+            await append_event(session_id, "tool_finished", {
+                "run_id": run_id,
+                "tool_id": call_id,
+                "tool": tool,
+                "output": str(output or ""),
+                "is_error": payload.get("success") is False,
+            })
+            emitted = True
+    elif record.get("type") == "response_item":
+        if payload_type == "message" and payload.get("role") == "assistant":
+            await emit_text(text_from_content(payload.get("content")))
+        elif payload_type in {"reasoning", "agent_reasoning"}:
+            text = str(payload.get("text") or "").strip()
+            if not text and isinstance(payload.get("summary"), list):
+                text = "\n".join(x.get("text", "") for x in payload["summary"] if isinstance(x, dict)).strip()
+            await emit_reasoning(text)
+        elif payload_type in {"function_call", "custom_tool_call"}:
+            tool = codex_tool_from_history_payload(payload)
+            if tool["id"] in seen_tool_started:
+                return emitted
+            seen_tool_started.add(tool["id"])
+            current_tools[tool["id"]] = tool
+            await append_event(session_id, "tool_started", {"run_id": run_id, "tool": tool})
+            emitted = True
+        elif payload_type in {"function_call_output", "custom_tool_call_output"}:
+            call_id = str(payload.get("call_id") or f"tool_{uuid.uuid4().hex[:8]}")
+            if call_id in seen_tool_finished:
+                return emitted
+            seen_tool_finished.add(call_id)
+            tool = current_tools.pop(call_id, None)
+            await append_event(session_id, "tool_finished", {
+                "run_id": run_id,
+                "tool_id": call_id,
+                "tool": tool,
+                "output": str(payload.get("output") or ""),
+            })
+            emitted = True
+    return emitted
+
+
+def codex_history_record_key(record: dict[str, Any]) -> str:
+    payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+    return "|".join(str(x or "") for x in (
+        record.get("timestamp"),
+        record.get("type"),
+        payload.get("type"),
+        payload.get("call_id"),
+        payload.get("turn_id"),
+        payload.get("name"),
+        str(payload.get("message") or payload.get("text") or payload.get("last_agent_message") or "")[:160],
+    ))
+
+
+async def tail_codex_history_fallback(
+    session_id: str,
+    run_id: str,
+    sess: dict[str, Any],
+    *,
+    started_at: float,
+    initial_path: Path | None,
+    initial_offset: int,
+    activity: dict[str, float],
+    text_parts: list[str],
+    seen_texts: set[str],
+    seen_reasoning: set[str],
+    seen_tool_started: set[str],
+    seen_tool_finished: set[str],
+    current_tools: dict[str, dict[str, Any]],
+) -> None:
+    if CODEX_HISTORY_FALLBACK_SILENCE_SECONDS <= 0:
+        return
+    path = initial_path
+    offset = initial_offset
+    provider_id = session_provider_id(sess)
+    seen_records: set[str] = set()
+
+    while True:
+        await asyncio.sleep(max(CODEX_HISTORY_FALLBACK_POLL_SECONDS, 0.25))
+        if time.time() - float(activity.get("stdout_at") or 0) < CODEX_HISTORY_FALLBACK_SILENCE_SECONDS:
+            continue
+        if not path or not path.exists():
+            if not provider_id:
+                current = STORE.sessions.get(session_id) or sess
+                provider_id = session_provider_id(current)
+            path = find_codex_history(str(provider_id)) if provider_id else None
+            offset = 0
+            if not path:
+                continue
+        try:
+            size = path.stat().st_size
+            if offset > size:
+                offset = 0
+            if offset == size:
+                continue
+            with path.open("rb") as f:
+                f.seek(offset)
+                chunk = f.read()
+                offset = f.tell()
+        except Exception as exc:
+            logger.debug("codex history fallback read failed session=%s run=%s: %s", session_id, run_id, exc)
+            continue
+        for line in chunk.decode("utf-8", "replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except Exception:
+                continue
+            timestamp = parse_iso_timestamp_seconds(record.get("timestamp"))
+            if timestamp is not None and timestamp < started_at - 2:
+                continue
+            key = codex_history_record_key(record)
+            if key in seen_records:
+                continue
+            seen_records.add(key)
+            try:
+                emitted = await emit_codex_history_record(
+                    session_id,
+                    run_id,
+                    record,
+                    text_parts,
+                    seen_texts,
+                    seen_reasoning,
+                    seen_tool_started,
+                    seen_tool_finished,
+                    current_tools,
+                )
+                if emitted:
+                    activity["event_at"] = time.time()
+            except Exception as exc:
+                logger.debug("codex history fallback emit failed session=%s run=%s: %s", session_id, run_id, exc)
+
+
 async def import_session_history(sess: dict[str, Any], *, force: bool = False, limit: int | None = None) -> dict[str, Any]:
     session_id = sess["id"]
     provider_id = session_provider_id(sess)
@@ -3628,6 +3853,10 @@ async def run_codex(session_id: str, run_id: str, prompt: str, sess: dict[str, A
     if str(Path(requested_cwd).expanduser()) != cwd:
         await append_event(session_id, "cwd_fallback", {"run_id": run_id, "requested_cwd": requested_cwd, "cwd": cwd})
     await append_event(session_id, "process_started", {"run_id": run_id, "backend": BACKEND_CODEX, "argv": cmd[:-1] + ["<prompt>"], "cwd": cwd})
+    started_at = time.time()
+    history_provider_id = session_provider_id(sess)
+    history_path = find_codex_history(str(history_provider_id)) if history_provider_id else None
+    history_offset = history_path.stat().st_size if history_path and history_path.exists() else 0
     env = runner_env()
     codex_dir = os.path.dirname(os.path.abspath(CODEX_BIN))
     if codex_dir and codex_dir not in env.get("PATH", "").split(os.pathsep):
@@ -3680,16 +3909,36 @@ async def run_codex(session_id: str, run_id: str, prompt: str, sess: dict[str, A
 
     text_parts: list[str] = []
     provider_id: str | None = None
-    last_event = time.time()
+    activity = {"event_at": time.time(), "stdout_at": time.time()}
+    seen_texts: set[str] = set()
+    seen_reasoning: set[str] = set()
+    seen_tool_started: set[str] = set()
+    seen_tool_finished: set[str] = set()
+    current_tools: dict[str, dict[str, Any]] = {}
     idle_killed = False
     stream_error: str | None = None
+    history_task = asyncio.create_task(tail_codex_history_fallback(
+        session_id,
+        run_id,
+        dict(sess),
+        started_at=started_at,
+        initial_path=history_path,
+        initial_offset=history_offset,
+        activity=activity,
+        text_parts=text_parts,
+        seen_texts=seen_texts,
+        seen_reasoning=seen_reasoning,
+        seen_tool_started=seen_tool_started,
+        seen_tool_finished=seen_tool_finished,
+        current_tools=current_tools,
+    ))
 
     try:
         while True:
             try:
                 raw = await asyncio.wait_for(proc.stdout.readline(), timeout=5)  # type: ignore[union-attr]
             except asyncio.TimeoutError:
-                idle = time.time() - last_event
+                idle = time.time() - float(activity.get("event_at") or 0)
                 if idle >= IDLE_WARN_SECONDS:
                     await append_event(session_id, "idle_warning", {"run_id": run_id, "idle_seconds": int(idle)})
                 if idle >= IDLE_KILL_SECONDS:
@@ -3699,7 +3948,9 @@ async def run_codex(session_id: str, run_id: str, prompt: str, sess: dict[str, A
                 continue
             if not raw:
                 break
-            last_event = time.time()
+            now = time.time()
+            activity["stdout_at"] = now
+            activity["event_at"] = now
             decoded = raw.decode("utf-8", "replace").rstrip("\r\n")
             await append_active_stdout(session_id, decoded)
             line = decoded.strip()
@@ -3726,8 +3977,16 @@ async def run_codex(session_id: str, run_id: str, prompt: str, sess: dict[str, A
                         "input": {"command": item.get("command", "")},
                     }
                     if etype == "item.started":
+                        if tool["id"] in seen_tool_started:
+                            continue
+                        seen_tool_started.add(tool["id"])
+                        current_tools[tool["id"]] = tool
                         await append_event(session_id, "tool_started", {"run_id": run_id, "tool": tool})
                     else:
+                        if tool["id"] in seen_tool_finished:
+                            continue
+                        seen_tool_finished.add(tool["id"])
+                        current_tools.pop(tool["id"], None)
                         await append_event(session_id, "tool_finished", {
                             "run_id": run_id,
                             "tool_id": tool["id"],
@@ -3737,19 +3996,24 @@ async def run_codex(session_id: str, run_id: str, prompt: str, sess: dict[str, A
                         })
                 elif itype == "agent_message" and etype == "item.completed":
                     text = clean_assistant_text(item.get("text") or "")
-                    if text:
+                    if text and text not in seen_texts:
+                        seen_texts.add(text)
                         text_parts.append(text)
                         await append_event(session_id, "assistant_text", {"run_id": run_id, "text": text})
                 elif itype in ("reasoning", "agent_reasoning") and etype == "item.completed":
                     text = (item.get("text") or "").strip()
                     if not text and isinstance(item.get("summary"), list):
                         text = "\n".join(x.get("text", "") for x in item["summary"] if isinstance(x, dict)).strip()
-                    if text:
+                    if text and text not in seen_reasoning:
+                        seen_reasoning.add(text)
                         await append_event(session_id, "reasoning_summary", {"run_id": run_id, "text": text})
     except Exception as e:
         stream_error = f"{type(e).__name__}: {e}"
         logger.exception("Codex run failed session=%s run=%s", session_id, run_id)
     finally:
+        history_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await history_task
         await terminate_process_tree(proc, grace=0.5)
         await clear_active_process(session_id)
 

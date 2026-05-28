@@ -420,6 +420,7 @@ class CreateJobRequest(BaseModel):
     interval_seconds: int | None = None
     first_run_at: str | None = None
     loop: bool = False
+    max_runs: int | None = None
     enabled: bool = True
     backend: str | None = None
 
@@ -430,6 +431,7 @@ class UpdateJobRequest(BaseModel):
     interval_seconds: int | None = None
     next_run_at: str | None = None
     loop: bool | None = None
+    max_runs: int | None = None
     enabled: bool | None = None
     backend: str | None = None
 
@@ -696,6 +698,7 @@ class JobStore:
         jid = f"job_{uuid.uuid4().hex[:16]}"
         now = now_iso()
         first_run_at = parse_job_timestamp(req.first_run_at)
+        max_runs = None if req.loop else max(1, int(req.max_runs or 1))
         job = {
             "id": jid,
             "session_id": req.session_id,
@@ -703,6 +706,7 @@ class JobStore:
             "prompt": req.prompt,
             "interval_seconds": req.interval_seconds,
             "loop": req.loop,
+            "max_runs": max_runs,
             "enabled": req.enabled,
             "backend": req.backend,
             "created_at": now,
@@ -730,10 +734,19 @@ class JobStore:
                 raise HTTPException(status_code=400, detail=f"backend must be one of {sorted(VALID_BACKENDS)}")
             has_next_run_patch = "next_run_at" in patch and patch["next_run_at"] is not None
             next_run_at = parse_job_timestamp(patch.get("next_run_at")) if has_next_run_patch else None
-            should_reschedule = any(key in patch for key in ("interval_seconds", "loop", "enabled"))
+            should_reschedule = any(key in patch for key in ("interval_seconds", "loop", "max_runs", "enabled"))
             for key in ("title", "prompt", "interval_seconds", "loop", "enabled", "backend"):
                 if key in patch and patch[key] is not None:
                     job[key] = patch[key]
+            if "max_runs" in patch:
+                if job.get("loop"):
+                    job["max_runs"] = None
+                elif patch["max_runs"] is not None:
+                    job["max_runs"] = max(1, int(patch["max_runs"]))
+            elif "loop" in patch and job.get("loop"):
+                job["max_runs"] = None
+            elif "loop" in patch and not job.get("loop") and not job.get("max_runs"):
+                job["max_runs"] = max(1, int(job.get("run_count") or 0) + 1)
             if job.get("enabled") and has_next_run_patch:
                 job["next_run_at"] = next_run_at
             elif job.get("enabled") and job.get("interval_seconds") and (should_reschedule or not job.get("next_run_at")):
@@ -765,7 +778,10 @@ class JobStore:
                 return
             job["last_run_at"] = now_iso()
             job["run_count"] = int(job.get("run_count") or 0) + 1
-            if job.get("enabled") and job.get("loop") and job.get("interval_seconds"):
+            run_count = int(job.get("run_count") or 0)
+            max_runs = int(job.get("max_runs") or 1)
+            finite_has_more = not job.get("loop") and run_count < max_runs
+            if job.get("enabled") and job.get("interval_seconds") and (job.get("loop") or finite_has_more):
                 job["next_run_at"] = time.time() + int(job["interval_seconds"])
             else:
                 job["enabled"] = False
@@ -850,7 +866,10 @@ class JobStore:
                             "job_id": jid,
                             "message": f"Scheduled job failed: {job.get('title') or jid} — {e}",
                         })
-                    if job.get("loop") and job.get("interval_seconds"):
+                    run_count = int(job.get("run_count") or 0)
+                    max_runs = int(job.get("max_runs") or 1)
+                    finite_has_more = not job.get("loop") and run_count < max_runs
+                    if job.get("interval_seconds") and (job.get("loop") or finite_has_more):
                         job["next_run_at"] = time.time() + int(job.get("interval_seconds") or 300)
                     else:
                         job["enabled"] = False

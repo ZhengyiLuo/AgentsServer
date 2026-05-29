@@ -84,6 +84,9 @@ MAX_FORK_MEMORY_ITEM_CHARS = int(os.environ.get("ZENITHBOT_FORK_MEMORY_ITEM_CHAR
 MAX_HANDOFF_DIGEST_CHARS = int(os.environ.get("ZENITHBOT_HANDOFF_DIGEST_CHARS", "56000"))
 DEFAULT_SESSION_EVENT_LIMIT = int(os.environ.get("ZENITHBOT_SESSION_EVENT_LIMIT", "100"))
 MAX_EVENT_RESPONSE_LIMIT = int(os.environ.get("ZENITHBOT_MAX_EVENT_RESPONSE_LIMIT", "1000"))
+EVENT_DELIVERY_RAW_CHARS = int(os.environ.get("ZENITHBOT_EVENT_DELIVERY_RAW_CHARS", "32768"))
+EVENT_DELIVERY_TEXT_CHARS = int(os.environ.get("ZENITHBOT_EVENT_DELIVERY_TEXT_CHARS", "65536"))
+EVENT_DELIVERY_TOOL_INPUT_CHARS = int(os.environ.get("ZENITHBOT_EVENT_DELIVERY_TOOL_INPUT_CHARS", "32768"))
 AGENT_TOKEN = os.environ.get("ZENITHDOCK_AGENT_TOKEN") or os.environ.get("ZENITHBOT_AGENT_TOKEN") or ""
 API_CONTRACT_VERSION = 3
 SESSION_ORDER_STEP = 1000.0
@@ -936,6 +939,7 @@ class SubscriberHub:
     async def broadcast(self, sid: str, event: dict[str, Any]) -> None:
         async with self._lock:
             subs = list(self._subscribers.get(sid, set()))
+        event = event_for_delivery(event)
         stale: list[WebSocket] = []
         for ws in subs:
             try:
@@ -2312,6 +2316,45 @@ def read_events(
         if tail_out is None and len(out) >= limit:
             break
     return list(tail_out) if tail_out is not None else out
+
+
+def truncate_delivery_text(value: str, max_chars: int) -> tuple[str, bool]:
+    if len(value) <= max_chars:
+        return value, False
+    visible = value[:max(0, max_chars)].rstrip()
+    omitted = max(0, len(value) - max_chars)
+    return f"{visible}\n\n[truncated {omitted} chars]", True
+
+
+def truncate_delivery_value(value: Any, max_chars: int) -> Any:
+    if isinstance(value, str):
+        return truncate_delivery_text(value, max_chars)[0]
+    if isinstance(value, dict):
+        return {key: truncate_delivery_value(child, max_chars) for key, child in value.items()}
+    if isinstance(value, list):
+        return [truncate_delivery_value(child, max_chars) for child in value]
+    return value
+
+
+def event_for_delivery(event: dict[str, Any]) -> dict[str, Any]:
+    out = dict(event)
+    for field in ("raw", "output", "text", "result_text", "message", "error", "prompt"):
+        value = out.get(field)
+        if not isinstance(value, str):
+            continue
+        max_chars = EVENT_DELIVERY_RAW_CHARS if field == "raw" else EVENT_DELIVERY_TEXT_CHARS
+        truncated, did_truncate = truncate_delivery_text(value, max_chars)
+        if did_truncate:
+            out[field] = truncated
+            out[f"{field}_truncated"] = True
+            out[f"{field}_original_chars"] = len(value)
+    tool = out.get("tool")
+    if isinstance(tool, dict):
+        tool_out = dict(tool)
+        if "input" in tool_out:
+            tool_out["input"] = truncate_delivery_value(tool_out.get("input"), EVENT_DELIVERY_TOOL_INPUT_CHARS)
+        out["tool"] = tool_out
+    return out
 
 
 def event_seq_bounds(session_id: str) -> tuple[int, int, int]:
@@ -4314,7 +4357,10 @@ async def get_session(
     sess = STORE.sessions.get(session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="session not found")
-    events = read_events(session_id, after=after, before=before, limit=limit, tail=tail and after <= 0)
+    events = [
+        event_for_delivery(event)
+        for event in read_events(session_id, after=after, before=before, limit=limit, tail=tail and after <= 0)
+    ]
     if after > 0 and before is None:
         _, latest_seq, event_count = event_seq_bounds(session_id)
     else:
@@ -4581,7 +4627,7 @@ async def session_events(session_id: str, ws: WebSocket, after: int = 0) -> None
     await HUB.subscribe(session_id, ws)
     try:
         for event in read_events(session_id, after=after):
-            await ws.send_json(event)
+            await ws.send_json(event_for_delivery(event))
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:

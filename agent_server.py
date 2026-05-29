@@ -655,8 +655,12 @@ class SessionStore:
             latest = int(sess.get("latest_agent_event_seq") or 0)
             requested = latest if last_read_agent_event_seq is None else max(0, int(last_read_agent_event_seq))
             current = int(sess.get("last_read_agent_event_seq") or 0)
-            sess["last_read_agent_event_seq"] = max(current, min(requested, latest))
+            if requested > latest:
+                sess["latest_agent_event_seq"] = requested
+                latest = requested
+            sess["last_read_agent_event_seq"] = max(current, requested)
             sess["last_read_agent_event_at"] = now_iso()
+            sess["manual_unread"] = False
             await self.save()
             return sess
 
@@ -668,6 +672,7 @@ class SessionStore:
             latest = int(sess.get("latest_agent_event_seq") or 0)
             sess["last_read_agent_event_seq"] = max(0, latest - 1)
             sess["last_read_agent_event_at"] = now_iso()
+            sess["manual_unread"] = True
             await self.save()
             return sess
 
@@ -2867,7 +2872,7 @@ def public_session(sess: dict[str, Any]) -> dict[str, Any]:
             "pinned", "pinned_at", "archived", "archived_at", "sort_order", "created_at", "updated_at",
             "latest_event_seq", "latest_event_at", "latest_event_type",
             "latest_agent_event_seq", "latest_agent_event_at", "latest_agent_event_type",
-            "last_read_agent_event_seq", "last_read_agent_event_at",
+            "last_read_agent_event_seq", "last_read_agent_event_at", "manual_unread",
         )
     }
 

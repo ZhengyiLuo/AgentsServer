@@ -83,7 +83,7 @@ MAX_HANDOFF_DIGEST_CHARS = int(os.environ.get("ZENITHBOT_HANDOFF_DIGEST_CHARS", 
 DEFAULT_SESSION_EVENT_LIMIT = int(os.environ.get("ZENITHBOT_SESSION_EVENT_LIMIT", "100"))
 MAX_EVENT_RESPONSE_LIMIT = int(os.environ.get("ZENITHBOT_MAX_EVENT_RESPONSE_LIMIT", "1000"))
 AGENT_TOKEN = os.environ.get("ZENITHDOCK_AGENT_TOKEN") or os.environ.get("ZENITHBOT_AGENT_TOKEN") or ""
-API_CONTRACT_VERSION = 2
+API_CONTRACT_VERSION = 3
 SESSION_ORDER_STEP = 1000.0
 
 SYSTEM_PROMPT = """\
@@ -367,6 +367,10 @@ class ReorderSessionRequest(BaseModel):
     direction: str
 
 
+class ReadSessionRequest(BaseModel):
+    last_read_agent_event_seq: int | None = None
+
+
 class TurnRequest(BaseModel):
     prompt: str
     file_ids: list[str] = Field(default_factory=list)
@@ -642,6 +646,30 @@ class SessionStore:
                 sess["updated_at"] = now_iso()
                 await self.save()
             return sorted_sessions(list(self.sessions.values()))
+
+    async def mark_read(self, sid: str, last_read_agent_event_seq: int | None) -> dict[str, Any]:
+        async with self._lock:
+            sess = self.sessions.get(sid)
+            if not sess:
+                raise HTTPException(status_code=404, detail="session not found")
+            latest = int(sess.get("latest_agent_event_seq") or 0)
+            requested = latest if last_read_agent_event_seq is None else max(0, int(last_read_agent_event_seq))
+            current = int(sess.get("last_read_agent_event_seq") or 0)
+            sess["last_read_agent_event_seq"] = max(current, min(requested, latest))
+            sess["last_read_agent_event_at"] = now_iso()
+            await self.save()
+            return sess
+
+    async def mark_unread(self, sid: str) -> dict[str, Any]:
+        async with self._lock:
+            sess = self.sessions.get(sid)
+            if not sess:
+                raise HTTPException(status_code=404, detail="session not found")
+            latest = int(sess.get("latest_agent_event_seq") or 0)
+            sess["last_read_agent_event_seq"] = max(0, latest - 1)
+            sess["last_read_agent_event_at"] = now_iso()
+            await self.save()
+            return sess
 
     async def delete(self, sid: str) -> bool:
         async with self._lock:
@@ -2839,6 +2867,7 @@ def public_session(sess: dict[str, Any]) -> dict[str, Any]:
             "pinned", "pinned_at", "archived", "archived_at", "sort_order", "created_at", "updated_at",
             "latest_event_seq", "latest_event_at", "latest_event_type",
             "latest_agent_event_seq", "latest_agent_event_at", "latest_agent_event_type",
+            "last_read_agent_event_seq", "last_read_agent_event_at",
         )
     }
 
@@ -4063,6 +4092,18 @@ async def update_session(session_id: str, req: UpdateSessionRequest) -> dict[str
 async def reorder_session(session_id: str, req: ReorderSessionRequest) -> dict[str, Any]:
     sessions = await STORE.reorder(session_id, req.direction)
     return {"sessions": [public_session(sess) for sess in sessions]}
+
+
+@app.post("/api/sessions/{session_id}/read")
+async def mark_session_read(session_id: str, req: ReadSessionRequest) -> dict[str, Any]:
+    sess = await STORE.mark_read(session_id, req.last_read_agent_event_seq)
+    return {"session": public_session(sess)}
+
+
+@app.post("/api/sessions/{session_id}/unread")
+async def mark_session_unread(session_id: str) -> dict[str, Any]:
+    sess = await STORE.mark_unread(session_id)
+    return {"session": public_session(sess)}
 
 
 @app.delete("/api/sessions/{session_id}")

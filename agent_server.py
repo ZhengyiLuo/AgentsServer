@@ -2996,6 +2996,13 @@ def title_model_label(value: str) -> str:
     clean = str(value or "").strip()
     if not clean:
         return "Server default"
+    known = {
+        "opus[1m]": "Opus 1M",
+        "claude-opus-4-8": "Opus 4.8",
+        "claude-opus-4-8[1m]": "Opus 4.8 1M",
+    }
+    if clean.lower() in known:
+        return known[clean.lower()]
     special = {
         "gpt": "GPT",
         "codex": "Codex",
@@ -3128,6 +3135,9 @@ def parse_claude_help_catalog() -> dict[str, Any]:
                 [
                     runtime_option("sonnet", "Sonnet"),
                     runtime_option("opus", "Opus"),
+                    runtime_option("opus[1m]", "Opus 1M"),
+                    runtime_option("claude-opus-4-8", "Opus 4.8"),
+                    runtime_option("claude-opus-4-8[1m]", "Opus 4.8 1M"),
                     runtime_option("haiku", "Haiku"),
                 ],
                 title_model_label(default_model),
@@ -3153,8 +3163,15 @@ def parse_claude_help_catalog() -> dict[str, Any]:
         aliases = re.findall(r"'([^']+)'", model_match.group(1))
         for alias in aliases:
             model_options.append(runtime_option(alias, title_model_label(alias)))
-    for alias in ("sonnet", "opus", "haiku"):
-        model_options.append(runtime_option(alias, title_model_label(alias)))
+    for alias, label in (
+        ("sonnet", "Sonnet"),
+        ("opus", "Opus"),
+        ("opus[1m]", "Opus 1M"),
+        ("claude-opus-4-8", "Opus 4.8"),
+        ("claude-opus-4-8[1m]", "Opus 4.8 1M"),
+        ("haiku", "Haiku"),
+    ):
+        model_options.append(runtime_option(alias, label))
 
     effort_match = re.search(r"--effort <level>.*?\(([^)]+)\)", help_text, re.IGNORECASE)
     if effort_match:
@@ -3436,13 +3453,13 @@ def file_response_media_type(meta: dict[str, Any]) -> str:
     return recorded
 
 
-async def collect_manifest(session_id: str, manifest_path: Path) -> None:
+async def collect_manifest(session_id: str, run_id: str, manifest_path: Path) -> None:
     if not manifest_path.exists():
         return
     try:
         data = json.loads(manifest_path.read_text())
     except Exception as e:
-        await append_event(session_id, "artifact_error", {"error": f"manifest parse failed: {e}"})
+        await append_event(session_id, "artifact_error", {"run_id": run_id, "error": f"manifest parse failed: {e}"})
         return
     finally:
         with suppress(OSError):
@@ -3455,9 +3472,9 @@ async def collect_manifest(session_id: str, manifest_path: Path) -> None:
         seen.add(path)
         rec = artifact_record(session_id, entry)
         if rec:
-            await append_event(session_id, "artifact_created", {"artifact": rec})
+            await append_event(session_id, "artifact_created", {"run_id": run_id, "artifact": rec})
         else:
-            await append_event(session_id, "artifact_error", {"path": path, "error": "file not found"})
+            await append_event(session_id, "artifact_error", {"run_id": run_id, "path": path, "error": "file not found"})
 
 
 async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, Any], manifest_path: Path) -> None:
@@ -3608,7 +3625,7 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
     if provider_id:
         await STORE.save_provider_session(session_id, provider_id, BACKEND_CLAUDE)
     result_text = clean_assistant_text(final_text or "\n\n".join(text_parts).strip())
-    await collect_manifest(session_id, manifest_path)
+    await collect_manifest(session_id, run_id, manifest_path)
     await append_event(session_id, "turn_finished", {
         "run_id": run_id,
         "backend": BACKEND_CLAUDE,
@@ -3765,7 +3782,7 @@ async def run_codex(session_id: str, run_id: str, prompt: str, sess: dict[str, A
         await append_event(session_id, "error", {"run_id": run_id, "message": stderr[:4000], "exit_code": proc.returncode})
     if provider_id:
         await STORE.save_provider_session(session_id, provider_id, BACKEND_CODEX)
-    await collect_manifest(session_id, manifest_path)
+    await collect_manifest(session_id, run_id, manifest_path)
     await append_event(session_id, "turn_finished", {
         "run_id": run_id,
         "backend": BACKEND_CODEX,

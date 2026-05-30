@@ -3829,8 +3829,14 @@ async def start_turn(
     try:
         if req.backend:
             sess = await STORE.update(session_id, {"backend": req.backend})
-        if req.model or req.effort:
-            sess = await STORE.update(session_id, {"model": req.model, "effort": req.effort})
+        fields_set = getattr(req, "model_fields_set", getattr(req, "__fields_set__", set()))
+        runtime_patch: dict[str, Any] = {}
+        if "model" in fields_set and req.model is not None:
+            runtime_patch["model"] = req.model
+        if "effort" in fields_set and req.effort is not None:
+            runtime_patch["effort"] = req.effort
+        if runtime_patch:
+            sess = await STORE.update(session_id, runtime_patch)
 
         run_id = f"run_{uuid.uuid4().hex[:16]}"
         manifest_path = manifests_dir(session_id) / f"{run_id}.json"

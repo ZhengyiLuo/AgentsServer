@@ -3247,6 +3247,18 @@ def build_codex_cmd(sess: dict[str, Any], prompt: str, manifest_path: Path) -> l
     return cmd
 
 
+def claude_result_error(event: dict[str, Any]) -> str | None:
+    if event.get("type") != "result":
+        return None
+    errors = event.get("errors")
+    if event.get("subtype") == "error_during_execution" or errors:
+        if isinstance(errors, list) and errors:
+            return "; ".join(str(item) for item in errors if item)
+        result = event.get("result")
+        return str(result or "Claude execution failed")
+    return None
+
+
 async def codex_app_server_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
     env = runner_env()
     codex_dir = os.path.dirname(os.path.abspath(CODEX_BIN))
@@ -3542,6 +3554,7 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
     last_event = time.time()
     idle_killed = False
     stream_error: str | None = None
+    result_error: str | None = None
 
     try:
         while True:
@@ -3571,8 +3584,6 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
                 continue
             if event.get("session_id") and not provider_id:
                 provider_id = event["session_id"]
-                await STORE.save_provider_session(session_id, provider_id, BACKEND_CLAUDE)
-                await append_event(session_id, "provider_session", {"run_id": run_id, "backend": BACKEND_CLAUDE, "provider_session_id": provider_id})
             etype = event.get("type")
             if etype == "assistant":
                 for block in event.get("message", {}).get("content", []):
@@ -3602,6 +3613,11 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
                             "is_error": block.get("is_error") is True,
                         })
             elif etype == "result":
+                result_error = claude_result_error(event)
+                if result_error:
+                    provider_id = None
+                    await append_event(session_id, "error", {"run_id": run_id, "backend": BACKEND_CLAUDE, "message": result_error})
+                    continue
                 final_text = event.get("result", "") or final_text
                 if event.get("session_id"):
                     provider_id = event["session_id"]
@@ -3622,8 +3638,9 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
         await append_event(session_id, "error", {"run_id": run_id, "message": "killed after idle timeout"})
     if not stopped and proc.returncode not in (0, None) and stderr:
         await append_event(session_id, "error", {"run_id": run_id, "message": stderr[:4000], "exit_code": proc.returncode})
-    if provider_id:
+    if provider_id and not result_error:
         await STORE.save_provider_session(session_id, provider_id, BACKEND_CLAUDE)
+        await append_event(session_id, "provider_session", {"run_id": run_id, "backend": BACKEND_CLAUDE, "provider_session_id": provider_id})
     result_text = clean_assistant_text(final_text or "\n\n".join(text_parts).strip())
     await collect_manifest(session_id, run_id, manifest_path)
     await append_event(session_id, "turn_finished", {

@@ -412,6 +412,10 @@ class HandoffDigestRequest(BaseModel):
     summarizer_effort: str | None = None
 
 
+class HandoffDigestSendRequest(HandoffDigestRequest):
+    target_session_id: str
+
+
 class TerminalOpenRequest(BaseModel):
     cwd: str | None = None
 
@@ -1017,6 +1021,10 @@ def should_bump_session_updated_at(event_type: str, event: dict[str, Any]) -> bo
         "file_uploaded",
         "job_created",
         "job_deferred",
+        "handoff_digest_started",
+        "handoff_digest_ready",
+        "handoff_digest_sent",
+        "handoff_digest_error",
         "backend_changed",
         "history_imported",
         "session_forked",
@@ -2778,6 +2786,64 @@ async def build_handoff_digest(
     }
 
 
+async def run_handoff_digest_send(
+    digest_job_id: str,
+    source_session_id: str,
+    req: HandoffDigestSendRequest,
+) -> None:
+    source = STORE.sessions.get(source_session_id)
+    target = STORE.sessions.get(req.target_session_id)
+    source_title = str((source or {}).get("title") or source_session_id)
+    target_session_id = req.target_session_id
+    try:
+        result = await build_handoff_digest(
+            source_session_id,
+            detail=req.detail,
+            user_prompt=req.user_prompt,
+            target_session_id=target_session_id,
+            summarizer_backend=req.summarizer_backend,
+            summarizer_model=req.summarizer_model,
+            summarizer_effort=req.summarizer_effort,
+        )
+        digest = str(result.get("digest") or "").strip()
+        if not digest:
+            raise RuntimeError("LLM digest was empty")
+        await append_event(target_session_id, "handoff_digest_ready", {
+            "digest_job_id": digest_job_id,
+            "source_session_id": source_session_id,
+            "target_session_id": target_session_id,
+            "message": f"Context digest from {source_title} is ready; sending it to this chat.",
+            "detail": req.detail,
+            "summarizer": result.get("summarizer"),
+            "digest_chars": len(digest),
+        })
+        await start_turn(target_session_id, TurnRequest(prompt=digest), queue_if_busy=True)
+        await append_event(target_session_id, "handoff_digest_sent", {
+            "digest_job_id": digest_job_id,
+            "source_session_id": source_session_id,
+            "target_session_id": target_session_id,
+            "message": f"Context digest from {source_title} was submitted to this chat.",
+            "detail": req.detail,
+            "digest_chars": len(digest),
+        })
+    except Exception as exc:
+        logger.warning(
+            "background handoff digest failed job=%s source=%s target=%s: %s",
+            digest_job_id,
+            source_session_id,
+            target_session_id,
+            exc,
+        )
+        await append_event(target_session_id, "handoff_digest_error", {
+            "digest_job_id": digest_job_id,
+            "source_session_id": source_session_id,
+            "target_session_id": target_session_id,
+            "message": f"Context digest from {source_title} failed: {exc}",
+            "detail": req.detail,
+            "error": str(exc),
+        })
+
+
 LEADING_DECORATION_RE = re.compile(
     r"(?m)^[ \t]*(?:(?::[A-Za-z0-9_+\-]+:|[\U0001F300-\U0001FAFF\u2600-\u27BF]\ufe0f?)[ \t]*)+"
 )
@@ -4376,6 +4442,39 @@ async def create_handoff_digest(session_id: str, req: HandoffDigestRequest) -> d
         summarizer_model=req.summarizer_model,
         summarizer_effort=req.summarizer_effort,
     )
+
+
+@app.post("/api/sessions/{session_id}/digest/send")
+async def send_handoff_digest_background(session_id: str, req: HandoffDigestSendRequest) -> dict[str, Any]:
+    source = STORE.sessions.get(session_id)
+    if not source:
+        raise HTTPException(status_code=404, detail="source session not found")
+    target = STORE.sessions.get(req.target_session_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="target session not found")
+    if session_id == req.target_session_id:
+        raise HTTPException(status_code=400, detail="target chat must be different from source chat")
+    digest_job_id = f"digest_{uuid.uuid4().hex[:16]}"
+    source_title = str(source.get("title") or session_id)
+    await append_event(req.target_session_id, "handoff_digest_started", {
+        "digest_job_id": digest_job_id,
+        "source_session_id": session_id,
+        "target_session_id": req.target_session_id,
+        "message": f"Generating LLM context digest from {source_title}.",
+        "detail": req.detail,
+        "summarizer": {
+            "backend": req.summarizer_backend or HANDOFF_DIGEST_BACKEND,
+            "model": req.summarizer_model if req.summarizer_model is not None else HANDOFF_DIGEST_MODEL,
+            "effort": req.summarizer_effort if req.summarizer_effort is not None else HANDOFF_DIGEST_EFFORT,
+            "mode": "llm",
+        },
+    })
+    asyncio.create_task(run_handoff_digest_send(digest_job_id, session_id, req))
+    return {
+        "ok": True,
+        "digest_job_id": digest_job_id,
+        "session": public_session(STORE.sessions[req.target_session_id]),
+    }
 
 
 @app.patch("/api/sessions/{session_id}")

@@ -383,6 +383,10 @@ class TurnRequest(BaseModel):
     backend: str | None = None
     model: str | None = None
     effort: str | None = None
+    display_prompt: str | None = None
+    purpose: str | None = None
+    digest_job_id: str | None = None
+    target_session_id: str | None = None
 
 
 class UpdateQueuedTurnRequest(BaseModel):
@@ -970,6 +974,7 @@ ACTIVE_LOCK = asyncio.Lock()
 QUEUED_TURNS: dict[str, deque[dict[str, Any]]] = {}
 RUN_NOW_TURNS: dict[str, dict[str, Any]] = {}
 QUEUE_LOCK = asyncio.Lock()
+RUN_METADATA: dict[str, dict[str, Any]] = {}
 
 LOG_PATH_SUFFIXES = {
     ".log", ".out", ".err", ".stderr", ".stdout", ".txt", ".jsonl", ".trace"
@@ -978,6 +983,11 @@ LIVE_STDOUT_MAX_LINES = 400
 LIVE_STDOUT_MAX_LINE_CHARS = 12_000
 TMUX_CAPTURE_MAX_LINES = 2_000
 TMUX_COMMAND_TIMEOUT_SECONDS = 4
+
+
+def run_event_metadata(run_id: str) -> dict[str, Any]:
+    metadata = RUN_METADATA.get(run_id) or {}
+    return {key: value for key, value in metadata.items() if value is not None}
 
 
 async def append_event(session_id: str, event_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1057,6 +1067,10 @@ async def enqueue_turn(session_id: str, req: TurnRequest, sess: dict[str, Any]) 
         "backend": req.backend,
         "model": req.model,
         "effort": req.effort,
+        "display_prompt": req.display_prompt,
+        "purpose": req.purpose,
+        "digest_job_id": req.digest_job_id,
+        "target_session_id": req.target_session_id,
         "created_at": now_iso(),
     }
     async with QUEUE_LOCK:
@@ -1066,9 +1080,12 @@ async def enqueue_turn(session_id: str, req: TurnRequest, sess: dict[str, Any]) 
     await append_event(session_id, "turn_queued", {
         "queued_id": queued_id,
         "backend": req.backend or sess.get("backend") or DEFAULT_BACKEND,
-        "prompt": req.prompt,
+        "prompt": req.display_prompt or req.prompt,
         "file_ids": list(req.file_ids),
         "position": position,
+        "purpose": req.purpose,
+        "digest_job_id": req.digest_job_id,
+        "target_session_id": req.target_session_id,
     })
     return {
         "queued": True,
@@ -1268,6 +1285,10 @@ async def start_next_queued_turn(session_id: str) -> None:
         backend=item.get("backend"),
         model=item.get("model"),
         effort=item.get("effort"),
+        display_prompt=item.get("display_prompt"),
+        purpose=item.get("purpose"),
+        digest_job_id=item.get("digest_job_id"),
+        target_session_id=item.get("target_session_id"),
     )
     try:
         await start_turn(session_id, req, queue_if_busy=False, queued_id=str(item["queued_id"]))
@@ -2786,6 +2807,116 @@ async def build_handoff_digest(
     }
 
 
+def build_source_chat_digest_turn_prompt(
+    *,
+    detail: str,
+    user_prompt: str | None,
+    target_session_id: str,
+) -> str:
+    prompt = compact_memory_text(user_prompt or "", 2200)
+    target_context = handoff_target_context(target_session_id)
+    detail_name = str(detail or "normal").strip().lower() or "normal"
+    return f"""\
+You are the source chat agent for a ZenithDock handoff.
+
+Create a concise, accurate Markdown context digest for the target agent. Use your current source-chat context as the primary evidence. This is not a normal user task: do not continue the project work, do not ask questions, and do not include meta commentary about generating the digest.
+
+Required output:
+- Start with "# ZenithDock Context Digest".
+- Include "## User Prompt For Target Agent" only if the user supplied one.
+- Include "## Executive Summary" with the current state in plain language.
+- Include "## Important Decisions / Facts" for durable conclusions.
+- Include "## Files, Videos, And Artifacts" with exact paths, filenames, IDs, and why they matter.
+- Include "## Active / Pending Work" for running jobs, queued work, blockers, or next checks.
+- Include "## Recommended Next Prompt" with a short instruction the target agent should follow.
+
+Rules:
+- Preserve exact commands, paths, session IDs, job names, URLs, and numeric results when they matter.
+- Do not invent missing facts. If the source context is unclear, say "Unknown".
+- Prefer a useful summary over a transcript. Collapse repetitive traces aggressively.
+- Keep the digest under {MAX_HANDOFF_DIGEST_CHARS} characters.
+- No emoji or decorative prefixes.
+
+Digest detail level requested: {detail_name}
+
+Target agent context:
+{target_context}
+
+User prompt for target agent:
+{prompt or "None"}
+"""
+
+
+def source_digest_display_prompt(target: dict[str, Any], user_prompt: str | None) -> str:
+    target_title = str(target.get("title") or "target chat")
+    prompt = compact_memory_text(user_prompt or "", 260)
+    if prompt:
+        return f"Generate a handoff digest for {target_title}.\n\nTarget prompt: {prompt}"
+    return f"Generate a handoff digest for {target_title}."
+
+
+def digest_turn_state(
+    session_id: str,
+    digest_job_id: str,
+    *,
+    queued_id: str | None = None,
+    run_id: str | None = None,
+    after_seq: int = 0,
+) -> tuple[str | None, str | None, str | None]:
+    current_run_id = run_id
+    text_parts: list[str] = []
+    last_error: str | None = None
+    for event in tail_jsonl_file(events_path(session_id), limit=900, max_bytes=4 * 1024 * 1024):
+        if int(event.get("seq") or 0) <= after_seq:
+            continue
+        if event.get("digest_job_id") != digest_job_id:
+            continue
+        event_type = event.get("type")
+        if queued_id and event.get("queued_id") == queued_id and event_type == "turn_started":
+            current_run_id = event.get("run_id") or current_run_id
+        if current_run_id and event.get("run_id") != current_run_id:
+            continue
+        if event_type == "assistant_text":
+            text = clean_assistant_text(event.get("text") or "")
+            if text:
+                text_parts.append(text)
+        elif event_type == "error":
+            last_error = str(event.get("message") or event.get("error") or "digest turn failed")
+        elif event_type == "turn_finished":
+            text = clean_assistant_text(event.get("result_text") or "\n\n".join(text_parts).strip())
+            if text:
+                return current_run_id, text, None
+            return current_run_id, None, last_error or "digest turn finished without text"
+    return current_run_id, None, last_error
+
+
+async def wait_for_digest_turn_result(
+    session_id: str,
+    digest_job_id: str,
+    *,
+    queued_id: str | None = None,
+    run_id: str | None = None,
+    after_seq: int = 0,
+) -> str:
+    deadline = time.time() + HANDOFF_DIGEST_TIMEOUT_SECONDS
+    current_run_id = run_id
+    last_error: str | None = None
+    while time.time() < deadline:
+        current_run_id, digest, error = digest_turn_state(
+            session_id,
+            digest_job_id,
+            queued_id=queued_id,
+            run_id=current_run_id,
+            after_seq=after_seq,
+        )
+        if digest:
+            return digest
+        if error:
+            last_error = error
+        await asyncio.sleep(1)
+    raise TimeoutError(last_error or f"handoff digest turn timed out after {HANDOFF_DIGEST_TIMEOUT_SECONDS}s")
+
+
 async def run_handoff_digest_send(
     digest_job_id: str,
     source_session_id: str,
@@ -2793,36 +2924,47 @@ async def run_handoff_digest_send(
 ) -> None:
     source = STORE.sessions.get(source_session_id)
     target = STORE.sessions.get(req.target_session_id)
-    source_title = str((source or {}).get("title") or source_session_id)
     target_session_id = req.target_session_id
+    source_title = str((source or {}).get("title") or source_session_id)
+    target_title = str((target or {}).get("title") or target_session_id)
     try:
-        result = await build_handoff_digest(
-            source_session_id,
+        if not source:
+            raise RuntimeError("source session not found")
+        if not target:
+            raise RuntimeError("target session not found")
+        prompt = build_source_chat_digest_turn_prompt(
             detail=req.detail,
             user_prompt=req.user_prompt,
             target_session_id=target_session_id,
-            summarizer_backend=req.summarizer_backend,
-            summarizer_model=req.summarizer_model,
-            summarizer_effort=req.summarizer_effort,
         )
-        digest = str(result.get("digest") or "").strip()
+        display_prompt = source_digest_display_prompt(target, req.user_prompt)
+        after_seq = int(source.get("latest_event_seq") or 0)
+        turn = await start_turn(
+            source_session_id,
+            TurnRequest(
+                prompt=prompt,
+                display_prompt=display_prompt,
+                purpose="handoff_digest",
+                digest_job_id=digest_job_id,
+                target_session_id=target_session_id,
+            ),
+            queue_if_busy=True,
+        )
+        digest = await wait_for_digest_turn_result(
+            source_session_id,
+            digest_job_id,
+            queued_id=turn.get("queued_id"),
+            run_id=turn.get("run_id"),
+            after_seq=after_seq,
+        )
         if not digest:
             raise RuntimeError("LLM digest was empty")
-        await append_event(target_session_id, "handoff_digest_ready", {
-            "digest_job_id": digest_job_id,
-            "source_session_id": source_session_id,
-            "target_session_id": target_session_id,
-            "message": f"Context digest from {source_title} is ready; sending it to this chat.",
-            "detail": req.detail,
-            "summarizer": result.get("summarizer"),
-            "digest_chars": len(digest),
-        })
         await start_turn(target_session_id, TurnRequest(prompt=digest), queue_if_busy=True)
-        await append_event(target_session_id, "handoff_digest_sent", {
+        await append_event(source_session_id, "handoff_digest_sent", {
             "digest_job_id": digest_job_id,
             "source_session_id": source_session_id,
             "target_session_id": target_session_id,
-            "message": f"Context digest from {source_title} was submitted to this chat.",
+            "message": f"Context digest from {source_title} was sent to {target_title}.",
             "detail": req.detail,
             "digest_chars": len(digest),
         })
@@ -2834,7 +2976,7 @@ async def run_handoff_digest_send(
             target_session_id,
             exc,
         )
-        await append_event(target_session_id, "handoff_digest_error", {
+        await append_event(source_session_id, "handoff_digest_error", {
             "digest_job_id": digest_job_id,
             "source_session_id": source_session_id,
             "target_session_id": target_session_id,
@@ -3817,13 +3959,15 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
             start_new_session=True,
         )
     except Exception as e:
-        await append_event(session_id, "error", {"run_id": run_id, "backend": BACKEND_CLAUDE, "message": f"failed to start Claude: {e}"})
+        await append_event(session_id, "error", {"run_id": run_id, "backend": BACKEND_CLAUDE, "message": f"failed to start Claude: {e}", **run_event_metadata(run_id)})
         await append_event(session_id, "turn_finished", {
             "run_id": run_id,
             "backend": BACKEND_CLAUDE,
             "exit_code": None,
             "result_text": "",
+            **run_event_metadata(run_id),
         })
+        RUN_METADATA.pop(run_id, None)
         await release_turn_slot(session_id)
         schedule_next_queued_turn(session_id)
         return
@@ -3901,7 +4045,7 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
                         text = clean_assistant_text(block["text"])
                         if text:
                             text_parts.append(text)
-                            await append_event(session_id, "assistant_text", {"run_id": run_id, "text": text})
+                            await append_event(session_id, "assistant_text", {"run_id": run_id, "text": text, **run_event_metadata(run_id)})
                     elif btype == "thinking" and block.get("thinking"):
                         await append_event(session_id, "reasoning_summary", {"run_id": run_id, "text": block["thinking"]})
                     elif btype in ("tool_use", "server_tool_use"):
@@ -3925,7 +4069,7 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
                 result_error = claude_result_error(event)
                 if result_error:
                     provider_id = None
-                    await append_event(session_id, "error", {"run_id": run_id, "backend": BACKEND_CLAUDE, "message": result_error})
+                    await append_event(session_id, "error", {"run_id": run_id, "backend": BACKEND_CLAUDE, "message": result_error, **run_event_metadata(run_id)})
                     continue
                 final_text = event.get("result", "") or final_text
                 if event.get("session_id"):
@@ -3942,11 +4086,11 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
         stderr = (await proc.stderr.read()).decode("utf-8", "replace").strip()
     stopped = run_id in STOPPED_RUNS
     if stream_error and not stopped:
-        await append_event(session_id, "error", {"run_id": run_id, "message": f"Claude stream failed: {stream_error}"})
+        await append_event(session_id, "error", {"run_id": run_id, "message": f"Claude stream failed: {stream_error}", **run_event_metadata(run_id)})
     if idle_killed:
-        await append_event(session_id, "error", {"run_id": run_id, "message": "killed after idle timeout"})
+        await append_event(session_id, "error", {"run_id": run_id, "message": "killed after idle timeout", **run_event_metadata(run_id)})
     if not stopped and proc.returncode not in (0, None) and stderr:
-        await append_event(session_id, "error", {"run_id": run_id, "message": stderr[:4000], "exit_code": proc.returncode})
+        await append_event(session_id, "error", {"run_id": run_id, "message": stderr[:4000], "exit_code": proc.returncode, **run_event_metadata(run_id)})
     if provider_id and not result_error:
         await STORE.save_provider_session(session_id, provider_id, BACKEND_CLAUDE)
         await append_event(session_id, "provider_session", {"run_id": run_id, "backend": BACKEND_CLAUDE, "provider_session_id": provider_id})
@@ -3958,7 +4102,9 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
         "exit_code": proc.returncode,
         "result_text": result_text,
         "stopped": stopped,
+        **run_event_metadata(run_id),
     })
+    RUN_METADATA.pop(run_id, None)
     await release_turn_slot(session_id)
     STOPPED_RUNS.discard(run_id)
     schedule_next_queued_turn(session_id)
@@ -3986,13 +4132,15 @@ async def run_codex(session_id: str, run_id: str, prompt: str, sess: dict[str, A
             start_new_session=True,
         )
     except Exception as e:
-        await append_event(session_id, "error", {"run_id": run_id, "backend": BACKEND_CODEX, "message": f"failed to start Codex: {e}"})
+        await append_event(session_id, "error", {"run_id": run_id, "backend": BACKEND_CODEX, "message": f"failed to start Codex: {e}", **run_event_metadata(run_id)})
         await append_event(session_id, "turn_finished", {
             "run_id": run_id,
             "backend": BACKEND_CODEX,
             "exit_code": None,
             "result_text": "",
+            **run_event_metadata(run_id),
         })
+        RUN_METADATA.pop(run_id, None)
         await release_turn_slot(session_id)
         schedule_next_queued_turn(session_id)
         return
@@ -4082,7 +4230,7 @@ async def run_codex(session_id: str, run_id: str, prompt: str, sess: dict[str, A
                     text = clean_assistant_text(item.get("text") or "")
                     if text:
                         text_parts.append(text)
-                        await append_event(session_id, "assistant_text", {"run_id": run_id, "text": text})
+                        await append_event(session_id, "assistant_text", {"run_id": run_id, "text": text, **run_event_metadata(run_id)})
                 elif itype in ("reasoning", "agent_reasoning") and etype == "item.completed":
                     text = (item.get("text") or "").strip()
                     if not text and isinstance(item.get("summary"), list):
@@ -4101,11 +4249,11 @@ async def run_codex(session_id: str, run_id: str, prompt: str, sess: dict[str, A
         stderr = (await proc.stderr.read()).decode("utf-8", "replace").strip()
     stopped = run_id in STOPPED_RUNS
     if stream_error and not stopped:
-        await append_event(session_id, "error", {"run_id": run_id, "message": f"Codex stream failed: {stream_error}"})
+        await append_event(session_id, "error", {"run_id": run_id, "message": f"Codex stream failed: {stream_error}", **run_event_metadata(run_id)})
     if idle_killed:
-        await append_event(session_id, "error", {"run_id": run_id, "message": "killed after idle timeout"})
+        await append_event(session_id, "error", {"run_id": run_id, "message": "killed after idle timeout", **run_event_metadata(run_id)})
     if not stopped and proc.returncode not in (0, None) and stderr:
-        await append_event(session_id, "error", {"run_id": run_id, "message": stderr[:4000], "exit_code": proc.returncode})
+        await append_event(session_id, "error", {"run_id": run_id, "message": stderr[:4000], "exit_code": proc.returncode, **run_event_metadata(run_id)})
     if provider_id:
         await STORE.save_provider_session(session_id, provider_id, BACKEND_CODEX)
     await collect_manifest(session_id, run_id, manifest_path)
@@ -4115,7 +4263,9 @@ async def run_codex(session_id: str, run_id: str, prompt: str, sess: dict[str, A
         "exit_code": proc.returncode,
         "result_text": clean_assistant_text("\n\n".join(text_parts).strip()),
         "stopped": stopped,
+        **run_event_metadata(run_id),
     })
+    RUN_METADATA.pop(run_id, None)
     await release_turn_slot(session_id)
     STOPPED_RUNS.discard(run_id)
     schedule_next_queued_turn(session_id)
@@ -4200,11 +4350,20 @@ async def start_turn(
         started_payload = {
             "run_id": run_id,
             "backend": backend,
-            "prompt": req.prompt,
+            "prompt": req.display_prompt or req.prompt,
             "file_ids": req.file_ids,
         }
         if queued_id:
             started_payload["queued_id"] = queued_id
+        run_metadata = {
+            "purpose": req.purpose,
+            "digest_job_id": req.digest_job_id,
+            "target_session_id": req.target_session_id,
+        }
+        run_metadata = {key: value for key, value in run_metadata.items() if value is not None}
+        if run_metadata:
+            RUN_METADATA[run_id] = run_metadata
+            started_payload.update(run_metadata)
         await append_event(session_id, "turn_started", started_payload)
         task = run_codex(session_id, run_id, prompt, dict(sess), manifest_path) if backend == BACKEND_CODEX else run_claude(session_id, run_id, prompt, dict(sess), manifest_path)
         asyncio.create_task(task)
@@ -4455,25 +4614,11 @@ async def send_handoff_digest_background(session_id: str, req: HandoffDigestSend
     if session_id == req.target_session_id:
         raise HTTPException(status_code=400, detail="target chat must be different from source chat")
     digest_job_id = f"digest_{uuid.uuid4().hex[:16]}"
-    source_title = str(source.get("title") or session_id)
-    await append_event(req.target_session_id, "handoff_digest_started", {
-        "digest_job_id": digest_job_id,
-        "source_session_id": session_id,
-        "target_session_id": req.target_session_id,
-        "message": f"Generating LLM context digest from {source_title}.",
-        "detail": req.detail,
-        "summarizer": {
-            "backend": req.summarizer_backend or HANDOFF_DIGEST_BACKEND,
-            "model": req.summarizer_model if req.summarizer_model is not None else HANDOFF_DIGEST_MODEL,
-            "effort": req.summarizer_effort if req.summarizer_effort is not None else HANDOFF_DIGEST_EFFORT,
-            "mode": "llm",
-        },
-    })
     asyncio.create_task(run_handoff_digest_send(digest_job_id, session_id, req))
     return {
         "ok": True,
         "digest_job_id": digest_job_id,
-        "session": public_session(STORE.sessions[req.target_session_id]),
+        "session": public_session(STORE.sessions[session_id]),
     }
 
 

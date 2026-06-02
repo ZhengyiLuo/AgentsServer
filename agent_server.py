@@ -2297,6 +2297,52 @@ def tail_jsonl_file(path: Path, limit: int = 40, max_bytes: int = 2 * 1024 * 102
     return records
 
 
+def event_output_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for block in value:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                block_type = str(block.get("type") or "")
+                if block_type in {"text", "input_text", "output_text"} and block.get("text"):
+                    parts.append(str(block.get("text") or ""))
+                elif block_type == "image":
+                    parts.append("[image result]")
+                elif block_type == "tool_reference":
+                    name = str(block.get("tool_name") or block.get("name") or "tool")
+                    parts.append(f"[tool reference: {name}]")
+                else:
+                    with suppress(Exception):
+                        parts.append(json.dumps(block, separators=(",", ":")))
+            else:
+                parts.append(str(block))
+        return compact_memory_text("\n".join(part for part in parts if part.strip()), 12_000)
+    if isinstance(value, dict):
+        if value.get("text"):
+            return compact_memory_text(str(value.get("text") or ""), 12_000)
+        if value.get("message"):
+            return compact_memory_text(str(value.get("message") or ""), 12_000)
+        if value.get("type") == "image":
+            return "[image result]"
+        with suppress(Exception):
+            return compact_memory_text(json.dumps(value, separators=(",", ":")), 12_000)
+    return str(value)
+
+
+def client_safe_event(event: dict[str, Any]) -> dict[str, Any]:
+    output = event.get("output")
+    if output is None or isinstance(output, str):
+        return event
+    safe = dict(event)
+    safe["output"] = event_output_text(output)
+    return safe
+
+
 async def release_turn_slot(session_id: str) -> None:
     async with ACTIVE_LOCK:
         ACTIVE.pop(session_id, None)
@@ -2342,6 +2388,7 @@ def read_events(
             continue
         seq = int(event.get("seq", 0))
         if seq > after and (before is None or seq < before):
+            event = client_safe_event(event)
             if tail_out is not None:
                 tail_out.append(event)
             else:
@@ -3510,6 +3557,18 @@ def session_backend_locked(sess: dict[str, Any]) -> bool:
     return any(str(sess.get(key) or "").strip() for key in ("session_id", "claude_session_id", "codex_thread_id"))
 
 
+def discovered_codex_default_model(models: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for model in models:
+        slug = str(model.get("slug") or model.get("id") or "").strip()
+        if slug == "gpt-5.5":
+            return model
+    for model in models:
+        slug = str(model.get("slug") or model.get("id") or "").strip()
+        if slug:
+            return model
+    return None
+
+
 def discover_codex_catalog() -> dict[str, Any]:
     models: list[dict[str, Any]] = []
     model_options: list[dict[str, str]] = []
@@ -3535,17 +3594,21 @@ def discover_codex_catalog() -> dict[str, Any]:
         if str(model.get("visibility") or "list") == "list" and model.get("supported_in_api", True) is not False
     ]
     visible_models.sort(key=runtime_priority)
+    default_entry = discovered_codex_default_model(visible_models)
+    if default_entry:
+        default_model = str(default_entry.get("slug") or default_entry.get("id") or "").strip()
+        default_model_label = str(default_entry.get("display_name") or title_model_label(default_model)).strip()
+        default_effort = str(default_entry.get("default_reasoning_level") or "").strip()
+        default_effort_label = title_effort_label(default_effort) if default_effort else ""
+    if default_model == "gpt-5.5" and default_effort == "medium":
+        default_effort = "xhigh"
+        default_effort_label = "XHigh"
     for model in visible_models:
         slug = str(model.get("slug") or model.get("id") or "").strip()
         if not slug:
             continue
         label = str(model.get("display_name") or title_model_label(slug)).strip()
         model_options.append(runtime_option(slug, label))
-        if not default_model:
-            default_model = slug
-            default_model_label = label
-            default_effort = str(model.get("default_reasoning_level") or "").strip()
-            default_effort_label = title_effort_label(default_effort) if default_effort else ""
         levels = model.get("supported_reasoning_levels")
         if isinstance(levels, list):
             for level in levels:
@@ -3916,28 +3979,78 @@ def file_response_media_type(meta: dict[str, Any]) -> str:
     return recorded
 
 
-async def collect_manifest(session_id: str, run_id: str, manifest_path: Path) -> None:
+def manifest_entry_path(entry: str | dict[str, Any]) -> str:
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        return str(entry.get("path") or "")
+    return ""
+
+
+def file_signature(path: str) -> tuple[int, int] | None:
+    try:
+        stat = Path(path).expanduser().stat()
+    except OSError:
+        return None
+    return (stat.st_size, stat.st_mtime_ns)
+
+
+def live_manifest_entry_ready(path: str, stable_files: dict[str, tuple[int, int]]) -> bool:
+    signature = file_signature(path)
+    if signature is None:
+        return False
+    previous = stable_files.get(path)
+    stable_files[path] = signature
+    return previous == signature and time.time_ns() - signature[1] > 750_000_000
+
+
+async def collect_manifest(
+    session_id: str,
+    run_id: str,
+    manifest_path: Path,
+    *,
+    seen_artifacts: set[str] | None = None,
+    stable_files: dict[str, tuple[int, int]] | None = None,
+    final: bool = True,
+) -> None:
     if not manifest_path.exists():
         return
     try:
         data = json.loads(manifest_path.read_text())
     except Exception as e:
-        await append_event(session_id, "artifact_error", {"run_id": run_id, "error": f"manifest parse failed: {e}"})
+        if final:
+            await append_event(session_id, "artifact_error", {"run_id": run_id, "error": f"manifest parse failed: {e}"})
         return
-    finally:
+    if final:
         with suppress(OSError):
             manifest_path.unlink()
-    seen: set[str] = set()
+    seen = seen_artifacts if seen_artifacts is not None else set()
     for entry in data.get("files", []):
-        path = entry if isinstance(entry, str) else entry.get("path", "") if isinstance(entry, dict) else ""
+        path = manifest_entry_path(entry)
         if not path or path in seen:
+            continue
+        if not final and stable_files is not None and not live_manifest_entry_ready(path, stable_files):
             continue
         seen.add(path)
         rec = artifact_record(session_id, entry)
         if rec:
             await append_event(session_id, "artifact_created", {"run_id": run_id, "artifact": rec})
-        else:
+        elif final:
             await append_event(session_id, "artifact_error", {"run_id": run_id, "path": path, "error": "file not found"})
+
+
+async def watch_manifest_artifacts(session_id: str, run_id: str, manifest_path: Path, seen_artifacts: set[str]) -> None:
+    stable_files: dict[str, tuple[int, int]] = {}
+    while True:
+        await collect_manifest(
+            session_id,
+            run_id,
+            manifest_path,
+            seen_artifacts=seen_artifacts,
+            stable_files=stable_files,
+            final=False,
+        )
+        await asyncio.sleep(1.0)
 
 
 async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, Any], manifest_path: Path) -> None:
@@ -4008,6 +4121,8 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
     idle_killed = False
     stream_error: str | None = None
     result_error: str | None = None
+    seen_artifacts: set[str] = set()
+    manifest_watch_task = asyncio.create_task(watch_manifest_artifacts(session_id, run_id, manifest_path, seen_artifacts))
 
     try:
         while True:
@@ -4057,7 +4172,7 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
                 for block in event.get("message", {}).get("content", []):
                     if block.get("type") == "tool_result":
                         tid = block.get("tool_use_id")
-                        content = block.get("content", "")
+                        content = event_output_text(block.get("content", ""))
                         await append_event(session_id, "tool_finished", {
                             "run_id": run_id,
                             "tool_id": tid,
@@ -4078,6 +4193,9 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
         stream_error = f"{type(e).__name__}: {e}"
         logger.exception("Claude run failed session=%s run=%s", session_id, run_id)
     finally:
+        manifest_watch_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await manifest_watch_task
         await terminate_process_tree(proc, grace=0.5)
         await clear_active_process(session_id)
 
@@ -4095,7 +4213,7 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
         await STORE.save_provider_session(session_id, provider_id, BACKEND_CLAUDE)
         await append_event(session_id, "provider_session", {"run_id": run_id, "backend": BACKEND_CLAUDE, "provider_session_id": provider_id})
     result_text = clean_assistant_text(final_text or "\n\n".join(text_parts).strip())
-    await collect_manifest(session_id, run_id, manifest_path)
+    await collect_manifest(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts, final=True)
     await append_event(session_id, "turn_finished", {
         "run_id": run_id,
         "backend": BACKEND_CLAUDE,
@@ -4174,6 +4292,8 @@ async def run_codex(session_id: str, run_id: str, prompt: str, sess: dict[str, A
     last_event = time.time()
     idle_killed = False
     stream_error: str | None = None
+    seen_artifacts: set[str] = set()
+    manifest_watch_task = asyncio.create_task(watch_manifest_artifacts(session_id, run_id, manifest_path, seen_artifacts))
 
     try:
         while True:
@@ -4241,6 +4361,9 @@ async def run_codex(session_id: str, run_id: str, prompt: str, sess: dict[str, A
         stream_error = f"{type(e).__name__}: {e}"
         logger.exception("Codex run failed session=%s run=%s", session_id, run_id)
     finally:
+        manifest_watch_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await manifest_watch_task
         await terminate_process_tree(proc, grace=0.5)
         await clear_active_process(session_id)
 
@@ -4256,7 +4379,7 @@ async def run_codex(session_id: str, run_id: str, prompt: str, sess: dict[str, A
         await append_event(session_id, "error", {"run_id": run_id, "message": stderr[:4000], "exit_code": proc.returncode, **run_event_metadata(run_id)})
     if provider_id:
         await STORE.save_provider_session(session_id, provider_id, BACKEND_CODEX)
-    await collect_manifest(session_id, run_id, manifest_path)
+    await collect_manifest(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts, final=True)
     await append_event(session_id, "turn_finished", {
         "run_id": run_id,
         "backend": BACKEND_CODEX,

@@ -80,6 +80,12 @@ MAX_IMPORTED_TEXT_CHARS = int(os.environ.get("ZENITHBOT_HISTORY_IMPORT_TEXT_CHAR
 MAX_FORK_MEMORY_CHARS = int(os.environ.get("ZENITHBOT_FORK_MEMORY_CHARS", "24000"))
 MAX_FORK_MEMORY_ITEM_CHARS = int(os.environ.get("ZENITHBOT_FORK_MEMORY_ITEM_CHARS", "1800"))
 MAX_HANDOFF_DIGEST_CHARS = int(os.environ.get("ZENITHBOT_HANDOFF_DIGEST_CHARS", "56000"))
+HANDOFF_DIGEST_TIMEOUT_SECONDS = int(os.environ.get("ZENITHBOT_HANDOFF_DIGEST_TIMEOUT_SECONDS", "180"))
+HANDOFF_DIGEST_BACKEND = os.environ.get("ZENITHBOT_HANDOFF_DIGEST_BACKEND", BACKEND_CLAUDE).lower()
+if HANDOFF_DIGEST_BACKEND not in VALID_BACKENDS:
+    HANDOFF_DIGEST_BACKEND = BACKEND_CLAUDE
+HANDOFF_DIGEST_MODEL = os.environ.get("ZENITHBOT_HANDOFF_DIGEST_MODEL", "sonnet").strip()
+HANDOFF_DIGEST_EFFORT = os.environ.get("ZENITHBOT_HANDOFF_DIGEST_EFFORT", "").strip()
 DEFAULT_SESSION_EVENT_LIMIT = int(os.environ.get("ZENITHBOT_SESSION_EVENT_LIMIT", "100"))
 MAX_EVENT_RESPONSE_LIMIT = int(os.environ.get("ZENITHBOT_MAX_EVENT_RESPONSE_LIMIT", "1000"))
 AGENT_TOKEN = os.environ.get("ZENITHDOCK_AGENT_TOKEN") or os.environ.get("ZENITHBOT_AGENT_TOKEN") or ""
@@ -400,6 +406,10 @@ class ImportHistoryRequest(BaseModel):
 class HandoffDigestRequest(BaseModel):
     detail: str = "normal"
     user_prompt: str | None = None
+    target_session_id: str | None = None
+    summarizer_backend: str | None = None
+    summarizer_model: str | None = None
+    summarizer_effort: str | None = None
 
 
 class TerminalOpenRequest(BaseModel):
@@ -2426,7 +2436,7 @@ def digest_file_line(file: dict[str, Any]) -> str:
     return line
 
 
-def build_handoff_digest(session_id: str, detail: str = "normal", user_prompt: str | None = None) -> dict[str, Any]:
+def build_handoff_source_pack(session_id: str, detail: str = "normal", user_prompt: str | None = None) -> dict[str, Any]:
     source = STORE.sessions.get(session_id)
     if not source:
         raise HTTPException(status_code=404, detail="source session not found")
@@ -2442,9 +2452,9 @@ def build_handoff_digest(session_id: str, detail: str = "normal", user_prompt: s
     prompt = compact_memory_text(user_prompt or "", 2200)
 
     lines = [
-        "# ZenithDock Context Digest",
+        "# ZenithDock Context Source Pack",
         "",
-        "This is an explicit handoff from another ZenithDock chat. Use it as background context for the next response.",
+        "This is source material for an LLM-generated handoff digest.",
     ]
     if prompt:
         lines.extend(["", "## User Prompt For Target Agent", prompt])
@@ -2527,11 +2537,244 @@ def build_handoff_digest(session_id: str, detail: str = "normal", user_prompt: s
         digest = f"{head}{sep}\n[Older digest content trimmed]\n{tail[-tail_budget:].lstrip()}"
 
     return {
-        "digest": digest,
+        "source_pack": digest,
         "source_session": public_session(source),
         "event_count": len(events),
         "file_count": len(files),
         "detail": str(detail or "normal").strip().lower() or "normal",
+    }
+
+
+def handoff_target_context(target_session_id: str | None) -> str:
+    if not target_session_id:
+        return "- Target chat: not selected"
+    target = STORE.sessions.get(target_session_id)
+    if not target:
+        return f"- Target chat: {target_session_id} (not found)"
+    provider_id = session_provider_id(target)
+    lines = [
+        f"- Target title: {target.get('title') or 'Untitled'}",
+        f"- Target ZenithDock session: {target_session_id}",
+        f"- Target backend: {target.get('backend') or DEFAULT_BACKEND}",
+        f"- Target working directory: {target.get('cwd') or DEFAULT_CWD}",
+    ]
+    if target.get("model"):
+        lines.append(f"- Target model: {target['model']}")
+    if target.get("effort"):
+        lines.append(f"- Target effort: {target['effort']}")
+    if provider_id:
+        lines.append(f"- Target provider session/thread: {provider_id}")
+    return "\n".join(lines)
+
+
+def build_handoff_summary_prompt(
+    source_pack: str,
+    *,
+    detail: str,
+    user_prompt: str | None,
+    target_session_id: str | None,
+) -> str:
+    prompt = compact_memory_text(user_prompt or "", 2200)
+    target_context = handoff_target_context(target_session_id)
+    detail_name = str(detail or "normal").strip().lower() or "normal"
+    return f"""\
+You are creating a concise, accurate LLM-summarized handoff digest for another coding/research agent.
+
+This is NOT a chat response to the user. Do not solve the task. Do not ask questions.
+Use the source packet below as evidence and produce a clean Markdown digest that the target agent can use as background context.
+
+Required output:
+- Start with "# ZenithDock Context Digest".
+- Include "## User Prompt For Target Agent" only if the user supplied one.
+- Include "## Executive Summary" with the current state in plain language.
+- Include "## Important Decisions / Facts" for durable conclusions.
+- Include "## Files, Videos, And Artifacts" with exact paths, filenames, IDs, and why they matter.
+- Include "## Active / Pending Work" for running jobs, queued work, blockers, or next checks.
+- Include "## Recommended Next Prompt" with a short instruction the target agent should follow.
+
+Rules:
+- Preserve exact commands, paths, session IDs, job names, URLs, and numeric results when they matter.
+- Do not invent missing facts. If the source packet is unclear, say "Unknown".
+- Prefer a useful summary over a transcript. Collapse repetitive traces aggressively.
+- Keep the digest under {MAX_HANDOFF_DIGEST_CHARS} characters.
+- No emoji or decorative prefixes.
+
+Digest detail level requested: {detail_name}
+
+Target agent context:
+{target_context}
+
+User prompt for target agent:
+{prompt or "None"}
+
+Source packet:
+```markdown
+{source_pack}
+```
+"""
+
+
+def parse_claude_digest_output(stdout: str) -> str:
+    text_parts: list[str] = []
+    final_text = ""
+    for raw in stdout.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+        if event.get("type") == "assistant":
+            for block in event.get("message", {}).get("content", []):
+                if block.get("type") == "text" and block.get("text"):
+                    text_parts.append(clean_assistant_text(block["text"]))
+        elif event.get("type") == "result":
+            error = claude_result_error(event)
+            if error:
+                raise RuntimeError(error)
+            final_text = clean_assistant_text(event.get("result", "") or final_text)
+    return clean_assistant_text(final_text or "\n\n".join(text_parts).strip())
+
+
+async def run_claude_handoff_summarizer(prompt: str, *, model: str | None, effort: str | None) -> str:
+    cmd = [
+        "claude", "-p",
+        "--output-format", "stream-json",
+        "--verbose",
+    ]
+    if model:
+        cmd.extend(["--model", model])
+    if effort:
+        cmd.extend(["--effort", effort])
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=existing_cwd(DEFAULT_CWD),
+        env=runner_env(),
+        limit=PROCESS_STREAM_LIMIT,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(prompt.encode("utf-8")),
+            timeout=HANDOFF_DIGEST_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        await terminate_process_tree(proc, grace=0.5)
+        raise TimeoutError(f"handoff digest LLM timed out after {HANDOFF_DIGEST_TIMEOUT_SECONDS}s")
+    decoded_stdout = stdout.decode("utf-8", "replace")
+    decoded_stderr = stderr.decode("utf-8", "replace").strip()
+    if proc.returncode not in (0, None):
+        raise RuntimeError(decoded_stderr or f"Claude digest summarizer exited {proc.returncode}")
+    digest = parse_claude_digest_output(decoded_stdout)
+    if not digest:
+        raise RuntimeError(decoded_stderr or "Claude digest summarizer returned empty output")
+    return digest
+
+
+def parse_codex_digest_output(stdout: str) -> str:
+    text_parts: list[str] = []
+    for raw in stdout.splitlines():
+        line = raw.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+        if event.get("type") not in ("item.completed", "response.completed"):
+            continue
+        item = event.get("item", {}) or {}
+        if item.get("type") == "agent_message":
+            text = clean_assistant_text(item.get("text") or "")
+            if text:
+                text_parts.append(text)
+    return clean_assistant_text("\n\n".join(text_parts).strip())
+
+
+async def run_codex_handoff_summarizer(prompt: str, *, model: str | None, effort: str | None) -> str:
+    cmd = [CODEX_BIN, "exec", "--json", "--skip-git-repo-check"]
+    if model:
+        cmd.extend(["--model", model])
+    if effort:
+        cmd.extend(["-c", f"model_reasoning_effort={effort}"])
+    cmd.extend(["-c", "model_reasoning_summary=none", prompt])
+    env = runner_env()
+    codex_dir = os.path.dirname(os.path.abspath(CODEX_BIN))
+    if codex_dir and codex_dir not in env.get("PATH", "").split(os.pathsep):
+        env["PATH"] = codex_dir + os.pathsep + env.get("PATH", "")
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=existing_cwd(DEFAULT_CWD),
+        env=env,
+        limit=PROCESS_STREAM_LIMIT,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=HANDOFF_DIGEST_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        await terminate_process_tree(proc, grace=0.5)
+        raise TimeoutError(f"handoff digest LLM timed out after {HANDOFF_DIGEST_TIMEOUT_SECONDS}s")
+    decoded_stdout = stdout.decode("utf-8", "replace")
+    decoded_stderr = stderr.decode("utf-8", "replace").strip()
+    if proc.returncode not in (0, None):
+        raise RuntimeError(decoded_stderr or f"Codex digest summarizer exited {proc.returncode}")
+    digest = parse_codex_digest_output(decoded_stdout)
+    if not digest:
+        raise RuntimeError(decoded_stderr or "Codex digest summarizer returned empty output")
+    return digest
+
+
+async def build_handoff_digest(
+    session_id: str,
+    detail: str = "normal",
+    user_prompt: str | None = None,
+    target_session_id: str | None = None,
+    summarizer_backend: str | None = None,
+    summarizer_model: str | None = None,
+    summarizer_effort: str | None = None,
+) -> dict[str, Any]:
+    source = build_handoff_source_pack(session_id, detail=detail, user_prompt=user_prompt)
+    source_pack = str(source["source_pack"])
+    backend = str(summarizer_backend or HANDOFF_DIGEST_BACKEND or BACKEND_CLAUDE).strip().lower()
+    if backend not in VALID_BACKENDS:
+        backend = HANDOFF_DIGEST_BACKEND
+    model = (summarizer_model if summarizer_model is not None else HANDOFF_DIGEST_MODEL).strip() or None
+    effort = (summarizer_effort if summarizer_effort is not None else HANDOFF_DIGEST_EFFORT).strip() or None
+    prompt = build_handoff_summary_prompt(
+        source_pack,
+        detail=str(source["detail"]),
+        user_prompt=user_prompt,
+        target_session_id=target_session_id,
+    )
+    try:
+        if backend == BACKEND_CODEX:
+            digest = await run_codex_handoff_summarizer(prompt, model=model, effort=effort)
+        else:
+            digest = await run_claude_handoff_summarizer(prompt, model=model, effort=effort)
+    except Exception as exc:
+        logger.warning("handoff digest LLM failed session=%s backend=%s model=%s: %s", session_id, backend, model, exc)
+        raise HTTPException(status_code=502, detail=f"LLM digest failed: {exc}") from exc
+    if len(digest) > MAX_HANDOFF_DIGEST_CHARS:
+        digest = digest[:MAX_HANDOFF_DIGEST_CHARS].rstrip() + "\n\n[Digest trimmed to server limit]"
+    return {
+        "digest": digest,
+        "source_session": source["source_session"],
+        "event_count": source["event_count"],
+        "file_count": source["file_count"],
+        "detail": source["detail"],
+        "summarizer": {
+            "backend": backend,
+            "model": model or "",
+            "effort": effort or "",
+            "mode": "llm",
+        },
     }
 
 
@@ -4124,7 +4367,15 @@ async def import_history(session_id: str, req: ImportHistoryRequest) -> dict[str
 
 @app.post("/api/sessions/{session_id}/digest")
 async def create_handoff_digest(session_id: str, req: HandoffDigestRequest) -> dict[str, Any]:
-    return build_handoff_digest(session_id, detail=req.detail, user_prompt=req.user_prompt)
+    return await build_handoff_digest(
+        session_id,
+        detail=req.detail,
+        user_prompt=req.user_prompt,
+        target_session_id=req.target_session_id,
+        summarizer_backend=req.summarizer_backend,
+        summarizer_model=req.summarizer_model,
+        summarizer_effort=req.summarizer_effort,
+    )
 
 
 @app.patch("/api/sessions/{session_id}")

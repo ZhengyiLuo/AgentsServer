@@ -17,6 +17,8 @@ machine paths.
 - Accepts file uploads and serves generated artifacts, including videos.
 - Supports queued turns, stop requests, chat forking, context digests, and rough
   history import from provider sessions.
+- Creates handoff digests with an actual LLM summarizer; the raw transcript/file
+  pack is only internal source material.
 - Runs recurring/loop jobs per chat with host load/memory guardrails.
 - Provides optional live process and tmux-pane inspection for active work.
 - Discovers available runtime models/efforts from the installed CLI tools when
@@ -233,9 +235,32 @@ Most settings are environment variables:
 | `CLAUDE_PROJECTS_ROOT` | Claude history search root | `~/.claude/projects` |
 | `CODEX_SESSIONS_ROOT` | Codex history search root | `~/.codex/sessions` |
 | `ZENITHBOT_JOB_MAX_ACTIVE_RUNS` | Scheduled-job concurrency cap | `2` |
-| `ZENITHBOT_MAX_ACTIVE_AGENT_RUNS` | Interactive agent concurrency cap | `4` |
+| `ZENITHBOT_MAX_ACTIVE_AGENT_RUNS` | Interactive agent concurrency cap | `10` |
 | `ZENITHBOT_JOB_MIN_AVAILABLE_MEM_MB` | Job launch memory guardrail | `4096` |
 | `ZENITHBOT_MIN_START_AVAILABLE_MEM_MB` | Interactive launch memory guardrail | `2048` |
+| `ZENITHBOT_HANDOFF_DIGEST_BACKEND` | LLM backend for context digests, `claude` or `codex` | `claude` |
+| `ZENITHBOT_HANDOFF_DIGEST_MODEL` | LLM model for context digests | `sonnet` |
+| `ZENITHBOT_HANDOFF_DIGEST_EFFORT` | Optional digest reasoning/effort setting | unset |
+| `ZENITHBOT_HANDOFF_DIGEST_TIMEOUT_SECONDS` | Digest summarizer timeout | `180` |
+| `ZENITHBOT_HANDOFF_DIGEST_CHARS` | Final digest character cap | `56000` |
+
+## Context Digests
+
+`POST /api/sessions/{session_id}/digest` creates a real LLM-summarized handoff
+for another chat. The server first builds a bounded source packet from recent
+events and files, then asks the configured digest backend to summarize it into
+a clean Markdown handoff. If the LLM summarizer fails, the endpoint fails
+visibly instead of returning the raw source packet as if it were a digest.
+
+By default, the digest summarizer uses Claude Sonnet:
+
+```bash
+ZENITHBOT_HANDOFF_DIGEST_BACKEND=claude
+ZENITHBOT_HANDOFF_DIGEST_MODEL=sonnet
+```
+
+You can switch it to Codex or another installed CLI model, but the relevant CLI
+must already be authenticated for the same Unix user that runs the service.
 
 ## Backend CLI Notes
 

@@ -89,7 +89,7 @@ HANDOFF_DIGEST_EFFORT = os.environ.get("ZENITHBOT_HANDOFF_DIGEST_EFFORT", "").st
 DEFAULT_SESSION_EVENT_LIMIT = int(os.environ.get("ZENITHBOT_SESSION_EVENT_LIMIT", "100"))
 MAX_EVENT_RESPONSE_LIMIT = int(os.environ.get("ZENITHBOT_MAX_EVENT_RESPONSE_LIMIT", "1000"))
 AGENT_TOKEN = os.environ.get("ZENITHDOCK_AGENT_TOKEN") or os.environ.get("ZENITHBOT_AGENT_TOKEN") or ""
-API_CONTRACT_VERSION = 3
+API_CONTRACT_VERSION = 4
 SESSION_ORDER_STEP = 1000.0
 
 SYSTEM_PROMPT = """\
@@ -2414,6 +2414,7 @@ def read_events(
     limit: int = 500,
     *,
     tail: bool = False,
+    visible: bool = False,
 ) -> list[dict[str, Any]]:
     path = events_path(session_id)
     if not path.exists():
@@ -2431,6 +2432,8 @@ def read_events(
         seq = int(event.get("seq", 0))
         if seq > after and (before is None or seq < before):
             event = client_safe_event(event)
+            if visible and not is_visible_timeline_event(event):
+                continue
             if tail_out is not None:
                 tail_out.append(event)
             else:
@@ -2438,6 +2441,56 @@ def read_events(
         if tail_out is None and len(out) >= limit:
             break
     return list(tail_out) if tail_out is not None else out
+
+
+def is_visible_timeline_event(event: dict[str, Any]) -> bool:
+    return str(event.get("type") or "") != "raw_event"
+
+
+def read_visible_events_page(
+    session_id: str,
+    after: int = 0,
+    before: int | None = None,
+    limit: int = 500,
+    *,
+    tail: bool = False,
+) -> tuple[list[dict[str, Any]], int, int, int, int]:
+    path = events_path(session_id)
+    if not path.exists():
+        return [], 0, 0, 0, 0
+    limit = max(1, min(int(limit or 500), MAX_EVENT_RESPONSE_LIMIT))
+    out: list[dict[str, Any]] = []
+    tail_out: deque[dict[str, Any]] | None = deque(maxlen=limit) if tail else None
+    latest_seq = 0
+    visible_count = 0
+    for line in path.open("r", encoding="utf-8", errors="ignore"):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+        seq = int(event.get("seq", 0))
+        if seq > 0:
+            latest_seq = seq
+        if seq <= after or (before is not None and seq >= before):
+            continue
+        event = client_safe_event(event)
+        if not is_visible_timeline_event(event):
+            continue
+        visible_count += 1
+        if tail_out is not None:
+            tail_out.append(event)
+        elif len(out) < limit:
+            out.append(event)
+    events = list(tail_out) if tail_out is not None else out
+    if tail:
+        omitted_before = max(0, visible_count - len(events))
+        omitted_after = 0
+    else:
+        omitted_before = 0
+        omitted_after = max(0, visible_count - len(events))
+    return events, latest_seq, visible_count, omitted_before, omitted_after
 
 
 def event_seq_bounds(session_id: str) -> tuple[int, int, int]:
@@ -4781,23 +4834,39 @@ async def get_session(
     before: int | None = None,
     limit: int = DEFAULT_SESSION_EVENT_LIMIT,
     tail: bool = True,
+    visible: bool = False,
 ) -> dict[str, Any]:
     sess = STORE.sessions.get(session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="session not found")
-    events = read_events(session_id, after=after, before=before, limit=limit, tail=tail and after <= 0)
-    if after > 0 and before is None:
+    page_tail = tail and after <= 0
+    if visible:
+        events, latest_seq, event_count, omitted_before, omitted_after = read_visible_events_page(
+            session_id,
+            after=after,
+            before=before,
+            limit=limit,
+            tail=page_tail,
+        )
+    elif after > 0 and before is None:
+        events = read_events(session_id, after=after, before=before, limit=limit, tail=page_tail)
         _, latest_seq, event_count = event_seq_bounds(session_id)
+        omitted_before = 0
+        if events:
+            omitted_after = max(0, latest_seq - int(events[-1].get("seq", 0)))
+        else:
+            omitted_after = max(0, latest_seq - after)
     else:
+        events = read_events(session_id, after=after, before=before, limit=limit, tail=page_tail)
         latest_seq = int(events[-1].get("seq", 0)) if events else 0
         event_count = 0
-    omitted_before = max(0, int(events[0].get("seq", 1)) - 1) if tail and after <= 0 and events else 0
-    if events:
-        omitted_after = max(0, latest_seq - int(events[-1].get("seq", 0)))
-    elif after > 0:
-        omitted_after = max(0, latest_seq - after)
-    else:
-        omitted_after = 0
+        omitted_before = max(0, int(events[0].get("seq", 1)) - 1) if page_tail and events else 0
+        if events:
+            omitted_after = max(0, latest_seq - int(events[-1].get("seq", 0)))
+        elif after > 0:
+            omitted_after = max(0, latest_seq - after)
+        else:
+            omitted_after = 0
     return {
         "session": public_session(sess),
         "events": events,

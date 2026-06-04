@@ -1182,6 +1182,39 @@ def queue_positions(queue: deque[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def public_queued_turn(session_id: str, item: dict[str, Any], position: int) -> dict[str, Any]:
+    return {
+        "queued_id": str(item.get("queued_id") or ""),
+        "session_id": session_id,
+        "prompt": str(item.get("display_prompt") or item.get("prompt") or ""),
+        "file_ids": list(item.get("file_ids") or []),
+        "backend": item.get("backend"),
+        "model": item.get("model"),
+        "effort": item.get("effort"),
+        "display_prompt": item.get("display_prompt"),
+        "purpose": item.get("purpose"),
+        "digest_job_id": item.get("digest_job_id"),
+        "target_session_id": item.get("target_session_id"),
+        "created_at": item.get("created_at"),
+        "position": position,
+    }
+
+
+async def queued_turns_snapshot(session_id: str) -> list[dict[str, Any]]:
+    async with QUEUE_LOCK:
+        queue = list(QUEUED_TURNS.get(session_id) or [])
+        run_now = RUN_NOW_TURNS.get(session_id)
+    items: list[dict[str, Any]] = []
+    if run_now is not None:
+        items.append(run_now)
+    items.extend(queue)
+    return [
+        public_queued_turn(session_id, item, idx + 1)
+        for idx, item in enumerate(items)
+        if str(item.get("queued_id") or "").strip()
+    ]
+
+
 async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedTurnRequest) -> dict[str, Any]:
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
@@ -1354,6 +1387,15 @@ async def start_next_queued_turn(session_id: str) -> None:
 
 def schedule_next_queued_turn(session_id: str) -> None:
     asyncio.create_task(start_next_queued_turn(session_id))
+
+
+def schedule_rebuilt_queued_turns() -> int:
+    scheduled = 0
+    for session_id, queue in list(QUEUED_TURNS.items()):
+        if queue:
+            schedule_next_queued_turn(session_id)
+            scheduled += 1
+    return scheduled
 
 
 def should_schedule_queue_after_finish(session_id: str, stopped: bool) -> bool:
@@ -4187,6 +4229,40 @@ async def watch_manifest_artifacts(session_id: str, run_id: str, manifest_path: 
         await asyncio.sleep(1.0)
 
 
+async def collect_recent_leftover_manifests(
+    session_id: str,
+    run_id: str,
+    primary_manifest_path: Path,
+    *,
+    seen_artifacts: set[str],
+    max_age_seconds: int = 6 * 60 * 60,
+) -> None:
+    """Recover artifacts when an agent writes to a stale run manifest path."""
+    root = manifests_dir(session_id)
+    if not root.exists():
+        return
+    cutoff = time.time() - max_age_seconds
+    try:
+        candidates = sorted(root.glob("*.json"), key=lambda path: path.stat().st_mtime)
+    except OSError:
+        return
+    for candidate in candidates:
+        if candidate == primary_manifest_path:
+            continue
+        try:
+            if candidate.stat().st_mtime < cutoff:
+                continue
+        except OSError:
+            continue
+        logger.info(
+            "collecting leftover manifest session=%s run=%s path=%s",
+            session_id,
+            run_id,
+            candidate,
+        )
+        await collect_manifest(session_id, run_id, candidate, seen_artifacts=seen_artifacts, final=True)
+
+
 async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, Any], manifest_path: Path) -> None:
     cmd = build_claude_cmd(sess, manifest_path)
     requested_cwd = str(sess.get("cwd") or DEFAULT_CWD)
@@ -4348,6 +4424,7 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
         await append_event(session_id, "provider_session", {"run_id": run_id, "backend": BACKEND_CLAUDE, "provider_session_id": provider_id})
     result_text = clean_assistant_text(final_text or "\n\n".join(text_parts).strip())
     await collect_manifest(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts, final=True)
+    await collect_recent_leftover_manifests(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts)
     await append_event(session_id, "turn_finished", {
         "run_id": run_id,
         "backend": BACKEND_CLAUDE,
@@ -4535,6 +4612,7 @@ async def run_codex(session_id: str, run_id: str, prompt: str, sess: dict[str, A
     if provider_id:
         await STORE.save_provider_session(session_id, provider_id, BACKEND_CODEX)
     await collect_manifest(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts, final=True)
+    await collect_recent_leftover_manifests(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts)
     await append_event(session_id, "turn_finished", {
         "run_id": run_id,
         "backend": BACKEND_CODEX,
@@ -4667,8 +4745,9 @@ async def lifespan(app: FastAPI):
     ensure_dirs()
     rebuilt_queue_count = rebuild_queued_turns_from_events()
     JOBS.start_scheduler()
+    scheduled_queue_drains = schedule_rebuilt_queued_turns()
     host_monitor_task = asyncio.create_task(host_monitor_loop())
-    logger.info("agent server ready state=%s sessions=%d jobs=%d queued=%d", STATE_DIR, len(STORE.sessions), len(JOBS.jobs), rebuilt_queue_count)
+    logger.info("agent server ready state=%s sessions=%d jobs=%d queued=%d queue_drains=%d", STATE_DIR, len(STORE.sessions), len(JOBS.jobs), rebuilt_queue_count, scheduled_queue_drains)
     try:
         yield
     finally:
@@ -4870,6 +4949,7 @@ async def get_session(
     return {
         "session": public_session(sess),
         "events": events,
+        "queued_turns": await queued_turns_snapshot(session_id),
         "events_omitted_before": omitted_before,
         "events_omitted_after": omitted_after,
         "latest_seq": latest_seq,

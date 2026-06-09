@@ -3946,7 +3946,80 @@ def codex_result_error(event: dict[str, Any]) -> str | None:
         return concise_error_message(event.get("message") or event.get("error") or event)
     if event_type == "turn.failed":
         return concise_error_message(event.get("error") or event.get("message") or event)
+    if event_type == "event_msg":
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        payload_type = str(payload.get("type") or "")
+        if payload_type in {"error", "turn_failed"}:
+            return concise_error_message(payload.get("message") or payload.get("error") or payload)
     return None
+
+
+def parse_codex_call_arguments(value: Any) -> Any:
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        with suppress(Exception):
+            return json.loads(text)
+        return text
+    return value if value is not None else {}
+
+
+def codex_call_tool(call_id: str, name: str, arguments: Any) -> dict[str, Any]:
+    parsed = parse_codex_call_arguments(arguments)
+    tool_name = str(name or "tool")
+    tool_input: Any = parsed
+    if tool_name == "exec_command" and isinstance(parsed, dict):
+        command = str(parsed.get("cmd") or parsed.get("command") or "")
+        tool_input = {"command": command}
+        if parsed.get("workdir"):
+            tool_input["workdir"] = parsed["workdir"]
+    elif tool_name == "apply_patch" and isinstance(parsed, str):
+        tool_input = {"patch": parsed}
+    elif tool_name == "apply_patch" and isinstance(parsed, dict) and "input" in parsed:
+        tool_input = {"patch": parsed.get("input")}
+    return {
+        "id": call_id or f"tool_{uuid.uuid4().hex[:8]}",
+        "name": "Bash" if tool_name == "exec_command" else tool_name,
+        "input": tool_input if isinstance(tool_input, dict) else {"value": tool_input},
+    }
+
+
+def codex_output_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    with suppress(Exception):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return str(value)
+
+
+def codex_output_exit_code(text: str) -> int | None:
+    for pattern in (r"Process exited with code (-?\d+)", r"Exit code:\s*(-?\d+)"):
+        match = re.search(pattern, text)
+        if match:
+            with suppress(Exception):
+                return int(match.group(1))
+    return None
+
+
+def codex_reasoning_text(payload: dict[str, Any]) -> str:
+    text = str(payload.get("text") or "").strip()
+    if text:
+        return text
+    summary = payload.get("summary")
+    if isinstance(summary, list):
+        parts: list[str] = []
+        for item in summary:
+            if isinstance(item, dict):
+                part = str(item.get("text") or item.get("summary_text") or "").strip()
+                if part:
+                    parts.append(part)
+            elif isinstance(item, str) and item.strip():
+                parts.append(item.strip())
+        return "\n".join(parts).strip()
+    return ""
 
 
 async def codex_app_server_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -4501,20 +4574,192 @@ async def run_codex(session_id: str, run_id: str, prompt: str, sess: dict[str, A
         await terminate_process_tree(proc)
 
     text_parts: list[str] = []
-    provider_id: str | None = None
+    provider_id: str | None = sess.get("codex_thread_id") or (
+        sess.get("session_id") if sess.get("backend") == BACKEND_CODEX else None
+    )
     last_event = time.time()
     idle_killed = False
     stream_error: str | None = None
     codex_error: str | None = None
     codex_error_emitted = False
     seen_artifacts: set[str] = set()
+    seen_raw_lines: set[str] = set()
+    seen_text_parts: set[str] = set()
+    seen_reasoning: set[str] = set()
+    tool_calls: dict[str, dict[str, Any]] = {}
+    started_tool_ids: set[str] = set()
+    finished_tool_ids: set[str] = set()
+    codex_history_path = find_codex_history(provider_id) if provider_id else None
+    codex_history_pos = codex_history_path.stat().st_size if codex_history_path and codex_history_path.exists() else 0
     manifest_watch_task = asyncio.create_task(watch_manifest_artifacts(session_id, run_id, manifest_path, seen_artifacts))
+
+    async def emit_provider_session(new_provider_id: str) -> None:
+        nonlocal provider_id, codex_history_path, codex_history_pos
+        if not new_provider_id:
+            return
+        provider_id = new_provider_id
+        await STORE.save_provider_session(session_id, provider_id, BACKEND_CODEX)
+        await append_event(session_id, "provider_session", {"run_id": run_id, "backend": BACKEND_CODEX, "provider_session_id": provider_id})
+        if not codex_history_path:
+            codex_history_path = find_codex_history(provider_id)
+            codex_history_pos = codex_history_path.stat().st_size if codex_history_path and codex_history_path.exists() else 0
+
+    async def emit_assistant_text(text: str) -> None:
+        text = clean_assistant_text(text)
+        if not text or text in seen_text_parts:
+            return
+        seen_text_parts.add(text)
+        text_parts.append(text)
+        await append_event(session_id, "assistant_text", {"run_id": run_id, "text": text, **run_event_metadata(run_id)})
+
+    async def emit_reasoning_text(text: str) -> None:
+        text = str(text or "").strip()
+        if not text or text in seen_reasoning:
+            return
+        seen_reasoning.add(text)
+        await append_event(session_id, "reasoning_summary", {"run_id": run_id, "text": text})
+
+    async def emit_tool_started(tool: dict[str, Any]) -> None:
+        tool_id = str(tool.get("id") or f"tool_{uuid.uuid4().hex[:8]}")
+        tool["id"] = tool_id
+        tool_calls[tool_id] = tool
+        if tool_id in started_tool_ids:
+            return
+        started_tool_ids.add(tool_id)
+        await append_event(session_id, "tool_started", {"run_id": run_id, "tool": tool})
+
+    async def emit_tool_finished(tool_id: str, output: Any, exit_code: int | None = None) -> None:
+        tool_id = str(tool_id or f"tool_{uuid.uuid4().hex[:8]}")
+        if tool_id in finished_tool_ids:
+            return
+        finished_tool_ids.add(tool_id)
+        output_text = codex_output_text(output)
+        tool = tool_calls.get(tool_id) or {"id": tool_id, "name": "Tool", "input": {}}
+        if exit_code is None:
+            exit_code = codex_output_exit_code(output_text)
+        await append_event(session_id, "tool_finished", {
+            "run_id": run_id,
+            "tool_id": tool_id,
+            "tool": tool,
+            "output": output_text,
+            "exit_code": exit_code,
+        })
+
+    async def handle_codex_event(event: dict[str, Any]) -> bool:
+        handled = False
+        etype = str(event.get("type") or "")
+        result_error = codex_result_error(event)
+        if result_error:
+            nonlocal codex_error, codex_error_emitted
+            codex_error = result_error
+            if not codex_error_emitted:
+                await append_event(session_id, "error", {
+                    "run_id": run_id,
+                    "backend": BACKEND_CODEX,
+                    "message": result_error,
+                    **run_event_metadata(run_id),
+                })
+                codex_error_emitted = True
+            return True
+        if etype == "thread.started" and event.get("thread_id"):
+            await emit_provider_session(str(event["thread_id"]))
+            return True
+        if etype in ("item.started", "item.completed"):
+            item = event.get("item", {}) or {}
+            itype = item.get("type", "")
+            if itype == "command_execution":
+                tool = {
+                    "id": item.get("id") or f"cmd_{uuid.uuid4().hex[:8]}",
+                    "name": "Bash",
+                    "input": {"command": item.get("command", "")},
+                }
+                if etype == "item.started":
+                    await emit_tool_started(tool)
+                else:
+                    await emit_tool_finished(str(tool["id"]), item.get("aggregated_output", ""), item.get("exit_code"))
+                handled = True
+            elif itype == "agent_message" and etype == "item.completed":
+                await emit_assistant_text(str(item.get("text") or ""))
+                handled = True
+            elif itype in ("reasoning", "agent_reasoning") and etype == "item.completed":
+                await emit_reasoning_text(codex_reasoning_text(item))
+                handled = True
+            return handled
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        if etype == "event_msg":
+            payload_type = str(payload.get("type") or "")
+            if payload_type == "agent_message":
+                await emit_assistant_text(str(payload.get("message") or ""))
+                return True
+            if payload_type == "agent_reasoning":
+                await emit_reasoning_text(str(payload.get("text") or ""))
+                return True
+            return False
+        if etype == "response_item":
+            payload_type = str(payload.get("type") or "")
+            if payload_type == "message" and payload.get("role") == "assistant":
+                await emit_assistant_text(text_from_content(payload.get("content")))
+                return True
+            if payload_type in {"function_call", "custom_tool_call"}:
+                call_id = str(payload.get("call_id") or payload.get("id") or f"tool_{uuid.uuid4().hex[:8]}")
+                arguments = payload.get("arguments") if "arguments" in payload else payload.get("input")
+                await emit_tool_started(codex_call_tool(call_id, str(payload.get("name") or "tool"), arguments))
+                return True
+            if payload_type in {"function_call_output", "custom_tool_call_output"}:
+                await emit_tool_finished(str(payload.get("call_id") or payload.get("id") or ""), payload.get("output"))
+                return True
+            if payload_type in {"reasoning", "agent_reasoning"}:
+                await emit_reasoning_text(codex_reasoning_text(payload))
+                return True
+        return False
+
+    async def handle_codex_line(line: str, *, record_raw: bool) -> bool:
+        line = line.strip()
+        if not line or not line.startswith("{") or line in seen_raw_lines:
+            return False
+        seen_raw_lines.add(line)
+        if record_raw:
+            await append_event(session_id, "raw_event", {"run_id": run_id, "backend": BACKEND_CODEX, "raw": line})
+        try:
+            event = json.loads(line)
+        except Exception:
+            return False
+        return await handle_codex_event(event)
+
+    async def drain_codex_history() -> bool:
+        nonlocal codex_history_path, codex_history_pos
+        if not codex_history_path and provider_id:
+            codex_history_path = find_codex_history(provider_id)
+            codex_history_pos = codex_history_path.stat().st_size if codex_history_path and codex_history_path.exists() else 0
+        if not codex_history_path or not codex_history_path.exists():
+            return False
+        try:
+            size = codex_history_path.stat().st_size
+            if size < codex_history_pos:
+                codex_history_pos = 0
+            if size <= codex_history_pos:
+                return False
+            with codex_history_path.open("r", encoding="utf-8", errors="ignore") as f:
+                f.seek(codex_history_pos)
+                lines = f.readlines()
+                codex_history_pos = f.tell()
+        except OSError:
+            return False
+        consumed = False
+        for history_line in lines:
+            if await handle_codex_line(history_line, record_raw=False):
+                consumed = True
+            elif history_line.strip():
+                consumed = True
+        return consumed
 
     try:
         while True:
             try:
                 raw = await asyncio.wait_for(proc.stdout.readline(), timeout=5)  # type: ignore[union-attr]
             except asyncio.TimeoutError:
+                if await drain_codex_history():
+                    last_event = time.time()
                 idle = time.time() - last_event
                 if idle >= IDLE_WARN_SECONDS:
                     await append_event(session_id, "idle_warning", {"run_id": run_id, "idle_seconds": int(idle)})
@@ -4529,65 +4774,16 @@ async def run_codex(session_id: str, run_id: str, prompt: str, sess: dict[str, A
             decoded = raw.decode("utf-8", "replace").rstrip("\r\n")
             await append_active_stdout(session_id, decoded)
             line = decoded.strip()
-            if not line or not line.startswith("{"):
-                continue
-            await append_event(session_id, "raw_event", {"run_id": run_id, "backend": BACKEND_CODEX, "raw": line})
-            try:
-                event = json.loads(line)
-            except Exception:
-                continue
-            etype = event.get("type", "")
-            result_error = codex_result_error(event)
-            if result_error:
-                codex_error = result_error
-                if not codex_error_emitted:
-                    await append_event(session_id, "error", {
-                        "run_id": run_id,
-                        "backend": BACKEND_CODEX,
-                        "message": result_error,
-                        **run_event_metadata(run_id),
-                    })
-                    codex_error_emitted = True
-                continue
-            if etype == "thread.started" and event.get("thread_id"):
-                provider_id = event["thread_id"]
-                await STORE.save_provider_session(session_id, provider_id, BACKEND_CODEX)
-                await append_event(session_id, "provider_session", {"run_id": run_id, "backend": BACKEND_CODEX, "provider_session_id": provider_id})
-                continue
-            if etype in ("item.started", "item.completed"):
-                item = event.get("item", {}) or {}
-                itype = item.get("type", "")
-                if itype == "command_execution":
-                    tool = {
-                        "id": item.get("id") or f"cmd_{uuid.uuid4().hex[:8]}",
-                        "name": "Bash",
-                        "input": {"command": item.get("command", "")},
-                    }
-                    if etype == "item.started":
-                        await append_event(session_id, "tool_started", {"run_id": run_id, "tool": tool})
-                    else:
-                        await append_event(session_id, "tool_finished", {
-                            "run_id": run_id,
-                            "tool_id": tool["id"],
-                            "tool": tool,
-                            "output": item.get("aggregated_output", ""),
-                            "exit_code": item.get("exit_code"),
-                        })
-                elif itype == "agent_message" and etype == "item.completed":
-                    text = clean_assistant_text(item.get("text") or "")
-                    if text:
-                        text_parts.append(text)
-                        await append_event(session_id, "assistant_text", {"run_id": run_id, "text": text, **run_event_metadata(run_id)})
-                elif itype in ("reasoning", "agent_reasoning") and etype == "item.completed":
-                    text = (item.get("text") or "").strip()
-                    if not text and isinstance(item.get("summary"), list):
-                        text = "\n".join(x.get("text", "") for x in item["summary"] if isinstance(x, dict)).strip()
-                    if text:
-                        await append_event(session_id, "reasoning_summary", {"run_id": run_id, "text": text})
+            if line.startswith("{"):
+                await handle_codex_line(line, record_raw=True)
+            if await drain_codex_history():
+                last_event = time.time()
     except Exception as e:
         stream_error = f"{type(e).__name__}: {e}"
         logger.exception("Codex run failed session=%s run=%s", session_id, run_id)
     finally:
+        with suppress(Exception):
+            await drain_codex_history()
         manifest_watch_task.cancel()
         with suppress(asyncio.CancelledError):
             await manifest_watch_task

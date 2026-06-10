@@ -740,7 +740,7 @@ class SessionStore:
             await forget_event_seq(sid)
         return existed is not None
 
-    async def save_provider_session(self, sid: str, provider_id: str, backend: str) -> None:
+    async def save_provider_session(self, sid: str, provider_id: str, backend: str, *, cwd: str | None = None) -> None:
         async with self._lock:
             sess = self.sessions.get(sid)
             if not sess:
@@ -748,6 +748,8 @@ class SessionStore:
             sess["session_id"] = provider_id
             sess["backend"] = sess.get("backend") or backend
             sess["claude_session_id" if backend == BACKEND_CLAUDE else "codex_thread_id"] = provider_id
+            if backend == BACKEND_CLAUDE and cwd:
+                sess["claude_session_cwd"] = cwd
             if backend == BACKEND_CLAUDE and sess.get("fork_from") and provider_id != sess.get("fork_from"):
                 sess["fork_from"] = None
             sess["updated_at"] = now_iso()
@@ -3258,6 +3260,46 @@ def find_claude_history(provider_id: str) -> Path | None:
     return max(matches, key=lambda p: p.stat().st_mtime)
 
 
+def claude_project_dir_for_cwd(cwd: str) -> Path:
+    # Claude Code stores transcript JSONL files under a cwd-derived project name.
+    project_name = str(Path(cwd).expanduser()).replace("/", "-")
+    return CLAUDE_PROJECTS_ROOT / project_name
+
+
+def claude_resume_file_for_cwd(provider_id: str, cwd: str) -> Path:
+    return claude_project_dir_for_cwd(cwd) / f"{provider_id}.jsonl"
+
+
+def claude_provider_id_for_session(sess: dict[str, Any]) -> str | None:
+    provider_id = sess.get("claude_session_id") or (
+        sess.get("session_id") if sess.get("backend") == BACKEND_CLAUDE else None
+    )
+    if sess.get("fork_from"):
+        provider_id = sess["fork_from"]
+    provider_id = str(provider_id or "").strip()
+    return provider_id or None
+
+
+def resolve_claude_resume_provider(sess: dict[str, Any], cwd: str) -> tuple[str | None, str | None]:
+    provider_id = claude_provider_id_for_session(sess)
+    if not provider_id:
+        return None, None
+
+    saved_cwd = str(sess.get("claude_session_cwd") or "").strip()
+    if saved_cwd and str(Path(saved_cwd).expanduser()) != str(Path(cwd).expanduser()):
+        return None, f"Claude resume skipped: provider session {provider_id} was created in {saved_cwd}, not {cwd}."
+
+    expected = claude_resume_file_for_cwd(provider_id, cwd)
+    if expected.exists():
+        return provider_id, None
+
+    found_elsewhere = find_claude_history(provider_id)
+    if found_elsewhere:
+        return None, f"Claude resume skipped: provider session {provider_id} is not available for cwd {cwd}."
+
+    return None, f"Claude resume skipped: provider session {provider_id} has no local transcript for cwd {cwd}."
+
+
 def find_codex_history(provider_id: str) -> Path | None:
     direct = path_if_jsonl(provider_id)
     if direct:
@@ -3851,7 +3893,7 @@ def discover_runtime_catalog() -> dict[str, Any]:
     }
 
 
-def build_claude_cmd(sess: dict[str, Any], manifest_path: Path) -> list[str]:
+def build_claude_cmd(sess: dict[str, Any], manifest_path: Path, *, provider_id: str | None = None) -> list[str]:
     cmd = [
         "claude", "-p",
         "--output-format", "stream-json",
@@ -3864,16 +3906,11 @@ def build_claude_cmd(sess: dict[str, Any], manifest_path: Path) -> list[str]:
         cmd.extend(["--model", str(sess["model"])])
     if sess.get("effort"):
         cmd.extend(["--effort", str(sess["effort"])])
-    provider_id = sess.get("claude_session_id") or (
-        sess.get("session_id") if sess.get("backend") == BACKEND_CLAUDE else None
-    )
-    if sess.get("fork_from"):
-        provider_id = sess["fork_from"]
     if provider_id:
         cmd.extend(["--resume", provider_id])
-    if sess.get("fork_from"):
-        cmd.append("--fork-session")
-        cmd.extend(["--name", f"Fork: {sess.get('title') or sess['id']}"])
+        if sess.get("fork_from"):
+            cmd.append("--fork-session")
+            cmd.extend(["--name", f"Fork: {sess.get('title') or sess['id']}"])
     return cmd
 
 
@@ -4337,11 +4374,20 @@ async def collect_recent_leftover_manifests(
 
 
 async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, Any], manifest_path: Path) -> None:
-    cmd = build_claude_cmd(sess, manifest_path)
     requested_cwd = str(sess.get("cwd") or DEFAULT_CWD)
     cwd = existing_cwd(requested_cwd)
+    resume_provider_id, resume_skip_message = resolve_claude_resume_provider(sess, cwd)
+    cmd = build_claude_cmd(sess, manifest_path, provider_id=resume_provider_id)
     if str(Path(requested_cwd).expanduser()) != cwd:
         await append_event(session_id, "cwd_fallback", {"run_id": run_id, "requested_cwd": requested_cwd, "cwd": cwd})
+    if resume_skip_message:
+        await append_event(session_id, "cwd_fallback", {
+            "run_id": run_id,
+            "requested_cwd": requested_cwd,
+            "cwd": cwd,
+            "provider_session_id": claude_provider_id_for_session(sess),
+            "message": resume_skip_message,
+        })
     await append_event(session_id, "process_started", {"run_id": run_id, "backend": BACKEND_CLAUDE, "argv": cmd, "cwd": cwd})
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -4493,7 +4539,7 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
     if not stopped and proc.returncode not in (0, None) and stderr:
         await append_event(session_id, "error", {"run_id": run_id, "message": stderr[:4000], "exit_code": proc.returncode, **run_event_metadata(run_id)})
     if provider_id and not result_error:
-        await STORE.save_provider_session(session_id, provider_id, BACKEND_CLAUDE)
+        await STORE.save_provider_session(session_id, provider_id, BACKEND_CLAUDE, cwd=cwd)
         await append_event(session_id, "provider_session", {"run_id": run_id, "backend": BACKEND_CLAUDE, "provider_session_id": provider_id})
     result_text = clean_assistant_text(final_text or "\n\n".join(text_parts).strip())
     await collect_manifest(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts, final=True)

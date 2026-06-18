@@ -119,6 +119,19 @@ Tool and inspection errors:
   destructive, removes/overwrites unrelated work, requires missing
   credentials/approval, or the user explicitly asked only for diagnosis.
 
+Skills and environment playbooks:
+- Before saying cluster paths such as `/mnt/amlfs-07` are unavailable, check the
+  available local skills, memories, and playbooks for matching instructions.
+  Look first under `~/.codex/skills`, `~/.claude/skills`, `~/.claude/agents`,
+  project `AGENTS.md`/`CLAUDE.md`, and relevant `~/.claude/projects/.../memory`
+  notes.
+- For AMLFS/OSMO access, prefer the installed OSMO/SONIC skills and memories
+  such as `osmo`, `osmo-exec`, `sonic`, `ssh-portforward`, and
+  `reference-osmo-amlfs-ssh`. Follow those instructions before substituting
+  local data or claiming the mount cannot be reached.
+- If the needed skill/playbook is missing, blocked, or fails, say exactly what
+  you checked and what blocked you.
+
 Turn lifecycle and background work:
 - This is not a persistent live chat process. Your Claude process ends when the
   current turn finishes.
@@ -180,6 +193,19 @@ Tool and inspection errors:
   change, or identify a real blocker. Stop only if retrying would be
   destructive, removes/overwrites unrelated work, requires missing
   credentials/approval, or the user explicitly asked only for diagnosis.
+
+Skills and environment playbooks:
+- Before saying cluster paths such as `/mnt/amlfs-07` are unavailable, check the
+  available local skills, memories, and playbooks for matching instructions.
+  Look first under `~/.codex/skills`, `~/.claude/skills`, `~/.claude/agents`,
+  project `AGENTS.md`/`CLAUDE.md`, and relevant `~/.claude/projects/.../memory`
+  notes.
+- For AMLFS/OSMO access, prefer the installed OSMO/SONIC skills and memories
+  such as `osmo`, `osmo-exec`, `sonic`, `ssh-portforward`, and
+  `reference-osmo-amlfs-ssh`. Follow those instructions before substituting
+  local data or claiming the mount cannot be reached.
+- If the needed skill/playbook is missing, blocked, or fails, say exactly what
+  you checked and what blocked you.
 
 This is Zenith Dock, not Slack. Do not call Slack upload APIs or Slack file
 helpers. Create files locally on the agent host and publish them through the manifest.

@@ -58,6 +58,11 @@ HOST_HEALTH_FILE = STATE_DIR / "host_health.jsonl"
 CLAUDE_PROJECTS_ROOT = Path(os.environ.get("CLAUDE_PROJECTS_ROOT", Path.home() / ".claude" / "projects"))
 CODEX_SESSIONS_ROOT = Path(os.environ.get("CODEX_SESSIONS_ROOT", Path.home() / ".codex" / "sessions"))
 CODEX_BIN = os.environ.get("CODEX_BIN", "codex")
+CODEX_DEFAULT_MODEL = os.environ.get("ZENITHBOT_CODEX_MODEL", "gpt-5.5").strip() or "gpt-5.5"
+_configured_codex_effort = os.environ.get("ZENITHBOT_CODEX_EFFORT", "xhigh").strip().lower() or "xhigh"
+CODEX_DEFAULT_EFFORT = CODEX_EFFORT_ALIASES.get(_configured_codex_effort, _configured_codex_effort)
+if CODEX_DEFAULT_EFFORT not in CODEX_EFFORTS:
+    CODEX_DEFAULT_EFFORT = "xhigh"
 DEFAULT_CWD = os.environ.get("ZENITHBOT_AGENT_CWD", str(Path.home()))
 DEFAULT_BACKEND = os.environ.get("ZENITHBOT_BACKEND", BACKEND_CLAUDE).lower()
 if DEFAULT_BACKEND not in VALID_BACKENDS:
@@ -3834,7 +3839,7 @@ def session_backend_locked(sess: dict[str, Any]) -> bool:
 def discovered_codex_default_model(models: list[dict[str, Any]]) -> dict[str, Any] | None:
     for model in models:
         slug = str(model.get("slug") or model.get("id") or "").strip()
-        if slug == "gpt-5.5":
+        if slug == CODEX_DEFAULT_MODEL:
             return model
     for model in models:
         slug = str(model.get("slug") or model.get("id") or "").strip()
@@ -3874,9 +3879,9 @@ def discover_codex_catalog() -> dict[str, Any]:
         default_model_label = str(default_entry.get("display_name") or title_model_label(default_model)).strip()
         default_effort = str(default_entry.get("default_reasoning_level") or "").strip()
         default_effort_label = title_effort_label(default_effort) if default_effort else ""
-    if default_model == "gpt-5.5" and default_effort == "medium":
-        default_effort = "xhigh"
-        default_effort_label = "XHigh"
+    if default_model == CODEX_DEFAULT_MODEL:
+        default_effort = CODEX_DEFAULT_EFFORT
+        default_effort_label = title_effort_label(default_effort)
     for model in visible_models:
         slug = str(model.get("slug") or model.get("id") or "").strip()
         if not slug:
@@ -4014,14 +4019,20 @@ def build_codex_cmd(sess: dict[str, Any], prompt: str, manifest_path: Path) -> l
         sess.get("session_id") if sess.get("backend") == BACKEND_CODEX else None
     )
     full_prompt = CODEX_PROMPT_PRELUDE.format(manifest_path=str(manifest_path)) + prompt
+    model = str(sess.get("model") or CODEX_DEFAULT_MODEL).strip()
+    normalized_effort = normalize_runtime_effort(
+        BACKEND_CODEX,
+        sess.get("effort") or CODEX_DEFAULT_EFFORT,
+    )
     cmd = [CODEX_BIN, "exec"]
-    if sess.get("model"):
-        cmd.extend(["--model", str(sess["model"])])
-    normalized_effort = normalize_runtime_effort(BACKEND_CODEX, sess.get("effort"))
+    if provider_id:
+        cmd.append("resume")
+    if model:
+        cmd.extend(["--model", model])
     if normalized_effort:
         cmd.extend(["-c", f"model_reasoning_effort={normalized_effort}"])
     if provider_id:
-        cmd.extend(["resume", provider_id])
+        cmd.append(str(provider_id))
     cmd.append("--json")
     cmd.extend(["-c", "model_reasoning_summary=detailed"])
     cmd.extend(["--disable", "image_generation"])
@@ -4073,10 +4084,15 @@ def concise_error_message(value: Any) -> str:
     return str(value)
 
 
+def is_codex_reconnect_notice(message: str) -> bool:
+    return bool(re.match(r"^Reconnecting\.\.\.\s+\d+/\d+\b", str(message or "").strip(), re.IGNORECASE))
+
+
 def codex_result_error(event: dict[str, Any]) -> str | None:
     event_type = str(event.get("type") or "")
     if event_type == "error":
-        return concise_error_message(event.get("message") or event.get("error") or event)
+        message = concise_error_message(event.get("message") or event.get("error") or event)
+        return None if is_codex_reconnect_notice(message) else message
     if event_type == "turn.failed":
         return concise_error_message(event.get("error") or event.get("message") or event)
     if event_type == "event_msg":
@@ -4941,11 +4957,13 @@ async def run_codex(session_id: str, run_id: str, prompt: str, sess: dict[str, A
     if idle_killed:
         await append_event(session_id, "error", {"run_id": run_id, "message": "killed after idle timeout", **run_event_metadata(run_id)})
     if not stopped and proc.returncode not in (0, None):
-        if stderr:
-            await append_event(session_id, "error", {"run_id": run_id, "message": stderr[:4000], "exit_code": proc.returncode, **run_event_metadata(run_id)})
-        elif codex_error and not codex_error_emitted:
+        if codex_error_emitted:
+            pass
+        elif codex_error:
             await append_event(session_id, "error", {"run_id": run_id, "message": codex_error, "exit_code": proc.returncode, **run_event_metadata(run_id)})
-        elif not codex_error:
+        elif stderr:
+            await append_event(session_id, "error", {"run_id": run_id, "message": stderr[:4000], "exit_code": proc.returncode, **run_event_metadata(run_id)})
+        else:
             await append_event(session_id, "error", {"run_id": run_id, "message": f"Codex exited {proc.returncode} without error output.", "exit_code": proc.returncode, **run_event_metadata(run_id)})
     if provider_id:
         await STORE.save_provider_session(session_id, provider_id, BACKEND_CODEX)

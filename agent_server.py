@@ -51,6 +51,7 @@ HOST_HEALTH_FILE = STATE_DIR / "host_health.jsonl"
 CLAUDE_PROJECTS_ROOT = Path(os.environ.get("CLAUDE_PROJECTS_ROOT", Path.home() / ".claude" / "projects"))
 CODEX_SESSIONS_ROOT = Path(os.environ.get("CODEX_SESSIONS_ROOT", Path.home() / ".codex" / "sessions"))
 CODEX_BIN = os.environ.get("CODEX_BIN", "codex")
+CODEX_IGNORE_USER_CONFIG = os.environ.get("ZENITHBOT_CODEX_IGNORE_USER_CONFIG", "1").lower() not in {"0", "false", "no", "off"}
 DEFAULT_CWD = os.environ.get("ZENITHBOT_AGENT_CWD", str(Path.home()))
 DEFAULT_BACKEND = os.environ.get("ZENITHBOT_BACKEND", BACKEND_CLAUDE).lower()
 if DEFAULT_BACKEND not in VALID_BACKENDS:
@@ -962,6 +963,7 @@ class JobStore:
             prompt=job["prompt"],
             file_ids=[],
             backend=job.get("backend"),
+            purpose=SCHEDULED_JOB_PURPOSE,
         )
         result = await start_turn(job["session_id"], req, queue_if_busy=False)
         await self.mark_ran(jid)
@@ -1063,6 +1065,7 @@ QUEUED_TURNS: dict[str, deque[dict[str, Any]]] = {}
 RUN_NOW_TURNS: dict[str, dict[str, Any]] = {}
 QUEUE_LOCK = asyncio.Lock()
 RUN_METADATA: dict[str, dict[str, Any]] = {}
+SCHEDULED_JOB_PURPOSE = "scheduled_job"
 
 LOG_PATH_SUFFIXES = {
     ".log", ".out", ".err", ".stderr", ".stdout", ".txt", ".jsonl", ".trace"
@@ -1076,6 +1079,14 @@ TMUX_COMMAND_TIMEOUT_SECONDS = 4
 def run_event_metadata(run_id: str) -> dict[str, Any]:
     metadata = RUN_METADATA.get(run_id) or {}
     return {key: value for key, value in metadata.items() if value is not None}
+
+
+def active_scheduled_job_run_count() -> int:
+    return sum(
+        1
+        for metadata in RUN_METADATA.values()
+        if metadata.get("purpose") == SCHEDULED_JOB_PURPOSE
+    )
 
 
 async def append_event(session_id: str, event_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -2960,6 +2971,8 @@ def parse_codex_digest_output(stdout: str) -> str:
 
 async def run_codex_handoff_summarizer(prompt: str, *, model: str | None, effort: str | None) -> str:
     cmd = [CODEX_BIN, "exec", "--json", "--skip-git-repo-check"]
+    if CODEX_IGNORE_USER_CONFIG:
+        cmd.append("--ignore-user-config")
     if model:
         cmd.extend(["--model", model])
     if effort:
@@ -3637,6 +3650,7 @@ def host_pressure_snapshot() -> dict[str, Any]:
         "job_max_load_per_cpu": JOB_MAX_LOAD_PER_CPU,
         "job_min_available_mem_mb": JOB_MIN_AVAILABLE_MEM_MB,
         "job_max_active_runs": JOB_MAX_ACTIVE_RUNS,
+        "job_active_runs": active_scheduled_job_run_count(),
         "start_max_load_per_cpu": MAX_START_LOAD_PER_CPU,
         "start_min_available_mem_mb": MIN_START_AVAILABLE_MEM_MB,
         "start_max_active_runs": MAX_ACTIVE_AGENT_RUNS,
@@ -3649,8 +3663,11 @@ async def scheduled_job_blocker(session_id: str) -> str | None:
             return "chat already has a running turn"
         active_count = len(BUSY_SESSIONS)
 
-    if JOB_MAX_ACTIVE_RUNS > 0 and active_count >= JOB_MAX_ACTIVE_RUNS:
-        return f"{active_count} active agent run(s)"
+    scheduled_active_count = active_scheduled_job_run_count()
+    if JOB_MAX_ACTIVE_RUNS > 0 and scheduled_active_count >= JOB_MAX_ACTIVE_RUNS:
+        return f"{scheduled_active_count} active scheduled job run(s)"
+    if MAX_ACTIVE_AGENT_RUNS > 0 and active_count >= MAX_ACTIVE_AGENT_RUNS:
+        return f"server already has {active_count} active agent run(s)"
 
     pressure = host_pressure_snapshot()
     load_per_cpu = pressure.get("load_per_cpu")
@@ -3969,6 +3986,8 @@ def build_codex_cmd(sess: dict[str, Any], prompt: str, manifest_path: Path) -> l
     )
     full_prompt = CODEX_PROMPT_PRELUDE.format(manifest_path=str(manifest_path)) + prompt
     cmd = [CODEX_BIN, "exec"]
+    if CODEX_IGNORE_USER_CONFIG:
+        cmd.append("--ignore-user-config")
     if sess.get("model"):
         cmd.extend(["--model", str(sess["model"])])
     if sess.get("effort"):

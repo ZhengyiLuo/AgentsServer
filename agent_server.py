@@ -42,6 +42,13 @@ logger = logging.getLogger("zenithbot-agent")
 BACKEND_CLAUDE = "claude"
 BACKEND_CODEX = "codex"
 VALID_BACKENDS = {BACKEND_CLAUDE, BACKEND_CODEX}
+CODEX_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
+CODEX_EFFORT_ALIASES = {
+    "max": "xhigh",
+    "extra high": "xhigh",
+    "extra-high": "xhigh",
+    "extra_high": "xhigh",
+}
 
 STATE_DIR = Path(os.environ.get("ZENITHBOT_AGENT_DIR", Path.home() / ".zenithbot-agent"))
 SESSIONS_FILE = STATE_DIR / "sessions.json"
@@ -498,6 +505,23 @@ class CreateJobRequest(BaseModel):
     backend: str | None = None
 
 
+def normalize_runtime_effort(backend: str, effort: Any, *, strict: bool = False) -> str | None:
+    clean = str(effort or "").strip().lower()
+    if not clean:
+        return None
+    if str(backend or "").strip().lower() != BACKEND_CODEX:
+        return clean
+
+    normalized = CODEX_EFFORT_ALIASES.get(clean, clean)
+    if normalized in CODEX_EFFORTS:
+        return normalized
+    if strict:
+        supported = ", ".join(sorted(CODEX_EFFORTS))
+        raise HTTPException(status_code=400, detail=f"Codex effort must be one of: {supported}")
+    logger.warning("dropping unsupported Codex effort value=%r", effort)
+    return None
+
+
 class UpdateJobRequest(BaseModel):
     title: str | None = None
     prompt: str | None = None
@@ -559,13 +583,23 @@ class SessionStore:
 
     async def load(self) -> None:
         ensure_dirs()
+        runtime_changed = False
         if SESSIONS_FILE.exists():
             try:
                 self.sessions = json.loads(SESSIONS_FILE.read_text())
             except Exception as e:
                 logger.warning("failed to load sessions: %s", e)
                 self.sessions = {}
+        for sess in self.sessions.values():
+            backend = str(sess.get("backend") or DEFAULT_BACKEND).strip().lower()
+            previous_effort = sess.get("effort")
+            normalized_effort = normalize_runtime_effort(backend, previous_effort)
+            if normalized_effort != previous_effort:
+                sess["effort"] = normalized_effort
+                runtime_changed = True
         await self.ensure_sort_orders()
+        if runtime_changed:
+            await self.save()
 
     async def save(self) -> None:
         ensure_dirs()
@@ -615,7 +649,7 @@ class SessionStore:
             "cwd": req.cwd or DEFAULT_CWD,
             "backend": backend,
             "model": req.model,
-            "effort": req.effort,
+            "effort": normalize_runtime_effort(backend, req.effort, strict=True),
             "session_id": active_provider_id,
             "claude_session_id": claude_session_id,
             "codex_thread_id": codex_thread_id,
@@ -656,6 +690,10 @@ class SessionStore:
                         sess["claude_session_id" if old == BACKEND_CLAUDE else "codex_thread_id"] = sess["session_id"]
                     sess["session_id"] = sess.get("claude_session_id" if backend == BACKEND_CLAUDE else "codex_thread_id")
                     sess["backend"] = backend
+                    if "model" not in patch:
+                        sess["model"] = None
+                    if "effort" not in patch:
+                        sess["effort"] = None
                     await append_event(sid, "backend_changed", {"old": old, "new": backend})
             for key in ("title", "folder", "cwd"):
                 if key in patch and patch[key] is not None:
@@ -663,8 +701,15 @@ class SessionStore:
             for key in ("model", "effort"):
                 if key in patch:
                     value = patch[key]
-                    clean = str(value).strip() if value is not None else ""
-                    sess[key] = clean or None
+                    if key == "effort":
+                        sess[key] = normalize_runtime_effort(
+                            str(sess.get("backend") or DEFAULT_BACKEND),
+                            value,
+                            strict=True,
+                        )
+                    else:
+                        clean = str(value).strip() if value is not None else ""
+                        sess[key] = clean or None
             if "pinned" in patch and patch["pinned"] is not None:
                 pinned = bool(patch["pinned"])
                 if pinned and not sess.get("pinned"):
@@ -2962,8 +3007,9 @@ async def run_codex_handoff_summarizer(prompt: str, *, model: str | None, effort
     cmd = [CODEX_BIN, "exec", "--json", "--skip-git-repo-check"]
     if model:
         cmd.extend(["--model", model])
-    if effort:
-        cmd.extend(["-c", f"model_reasoning_effort={effort}"])
+    normalized_effort = normalize_runtime_effort(BACKEND_CODEX, effort)
+    if normalized_effort:
+        cmd.extend(["-c", f"model_reasoning_effort={normalized_effort}"])
     cmd.extend(["-c", "model_reasoning_summary=none", prompt])
     env = runner_env()
     codex_dir = os.path.dirname(os.path.abspath(CODEX_BIN))
@@ -3971,8 +4017,9 @@ def build_codex_cmd(sess: dict[str, Any], prompt: str, manifest_path: Path) -> l
     cmd = [CODEX_BIN, "exec"]
     if sess.get("model"):
         cmd.extend(["--model", str(sess["model"])])
-    if sess.get("effort"):
-        cmd.extend(["-c", f"model_reasoning_effort={sess['effort']}"])
+    normalized_effort = normalize_runtime_effort(BACKEND_CODEX, sess.get("effort"))
+    if normalized_effort:
+        cmd.extend(["-c", f"model_reasoning_effort={normalized_effort}"])
     if provider_id:
         cmd.extend(["resume", provider_id])
     cmd.append("--json")

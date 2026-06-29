@@ -23,6 +23,7 @@ import shutil
 import signal
 import subprocess
 import time
+import tomllib
 import uuid
 from collections import deque
 from contextlib import asynccontextmanager, suppress
@@ -56,6 +57,29 @@ DEFAULT_CWD = os.environ.get("ZENITHBOT_AGENT_CWD", str(Path.home()))
 DEFAULT_BACKEND = os.environ.get("ZENITHBOT_BACKEND", BACKEND_CLAUDE).lower()
 if DEFAULT_BACKEND not in VALID_BACKENDS:
     DEFAULT_BACKEND = BACKEND_CLAUDE
+
+CODEX_FALLBACK_MODELS = (
+    ("gpt-5.6-sol", "GPT-5.6-Sol"),
+    ("gpt-5.6-terra", "GPT-5.6-Terra"),
+    ("gpt-5.6-luna", "GPT-5.6-Luna"),
+    ("gpt-5.5", "GPT-5.5"),
+    ("gpt-5.4", "GPT-5.4"),
+    ("gpt-5.4-mini", "GPT-5.4-Mini"),
+)
+CODEX_FALLBACK_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
+CODEX_FALLBACK_MODEL_EFFORTS = {
+    "gpt-5.6-sol": ("low", "medium", "high", "xhigh", "max", "ultra"),
+    "gpt-5.6-terra": ("low", "medium", "high", "xhigh", "max", "ultra"),
+    "gpt-5.6-luna": ("low", "medium", "high", "xhigh", "max"),
+    "gpt-5.5": ("low", "medium", "high", "xhigh"),
+    "gpt-5.4": ("low", "medium", "high", "xhigh"),
+    "gpt-5.4-mini": ("low", "medium", "high", "xhigh"),
+}
+CODEX_FALLBACK_SERVICE_TIERS = {
+    "gpt-5.6-sol": "priority",
+    "gpt-5.6-terra": "priority",
+    "gpt-5.6-luna": "priority",
+}
 
 REQUEST_TIMEOUT_SECONDS = int(os.environ.get("ZENITHBOT_REQUEST_TIMEOUT_SECONDS", "86400"))
 CODEX_APP_SERVER_TIMEOUT_SECONDS = int(os.environ.get("ZENITHBOT_CODEX_APP_SERVER_TIMEOUT_SECONDS", "30"))
@@ -2971,12 +2995,17 @@ def parse_codex_digest_output(stdout: str) -> str:
 
 async def run_codex_handoff_summarizer(prompt: str, *, model: str | None, effort: str | None) -> str:
     cmd = [CODEX_BIN, "exec", "--json", "--skip-git-repo-check"]
+    configured_model, _configured_effort, configured_service_tier = codex_user_config_defaults()
+    effective_model = str(model or configured_model or "").strip()
+    effective_service_tier = configured_service_tier or codex_default_service_tier(effective_model)
     if CODEX_IGNORE_USER_CONFIG:
         cmd.append("--ignore-user-config")
     if model:
         cmd.extend(["--model", model])
     if effort:
         cmd.extend(["-c", f"model_reasoning_effort={effort}"])
+    if effective_service_tier:
+        cmd.extend(["-c", f"service_tier={effective_service_tier}"])
     cmd.extend(["-c", "model_reasoning_summary=none", prompt])
     env = runner_env()
     codex_dir = os.path.dirname(os.path.abspath(CODEX_BIN))
@@ -3726,12 +3755,12 @@ def runner_env() -> dict[str, str]:
     return env
 
 
-def runtime_option(value: str, label: str | None = None) -> dict[str, str]:
+def runtime_option(value: str, label: str | None = None, **extra: Any) -> dict[str, Any]:
     clean = str(value or "").strip()
-    return {"value": clean, "label": str(label or clean or "Server default").strip()}
+    return {"value": clean, "label": str(label or clean or "Server default").strip(), **extra}
 
 
-def server_default_runtime_option(label: str | None = None) -> dict[str, str]:
+def server_default_runtime_option(label: str | None = None) -> dict[str, Any]:
     return runtime_option("", label or "Server default")
 
 
@@ -3763,15 +3792,16 @@ def title_effort_label(value: str) -> str:
     return clean.capitalize()
 
 
-def unique_runtime_options(options: list[dict[str, str]], default_label: str | None = None) -> list[dict[str, str]]:
-    out: list[dict[str, str]] = []
+def unique_runtime_options(options: list[dict[str, Any]], default_label: str | None = None) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
     seen: set[str] = set()
     for option in [server_default_runtime_option(default_label), *options]:
         value = str(option.get("value") or "").strip()
         if value in seen:
             continue
         seen.add(value)
-        out.append(runtime_option(value, option.get("label") or None))
+        extra = {key: val for key, val in option.items() if key not in {"value", "label"}}
+        out.append(runtime_option(value, option.get("label") or None, **extra))
     return out
 
 
@@ -3802,11 +3832,36 @@ def session_backend_locked(sess: dict[str, Any]) -> bool:
     return any(str(sess.get(key) or "").strip() for key in ("session_id", "claude_session_id", "codex_thread_id"))
 
 
-def discovered_codex_default_model(models: list[dict[str, Any]]) -> dict[str, Any] | None:
-    for model in models:
-        slug = str(model.get("slug") or model.get("id") or "").strip()
-        if slug == "gpt-5.5":
-            return model
+def codex_user_config_path() -> Path:
+    return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser() / "config.toml"
+
+
+def codex_user_config_defaults() -> tuple[str, str, str]:
+    if CODEX_IGNORE_USER_CONFIG:
+        return "", "", ""
+    path = codex_user_config_path()
+    try:
+        with path.open("rb") as f:
+            payload = tomllib.load(f)
+    except Exception as exc:
+        logger.debug("codex config default discovery skipped path=%s: %s", path, exc)
+        return "", "", ""
+    model = str(payload.get("model") or "").strip()
+    effort = str(payload.get("model_reasoning_effort") or "").strip()
+    service_tier = str(payload.get("service_tier") or "").strip()
+    return model, effort, service_tier
+
+
+def codex_default_service_tier(model: str) -> str:
+    return CODEX_FALLBACK_SERVICE_TIERS.get(str(model or "").strip(), "")
+
+
+def discovered_codex_default_model(models: list[dict[str, Any]], preferred_slug: str = "") -> dict[str, Any] | None:
+    if preferred_slug:
+        for model in models:
+            slug = str(model.get("slug") or model.get("id") or "").strip()
+            if slug == preferred_slug:
+                return model
     for model in models:
         slug = str(model.get("slug") or model.get("id") or "").strip()
         if slug:
@@ -3816,14 +3871,17 @@ def discovered_codex_default_model(models: list[dict[str, Any]]) -> dict[str, An
 
 def discover_codex_catalog() -> dict[str, Any]:
     models: list[dict[str, Any]] = []
-    model_options: list[dict[str, str]] = []
-    effort_options: list[dict[str, str]] = []
+    model_options: list[dict[str, Any]] = []
+    effort_options: list[dict[str, Any]] = []
+    model_efforts: dict[str, list[dict[str, Any]]] = {}
     default_model = ""
     default_model_label = ""
     default_effort = ""
     default_effort_label = ""
+    default_service_tier = ""
     model_source = "codex debug models"
     effort_source = "codex debug models"
+    configured_model, configured_effort, configured_service_tier = codex_user_config_defaults()
     try:
         payload = json.loads(run_catalog_command([CODEX_BIN, "debug", "models"]))
         raw_models = payload.get("models") if isinstance(payload, dict) else None
@@ -3839,12 +3897,24 @@ def discover_codex_catalog() -> dict[str, Any]:
         if str(model.get("visibility") or "list") == "list" and model.get("supported_in_api", True) is not False
     ]
     visible_models.sort(key=runtime_priority)
-    default_entry = discovered_codex_default_model(visible_models)
+    default_entry = discovered_codex_default_model(visible_models, configured_model)
     if default_entry:
-        default_model = str(default_entry.get("slug") or default_entry.get("id") or "").strip()
+        default_model = configured_model or str(default_entry.get("slug") or default_entry.get("id") or "").strip()
         default_model_label = str(default_entry.get("display_name") or title_model_label(default_model)).strip()
-        default_effort = str(default_entry.get("default_reasoning_level") or "").strip()
+        default_effort = configured_effort or str(default_entry.get("default_reasoning_level") or "").strip()
         default_effort_label = title_effort_label(default_effort) if default_effort else ""
+        default_service_tier = configured_service_tier or str(default_entry.get("default_service_tier") or "").strip()
+    elif configured_model:
+        default_model = configured_model
+        default_model_label = title_model_label(configured_model)
+        default_effort = configured_effort
+        default_effort_label = title_effort_label(default_effort) if default_effort else ""
+        default_service_tier = configured_service_tier or codex_default_service_tier(default_model)
+    elif not visible_models:
+        default_model, default_model_label = CODEX_FALLBACK_MODELS[0]
+        default_effort = configured_effort or "medium"
+        default_effort_label = title_effort_label(default_effort)
+        default_service_tier = configured_service_tier or codex_default_service_tier(default_model)
     if default_model == "gpt-5.5" and default_effort == "medium":
         default_effort = "xhigh"
         default_effort_label = "XHigh"
@@ -3853,7 +3923,7 @@ def discover_codex_catalog() -> dict[str, Any]:
         if not slug:
             continue
         label = str(model.get("display_name") or title_model_label(slug)).strip()
-        model_options.append(runtime_option(slug, label))
+        model_effort_options: list[dict[str, Any]] = []
         levels = model.get("supported_reasoning_levels")
         if isinstance(levels, list):
             for level in levels:
@@ -3861,15 +3931,39 @@ def discover_codex_catalog() -> dict[str, Any]:
                     continue
                 effort = str(level.get("effort") or "").strip()
                 if effort:
-                    effort_options.append(runtime_option(effort, title_effort_label(effort)))
+                    option = runtime_option(effort, title_effort_label(effort))
+                    effort_options.append(option)
+                    model_effort_options.append(option)
+        if model_effort_options:
+            model_efforts[slug] = unique_runtime_options(model_effort_options, None)[1:]
+        service_tier = str(model.get("default_service_tier") or "").strip()
+        model_options.append(runtime_option(slug, label, efforts=model_efforts.get(slug, []), service_tier=service_tier or None))
+
+    if not model_options:
+        for slug, label in CODEX_FALLBACK_MODELS:
+            fallback_efforts = [
+                runtime_option(effort, title_effort_label(effort))
+                for effort in CODEX_FALLBACK_MODEL_EFFORTS.get(slug, CODEX_FALLBACK_EFFORTS)
+            ]
+            model_efforts[slug] = fallback_efforts
+            service_tier = codex_default_service_tier(slug)
+            model_options.append(runtime_option(slug, label, efforts=fallback_efforts, service_tier=service_tier or None))
+    if not effort_options:
+        effort_options.extend(runtime_option(effort, title_effort_label(effort)) for effort in CODEX_FALLBACK_EFFORTS)
+    if configured_model and not any(option.get("value") == configured_model for option in model_options):
+        model_options.insert(0, runtime_option(configured_model, title_model_label(configured_model)))
+    if configured_effort and not any(option.get("value") == configured_effort for option in effort_options):
+        effort_options.append(runtime_option(configured_effort, title_effort_label(configured_effort)))
 
     return {
         "models": unique_runtime_options(model_options, f"Server default ({default_model_label})" if default_model_label else None),
         "efforts": unique_runtime_options(effort_options, f"Server default ({default_effort_label})" if default_effort_label else None),
+        "model_efforts": model_efforts,
         "model_source": model_source,
         "effort_source": effort_source,
         "default_model": default_model or None,
         "default_effort": default_effort or None,
+        "default_service_tier": default_service_tier or None,
     }
 
 
@@ -3984,6 +4078,9 @@ def build_codex_cmd(sess: dict[str, Any], prompt: str, manifest_path: Path) -> l
     provider_id = sess.get("codex_thread_id") or (
         sess.get("session_id") if sess.get("backend") == BACKEND_CODEX else None
     )
+    configured_model, _configured_effort, configured_service_tier = codex_user_config_defaults()
+    effective_model = str(sess.get("model") or configured_model or "").strip()
+    effective_service_tier = configured_service_tier or codex_default_service_tier(effective_model)
     full_prompt = CODEX_PROMPT_PRELUDE.format(manifest_path=str(manifest_path)) + prompt
     cmd = [CODEX_BIN, "exec"]
     if CODEX_IGNORE_USER_CONFIG:
@@ -3992,6 +4089,8 @@ def build_codex_cmd(sess: dict[str, Any], prompt: str, manifest_path: Path) -> l
         cmd.extend(["--model", str(sess["model"])])
     if sess.get("effort"):
         cmd.extend(["-c", f"model_reasoning_effort={sess['effort']}"])
+    if effective_service_tier:
+        cmd.extend(["-c", f"service_tier={effective_service_tier}"])
     if provider_id:
         cmd.extend(["resume", provider_id])
     cmd.append("--json")

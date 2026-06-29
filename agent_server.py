@@ -68,6 +68,10 @@ CODEX_STREAM_FALLBACK_MODELS = {
     for model in os.environ.get("ZENITHBOT_CODEX_STREAM_FALLBACK_MODELS", "gpt-5.6-sol").split(",")
     if model.strip()
 }
+CODEX_STREAM_FALLBACK_MODEL = (
+    os.environ.get("ZENITHBOT_CODEX_STREAM_FALLBACK_MODEL", "gpt-5.6-terra").strip()
+    or CODEX_DEFAULT_MODEL
+)
 DEFAULT_CWD = os.environ.get("ZENITHBOT_AGENT_CWD", str(Path.home()))
 DEFAULT_BACKEND = os.environ.get("ZENITHBOT_BACKEND", BACKEND_CLAUDE).lower()
 if DEFAULT_BACKEND not in VALID_BACKENDS:
@@ -4973,17 +4977,21 @@ async def run_codex(
         and not started_tool_ids
     )
     if should_fallback:
+        retry_effort = normalize_runtime_effort(
+            BACKEND_CODEX,
+            sess.get("effort") or CODEX_DEFAULT_EFFORT,
+        ) or CODEX_DEFAULT_EFFORT
         retry_sess = dict(sess)
-        retry_sess["model"] = CODEX_DEFAULT_MODEL
-        retry_sess["effort"] = CODEX_DEFAULT_EFFORT
+        retry_sess["model"] = CODEX_STREAM_FALLBACK_MODEL
+        retry_sess["effort"] = retry_effort
         await STORE.update(session_id, {
-            "model": CODEX_DEFAULT_MODEL,
-            "effort": CODEX_DEFAULT_EFFORT,
+            "model": CODEX_STREAM_FALLBACK_MODEL,
+            "effort": retry_effort,
         })
         await append_event(session_id, "runtime_fallback", {
             "run_id": run_id,
             "backend": BACKEND_CODEX,
-            "message": f"{requested_model} disconnected before producing output; retrying once with {CODEX_DEFAULT_MODEL} {title_effort_label(CODEX_DEFAULT_EFFORT)}.",
+            "message": f"{requested_model} disconnected before producing output; retrying once with {CODEX_STREAM_FALLBACK_MODEL} {title_effort_label(retry_effort)}.",
             **run_event_metadata(run_id),
         })
         await run_codex(

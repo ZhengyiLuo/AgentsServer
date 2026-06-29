@@ -63,6 +63,11 @@ _configured_codex_effort = os.environ.get("ZENITHBOT_CODEX_EFFORT", "xhigh").str
 CODEX_DEFAULT_EFFORT = CODEX_EFFORT_ALIASES.get(_configured_codex_effort, _configured_codex_effort)
 if CODEX_DEFAULT_EFFORT not in CODEX_EFFORTS:
     CODEX_DEFAULT_EFFORT = "xhigh"
+CODEX_STREAM_FALLBACK_MODELS = {
+    model.strip().lower()
+    for model in os.environ.get("ZENITHBOT_CODEX_STREAM_FALLBACK_MODELS", "gpt-5.6-sol").split(",")
+    if model.strip()
+}
 DEFAULT_CWD = os.environ.get("ZENITHBOT_AGENT_CWD", str(Path.home()))
 DEFAULT_BACKEND = os.environ.get("ZENITHBOT_BACKEND", BACKEND_CLAUDE).lower()
 if DEFAULT_BACKEND not in VALID_BACKENDS:
@@ -4088,6 +4093,11 @@ def is_codex_reconnect_notice(message: str) -> bool:
     return bool(re.match(r"^Reconnecting\.\.\.\s+\d+/\d+\b", str(message or "").strip(), re.IGNORECASE))
 
 
+def is_codex_stream_disconnect_error(message: str) -> bool:
+    clean = str(message or "").strip().lower()
+    return "stream disconnected before completion" in clean
+
+
 def codex_result_error(event: dict[str, Any]) -> str | None:
     event_type = str(event.get("type") or "")
     if event_type == "error":
@@ -4672,7 +4682,15 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
         schedule_next_queued_turn(session_id)
 
 
-async def run_codex(session_id: str, run_id: str, prompt: str, sess: dict[str, Any], manifest_path: Path) -> None:
+async def run_codex(
+    session_id: str,
+    run_id: str,
+    prompt: str,
+    sess: dict[str, Any],
+    manifest_path: Path,
+    *,
+    fallback_attempt: int = 0,
+) -> None:
     cmd = build_codex_cmd(sess, prompt, manifest_path)
     requested_cwd = str(sess.get("cwd") or DEFAULT_CWD)
     cwd = existing_cwd(requested_cwd)
@@ -4739,7 +4757,6 @@ async def run_codex(session_id: str, run_id: str, prompt: str, sess: dict[str, A
     idle_killed = False
     stream_error: str | None = None
     codex_error: str | None = None
-    codex_error_emitted = False
     seen_artifacts: set[str] = set()
     seen_raw_lines: set[str] = set()
     seen_text_parts: set[str] = set()
@@ -4808,16 +4825,8 @@ async def run_codex(session_id: str, run_id: str, prompt: str, sess: dict[str, A
         etype = str(event.get("type") or "")
         result_error = codex_result_error(event)
         if result_error:
-            nonlocal codex_error, codex_error_emitted
+            nonlocal codex_error
             codex_error = result_error
-            if not codex_error_emitted:
-                await append_event(session_id, "error", {
-                    "run_id": run_id,
-                    "backend": BACKEND_CODEX,
-                    "message": result_error,
-                    **run_event_metadata(run_id),
-                })
-                codex_error_emitted = True
             return True
         if etype == "thread.started" and event.get("thread_id"):
             await emit_provider_session(str(event["thread_id"]))
@@ -4952,14 +4961,46 @@ async def run_codex(session_id: str, run_id: str, prompt: str, sess: dict[str, A
     if proc.stderr:
         stderr = (await proc.stderr.read()).decode("utf-8", "replace").strip()
     stopped = run_id in STOPPED_RUNS
+    requested_model = str(sess.get("model") or CODEX_DEFAULT_MODEL).strip()
+    terminal_error = codex_error or stderr
+    should_fallback = (
+        not stopped
+        and proc.returncode not in (0, None)
+        and fallback_attempt == 0
+        and requested_model.lower() in CODEX_STREAM_FALLBACK_MODELS
+        and is_codex_stream_disconnect_error(terminal_error)
+        and not text_parts
+        and not started_tool_ids
+    )
+    if should_fallback:
+        retry_sess = dict(sess)
+        retry_sess["model"] = CODEX_DEFAULT_MODEL
+        retry_sess["effort"] = CODEX_DEFAULT_EFFORT
+        await STORE.update(session_id, {
+            "model": CODEX_DEFAULT_MODEL,
+            "effort": CODEX_DEFAULT_EFFORT,
+        })
+        await append_event(session_id, "runtime_fallback", {
+            "run_id": run_id,
+            "backend": BACKEND_CODEX,
+            "message": f"{requested_model} disconnected before producing output; retrying once with {CODEX_DEFAULT_MODEL} {title_effort_label(CODEX_DEFAULT_EFFORT)}.",
+            **run_event_metadata(run_id),
+        })
+        await run_codex(
+            session_id,
+            run_id,
+            prompt,
+            retry_sess,
+            manifest_path,
+            fallback_attempt=1,
+        )
+        return
     if stream_error and not stopped:
         await append_event(session_id, "error", {"run_id": run_id, "message": f"Codex stream failed: {stream_error}", **run_event_metadata(run_id)})
     if idle_killed:
         await append_event(session_id, "error", {"run_id": run_id, "message": "killed after idle timeout", **run_event_metadata(run_id)})
     if not stopped and proc.returncode not in (0, None):
-        if codex_error_emitted:
-            pass
-        elif codex_error:
+        if codex_error:
             await append_event(session_id, "error", {"run_id": run_id, "message": codex_error, "exit_code": proc.returncode, **run_event_metadata(run_id)})
         elif stderr:
             await append_event(session_id, "error", {"run_id": run_id, "message": stderr[:4000], "exit_code": proc.returncode, **run_event_metadata(run_id)})

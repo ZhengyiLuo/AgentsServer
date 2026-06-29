@@ -23,7 +23,6 @@ import shutil
 import signal
 import subprocess
 import time
-import tomllib
 import uuid
 from collections import deque
 from contextlib import asynccontextmanager, suppress
@@ -37,6 +36,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 import uvicorn
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 agent hosts
+    tomllib = None
 
 logger = logging.getLogger("zenithbot-agent")
 
@@ -3869,11 +3873,38 @@ def codex_user_config_path() -> Path:
     return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser() / "config.toml"
 
 
+def load_codex_user_config(path: Path) -> dict[str, Any]:
+    if tomllib is not None:
+        with path.open("rb") as f:
+            return tomllib.load(f)
+
+    # Python 3.10 has no stdlib TOML parser. Only these top-level strings are
+    # needed here; nested Codex configuration remains owned by the CLI.
+    wanted = {"model", "model_reasoning_effort", "service_tier"}
+    payload: dict[str, Any] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            break
+        key, separator, raw_value = line.partition("=")
+        key = key.strip()
+        if not separator or key not in wanted:
+            continue
+        lexer = shlex.shlex(raw_value, posix=True)
+        lexer.whitespace_split = True
+        lexer.commenters = "#"
+        values = list(lexer)
+        if values:
+            payload[key] = values[0]
+    return payload
+
+
 def codex_user_config_defaults() -> tuple[str, str, str]:
     path = codex_user_config_path()
     try:
-        with path.open("rb") as f:
-            payload = tomllib.load(f)
+        payload = load_codex_user_config(path)
     except Exception as exc:
         logger.debug("codex config default discovery skipped path=%s: %s", path, exc)
         return "", "", ""

@@ -26,7 +26,7 @@ machine paths.
 
 ## Requirements
 
-- Linux or macOS host with Python 3.11+.
+- Linux or macOS host with Python 3.10+.
 - `uv` recommended for the runtime environment.
 - Claude CLI and/or Codex CLI installed and authenticated on the agent host.
 - `tmux` if you want terminal/session inspection.

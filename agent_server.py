@@ -3610,7 +3610,13 @@ async def copy_fork_history(parent_id: str, child_id: str) -> int:
     return copied
 
 
-def build_fork_memory(parent: dict[str, Any], parent_id: str, *, reason: str | None = None) -> str:
+def build_fork_memory(
+    parent: dict[str, Any],
+    parent_id: str,
+    *,
+    reason: str | None = None,
+    exclude_run_id: str | None = None,
+) -> str:
     provider_id = session_provider_id(parent)
     header = [
         "[ZenithDock memory fork]",
@@ -3628,7 +3634,11 @@ def build_fork_memory(parent: dict[str, Any], parent_id: str, *, reason: str | N
         header.append(f"Fork fallback reason: {compact_memory_text(reason, 800)}")
 
     lines: list[str] = header + ["", "Recent rough conversation:"]
-    events = read_events(parent_id, limit=160, tail=True)
+    events = [
+        event
+        for event in read_events(parent_id, limit=160, tail=True)
+        if not exclude_run_id or event.get("run_id") != exclude_run_id
+    ]
     assistant_runs = {
         event.get("run_id")
         for event in events
@@ -3669,6 +3679,45 @@ def build_fork_memory(parent: dict[str, Any], parent_id: str, *, reason: str | N
         memory = memory[-MAX_FORK_MEMORY_CHARS:].lstrip()
         memory = "[ZenithDock memory fork]\n[Older memory trimmed]\n" + memory
     return memory
+
+
+def is_codex_compaction_failure(message: str) -> bool:
+    lowered = str(message or "").lower()
+    return "remote compact task" in lowered and "stream disconnected" in lowered
+
+
+async def rollover_codex_provider_session(
+    session_id: str,
+    run_id: str,
+    provider_id: str,
+    reason: str,
+) -> tuple[dict[str, Any], str] | None:
+    current = STORE.sessions.get(session_id)
+    if not current:
+        return None
+    snapshot = dict(current)
+    memory = build_fork_memory(snapshot, session_id, reason=reason, exclude_run_id=run_id)
+    async with STORE._lock:
+        current = STORE.sessions.get(session_id)
+        if not current or session_provider_id(current) != provider_id:
+            return None
+        current["session_id"] = None
+        current["codex_thread_id"] = None
+        current["memory_seed"] = memory
+        current["memory_seed_used"] = True
+        current["memory_forked"] = True
+        current["memory_fork_reason"] = compact_memory_text(reason, 2000)
+        current["updated_at"] = now_iso()
+        await STORE.save()
+        fresh_session = dict(current)
+    await append_event(session_id, "provider_rollover", {
+        "run_id": run_id,
+        "backend": BACKEND_CODEX,
+        "old_provider_session_id": provider_id,
+        "message": "Codex provider context was full. Retrying this turn once on a fresh thread with bounded recent memory.",
+        "reason": compact_memory_text(reason, 1200),
+    })
+    return fresh_session, memory
 
 
 def public_session(sess: dict[str, Any]) -> dict[str, Any]:
@@ -4808,6 +4857,8 @@ async def run_codex(
     prompt: str,
     sess: dict[str, Any],
     manifest_path: Path,
+    *,
+    allow_compaction_rollover: bool = True,
 ) -> None:
     cmd = build_codex_cmd(sess, prompt, manifest_path)
     requested_cwd = str(sess.get("cwd") or DEFAULT_CWD)
@@ -5079,6 +5130,34 @@ async def run_codex(
     if proc.stderr:
         stderr = (await proc.stderr.read()).decode("utf-8", "replace").strip()
     stopped = run_id in STOPPED_RUNS
+    terminal_error = codex_error or stderr
+    should_rollover = (
+        allow_compaction_rollover
+        and bool(provider_id)
+        and not stopped
+        and not stream_error
+        and not idle_killed
+        and proc.returncode not in (0, None)
+        and not text_parts
+        and not seen_reasoning
+        and not started_tool_ids
+        and not seen_artifacts
+        and is_codex_compaction_failure(terminal_error)
+    )
+    if should_rollover:
+        rollover = await rollover_codex_provider_session(session_id, run_id, str(provider_id), terminal_error)
+        if rollover:
+            fresh_session, memory = rollover
+            retry_prompt = f"{memory}\n\n[Current user prompt]\n{prompt}"
+            await run_codex(
+                session_id,
+                run_id,
+                retry_prompt,
+                fresh_session,
+                manifest_path,
+                allow_compaction_rollover=False,
+            )
+            return
     if stream_error and not stopped:
         await append_event(session_id, "error", {"run_id": run_id, "message": f"Codex stream failed: {stream_error}", **run_event_metadata(run_id)})
     if idle_killed:
@@ -5171,7 +5250,11 @@ async def start_turn(
 
         backend = sess.get("backend") or DEFAULT_BACKEND
         memory_seed = str(sess.get("memory_seed") or "").strip()
-        if backend == BACKEND_CODEX and memory_seed and not sess.get("memory_seed_used"):
+        if (
+            backend == BACKEND_CODEX
+            and memory_seed
+            and (not sess.get("memory_seed_used") or not session_provider_id(sess))
+        ):
             prompt = f"{memory_seed}\n\n[Current user prompt]\n{prompt}"
             async with STORE._lock:
                 current = STORE.sessions.get(session_id)

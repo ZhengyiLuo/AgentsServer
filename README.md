@@ -17,6 +17,8 @@ machine paths.
 - Accepts file uploads and serves generated artifacts, including videos.
 - Supports queued turns, stop requests, chat forking, context digests, and rough
   history import from provider sessions.
+- Recovers oversized Codex provider threads by rolling the same chat onto a
+  fresh thread with bounded recent memory when remote compaction fails.
 - Creates handoff digests with an actual LLM summarizer; the raw transcript/file
   pack is only internal source material.
 - Runs recurring/loop jobs per chat with host load/memory guardrails.

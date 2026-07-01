@@ -174,12 +174,26 @@ Skills and environment playbooks:
 Turn lifecycle and background work:
 - This is not a persistent live chat process. Your Claude process ends when the
   current turn finishes.
-- Do not promise that an in-memory timer, watcher, subagent, reminder, or
-  "I'll check back" loop will continue after the turn. It will not.
+- Claude Code's native Agent tool is available for bounded parallel work. A
+  subagent may monitor a render or process while you do other work, but it is
+  still owned by this parent turn.
+- If you launch a subagent with `run_in_background: true`, keep its task ID and
+  join it with `TaskOutput` using a blocking wait before you finish. Never leave
+  a child task unjoined and never imply it will report after this process exits.
+- If the user requested the output of a render, sweep, conversion, or other
+  launched process, stay alive in this turn until it completes, inspect the
+  result, publish the artifacts through the manifest, and then answer. Use a
+  foreground subagent, a background subagent plus blocking `TaskOutput`, or
+  bounded polling/waits in the parent.
+- Do not say "monitor armed", "when the watcher fires I'll send it", "I'll
+  check back", or similar future-tense promises and then end the turn.
+- A tmux process or shell watcher can keep computation alive, but it cannot
+  resume this Claude turn or make ZenithDock ingest a manifest after the turn
+  has ended.
 - If background monitoring is needed, create a real durable mechanism: a
-  ZenithDock scheduled job, a tmux/session process, a system service, or a
-  script the user can run. State exactly what you created and how to inspect or
-  stop it.
+  ZenithDock scheduled job that launches a later agent turn, a system service,
+  or a script the user can inspect and run. State exactly what you created and
+  how to inspect or stop it.
 - If you did not create a durable mechanism, say that the user should ask again
   later instead of implying you will keep running.
 
@@ -439,6 +453,7 @@ class CreateSessionRequest(BaseModel):
     model: str | None = None
     effort: str | None = None
     pinned: bool | None = None
+    archived: bool | None = None
     provider_session_id: str | None = None
     session_id: str | None = None
     claude_session_id: str | None = None
@@ -674,6 +689,8 @@ class SessionStore:
         title = req.title or (
             f"Resumed {backend.title()} {str(active_provider_id)[:8]}" if active_provider_id else "New chat"
         )
+        archived = bool(req.archived)
+        pinned = bool(req.pinned) and not archived
         sess = {
             "id": sid,
             "title": title,
@@ -687,10 +704,10 @@ class SessionStore:
             "codex_thread_id": codex_thread_id,
             "parent_id": parent_id,
             "fork_from": None,
-            "pinned": bool(req.pinned),
-            "pinned_at": now if req.pinned else None,
-            "archived": False,
-            "archived_at": None,
+            "pinned": pinned,
+            "pinned_at": now if pinned else None,
+            "archived": archived,
+            "archived_at": now if archived else None,
             "created_at": now,
             "updated_at": now,
         }

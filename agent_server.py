@@ -16,6 +16,7 @@ import hashlib
 import hmac
 import json
 import logging
+import mmap
 import os
 import re
 import shlex
@@ -2678,6 +2679,50 @@ def read_visible_events_page(
         omitted_before = 0
         omitted_after = max(0, visible_count - len(events))
     return events, latest_seq, visible_count, omitted_before, omitted_after
+
+
+def read_visible_events_after_page(
+    session_id: str,
+    after: int,
+    limit: int = 500,
+) -> tuple[list[dict[str, Any]], int, int, int, int]:
+    """Read a recent append-only delta without rescanning the whole transcript."""
+    path = events_path(session_id)
+    if not path.exists() or path.stat().st_size <= 0:
+        return [], 0, 0, 0, 0
+    limit = max(1, min(int(limit or 500), MAX_EVENT_RESPONSE_LIMIT))
+    selected: deque[dict[str, Any]] = deque(maxlen=limit)
+    visible_count = 0
+    latest_seq = last_event_seq_from_file(path)
+
+    try:
+        with path.open("rb") as source, mmap.mmap(source.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+            cursor = len(mapped)
+            while cursor > 0:
+                line_end = cursor
+                newline = mapped.rfind(b"\n", 0, line_end)
+                line_start = newline + 1
+                cursor = newline if newline >= 0 else 0
+                raw = mapped[line_start:line_end].strip()
+                if not raw:
+                    continue
+                try:
+                    event = json.loads(raw.decode("utf-8", "replace"))
+                except Exception:
+                    continue
+                seq = int(event.get("seq", 0))
+                if seq <= after:
+                    break
+                if not is_visible_timeline_event(event):
+                    continue
+                visible_count += 1
+                selected.appendleft(client_safe_event(event))
+    except Exception as exc:
+        logger.warning("fast event delta failed session=%s: %s", session_id, exc)
+        return read_visible_events_page(session_id, after=after, limit=limit, tail=False)
+
+    events = list(selected)
+    return events, latest_seq, visible_count, 0, max(0, visible_count - len(events))
 
 
 def event_seq_bounds(session_id: str) -> tuple[int, int, int]:
@@ -5501,13 +5546,20 @@ async def get_session(
         raise HTTPException(status_code=404, detail="session not found")
     page_tail = tail and after <= 0
     if visible:
-        events, latest_seq, event_count, omitted_before, omitted_after = read_visible_events_page(
-            session_id,
-            after=after,
-            before=before,
-            limit=limit,
-            tail=page_tail,
-        )
+        if after > 0 and before is None and not page_tail:
+            events, latest_seq, event_count, omitted_before, omitted_after = read_visible_events_after_page(
+                session_id,
+                after=after,
+                limit=limit,
+            )
+        else:
+            events, latest_seq, event_count, omitted_before, omitted_after = read_visible_events_page(
+                session_id,
+                after=after,
+                before=before,
+                limit=limit,
+                tail=page_tail,
+            )
     elif after > 0 and before is None:
         events = read_events(session_id, after=after, before=before, limit=limit, tail=page_tail)
         _, latest_seq, event_count = event_seq_bounds(session_id)

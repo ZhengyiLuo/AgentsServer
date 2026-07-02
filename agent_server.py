@@ -98,6 +98,7 @@ HOST_HEALTH_MAX_BYTES = int(os.environ.get("ZENITHBOT_HOST_HEALTH_MAX_BYTES", st
 IDLE_WARN_SECONDS = int(os.environ.get("ZENITHBOT_IDLE_WARN_SECONDS", "1800"))
 IDLE_KILL_SECONDS = int(os.environ.get("ZENITHBOT_IDLE_KILL_SECONDS", "21600"))
 STOP_GRACE_SECONDS = float(os.environ.get("ZENITHBOT_STOP_GRACE_SECONDS", "2.0"))
+STARTING_STOP_GRACE_SECONDS = float(os.environ.get("ZENITHBOT_STARTING_STOP_GRACE_SECONDS", "120"))
 PROCESS_STREAM_LIMIT = int(os.environ.get("ZENITHBOT_PROCESS_STREAM_LIMIT", str(16 * 1024 * 1024)))
 MAX_UPLOAD_BYTES = int(os.environ.get("ZENITHBOT_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024 * 1024)))
 MAX_IMPORT_MESSAGES = int(os.environ.get("ZENITHBOT_HISTORY_IMPORT_LIMIT", "400"))
@@ -1082,6 +1083,7 @@ class SubscriberHub:
 HUB = SubscriberHub()
 ACTIVE: dict[str, dict[str, Any]] = {}
 BUSY_SESSIONS: set[str] = set()
+STARTING_SESSIONS: dict[str, float] = {}
 STOP_REQUESTS: set[str] = set()
 STOPPED_RUNS: set[str] = set()
 ACTIVE_LOCK = asyncio.Lock()
@@ -2517,12 +2519,14 @@ async def release_turn_slot(session_id: str) -> None:
     async with ACTIVE_LOCK:
         ACTIVE.pop(session_id, None)
         BUSY_SESSIONS.discard(session_id)
+        STARTING_SESSIONS.pop(session_id, None)
         STOP_REQUESTS.discard(session_id)
 
 
 async def clear_active_process(session_id: str) -> None:
     async with ACTIVE_LOCK:
         ACTIVE.pop(session_id, None)
+        STARTING_SESSIONS.pop(session_id, None)
 
 
 def active_snapshot_input(active: dict[str, Any]) -> dict[str, Any]:
@@ -4582,6 +4586,7 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
         return
     async with ACTIVE_LOCK:
         BUSY_SESSIONS.add(session_id)
+        STARTING_SESSIONS.pop(session_id, None)
         stop_requested = session_id in STOP_REQUESTS
         if stop_requested:
             STOP_REQUESTS.discard(session_id)
@@ -4763,6 +4768,7 @@ async def run_codex(session_id: str, run_id: str, prompt: str, sess: dict[str, A
         return
     async with ACTIVE_LOCK:
         BUSY_SESSIONS.add(session_id)
+        STARTING_SESSIONS.pop(session_id, None)
         stop_requested = session_id in STOP_REQUESTS
         if stop_requested:
             STOP_REQUESTS.discard(session_id)
@@ -5058,6 +5064,7 @@ async def start_turn(
                 raise HTTPException(status_code=409, detail="session already has a running turn")
         else:
             BUSY_SESSIONS.add(session_id)
+            STARTING_SESSIONS[session_id] = time.time()
             reserved = True
     if should_queue:
         return await enqueue_turn(session_id, req, sess)
@@ -5566,6 +5573,7 @@ async def stop_turn_endpoint(session_id: str) -> dict[str, Any]:
 
 
 async def stop_turn(session_id: str, *, emit_event: bool = True, schedule_queue: bool = True) -> dict[str, Any]:
+    pending = False
     async with ACTIVE_LOCK:
         active = ACTIVE.get(session_id)
         busy = session_id in BUSY_SESSIONS
@@ -5574,15 +5582,28 @@ async def stop_turn(session_id: str, *, emit_event: bool = True, schedule_queue:
             if active.get("run_id"):
                 STOPPED_RUNS.add(str(active["run_id"]))
         elif busy:
-            STOP_REQUESTS.add(session_id)
+            started_at = STARTING_SESSIONS.get(session_id)
+            if started_at is not None and time.time() - started_at < STARTING_STOP_GRACE_SECONDS:
+                STOP_REQUESTS.add(session_id)
+                pending = True
+            else:
+                BUSY_SESSIONS.discard(session_id)
+                STARTING_SESSIONS.pop(session_id, None)
+                STOP_REQUESTS.discard(session_id)
     if not active:
         if busy:
             if emit_event:
                 await append_event(session_id, "turn_stopped", {
                     "run_id": None,
-                    "message": "Stop requested before the agent process was ready.",
+                    "message": (
+                        "Stop requested before the agent process was ready."
+                        if pending
+                        else "Cleared stale busy state with no live agent process."
+                    ),
                 })
-            return {"ok": True, "stopped": True, "pending": True}
+            if not pending and schedule_queue:
+                schedule_next_queued_turn(session_id)
+            return {"ok": True, "stopped": True, "pending": pending}
         if schedule_queue:
             schedule_next_queued_turn(session_id)
         return {"ok": True, "stopped": False}

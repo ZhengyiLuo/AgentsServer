@@ -3917,6 +3917,8 @@ def title_model_label(value: str) -> str:
     if not clean:
         return "Server default"
     known = {
+        "fable": "Fable",
+        "claude-fable-5": "Fable 5",
         "opus[1m]": "Opus 1M",
         "claude-opus-4-8": "Opus 4.8",
         "claude-opus-4-8[1m]": "Opus 4.8 1M",
@@ -4163,6 +4165,8 @@ def parse_claude_help_catalog() -> dict[str, Any]:
         return {
             "models": unique_runtime_options(
                 [
+                    runtime_option("fable", "Fable"),
+                    runtime_option("claude-fable-5", "Fable 5"),
                     runtime_option("sonnet", "Sonnet"),
                     runtime_option("opus", "Opus"),
                     runtime_option("opus[1m]", "Opus 1M"),
@@ -4194,6 +4198,8 @@ def parse_claude_help_catalog() -> dict[str, Any]:
         for alias in aliases:
             model_options.append(runtime_option(alias, title_model_label(alias)))
     for alias, label in (
+        ("fable", "Fable"),
+        ("claude-fable-5", "Fable 5"),
         ("sonnet", "Sonnet"),
         ("opus", "Opus"),
         ("opus[1m]", "Opus 1M"),

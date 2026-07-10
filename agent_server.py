@@ -23,9 +23,10 @@ import shlex
 import shutil
 import signal
 import subprocess
+import threading
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
@@ -358,6 +359,9 @@ def ensure_dirs(session_id: str | None = None) -> None:
 
 EVENT_SEQ_CACHE: dict[str, int] = {}
 EVENT_SEQ_LOCK = asyncio.Lock()
+TIMELINE_INDEX_CACHE_MAX = int(os.environ.get("ZENITHBOT_TIMELINE_INDEX_CACHE_MAX", "24"))
+TIMELINE_INDEX_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
+TIMELINE_INDEX_LOCKS: dict[str, threading.Lock] = {}
 
 
 def last_event_seq_from_file(path: Path) -> int:
@@ -407,6 +411,8 @@ async def next_event_seq(session_id: str, path: Path) -> int:
 async def forget_event_seq(session_id: str) -> None:
     async with EVENT_SEQ_LOCK:
         EVENT_SEQ_CACHE.pop(session_id, None)
+    TIMELINE_INDEX_CACHE.pop(session_id, None)
+    TIMELINE_INDEX_LOCKS.pop(session_id, None)
 
 
 def token_matches(candidate: str | None) -> bool:
@@ -491,6 +497,8 @@ class TurnRequest(BaseModel):
     effort: str | None = None
     display_prompt: str | None = None
     purpose: str | None = None
+    job_id: str | None = None
+    job_title: str | None = None
     digest_job_id: str | None = None
     target_session_id: str | None = None
 
@@ -1057,6 +1065,9 @@ class JobStore:
             prompt=job["prompt"],
             file_ids=[],
             backend=job.get("backend"),
+            purpose="scheduled_job",
+            job_id=jid,
+            job_title=str(job.get("title") or jid),
         )
         result = await start_turn(job["session_id"], req, queue_if_busy=False)
         await self.mark_ran(jid)
@@ -2747,6 +2758,367 @@ def event_seq_bounds(session_id: str) -> tuple[int, int, int]:
         latest_seq = seq
         count += 1
     return first_seq, latest_seq, count
+
+
+TIMELINE_INDEX_HIDDEN_TYPES = {"turn_queued", "turn_unqueued", "queue_snapshot", "raw_event"}
+TIMELINE_INDEX_JOB_TYPES = {"job_created", "job_ran", "job_started", "job_deferred", "job_finished", "job_error"}
+TIMELINE_INDEX_TRACE_TYPES = {
+    "reasoning_summary", "tool_started", "tool_finished", "process_started", "provider_session",
+    "cwd_fallback", "history_imported", "backend_changed", "artifact_error", "session_created",
+    "idle_warning",
+}
+
+
+def compact_timeline_index_text(value: Any, limit: int = 240) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        if isinstance(value, dict):
+            value = value.get("message") or value.get("error") or value
+        try:
+            value = json.dumps(value, ensure_ascii=False)
+        except Exception:
+            value = str(value)
+    compact = re.sub(r"\s+", " ", value).strip()
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(1, limit - 1)].rstrip() + "…"
+
+
+def timeline_index_event_text(event: dict[str, Any]) -> str:
+    for field in ("result_text", "text", "prompt", "message", "error", "output"):
+        text = compact_timeline_index_text(event.get(field))
+        if text:
+            return text
+    return ""
+
+
+def timeline_search_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return re.sub(r"\s+", " ", value).strip()
+    if isinstance(value, dict):
+        for key in ("message", "error", "detail"):
+            text = timeline_search_value(value.get(key))
+            if text:
+                return text
+    try:
+        return re.sub(r"\s+", " ", json.dumps(value, ensure_ascii=False)).strip()
+    except Exception:
+        return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def timeline_search_event_text(event: dict[str, Any]) -> str:
+    for field in ("result_text", "text", "prompt", "message", "error"):
+        text = timeline_search_value(event.get(field))
+        if text:
+            return text
+    return ""
+
+
+def timeline_search_snippet(text: str, tokens: list[str], limit: int = 260) -> str:
+    compact = re.sub(r"\s+", " ", text).strip()
+    if len(compact) <= limit:
+        return compact
+    folded = compact.casefold()
+    positions = [folded.find(token) for token in tokens if token and folded.find(token) >= 0]
+    center = min(positions) if positions else 0
+    start = max(0, center - limit // 3)
+    end = min(len(compact), start + limit)
+    start = max(0, end - limit)
+    return ("…" if start else "") + compact[start:end].strip() + ("…" if end < len(compact) else "")
+
+
+def timeline_index_is_error(event: dict[str, Any]) -> bool:
+    event_type = str(event.get("type") or "")
+    if event_type in {"tool_started", "tool_finished", "raw_event"}:
+        return False
+    return event_type == "error" or event_type.endswith("_error") or event.get("is_error") is True or bool(event.get("error"))
+
+
+def build_timeline_index(session_id: str) -> dict[str, Any]:
+    lock = TIMELINE_INDEX_LOCKS.setdefault(session_id, threading.Lock())
+    with lock:
+        return _build_timeline_index_locked(session_id)
+
+
+def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
+    path = events_path(session_id)
+    if not path.exists():
+        return {
+            "session_id": session_id,
+            "landmarks": [],
+            "latest_seq": 0,
+            "event_count": 0,
+            "generated_at": now_iso(),
+        }
+    stat = path.stat()
+    signature = (stat.st_size, stat.st_mtime_ns)
+    cached = TIMELINE_INDEX_CACHE.get(session_id)
+    if cached and cached.get("signature") == signature:
+        TIMELINE_INDEX_CACHE.move_to_end(session_id)
+        return cached["payload"]
+
+    can_append = bool(
+        cached and cached.get("inode") == stat.st_ino and
+        0 <= int(cached.get("offset") or 0) < stat.st_size
+    )
+    records: list[dict[str, Any]] = cached["records"] if can_append else []
+    by_key: dict[str, dict[str, Any]] = {record["key"]: record for record in records}
+    active_turn_key: str | None = cached.get("active_turn_key") if can_append else None
+    current_turn_by_run: dict[str, str] = dict(cached.get("current_turn_by_run") or {}) if can_append else {}
+    visible_count = int(cached.get("visible_count") or 0) if can_append else 0
+    latest_seq = int(cached.get("latest_seq") or 0) if can_append else 0
+    scan_offset = int(cached.get("offset") or 0) if can_append else 0
+
+    def ensure_record(key: str, kind: str, event: dict[str, Any]) -> dict[str, Any]:
+        record = by_key.get(key)
+        seq = int(event.get("seq") or 0)
+        if record is None:
+            record = {
+                "key": key,
+                "kind": kind,
+                "start_seq": seq,
+                "end_seq": seq,
+                "title": "",
+                "preview": "",
+                "meta": "",
+                "timestamp": event.get("ts"),
+                "tool_count": 0,
+                "thought_count": 0,
+                "event_count": 0,
+                "file_names": [],
+                "has_user": False,
+                "search_entries": [],
+                "_search_values": set(),
+            }
+            by_key[key] = record
+            records.append(record)
+        record.setdefault("search_entries", [])
+        record.setdefault("_search_values", set())
+        record["start_seq"] = min(int(record["start_seq"]), seq)
+        record["end_seq"] = max(int(record["end_seq"]), seq)
+        record["event_count"] += 1
+        return record
+
+    def add_search_entry(record: dict[str, Any], event: dict[str, Any], role: str, text: str | None = None) -> None:
+        value = text if text is not None else timeline_search_event_text(event)
+        value = re.sub(r"\s+", " ", value or "").strip()
+        if not value:
+            return
+        search_values = record.setdefault("_search_values", set())
+        fingerprint = (role, value)
+        if fingerprint in search_values:
+            return
+        search_values.add(fingerprint)
+        record.setdefault("search_entries", []).append({
+            "event_id": str(event.get("id") or event.get("seq") or ""),
+            "seq": int(event.get("seq") or 0),
+            "ts": event.get("ts"),
+            "role": role,
+            "text": value,
+        })
+
+    final_offset = scan_offset
+    with path.open("rb") as source:
+        source.seek(scan_offset)
+        for raw_line in source:
+            if not raw_line.strip():
+                continue
+            try:
+                event = json.loads(raw_line.decode("utf-8", "replace"))
+            except Exception:
+                continue
+            seq = int(event.get("seq") or 0)
+            event_type = str(event.get("type") or "")
+            if seq <= 0:
+                continue
+            latest_seq = max(latest_seq, seq)
+            if event_type in TIMELINE_INDEX_HIDDEN_TYPES:
+                continue
+            visible_count += 1
+
+            if event_type in TIMELINE_INDEX_JOB_TYPES or event.get("job_id"):
+                job = event.get("job") if isinstance(event.get("job"), dict) else {}
+                job_id = event.get("job_id") or job.get("id") or event.get("run_id") or f"job-{seq}"
+                record = ensure_record(f"job:{job_id}", "job", event)
+                record["title"] = compact_timeline_index_text(job.get("title") or record["title"] or event.get("message") or "Scheduled job", 72)
+                text = timeline_index_event_text(event)
+                if text:
+                    record["preview"] = text
+                add_search_entry(record, event, "job")
+                continue
+
+            if timeline_index_is_error(event):
+                text = timeline_index_event_text(event)
+                record = ensure_record(f"event:{event.get('id') or seq}", "error", event)
+                record["title"] = compact_timeline_index_text(event_type.replace("_", " ").title() or "Error", 72)
+                record["preview"] = text or "Agent error"
+                add_search_entry(record, event, "error")
+                continue
+
+            run_id = str(event.get("run_id") or "").strip()
+            if event_type == "turn_started":
+                run_key = run_id or f"seq-{seq}"
+                key = f"turn:{run_key}"
+                if key in by_key and by_key[key].get("has_user"):
+                    key = f"turn:{run_key}:start-{seq}"
+                active_turn_key = key
+                if run_id:
+                    current_turn_by_run[run_id] = key
+                record = ensure_record(key, "digest" if event.get("purpose") == "handoff_digest" else "user", event)
+                record["has_user"] = True
+                prompt = compact_timeline_index_text(event.get("prompt"))
+                if prompt:
+                    record["title"] = compact_timeline_index_text(prompt, 72)
+                    record["prompt"] = prompt
+                add_search_entry(record, event, "user")
+                continue
+
+            key = current_turn_by_run.get(run_id) if run_id else active_turn_key
+            if run_id and not key:
+                key = f"turn:{run_id}"
+            if event_type in {"assistant_text", "turn_finished"}:
+                key = key or f"turn:seq-{seq}"
+                record = ensure_record(key, "assistant", event)
+                if not record.get("has_user") and record.get("kind") != "digest":
+                    record["kind"] = "assistant"
+                response = compact_timeline_index_text(event.get("result_text") if event_type == "turn_finished" else event.get("text"))
+                if response:
+                    record["preview"] = response
+                    if not record["title"]:
+                        record["title"] = compact_timeline_index_text(response, 72)
+                add_search_entry(record, event, "assistant")
+                if event_type == "turn_finished" and active_turn_key == key:
+                    active_turn_key = None
+                if event_type == "turn_finished" and run_id:
+                    current_turn_by_run.pop(run_id, None)
+                continue
+
+            if event_type in {"artifact_created", "file_uploaded"}:
+                file_payload = event.get("artifact") or event.get("file")
+                if isinstance(file_payload, dict):
+                    if event_type == "file_uploaded" and not key:
+                        continue
+                    key = key or f"turn:seq-{seq}"
+                    record = ensure_record(key, "media", event)
+                    file_name = compact_timeline_index_text(file_payload.get("title") or file_payload.get("filename"), 72)
+                    if file_name and file_name not in record["file_names"]:
+                        record["file_names"].append(file_name)
+                    if not record["title"] and file_name:
+                        record["title"] = file_name
+                    add_search_entry(record, event, "file", file_name)
+                continue
+
+            if event_type in TIMELINE_INDEX_TRACE_TYPES or key:
+                key = key or f"turn:seq-{seq}"
+                record = ensure_record(key, "trace", event)
+                if event_type == "tool_started":
+                    record["tool_count"] += 1
+                elif event_type == "reasoning_summary":
+                    record["thought_count"] += 1
+                text = timeline_index_event_text(event)
+                if text and not record.get("trace_preview"):
+                    record["trace_preview"] = text
+                if event_type == "reasoning_summary":
+                    add_search_entry(record, event, "trace")
+                continue
+
+            text = timeline_index_event_text(event)
+            record = ensure_record(f"event:{event.get('id') or seq}", "system", event)
+            record["title"] = compact_timeline_index_text(event_type.replace("_", " ").title() or "System", 72)
+            record["preview"] = text or record["title"]
+            add_search_entry(record, event, "system")
+        final_offset = source.tell()
+
+    landmarks: list[dict[str, Any]] = []
+    for stored in records:
+        file_names = list(stored.get("file_names") or [])
+        tool_count = int(stored.get("tool_count") or 0)
+        thought_count = int(stored.get("thought_count") or 0)
+        event_count = int(stored.get("event_count") or 0)
+        has_user = bool(stored.get("has_user"))
+        prompt = str(stored.get("prompt") or "")
+        trace_preview = str(stored.get("trace_preview") or "")
+        kind = "user" if has_user and stored["kind"] != "digest" else stored["kind"]
+        title = compact_timeline_index_text(
+            stored.get("title") or prompt or stored.get("preview") or trace_preview or
+            (file_names[0] if file_names else "Agent turn"),
+            72,
+        )
+        preview = compact_timeline_index_text(
+            stored.get("preview") or trace_preview or ", ".join(file_names) or prompt or title
+        )
+        meta_parts: list[str] = []
+        if tool_count:
+            meta_parts.append(f"{tool_count} tool{'s' if tool_count != 1 else ''}")
+        if thought_count:
+            meta_parts.append(f"{thought_count} thought{'s' if thought_count != 1 else ''}")
+        if file_names:
+            meta_parts.append(f"{len(file_names)} file{'s' if len(file_names) != 1 else ''}")
+        if kind == "job" and not meta_parts:
+            meta_parts.append(f"{event_count} update{'s' if event_count != 1 else ''}")
+        landmarks.append({
+            "key": stored["key"],
+            "kind": kind,
+            "start_seq": stored["start_seq"],
+            "end_seq": stored["end_seq"],
+            "title": title,
+            "preview": preview,
+            "meta": " · ".join(meta_parts),
+            "timestamp": stored.get("timestamp"),
+        })
+
+    payload = {
+        "session_id": session_id,
+        "landmarks": landmarks,
+        "latest_seq": latest_seq,
+        "event_count": visible_count,
+        "generated_at": now_iso(),
+    }
+    TIMELINE_INDEX_CACHE[session_id] = {
+        "signature": signature,
+        "payload": payload,
+        "records": records,
+        "active_turn_key": active_turn_key,
+        "current_turn_by_run": current_turn_by_run,
+        "visible_count": visible_count,
+        "latest_seq": latest_seq,
+        "offset": final_offset,
+        "inode": stat.st_ino,
+    }
+    TIMELINE_INDEX_CACHE.move_to_end(session_id)
+    while len(TIMELINE_INDEX_CACHE) > max(1, TIMELINE_INDEX_CACHE_MAX):
+        TIMELINE_INDEX_CACHE.popitem(last=False)
+    return payload
+
+
+def search_timeline_index(session_id: str, query: str, limit: int = 40) -> dict[str, Any]:
+    matches = re.findall(r'"([^"]+)"|(\S+)', query.strip())
+    tokens = [(phrase or word).casefold() for phrase, word in matches if phrase or word]
+    if not tokens:
+        return {"session_id": session_id, "query": query, "results": []}
+    lock = TIMELINE_INDEX_LOCKS.setdefault(session_id, threading.Lock())
+    with lock:
+        _build_timeline_index_locked(session_id)
+        cached = TIMELINE_INDEX_CACHE.get(session_id) or {}
+        entries = [
+            entry
+            for record in cached.get("records", [])
+            for entry in record.get("search_entries", [])
+            if all(token in str(entry.get("text") or "").casefold() for token in tokens)
+        ]
+    entries.sort(key=lambda entry: int(entry.get("seq") or 0), reverse=True)
+    results = [{
+        "session_id": session_id,
+        "event_id": entry.get("event_id"),
+        "seq": int(entry.get("seq") or 0),
+        "ts": entry.get("ts"),
+        "role": entry.get("role") or "system",
+        "snippet": timeline_search_snippet(str(entry.get("text") or ""), tokens),
+    } for entry in entries[: max(1, min(100, limit))]]
+    return {"session_id": session_id, "query": query, "results": results}
 
 
 def compact_import_text(text: str) -> str:
@@ -5347,6 +5719,8 @@ async def start_turn(
             started_payload["queued_id"] = queued_id
         run_metadata = {
             "purpose": req.purpose,
+            "job_id": req.job_id,
+            "job_title": req.job_title,
             "digest_job_id": req.digest_job_id,
             "target_session_id": req.target_session_id,
         }
@@ -5536,6 +5910,24 @@ async def create_session(req: CreateSessionRequest) -> dict[str, Any]:
     if should_import:
         await import_session_history(sess)
     return {"session": public_session(sess)}
+
+
+@app.get("/api/sessions/{session_id}/timeline-index")
+async def get_timeline_index(session_id: str) -> dict[str, Any]:
+    if session_id not in STORE.sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+    return await asyncio.to_thread(build_timeline_index, session_id)
+
+
+@app.get("/api/sessions/{session_id}/search")
+async def search_session_timeline(
+    session_id: str,
+    q: str = Query(min_length=2, max_length=500),
+    limit: int = Query(default=40, ge=1, le=100),
+) -> dict[str, Any]:
+    if session_id not in STORE.sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+    return await asyncio.to_thread(search_timeline_index, session_id, q, limit)
 
 
 @app.get("/api/sessions/{session_id}")

@@ -25,6 +25,7 @@ import re
 import shlex
 import shutil
 import signal
+import sqlite3
 import struct
 import subprocess
 import termios
@@ -367,6 +368,8 @@ EVENT_SEQ_LOCK = asyncio.Lock()
 TIMELINE_INDEX_CACHE_MAX = int(os.environ.get("ZENITHBOT_TIMELINE_INDEX_CACHE_MAX", "24"))
 TIMELINE_INDEX_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 TIMELINE_INDEX_LOCKS: dict[str, threading.Lock] = {}
+HISTORY_SEARCH_DB = STATE_DIR / "history_search.sqlite3"
+HISTORY_SEARCH_LOCK = threading.Lock()
 
 
 def last_event_seq_from_file(path: Path) -> int:
@@ -3015,6 +3018,23 @@ def timeline_search_snippet(text: str, tokens: list[str], limit: int = 260) -> s
     return ("…" if start else "") + compact[start:end].strip() + ("…" if end < len(compact) else "")
 
 
+def timeline_search_tokens(query: str) -> list[str]:
+    matches = re.findall(r'"([^"]+)"|(\S+)', query.strip())
+    return [(phrase or word).casefold() for phrase, word in matches if phrase or word]
+
+
+def timeline_search_fts_query(query: str) -> str:
+    matches = re.findall(r'"([^"]+)"|(\S+)', query.strip())
+    terms: list[str] = []
+    for phrase, word in matches:
+        value = (phrase or word).casefold()
+        if not value:
+            continue
+        escaped = value.replace('"', '""')
+        terms.append(f'"{escaped}"' if phrase else f'"{escaped}"*')
+    return " AND ".join(terms)
+
+
 def timeline_index_is_error(event: dict[str, Any]) -> bool:
     event_type = str(event.get("type") or "")
     if event_type in {"tool_started", "tool_finished", "raw_event"}:
@@ -3280,8 +3300,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
 
 
 def search_timeline_index(session_id: str, query: str, limit: int = 40) -> dict[str, Any]:
-    matches = re.findall(r'"([^"]+)"|(\S+)', query.strip())
-    tokens = [(phrase or word).casefold() for phrase, word in matches if phrase or word]
+    tokens = timeline_search_tokens(query)
     if not tokens:
         return {"session_id": session_id, "query": query, "results": []}
     lock = TIMELINE_INDEX_LOCKS.setdefault(session_id, threading.Lock())
@@ -3304,6 +3323,198 @@ def search_timeline_index(session_id: str, query: str, limit: int = 40) -> dict[
         "snippet": timeline_search_snippet(str(entry.get("text") or ""), tokens),
     } for entry in entries[: max(1, min(100, limit))]]
     return {"session_id": session_id, "query": query, "results": results}
+
+
+HISTORY_SEARCH_EVENT_TYPES = {
+    "turn_started", "assistant_text", "turn_finished", "reasoning_summary", "error",
+    "job_created", "job_ran", "job_started", "job_deferred", "job_finished", "job_error",
+    "artifact_created", "artifact_error", "file_uploaded",
+    "handoff_digest_started", "handoff_digest_ready", "handoff_digest_submitted", "handoff_digest_sent",
+}
+HISTORY_SEARCH_LINE_MARKERS = tuple(
+    f'"type":"{event_type}"'.encode("utf-8") for event_type in sorted(HISTORY_SEARCH_EVENT_TYPES)
+) + (b'_error"',)
+
+
+def history_search_event_record(event: dict[str, Any]) -> tuple[str, str] | None:
+    event_type = str(event.get("type") or "")
+    if event_type not in HISTORY_SEARCH_EVENT_TYPES and not event_type.endswith("_error"):
+        return None
+    if event_type in TIMELINE_INDEX_JOB_TYPES or event.get("job_id"):
+        role = "job"
+    elif timeline_index_is_error(event):
+        role = "error"
+    elif event_type == "turn_started":
+        role = "user"
+    elif event_type in {"assistant_text", "turn_finished"}:
+        role = "assistant"
+    elif event_type == "reasoning_summary":
+        role = "trace"
+    elif event_type in {"artifact_created", "file_uploaded"}:
+        role = "file"
+    else:
+        role = "system"
+
+    values = [timeline_search_event_text(event)]
+    job = event.get("job") if isinstance(event.get("job"), dict) else {}
+    values.extend((timeline_search_value(job.get("title")), timeline_search_value(job.get("prompt"))))
+    file_payload = event.get("artifact") or event.get("file")
+    if isinstance(file_payload, dict):
+        values.extend((timeline_search_value(file_payload.get("title")), timeline_search_value(file_payload.get("filename"))))
+    text = " ".join(dict.fromkeys(value for value in values if value)).strip()
+    return (role, text) if text else None
+
+
+def history_search_connection() -> sqlite3.Connection:
+    ensure_dirs()
+    connection = sqlite3.connect(HISTORY_SEARCH_DB, timeout=30)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
+    connection.executescript("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS history_search USING fts5(
+            text,
+            session_id UNINDEXED,
+            event_id UNINDEXED,
+            seq UNINDEXED,
+            ts UNINDEXED,
+            role UNINDEXED,
+            tokenize='unicode61 remove_diacritics 2'
+        );
+        CREATE TABLE IF NOT EXISTS history_search_state (
+            session_id TEXT PRIMARY KEY,
+            inode INTEGER NOT NULL,
+            offset INTEGER NOT NULL,
+            mtime_ns INTEGER NOT NULL
+        );
+    """)
+    return connection
+
+
+def sync_history_search_index(connection: sqlite3.Connection) -> tuple[int, int]:
+    valid_session_ids = set(STORE.sessions)
+    indexed_events = 0
+    indexed_sessions = 0
+    state_rows = connection.execute("SELECT session_id FROM history_search_state").fetchall()
+    for (stale_id,) in state_rows:
+        if stale_id in valid_session_ids:
+            continue
+        connection.execute("DELETE FROM history_search WHERE session_id = ?", (stale_id,))
+        connection.execute("DELETE FROM history_search_state WHERE session_id = ?", (stale_id,))
+    connection.commit()
+
+    insert = "INSERT INTO history_search(text, session_id, event_id, seq, ts, role) VALUES (?, ?, ?, ?, ?, ?)"
+    update_state = """
+        INSERT INTO history_search_state(session_id, inode, offset, mtime_ns) VALUES (?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+            inode = excluded.inode, offset = excluded.offset, mtime_ns = excluded.mtime_ns
+    """
+    for session_id in valid_session_ids:
+        path = events_path(session_id)
+        if not path.exists():
+            continue
+        stat = path.stat()
+        state = connection.execute(
+            "SELECT inode, offset FROM history_search_state WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        offset = int(state[1]) if state else 0
+        if state and (int(state[0]) != stat.st_ino or stat.st_size < offset):
+            connection.execute("DELETE FROM history_search WHERE session_id = ?", (session_id,))
+            connection.execute("DELETE FROM history_search_state WHERE session_id = ?", (session_id,))
+            connection.commit()
+            offset = 0
+        if stat.st_size <= offset:
+            continue
+
+        indexed_sessions += 1
+        pending: list[tuple[str, str, str, int, str | None, str]] = []
+        committed_offset = offset
+        with path.open("rb") as source:
+            source.seek(offset)
+            while True:
+                line_start = source.tell()
+                raw_line = source.readline()
+                if not raw_line:
+                    break
+                if not raw_line.endswith(b"\n"):
+                    source.seek(line_start)
+                    break
+                committed_offset = source.tell()
+                if not any(marker in raw_line for marker in HISTORY_SEARCH_LINE_MARKERS):
+                    continue
+                with suppress(Exception):
+                    event = json.loads(raw_line.decode("utf-8", "replace"))
+                    record = history_search_event_record(event)
+                    if record:
+                        role, text = record
+                        pending.append((
+                            text,
+                            session_id,
+                            str(event.get("id") or event.get("seq") or uuid.uuid4().hex),
+                            int(event.get("seq") or 0),
+                            event.get("ts"),
+                            role,
+                        ))
+                if len(pending) >= 1000:
+                    connection.executemany(insert, pending)
+                    indexed_events += len(pending)
+                    pending.clear()
+                    connection.execute(update_state, (session_id, stat.st_ino, committed_offset, stat.st_mtime_ns))
+                    connection.commit()
+        if pending:
+            connection.executemany(insert, pending)
+            indexed_events += len(pending)
+        connection.execute(update_state, (session_id, stat.st_ino, committed_offset, stat.st_mtime_ns))
+        connection.commit()
+    return indexed_sessions, indexed_events
+
+
+def search_all_timelines(query: str, limit: int = 40) -> dict[str, Any]:
+    tokens = timeline_search_tokens(query)
+    if not tokens:
+        return {"query": query, "results": []}
+    fts_query = timeline_search_fts_query(query)
+    started = time.monotonic()
+    with HISTORY_SEARCH_LOCK:
+        connection = history_search_connection()
+        try:
+            indexed_sessions, indexed_events = sync_history_search_index(connection)
+            rows = connection.execute("""
+                WITH ranked AS (
+                    SELECT session_id, event_id, seq, ts, role, text,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY session_id ORDER BY COALESCE(ts, '') DESC, CAST(seq AS INTEGER) DESC
+                           ) AS match_rank,
+                           COUNT(*) OVER (PARTITION BY session_id) AS match_count
+                    FROM history_search
+                    WHERE history_search MATCH ?
+                )
+                SELECT session_id, event_id, seq, ts, role, text, match_count
+                FROM ranked
+                WHERE match_rank = 1
+                ORDER BY COALESCE(ts, '') DESC, CAST(seq AS INTEGER) DESC
+                LIMIT ?
+            """, (fts_query, max(1, min(100, limit)))).fetchall()
+        finally:
+            connection.close()
+    if indexed_sessions or indexed_events:
+        logger.info(
+            "history search index synced sessions=%s events=%s elapsed=%.2fs",
+            indexed_sessions,
+            indexed_events,
+            time.monotonic() - started,
+        )
+    return {
+        "query": query,
+        "results": [{
+            "session_id": row[0],
+            "event_id": row[1],
+            "seq": int(row[2] or 0),
+            "ts": row[3],
+            "role": row[4] or "system",
+            "snippet": timeline_search_snippet(str(row[5] or ""), tokens),
+            "match_count": int(row[6] or 1),
+        } for row in rows],
+    }
 
 
 def compact_import_text(text: str) -> str:
@@ -6095,6 +6306,14 @@ async def list_sessions() -> dict[str, Any]:
     await STORE.ensure_sort_orders()
     sessions = [public_session(s) for s in sorted_sessions(list(STORE.sessions.values()))]
     return {"sessions": sessions}
+
+
+@app.get("/api/search")
+async def search_all_session_timelines(
+    q: str = Query(min_length=2, max_length=500),
+    limit: int = Query(default=40, ge=1, le=100),
+) -> dict[str, Any]:
+    return await asyncio.to_thread(search_all_timelines, q, limit)
 
 
 @app.post("/api/sessions")

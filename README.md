@@ -289,12 +289,25 @@ Run these as the same Unix user that owns the systemd service. If the CLI works
 in your login shell but fails under systemd, check the service `PATH`, virtual
 environment, and any provider-specific auth/config files.
 
+## Whole-History Search
+
+`GET /api/search?q=<query>&limit=<chat-count>` searches user, assistant, error,
+job, reasoning-summary, and file text across every chat. Quoted phrases remain
+phrases; unquoted terms use prefix matching for responsive type-ahead search.
+
+The first request incrementally builds `history_search.sqlite3` inside the
+agent state directory. Each transcript stores its indexed byte offset, so later
+requests ingest only newly appended JSONL records. The index is persistent and
+safe across server restarts; a replaced or truncated transcript is rebuilt
+automatically. Indexing runs in a worker thread and does not block agent turns.
+
 ## Public API Sketch
 
 The server exposes JSON endpoints under `/api`.
 
 - `GET /api/health`
 - `GET /api/sessions`
+- `GET /api/search`
 - `POST /api/sessions`
 - `PATCH /api/sessions/{session_id}`
 - `GET /api/sessions/{session_id}/events`

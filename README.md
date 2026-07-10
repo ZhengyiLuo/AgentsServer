@@ -23,6 +23,9 @@ machine paths.
   pack is only internal source material.
 - Runs recurring/loop jobs per chat with host load/memory guardrails.
 - Provides optional live process and tmux-pane inspection for active work.
+- Hosts one persistent interactive tmux terminal per chat. Clients attach over
+  an authenticated PTY WebSocket; disconnecting a client does not stop the
+  tmux session, its panes, or processes.
 - Discovers available runtime models/efforts from the installed CLI tools when
   possible.
 
@@ -31,7 +34,7 @@ machine paths.
 - Linux or macOS host with Python 3.10+.
 - `uv` recommended for the runtime environment.
 - Claude CLI and/or Codex CLI installed and authenticated on the agent host.
-- `tmux` if you want terminal/session inspection.
+- `tmux` for persistent chat terminals and tmux-pane inspection.
 - Tailscale on the agent host and each client device if you want to use the
   server from another Mac, iPhone, or iPad.
 - Optional: a user-level `systemd` service on Linux.

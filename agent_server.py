@@ -12,17 +12,22 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
+import fcntl
 import hashlib
 import hmac
 import json
 import logging
 import mmap
 import os
+import pty
 import re
 import shlex
 import shutil
 import signal
+import struct
 import subprocess
+import termios
 import threading
 import time
 import uuid
@@ -130,7 +135,7 @@ HANDOFF_DIGEST_EFFORT = os.environ.get("ZENITHBOT_HANDOFF_DIGEST_EFFORT", "").st
 DEFAULT_SESSION_EVENT_LIMIT = int(os.environ.get("ZENITHBOT_SESSION_EVENT_LIMIT", "100"))
 MAX_EVENT_RESPONSE_LIMIT = int(os.environ.get("ZENITHBOT_MAX_EVENT_RESPONSE_LIMIT", "1000"))
 AGENT_TOKEN = os.environ.get("ZENITHDOCK_AGENT_TOKEN") or os.environ.get("ZENITHBOT_AGENT_TOKEN") or ""
-API_CONTRACT_VERSION = 4
+API_CONTRACT_VERSION = 5
 SESSION_ORDER_STEP = 1000.0
 
 SYSTEM_PROMPT = """\
@@ -547,6 +552,11 @@ class TerminalInputRequest(BaseModel):
 class TerminalResizeRequest(BaseModel):
     columns: int = 100
     rows: int = 30
+
+
+class TerminalActionRequest(BaseModel):
+    action: str
+    target: str | None = None
 
 
 class CreateJobRequest(BaseModel):
@@ -1177,6 +1187,11 @@ LIVE_STDOUT_MAX_LINES = 400
 LIVE_STDOUT_MAX_LINE_CHARS = 12_000
 TMUX_CAPTURE_MAX_LINES = 2_000
 TMUX_COMMAND_TIMEOUT_SECONDS = 4
+TERMINAL_MIN_COLUMNS = 40
+TERMINAL_MAX_COLUMNS = 500
+TERMINAL_MIN_ROWS = 12
+TERMINAL_MAX_ROWS = 200
+TERMINAL_READ_BYTES = 64 * 1024
 
 
 def run_event_metadata(run_id: str) -> dict[str, Any]:
@@ -1920,7 +1935,24 @@ def tmux_session_exists(name: str) -> bool:
     return run_tmux(["has-session", "-t", name], check=False).returncode == 0
 
 
-def ensure_terminal_session(session_id: str, cwd: str | None = None) -> dict[str, Any]:
+def terminal_dimensions(columns: int | None = None, rows: int | None = None) -> tuple[int, int]:
+    cols = max(TERMINAL_MIN_COLUMNS, min(int(columns or 120), TERMINAL_MAX_COLUMNS))
+    lines = max(TERMINAL_MIN_ROWS, min(int(rows or 36), TERMINAL_MAX_ROWS))
+    return cols, lines
+
+
+def set_pty_dimensions(fd: int, columns: int, rows: int) -> None:
+    cols, lines = terminal_dimensions(columns, rows)
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", lines, cols, 0, 0))
+
+
+def ensure_terminal_session(
+    session_id: str,
+    cwd: str | None = None,
+    *,
+    columns: int | None = None,
+    rows: int | None = None,
+) -> dict[str, Any]:
     sess = STORE.sessions.get(session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="session not found")
@@ -1928,9 +1960,97 @@ def ensure_terminal_session(session_id: str, cwd: str | None = None) -> dict[str
     created = False
     if not tmux_session_exists(name):
         workdir = existing_cwd(cwd or sess.get("cwd") or DEFAULT_CWD)
-        run_tmux(["new-session", "-d", "-s", name, "-c", workdir])
+        cols, lines = terminal_dimensions(columns, rows)
+        run_tmux(["new-session", "-d", "-s", name, "-x", str(cols), "-y", str(lines), "-c", workdir])
         created = True
+    # These are session-scoped defaults. Existing user-created windows and
+    # panes remain untouched while newly created panes keep useful history.
+    run_tmux(["set-option", "-t", name, "history-limit", "100000"], check=False)
+    run_tmux(["set-option", "-t", name, "mouse", "on"], check=False)
+    run_tmux(["set-option", "-t", name, "window-size", "latest"], check=False)
     return terminal_snapshot(session_id, created=created)
+
+
+def spawn_terminal_client(
+    session_id: str,
+    cwd: str | None,
+    columns: int,
+    rows: int,
+) -> tuple[subprocess.Popen[bytes], int, str]:
+    snapshot = ensure_terminal_session(session_id, cwd, columns=columns, rows=rows)
+    name = str(snapshot["name"])
+    workdir = existing_cwd(snapshot.get("cwd") or cwd or STORE.sessions[session_id].get("cwd") or DEFAULT_CWD)
+    master_fd, slave_fd = pty.openpty()
+    env = os.environ.copy()
+    # A server launched from tmux must still be able to attach a child client.
+    # Keeping these variables makes tmux reject the nested attachment.
+    env.pop("TMUX", None)
+    env.pop("TMUX_PANE", None)
+    env["TERM"] = "xterm-256color"
+    env["COLORTERM"] = "truecolor"
+    env.setdefault("LANG", "C.UTF-8")
+    try:
+        set_pty_dimensions(slave_fd, columns, rows)
+        process = subprocess.Popen(
+            [tmux_bin(), "attach-session", "-t", name],
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            cwd=workdir,
+            env=env,
+            close_fds=True,
+            start_new_session=True,
+        )
+    except Exception:
+        os.close(master_fd)
+        raise
+    finally:
+        os.close(slave_fd)
+    return process, master_fd, name
+
+
+def write_terminal_input(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError(errno.EIO, "terminal input closed")
+        view = view[written:]
+
+
+async def read_terminal_output(fd: int) -> bytes:
+    loop = asyncio.get_running_loop()
+    ready: asyncio.Future[bytes] = loop.create_future()
+
+    def on_readable() -> None:
+        if ready.done():
+            return
+        try:
+            ready.set_result(os.read(fd, TERMINAL_READ_BYTES))
+        except OSError as exc:
+            ready.set_exception(exc)
+
+    loop.add_reader(fd, on_readable)
+    try:
+        return await ready
+    finally:
+        loop.remove_reader(fd)
+
+
+def stop_terminal_client(process: subprocess.Popen[bytes], master_fd: int) -> None:
+    with suppress(OSError):
+        os.close(master_fd)
+    if process.poll() is not None:
+        return
+    with suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGTERM)
+    try:
+        process.wait(timeout=1.5)
+    except subprocess.TimeoutExpired:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        with suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=1)
 
 
 def terminal_snapshot(session_id: str, *, lines: int = 240, created: bool = False) -> dict[str, Any]:
@@ -2021,6 +2141,71 @@ def kill_terminal_session(session_id: str) -> dict[str, Any]:
         "text": "",
         "updated_at": now_iso(),
     }
+
+
+def terminal_windows_snapshot(session_id: str) -> dict[str, Any]:
+    if session_id not in STORE.sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+    name = terminal_session_name(session_id)
+    if not tmux_session_exists(name):
+        return {"session_id": session_id, "name": name, "exists": False, "windows": []}
+    result = run_tmux([
+        "list-windows",
+        "-t",
+        name,
+        "-F",
+        "#{window_id}\t#{window_index}\t#{window_name}\t#{window_active}\t#{window_panes}",
+    ])
+    windows: list[dict[str, Any]] = []
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 5:
+            continue
+        windows.append({
+            "id": parts[0],
+            "index": int(parts[1]) if parts[1].isdigit() else 0,
+            "name": parts[2] or "shell",
+            "active": parts[3] == "1",
+            "panes": int(parts[4]) if parts[4].isdigit() else 1,
+        })
+    return {"session_id": session_id, "name": name, "exists": True, "windows": windows}
+
+
+def terminal_action(session_id: str, action: str, target: str | None = None) -> dict[str, Any]:
+    if session_id not in STORE.sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+    name = terminal_session_name(session_id)
+    if not tmux_session_exists(name):
+        ensure_terminal_session(session_id)
+    clean_action = str(action or "").strip().lower()
+    active_cwd = run_tmux(
+        ["display-message", "-p", "-t", name, "#{pane_current_path}"],
+        check=False,
+    ).stdout.strip()
+    workdir = existing_cwd(active_cwd or STORE.sessions[session_id].get("cwd") or DEFAULT_CWD)
+    if clean_action == "new-window":
+        run_tmux(["new-window", "-t", name, "-c", workdir])
+    elif clean_action == "split-right":
+        run_tmux(["split-window", "-h", "-t", name, "-c", workdir])
+    elif clean_action == "split-down":
+        run_tmux(["split-window", "-v", "-t", name, "-c", workdir])
+    elif clean_action == "next-window":
+        run_tmux(["next-window", "-t", name])
+    elif clean_action == "previous-window":
+        run_tmux(["previous-window", "-t", name])
+    elif clean_action == "select-window":
+        clean_target = str(target or "").strip()
+        if not re.fullmatch(r"\d+", clean_target):
+            raise HTTPException(status_code=400, detail="invalid tmux window")
+        run_tmux(["select-window", "-t", f"{name}:{clean_target}"])
+    elif clean_action == "kill-pane":
+        pane_count = run_tmux(["list-panes", "-t", name, "-F", "#{pane_id}"]).stdout.splitlines()
+        if len(pane_count) <= 1:
+            raise HTTPException(status_code=409, detail="This is the last pane. Kill the terminal session instead.")
+        run_tmux(["kill-pane", "-t", name])
+    else:
+        raise HTTPException(status_code=400, detail="unsupported terminal action")
+    return terminal_windows_snapshot(session_id)
 
 
 TMUX_SUBMITTER_KEYWORDS = (
@@ -5841,6 +6026,16 @@ async def resize_session_terminal(session_id: str, req: TerminalResizeRequest) -
     return await asyncio.to_thread(resize_terminal_pane, session_id, req.columns, req.rows)
 
 
+@app.get("/api/sessions/{session_id}/terminal/windows")
+async def get_session_terminal_windows(session_id: str) -> dict[str, Any]:
+    return await asyncio.to_thread(terminal_windows_snapshot, session_id)
+
+
+@app.post("/api/sessions/{session_id}/terminal/action")
+async def run_session_terminal_action(session_id: str, req: TerminalActionRequest) -> dict[str, Any]:
+    return await asyncio.to_thread(terminal_action, session_id, req.action, req.target)
+
+
 @app.delete("/api/sessions/{session_id}/terminal")
 async def delete_session_terminal(session_id: str) -> dict[str, Any]:
     return await asyncio.to_thread(kill_terminal_session, session_id)
@@ -6250,6 +6445,100 @@ async def delete_job(job_id: str) -> dict[str, Any]:
 @app.post("/api/jobs/{job_id}/run")
 async def run_job(job_id: str) -> dict[str, Any]:
     return await JOBS.run_job(job_id)
+
+
+@app.websocket("/api/sessions/{session_id}/terminal/ws")
+async def session_terminal(
+    session_id: str,
+    ws: WebSocket,
+    columns: int = 120,
+    rows: int = 36,
+    cwd: str | None = None,
+) -> None:
+    if not websocket_authorized(ws):
+        await ws.close(code=4401)
+        return
+    if session_id not in STORE.sessions:
+        await ws.close(code=4404)
+        return
+
+    cols, lines = terminal_dimensions(columns, rows)
+    await ws.accept()
+    process: subprocess.Popen[bytes] | None = None
+    master_fd: int | None = None
+    try:
+        process, master_fd, name = await asyncio.to_thread(
+            spawn_terminal_client,
+            session_id,
+            cwd,
+            cols,
+            lines,
+        )
+        await ws.send_json({
+            "type": "ready",
+            "session_id": session_id,
+            "name": name,
+            "columns": cols,
+            "rows": lines,
+        })
+
+        async def pump_output() -> None:
+            assert master_fd is not None
+            while True:
+                try:
+                    data = await read_terminal_output(master_fd)
+                except OSError as exc:
+                    if exc.errno in {errno.EIO, errno.EBADF}:
+                        return
+                    raise
+                if not data:
+                    return
+                await ws.send_bytes(data)
+
+        async def receive_input() -> None:
+            assert master_fd is not None
+            while True:
+                message = await ws.receive()
+                if message["type"] == "websocket.disconnect":
+                    return
+                data = message.get("bytes")
+                if data:
+                    write_terminal_input(master_fd, data)
+                    continue
+                text = message.get("text")
+                if not text:
+                    continue
+                try:
+                    control = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                if control.get("type") == "resize":
+                    next_cols, next_rows = terminal_dimensions(control.get("columns"), control.get("rows"))
+                    set_pty_dimensions(master_fd, next_cols, next_rows)
+
+        output_task = asyncio.create_task(pump_output())
+        input_task = asyncio.create_task(receive_input())
+        done, pending = await asyncio.wait(
+            {output_task, input_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            with suppress(WebSocketDisconnect, RuntimeError, OSError):
+                task.result()
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logger.warning("terminal websocket failed session=%s error=%s", session_id, exc)
+        with suppress(RuntimeError):
+            await ws.send_json({"type": "error", "message": str(exc)[:1000]})
+    finally:
+        if process is not None and master_fd is not None:
+            await asyncio.to_thread(stop_terminal_client, process, master_fd)
+        with suppress(RuntimeError):
+            await ws.close()
 
 
 @app.websocket("/api/sessions/{session_id}/events")

@@ -66,6 +66,7 @@ STATE_DIR = Path(os.environ.get("ZENITHBOT_AGENT_DIR", Path.home() / ".zenithbot
 SESSIONS_FILE = STATE_DIR / "sessions.json"
 JOBS_FILE = STATE_DIR / "jobs.json"
 FILES_ROOT = STATE_DIR / "files"
+CODE_DIFFS_ROOT = STATE_DIR / "code_diffs"
 HOST_HEALTH_FILE = STATE_DIR / "host_health.jsonl"
 CLAUDE_PROJECTS_ROOT = Path(os.environ.get("CLAUDE_PROJECTS_ROOT", Path.home() / ".claude" / "projects"))
 CODEX_SESSIONS_ROOT = Path(os.environ.get("CODEX_SESSIONS_ROOT", Path.home() / ".codex" / "sessions"))
@@ -136,8 +137,9 @@ HANDOFF_DIGEST_EFFORT = os.environ.get("ZENITHBOT_HANDOFF_DIGEST_EFFORT", "").st
 DEFAULT_SESSION_EVENT_LIMIT = int(os.environ.get("ZENITHBOT_SESSION_EVENT_LIMIT", "100"))
 MAX_EVENT_RESPONSE_LIMIT = int(os.environ.get("ZENITHBOT_MAX_EVENT_RESPONSE_LIMIT", "1000"))
 AGENT_TOKEN = os.environ.get("ZENITHDOCK_AGENT_TOKEN") or os.environ.get("ZENITHBOT_AGENT_TOKEN") or ""
-API_CONTRACT_VERSION = 5
+API_CONTRACT_VERSION = 6
 SESSION_ORDER_STEP = 1000.0
+CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS = int(os.environ.get("ZENITHBOT_CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS", "120"))
 
 SYSTEM_PROMPT = """\
 You are responding through Zenith Dock, a native Mac frontend for Zenithbot.
@@ -206,13 +208,10 @@ Turn lifecycle and background work:
   later instead of implying you will keep running.
 
 Code changes and diffs:
-- When you edit code or configuration, leave a machine-readable diff trace for
-  the UI. After the edits and validation, run `git diff --stat` and then a
-  bounded unified diff such as `git diff -- <changed paths> | sed -n '1,240p'`.
-- If the repository is not a git checkout, show the equivalent patch or changed
-  file snippets with clear `---`, `+++`, and `@@` diff hunks.
-- Do not put the whole diff in the final answer unless the user asks. The UI
-  reads it from the tool trace and renders a review card.
+- Validate code changes normally, but do not print a full repository diff just
+  for Zenith Dock. The server captures the complete per-turn Git diff directly.
+- A short `git diff --stat` is useful when it helps explain validation. Keep the
+  final answer focused unless the user explicitly asks to see the patch inline.
 
 Files and artifacts:
 - User uploads are available as local paths in the prompt.
@@ -330,6 +329,10 @@ def manifests_dir(session_id: str) -> Path:
     return session_dir(session_id) / "manifests"
 
 
+def code_diffs_dir(session_id: str) -> Path:
+    return CODE_DIFFS_ROOT / session_id
+
+
 def existing_cwd(requested: str | None) -> str:
     candidates = [requested, DEFAULT_CWD, str(Path.home()), "/tmp"]
     for candidate in candidates:
@@ -357,10 +360,191 @@ def server_identity() -> str:
 def ensure_dirs(session_id: str | None = None) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     FILES_ROOT.mkdir(parents=True, exist_ok=True)
+    CODE_DIFFS_ROOT.mkdir(parents=True, exist_ok=True)
     if session_id:
         session_dir(session_id).mkdir(parents=True, exist_ok=True)
         uploads_dir(session_id).mkdir(parents=True, exist_ok=True)
         manifests_dir(session_id).mkdir(parents=True, exist_ok=True)
+        code_diffs_dir(session_id).mkdir(parents=True, exist_ok=True)
+
+
+def _git_command(
+    repo_root: str,
+    args: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    stdout: Any = subprocess.PIPE,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-c", "core.quotePath=false", "-C", repo_root, *args],
+        stdin=subprocess.DEVNULL,
+        stdout=stdout,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        timeout=CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS,
+        check=False,
+    )
+
+
+def _capture_git_tree(session_id: str, run_id: str, cwd: str) -> dict[str, str] | None:
+    """Snapshot the worktree through a temporary index without touching the real index."""
+    try:
+        probe = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    repo_root = probe.stdout.strip()
+    if probe.returncode != 0 or not repo_root:
+        return None
+
+    ensure_dirs(session_id)
+    index_path = code_diffs_dir(session_id) / f".{safe_name(run_id)}-{uuid.uuid4().hex}.index"
+    env = dict(os.environ)
+    env["GIT_INDEX_FILE"] = str(index_path)
+    try:
+        seeded_from_index = False
+        index_probe = _git_command(repo_root, ["rev-parse", "--git-path", "index"])
+        source_index = Path(index_probe.stdout.strip()) if index_probe.returncode == 0 else Path()
+        if source_index and not source_index.is_absolute():
+            source_index = Path(repo_root) / source_index
+        if source_index.is_file():
+            shutil.copy2(source_index, index_path)
+            seeded_from_index = True
+        else:
+            head = _git_command(repo_root, ["rev-parse", "--verify", "HEAD"])
+            read_args = ["read-tree", head.stdout.strip()] if head.returncode == 0 and head.stdout.strip() else ["read-tree", "--empty"]
+            if _git_command(repo_root, read_args, env=env).returncode != 0:
+                return None
+        staged = _git_command(repo_root, ["add", "-A", "--", "."], env=env)
+        if staged.returncode != 0 and seeded_from_index:
+            with suppress(OSError):
+                index_path.unlink()
+            head = _git_command(repo_root, ["rev-parse", "--verify", "HEAD"])
+            read_args = ["read-tree", head.stdout.strip()] if head.returncode == 0 and head.stdout.strip() else ["read-tree", "--empty"]
+            if _git_command(repo_root, read_args, env=env).returncode == 0:
+                staged = _git_command(repo_root, ["add", "-A", "--", "."], env=env)
+        if staged.returncode != 0:
+            logger.info(
+                "code diff snapshot skipped session=%s run=%s: %s",
+                session_id,
+                run_id,
+                staged.stderr.strip()[:500],
+            )
+            return None
+        tree = _git_command(repo_root, ["write-tree"], env=env)
+        tree_id = tree.stdout.strip()
+        if tree.returncode != 0 or not tree_id:
+            return None
+        return {"repo_root": repo_root, "tree": tree_id}
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.info("code diff snapshot failed session=%s run=%s error=%s", session_id, run_id, exc)
+        return None
+    finally:
+        with suppress(OSError):
+            index_path.unlink()
+        with suppress(OSError):
+            Path(f"{index_path}.lock").unlink()
+
+
+def _parse_git_numstat(source: str) -> list[dict[str, Any]]:
+    files: list[dict[str, Any]] = []
+    for raw_line in source.splitlines():
+        parts = raw_line.split("\t", 2)
+        if len(parts) != 3:
+            continue
+        added_raw, deleted_raw, path = parts
+        added = int(added_raw) if added_raw.isdigit() else None
+        deleted = int(deleted_raw) if deleted_raw.isdigit() else None
+        files.append({
+            "path": path.strip(),
+            "additions": added,
+            "deletions": deleted,
+            "binary": added is None or deleted is None,
+        })
+    return files
+
+
+def _write_turn_code_diff(
+    session_id: str,
+    run_id: str,
+    backend: str,
+    baseline: dict[str, str],
+    cwd: str,
+) -> dict[str, Any] | None:
+    current = _capture_git_tree(session_id, run_id, cwd)
+    if not current or current.get("repo_root") != baseline.get("repo_root"):
+        return None
+    base_tree = str(baseline.get("tree") or "")
+    current_tree = str(current.get("tree") or "")
+    if not base_tree or not current_tree or base_tree == current_tree:
+        return None
+
+    repo_root = str(current["repo_root"])
+    diff_root = code_diffs_dir(session_id)
+    patch_path = diff_root / f"{safe_name(run_id)}.patch"
+    patch_tmp = diff_root / f".{safe_name(run_id)}-{uuid.uuid4().hex}.patch"
+    try:
+        with patch_tmp.open("w", encoding="utf-8") as output:
+            patch = _git_command(
+                repo_root,
+                ["diff", "--no-ext-diff", "--no-textconv", "--find-renames", "--unified=3", base_tree, current_tree, "--"],
+                stdout=output,
+            )
+        if patch.returncode != 0 or patch_tmp.stat().st_size == 0:
+            with suppress(OSError):
+                patch_tmp.unlink()
+            return None
+        patch_tmp.replace(patch_path)
+        numstat = _git_command(repo_root, ["diff", "--numstat", "--find-renames", base_tree, current_tree, "--"])
+        files = _parse_git_numstat(numstat.stdout if numstat.returncode == 0 else "")
+        additions = sum(int(item["additions"] or 0) for item in files)
+        deletions = sum(int(item["deletions"] or 0) for item in files)
+        metadata = {
+            "run_id": run_id,
+            "backend": backend,
+            "repository_root": repo_root,
+            "diff_files": files,
+            "files_changed": len(files),
+            "additions": additions,
+            "deletions": deletions,
+            "byte_count": patch_path.stat().st_size,
+            "created_at": now_iso(),
+        }
+        metadata_path = diff_root / f"{safe_name(run_id)}.json"
+        metadata_tmp = diff_root / f".{safe_name(run_id)}-{uuid.uuid4().hex}.json"
+        metadata_tmp.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        metadata_tmp.replace(metadata_path)
+        return metadata
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("code diff capture failed session=%s run=%s error=%s", session_id, run_id, exc)
+        with suppress(OSError):
+            patch_tmp.unlink()
+        return None
+
+
+async def capture_git_baseline(session_id: str, run_id: str, cwd: str) -> dict[str, str] | None:
+    return await asyncio.to_thread(_capture_git_tree, session_id, run_id, cwd)
+
+
+async def publish_turn_code_diff(
+    session_id: str,
+    run_id: str,
+    backend: str,
+    cwd: str,
+    baseline: dict[str, str] | None,
+) -> None:
+    if not baseline:
+        return
+    metadata = await asyncio.to_thread(_write_turn_code_diff, session_id, run_id, backend, baseline, cwd)
+    if metadata:
+        await append_event(session_id, "code_diff", metadata)
 
 
 EVENT_SEQ_CACHE: dict[str, int] = {}
@@ -5538,6 +5722,7 @@ async def collect_recent_leftover_manifests(
 async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, Any], manifest_path: Path) -> None:
     requested_cwd = str(sess.get("cwd") or DEFAULT_CWD)
     cwd = existing_cwd(requested_cwd)
+    diff_baseline = await capture_git_baseline(session_id, run_id, cwd)
     resume_provider_id, resume_skip_message = resolve_claude_resume_provider(sess, cwd)
     cmd = build_claude_cmd(sess, manifest_path, provider_id=resume_provider_id)
     if str(Path(requested_cwd).expanduser()) != cwd:
@@ -5706,6 +5891,7 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
     result_text = clean_assistant_text(final_text or "\n\n".join(text_parts).strip())
     await collect_manifest(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts, final=True)
     await collect_recent_leftover_manifests(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts)
+    await publish_turn_code_diff(session_id, run_id, BACKEND_CLAUDE, cwd, diff_baseline)
     await append_event(session_id, "turn_finished", {
         "run_id": run_id,
         "backend": BACKEND_CLAUDE,
@@ -5730,10 +5916,13 @@ async def run_codex(
     manifest_path: Path,
     *,
     allow_compaction_rollover: bool = True,
+    diff_baseline: dict[str, str] | None = None,
 ) -> None:
     cmd = build_codex_cmd(sess, prompt, manifest_path)
     requested_cwd = str(sess.get("cwd") or DEFAULT_CWD)
     cwd = existing_cwd(requested_cwd)
+    if diff_baseline is None:
+        diff_baseline = await capture_git_baseline(session_id, run_id, cwd)
     if str(Path(requested_cwd).expanduser()) != cwd:
         await append_event(session_id, "cwd_fallback", {"run_id": run_id, "requested_cwd": requested_cwd, "cwd": cwd})
     await append_event(session_id, "process_started", {"run_id": run_id, "backend": BACKEND_CODEX, "argv": cmd[:-1] + ["<prompt>"], "cwd": cwd})
@@ -6027,6 +6216,7 @@ async def run_codex(
                 fresh_session,
                 manifest_path,
                 allow_compaction_rollover=False,
+                diff_baseline=diff_baseline,
             )
             return
     if stream_error and not stopped:
@@ -6044,6 +6234,7 @@ async def run_codex(
         await STORE.save_provider_session(session_id, provider_id, BACKEND_CODEX)
     await collect_manifest(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts, final=True)
     await collect_recent_leftover_manifests(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts)
+    await publish_turn_code_diff(session_id, run_id, BACKEND_CODEX, cwd, diff_baseline)
     await append_event(session_id, "turn_finished", {
         "run_id": run_id,
         "backend": BACKEND_CODEX,
@@ -6813,6 +7004,23 @@ async def session_events(session_id: str, ws: WebSocket, after: int = 0) -> None
         pass
     finally:
         await HUB.unsubscribe(session_id, ws)
+
+
+@app.get("/api/sessions/{session_id}/diffs/{run_id}")
+async def get_turn_code_diff(session_id: str, run_id: str) -> FileResponse:
+    if session_id not in STORE.sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", run_id or ""):
+        raise HTTPException(status_code=404, detail="code diff not found")
+    patch_path = code_diffs_dir(session_id) / f"{run_id}.patch"
+    if not patch_path.is_file():
+        raise HTTPException(status_code=404, detail="code diff not found")
+    return FileResponse(
+        patch_path,
+        media_type="text/x-diff; charset=utf-8",
+        filename=f"{run_id}.patch",
+        content_disposition_type="inline",
+    )
 
 
 @app.post("/api/sessions/{session_id}/files")

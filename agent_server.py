@@ -1971,6 +1971,9 @@ def ensure_terminal_session(
     run_tmux(["set-option", "-t", name, "history-limit", "100000"], check=False)
     run_tmux(["set-option", "-t", name, "mouse", "on"], check=False)
     run_tmux(["set-option", "-t", name, "window-size", "latest"], check=False)
+    # AgentsDock renders its own window tabs and terminal controls. The tmux
+    # status line would duplicate those controls and consume a row in the PTY.
+    run_tmux(["set-option", "-t", name, "status", "off"], check=False)
     return terminal_snapshot(session_id, created=created)
 
 

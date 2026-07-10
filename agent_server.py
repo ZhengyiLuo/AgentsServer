@@ -1969,7 +1969,15 @@ def ensure_terminal_session(
     # These are session-scoped defaults. Existing user-created windows and
     # panes remain untouched while newly created panes keep useful history.
     run_tmux(["set-option", "-t", name, "history-limit", "100000"], check=False)
-    run_tmux(["set-option", "-t", name, "mouse", "on"], check=False)
+    mouse_initialized = run_tmux(
+        ["show-options", "-qv", "-t", name, "@agentsdock_mouse_initialized"],
+        check=False,
+    ).stdout.strip()
+    if created or mouse_initialized != "1":
+        # Local selection is the useful default in an embedded terminal. Users
+        # can opt into tmux mouse capture from the terminal actions menu.
+        run_tmux(["set-option", "-t", name, "mouse", "off"], check=False)
+        run_tmux(["set-option", "-t", name, "@agentsdock_mouse_initialized", "1"], check=False)
     run_tmux(["set-option", "-t", name, "window-size", "latest"], check=False)
     # AgentsDock renders its own window tabs and terminal controls. The tmux
     # status line would duplicate those controls and consume a row in the PTY.
@@ -2154,7 +2162,7 @@ def terminal_windows_snapshot(session_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="session not found")
     name = terminal_session_name(session_id)
     if not tmux_session_exists(name):
-        return {"session_id": session_id, "name": name, "exists": False, "windows": []}
+        return {"session_id": session_id, "name": name, "exists": False, "mouse_enabled": False, "windows": []}
     result = run_tmux([
         "list-windows",
         "-t",
@@ -2174,7 +2182,14 @@ def terminal_windows_snapshot(session_id: str) -> dict[str, Any]:
             "active": parts[3] == "1",
             "panes": int(parts[4]) if parts[4].isdigit() else 1,
         })
-    return {"session_id": session_id, "name": name, "exists": True, "windows": windows}
+    mouse = run_tmux(["show-options", "-qv", "-t", name, "mouse"], check=False).stdout.strip()
+    return {
+        "session_id": session_id,
+        "name": name,
+        "exists": True,
+        "mouse_enabled": mouse == "on",
+        "windows": windows,
+    }
 
 
 def terminal_action(session_id: str, action: str, target: str | None = None) -> dict[str, Any]:
@@ -2222,6 +2237,10 @@ def terminal_action(session_id: str, action: str, target: str | None = None) -> 
         if len(pane_count) <= 1:
             raise HTTPException(status_code=409, detail="This is the last pane. Kill the terminal session instead.")
         run_tmux(["kill-pane", "-t", name])
+    elif clean_action == "toggle-mouse":
+        current = run_tmux(["show-options", "-qv", "-t", name, "mouse"], check=False).stdout.strip()
+        run_tmux(["set-option", "-t", name, "mouse", "off" if current == "on" else "on"])
+        run_tmux(["set-option", "-t", name, "@agentsdock_mouse_initialized", "1"], check=False)
     else:
         raise HTTPException(status_code=400, detail="unsupported terminal action")
     return terminal_windows_snapshot(session_id)

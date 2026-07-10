@@ -25,7 +25,9 @@ machine paths.
 - Provides optional live process and tmux-pane inspection for active work.
 - Hosts one persistent interactive tmux terminal per chat. Clients attach over
   an authenticated PTY WebSocket; disconnecting a client does not stop the
-  tmux session, its panes, or processes.
+  tmux session, its panes, or processes. Structured actions create, select,
+  split, and close individual windows while guarding the final persistent
+  window from accidental destruction.
 - Discovers available runtime models/efforts from the installed CLI tools when
   possible.
 

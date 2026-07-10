@@ -2201,6 +2201,19 @@ def terminal_action(session_id: str, action: str, target: str | None = None) -> 
         if not re.fullmatch(r"\d+", clean_target):
             raise HTTPException(status_code=400, detail="invalid tmux window")
         run_tmux(["select-window", "-t", f"{name}:{clean_target}"])
+    elif clean_action == "kill-window":
+        clean_target = str(target or "").strip()
+        if not re.fullmatch(r"\d+", clean_target):
+            raise HTTPException(status_code=400, detail="invalid tmux window")
+        windows = terminal_windows_snapshot(session_id)["windows"]
+        if len(windows) <= 1:
+            raise HTTPException(
+                status_code=409,
+                detail="This is the final window. Kill the terminal session instead.",
+            )
+        if not any(str(window["index"]) == clean_target for window in windows):
+            raise HTTPException(status_code=404, detail="tmux window not found")
+        run_tmux(["kill-window", "-t", f"{name}:{clean_target}"])
     elif clean_action == "kill-pane":
         pane_count = run_tmux(["list-panes", "-t", name, "-F", "#{pane_id}"]).stdout.splitlines()
         if len(pane_count) <= 1:

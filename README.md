@@ -250,6 +250,7 @@ Most settings are environment variables:
 | `ZENITHBOT_HANDOFF_DIGEST_EFFORT` | Optional digest reasoning/effort setting | unset |
 | `ZENITHBOT_HANDOFF_DIGEST_TIMEOUT_SECONDS` | Digest summarizer timeout | `180` |
 | `ZENITHBOT_HANDOFF_DIGEST_CHARS` | Final digest character cap | `56000` |
+| `ZENITHBOT_CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS` | Maximum time for each isolated Git worktree snapshot | `120` |
 
 ## Context Digests
 
@@ -303,6 +304,24 @@ requests ingest only newly appended JSONL records. The index is persistent and
 safe across server restarts; a replaced or truncated transcript is rebuilt
 automatically. Indexing runs in a worker thread and does not block agent turns.
 
+## Per-Turn Code Review
+
+For Git worktrees, the server snapshots the repository immediately before and
+after each agent turn through an isolated temporary index. This captures the
+complete turn-specific textual patch without modifying the user's real index
+or folding pre-existing dirty changes into the review.
+
+The append-only timeline stores only a compact `code_diff` event with file and
+line-count metadata. Clients fetch the complete patch on demand:
+
+```text
+GET /api/sessions/{session_id}/diffs/{run_id}
+```
+
+The endpoint uses the same bearer-token authentication as the rest of the API.
+Binary changes remain compact Git binary markers rather than being copied into
+the event log.
+
 ## Public API Sketch
 
 The server exposes JSON endpoints under `/api`.
@@ -318,6 +337,7 @@ The server exposes JSON endpoints under `/api`.
 - `POST /api/sessions/{session_id}/fork`
 - `POST /api/sessions/{session_id}/digest`
 - `GET /api/sessions/{session_id}/files`
+- `GET /api/sessions/{session_id}/diffs/{run_id}`
 - `POST /api/sessions/{session_id}/upload`
 - `GET /api/sessions/{session_id}/processes`
 - `GET /api/sessions/{session_id}/tmux`

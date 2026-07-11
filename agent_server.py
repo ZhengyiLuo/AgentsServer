@@ -2324,6 +2324,38 @@ def resize_terminal_pane(session_id: str, columns: int, rows: int) -> dict[str, 
     return terminal_snapshot(session_id, lines=line_count)
 
 
+def scroll_terminal_history(session_id: str, delta: int) -> bool:
+    """Scroll the active tmux pane's persistent history without enabling mouse capture."""
+    if session_id not in STORE.sessions:
+        return False
+    name = terminal_session_name(session_id)
+    if not tmux_session_exists(name):
+        return False
+    amount = max(1, min(abs(int(delta or 0)), 80))
+    if not delta:
+        return False
+    pane_in_mode = run_tmux(
+        ["display-message", "-p", "-t", name, "#{pane_in_mode}"],
+        check=False,
+    ).stdout.strip() == "1"
+    if delta < 0:
+        if not pane_in_mode:
+            run_tmux(["copy-mode", "-e", "-t", name], check=False)
+        run_tmux(["send-keys", "-X", "-N", str(amount), "-t", name, "scroll-up"], check=False)
+    elif pane_in_mode:
+        run_tmux(["send-keys", "-X", "-N", str(amount), "-t", name, "scroll-down"], check=False)
+    return run_tmux(
+        ["display-message", "-p", "-t", name, "#{pane_in_mode}"],
+        check=False,
+    ).stdout.strip() == "1"
+
+
+def exit_terminal_auto_scroll(session_id: str) -> None:
+    name = terminal_session_name(session_id)
+    if tmux_session_exists(name):
+        run_tmux(["send-keys", "-X", "-t", name, "cancel"], check=False)
+
+
 def kill_terminal_session(session_id: str) -> dict[str, Any]:
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
@@ -6942,12 +6974,16 @@ async def session_terminal(
 
         async def receive_input() -> None:
             assert master_fd is not None
+            auto_scroll_mode = False
             while True:
                 message = await ws.receive()
                 if message["type"] == "websocket.disconnect":
                     return
                 data = message.get("bytes")
                 if data:
+                    if auto_scroll_mode:
+                        await asyncio.to_thread(exit_terminal_auto_scroll, session_id)
+                        auto_scroll_mode = False
                     write_terminal_input(master_fd, data)
                     continue
                 text = message.get("text")
@@ -6960,6 +6996,13 @@ async def session_terminal(
                 if control.get("type") == "resize":
                     next_cols, next_rows = terminal_dimensions(control.get("columns"), control.get("rows"))
                     set_pty_dimensions(master_fd, next_cols, next_rows)
+                elif control.get("type") == "scroll":
+                    with suppress(TypeError, ValueError):
+                        auto_scroll_mode = await asyncio.to_thread(
+                            scroll_terminal_history,
+                            session_id,
+                            int(control.get("delta") or 0),
+                        )
 
         output_task = asyncio.create_task(pump_output())
         input_task = asyncio.create_task(receive_input())

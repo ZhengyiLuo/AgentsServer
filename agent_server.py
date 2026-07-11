@@ -109,7 +109,9 @@ CODEX_APP_SERVER_TIMEOUT_SECONDS = int(os.environ.get("ZENITHBOT_CODEX_APP_SERVE
 RUNTIME_CATALOG_TIMEOUT_SECONDS = float(os.environ.get("ZENITHBOT_RUNTIME_CATALOG_TIMEOUT_SECONDS", "6"))
 JOB_SCHEDULER_INTERVAL_SECONDS = float(os.environ.get("ZENITHBOT_JOB_SCHEDULER_INTERVAL_SECONDS", "5"))
 JOB_BUSY_RETRY_SECONDS = int(os.environ.get("ZENITHBOT_JOB_BUSY_RETRY_SECONDS", "60"))
-JOB_MAX_ACTIVE_RUNS = int(os.environ.get("ZENITHBOT_JOB_MAX_ACTIVE_RUNS", "2"))
+# Zero means scheduled jobs have no scheduler-specific concurrency ceiling.
+# Host pressure and the global agent-run guard still protect the machine.
+JOB_MAX_ACTIVE_RUNS = int(os.environ.get("ZENITHBOT_JOB_MAX_ACTIVE_RUNS", "0"))
 JOB_MAX_LOAD_PER_CPU = float(os.environ.get("ZENITHBOT_JOB_MAX_LOAD_PER_CPU", "1.25"))
 JOB_MIN_AVAILABLE_MEM_MB = int(os.environ.get("ZENITHBOT_JOB_MIN_AVAILABLE_MEM_MB", "4096"))
 JOB_DEFER_EVENT_MIN_SECONDS = int(os.environ.get("ZENITHBOT_JOB_DEFER_EVENT_MIN_SECONDS", "300"))

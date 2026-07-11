@@ -241,7 +241,7 @@ Most settings are environment variables:
 | `CODEX_BIN` | Codex executable name/path | `codex` |
 | `CLAUDE_PROJECTS_ROOT` | Claude history search root | `~/.claude/projects` |
 | `CODEX_SESSIONS_ROOT` | Codex history search root | `~/.codex/sessions` |
-| `ZENITHBOT_JOB_MAX_ACTIVE_RUNS` | Scheduled-job concurrency cap | `2` |
+| `ZENITHBOT_JOB_MAX_ACTIVE_RUNS` | Scheduled-job concurrency cap (`0` disables this dedicated cap) | `0` |
 | `ZENITHBOT_MAX_ACTIVE_AGENT_RUNS` | Interactive agent concurrency cap | `10` |
 | `ZENITHBOT_JOB_MIN_AVAILABLE_MEM_MB` | Job launch memory guardrail | `4096` |
 | `ZENITHBOT_MIN_START_AVAILABLE_MEM_MB` | Interactive launch memory guardrail | `2048` |

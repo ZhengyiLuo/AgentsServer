@@ -6,6 +6,7 @@ REMOTE_HOST="${ZENITHDOCK_REMOTE_HOST:-${1:-}}"
 REMOTE_APP_DIR="${ZENITHDOCK_REMOTE_APP_DIR:-Zenithbot}"
 REMOTE_SERVER_PATH="$REMOTE_APP_DIR/scripts/agent_server.py"
 SERVICE_NAME="${ZENITHDOCK_AGENT_SERVICE:-zenithbot-agent.service}"
+HEALTH_ATTEMPTS="${ZENITHDOCK_HEALTH_ATTEMPTS:-45}"
 
 if [[ -z "$REMOTE_HOST" ]]; then
   cat >&2 <<'USAGE'
@@ -17,6 +18,7 @@ Optional:
   ZENITHDOCK_REMOTE_APP_DIR=<remote-app-dir>
   ZENITHDOCK_AGENT_SERVICE=<systemd-user-service>
   ZENITHDOCK_AGENT_TOKEN=<health-check-token>
+  ZENITHDOCK_HEALTH_ATTEMPTS=<startup-health-attempts>
 USAGE
   exit 2
 fi
@@ -34,7 +36,7 @@ echo "Checking health"
 REMOTE_HEALTH_BODY="/tmp/zenithdock-agent-health.json"
 HEALTH_OK=0
 STATUS="000"
-for attempt in 1 2 3 4 5; do
+for ((attempt = 1; attempt <= HEALTH_ATTEMPTS; attempt++)); do
   if [[ -n "${ZENITHDOCK_AGENT_TOKEN:-}" ]]; then
     if ssh "$REMOTE_HOST" "curl -fsS -H 'Authorization: Bearer ${ZENITHDOCK_AGENT_TOKEN}' http://127.0.0.1:7850/api/health"; then
       HEALTH_OK=1

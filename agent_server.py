@@ -638,6 +638,13 @@ TIMELINE_INDEX_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 TIMELINE_INDEX_LOCKS: dict[str, threading.Lock] = {}
 HISTORY_SEARCH_DB = STATE_DIR / "history_search.sqlite3"
 HISTORY_SEARCH_LOCK = threading.Lock()
+HISTORY_SEARCH_DIRTY: set[str] = set()
+HISTORY_SEARCH_SYNC_INTERVAL_SECONDS = max(
+    0.25, float(os.environ.get("ZENITHBOT_HISTORY_SEARCH_SYNC_INTERVAL_SECONDS", "1.0"))
+)
+HISTORY_SEARCH_FULL_SYNC_INTERVAL_SECONDS = max(
+    30.0, float(os.environ.get("ZENITHBOT_HISTORY_SEARCH_FULL_SYNC_INTERVAL_SECONDS", "300"))
+)
 
 
 def last_event_seq_from_file(path: Path) -> int:
@@ -1071,6 +1078,7 @@ class SessionStore:
                 sess["sort_order"] = self.top_order_for_section(new_section, excluding_id=sid)
             sess["updated_at"] = now_iso()
             await self.save()
+            HISTORY_SEARCH_DIRTY.add(sid)
             return sess
 
     async def reorder(
@@ -1171,6 +1179,7 @@ class SessionStore:
         if existed:
             shutil.rmtree(session_dir(sid), ignore_errors=True)
             await forget_event_seq(sid)
+            HISTORY_SEARCH_DIRTY.add(sid)
         return existed is not None
 
     async def save_provider_session(self, sid: str, provider_id: str, backend: str, *, cwd: str | None = None) -> None:
@@ -1485,6 +1494,7 @@ async def append_event(session_id: str, event_type: str, payload: dict[str, Any]
     }
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(event, separators=(",", ":")) + "\n")
+    HISTORY_SEARCH_DIRTY.add(session_id)
     await update_session_event_metadata(session_id, event)
     await HUB.broadcast(session_id, event)
     return event
@@ -3647,25 +3657,31 @@ def search_timeline_index(session_id: str, query: str, limit: int = 40) -> dict[
     tokens = timeline_search_tokens(query)
     if not tokens:
         return {"session_id": session_id, "query": query, "results": []}
-    lock = TIMELINE_INDEX_LOCKS.setdefault(session_id, threading.Lock())
-    with lock:
-        _build_timeline_index_locked(session_id)
-        cached = TIMELINE_INDEX_CACHE.get(session_id) or {}
-        entries = [
-            entry
-            for record in cached.get("records", [])
-            for entry in record.get("search_entries", [])
-            if all(token in str(entry.get("text") or "").casefold() for token in tokens)
-        ]
-    entries.sort(key=lambda entry: int(entry.get("seq") or 0), reverse=True)
+    connection = history_search_connection()
+    try:
+        state = connection.execute(
+            "SELECT offset FROM history_search_state WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        rows = connection.execute("""
+            SELECT event_id, seq, ts, role, text
+            FROM history_search
+            WHERE history_search MATCH ? AND session_id = ?
+            ORDER BY CAST(seq AS INTEGER) DESC
+            LIMIT ?
+        """, (timeline_search_fts_query(query), session_id, max(1, min(100, limit)))).fetchall()
+    finally:
+        connection.close()
+    with suppress(OSError):
+        if not state or int(state[0]) < events_path(session_id).stat().st_size:
+            HISTORY_SEARCH_DIRTY.add(session_id)
     results = [{
         "session_id": session_id,
-        "event_id": entry.get("event_id"),
-        "seq": int(entry.get("seq") or 0),
-        "ts": entry.get("ts"),
-        "role": entry.get("role") or "system",
-        "snippet": timeline_search_snippet(str(entry.get("text") or ""), tokens),
-    } for entry in entries[: max(1, min(100, limit))]]
+        "event_id": row[0],
+        "seq": int(row[1] or 0),
+        "ts": row[2],
+        "role": row[3] or "system",
+        "snippet": timeline_search_snippet(str(row[4] or ""), tokens),
+    } for row in rows]
     return {"session_id": session_id, "query": query, "results": results}
 
 
@@ -3730,20 +3746,46 @@ def history_search_connection() -> sqlite3.Connection:
             offset INTEGER NOT NULL,
             mtime_ns INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS history_search_sessions (
+            session_id TEXT PRIMARY KEY,
+            active INTEGER NOT NULL
+        );
     """)
     return connection
 
 
-def sync_history_search_index(connection: sqlite3.Connection) -> tuple[int, int]:
-    valid_session_ids = set(STORE.sessions)
+def sync_history_search_index(
+    connection: sqlite3.Connection,
+    target_session_ids: set[str],
+    active_session_ids: set[str],
+    *,
+    prune: bool = False,
+) -> tuple[int, int]:
     indexed_events = 0
     indexed_sessions = 0
-    state_rows = connection.execute("SELECT session_id FROM history_search_state").fetchall()
-    for (stale_id,) in state_rows:
-        if stale_id in valid_session_ids:
-            continue
-        connection.execute("DELETE FROM history_search WHERE session_id = ?", (stale_id,))
-        connection.execute("DELETE FROM history_search_state WHERE session_id = ?", (stale_id,))
+    if prune:
+        connection.execute("DELETE FROM history_search_sessions")
+        connection.executemany(
+            "INSERT INTO history_search_sessions(session_id, active) VALUES (?, 1)",
+            ((session_id,) for session_id in active_session_ids),
+        )
+        state_rows = connection.execute("SELECT session_id FROM history_search_state").fetchall()
+        for (stale_id,) in state_rows:
+            if stale_id in active_session_ids:
+                continue
+            connection.execute("DELETE FROM history_search WHERE session_id = ?", (stale_id,))
+            connection.execute("DELETE FROM history_search_state WHERE session_id = ?", (stale_id,))
+    else:
+        for session_id in target_session_ids:
+            active = session_id in active_session_ids
+            connection.execute(
+                "INSERT INTO history_search_sessions(session_id, active) VALUES (?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET active = excluded.active",
+                (session_id, int(active)),
+            )
+            if not active:
+                connection.execute("DELETE FROM history_search WHERE session_id = ?", (session_id,))
+                connection.execute("DELETE FROM history_search_state WHERE session_id = ?", (session_id,))
     connection.commit()
 
     insert = "INSERT INTO history_search(text, session_id, event_id, seq, ts, role) VALUES (?, ?, ?, ?, ?, ?)"
@@ -3752,9 +3794,12 @@ def sync_history_search_index(connection: sqlite3.Connection) -> tuple[int, int]
         ON CONFLICT(session_id) DO UPDATE SET
             inode = excluded.inode, offset = excluded.offset, mtime_ns = excluded.mtime_ns
     """
-    for session_id in valid_session_ids:
+    for session_id in target_session_ids & active_session_ids:
         path = events_path(session_id)
         if not path.exists():
+            connection.execute("DELETE FROM history_search WHERE session_id = ?", (session_id,))
+            connection.execute("DELETE FROM history_search_state WHERE session_id = ?", (session_id,))
+            connection.commit()
             continue
         stat = path.stat()
         state = connection.execute(
@@ -3812,41 +3857,96 @@ def sync_history_search_index(connection: sqlite3.Connection) -> tuple[int, int]
     return indexed_sessions, indexed_events
 
 
+def run_history_search_sync(
+    target_session_ids: set[str],
+    active_session_ids: set[str],
+    *,
+    prune: bool = False,
+) -> tuple[int, int]:
+    with HISTORY_SEARCH_LOCK:
+        connection = history_search_connection()
+        try:
+            return sync_history_search_index(
+                connection,
+                target_session_ids,
+                active_session_ids,
+                prune=prune,
+            )
+        finally:
+            connection.close()
+
+
+async def history_search_index_loop() -> None:
+    last_full_sync: float | None = None
+    while True:
+        active_session_ids = {
+            session_id
+            for session_id, session in STORE.sessions.items()
+            if not bool(session.get("archived"))
+        }
+        now = time.monotonic()
+        full_sync = last_full_sync is None or now - last_full_sync >= HISTORY_SEARCH_FULL_SYNC_INTERVAL_SECONDS
+        if full_sync:
+            target_session_ids = set(active_session_ids)
+            HISTORY_SEARCH_DIRTY.difference_update(target_session_ids)
+        else:
+            target_session_ids = set(HISTORY_SEARCH_DIRTY)
+            HISTORY_SEARCH_DIRTY.difference_update(target_session_ids)
+        if target_session_ids or full_sync:
+            started = time.monotonic()
+            try:
+                indexed_sessions, indexed_events = await asyncio.to_thread(
+                    run_history_search_sync,
+                    target_session_ids,
+                    active_session_ids,
+                    prune=full_sync,
+                )
+                if indexed_sessions or indexed_events:
+                    logger.info(
+                        "history search index synced sessions=%s events=%s elapsed=%.2fs",
+                        indexed_sessions,
+                        indexed_events,
+                        time.monotonic() - started,
+                    )
+                if full_sync:
+                    last_full_sync = now
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                HISTORY_SEARCH_DIRTY.update(target_session_ids)
+                logger.exception("history search background sync failed")
+        await asyncio.sleep(HISTORY_SEARCH_SYNC_INTERVAL_SECONDS)
+
+
 def search_all_timelines(query: str, limit: int = 40) -> dict[str, Any]:
     tokens = timeline_search_tokens(query)
     if not tokens:
         return {"query": query, "results": []}
     fts_query = timeline_search_fts_query(query)
-    started = time.monotonic()
-    with HISTORY_SEARCH_LOCK:
-        connection = history_search_connection()
-        try:
-            indexed_sessions, indexed_events = sync_history_search_index(connection)
-            rows = connection.execute("""
-                WITH ranked AS (
-                    SELECT session_id, event_id, seq, ts, role, text,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY session_id ORDER BY COALESCE(ts, '') DESC, CAST(seq AS INTEGER) DESC
-                           ) AS match_rank,
-                           COUNT(*) OVER (PARTITION BY session_id) AS match_count
-                    FROM history_search
-                    WHERE history_search MATCH ?
-                )
-                SELECT session_id, event_id, seq, ts, role, text, match_count
-                FROM ranked
-                WHERE match_rank = 1
-                ORDER BY COALESCE(ts, '') DESC, CAST(seq AS INTEGER) DESC
-                LIMIT ?
-            """, (fts_query, max(1, min(100, limit)))).fetchall()
-        finally:
-            connection.close()
-    if indexed_sessions or indexed_events:
-        logger.info(
-            "history search index synced sessions=%s events=%s elapsed=%.2fs",
-            indexed_sessions,
-            indexed_events,
-            time.monotonic() - started,
-        )
+    connection = history_search_connection()
+    try:
+        rows = connection.execute("""
+            WITH ranked AS (
+                SELECT history_search.session_id, event_id, seq, ts, role, text,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY history_search.session_id
+                           ORDER BY COALESCE(ts, '') DESC, CAST(seq AS INTEGER) DESC
+                       ) AS match_rank,
+                       COUNT(*) OVER (PARTITION BY history_search.session_id) AS match_count
+                FROM history_search
+                JOIN history_search_sessions
+                  ON history_search_sessions.session_id = history_search.session_id
+                 AND history_search_sessions.active = 1
+                WHERE history_search MATCH ?
+            )
+            SELECT session_id, event_id, seq, ts, role, text, match_count
+            FROM ranked
+            WHERE match_rank = 1
+            ORDER BY COALESCE(ts, '') DESC, CAST(seq AS INTEGER) DESC
+            LIMIT ?
+        """, (fts_query, max(1, min(100, limit)))).fetchall()
+    finally:
+        connection.close()
     return {
         "query": query,
         "results": [{
@@ -6504,13 +6604,17 @@ async def lifespan(app: FastAPI):
     JOBS.start_scheduler()
     scheduled_queue_drains = schedule_rebuilt_queued_turns()
     host_monitor_task = asyncio.create_task(host_monitor_loop())
+    history_search_task = asyncio.create_task(history_search_index_loop())
     logger.info("agent server ready state=%s sessions=%d jobs=%d queued=%d queue_drains=%d", STATE_DIR, len(STORE.sessions), len(JOBS.jobs), rebuilt_queue_count, scheduled_queue_drains)
     try:
         yield
     finally:
         host_monitor_task.cancel()
+        history_search_task.cancel()
         with suppress(asyncio.CancelledError):
             await host_monitor_task
+        with suppress(asyncio.CancelledError):
+            await history_search_task
 
 
 app = FastAPI(title="Zenithbot Agent Server", lifespan=lifespan)

@@ -784,6 +784,7 @@ class TurnRequest(BaseModel):
     job_id: str | None = None
     job_title: str | None = None
     digest_job_id: str | None = None
+    source_session_id: str | None = None
     target_session_id: str | None = None
 
 
@@ -1506,7 +1507,7 @@ def is_agent_visible_event(event_type: str, event: dict[str, Any]) -> bool:
         return bool(str(event.get("text") or "").strip())
     if event_type == "turn_finished":
         return bool(str(event.get("result_text") or "").strip())
-    return event_type in {"error", "artifact_created", "job_ran", "job_error"}
+    return event_type in {"error", "artifact_created", "job_ran", "job_error", "handoff_digest_received"}
 
 
 def should_bump_session_updated_at(event_type: str, event: dict[str, Any]) -> bool:
@@ -1524,6 +1525,7 @@ def should_bump_session_updated_at(event_type: str, event: dict[str, Any]) -> bo
         "job_deferred",
         "handoff_digest_started",
         "handoff_digest_ready",
+        "handoff_digest_received",
         "handoff_digest_sent",
         "handoff_digest_error",
         "backend_changed",
@@ -1561,6 +1563,7 @@ async def enqueue_turn(session_id: str, req: TurnRequest, sess: dict[str, Any]) 
         "display_prompt": req.display_prompt,
         "purpose": req.purpose,
         "digest_job_id": req.digest_job_id,
+        "source_session_id": req.source_session_id,
         "target_session_id": req.target_session_id,
         "created_at": now_iso(),
     }
@@ -1571,11 +1574,16 @@ async def enqueue_turn(session_id: str, req: TurnRequest, sess: dict[str, Any]) 
     queued_event = await append_event(session_id, "turn_queued", {
         "queued_id": queued_id,
         "backend": req.backend or sess.get("backend") or DEFAULT_BACKEND,
+        "model": req.model,
+        "effort": req.effort,
         "prompt": req.display_prompt or req.prompt,
+        "request_prompt": req.prompt,
+        "display_prompt": req.display_prompt,
         "file_ids": list(req.file_ids),
         "position": position,
         "purpose": req.purpose,
         "digest_job_id": req.digest_job_id,
+        "source_session_id": req.source_session_id,
         "target_session_id": req.target_session_id,
     })
     return {
@@ -1648,6 +1656,7 @@ def public_queued_turn(session_id: str, item: dict[str, Any], position: int) -> 
         "display_prompt": item.get("display_prompt"),
         "purpose": item.get("purpose"),
         "digest_job_id": item.get("digest_job_id"),
+        "source_session_id": item.get("source_session_id"),
         "target_session_id": item.get("target_session_id"),
         "created_at": item.get("created_at"),
         "position": position,
@@ -1813,6 +1822,7 @@ async def start_next_queued_turn(session_id: str) -> None:
         display_prompt=item.get("display_prompt"),
         purpose=item.get("purpose"),
         digest_job_id=item.get("digest_job_id"),
+        source_session_id=item.get("source_session_id"),
         target_session_id=item.get("target_session_id"),
     )
     try:
@@ -1856,6 +1866,24 @@ def should_schedule_queue_after_finish(session_id: str, stopped: bool) -> bool:
     return not stopped or session_id in RUN_NOW_TURNS
 
 
+def queued_turn_from_event(event: dict[str, Any], sess: dict[str, Any], position: int) -> dict[str, Any]:
+    return {
+        "queued_id": str(event.get("queued_id") or ""),
+        "prompt": event.get("request_prompt") or event.get("prompt") or "",
+        "file_ids": list(event.get("file_ids") or []),
+        "backend": event.get("backend") or sess.get("backend"),
+        "model": event.get("model") if event.get("model") is not None else sess.get("model"),
+        "effort": event.get("effort") if event.get("effort") is not None else sess.get("effort"),
+        "display_prompt": event.get("display_prompt"),
+        "purpose": event.get("purpose"),
+        "digest_job_id": event.get("digest_job_id"),
+        "source_session_id": event.get("source_session_id"),
+        "target_session_id": event.get("target_session_id"),
+        "created_at": event.get("ts") or now_iso(),
+        "position": int(event.get("position") or position),
+    }
+
+
 def rebuild_queued_turns_from_events() -> int:
     rebuilt = 0
     for session_id, sess in STORE.sessions.items():
@@ -1874,16 +1902,7 @@ def rebuild_queued_turns_from_events() -> int:
             queued_id = str(event.get("queued_id") or "")
             event_type = str(event.get("type") or "")
             if event_type == "turn_queued" and queued_id:
-                pending[queued_id] = {
-                    "queued_id": queued_id,
-                    "prompt": event.get("prompt") or "",
-                    "file_ids": list(event.get("file_ids") or []),
-                    "backend": event.get("backend") or sess.get("backend"),
-                    "model": sess.get("model"),
-                    "effort": sess.get("effort"),
-                    "created_at": event.get("ts") or now_iso(),
-                    "position": int(event.get("position") or (len(order) + 1)),
-                }
+                pending[queued_id] = queued_turn_from_event(event, sess, len(order) + 1)
                 if queued_id not in order:
                     order.append(queued_id)
             elif event_type in {"turn_queue_updated", "turn_queue_run_now"} and queued_id in pending:
@@ -3329,7 +3348,7 @@ def compact_timeline_index_text(value: Any, limit: int = 240) -> str:
 
 
 def timeline_index_event_text(event: dict[str, Any]) -> str:
-    for field in ("result_text", "text", "prompt", "message", "error", "output"):
+    for field in ("result_text", "text", "prompt", "digest", "message", "error", "output"):
         text = compact_timeline_index_text(event.get(field))
         if text:
             return text
@@ -3353,7 +3372,7 @@ def timeline_search_value(value: Any) -> str:
 
 
 def timeline_search_event_text(event: dict[str, Any]) -> str:
-    for field in ("result_text", "text", "prompt", "message", "error"):
+    for field in ("result_text", "text", "prompt", "digest", "message", "error"):
         text = timeline_search_value(event.get(field))
         if text:
             return text
@@ -3499,6 +3518,34 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                 continue
             visible_count += 1
 
+            digest_id = str(event.get("digest_job_id") or "").strip()
+            is_digest_lifecycle = event_type.startswith("handoff_digest_")
+            is_digest_generation = event.get("purpose") == "handoff_digest"
+            if digest_id and (is_digest_lifecycle or is_digest_generation):
+                record = ensure_record(f"digest:{digest_id}", "digest", event)
+                run_id = str(event.get("run_id") or "").strip()
+                if run_id and is_digest_generation:
+                    current_turn_by_run[run_id] = record["key"]
+                    active_turn_key = record["key"]
+                text = timeline_index_event_text(event)
+                if text and (is_digest_lifecycle or not record.get("preview")):
+                    record["preview"] = text
+                if event_type == "handoff_digest_received":
+                    record["title"] = "Context Digest"
+                    add_search_entry(record, event, "system", timeline_search_event_text(event))
+                elif event_type == "handoff_digest_sent":
+                    record["title"] = "Digest Sent"
+                elif event_type == "handoff_digest_error":
+                    record["title"] = "Digest Failed"
+                elif not record.get("title"):
+                    record["title"] = "Creating Digest"
+                if event_type == "turn_finished":
+                    if active_turn_key == record["key"]:
+                        active_turn_key = None
+                    if run_id:
+                        current_turn_by_run.pop(run_id, None)
+                continue
+
             if event_type in TIMELINE_INDEX_JOB_TYPES or event.get("job_id"):
                 job = event.get("job") if isinstance(event.get("job"), dict) else {}
                 job_id = event.get("job_id") or job.get("id") or event.get("run_id") or f"job-{seq}"
@@ -3527,7 +3574,10 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                 active_turn_key = key
                 if run_id:
                     current_turn_by_run[run_id] = key
-                record = ensure_record(key, "digest" if event.get("purpose") == "handoff_digest" else "user", event)
+                if event.get("purpose") == "handoff_digest_delivery":
+                    ensure_record(key, "assistant", event)
+                    continue
+                record = ensure_record(key, "user", event)
                 record["has_user"] = True
                 prompt = compact_timeline_index_text(event.get("prompt"))
                 if prompt:
@@ -3690,7 +3740,7 @@ HISTORY_SEARCH_EVENT_TYPES = {
     "turn_started", "assistant_text", "turn_finished", "reasoning_summary", "error",
     "job_created", "job_ran", "job_started", "job_deferred", "job_finished", "job_error",
     "artifact_created", "artifact_error", "file_uploaded",
-    "handoff_digest_started", "handoff_digest_ready", "handoff_digest_submitted", "handoff_digest_sent",
+    "handoff_digest_started", "handoff_digest_ready", "handoff_digest_received", "handoff_digest_submitted", "handoff_digest_sent",
 }
 HISTORY_SEARCH_LINE_MARKERS = tuple(
     f'"type":"{event_type}"'.encode("utf-8") for event_type in sorted(HISTORY_SEARCH_EVENT_TYPES)
@@ -4448,6 +4498,11 @@ def source_digest_display_prompt(target: dict[str, Any], user_prompt: str | None
     return f"Generate a handoff digest for {target_title}."
 
 
+def target_digest_display_prompt(source: dict[str, Any]) -> str:
+    source_title = str(source.get("title") or "source chat")
+    return f"Context digest from {source_title}."
+
+
 def digest_turn_state(
     session_id: str,
     digest_job_id: str,
@@ -4552,7 +4607,39 @@ async def run_handoff_digest_send(
         )
         if not digest:
             raise RuntimeError("LLM digest was empty")
-        await start_turn(target_session_id, TurnRequest(prompt=digest), queue_if_busy=True)
+        delivery_prompt = target_digest_display_prompt(source)
+        await append_event(target_session_id, "handoff_digest_received", {
+            "digest_job_id": digest_job_id,
+            "source_session_id": source_session_id,
+            "target_session_id": target_session_id,
+            "message": f"Context digest from {source_title} was delivered to this chat.",
+            "digest": digest,
+            "detail": req.detail,
+            "digest_chars": len(digest),
+        })
+        try:
+            await start_turn(
+                target_session_id,
+                TurnRequest(
+                    prompt=digest,
+                    display_prompt=delivery_prompt,
+                    purpose="handoff_digest_delivery",
+                    digest_job_id=digest_job_id,
+                    source_session_id=source_session_id,
+                    target_session_id=target_session_id,
+                ),
+                queue_if_busy=True,
+            )
+        except Exception as exc:
+            await append_event(target_session_id, "handoff_digest_error", {
+                "digest_job_id": digest_job_id,
+                "source_session_id": source_session_id,
+                "target_session_id": target_session_id,
+                "message": f"Context digest from {source_title} could not be submitted: {exc}",
+                "detail": req.detail,
+                "error": str(exc),
+            })
+            raise
         await append_event(source_session_id, "handoff_digest_sent", {
             "digest_job_id": digest_job_id,
             "source_session_id": source_session_id,
@@ -6714,6 +6801,7 @@ async def start_turn(
             "job_id": req.job_id,
             "job_title": req.job_title,
             "digest_job_id": req.digest_job_id,
+            "source_session_id": req.source_session_id,
             "target_session_id": req.target_session_id,
         }
         run_metadata = {key: value for key, value in run_metadata.items() if value is not None}
@@ -7035,10 +7123,18 @@ async def send_handoff_digest_background(session_id: str, req: HandoffDigestSend
     if session_id == req.target_session_id:
         raise HTTPException(status_code=400, detail="target chat must be different from source chat")
     digest_job_id = f"digest_{uuid.uuid4().hex[:16]}"
+    started_event = await append_event(session_id, "handoff_digest_started", {
+        "digest_job_id": digest_job_id,
+        "source_session_id": session_id,
+        "target_session_id": req.target_session_id,
+        "message": f"Creating a context digest for {target.get('title') or req.target_session_id}.",
+        "detail": req.detail,
+    })
     asyncio.create_task(run_handoff_digest_send(digest_job_id, session_id, req))
     return {
         "ok": True,
         "digest_job_id": digest_job_id,
+        "event": started_event,
         "session": public_session(STORE.sessions[session_id]),
     }
 

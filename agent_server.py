@@ -106,6 +106,7 @@ CODEX_FALLBACK_SERVICE_TIERS = {
 
 REQUEST_TIMEOUT_SECONDS = int(os.environ.get("ZENITHBOT_REQUEST_TIMEOUT_SECONDS", "86400"))
 CODEX_APP_SERVER_TIMEOUT_SECONDS = int(os.environ.get("ZENITHBOT_CODEX_APP_SERVER_TIMEOUT_SECONDS", "30"))
+CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS = int(os.environ.get("ZENITHBOT_CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS", "120"))
 RUNTIME_CATALOG_TIMEOUT_SECONDS = float(os.environ.get("ZENITHBOT_RUNTIME_CATALOG_TIMEOUT_SECONDS", "6"))
 JOB_SCHEDULER_INTERVAL_SECONDS = float(os.environ.get("ZENITHBOT_JOB_SCHEDULER_INTERVAL_SECONDS", "5"))
 JOB_BUSY_RETRY_SECONDS = int(os.environ.get("ZENITHBOT_JOB_BUSY_RETRY_SECONDS", "60"))
@@ -5000,6 +5001,7 @@ def should_recover_codex_resume(
     stopped: bool,
     stream_error: str | None,
     idle_killed: bool,
+    resume_stalled: bool,
     returncode: int | None,
     produced_activity: bool,
     terminal_error: str,
@@ -5013,7 +5015,7 @@ def should_recover_codex_resume(
         or produced_activity
     ):
         return False
-    if returncode in (0, None):
+    if resume_stalled or returncode in (0, None):
         return True
     return is_codex_resume_failure(terminal_error) or is_codex_compaction_failure(terminal_error)
 
@@ -6271,7 +6273,9 @@ async def run_codex(
         sess.get("session_id") if sess.get("backend") == BACKEND_CODEX else None
     )
     last_event = time.time()
+    resume_started_at = last_event
     idle_killed = False
+    resume_stalled = False
     stream_error: str | None = None
     codex_error: str | None = None
     seen_artifacts: set[str] = set()
@@ -6446,6 +6450,29 @@ async def run_codex(
             except asyncio.TimeoutError:
                 if await drain_codex_history():
                     last_event = time.time()
+                produced_activity = bool(
+                    text_parts
+                    or seen_reasoning
+                    or started_tool_ids
+                    or finished_tool_ids
+                    or seen_artifacts
+                )
+                if (
+                    resumed_provider_id
+                    and CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS > 0
+                    and not produced_activity
+                    and time.time() - resume_started_at >= CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS
+                ):
+                    resume_stalled = True
+                    logger.warning(
+                        "Codex resume produced no activity before startup timeout session=%s run=%s provider=%s timeout=%ss",
+                        session_id,
+                        run_id,
+                        resumed_provider_id,
+                        CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS,
+                    )
+                    await terminate_process_tree(proc)
+                    break
                 idle = time.time() - last_event
                 if idle >= IDLE_WARN_SECONDS:
                     await append_event(session_id, "idle_warning", {"run_id": run_id, "idle_seconds": int(idle)})
@@ -6501,17 +6528,23 @@ async def run_codex(
         stopped=stopped,
         stream_error=stream_error,
         idle_killed=idle_killed,
+        resume_stalled=resume_stalled,
         returncode=proc.returncode,
         produced_activity=produced_activity,
         terminal_error=terminal_error,
     )
     if should_rollover:
-        recovery_reason = terminal_error or "Codex resume exited successfully without producing any response events."
-        recovery_message = (
-            "Codex resume produced no reply. Retrying this turn once on a fresh thread with bounded recent memory."
-            if silent_completion
-            else "Codex could not continue the provider thread. Retrying this turn once on a fresh thread with bounded recent memory."
+        recovery_reason = (
+            f"Codex resume produced no activity for {CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS} seconds."
+            if resume_stalled
+            else terminal_error or "Codex resume exited successfully without producing any response events."
         )
+        if resume_stalled:
+            recovery_message = "Codex resume stalled before producing a reply. Retrying this turn once on a fresh thread with bounded recent memory."
+        elif silent_completion:
+            recovery_message = "Codex resume produced no reply. Retrying this turn once on a fresh thread with bounded recent memory."
+        else:
+            recovery_message = "Codex could not continue the provider thread. Retrying this turn once on a fresh thread with bounded recent memory."
         logger.warning(
             "recovering empty Codex resume session=%s run=%s provider=%s exit=%s reason=%s",
             session_id,
@@ -6544,7 +6577,15 @@ async def run_codex(
         await append_event(session_id, "error", {"run_id": run_id, "message": f"Codex stream failed: {stream_error}", **run_event_metadata(run_id)})
     if idle_killed:
         await append_event(session_id, "error", {"run_id": run_id, "message": "killed after idle timeout", **run_event_metadata(run_id)})
-    if not stopped and proc.returncode not in (0, None):
+    if resume_stalled:
+        await append_event(session_id, "error", {
+            "run_id": run_id,
+            "backend": BACKEND_CODEX,
+            "message": f"Codex resume produced no activity for {CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS} seconds.",
+            "exit_code": proc.returncode,
+            **run_event_metadata(run_id),
+        })
+    elif not stopped and proc.returncode not in (0, None):
         if codex_error:
             await append_event(session_id, "error", {"run_id": run_id, "message": codex_error, "exit_code": proc.returncode, **run_event_metadata(run_id)})
         elif stderr:

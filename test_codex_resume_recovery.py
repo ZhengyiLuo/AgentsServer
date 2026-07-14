@@ -15,6 +15,7 @@ class CodexResumeRecoveryTests(unittest.TestCase):
             "stopped": False,
             "stream_error": None,
             "idle_killed": False,
+            "resume_stalled": False,
             "returncode": 0,
             "produced_activity": False,
             "terminal_error": "",
@@ -35,6 +36,9 @@ class CodexResumeRecoveryTests(unittest.TestCase):
                 terminal_error="No conversation found with session ID: thread-123",
             )
         )
+
+    def test_stalled_resume_recovers(self) -> None:
+        self.assertTrue(self.recovery(returncode=-15, resume_stalled=True))
 
     def test_unrelated_provider_failure_does_not_replay(self) -> None:
         self.assertFalse(

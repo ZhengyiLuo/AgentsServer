@@ -30,6 +30,10 @@ machine paths.
   window from accidental destruction.
 - Discovers available runtime models/efforts from the installed CLI tools when
   possible.
+- Reports Claude Code and Codex installation, authentication, version, and
+  latest-run health separately from basic server connectivity. New turns are
+  rejected with an actionable error before timeline activity when their
+  selected runtime is unavailable.
 
 ## Requirements
 
@@ -238,7 +242,9 @@ Most settings are environment variables:
 | `ZENITHBOT_AGENT_PORT` | Port | `7850` |
 | `ZENITHDOCK_AGENT_TOKEN` | Shared bearer token | unset |
 | `ZENITHBOT_BACKEND` | Default backend, `claude` or `codex` | `claude` |
+| `CLAUDE_BIN` | Claude Code executable name/path | `claude` |
 | `CODEX_BIN` | Codex executable name/path | `codex` |
+| `ZENITHBOT_RUNTIME_DIAGNOSTIC_TTL_SECONDS` | Cache lifetime for safe CLI version/auth probes | `60` |
 | `CLAUDE_PROJECTS_ROOT` | Claude history search root | `~/.claude/projects` |
 | `CODEX_SESSIONS_ROOT` | Codex history search root | `~/.codex/sessions` |
 | `ZENITHBOT_JOB_MAX_ACTIVE_RUNS` | Scheduled-job concurrency cap (`0` disables this dedicated cap) | `0` |
@@ -291,6 +297,27 @@ codex --version
 Run these as the same Unix user that owns the systemd service. If the CLI works
 in your login shell but fails under systemd, check the service `PATH`, virtual
 environment, and any provider-specific auth/config files.
+
+### Runtime diagnostics
+
+API contract v7 exposes privacy-safe runtime status in two places:
+
+```text
+GET /api/health
+GET /api/runtime/catalog?refresh=true
+```
+
+The health response includes cached `runtimes` entries. The catalog endpoint's
+`refresh=true` query forces a fresh version/authentication probe. Each backend
+reports `ready`, `missing`, `unauthenticated`, or probe `error`, plus an
+actionable recovery instruction. It never returns account identity, auth
+output, or tokens.
+
+A new prompt performs the same preflight before reserving real agent work. If
+the selected CLI is unavailable, the endpoint returns a structured
+`503 runtime_unavailable` response. Failures after a healthy launch remain a
+`last_error` on a ready runtime so model overloads, bad thread IDs, and ordinary
+provider failures are not mislabeled as missing installations.
 
 ## Whole-History Search
 

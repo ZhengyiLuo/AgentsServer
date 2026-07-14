@@ -71,6 +71,7 @@ CODE_DIFFS_ROOT = STATE_DIR / "code_diffs"
 HOST_HEALTH_FILE = STATE_DIR / "host_health.jsonl"
 CLAUDE_PROJECTS_ROOT = Path(os.environ.get("CLAUDE_PROJECTS_ROOT", Path.home() / ".claude" / "projects"))
 CODEX_SESSIONS_ROOT = Path(os.environ.get("CODEX_SESSIONS_ROOT", Path.home() / ".codex" / "sessions"))
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CODEX_BIN = os.environ.get("CODEX_BIN", "codex")
 CODEX_DEFAULT_MODEL = os.environ.get("ZENITHBOT_CODEX_MODEL", "gpt-5.5").strip() or "gpt-5.5"
 _configured_codex_effort = os.environ.get("ZENITHBOT_CODEX_EFFORT", "xhigh").strip().lower() or "xhigh"
@@ -109,6 +110,7 @@ REQUEST_TIMEOUT_SECONDS = int(os.environ.get("ZENITHBOT_REQUEST_TIMEOUT_SECONDS"
 CODEX_APP_SERVER_TIMEOUT_SECONDS = int(os.environ.get("ZENITHBOT_CODEX_APP_SERVER_TIMEOUT_SECONDS", "30"))
 CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS = int(os.environ.get("ZENITHBOT_CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS", "120"))
 RUNTIME_CATALOG_TIMEOUT_SECONDS = float(os.environ.get("ZENITHBOT_RUNTIME_CATALOG_TIMEOUT_SECONDS", "6"))
+RUNTIME_DIAGNOSTIC_TTL_SECONDS = float(os.environ.get("ZENITHBOT_RUNTIME_DIAGNOSTIC_TTL_SECONDS", "60"))
 JOB_SCHEDULER_INTERVAL_SECONDS = float(os.environ.get("ZENITHBOT_JOB_SCHEDULER_INTERVAL_SECONDS", "5"))
 JOB_BUSY_RETRY_SECONDS = int(os.environ.get("ZENITHBOT_JOB_BUSY_RETRY_SECONDS", "60"))
 # Zero means scheduled jobs have no scheduler-specific concurrency ceiling.
@@ -141,7 +143,7 @@ HANDOFF_DIGEST_EFFORT = os.environ.get("ZENITHBOT_HANDOFF_DIGEST_EFFORT", "").st
 DEFAULT_SESSION_EVENT_LIMIT = int(os.environ.get("ZENITHBOT_SESSION_EVENT_LIMIT", "100"))
 MAX_EVENT_RESPONSE_LIMIT = int(os.environ.get("ZENITHBOT_MAX_EVENT_RESPONSE_LIMIT", "1000"))
 AGENT_TOKEN = os.environ.get("ZENITHDOCK_AGENT_TOKEN") or os.environ.get("ZENITHBOT_AGENT_TOKEN") or ""
-API_CONTRACT_VERSION = 6
+API_CONTRACT_VERSION = 7
 SESSION_ORDER_STEP = 1000.0
 CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS = int(os.environ.get("ZENITHBOT_CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS", "120"))
 
@@ -1466,6 +1468,8 @@ RUN_METADATA: dict[str, dict[str, Any]] = {}
 HANDOFF_DIGEST_JOBS: dict[str, dict[str, Any]] = {}
 HANDOFF_DIGEST_JOBS_LOCK = asyncio.Lock()
 HANDOFF_DIGEST_FINALIZING: set[str] = set()
+RUNTIME_DIAGNOSTICS: dict[str, dict[str, Any]] = {}
+RUNTIME_DIAGNOSTICS_LOCK = threading.RLock()
 
 LOG_PATH_SUFFIXES = {
     ".log", ".out", ".err", ".stderr", ".stdout", ".txt", ".jsonl", ".trace"
@@ -4331,7 +4335,7 @@ def parse_claude_digest_output(stdout: str) -> str:
 
 async def run_claude_handoff_summarizer(prompt: str, *, model: str | None, effort: str | None) -> str:
     cmd = [
-        "claude", "-p",
+        CLAUDE_BIN, "-p",
         "--output-format", "stream-json",
         "--verbose",
     ]
@@ -5707,6 +5711,218 @@ def run_catalog_command(cmd: list[str]) -> str:
     return result.stdout
 
 
+def runtime_executable(backend: str) -> str:
+    return CLAUDE_BIN if backend == BACKEND_CLAUDE else CODEX_BIN
+
+
+def runtime_display_name(backend: str) -> str:
+    return "Claude Code" if backend == BACKEND_CLAUDE else "Codex"
+
+
+def runtime_action(backend: str, status: str) -> str | None:
+    executable = runtime_executable(backend)
+    if status == "missing":
+        return f"Install {runtime_display_name(backend)} for the server user, make `{executable}` available on PATH, then restart the agent server."
+    if status == "unauthenticated":
+        command = "claude auth login" if backend == BACKEND_CLAUDE else "codex login"
+        return f"Run `{command}` as the server user, then refresh runtime status."
+    if status == "error":
+        command = "claude auth status" if backend == BACKEND_CLAUDE else "codex login status"
+        return f"Run `{executable} --version` and `{command}` as the server user, then refresh runtime status."
+    return None
+
+
+def runtime_diagnostic_payload(
+    backend: str,
+    status: str,
+    *,
+    installed: bool | None,
+    authenticated: bool | None,
+    version: str | None = None,
+    message: str | None = None,
+) -> dict[str, Any]:
+    display = runtime_display_name(backend)
+    default_messages = {
+        "ready": f"{display} is installed and authenticated.",
+        "missing": f"{display} is not installed or is not available to the agent server.",
+        "unauthenticated": f"{display} is installed but the server user is not authenticated.",
+        "error": f"{display} is installed but its runtime check failed.",
+        "unknown": f"{display} has not been checked yet.",
+    }
+    return {
+        "backend": backend,
+        "status": status,
+        "available": status == "ready",
+        "installed": installed,
+        "authenticated": authenticated,
+        "version": version,
+        "message": message or default_messages.get(status, default_messages["unknown"]),
+        "action": runtime_action(backend, status),
+        "checked_at": now_iso(),
+        "checked_at_epoch": time.time(),
+        "last_error": None,
+        "last_error_at": None,
+    }
+
+
+def safe_runtime_version(output: str) -> str | None:
+    first_line = next((line.strip() for line in str(output or "").splitlines() if line.strip()), "")
+    if not first_line:
+        return None
+    clean = re.sub(r"[^A-Za-z0-9._+()\- /]", "", first_line).strip()
+    return clean[:120] or None
+
+
+def runtime_command(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        cmd,
+        cwd=DEFAULT_CWD if Path(DEFAULT_CWD).exists() else str(Path.home()),
+        env=runner_env(),
+        text=True,
+        capture_output=True,
+        timeout=RUNTIME_CATALOG_TIMEOUT_SECONDS,
+        check=False,
+    )
+
+
+def auth_failure_text(value: str) -> bool:
+    text = str(value or "").lower()
+    return any(marker in text for marker in (
+        "authorizationrequired", "authentication required", "not authenticated",
+        "not logged in", "login required", "unauthorized", "invalid api key",
+        "missing api key", "please log in", "please login",
+    ))
+
+
+def probe_runtime(backend: str) -> dict[str, Any]:
+    configured = runtime_executable(backend)
+    resolved = shutil.which(configured, path=runner_env().get("PATH"))
+    if not resolved:
+        return runtime_diagnostic_payload(backend, "missing", installed=False, authenticated=False)
+
+    try:
+        version_result = runtime_command([resolved, "--version"])
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("%s version probe failed: %s", backend, type(exc).__name__)
+        return runtime_diagnostic_payload(backend, "error", installed=True, authenticated=None)
+    version = safe_runtime_version(version_result.stdout or version_result.stderr)
+    if version_result.returncode != 0:
+        return runtime_diagnostic_payload(backend, "error", installed=True, authenticated=None, version=version)
+
+    auth_cmd = [resolved, "auth", "status", "--json"] if backend == BACKEND_CLAUDE else [resolved, "login", "status"]
+    try:
+        auth_result = runtime_command(auth_cmd)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("%s auth probe failed: %s", backend, type(exc).__name__)
+        return runtime_diagnostic_payload(backend, "error", installed=True, authenticated=None, version=version)
+
+    combined = f"{auth_result.stdout}\n{auth_result.stderr}"
+    if backend == BACKEND_CLAUDE and auth_result.stdout.strip():
+        try:
+            auth_payload = json.loads(auth_result.stdout)
+        except (TypeError, ValueError):
+            auth_payload = None
+        if isinstance(auth_payload, dict) and auth_payload.get("loggedIn") is False:
+            return runtime_diagnostic_payload(backend, "unauthenticated", installed=True, authenticated=False, version=version)
+        if isinstance(auth_payload, dict) and auth_payload.get("loggedIn") is True:
+            return runtime_diagnostic_payload(backend, "ready", installed=True, authenticated=True, version=version)
+    if auth_result.returncode == 0:
+        return runtime_diagnostic_payload(backend, "ready", installed=True, authenticated=True, version=version)
+    if auth_failure_text(combined):
+        return runtime_diagnostic_payload(backend, "unauthenticated", installed=True, authenticated=False, version=version)
+    return runtime_diagnostic_payload(backend, "error", installed=True, authenticated=None, version=version)
+
+
+def store_runtime_diagnostic(diagnostic: dict[str, Any], *, preserve_last_error: bool = True) -> dict[str, Any]:
+    backend = str(diagnostic.get("backend") or "")
+    with RUNTIME_DIAGNOSTICS_LOCK:
+        previous = RUNTIME_DIAGNOSTICS.get(backend) or {}
+        current = dict(diagnostic)
+        if preserve_last_error and previous.get("last_error"):
+            current["last_error"] = previous.get("last_error")
+            current["last_error_at"] = previous.get("last_error_at")
+        RUNTIME_DIAGNOSTICS[backend] = current
+        return dict(current)
+
+
+def runtime_diagnostic(backend: str, *, force: bool = False) -> dict[str, Any]:
+    with RUNTIME_DIAGNOSTICS_LOCK:
+        cached = dict(RUNTIME_DIAGNOSTICS.get(backend) or {})
+    checked_at = cached.get("checked_at_epoch")
+    if not force and isinstance(checked_at, (int, float)) and time.time() - checked_at < RUNTIME_DIAGNOSTIC_TTL_SECONDS:
+        return cached
+    return store_runtime_diagnostic(probe_runtime(backend))
+
+
+def refresh_runtime_diagnostics(*, force: bool = False) -> dict[str, dict[str, Any]]:
+    return {backend: runtime_diagnostic(backend, force=force) for backend in sorted(VALID_BACKENDS)}
+
+
+def public_runtime_diagnostic(diagnostic: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in diagnostic.items() if key != "checked_at_epoch"}
+
+
+def runtime_diagnostics_snapshot() -> dict[str, dict[str, Any]]:
+    with RUNTIME_DIAGNOSTICS_LOCK:
+        return {
+            backend: public_runtime_diagnostic(dict(RUNTIME_DIAGNOSTICS.get(backend) or runtime_diagnostic_payload(
+                backend, "unknown", installed=None, authenticated=None
+            )))
+            for backend in sorted(VALID_BACKENDS)
+        }
+
+
+def record_runtime_failure(backend: str, error: Any, *, spawn_failure: bool = False) -> None:
+    text = str(error or "").strip()
+    lower = text.lower()
+    with RUNTIME_DIAGNOSTICS_LOCK:
+        previous = dict(RUNTIME_DIAGNOSTICS.get(backend) or runtime_diagnostic_payload(
+            backend, "unknown", installed=None, authenticated=None
+        ))
+    if auth_failure_text(text):
+        current = runtime_diagnostic_payload(
+            backend, "unauthenticated", installed=True, authenticated=False, version=previous.get("version")
+        )
+    elif spawn_failure and (
+        isinstance(error, FileNotFoundError)
+        or any(marker in lower for marker in ("no such file", "enoent", "failed to start"))
+    ):
+        current = runtime_diagnostic_payload(
+            backend, "missing", installed=False, authenticated=False, version=previous.get("version")
+        )
+    else:
+        current = previous
+    current["last_error"] = "The latest provider run failed. Open the chat error for details, then retry or refresh runtime status."
+    current["last_error_at"] = now_iso()
+    store_runtime_diagnostic(current, preserve_last_error=False)
+
+
+def record_runtime_success(backend: str) -> None:
+    with RUNTIME_DIAGNOSTICS_LOCK:
+        previous = dict(RUNTIME_DIAGNOSTICS.get(backend) or {})
+    current = runtime_diagnostic_payload(
+        backend,
+        "ready",
+        installed=True,
+        authenticated=True,
+        version=previous.get("version"),
+    )
+    store_runtime_diagnostic(current, preserve_last_error=False)
+
+
+async def ensure_runtime_available(backend: str) -> dict[str, Any]:
+    diagnostic = await asyncio.to_thread(runtime_diagnostic, backend)
+    if diagnostic.get("status") == "ready":
+        return diagnostic
+    raise HTTPException(status_code=503, detail={
+        "code": "runtime_unavailable",
+        "backend": backend,
+        "status": diagnostic.get("status") or "unknown",
+        "message": diagnostic.get("message") or f"{runtime_display_name(backend)} is unavailable.",
+        "action": diagnostic.get("action"),
+    })
+
+
 def runtime_priority(model: dict[str, Any]) -> int:
     try:
         return int(model["priority"])
@@ -5895,7 +6111,7 @@ def parse_claude_help_catalog() -> dict[str, Any]:
     )
     default_effort = os.environ.get("CLAUDE_EFFORT") or os.environ.get("ZENITHBOT_CLAUDE_EFFORT") or ""
     try:
-        help_text = run_catalog_command(["claude", "--help"])
+        help_text = run_catalog_command([CLAUDE_BIN, "--help"])
     except Exception as exc:
         logger.warning("claude model discovery failed: %s", exc)
         return {
@@ -5962,19 +6178,23 @@ def parse_claude_help_catalog() -> dict[str, Any]:
     }
 
 
-def discover_runtime_catalog() -> dict[str, Any]:
-    return {
+def discover_runtime_catalog(*, force_runtime_probe: bool = False) -> dict[str, Any]:
+    diagnostics = refresh_runtime_diagnostics(force=force_runtime_probe)
+    catalog = {
         "generated_at": now_iso(),
         "backends": {
             BACKEND_CLAUDE: parse_claude_help_catalog(),
             BACKEND_CODEX: discover_codex_catalog(),
         },
     }
+    for backend, diagnostic in diagnostics.items():
+        catalog["backends"][backend]["diagnostic"] = public_runtime_diagnostic(diagnostic)
+    return catalog
 
 
 def build_claude_cmd(sess: dict[str, Any], manifest_path: Path, *, provider_id: str | None = None) -> list[str]:
     cmd = [
-        "claude", "-p",
+        CLAUDE_BIN, "-p",
         "--output-format", "stream-json",
         "--verbose",
         "--dangerously-skip-permissions",
@@ -6497,6 +6717,7 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
             start_new_session=True,
         )
     except Exception as e:
+        record_runtime_failure(BACKEND_CLAUDE, e, spawn_failure=True)
         await append_event(session_id, "error", {"run_id": run_id, "backend": BACKEND_CLAUDE, "message": f"failed to start Claude: {e}", **run_event_metadata(run_id)})
         await append_turn_finished_event(session_id, {
             "run_id": run_id,
@@ -6636,6 +6857,10 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
         await append_event(session_id, "error", {"run_id": run_id, "message": "killed after idle timeout", **run_event_metadata(run_id)})
     if not stopped and proc.returncode not in (0, None) and stderr:
         await append_event(session_id, "error", {"run_id": run_id, "message": stderr[:4000], "exit_code": proc.returncode, **run_event_metadata(run_id)})
+    if not stopped and (result_error or stream_error or proc.returncode not in (0, None)):
+        record_runtime_failure(BACKEND_CLAUDE, result_error or stream_error or stderr or f"exit {proc.returncode}")
+    elif not stopped:
+        record_runtime_success(BACKEND_CLAUDE)
     if provider_id and not result_error:
         await STORE.save_provider_session(session_id, provider_id, BACKEND_CLAUDE, cwd=cwd)
         await append_event(session_id, "provider_session", {"run_id": run_id, "backend": BACKEND_CLAUDE, "provider_session_id": provider_id})
@@ -6693,6 +6918,7 @@ async def run_codex(
             start_new_session=True,
         )
     except Exception as e:
+        record_runtime_failure(BACKEND_CODEX, e, spawn_failure=True)
         await append_event(session_id, "error", {"run_id": run_id, "backend": BACKEND_CODEX, "message": f"failed to start Codex: {e}", **run_event_metadata(run_id)})
         await append_turn_finished_event(session_id, {
             "run_id": run_id,
@@ -7062,6 +7288,10 @@ async def run_codex(
             "exit_code": proc.returncode,
             **run_event_metadata(run_id),
         })
+    if not stopped and (stream_error or idle_killed or resume_stalled or proc.returncode not in (0, None) or silent_completion):
+        record_runtime_failure(BACKEND_CODEX, terminal_error or stream_error or f"exit {proc.returncode}")
+    elif not stopped:
+        record_runtime_success(BACKEND_CODEX)
     if provider_id:
         await STORE.save_provider_session(session_id, provider_id, BACKEND_CODEX)
     await collect_manifest(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts, final=True)
@@ -7126,6 +7356,9 @@ async def start_turn(
         if runtime_patch:
             sess = await STORE.update(session_id, runtime_patch)
 
+        backend = sess.get("backend") or DEFAULT_BACKEND
+        await ensure_runtime_available(backend)
+
         run_id = f"run_{uuid.uuid4().hex[:16]}"
         manifest_path = manifests_dir(session_id) / f"{run_id}.json"
         prompt = req.prompt
@@ -7142,7 +7375,6 @@ async def start_turn(
                 prompt += f"- {rec.get('path')} ({rec.get('filename')}, {rec.get('content_type')})\n"
             prompt += "Use these local paths directly when needed.\n"
 
-        backend = sess.get("backend") or DEFAULT_BACKEND
         memory_seed = str(sess.get("memory_seed") or "").strip()
         if (
             backend == BACKEND_CODEX
@@ -7212,6 +7444,7 @@ async def lifespan(app: FastAPI):
     digest_recovery_task = asyncio.create_task(reconcile_handoff_digest_jobs())
     host_monitor_task = asyncio.create_task(host_monitor_loop())
     history_search_task = asyncio.create_task(history_search_index_loop())
+    runtime_probe_task = asyncio.create_task(asyncio.to_thread(refresh_runtime_diagnostics, force=True))
     logger.info(
         "agent server ready state=%s sessions=%d jobs=%d digests=%d queued=%d queue_drains=%d",
         STATE_DIR,
@@ -7227,12 +7460,15 @@ async def lifespan(app: FastAPI):
         digest_recovery_task.cancel()
         host_monitor_task.cancel()
         history_search_task.cancel()
+        runtime_probe_task.cancel()
         with suppress(asyncio.CancelledError):
             await digest_recovery_task
         with suppress(asyncio.CancelledError):
             await host_monitor_task
         with suppress(asyncio.CancelledError):
             await history_search_task
+        with suppress(asyncio.CancelledError):
+            await runtime_probe_task
 
 
 app = FastAPI(title="Zenithbot Agent Server", lifespan=lifespan)
@@ -7275,6 +7511,7 @@ async def health() -> dict[str, Any]:
         "jobs": len(JOBS.jobs),
         "job_guard": pressure,
         "host_health_log": str(HOST_HEALTH_FILE),
+        "runtimes": runtime_diagnostics_snapshot(),
     }
 
 
@@ -7290,8 +7527,8 @@ async def host_diagnostics(limit: int = 40) -> dict[str, Any]:
 
 
 @app.get("/api/runtime/catalog")
-async def runtime_catalog() -> dict[str, Any]:
-    return await asyncio.to_thread(discover_runtime_catalog)
+async def runtime_catalog(refresh: bool = False) -> dict[str, Any]:
+    return await asyncio.to_thread(discover_runtime_catalog, force_runtime_probe=refresh)
 
 
 @app.get("/api/sessions/{session_id}/terminal")

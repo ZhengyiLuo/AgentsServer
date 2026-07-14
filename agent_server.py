@@ -5892,7 +5892,8 @@ def record_runtime_failure(backend: str, error: Any, *, spawn_failure: bool = Fa
         )
     else:
         current = previous
-    current["last_error"] = "The latest provider run failed. Open the chat error for details, then retry or refresh runtime status."
+    failure = compact_memory_text(text, 700) if text else ""
+    current["last_error"] = failure or "The latest provider run failed. Open the chat error for details, then retry or refresh runtime status."
     current["last_error_at"] = now_iso()
     store_runtime_diagnostic(current, preserve_last_error=False)
 

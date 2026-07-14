@@ -4960,11 +4960,71 @@ def is_codex_compaction_failure(message: str) -> bool:
     return "remote compact task" in lowered and "stream disconnected" in lowered
 
 
+def is_codex_resume_failure(message: str) -> bool:
+    lowered = str(message or "").lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "no conversation found with session id",
+            "conversation not found",
+            "thread not found",
+            "session not found",
+            "failed to resume",
+            "could not resume",
+            "unable to resume",
+        )
+    )
+
+
+def is_silent_codex_completion(
+    *,
+    stopped: bool,
+    stream_error: str | None,
+    idle_killed: bool,
+    returncode: int | None,
+    produced_activity: bool,
+) -> bool:
+    return (
+        not stopped
+        and not stream_error
+        and not idle_killed
+        and returncode in (0, None)
+        and not produced_activity
+    )
+
+
+def should_recover_codex_resume(
+    *,
+    allow_rollover: bool,
+    resumed_provider_id: str | None,
+    stopped: bool,
+    stream_error: str | None,
+    idle_killed: bool,
+    returncode: int | None,
+    produced_activity: bool,
+    terminal_error: str,
+) -> bool:
+    if (
+        not allow_rollover
+        or not resumed_provider_id
+        or stopped
+        or stream_error
+        or idle_killed
+        or produced_activity
+    ):
+        return False
+    if returncode in (0, None):
+        return True
+    return is_codex_resume_failure(terminal_error) or is_codex_compaction_failure(terminal_error)
+
+
 async def rollover_codex_provider_session(
     session_id: str,
     run_id: str,
     provider_id: str,
     reason: str,
+    *,
+    message: str,
 ) -> tuple[dict[str, Any], str] | None:
     current = STORE.sessions.get(session_id)
     if not current:
@@ -4988,7 +5048,7 @@ async def rollover_codex_provider_session(
         "run_id": run_id,
         "backend": BACKEND_CODEX,
         "old_provider_session_id": provider_id,
-        "message": "Codex provider context was full. Retrying this turn once on a fresh thread with bounded recent memory.",
+        "message": message,
         "reason": compact_memory_text(reason, 1200),
     })
     return fresh_session, memory
@@ -6145,6 +6205,7 @@ async def run_codex(
     allow_compaction_rollover: bool = True,
     diff_baseline: dict[str, str] | None = None,
 ) -> None:
+    resumed_provider_id = session_provider_id(sess)
     cmd = build_codex_cmd(sess, prompt, manifest_path)
     requested_cwd = str(sess.get("cwd") or DEFAULT_CWD)
     cwd = existing_cwd(requested_cwd)
@@ -6420,21 +6481,52 @@ async def run_codex(
         stderr = (await proc.stderr.read()).decode("utf-8", "replace").strip()
     stopped = run_id in STOPPED_RUNS
     terminal_error = codex_error or stderr
-    should_rollover = (
-        allow_compaction_rollover
-        and bool(provider_id)
-        and not stopped
-        and not stream_error
-        and not idle_killed
-        and proc.returncode not in (0, None)
-        and not text_parts
-        and not seen_reasoning
-        and not started_tool_ids
-        and not seen_artifacts
-        and is_codex_compaction_failure(terminal_error)
+    produced_activity = bool(
+        text_parts
+        or seen_reasoning
+        or started_tool_ids
+        or finished_tool_ids
+        or seen_artifacts
+    )
+    silent_completion = is_silent_codex_completion(
+        stopped=stopped,
+        stream_error=stream_error,
+        idle_killed=idle_killed,
+        returncode=proc.returncode,
+        produced_activity=produced_activity,
+    )
+    should_rollover = should_recover_codex_resume(
+        allow_rollover=allow_compaction_rollover,
+        resumed_provider_id=resumed_provider_id,
+        stopped=stopped,
+        stream_error=stream_error,
+        idle_killed=idle_killed,
+        returncode=proc.returncode,
+        produced_activity=produced_activity,
+        terminal_error=terminal_error,
     )
     if should_rollover:
-        rollover = await rollover_codex_provider_session(session_id, run_id, str(provider_id), terminal_error)
+        recovery_reason = terminal_error or "Codex resume exited successfully without producing any response events."
+        recovery_message = (
+            "Codex resume produced no reply. Retrying this turn once on a fresh thread with bounded recent memory."
+            if silent_completion
+            else "Codex could not continue the provider thread. Retrying this turn once on a fresh thread with bounded recent memory."
+        )
+        logger.warning(
+            "recovering empty Codex resume session=%s run=%s provider=%s exit=%s reason=%s",
+            session_id,
+            run_id,
+            resumed_provider_id,
+            proc.returncode,
+            compact_memory_text(recovery_reason, 500),
+        )
+        rollover = await rollover_codex_provider_session(
+            session_id,
+            run_id,
+            str(resumed_provider_id),
+            recovery_reason,
+            message=recovery_message,
+        )
         if rollover:
             fresh_session, memory = rollover
             retry_prompt = f"{memory}\n\n[Current user prompt]\n{prompt}"
@@ -6459,6 +6551,14 @@ async def run_codex(
             await append_event(session_id, "error", {"run_id": run_id, "message": stderr[:4000], "exit_code": proc.returncode, **run_event_metadata(run_id)})
         else:
             await append_event(session_id, "error", {"run_id": run_id, "message": f"Codex exited {proc.returncode} without error output.", "exit_code": proc.returncode, **run_event_metadata(run_id)})
+    elif silent_completion:
+        await append_event(session_id, "error", {
+            "run_id": run_id,
+            "backend": BACKEND_CODEX,
+            "message": "Codex exited without producing a reply. Retry the message; if this was a resumed external thread, create a fresh memory-backed continuation.",
+            "exit_code": proc.returncode,
+            **run_event_metadata(run_id),
+        })
     if provider_id:
         await STORE.save_provider_session(session_id, provider_id, BACKEND_CODEX)
     await collect_manifest(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts, final=True)

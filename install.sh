@@ -53,6 +53,7 @@ SERVER_SOURCE="$SOURCE_DIR/agent_server.py"
 APP_DIR="$INSTALL_ROOT/current"
 VENV_DIR="$INSTALL_ROOT/.venv"
 ENV_FILE="$CONFIG_ROOT/env"
+SERVER_PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
 if [[ ! -f "$SERVER_SOURCE" ]]; then
   echo "agent_server.py is missing beside install.sh." >&2
@@ -108,6 +109,7 @@ ZENITHBOT_AGENT_CWD=$HOME
 ZENITHBOT_AGENT_BIND=$BIND_ADDRESS
 ZENITHBOT_AGENT_PORT=$PORT
 ZENITHDOCK_AGENT_TOKEN=$TOKEN
+PATH=$SERVER_PATH
 EOF
 chmod 600 "$ENV_FILE"
 
@@ -157,6 +159,7 @@ elif [[ "$OS_NAME" == "Darwin" ]]; then
     <key>ZENITHBOT_AGENT_DIR</key><string>$STATE_ROOT</string>
     <key>ZENITHBOT_AGENT_CWD</key><string>$HOME</string>
     <key>ZENITHDOCK_AGENT_TOKEN</key><string>$TOKEN</string>
+    <key>PATH</key><string>$SERVER_PATH</string>
   </dict>
   <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>$HOME/Library/Logs/AgentsServer/server.log</string>

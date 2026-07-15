@@ -114,13 +114,11 @@ RUNTIME_DIAGNOSTIC_TTL_SECONDS = float(os.environ.get("ZENITHBOT_RUNTIME_DIAGNOS
 JOB_SCHEDULER_INTERVAL_SECONDS = float(os.environ.get("ZENITHBOT_JOB_SCHEDULER_INTERVAL_SECONDS", "5"))
 JOB_BUSY_RETRY_SECONDS = int(os.environ.get("ZENITHBOT_JOB_BUSY_RETRY_SECONDS", "60"))
 # Zero means scheduled jobs have no scheduler-specific concurrency ceiling.
-# Host pressure and the global agent-run guard still protect the machine.
+# The global agent-run guard and low-memory check still protect the machine.
 JOB_MAX_ACTIVE_RUNS = int(os.environ.get("ZENITHBOT_JOB_MAX_ACTIVE_RUNS", "0"))
-JOB_MAX_LOAD_PER_CPU = float(os.environ.get("ZENITHBOT_JOB_MAX_LOAD_PER_CPU", "1.25"))
 JOB_MIN_AVAILABLE_MEM_MB = int(os.environ.get("ZENITHBOT_JOB_MIN_AVAILABLE_MEM_MB", "4096"))
 JOB_DEFER_EVENT_MIN_SECONDS = int(os.environ.get("ZENITHBOT_JOB_DEFER_EVENT_MIN_SECONDS", "300"))
 MAX_ACTIVE_AGENT_RUNS = int(os.environ.get("ZENITHBOT_MAX_ACTIVE_AGENT_RUNS", "10"))
-MAX_START_LOAD_PER_CPU = float(os.environ.get("ZENITHBOT_MAX_START_LOAD_PER_CPU", "2.0"))
 MIN_START_AVAILABLE_MEM_MB = int(os.environ.get("ZENITHBOT_MIN_START_AVAILABLE_MEM_MB", "2048"))
 HOST_MONITOR_INTERVAL_SECONDS = float(os.environ.get("ZENITHBOT_HOST_MONITOR_INTERVAL_SECONDS", "15"))
 HOST_HEALTH_MAX_BYTES = int(os.environ.get("ZENITHBOT_HOST_HEALTH_MAX_BYTES", str(20 * 1024 * 1024)))
@@ -5570,10 +5568,8 @@ def host_pressure_snapshot() -> dict[str, Any]:
         "load_per_cpu": load_per_cpu,
         "cpu_count": cpu_count,
         "available_mem_mb": available_mem_mb,
-        "job_max_load_per_cpu": JOB_MAX_LOAD_PER_CPU,
         "job_min_available_mem_mb": JOB_MIN_AVAILABLE_MEM_MB,
         "job_max_active_runs": JOB_MAX_ACTIVE_RUNS,
-        "start_max_load_per_cpu": MAX_START_LOAD_PER_CPU,
         "start_min_available_mem_mb": MIN_START_AVAILABLE_MEM_MB,
         "start_max_active_runs": MAX_ACTIVE_AGENT_RUNS,
     }
@@ -5589,10 +5585,6 @@ async def scheduled_job_blocker(session_id: str) -> str | None:
         return f"{active_count} active agent run(s)"
 
     pressure = host_pressure_snapshot()
-    load_per_cpu = pressure.get("load_per_cpu")
-    if isinstance(load_per_cpu, (int, float)) and load_per_cpu >= JOB_MAX_LOAD_PER_CPU:
-        return f"host load high ({load_per_cpu:.2f}/CPU)"
-
     available_mem_mb = pressure.get("available_mem_mb")
     if (
         isinstance(available_mem_mb, int)
@@ -5612,10 +5604,6 @@ async def turn_start_blocker(*, ignore_session_id: str | None = None) -> str | N
         return f"server already has {active_count} active agent run(s)"
 
     pressure = host_pressure_snapshot()
-    load_per_cpu = pressure.get("load_per_cpu")
-    if isinstance(load_per_cpu, (int, float)) and load_per_cpu >= MAX_START_LOAD_PER_CPU:
-        return f"host load high ({load_per_cpu:.2f}/CPU)"
-
     available_mem_mb = pressure.get("available_mem_mb")
     if (
         isinstance(available_mem_mb, int)

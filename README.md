@@ -27,7 +27,8 @@ machine paths.
   an authenticated PTY WebSocket; disconnecting a client does not stop the
   tmux session, its panes, or processes. Structured actions create, select,
   split, and close individual windows while guarding the final persistent
-  window from accidental destruction.
+  window from accidental destruction. Archiving a chat kills this owned tmux
+  session and prevents it from being recreated until the chat is unarchived.
 - Discovers available runtime models/efforts from the installed CLI tools when
   possible.
 - Reports Claude Code and Codex installation, authentication, version, and

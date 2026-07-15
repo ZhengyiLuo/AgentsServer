@@ -2296,6 +2296,8 @@ def ensure_terminal_session(
     sess = STORE.sessions.get(session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="session not found")
+    if bool(sess.get("archived")):
+        raise HTTPException(status_code=409, detail="unarchive this chat before opening its terminal")
     name = terminal_session_name(session_id)
     created = False
     if not tmux_session_exists(name):
@@ -7774,6 +7776,8 @@ async def send_handoff_digest_background(session_id: str, req: HandoffDigestSend
 @app.patch("/api/sessions/{session_id}")
 async def update_session(session_id: str, req: UpdateSessionRequest) -> dict[str, Any]:
     sess = await STORE.update(session_id, req.model_dump(exclude_unset=True))
+    if req.archived is True:
+        await asyncio.to_thread(kill_terminal_session, session_id)
     return {"session": public_session(sess)}
 
 
@@ -8007,6 +8011,9 @@ async def session_terminal(
         return
     if session_id not in STORE.sessions:
         await ws.close(code=4404)
+        return
+    if bool(STORE.sessions[session_id].get("archived")):
+        await ws.close(code=4409)
         return
 
     cols, lines = terminal_dimensions(columns, rows)

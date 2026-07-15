@@ -1,4 +1,4 @@
-# ZenithBotServer
+# AgentsServer
 
 Standalone agent server for ZenithDock-style clients. It runs on the machine
 that owns the CLI tools and workspace, exposes a small HTTP/WebSocket API, and
@@ -46,7 +46,26 @@ machine paths.
   server from another Mac, iPhone, or iPad.
 - Optional: a user-level `systemd` service on Linux.
 
-## Quick Onboarding
+## One-Command Setup
+
+Clone the repository and run the idempotent installer as the user who will run
+Claude Code or Codex:
+
+```bash
+git clone https://github.com/ZhengyiLuo/AgentsServer.git
+cd AgentsServer
+./install.sh
+```
+
+The installer uses `uv`, installs a user-level service, creates a private access
+token, verifies authenticated health, and preserves existing
+`~/.zenithbot-agent` chat state on every update. It does not use `sudo`.
+
+AgentsDock desktop can run this same installer locally or over an existing SSH
+key connection from its first-run setup window. Remote clients should use the
+Tailscale URL printed by the installer.
+
+## Manual Onboarding
 
 1. Clone this repo on the machine that will run the agents.
 
@@ -64,7 +83,7 @@ uv pip install fastapi uvicorn python-multipart pydantic
 
 3. Install and authenticate the backend CLI tools you want to use.
 
-ZenithBotServer does not bundle Claude or Codex. It shells out to the CLI tools
+AgentsServer does not bundle Claude or Codex. It shells out to the CLI tools
 that are already installed on the agent host. Install the official Claude CLI
 and/or Codex CLI, sign in or configure credentials for each, then verify the
 commands work in the same shell/user that will run the server:

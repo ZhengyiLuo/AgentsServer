@@ -93,6 +93,19 @@ class RuntimeDiagnosticTests(unittest.TestCase):
         self.assertEqual(diagnostic["status"], "missing")
         self.assertFalse(diagnostic["installed"])
 
+    def test_claude_catalog_parses_wrapped_effort_levels(self) -> None:
+        help_text = """\
+  --effort <level>                      Effort level for the current session
+                                        (low, medium, high, xhigh, max)
+  --exclude-dynamic-system-prompt-sections
+"""
+        with patch.object(agent_server, "run_catalog_command", return_value=help_text):
+            catalog = agent_server.parse_claude_help_catalog()
+        self.assertEqual(
+            [option["value"] for option in catalog["efforts"]],
+            ["", "low", "medium", "high", "xhigh", "max"],
+        )
+
 
 class RuntimePreflightTests(unittest.IsolatedAsyncioTestCase):
     async def test_unavailable_runtime_fails_before_launch(self) -> None:

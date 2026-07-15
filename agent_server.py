@@ -6164,11 +6164,11 @@ def parse_claude_help_catalog() -> dict[str, Any]:
     ):
         model_options.append(runtime_option(alias, label))
 
-    effort_match = re.search(r"--effort <level>.*?\(([^)]+)\)", help_text, re.IGNORECASE)
+    effort_match = re.search(r"--effort\s+<level>.*?\(([^)]+)\)", help_text, re.IGNORECASE | re.DOTALL)
     if effort_match:
         for effort in re.split(r"[,/\s]+", effort_match.group(1)):
             clean = effort.strip()
-            if clean:
+            if clean and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", clean):
                 effort_options.append(runtime_option(clean, title_effort_label(clean)))
 
     return {

@@ -1,15 +1,33 @@
 # AgentsServer
 
-Standalone agent server for ZenithDock-style clients. It runs on the machine
-that owns the CLI tools and workspace, exposes a small HTTP/WebSocket API, and
-streams normalized Claude/Codex events, artifacts, uploads, scheduled jobs,
-process inspection, and tmux pane capture to native clients.
+**AgentsServer is the self-hosted execution backend for
+[AgentsDock](https://github.com/ZhengyiLuo/AgentsDock).** AgentsDock provides
+the polished desktop and mobile chat experience; AgentsServer runs on the
+machine that owns your workspaces, Claude Code installation, and Codex CLI.
+Together they provide persistent agent chats without routing private project
+files through a third-party chat service.
+
+AgentsServer exposes an authenticated HTTP/WebSocket API and streams normalized
+Claude/Codex events, files, videos, uploads, scheduled jobs, process inspection,
+and persistent tmux terminals to AgentsDock clients.
+
+```text
+AgentsDock (Mac, iPhone, iPad, Linux)
+        |
+        | private HTTP/WebSocket connection
+        v
+AgentsServer (your workstation or server)
+        |
+        +-- Claude Code CLI
+        +-- Codex CLI
+        +-- local workspaces, files, jobs, and tmux sessions
+```
 
 This repository is intentionally server-only. It should not contain local chat
 state, uploaded files, tokens, compiled caches, private hostnames, or personal
 machine paths.
 
-## What It Does
+## What It Gives AgentsDock
 
 - Creates and resumes chat sessions for Claude and Codex CLI backends.
 - Streams live agent events over WebSocket while preserving a JSONL event
@@ -46,6 +64,18 @@ machine paths.
   server from another Mac, iPhone, or iPad.
 - Optional: a user-level `systemd` service on Linux.
 
+## AgentsDock
+
+AgentsDock is the companion client for this server. It provides multiple chats
+and folders, queues and scheduled jobs, rich Markdown/code rendering, inline
+media, downloads and drag-out, code review, search, notifications, and
+persistent per-chat terminals.
+
+Get the client and current installation instructions from the
+[AgentsDock repository](https://github.com/ZhengyiLuo/AgentsDock). The macOS
+desktop app is available as a Developer ID-signed and Apple-notarized build;
+Apple-platform test builds are also distributed through TestFlight.
+
 ## One-Command Setup
 
 Clone the repository and run the idempotent installer as the user who will run
@@ -70,8 +100,8 @@ Tailscale URL printed by the installer.
 1. Clone this repo on the machine that will run the agents.
 
 ```bash
-git clone <repo-url>
-cd ZenithBotServer
+git clone https://github.com/ZhengyiLuo/AgentsServer.git
+cd AgentsServer
 ```
 
 2. Create a Python environment.
@@ -111,11 +141,11 @@ uv run python agent_server.py serve --bind 0.0.0.0 --port 7850
 curl http://127.0.0.1:7850/api/health
 ```
 
-6. Connect a ZenithDock client.
+6. Connect AgentsDock.
 
-The ZenithDock app is distributed through TestFlight for macOS, iOS, and
-iPadOS. Install the app there first, then configure the server URL and access
-token in the app.
+Open AgentsDock, enter the server URL printed by the installer, and paste its
+access token. The desktop app can also run the installer for you during
+first-run setup.
 
 For a client on the same machine, use:
 
@@ -171,8 +201,8 @@ Clients should send either:
 Authorization: Bearer replace-with-a-long-random-token
 ```
 
-or the `X-ZenithDock-Token` header. Leave the variable unset only for trusted
-local development.
+or the legacy `X-ZenithDock-Token` header retained for client compatibility.
+Leave the variable unset only for trusted local development.
 
 ## Remote Access With Tailscale
 
@@ -188,7 +218,7 @@ tailscale ip -4
 ```
 
 On the client device, make sure Tailscale is connected to the same account or
-tailnet, then set the ZenithDock server URL to:
+tailnet, then set the AgentsDock server URL to:
 
 ```text
 http://<tailscale-ip>:7850
@@ -202,11 +232,33 @@ If the browser can open `/api/health` but the app cannot connect, check:
 - the server is bound to `0.0.0.0` or the Tailscale interface, not only
   `127.0.0.1`
 
-## Deployment
+## Updating AgentsServer
 
-`deploy.sh` copies `agent_server.py` to a remote app directory, compiles it,
-restarts the configured user service, and checks local health on the remote
-host.
+Pull the newest version and rerun the installer. It updates the runtime and
+service while preserving the access token and all chat state:
+
+```bash
+git pull --ff-only
+./install.sh
+```
+
+On Linux, inspect the installed service with:
+
+```bash
+systemctl --user status agents-server.service --no-pager -l
+journalctl --user -u agents-server.service -f
+```
+
+On macOS, the installer creates the LaunchAgent
+`com.agentsdock.server` and writes logs under
+`~/Library/Logs/AgentsServer/`.
+
+## Legacy Deployment Helper
+
+New installations should use `install.sh`. For an existing deployment that
+still uses the historical Zenithbot directory and service names, `deploy.sh`
+copies `agent_server.py` to that remote app directory, compiles it, restarts
+the configured user service, and checks local health on the remote host.
 
 ```bash
 ./deploy.sh <ssh-host>
@@ -231,9 +283,13 @@ Create that directory on the remote host before the first deploy, and install a
 matching user service. A template lives at
 `systemd/zenithbot-agent.service.example`.
 
-## Systemd User Service
+## Legacy Systemd Template
 
-Example install flow on the remote host:
+The repository retains `systemd/zenithbot-agent.service.example` for existing
+deployments. New installations do not need it because `install.sh` creates and
+manages `agents-server.service` automatically.
+
+Legacy install flow:
 
 ```bash
 mkdir -p ~/.config/systemd/user ~/Zenithbot/scripts
@@ -252,7 +308,9 @@ curl -H 'Authorization: Bearer replace-with-a-long-random-token' \
 
 ## Useful Configuration
 
-Most settings are environment variables:
+Most settings are environment variables. The `ZENITHBOT_*` and
+`ZENITHDOCK_AGENT_TOKEN` names are retained as a stable wire/configuration
+contract so existing AgentsDock installations and chat state continue to work:
 
 | Variable | Purpose | Default |
 |---|---|---|
@@ -298,7 +356,7 @@ must already be authenticated for the same Unix user that runs the service.
 
 ## Backend CLI Notes
 
-The backend selection in ZenithDock only chooses which CLI the server invokes.
+The backend selection in AgentsDock only chooses which CLI the server invokes.
 The model, effort, authentication, provider-side session storage, and available
 commands still come from the installed CLI tools and their local configuration.
 

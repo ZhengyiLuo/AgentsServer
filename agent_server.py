@@ -147,6 +147,7 @@ MAX_IMPORTED_TEXT_CHARS = int(os.environ.get("ZENITHBOT_HISTORY_IMPORT_TEXT_CHAR
 MAX_FORK_MEMORY_CHARS = int(os.environ.get("ZENITHBOT_FORK_MEMORY_CHARS", "24000"))
 MAX_FORK_MEMORY_ITEM_CHARS = int(os.environ.get("ZENITHBOT_FORK_MEMORY_ITEM_CHARS", "1800"))
 MAX_HANDOFF_DIGEST_CHARS = int(os.environ.get("ZENITHBOT_HANDOFF_DIGEST_CHARS", "56000"))
+MAX_SESSION_SYSTEM_PROMPT_CHARS = int(os.environ.get("ZENITHBOT_SESSION_SYSTEM_PROMPT_CHARS", "24000"))
 HANDOFF_DIGEST_TIMEOUT_SECONDS = int(os.environ.get("ZENITHBOT_HANDOFF_DIGEST_TIMEOUT_SECONDS", "180"))
 HANDOFF_DIGEST_BACKEND = os.environ.get("ZENITHBOT_HANDOFF_DIGEST_BACKEND", BACKEND_CLAUDE).lower()
 if HANDOFF_DIGEST_BACKEND not in VALID_BACKENDS:
@@ -797,6 +798,7 @@ class CreateSessionRequest(BaseModel):
     backend: str | None = None
     model: str | None = None
     effort: str | None = None
+    system_prompt: str | None = Field(default=None, max_length=MAX_SESSION_SYSTEM_PROMPT_CHARS)
     pinned: bool | None = None
     archived: bool | None = None
     provider_session_id: str | None = None
@@ -813,6 +815,7 @@ class UpdateSessionRequest(BaseModel):
     backend: str | None = None
     model: str | None = None
     effort: str | None = None
+    system_prompt: str | None = Field(default=None, max_length=MAX_SESSION_SYSTEM_PROMPT_CHARS)
     pinned: bool | None = None
     archived: bool | None = None
 
@@ -921,6 +924,18 @@ def normalize_runtime_effort(backend: str, effort: Any, *, strict: bool = False)
         raise HTTPException(status_code=400, detail=f"Codex effort must be one of: {supported}")
     logger.warning("dropping unsupported Codex effort value=%r", effort)
     return None
+
+
+def clean_session_system_prompt(value: Any) -> str | None:
+    clean = str(value or "").strip()
+    if not clean:
+        return None
+    if len(clean) > MAX_SESSION_SYSTEM_PROMPT_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"system prompt must be at most {MAX_SESSION_SYSTEM_PROMPT_CHARS} characters",
+        )
+    return clean
 
 
 class UpdateJobRequest(BaseModel):
@@ -1057,6 +1072,7 @@ class SessionStore:
             "backend": backend,
             "model": req.model,
             "effort": normalize_runtime_effort(backend, req.effort, strict=True),
+            "system_prompt": clean_session_system_prompt(req.system_prompt),
             "session_id": active_provider_id,
             "claude_session_id": claude_session_id,
             "codex_thread_id": codex_thread_id,
@@ -1105,6 +1121,8 @@ class SessionStore:
             for key in ("title", "folder", "cwd"):
                 if key in patch and patch[key] is not None:
                     sess[key] = patch[key]
+            if "system_prompt" in patch:
+                sess["system_prompt"] = clean_session_system_prompt(patch["system_prompt"])
             for key in ("model", "effort"):
                 if key in patch:
                     value = patch[key]
@@ -5583,7 +5601,7 @@ def public_session(sess: dict[str, Any]) -> dict[str, Any]:
     return {
         k: sess.get(k)
         for k in (
-            "id", "title", "folder", "cwd", "backend", "model", "effort",
+            "id", "title", "folder", "cwd", "backend", "model", "effort", "system_prompt",
             "session_id", "claude_session_id", "codex_thread_id",
             "parent_id", "fork_from", "memory_forked", "memory_seed_used",
             "pinned", "pinned_at", "archived", "archived_at", "sort_order", "created_at", "updated_at",
@@ -6247,16 +6265,32 @@ def discover_runtime_catalog(*, force_runtime_probe: bool = False) -> dict[str, 
     return catalog
 
 
+def session_prompt_addendum(sess: dict[str, Any]) -> str:
+    custom_prompt = str(sess.get("system_prompt") or "").strip()
+    if not custom_prompt:
+        return ""
+    return (
+        "\n[Per-chat system instructions]\n"
+        f"{custom_prompt}\n"
+        "[End per-chat system instructions]\n\n"
+    )
+
+
+def session_system_prompt(session_id: str, sess: dict[str, Any], manifest_path: Path) -> str:
+    return SYSTEM_PROMPT.format(
+        manifest_path=str(manifest_path),
+        terminal_session=terminal_session_name(session_id),
+    ) + session_prompt_addendum(sess)
+
+
 def build_claude_cmd(session_id: str, sess: dict[str, Any], manifest_path: Path, *, provider_id: str | None = None) -> list[str]:
+    system_prompt = session_system_prompt(session_id, sess, manifest_path)
     cmd = [
         CLAUDE_BIN, "-p",
         "--output-format", "stream-json",
         "--verbose",
         "--dangerously-skip-permissions",
-        "--append-system-prompt", SYSTEM_PROMPT.format(
-            manifest_path=str(manifest_path),
-            terminal_session=terminal_session_name(session_id),
-        ),
+        "--append-system-prompt", system_prompt,
         "--disallowedTools", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
     ]
     if sess.get("model"):
@@ -6279,7 +6313,7 @@ def build_codex_cmd(session_id: str, sess: dict[str, Any], prompt: str, manifest
     full_prompt = CODEX_PROMPT_PRELUDE.format(
         manifest_path=str(manifest_path),
         terminal_session=terminal_session_name(session_id),
-    ) + prompt
+    ) + session_prompt_addendum(sess) + prompt
     model = str(sess.get("model") or configured_model or CODEX_DEFAULT_MODEL).strip()
     normalized_effort = normalize_runtime_effort(
         BACKEND_CODEX,
@@ -8042,6 +8076,7 @@ async def fork_session(session_id: str, req: ForkSessionRequest) -> dict[str, An
             backend=parent_backend,
             model=parent.get("model"),
             effort=parent.get("effort"),
+            system_prompt=parent.get("system_prompt"),
             pinned=bool(parent.get("pinned")),
             archived=bool(parent.get("archived")),
             provider_session_id=forked_codex_thread_id if parent_backend == BACKEND_CODEX else None,

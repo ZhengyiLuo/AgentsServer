@@ -5,8 +5,16 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REMOTE_HOST="${ZENITHDOCK_REMOTE_HOST:-${1:-}}"
 REMOTE_APP_DIR="${ZENITHDOCK_REMOTE_APP_DIR:-Zenithbot}"
 REMOTE_SERVER_PATH="$REMOTE_APP_DIR/scripts/agent_server.py"
+REMOTE_SERVER_DIR="$(dirname "$REMOTE_SERVER_PATH")"
+REMOTE_PYTHON="$REMOTE_APP_DIR/.venv/bin/python"
 SERVICE_NAME="${ZENITHDOCK_AGENT_SERVICE:-zenithbot-agent.service}"
 HEALTH_ATTEMPTS="${ZENITHDOCK_HEALTH_ATTEMPTS:-45}"
+RUNTIME_FILES=(
+  "$SCRIPT_DIR/agent_server.py"
+  "$SCRIPT_DIR/update_runner.py"
+  "$SCRIPT_DIR/release-public-key.pem"
+  "$SCRIPT_DIR/VERSION"
+)
 
 if [[ -z "$REMOTE_HOST" ]]; then
   cat >&2 <<'USAGE'
@@ -23,11 +31,23 @@ USAGE
   exit 2
 fi
 
-echo "Deploying $SCRIPT_DIR/agent_server.py to $REMOTE_HOST:$REMOTE_SERVER_PATH"
-scp "$SCRIPT_DIR/agent_server.py" "$REMOTE_HOST:$REMOTE_SERVER_PATH"
+echo "Deploying AgentsServer runtime to $REMOTE_HOST:$REMOTE_SERVER_DIR"
+ssh "$REMOTE_HOST" "mkdir -p '$REMOTE_SERVER_DIR'"
+scp "${RUNTIME_FILES[@]}" "$REMOTE_HOST:$REMOTE_SERVER_DIR/"
+
+echo "Checking server runtime dependencies"
+ssh "$REMOTE_HOST" "
+  if ! '$REMOTE_PYTHON' -c 'import cryptography' >/dev/null 2>&1; then
+    if [[ -x \"\$HOME/.local/bin/uv\" ]]; then
+      \"\$HOME/.local/bin/uv\" pip install --python '$REMOTE_PYTHON' cryptography
+    else
+      '$REMOTE_PYTHON' -m pip install cryptography
+    fi
+  fi
+"
 
 echo "Compiling server on $REMOTE_HOST"
-ssh "$REMOTE_HOST" "python3 -m py_compile '$REMOTE_SERVER_PATH'"
+ssh "$REMOTE_HOST" "'$REMOTE_PYTHON' -m py_compile '$REMOTE_SERVER_PATH' '$REMOTE_SERVER_DIR/update_runner.py'"
 
 echo "Restarting $SERVICE_NAME"
 ssh "$REMOTE_HOST" "systemctl --user restart '$SERVICE_NAME'"

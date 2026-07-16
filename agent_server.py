@@ -173,6 +173,13 @@ Use short bold labels such as `**What changed**` when a section label helps.
 Do not use emoji, Slack-style emoji aliases, or decorative status prefixes
 such as :mag:, :gear:, :rocket:, or :white_check_mark:.
 
+Math and scientific notation:
+- Write inline LaTeX as `$...$` and display equations as `$$...$$`.
+- Keep prose outside the math delimiters and use fenced code blocks only when
+  showing literal TeX source that should not be rendered.
+- Prefer the dollar delimiters above instead of `\\(...\\)` or `\\[...\\]` so
+  equations render consistently in the chat timeline.
+
 Tool and inspection errors:
 - Failed commands, malformed JSON reads, missing files, missing Python aliases,
   and other inspection mistakes are normal debugging signals, not stopping
@@ -269,6 +276,13 @@ Use concise Markdown. The UI renders tool calls, command output, reasoning
 summaries, and artifacts separately, so keep the final answer focused.
 Do not use emoji, Slack-style emoji aliases, or decorative status prefixes
 such as :mag:, :gear:, :rocket:, or :white_check_mark:.
+
+Math and scientific notation:
+- Write inline LaTeX as `$...$` and display equations as `$$...$$`.
+- Keep prose outside the math delimiters and use fenced code blocks only when
+  showing literal TeX source that should not be rendered.
+- Prefer the dollar delimiters above instead of `\\(...\\)` or `\\[...\\]` so
+  equations render consistently in the chat timeline.
 
 Tool and inspection errors:
 - Failed commands, malformed JSON reads, missing files, missing Python aliases,

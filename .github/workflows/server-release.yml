@@ -1,0 +1,53 @@
+name: Server release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing or new release tag matching VERSION (for example v0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Validate version tag
+        shell: bash
+        run: |
+          test "v$(cat VERSION)" = "$RELEASE_TAG"
+          test "${RELEASE_TAG#v}" != "$RELEASE_TAG"
+      - name: Lock and test
+        run: |
+          uv lock --check
+          uv run python -m unittest discover -p 'test_*.py'
+      - name: Build release assets
+        run: uv run python scripts/package_release.py
+      - name: Sign release manifest
+        env:
+          RELEASE_KEY_B64: ${{ secrets.AGENTS_SERVER_RELEASE_PRIVATE_KEY_B64 }}
+        shell: bash
+        run: |
+          test -n "$RELEASE_KEY_B64"
+          printf '%s' "$RELEASE_KEY_B64" | base64 --decode > "$RUNNER_TEMP/agents-server-release.pem"
+          openssl pkeyutl -sign -rawin \
+            -inkey "$RUNNER_TEMP/agents-server-release.pem" \
+            -in dist/agents-server-manifest.json \
+            -out dist/agents-server-manifest.sig
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "$RELEASE_TAG" dist/* \
+            --title "AgentsServer $RELEASE_TAG" \
+            --generate-notes

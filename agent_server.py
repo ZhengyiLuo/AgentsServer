@@ -28,6 +28,7 @@ import signal
 import sqlite3
 import struct
 import subprocess
+import sys
 import termios
 import threading
 import time
@@ -44,6 +45,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 import uvicorn
+
+from update_runner import atomic_json as atomic_update_json
+from update_runner import check_release, utc_now as update_utc_now
 
 try:
     import tomllib
@@ -63,12 +67,23 @@ CODEX_EFFORT_ALIASES = {
 }
 
 STATE_DIR = Path(os.environ.get("ZENITHBOT_AGENT_DIR", Path.home() / ".zenithbot-agent"))
+SERVER_ROOT = Path(__file__).resolve().parent
+SERVER_VERSION_FILE = SERVER_ROOT / "VERSION"
+try:
+    SERVER_VERSION = SERVER_VERSION_FILE.read_text().strip() or "development"
+except OSError:
+    SERVER_VERSION = "development"
 SESSIONS_FILE = STATE_DIR / "sessions.json"
 JOBS_FILE = STATE_DIR / "jobs.json"
 HANDOFF_DIGEST_JOBS_FILE = STATE_DIR / "handoff_digest_jobs.json"
 FILES_ROOT = STATE_DIR / "files"
 CODE_DIFFS_ROOT = STATE_DIR / "code_diffs"
 HOST_HEALTH_FILE = STATE_DIR / "host_health.jsonl"
+SERVER_ADMIN_ROOT = STATE_DIR / "admin"
+SERVER_UPDATE_STATUS_FILE = SERVER_ADMIN_ROOT / "server-update.json"
+SERVER_UPDATE_LOG_FILE = SERVER_ADMIN_ROOT / "server-update.log"
+SERVER_UPDATE_PUBLIC_KEY = SERVER_ROOT / "release-public-key.pem"
+SERVER_UPDATE_RUNNER = SERVER_ROOT / "update_runner.py"
 CLAUDE_PROJECTS_ROOT = Path(os.environ.get("CLAUDE_PROJECTS_ROOT", Path.home() / ".claude" / "projects"))
 CODEX_SESSIONS_ROOT = Path(os.environ.get("CODEX_SESSIONS_ROOT", Path.home() / ".codex" / "sessions"))
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
@@ -141,6 +156,9 @@ HANDOFF_DIGEST_EFFORT = os.environ.get("ZENITHBOT_HANDOFF_DIGEST_EFFORT", "").st
 DEFAULT_SESSION_EVENT_LIMIT = int(os.environ.get("ZENITHBOT_SESSION_EVENT_LIMIT", "100"))
 MAX_EVENT_RESPONSE_LIMIT = int(os.environ.get("ZENITHBOT_MAX_EVENT_RESPONSE_LIMIT", "1000"))
 AGENT_TOKEN = os.environ.get("ZENITHDOCK_AGENT_TOKEN") or os.environ.get("ZENITHBOT_AGENT_TOKEN") or ""
+ADMIN_TOKEN = os.environ.get("AGENTS_SERVER_ADMIN_TOKEN") or ""
+SERVER_BIND_ADDRESS = os.environ.get("ZENITHBOT_AGENT_BIND", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("ZENITHBOT_AGENT_PORT", "7850"))
 API_CONTRACT_VERSION = 7
 SESSION_ORDER_STEP = 1000.0
 CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS = int(os.environ.get("ZENITHBOT_CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS", "120"))
@@ -231,6 +249,17 @@ Files and artifacts:
 - Use absolute file paths. Videos should be normal playable files such as mp4
   or mov. If `python` is not installed, use `python3` or shell tools to write
   files and the manifest.
+
+Persistent chat terminal:
+- This chat's AgentsDock terminal is the tmux session named
+  `{terminal_session}` on this same host.
+- The terminal is a separate interactive shell. Its screen and user input are
+  not automatically included in your context.
+- When terminal state is relevant, inspect it read-only with
+  `tmux capture-pane -p -J -t "$AGENTSDOCK_TMUX_SESSION" -S -200` and inspect
+  windows with `tmux list-windows -t "$AGENTSDOCK_TMUX_SESSION"`.
+- Do not send keys, resize panes, close windows, or kill the terminal session
+  unless the user explicitly asks you to operate on it.
 """
 
 CODEX_PROMPT_PRELUDE = """\
@@ -283,6 +312,17 @@ Manifest format:
 Use absolute file paths. Videos should be normal playable files such as mp4 or
 mov. If `python` is not installed, use `python3` or shell tools to write files
 and the manifest.
+
+Persistent chat terminal:
+- This chat's AgentsDock terminal is the tmux session named
+  `{terminal_session}` on this same host.
+- The terminal is a separate interactive shell. Its screen and user input are
+  not automatically included in your context.
+- When terminal state is relevant, inspect it read-only with
+  `tmux capture-pane -p -J -t "$AGENTSDOCK_TMUX_SESSION" -S -200` and inspect
+  windows with `tmux list-windows -t "$AGENTSDOCK_TMUX_SESSION"`.
+- Do not send keys, resize panes, close windows, or kill the terminal session
+  unless the user explicitly asks you to operate on it.
 
 User prompt follows.
 ]
@@ -727,6 +767,19 @@ def request_authorized(request: Request) -> bool:
     )
 
 
+def admin_token_matches(candidate: str | None) -> bool:
+    if not ADMIN_TOKEN or not candidate:
+        return False
+    return hmac.compare_digest(candidate, ADMIN_TOKEN)
+
+
+def require_admin_token(request: Request) -> None:
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=503, detail="server administration is not configured; run the current AgentsServer installer once")
+    if not admin_token_matches(request.headers.get("x-agentsserver-admin-token")):
+        raise HTTPException(status_code=403, detail="server administrator token is required")
+
+
 def websocket_authorized(ws: WebSocket) -> bool:
     if not AGENT_TOKEN:
         return True
@@ -879,6 +932,10 @@ class UpdateJobRequest(BaseModel):
     max_runs: int | None = None
     enabled: bool | None = None
     backend: str | None = None
+
+
+class ServerUpdateRequest(BaseModel):
+    version: str | None = None
 
 
 def session_folder(sess: dict[str, Any]) -> str:
@@ -5633,6 +5690,13 @@ def runner_env() -> dict[str, str]:
     return env
 
 
+def agent_runner_env(session_id: str) -> dict[str, str]:
+    env = runner_env()
+    env["AGENTSDOCK_CHAT_ID"] = session_id
+    env["AGENTSDOCK_TMUX_SESSION"] = terminal_session_name(session_id)
+    return env
+
+
 def runtime_option(value: str, label: str | None = None, **extra: Any) -> dict[str, Any]:
     clean = str(value or "").strip()
     return {"value": clean, "label": str(label or clean or "Server default").strip(), **extra}
@@ -6183,13 +6247,16 @@ def discover_runtime_catalog(*, force_runtime_probe: bool = False) -> dict[str, 
     return catalog
 
 
-def build_claude_cmd(sess: dict[str, Any], manifest_path: Path, *, provider_id: str | None = None) -> list[str]:
+def build_claude_cmd(session_id: str, sess: dict[str, Any], manifest_path: Path, *, provider_id: str | None = None) -> list[str]:
     cmd = [
         CLAUDE_BIN, "-p",
         "--output-format", "stream-json",
         "--verbose",
         "--dangerously-skip-permissions",
-        "--append-system-prompt", SYSTEM_PROMPT.format(manifest_path=str(manifest_path)),
+        "--append-system-prompt", SYSTEM_PROMPT.format(
+            manifest_path=str(manifest_path),
+            terminal_session=terminal_session_name(session_id),
+        ),
         "--disallowedTools", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
     ]
     if sess.get("model"):
@@ -6204,12 +6271,15 @@ def build_claude_cmd(sess: dict[str, Any], manifest_path: Path, *, provider_id: 
     return cmd
 
 
-def build_codex_cmd(sess: dict[str, Any], prompt: str, manifest_path: Path) -> list[str]:
+def build_codex_cmd(session_id: str, sess: dict[str, Any], prompt: str, manifest_path: Path) -> list[str]:
     provider_id = sess.get("codex_thread_id") or (
         sess.get("session_id") if sess.get("backend") == BACKEND_CODEX else None
     )
     configured_model, configured_effort, configured_service_tier = codex_user_config_defaults()
-    full_prompt = CODEX_PROMPT_PRELUDE.format(manifest_path=str(manifest_path)) + prompt
+    full_prompt = CODEX_PROMPT_PRELUDE.format(
+        manifest_path=str(manifest_path),
+        terminal_session=terminal_session_name(session_id),
+    ) + prompt
     model = str(sess.get("model") or configured_model or CODEX_DEFAULT_MODEL).strip()
     normalized_effort = normalize_runtime_effort(
         BACKEND_CODEX,
@@ -6684,7 +6754,7 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
     cwd = existing_cwd(requested_cwd)
     diff_baseline = await capture_git_baseline(session_id, run_id, cwd)
     resume_provider_id, resume_skip_message = resolve_claude_resume_provider(sess, cwd)
-    cmd = build_claude_cmd(sess, manifest_path, provider_id=resume_provider_id)
+    cmd = build_claude_cmd(session_id, sess, manifest_path, provider_id=resume_provider_id)
     if str(Path(requested_cwd).expanduser()) != cwd:
         await append_event(session_id, "cwd_fallback", {"run_id": run_id, "requested_cwd": requested_cwd, "cwd": cwd})
     if resume_skip_message:
@@ -6703,7 +6773,7 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
-            env=runner_env(),
+            env=agent_runner_env(session_id),
             limit=PROCESS_STREAM_LIMIT,
             start_new_session=True,
         )
@@ -6886,7 +6956,7 @@ async def run_codex(
     diff_baseline: dict[str, str] | None = None,
 ) -> None:
     resumed_provider_id = session_provider_id(sess)
-    cmd = build_codex_cmd(sess, prompt, manifest_path)
+    cmd = build_codex_cmd(session_id, sess, prompt, manifest_path)
     requested_cwd = str(sess.get("cwd") or DEFAULT_CWD)
     cwd = existing_cwd(requested_cwd)
     if diff_baseline is None:
@@ -6894,7 +6964,7 @@ async def run_codex(
     if str(Path(requested_cwd).expanduser()) != cwd:
         await append_event(session_id, "cwd_fallback", {"run_id": run_id, "requested_cwd": requested_cwd, "cwd": cwd})
     await append_event(session_id, "process_started", {"run_id": run_id, "backend": BACKEND_CODEX, "argv": cmd[:-1] + ["<prompt>"], "cwd": cwd})
-    env = runner_env()
+    env = agent_runner_env(session_id)
     codex_dir = os.path.dirname(os.path.abspath(CODEX_BIN))
     if codex_dir and codex_dir not in env.get("PATH", "").split(os.pathsep):
         env["PATH"] = codex_dir + os.pathsep + env.get("PATH", "")
@@ -7423,6 +7493,54 @@ async def start_turn(
         raise
 
 
+SERVER_UPDATE_ACTIVE_PHASES = {"starting", "checking", "downloading", "verifying", "installing", "restarting"}
+
+
+def read_server_update_status() -> dict[str, Any]:
+    try:
+        value = json.loads(SERVER_UPDATE_STATUS_FILE.read_text())
+        if not isinstance(value, dict):
+            value = {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        value = {}
+    value.setdefault("phase", "idle")
+    value["current_version"] = SERVER_VERSION
+    value["api_contract_version"] = API_CONTRACT_VERSION
+    value["admin_available"] = bool(ADMIN_TOKEN)
+    return value
+
+
+def write_server_update_status(**changes: Any) -> dict[str, Any]:
+    value = read_server_update_status()
+    value.update(changes)
+    value["updated_at"] = update_utc_now()
+    atomic_update_json(SERVER_UPDATE_STATUS_FILE, value)
+    return value
+
+
+def server_update_tmux_name(update_id: str) -> str:
+    clean = re.sub(r"[^A-Za-z0-9_-]", "", update_id)[:32]
+    return f"agents_server_update_{clean or 'current'}"
+
+
+def server_update_is_active(status: dict[str, Any]) -> bool:
+    if str(status.get("phase") or "") not in SERVER_UPDATE_ACTIVE_PHASES:
+        return False
+    update_id = str(status.get("update_id") or "")
+    if not update_id or shutil.which("tmux") is None:
+        return False
+    return run_tmux(["has-session", "-t", server_update_tmux_name(update_id)], check=False).returncode == 0
+
+
+async def signed_release_manifest() -> dict[str, Any]:
+    if not SERVER_UPDATE_PUBLIC_KEY.is_file():
+        raise HTTPException(status_code=503, detail="release verification key is missing from this server installation")
+    try:
+        return await asyncio.to_thread(check_release, SERVER_UPDATE_PUBLIC_KEY)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"signed release check failed: {exc}") from exc
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await STORE.load()
@@ -7462,7 +7580,7 @@ async def lifespan(app: FastAPI):
             await runtime_probe_task
 
 
-app = FastAPI(title="Zenithbot Agent Server", lifespan=lifespan)
+app = FastAPI(title="AgentsServer", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -7490,12 +7608,14 @@ async def health() -> dict[str, Any]:
     pressure = host_pressure_snapshot()
     return {
         "ok": True,
+        "server_version": SERVER_VERSION,
         "api_contract_version": API_CONTRACT_VERSION,
         "server_identity": server_identity(),
         "state_dir": str(STATE_DIR),
         "default_backend": DEFAULT_BACKEND,
         "default_cwd": existing_cwd(DEFAULT_CWD),
         "auth_required": bool(AGENT_TOKEN),
+        "admin_available": bool(ADMIN_TOKEN),
         "active": active,
         "active_count": len(active),
         "queued": queued,
@@ -7504,6 +7624,89 @@ async def health() -> dict[str, Any]:
         "host_health_log": str(HOST_HEALTH_FILE),
         "runtimes": runtime_diagnostics_snapshot(),
     }
+
+
+@app.get("/api/admin/update")
+async def server_update_status(request: Request) -> dict[str, Any]:
+    require_admin_token(request)
+    status = read_server_update_status()
+    if str(status.get("phase") or "") in SERVER_UPDATE_ACTIVE_PHASES and not await asyncio.to_thread(server_update_is_active, status):
+        status = write_server_update_status(
+            phase="failed",
+            message="The detached updater exited before reporting completion. See server-update.log.",
+            finished_at=update_utc_now(),
+        )
+    return status
+
+
+@app.post("/api/admin/update/check")
+async def check_server_update(request: Request) -> dict[str, Any]:
+    require_admin_token(request)
+    status = read_server_update_status()
+    if await asyncio.to_thread(server_update_is_active, status):
+        raise HTTPException(status_code=409, detail="a server update is already running")
+    manifest = await signed_release_manifest()
+    latest = str(manifest["version"])
+    return write_server_update_status(
+        phase="available" if latest != SERVER_VERSION else "current",
+        latest_version=latest,
+        update_available=latest != SERVER_VERSION,
+        message=(f"AgentsServer {latest} is available." if latest != SERVER_VERSION else f"AgentsServer {SERVER_VERSION} is current."),
+        checked_at=update_utc_now(),
+    )
+
+
+@app.post("/api/admin/update/start")
+async def start_server_update(request: Request, body: ServerUpdateRequest) -> dict[str, Any]:
+    require_admin_token(request)
+    status = read_server_update_status()
+    if await asyncio.to_thread(server_update_is_active, status):
+        raise HTTPException(status_code=409, detail="a server update is already running")
+    manifest = await signed_release_manifest()
+    latest = str(manifest["version"])
+    requested = str(body.version or latest).strip()
+    if requested != latest:
+        raise HTTPException(status_code=409, detail=f"the latest signed release is {latest}")
+    if requested == SERVER_VERSION:
+        return write_server_update_status(
+            phase="current",
+            latest_version=latest,
+            update_available=False,
+            message=f"AgentsServer {SERVER_VERSION} is already installed.",
+            checked_at=update_utc_now(),
+        )
+    if shutil.which("tmux") is None:
+        raise HTTPException(status_code=503, detail="tmux is required for detached server updates")
+    if not SERVER_UPDATE_RUNNER.is_file() or not SERVER_UPDATE_PUBLIC_KEY.is_file():
+        raise HTTPException(status_code=503, detail="this server installation predates managed updates; run the installer once")
+
+    update_id = uuid.uuid4().hex
+    tmux_name = server_update_tmux_name(update_id)
+    command = [
+        sys.executable,
+        str(SERVER_UPDATE_RUNNER),
+        "--status-file", str(SERVER_UPDATE_STATUS_FILE),
+        "--public-key", str(SERVER_UPDATE_PUBLIC_KEY),
+        "--port", str(SERVER_PORT),
+        "--bind", SERVER_BIND_ADDRESS,
+        "--expected-version", requested,
+    ]
+    status = write_server_update_status(
+        update_id=update_id,
+        phase="starting",
+        target_version=requested,
+        latest_version=latest,
+        update_available=True,
+        message=f"Starting detached update to AgentsServer {requested}.",
+        started_at=update_utc_now(),
+        finished_at=None,
+    )
+    try:
+        await asyncio.to_thread(run_tmux, ["new-session", "-d", "-s", tmux_name, shlex.join(command)])
+    except Exception as exc:
+        write_server_update_status(phase="failed", message=f"Could not start detached updater: {exc}", finished_at=update_utc_now())
+        raise HTTPException(status_code=500, detail="could not start detached updater") from exc
+    return status
 
 
 @app.get("/api/diagnostics/host")

@@ -62,7 +62,30 @@ STAGE_DIR="$RELEASES_ROOT/.staging-$RELEASE_VERSION-$$"
 CURRENT_LINK="$INSTALL_ROOT/current"
 PREVIOUS_LINK="$INSTALL_ROOT/previous"
 ENV_FILE="$CONFIG_ROOT/env"
-SERVER_PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+LEGACY_SERVICE_FILE="$HOME/.config/systemd/user/$LEGACY_SERVICE_NAME.service"
+
+read_env_value() {
+  local file="$1"
+  local name="$2"
+  [[ -f "$file" ]] || return 0
+  sed -n "s/^${name}=//p" "$file" | tail -n 1
+}
+
+LEGACY_ENV_FILE=""
+if [[ -f "$LEGACY_SERVICE_FILE" ]]; then
+  LEGACY_ENV_FILE="$(sed -n 's/^EnvironmentFile=//p' "$LEGACY_SERVICE_FILE" | tail -n 1)"
+  LEGACY_ENV_FILE="${LEGACY_ENV_FILE#-}"
+  LEGACY_ENV_FILE="${LEGACY_ENV_FILE#\"}"
+  LEGACY_ENV_FILE="${LEGACY_ENV_FILE%\"}"
+  LEGACY_ENV_FILE="${LEGACY_ENV_FILE//%h/$HOME}"
+fi
+if [[ ! -f "$LEGACY_ENV_FILE" && -f "$HOME/Zenithbot/.env" ]]; then
+  LEGACY_ENV_FILE="$HOME/Zenithbot/.env"
+fi
+
+EXISTING_PATH="$(read_env_value "$ENV_FILE" PATH)"
+[[ -n "$EXISTING_PATH" ]] || EXISTING_PATH="$(read_env_value "$LEGACY_ENV_FILE" PATH)"
+SERVER_PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${EXISTING_PATH:-$PATH}"
 RELEASE_FILES=(agent_server.py install.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem)
 
 for name in "${RELEASE_FILES[@]}"; do
@@ -125,12 +148,14 @@ echo "[2/7] Resolving the release dependencies with uv"
 uv sync --project "$STAGE_DIR" --python '>=3.10' --no-dev --frozen >/dev/null
 
 TOKEN=""
-if [[ -f "$ENV_FILE" ]]; then
-  TOKEN="$(sed -n 's/^AGENTSDOCK_AGENT_TOKEN=//p' "$ENV_FILE" | tail -n 1)"
-  [[ -n "$TOKEN" ]] || TOKEN="$(sed -n 's/^ZENITHDOCK_AGENT_TOKEN=//p' "$ENV_FILE" | tail -n 1)"
-fi
+for candidate in "$ENV_FILE" "$LEGACY_ENV_FILE"; do
+  [[ -n "$candidate" && -f "$candidate" ]] || continue
+  TOKEN="$(read_env_value "$candidate" AGENTSDOCK_AGENT_TOKEN)"
+  [[ -n "$TOKEN" ]] || TOKEN="$(read_env_value "$candidate" ZENITHDOCK_AGENT_TOKEN)"
+  [[ -n "$TOKEN" ]] || TOKEN="$(read_env_value "$candidate" ZENITHBOT_AGENT_TOKEN)"
+  [[ -z "$TOKEN" ]] || break
+done
 if [[ -z "$TOKEN" ]]; then
-  LEGACY_SERVICE_FILE="$HOME/.config/systemd/user/$LEGACY_SERVICE_NAME.service"
   if [[ -f "$LEGACY_SERVICE_FILE" ]]; then
     TOKEN="$(grep -E '^Environment="?ZENITHDOCK_AGENT_TOKEN=' "$LEGACY_SERVICE_FILE" | tail -n 1 || true)"
     TOKEN="${TOKEN#*ZENITHDOCK_AGENT_TOKEN=}"
@@ -147,7 +172,16 @@ generate_token() {
 [[ "$TOKEN" =~ ^[A-Za-z0-9_-]{32,}$ ]] || TOKEN="$(generate_token)"
 
 ENV_TEMP="$CONFIG_ROOT/.env.$$"
-cat > "$ENV_TEMP" <<EOF
+PRESERVE_SOURCE=""
+[[ ! -f "$LEGACY_ENV_FILE" ]] || PRESERVE_SOURCE="$LEGACY_ENV_FILE"
+[[ ! -f "$ENV_FILE" ]] || PRESERVE_SOURCE="$ENV_FILE"
+if [[ -n "$PRESERVE_SOURCE" ]]; then
+  grep -Ev '^(AGENTSDOCK_(STATE_DIR|AGENT_CWD|AGENT_BIND|AGENT_PORT|AGENT_TOKEN)|AGENTS_SERVER_(STATE_DIR|INSTALL_DIR)|ZENITHBOT_AGENT_(DIR|CWD|BIND|PORT|TOKEN)|ZENITHDOCK_AGENT_TOKEN|PATH)=' \
+    "$PRESERVE_SOURCE" > "$ENV_TEMP" || true
+else
+  : > "$ENV_TEMP"
+fi
+cat >> "$ENV_TEMP" <<EOF
 AGENTSDOCK_STATE_DIR=$STATE_ROOT
 AGENTSDOCK_AGENT_CWD=$HOME
 AGENTSDOCK_AGENT_BIND=$BIND_ADDRESS

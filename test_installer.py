@@ -104,6 +104,19 @@ chmod 755 "$project/.venv/bin/python"
             legacy = home / ".zenithbot-agent"
             legacy.mkdir()
             (legacy / "sessions.json").write_text('{"kept": true}\n')
+            legacy_runtime = home / "Zenithbot"
+            legacy_runtime.mkdir()
+            preserved_token = "legacy_token_abcdefghijklmnopqrstuvwxyz012345"
+            (legacy_runtime / ".env").write_text(
+                f"ZENITHDOCK_AGENT_TOKEN={preserved_token}\n"
+                "NOTION_TOKEN=keep-private-runtime-setting\n"
+                "PATH=/legacy/runtime/bin:/usr/bin:/bin\n"
+            )
+            legacy_service_dir = home / ".config" / "systemd" / "user"
+            legacy_service_dir.mkdir(parents=True)
+            (legacy_service_dir / "zenithbot-agent.service").write_text(
+                "[Service]\nEnvironmentFile=%h/Zenithbot/.env\n"
+            )
             self.write_executable(fake_bin / "uname", "#!/bin/sh\necho Linux\n")
             self.write_executable(fake_bin / "systemctl", "#!/bin/sh\nexit 0\n")
             self.write_executable(fake_bin / "curl", "#!/bin/sh\nexit 0\n")
@@ -139,6 +152,12 @@ chmod 755 "$project/.venv/bin/python"
             self.assertTrue(legacy.is_symlink())
             self.assertEqual(legacy.resolve(), canonical.resolve())
             self.assertEqual((canonical / "sessions.json").read_text(), '{"kept": true}\n')
+            installed_env = (root / "config" / "env").read_text()
+            self.assertIn(f"AGENTSDOCK_AGENT_TOKEN={preserved_token}\n", installed_env)
+            self.assertIn("NOTION_TOKEN=keep-private-runtime-setting\n", installed_env)
+            self.assertIn("/legacy/runtime/bin", installed_env)
+            self.assertNotIn("ZENITHDOCK_AGENT_TOKEN=", installed_env)
+            self.assertIn(f'"access_token":"{preserved_token}"', result.stdout)
 
     @staticmethod
     def write_executable(path: Path, source: str):

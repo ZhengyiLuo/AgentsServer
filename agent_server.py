@@ -270,10 +270,10 @@ Turn lifecycle and background work:
 - Do not say "monitor armed", "when the watcher fires I'll send it", "I'll
   check back", or similar future-tense promises and then end the turn.
 - A tmux process or shell watcher can keep computation alive, but it cannot
-  resume this Claude turn or make ZenithDock ingest a manifest after the turn
+  resume this Claude turn or make AgentsDock ingest a manifest after the turn
   has ended.
 - If background monitoring is needed, create a real durable mechanism: a
-  ZenithDock scheduled job that launches a later agent turn, a system service,
+  AgentsDock scheduled job that launches a later agent turn, a system service,
   or a script the user can inspect and run. State exactly what you created and
   how to inspect or stop it.
 - If you did not create a durable mechanism, say that the user should ask again
@@ -281,7 +281,7 @@ Turn lifecycle and background work:
 
 Code changes and diffs:
 - Validate code changes normally, but do not print a full repository diff just
-  for Zenith Dock. The server captures the complete per-turn Git diff directly.
+  for AgentsDock. The server captures the complete per-turn Git diff directly.
 - A short `git diff --stat` is useful when it helps explain validation. Keep the
   final answer focused unless the user explicitly asks to see the patch inline.
 
@@ -357,7 +357,7 @@ Skills and environment playbooks:
 - If the needed skill/playbook is missing, blocked, or fails, say exactly what
   you checked and what blocked you.
 
-This is Zenith Dock, not Slack. Do not call Slack upload APIs or Slack file
+This is AgentsDock, not Slack. Do not call Slack upload APIs or Slack file
 helpers. Create files locally on the agent host and publish them through the manifest.
 
 If you create files the user should receive, write a JSON manifest at exactly:
@@ -3167,7 +3167,7 @@ async def host_health_record() -> dict[str, Any]:
     top_processes = []
     for row in top_rows:
         clean = trim_process_args(row)
-        clean["tracked_by_zenithdock"] = int(clean.get("pgid") or -1) in active_pgids
+        clean["tracked_by_agentsdock"] = int(clean.get("pgid") or -1) in active_pgids
         top_processes.append(clean)
     return {
         "ts": now_iso(),
@@ -4268,7 +4268,7 @@ def build_handoff_source_pack(session_id: str, detail: str = "normal", user_prom
     prompt = compact_memory_text(user_prompt or "", 2200)
 
     lines = [
-        "# ZenithDock Context Source Pack",
+        "# AgentsDock Context Source Pack",
         "",
         "This is source material for an LLM-generated handoff digest.",
     ]
@@ -4279,7 +4279,7 @@ def build_handoff_source_pack(session_id: str, detail: str = "normal", user_prom
         "",
         "## Source Chat",
         f"- Title: {source.get('title') or 'Untitled'}",
-        f"- ZenithDock session: {session_id}",
+        f"- AgentsDock session: {session_id}",
         f"- Backend: {source.get('backend') or DEFAULT_BACKEND}",
         f"- Working directory: {source.get('cwd') or DEFAULT_CWD}",
     ])
@@ -4370,7 +4370,7 @@ def handoff_target_context(target_session_id: str | None) -> str:
     provider_id = session_provider_id(target)
     lines = [
         f"- Target title: {target.get('title') or 'Untitled'}",
-        f"- Target ZenithDock session: {target_session_id}",
+        f"- Target AgentsDock session: {target_session_id}",
         f"- Target backend: {target.get('backend') or DEFAULT_BACKEND}",
         f"- Target working directory: {target.get('cwd') or DEFAULT_CWD}",
     ]
@@ -4400,7 +4400,7 @@ This is NOT a chat response to the user. Do not solve the task. Do not ask quest
 Use the source packet below as evidence and produce a clean Markdown digest that the target agent can use as background context.
 
 Required output:
-- Start with "# ZenithDock Context Digest".
+- Start with "# AgentsDock Context Digest".
 - Include "## User Prompt For Target Agent" only if the user supplied one.
 - Include "## Executive Summary" with the current state in plain language.
 - Include "## Important Decisions / Facts" for durable conclusions.
@@ -4610,12 +4610,12 @@ def build_source_chat_digest_turn_prompt(
     target_context = handoff_target_context(target_session_id)
     detail_name = str(detail or "normal").strip().lower() or "normal"
     return f"""\
-You are the source chat agent for a ZenithDock handoff.
+You are the source chat agent for an AgentsDock handoff.
 
 Create a concise, accurate Markdown context digest for the target agent. Use your current source-chat context as the primary evidence. This is not a normal user task: do not continue the project work, do not ask questions, and do not include meta commentary about generating the digest.
 
 Required output:
-- Start with "# ZenithDock Context Digest".
+- Start with "# AgentsDock Context Digest".
 - Include "## User Prompt For Target Agent" only if the user supplied one.
 - Include "## Executive Summary" with the current state in plain language.
 - Include "## Important Decisions / Facts" for durable conclusions.
@@ -5480,11 +5480,11 @@ def build_fork_memory(
 ) -> str:
     provider_id = session_provider_id(parent)
     header = [
-        "[ZenithDock memory fork]",
+        "[AgentsDock memory fork]",
         "This is a fresh provider thread seeded from a compact memory dump because the original provider-level fork was unavailable.",
         "Use this memory as background context. Do not treat it as a new user request.",
         "",
-        f"Parent ZenithDock session: {parent_id}",
+        f"Parent AgentsDock session: {parent_id}",
         f"Parent title: {parent.get('title') or 'Untitled'}",
         f"Backend: {parent.get('backend') or DEFAULT_BACKEND}",
         f"Working directory: {parent.get('cwd') or DEFAULT_CWD}",
@@ -5538,7 +5538,7 @@ def build_fork_memory(
     memory = "\n".join(lines).strip()
     if len(memory) > MAX_FORK_MEMORY_CHARS:
         memory = memory[-MAX_FORK_MEMORY_CHARS:].lstrip()
-        memory = "[ZenithDock memory fork]\n[Older memory trimmed]\n" + memory
+        memory = "[AgentsDock memory fork]\n[Older memory trimmed]\n" + memory
     return memory
 
 
@@ -6575,7 +6575,7 @@ async def codex_app_server_request(method: str, params: dict[str, Any]) -> dict[
     stderr_task = asyncio.create_task(read_stderr())
     try:
         await send(1, "initialize", {
-            "clientInfo": {"name": "zenithdock-agent-server", "version": "0"},
+            "clientInfo": {"name": "agents-server", "version": "0"},
             "capabilities": {"experimentalApi": True},
         })
         await read_response(1)

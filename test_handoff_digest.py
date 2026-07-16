@@ -109,7 +109,7 @@ class DigestDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(update_job.await_args.args[1]["status"], "source_queued")
 
     async def test_source_completion_delivers_once_even_if_reconciled_twice(self) -> None:
-        digest = "# ZenithDock Context Digest\n\n## Executive Summary\nReady."
+        digest = "# AgentsDock Context Digest\n\n## Executive Summary\nReady."
         agent_server.HANDOFF_DIGEST_JOBS["digest-1"] = self.job()
         emitted: list[tuple[str, str, dict[str, object]]] = []
         delivery_state: list[str | None] = [None]
@@ -167,7 +167,7 @@ class DigestDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(received["digest"], digest)
 
     async def test_restart_replays_an_interrupted_target_delivery(self) -> None:
-        digest = "# ZenithDock Context Digest\n\nRecovered after restart."
+        digest = "# AgentsDock Context Digest\n\nRecovered after restart."
         job = self.job()
         job.update({"status": "target_running", "digest": digest})
         agent_server.HANDOFF_DIGEST_JOBS["digest-1"] = job

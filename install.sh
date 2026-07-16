@@ -146,6 +146,7 @@ chmod 755 "$STAGE_DIR/agent_server.py" "$STAGE_DIR/install.sh" "$STAGE_DIR/updat
 
 echo "[2/7] Resolving the release dependencies with uv"
 uv sync --project "$STAGE_DIR" --python '>=3.10' --no-dev --frozen >/dev/null
+"$STAGE_DIR/.venv/bin/python" -c 'import websockets' >/dev/null
 
 TOKEN=""
 for candidate in "$ENV_FILE" "$LEGACY_ENV_FILE"; do

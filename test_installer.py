@@ -3,6 +3,7 @@ import subprocess
 import tempfile
 import unittest
 import re
+import tomllib
 from pathlib import Path
 
 
@@ -11,6 +12,12 @@ INSTALLER = ROOT / "install.sh"
 
 
 class InstallerContractTests(unittest.TestCase):
+    def test_runtime_includes_and_verifies_websocket_support(self):
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+        dependencies = project["project"]["dependencies"]
+        self.assertTrue(any(item.startswith("websockets") for item in dependencies))
+        self.assertIn("-c 'import websockets'", INSTALLER.read_text())
+
     def test_shell_syntax_is_valid(self):
         result = subprocess.run(
             ["bash", "-n", str(INSTALLER)],

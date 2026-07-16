@@ -45,6 +45,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 import uvicorn
+import websockets
 
 from update_runner import atomic_json as atomic_update_json
 from update_runner import ReleaseUnavailableError, check_release, utc_now as update_utc_now
@@ -7696,6 +7697,8 @@ async def health() -> dict[str, Any]:
         "default_cwd": existing_cwd(DEFAULT_CWD),
         "auth_required": bool(AGENT_TOKEN),
         "managed_updates": SERVER_UPDATE_RUNNER.is_file() and SERVER_UPDATE_PUBLIC_KEY.is_file(),
+        "websocket_runtime": True,
+        "websocket_runtime_version": websockets.__version__,
         "active": active,
         "active_count": len(active),
         "queued": queued,

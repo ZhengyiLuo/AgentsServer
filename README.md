@@ -129,7 +129,7 @@ cd AgentsServer
 
 ```bash
 uv venv
-uv pip install fastapi uvicorn python-multipart pydantic
+uv sync --frozen
 ```
 
 3. Install and authenticate the backend CLI tools you want to use.

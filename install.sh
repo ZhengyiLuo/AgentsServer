@@ -97,10 +97,8 @@ echo "[2/7] Resolving the release dependencies with uv"
 uv sync --project "$STAGE_DIR" --python '>=3.10' --no-dev --frozen >/dev/null
 
 TOKEN=""
-ADMIN_TOKEN=""
 if [[ -f "$ENV_FILE" ]]; then
   TOKEN="$(sed -n 's/^ZENITHDOCK_AGENT_TOKEN=//p' "$ENV_FILE" | tail -n 1)"
-  ADMIN_TOKEN="$(sed -n 's/^AGENTS_SERVER_ADMIN_TOKEN=//p' "$ENV_FILE" | tail -n 1)"
 fi
 generate_token() {
   if command -v openssl >/dev/null 2>&1; then
@@ -110,7 +108,6 @@ generate_token() {
   fi
 }
 [[ "$TOKEN" =~ ^[A-Za-z0-9_-]{32,}$ ]] || TOKEN="$(generate_token)"
-[[ "$ADMIN_TOKEN" =~ ^[A-Za-z0-9_-]{32,}$ ]] || ADMIN_TOKEN="$(generate_token)"
 
 ENV_TEMP="$CONFIG_ROOT/.env.$$"
 cat > "$ENV_TEMP" <<EOF
@@ -119,7 +116,6 @@ ZENITHBOT_AGENT_CWD=$HOME
 ZENITHBOT_AGENT_BIND=$BIND_ADDRESS
 ZENITHBOT_AGENT_PORT=$PORT
 ZENITHDOCK_AGENT_TOKEN=$TOKEN
-AGENTS_SERVER_ADMIN_TOKEN=$ADMIN_TOKEN
 AGENTS_SERVER_INSTALL_DIR=$INSTALL_ROOT
 PATH=$SERVER_PATH
 EOF
@@ -209,7 +205,6 @@ elif [[ "$OS_NAME" == "Darwin" ]]; then
     <key>ZENITHBOT_AGENT_BIND</key><string>$BIND_ADDRESS</string>
     <key>ZENITHBOT_AGENT_PORT</key><string>$PORT</string>
     <key>ZENITHDOCK_AGENT_TOKEN</key><string>$TOKEN</string>
-    <key>AGENTS_SERVER_ADMIN_TOKEN</key><string>$ADMIN_TOKEN</string>
     <key>AGENTS_SERVER_INSTALL_DIR</key><string>$INSTALL_ROOT</string>
     <key>PATH</key><string>$SERVER_PATH</string>
   </dict>
@@ -269,5 +264,5 @@ SERVER_URL="http://127.0.0.1:$PORT"
 [[ -z "$TAILSCALE_IP" ]] || SERVER_URL="http://$TAILSCALE_IP:$PORT"
 
 echo "[7/7] AgentsServer $RELEASE_VERSION is ready"
-printf 'AGENTSDOCK_SETUP_RESULT={"server_url":"%s","access_token":"%s","admin_token":"%s","service":"%s","tailscale_ip":"%s","server_version":"%s"}\n' \
-  "$SERVER_URL" "$TOKEN" "$ADMIN_TOKEN" "$SERVICE_KIND" "$TAILSCALE_IP" "$RELEASE_VERSION"
+printf 'AGENTSDOCK_SETUP_RESULT={"server_url":"%s","access_token":"%s","service":"%s","tailscale_ip":"%s","server_version":"%s"}\n' \
+  "$SERVER_URL" "$TOKEN" "$SERVICE_KIND" "$TAILSCALE_IP" "$RELEASE_VERSION"

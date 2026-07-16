@@ -25,7 +25,7 @@ class InstallerContractTests(unittest.TestCase):
         self.assertIn('STATE_ROOT="${ZENITHBOT_AGENT_DIR:-$HOME/.zenithbot-agent}"', source)
         self.assertIn("AGENTSDOCK_SETUP_RESULT=", source)
         self.assertIn("ZENITHDOCK_AGENT_TOKEN", source)
-        self.assertIn("AGENTS_SERVER_ADMIN_TOKEN", source)
+        self.assertNotIn("AGENTS_SERVER_ADMIN_TOKEN", source)
         self.assertIn('RELEASES_ROOT="$INSTALL_ROOT/releases"', source)
         self.assertIn('PREVIOUS_LINK="$INSTALL_ROOT/previous"', source)
         self.assertIn('REPLACED_DIR="$RELEASES_ROOT/$RELEASE_VERSION-replaced-', source)

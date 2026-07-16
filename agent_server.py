@@ -156,7 +156,6 @@ HANDOFF_DIGEST_EFFORT = os.environ.get("ZENITHBOT_HANDOFF_DIGEST_EFFORT", "").st
 DEFAULT_SESSION_EVENT_LIMIT = int(os.environ.get("ZENITHBOT_SESSION_EVENT_LIMIT", "100"))
 MAX_EVENT_RESPONSE_LIMIT = int(os.environ.get("ZENITHBOT_MAX_EVENT_RESPONSE_LIMIT", "1000"))
 AGENT_TOKEN = os.environ.get("ZENITHDOCK_AGENT_TOKEN") or os.environ.get("ZENITHBOT_AGENT_TOKEN") or ""
-ADMIN_TOKEN = os.environ.get("AGENTS_SERVER_ADMIN_TOKEN") or ""
 SERVER_BIND_ADDRESS = os.environ.get("ZENITHBOT_AGENT_BIND", "0.0.0.0")
 SERVER_PORT = int(os.environ.get("ZENITHBOT_AGENT_PORT", "7850"))
 API_CONTRACT_VERSION = 7
@@ -765,19 +764,6 @@ def request_authorized(request: Request) -> bool:
         or token_matches(request.headers.get("x-zenithdock-token"))
         or token_matches(request.query_params.get("token"))
     )
-
-
-def admin_token_matches(candidate: str | None) -> bool:
-    if not ADMIN_TOKEN or not candidate:
-        return False
-    return hmac.compare_digest(candidate, ADMIN_TOKEN)
-
-
-def require_admin_token(request: Request) -> None:
-    if not ADMIN_TOKEN:
-        raise HTTPException(status_code=503, detail="server administration is not configured; run the current AgentsServer installer once")
-    if not admin_token_matches(request.headers.get("x-agentsserver-admin-token")):
-        raise HTTPException(status_code=403, detail="server administrator token is required")
 
 
 def websocket_authorized(ws: WebSocket) -> bool:
@@ -7506,7 +7492,6 @@ def read_server_update_status() -> dict[str, Any]:
     value.setdefault("phase", "idle")
     value["current_version"] = SERVER_VERSION
     value["api_contract_version"] = API_CONTRACT_VERSION
-    value["admin_available"] = bool(ADMIN_TOKEN)
     return value
 
 
@@ -7615,7 +7600,7 @@ async def health() -> dict[str, Any]:
         "default_backend": DEFAULT_BACKEND,
         "default_cwd": existing_cwd(DEFAULT_CWD),
         "auth_required": bool(AGENT_TOKEN),
-        "admin_available": bool(ADMIN_TOKEN),
+        "managed_updates": SERVER_UPDATE_RUNNER.is_file() and SERVER_UPDATE_PUBLIC_KEY.is_file(),
         "active": active,
         "active_count": len(active),
         "queued": queued,
@@ -7627,8 +7612,7 @@ async def health() -> dict[str, Any]:
 
 
 @app.get("/api/admin/update")
-async def server_update_status(request: Request) -> dict[str, Any]:
-    require_admin_token(request)
+async def server_update_status() -> dict[str, Any]:
     status = read_server_update_status()
     if str(status.get("phase") or "") in SERVER_UPDATE_ACTIVE_PHASES and not await asyncio.to_thread(server_update_is_active, status):
         status = write_server_update_status(
@@ -7640,8 +7624,7 @@ async def server_update_status(request: Request) -> dict[str, Any]:
 
 
 @app.post("/api/admin/update/check")
-async def check_server_update(request: Request) -> dict[str, Any]:
-    require_admin_token(request)
+async def check_server_update() -> dict[str, Any]:
     status = read_server_update_status()
     if await asyncio.to_thread(server_update_is_active, status):
         raise HTTPException(status_code=409, detail="a server update is already running")
@@ -7657,8 +7640,7 @@ async def check_server_update(request: Request) -> dict[str, Any]:
 
 
 @app.post("/api/admin/update/start")
-async def start_server_update(request: Request, body: ServerUpdateRequest) -> dict[str, Any]:
-    require_admin_token(request)
+async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
     status = read_server_update_status()
     if await asyncio.to_thread(server_update_is_active, status):
         raise HTTPException(status_code=409, detail="a server update is already running")

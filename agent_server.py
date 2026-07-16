@@ -5829,6 +5829,27 @@ def run_catalog_command(cmd: list[str]) -> str:
     return result.stdout
 
 
+def claude_supports_effort(effort: str) -> bool:
+    clean = str(effort or "").strip().lower()
+    if not clean:
+        return False
+    try:
+        result = subprocess.run(
+            [CLAUDE_BIN, "--effort", clean, "--version"],
+            cwd=DEFAULT_CWD if Path(DEFAULT_CWD).exists() else str(Path.home()),
+            env=runner_env(),
+            text=True,
+            capture_output=True,
+            timeout=RUNTIME_CATALOG_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except Exception as exc:
+        logger.debug("claude effort probe failed effort=%s: %s", clean, exc)
+        return False
+    output = f"{result.stdout}\n{result.stderr}".lower()
+    return result.returncode == 0 and "unknown --effort value" not in output
+
+
 def runtime_executable(backend: str) -> str:
     return CLAUDE_BIN if backend == BACKEND_CLAUDE else CODEX_BIN
 
@@ -6229,6 +6250,7 @@ def parse_claude_help_catalog() -> dict[str, Any]:
         or "sonnet"
     )
     default_effort = os.environ.get("CLAUDE_EFFORT") or agentsdock_setting("CLAUDE_EFFORT", "")
+    supports_ultracode = claude_supports_effort("ultracode")
     try:
         help_text = run_catalog_command([CLAUDE_BIN, "--help"])
     except Exception as exc:
@@ -6254,6 +6276,7 @@ def parse_claude_help_catalog() -> dict[str, Any]:
                     runtime_option("high", "High"),
                     runtime_option("xhigh", "XHigh"),
                     runtime_option("max", "Max"),
+                    *([runtime_option("ultracode", "Ultracode")] if supports_ultracode else []),
                 ],
                 title_effort_label(default_effort) if default_effort else "",
             ),
@@ -6286,6 +6309,8 @@ def parse_claude_help_catalog() -> dict[str, Any]:
             clean = effort.strip()
             if clean and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", clean):
                 effort_options.append(runtime_option(clean, title_effort_label(clean)))
+    if supports_ultracode:
+        effort_options.append(runtime_option("ultracode", "Ultracode"))
 
     return {
         "models": unique_runtime_options(model_options, title_model_label(default_model)),

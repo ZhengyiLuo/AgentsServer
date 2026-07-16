@@ -99,12 +99,37 @@ class RuntimeDiagnosticTests(unittest.TestCase):
                                         (low, medium, high, xhigh, max)
   --exclude-dynamic-system-prompt-sections
 """
-        with patch.object(agent_server, "run_catalog_command", return_value=help_text):
+        with patch.object(agent_server, "run_catalog_command", return_value=help_text), patch.object(
+            agent_server, "claude_supports_effort", return_value=False
+        ):
             catalog = agent_server.parse_claude_help_catalog()
         self.assertEqual(
             [option["value"] for option in catalog["efforts"]],
             ["", "low", "medium", "high", "xhigh", "max"],
         )
+
+    def test_claude_catalog_advertises_supported_ultracode_effort(self) -> None:
+        help_text = """\
+  --effort <level>                      Effort level for the current session
+                                        (low, medium, high, xhigh, max)
+"""
+        with patch.object(agent_server, "run_catalog_command", return_value=help_text), patch.object(
+            agent_server, "claude_supports_effort", return_value=True
+        ):
+            catalog = agent_server.parse_claude_help_catalog()
+        self.assertEqual(
+            [option["value"] for option in catalog["efforts"]],
+            ["", "low", "medium", "high", "xhigh", "max", "ultracode"],
+        )
+
+    def test_claude_effort_probe_rejects_unknown_values(self) -> None:
+        warning = "Warning: Unknown --effort value 'ultracode' - ignoring it and using the default effort."
+        with patch.object(agent_server.subprocess, "run", return_value=completed([], stderr=warning)):
+            self.assertFalse(agent_server.claude_supports_effort("ultracode"))
+
+    def test_claude_effort_probe_accepts_silent_values(self) -> None:
+        with patch.object(agent_server.subprocess, "run", return_value=completed([], stdout="2.1.207 (Claude Code)\n")):
+            self.assertTrue(agent_server.claude_supports_effort("ultracode"))
 
 
 class RuntimePreflightTests(unittest.IsolatedAsyncioTestCase):

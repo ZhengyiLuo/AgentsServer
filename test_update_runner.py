@@ -3,7 +3,9 @@ import json
 import tarfile
 import tempfile
 import unittest
+from urllib.error import HTTPError
 from pathlib import Path
+from unittest.mock import patch
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -68,6 +70,12 @@ class UpdateRunnerTests(unittest.TestCase):
             value = json.loads(path.read_text())
         self.assertEqual(value["phase"], "complete")
         self.assertEqual(value["update_id"], "abc")
+
+    def test_missing_release_has_a_clear_error(self):
+        missing = HTTPError(update_runner.LATEST_MANIFEST_URL, 404, "Not Found", {}, None)
+        with patch.object(update_runner, "download_bytes", side_effect=missing):
+            with self.assertRaisesRegex(update_runner.ReleaseUnavailableError, "No signed AgentsServer release"):
+                update_runner.check_release(Path("unused.pem"))
 
 
 if __name__ == "__main__":

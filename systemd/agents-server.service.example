@@ -1,0 +1,18 @@
+[Unit]
+Description=AgentsServer
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/agents-server/current
+Environment=AGENTSDOCK_STATE_DIR=%h/.agentsdock
+Environment=AGENTSDOCK_AGENT_CWD=%h
+Environment=AGENTSDOCK_BACKEND=codex
+# Set this on real deployments. Do not commit a real token.
+# Environment=AGENTSDOCK_AGENT_TOKEN=replace-with-a-long-random-token
+ExecStart=%h/.local/share/agents-server/current/.venv/bin/python %h/.local/share/agents-server/current/agent_server.py serve --bind 0.0.0.0 --port 7850
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

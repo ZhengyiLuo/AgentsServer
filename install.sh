@@ -7,8 +7,18 @@ RELEASE_VERSION=""
 UV_VERSION="${AGENTS_SERVER_UV_VERSION:-0.10.10}"
 INSTALL_ROOT="${AGENTS_SERVER_INSTALL_DIR:-$HOME/.local/share/agents-server}"
 CONFIG_ROOT="${AGENTS_SERVER_CONFIG_DIR:-$HOME/.config/agents-server}"
-STATE_ROOT="${ZENITHBOT_AGENT_DIR:-$HOME/.zenithbot-agent}"
+LEGACY_STATE_ROOT="$HOME/.zenithbot-agent"
+if [[ -n "${AGENTSDOCK_STATE_DIR:-}" ]]; then
+  STATE_ROOT="$AGENTSDOCK_STATE_DIR"
+elif [[ -n "${AGENTS_SERVER_STATE_DIR:-}" ]]; then
+  STATE_ROOT="$AGENTS_SERVER_STATE_DIR"
+elif [[ -n "${ZENITHBOT_AGENT_DIR:-}" ]]; then
+  STATE_ROOT="$ZENITHBOT_AGENT_DIR"
+else
+  STATE_ROOT="$HOME/.agentsdock"
+fi
 SERVICE_NAME="agents-server"
+LEGACY_SERVICE_NAME="zenithbot-agent"
 
 usage() {
   cat <<'USAGE'
@@ -65,7 +75,25 @@ done
 cleanup() { rm -rf "$STAGE_DIR"; }
 trap cleanup EXIT
 
+migrate_legacy_state() {
+  [[ "$STATE_ROOT" == "$HOME/.agentsdock" ]] || return 0
+  if [[ -L "$LEGACY_STATE_ROOT" ]]; then
+    return 0
+  fi
+  if [[ -e "$LEGACY_STATE_ROOT" && ! -e "$STATE_ROOT" ]]; then
+    echo "      Migrating existing AgentsDock history to $STATE_ROOT"
+    mv "$LEGACY_STATE_ROOT" "$STATE_ROOT"
+    ln -s "$STATE_ROOT" "$LEGACY_STATE_ROOT"
+  elif [[ -e "$LEGACY_STATE_ROOT" && -e "$STATE_ROOT" ]]; then
+    echo "Both $LEGACY_STATE_ROOT and $STATE_ROOT exist; refusing to guess which history is canonical." >&2
+    exit 1
+  elif [[ -d "$STATE_ROOT" && ! -e "$LEGACY_STATE_ROOT" ]]; then
+    ln -s "$STATE_ROOT" "$LEGACY_STATE_ROOT"
+  fi
+}
+
 echo "[1/7] Preparing the versioned AgentsServer runtime"
+migrate_legacy_state
 mkdir -p "$RELEASES_ROOT" "$CONFIG_ROOT" "$STATE_ROOT" "$STATE_ROOT/admin"
 chmod 700 "$CONFIG_ROOT" "$STATE_ROOT" "$STATE_ROOT/admin"
 
@@ -98,7 +126,16 @@ uv sync --project "$STAGE_DIR" --python '>=3.10' --no-dev --frozen >/dev/null
 
 TOKEN=""
 if [[ -f "$ENV_FILE" ]]; then
-  TOKEN="$(sed -n 's/^ZENITHDOCK_AGENT_TOKEN=//p' "$ENV_FILE" | tail -n 1)"
+  TOKEN="$(sed -n 's/^AGENTSDOCK_AGENT_TOKEN=//p' "$ENV_FILE" | tail -n 1)"
+  [[ -n "$TOKEN" ]] || TOKEN="$(sed -n 's/^ZENITHDOCK_AGENT_TOKEN=//p' "$ENV_FILE" | tail -n 1)"
+fi
+if [[ -z "$TOKEN" ]]; then
+  LEGACY_SERVICE_FILE="$HOME/.config/systemd/user/$LEGACY_SERVICE_NAME.service"
+  if [[ -f "$LEGACY_SERVICE_FILE" ]]; then
+    TOKEN="$(grep -E '^Environment="?ZENITHDOCK_AGENT_TOKEN=' "$LEGACY_SERVICE_FILE" | tail -n 1 || true)"
+    TOKEN="${TOKEN#*ZENITHDOCK_AGENT_TOKEN=}"
+    TOKEN="${TOKEN%\"}"
+  fi
 fi
 generate_token() {
   if command -v openssl >/dev/null 2>&1; then
@@ -111,11 +148,11 @@ generate_token() {
 
 ENV_TEMP="$CONFIG_ROOT/.env.$$"
 cat > "$ENV_TEMP" <<EOF
-ZENITHBOT_AGENT_DIR=$STATE_ROOT
-ZENITHBOT_AGENT_CWD=$HOME
-ZENITHBOT_AGENT_BIND=$BIND_ADDRESS
-ZENITHBOT_AGENT_PORT=$PORT
-ZENITHDOCK_AGENT_TOKEN=$TOKEN
+AGENTSDOCK_STATE_DIR=$STATE_ROOT
+AGENTSDOCK_AGENT_CWD=$HOME
+AGENTSDOCK_AGENT_BIND=$BIND_ADDRESS
+AGENTSDOCK_AGENT_PORT=$PORT
+AGENTSDOCK_AGENT_TOKEN=$TOKEN
 AGENTS_SERVER_INSTALL_DIR=$INSTALL_ROOT
 PATH=$SERVER_PATH
 EOF
@@ -151,6 +188,7 @@ ln -sfn "$RELEASE_DIR" "$CURRENT_LINK"
 
 restart_service() {
   if [[ "$OS_NAME" == "Linux" ]]; then
+    systemctl --user disable --now "$LEGACY_SERVICE_NAME.service" >/dev/null 2>&1 || true
     systemctl --user daemon-reload
     systemctl --user enable "$SERVICE_NAME.service" >/dev/null
     systemctl --user restart "$SERVICE_NAME.service"
@@ -200,11 +238,11 @@ elif [[ "$OS_NAME" == "Darwin" ]]; then
   </array>
   <key>WorkingDirectory</key><string>$CURRENT_LINK</string>
   <key>EnvironmentVariables</key><dict>
-    <key>ZENITHBOT_AGENT_DIR</key><string>$STATE_ROOT</string>
-    <key>ZENITHBOT_AGENT_CWD</key><string>$HOME</string>
-    <key>ZENITHBOT_AGENT_BIND</key><string>$BIND_ADDRESS</string>
-    <key>ZENITHBOT_AGENT_PORT</key><string>$PORT</string>
-    <key>ZENITHDOCK_AGENT_TOKEN</key><string>$TOKEN</string>
+    <key>AGENTSDOCK_STATE_DIR</key><string>$STATE_ROOT</string>
+    <key>AGENTSDOCK_AGENT_CWD</key><string>$HOME</string>
+    <key>AGENTSDOCK_AGENT_BIND</key><string>$BIND_ADDRESS</string>
+    <key>AGENTSDOCK_AGENT_PORT</key><string>$PORT</string>
+    <key>AGENTSDOCK_AGENT_TOKEN</key><string>$TOKEN</string>
     <key>AGENTS_SERVER_INSTALL_DIR</key><string>$INSTALL_ROOT</string>
     <key>PATH</key><string>$SERVER_PATH</string>
   </dict>
@@ -241,6 +279,9 @@ if ! wait_for_health; then
     echo "The previous release was restored." >&2
   fi
   if [[ "$OS_NAME" == "Linux" ]]; then
+    if [[ -z "$OLD_TARGET" && -f "$HOME/.config/systemd/user/$LEGACY_SERVICE_NAME.service" ]]; then
+      systemctl --user enable --now "$LEGACY_SERVICE_NAME.service" >/dev/null 2>&1 || true
+    fi
     systemctl --user status "$SERVICE_NAME.service" --no-pager -l >&2 || true
   fi
   exit 1

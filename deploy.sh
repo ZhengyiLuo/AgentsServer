@@ -3,12 +3,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REMOTE_HOST="${ZENITHDOCK_REMOTE_HOST:-${1:-}}"
-REMOTE_APP_DIR="${ZENITHDOCK_REMOTE_APP_DIR:-Zenithbot}"
-REMOTE_SERVER_PATH="$REMOTE_APP_DIR/scripts/agent_server.py"
+REMOTE_APP_DIR="${AGENTSDOCK_REMOTE_APP_DIR:-${ZENITHDOCK_REMOTE_APP_DIR:-.local/share/agents-server/current}}"
+REMOTE_SERVER_PATH="$REMOTE_APP_DIR/agent_server.py"
 REMOTE_SERVER_DIR="$(dirname "$REMOTE_SERVER_PATH")"
 REMOTE_PYTHON="$REMOTE_APP_DIR/.venv/bin/python"
-SERVICE_NAME="${ZENITHDOCK_AGENT_SERVICE:-zenithbot-agent.service}"
+SERVICE_NAME="${AGENTSDOCK_SERVER_SERVICE:-${ZENITHDOCK_AGENT_SERVICE:-agents-server.service}}"
 HEALTH_ATTEMPTS="${ZENITHDOCK_HEALTH_ATTEMPTS:-45}"
+HEALTH_TOKEN="${AGENTSDOCK_AGENT_TOKEN:-${ZENITHDOCK_AGENT_TOKEN:-}}"
 RUNTIME_FILES=(
   "$SCRIPT_DIR/agent_server.py"
   "$SCRIPT_DIR/update_runner.py"
@@ -23,9 +24,9 @@ Usage:
   ./server/deploy.sh <ssh-host>
 
 Optional:
-  ZENITHDOCK_REMOTE_APP_DIR=<remote-app-dir>
-  ZENITHDOCK_AGENT_SERVICE=<systemd-user-service>
-  ZENITHDOCK_AGENT_TOKEN=<health-check-token>
+  AGENTSDOCK_REMOTE_APP_DIR=<remote-app-dir>
+  AGENTSDOCK_SERVER_SERVICE=<systemd-user-service>
+  AGENTSDOCK_AGENT_TOKEN=<health-check-token>
   ZENITHDOCK_HEALTH_ATTEMPTS=<startup-health-attempts>
 USAGE
   exit 2
@@ -57,8 +58,8 @@ REMOTE_HEALTH_BODY="/tmp/zenithdock-agent-health.json"
 HEALTH_OK=0
 STATUS="000"
 for ((attempt = 1; attempt <= HEALTH_ATTEMPTS; attempt++)); do
-  if [[ -n "${ZENITHDOCK_AGENT_TOKEN:-}" ]]; then
-    if ssh "$REMOTE_HOST" "curl -fsS -H 'Authorization: Bearer ${ZENITHDOCK_AGENT_TOKEN}' http://127.0.0.1:7850/api/health"; then
+  if [[ -n "$HEALTH_TOKEN" ]]; then
+    if ssh "$REMOTE_HOST" "curl -fsS -H 'Authorization: Bearer ${HEALTH_TOKEN}' http://127.0.0.1:7850/api/health"; then
       HEALTH_OK=1
       break
     fi
@@ -69,7 +70,7 @@ for ((attempt = 1; attempt <= HEALTH_ATTEMPTS; attempt++)); do
       HEALTH_OK=1
       break
     elif [[ "$STATUS" == "401" ]]; then
-      echo "Health endpoint requires a token; service is responding. Set ZENITHDOCK_AGENT_TOKEN to verify authenticated health."
+      echo "Health endpoint requires a token; service is responding. Set AGENTSDOCK_AGENT_TOKEN to verify authenticated health."
       HEALTH_OK=1
       break
     fi

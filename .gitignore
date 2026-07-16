@@ -11,6 +11,7 @@ venv/
 !.env.example
 
 # Runtime state
+.agentsdock/
 .zenithbot-agent/
 state/
 files/

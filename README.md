@@ -94,7 +94,9 @@ cd AgentsServer
 
 The installer uses `uv`, installs a user-level service, creates a private access
 token, verifies authenticated health, and preserves existing
-`~/.zenithbot-agent` chat state on every update. It does not use `sudo`.
+`~/.agentsdock` chat state on every update. Existing
+`~/.zenithbot-agent` state is migrated automatically and left behind as a
+compatibility link. The installer does not use `sudo`.
 
 AgentsDock desktop can run this same installer locally or over an existing SSH
 key connection from its first-run setup window. Remote clients should use the
@@ -146,7 +148,7 @@ codex --version
 ```
 
 If you only want one backend, install only that backend and set
-`ZENITHBOT_BACKEND` accordingly.
+`AGENTSDOCK_BACKEND` accordingly.
 
 4. Start the server locally.
 
@@ -181,7 +183,7 @@ http://<tailscale-ip>:7850
 ```
 
 Do not expose port `7850` directly to the public internet. Use Tailscale or
-another private network, and set `ZENITHDOCK_AGENT_TOKEN` for shared-token
+another private network, and set `AGENTSDOCK_AGENT_TOKEN` for shared-token
 access control.
 
 ## Run Locally
@@ -196,21 +198,21 @@ Health check:
 curl http://127.0.0.1:7850/api/health
 ```
 
-The default state directory is `~/.zenithbot-agent`. Override it when you want
+The default state directory is `~/.agentsdock`. Override it when you want
 state somewhere else:
 
 ```bash
-ZENITHBOT_AGENT_DIR=/path/to/state \
+AGENTSDOCK_STATE_DIR=/path/to/state \
 uv run python agent_server.py serve --bind 0.0.0.0 --port 7850
 ```
 
 ## Security
 
-Set `ZENITHDOCK_AGENT_TOKEN` to require a shared bearer token for HTTP calls,
+Set `AGENTSDOCK_AGENT_TOKEN` to require a shared bearer token for HTTP calls,
 uploads, file/video fetches, and WebSocket streams.
 
 ```bash
-export ZENITHDOCK_AGENT_TOKEN='replace-with-a-long-random-token'
+export AGENTSDOCK_AGENT_TOKEN='replace-with-a-long-random-token'
 uv run python agent_server.py serve --bind 0.0.0.0 --port 7850
 ```
 
@@ -220,7 +222,8 @@ Clients should send either:
 Authorization: Bearer replace-with-a-long-random-token
 ```
 
-or the legacy `X-ZenithDock-Token` header retained for client compatibility.
+or `X-AgentsDock-Token`. The legacy `X-ZenithDock-Token` header remains
+accepted for existing clients.
 Leave the variable unset only for trusted local development.
 
 ## Remote Access With Tailscale
@@ -247,7 +250,7 @@ If the browser can open `/api/health` but the app cannot connect, check:
 
 - the client is also connected to Tailscale
 - the URL includes the correct port
-- the same `ZENITHDOCK_AGENT_TOKEN` is configured in the app
+- the same `AGENTSDOCK_AGENT_TOKEN` is configured in the app
 - the server is bound to `0.0.0.0` or the Tailscale interface, not only
   `127.0.0.1`
 
@@ -287,17 +290,17 @@ POST /api/admin/update/start
 
 The update runs in a detached tmux session so restarting AgentsServer cannot
 terminate its own installer. Progress is written to
-`~/.zenithbot-agent/admin/server-update.json`, and installer output is kept in
+`~/.agentsdock/admin/server-update.json`, and installer output is kept in
 `server-update.log` beside it. Chat history, files, jobs, tokens, and tmux
 sessions remain under the persistent state/configuration roots and are never
 placed inside a release directory.
 
-## Legacy Deployment Helper
+## Development Deployment Helper
 
-New installations should use `install.sh`. For an existing deployment that
-still uses the historical Zenithbot directory and service names, `deploy.sh`
-copies `agent_server.py` to that remote app directory, compiles it, restarts
-the configured user service, and checks local health on the remote host.
+New installations should use `install.sh`. For a managed installation,
+`deploy.sh` copies the complete server runtime into the active release,
+compiles it, restarts the configured user service, and checks local health on
+the remote host. It is intended for development, not end-user upgrades.
 
 ```bash
 ./deploy.sh <ssh-host>
@@ -306,75 +309,76 @@ the configured user service, and checks local health on the remote host.
 Optional variables:
 
 ```bash
-ZENITHDOCK_REMOTE_APP_DIR='Zenithbot' \
-ZENITHDOCK_AGENT_SERVICE='zenithbot-agent.service' \
-ZENITHDOCK_AGENT_TOKEN='replace-with-a-long-random-token' \
+AGENTSDOCK_REMOTE_APP_DIR='.local/share/agents-server/current' \
+AGENTSDOCK_SERVER_SERVICE='agents-server.service' \
+AGENTSDOCK_AGENT_TOKEN='replace-with-a-long-random-token' \
 ./deploy.sh <ssh-host>
 ```
 
 The deploy helper writes to:
 
 ```text
-<remote-app-dir>/scripts/agent_server.py
+<remote-app-dir>/agent_server.py
 ```
 
-Create that directory on the remote host before the first deploy, and install a
-matching user service. A template lives at
-`systemd/zenithbot-agent.service.example`.
+Run `install.sh` before the first deploy so the versioned runtime, environment,
+token, and service are present. A reference Linux unit lives at
+`systemd/agents-server.service.example`.
 
-## Legacy Systemd Template
+## Systemd Template
 
-The repository retains `systemd/zenithbot-agent.service.example` for existing
-deployments. New installations do not need it because `install.sh` creates and
-manages `agents-server.service` automatically.
+New installations do not need to copy the template because `install.sh`
+creates and manages `agents-server.service` automatically. The template is
+provided for inspection and custom deployments.
 
-Legacy install flow:
+Manual install flow:
 
 ```bash
-mkdir -p ~/.config/systemd/user ~/Zenithbot/scripts
-cp systemd/zenithbot-agent.service.example ~/.config/systemd/user/zenithbot-agent.service
+mkdir -p ~/.config/systemd/user
+cp systemd/agents-server.service.example ~/.config/systemd/user/agents-server.service
 systemctl --user daemon-reload
-systemctl --user enable --now zenithbot-agent.service
+systemctl --user enable --now agents-server.service
 ```
 
 Then check it:
 
 ```bash
-systemctl --user status zenithbot-agent.service --no-pager -l
+systemctl --user status agents-server.service --no-pager -l
 curl -H 'Authorization: Bearer replace-with-a-long-random-token' \
   http://127.0.0.1:7850/api/health
 ```
 
 ## Useful Configuration
 
-Most settings are environment variables. The `ZENITHBOT_*` and
-`ZENITHDOCK_AGENT_TOKEN` names are retained as a stable wire/configuration
-contract so existing AgentsDock installations and chat state continue to work:
+Most settings are environment variables. New configurations should use
+`AGENTSDOCK_*`. Historical `ZENITHBOT_*` and `ZENITHDOCK_AGENT_TOKEN` names are
+accepted only as compatibility aliases so existing installations can migrate
+without losing chat state:
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `ZENITHBOT_AGENT_DIR` | Persistent session/job/file state directory | `~/.zenithbot-agent` |
-| `ZENITHBOT_AGENT_CWD` | Default working directory for new sessions | user home |
-| `ZENITHBOT_AGENT_BIND` | Bind address | `0.0.0.0` |
-| `ZENITHBOT_AGENT_PORT` | Port | `7850` |
-| `ZENITHDOCK_AGENT_TOKEN` | Shared bearer token | unset |
+| `AGENTSDOCK_STATE_DIR` | Persistent session/job/file state directory | `~/.agentsdock` |
+| `AGENTSDOCK_AGENT_CWD` | Default working directory for new sessions | user home |
+| `AGENTSDOCK_AGENT_BIND` | Bind address | `0.0.0.0` |
+| `AGENTSDOCK_AGENT_PORT` | Port | `7850` |
+| `AGENTSDOCK_AGENT_TOKEN` | Shared bearer token | unset |
 | `AGENTS_SERVER_INSTALL_DIR` | Versioned server runtime root | `~/.local/share/agents-server` |
-| `ZENITHBOT_BACKEND` | Default backend, `claude` or `codex` | `claude` |
+| `AGENTSDOCK_BACKEND` | Default backend, `claude` or `codex` | `claude` |
 | `CLAUDE_BIN` | Claude Code executable name/path | `claude` |
 | `CODEX_BIN` | Codex executable name/path | `codex` |
-| `ZENITHBOT_RUNTIME_DIAGNOSTIC_TTL_SECONDS` | Cache lifetime for safe CLI version/auth probes | `60` |
+| `AGENTSDOCK_RUNTIME_DIAGNOSTIC_TTL_SECONDS` | Cache lifetime for safe CLI version/auth probes | `60` |
 | `CLAUDE_PROJECTS_ROOT` | Claude history search root | `~/.claude/projects` |
 | `CODEX_SESSIONS_ROOT` | Codex history search root | `~/.codex/sessions` |
-| `ZENITHBOT_JOB_MAX_ACTIVE_RUNS` | Scheduled-job concurrency cap (`0` disables this dedicated cap) | `0` |
-| `ZENITHBOT_MAX_ACTIVE_AGENT_RUNS` | Interactive agent concurrency cap | `10` |
-| `ZENITHBOT_JOB_MIN_AVAILABLE_MEM_MB` | Job launch memory guardrail | `4096` |
-| `ZENITHBOT_MIN_START_AVAILABLE_MEM_MB` | Interactive launch memory guardrail | `2048` |
-| `ZENITHBOT_HANDOFF_DIGEST_BACKEND` | LLM backend for context digests, `claude` or `codex` | `claude` |
-| `ZENITHBOT_HANDOFF_DIGEST_MODEL` | LLM model for context digests | `sonnet` |
-| `ZENITHBOT_HANDOFF_DIGEST_EFFORT` | Optional digest reasoning/effort setting | unset |
-| `ZENITHBOT_HANDOFF_DIGEST_TIMEOUT_SECONDS` | Digest summarizer timeout | `180` |
-| `ZENITHBOT_HANDOFF_DIGEST_CHARS` | Final digest character cap | `56000` |
-| `ZENITHBOT_CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS` | Maximum time for each isolated Git worktree snapshot | `120` |
+| `AGENTSDOCK_JOB_MAX_ACTIVE_RUNS` | Scheduled-job concurrency cap (`0` disables this dedicated cap) | `0` |
+| `AGENTSDOCK_MAX_ACTIVE_AGENT_RUNS` | Interactive agent concurrency cap | `10` |
+| `AGENTSDOCK_JOB_MIN_AVAILABLE_MEM_MB` | Job launch memory guardrail | `4096` |
+| `AGENTSDOCK_MIN_START_AVAILABLE_MEM_MB` | Interactive launch memory guardrail | `2048` |
+| `AGENTSDOCK_HANDOFF_DIGEST_BACKEND` | LLM backend for context digests, `claude` or `codex` | `claude` |
+| `AGENTSDOCK_HANDOFF_DIGEST_MODEL` | LLM model for context digests | `sonnet` |
+| `AGENTSDOCK_HANDOFF_DIGEST_EFFORT` | Optional digest reasoning/effort setting | unset |
+| `AGENTSDOCK_HANDOFF_DIGEST_TIMEOUT_SECONDS` | Digest summarizer timeout | `180` |
+| `AGENTSDOCK_HANDOFF_DIGEST_CHARS` | Final digest character cap | `56000` |
+| `AGENTSDOCK_CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS` | Maximum time for each isolated Git worktree snapshot | `120` |
 
 ## Context Digests
 
@@ -387,8 +391,8 @@ visibly instead of returning the raw source packet as if it were a digest.
 By default, the digest summarizer uses Claude Sonnet:
 
 ```bash
-ZENITHBOT_HANDOFF_DIGEST_BACKEND=claude
-ZENITHBOT_HANDOFF_DIGEST_MODEL=sonnet
+AGENTSDOCK_HANDOFF_DIGEST_BACKEND=claude
+AGENTSDOCK_HANDOFF_DIGEST_MODEL=sonnet
 ```
 
 You can switch it to Codex or another installed CLI model, but the relevant CLI
@@ -506,7 +510,7 @@ rg -n 'private-host|/home/<name>|/Users/<name>|token-value' .
 
 Do not commit:
 
-- `~/.zenithbot-agent` state
+- `~/.agentsdock` state (and the legacy `~/.zenithbot-agent` compatibility link)
 - uploads or generated artifacts
 - `.env` files or access tokens
 - machine-specific hostnames, IP addresses, or user home paths

@@ -4,7 +4,7 @@ requires-python = ">=3.10"
 
 [[package]]
 name = "agents-server-runtime"
-version = "0.1.0"
+version = "0.1.1"
 source = { virtual = "." }
 dependencies = [
     { name = "cryptography" },

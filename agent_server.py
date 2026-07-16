@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Zenithbot Agent Server.
+"""AgentsServer.
 
 FastAPI service for a native Mac frontend. The server owns agent execution on
 the agent host and streams normalized events from Claude Code / Codex CLI runs.
@@ -47,14 +47,14 @@ from pydantic import BaseModel, Field
 import uvicorn
 
 from update_runner import atomic_json as atomic_update_json
-from update_runner import check_release, utc_now as update_utc_now
+from update_runner import ReleaseUnavailableError, check_release, utc_now as update_utc_now
 
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.10 agent hosts
     tomllib = None
 
-logger = logging.getLogger("zenithbot-agent")
+logger = logging.getLogger("agents-server")
 
 BACKEND_CLAUDE = "claude"
 BACKEND_CODEX = "codex"
@@ -66,7 +66,45 @@ CODEX_EFFORT_ALIASES = {
     "extra_high": "xhigh",
 }
 
-STATE_DIR = Path(os.environ.get("ZENITHBOT_AGENT_DIR", Path.home() / ".zenithbot-agent"))
+def env_setting(primary: str, default: str | None = None, *legacy: str) -> str | None:
+    """Read a canonical setting while honoring pre-AgentsDock deployments."""
+    for name in (primary, *legacy):
+        value = os.environ.get(name)
+        if value is not None:
+            return value
+    return default
+
+
+def agentsdock_setting(suffix: str, default: str) -> str:
+    value = env_setting(f"AGENTSDOCK_{suffix}", default, f"ZENITHBOT_{suffix}")
+    return value if value is not None else default
+
+
+def resolve_state_dir() -> Path:
+    configured = env_setting(
+        "AGENTSDOCK_STATE_DIR",
+        None,
+        "AGENTS_SERVER_STATE_DIR",
+        "ZENITHBOT_AGENT_DIR",
+    )
+    if configured:
+        return Path(configured).expanduser()
+
+    canonical = Path.home() / ".agentsdock"
+    legacy = Path.home() / ".zenithbot-agent"
+    if canonical.exists() or not legacy.exists() or legacy.is_symlink():
+        return canonical
+    try:
+        legacy.rename(canonical)
+        legacy.symlink_to(canonical, target_is_directory=True)
+        logger.info("migrated legacy state directory to %s", canonical)
+        return canonical
+    except OSError as exc:
+        logger.warning("could not migrate legacy state directory %s: %s", legacy, exc)
+        return legacy
+
+
+STATE_DIR = resolve_state_dir()
 SERVER_ROOT = Path(__file__).resolve().parent
 SERVER_VERSION_FILE = SERVER_ROOT / "VERSION"
 try:
@@ -88,13 +126,13 @@ CLAUDE_PROJECTS_ROOT = Path(os.environ.get("CLAUDE_PROJECTS_ROOT", Path.home() /
 CODEX_SESSIONS_ROOT = Path(os.environ.get("CODEX_SESSIONS_ROOT", Path.home() / ".codex" / "sessions"))
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CODEX_BIN = os.environ.get("CODEX_BIN", "codex")
-CODEX_DEFAULT_MODEL = os.environ.get("ZENITHBOT_CODEX_MODEL", "gpt-5.5").strip() or "gpt-5.5"
-_configured_codex_effort = os.environ.get("ZENITHBOT_CODEX_EFFORT", "xhigh").strip().lower() or "xhigh"
+CODEX_DEFAULT_MODEL = agentsdock_setting("CODEX_MODEL", "gpt-5.5").strip() or "gpt-5.5"
+_configured_codex_effort = agentsdock_setting("CODEX_EFFORT", "xhigh").strip().lower() or "xhigh"
 CODEX_DEFAULT_EFFORT = CODEX_EFFORT_ALIASES.get(_configured_codex_effort, _configured_codex_effort)
 if CODEX_DEFAULT_EFFORT not in CODEX_EFFORTS:
     CODEX_DEFAULT_EFFORT = "xhigh"
-DEFAULT_CWD = os.environ.get("ZENITHBOT_AGENT_CWD", str(Path.home()))
-DEFAULT_BACKEND = os.environ.get("ZENITHBOT_BACKEND", BACKEND_CLAUDE).lower()
+DEFAULT_CWD = agentsdock_setting("AGENT_CWD", str(Path.home()))
+DEFAULT_BACKEND = agentsdock_setting("BACKEND", BACKEND_CLAUDE).lower()
 if DEFAULT_BACKEND not in VALID_BACKENDS:
     DEFAULT_BACKEND = BACKEND_CLAUDE
 
@@ -121,50 +159,55 @@ CODEX_FALLBACK_SERVICE_TIERS = {
     "gpt-5.6-luna": "priority",
 }
 
-REQUEST_TIMEOUT_SECONDS = int(os.environ.get("ZENITHBOT_REQUEST_TIMEOUT_SECONDS", "86400"))
-CODEX_APP_SERVER_TIMEOUT_SECONDS = int(os.environ.get("ZENITHBOT_CODEX_APP_SERVER_TIMEOUT_SECONDS", "30"))
-CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS = int(os.environ.get("ZENITHBOT_CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS", "120"))
-RUNTIME_CATALOG_TIMEOUT_SECONDS = float(os.environ.get("ZENITHBOT_RUNTIME_CATALOG_TIMEOUT_SECONDS", "6"))
-RUNTIME_DIAGNOSTIC_TTL_SECONDS = float(os.environ.get("ZENITHBOT_RUNTIME_DIAGNOSTIC_TTL_SECONDS", "60"))
-JOB_SCHEDULER_INTERVAL_SECONDS = float(os.environ.get("ZENITHBOT_JOB_SCHEDULER_INTERVAL_SECONDS", "5"))
-JOB_BUSY_RETRY_SECONDS = int(os.environ.get("ZENITHBOT_JOB_BUSY_RETRY_SECONDS", "60"))
+REQUEST_TIMEOUT_SECONDS = int(agentsdock_setting("REQUEST_TIMEOUT_SECONDS", "86400"))
+CODEX_APP_SERVER_TIMEOUT_SECONDS = int(agentsdock_setting("CODEX_APP_SERVER_TIMEOUT_SECONDS", "30"))
+CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS = int(agentsdock_setting("CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS", "120"))
+RUNTIME_CATALOG_TIMEOUT_SECONDS = float(agentsdock_setting("RUNTIME_CATALOG_TIMEOUT_SECONDS", "6"))
+RUNTIME_DIAGNOSTIC_TTL_SECONDS = float(agentsdock_setting("RUNTIME_DIAGNOSTIC_TTL_SECONDS", "60"))
+JOB_SCHEDULER_INTERVAL_SECONDS = float(agentsdock_setting("JOB_SCHEDULER_INTERVAL_SECONDS", "5"))
+JOB_BUSY_RETRY_SECONDS = int(agentsdock_setting("JOB_BUSY_RETRY_SECONDS", "60"))
 # Zero means scheduled jobs have no scheduler-specific concurrency ceiling.
 # The global agent-run guard and low-memory check still protect the machine.
-JOB_MAX_ACTIVE_RUNS = int(os.environ.get("ZENITHBOT_JOB_MAX_ACTIVE_RUNS", "0"))
-JOB_MIN_AVAILABLE_MEM_MB = int(os.environ.get("ZENITHBOT_JOB_MIN_AVAILABLE_MEM_MB", "4096"))
-JOB_DEFER_EVENT_MIN_SECONDS = int(os.environ.get("ZENITHBOT_JOB_DEFER_EVENT_MIN_SECONDS", "300"))
-MAX_ACTIVE_AGENT_RUNS = int(os.environ.get("ZENITHBOT_MAX_ACTIVE_AGENT_RUNS", "10"))
-MIN_START_AVAILABLE_MEM_MB = int(os.environ.get("ZENITHBOT_MIN_START_AVAILABLE_MEM_MB", "2048"))
-HOST_MONITOR_INTERVAL_SECONDS = float(os.environ.get("ZENITHBOT_HOST_MONITOR_INTERVAL_SECONDS", "15"))
-HOST_HEALTH_MAX_BYTES = int(os.environ.get("ZENITHBOT_HOST_HEALTH_MAX_BYTES", str(20 * 1024 * 1024)))
-IDLE_WARN_SECONDS = int(os.environ.get("ZENITHBOT_IDLE_WARN_SECONDS", "1800"))
-IDLE_KILL_SECONDS = int(os.environ.get("ZENITHBOT_IDLE_KILL_SECONDS", "21600"))
-STOP_GRACE_SECONDS = float(os.environ.get("ZENITHBOT_STOP_GRACE_SECONDS", "2.0"))
-PROCESS_STREAM_LIMIT = int(os.environ.get("ZENITHBOT_PROCESS_STREAM_LIMIT", str(16 * 1024 * 1024)))
-MAX_UPLOAD_BYTES = int(os.environ.get("ZENITHBOT_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024 * 1024)))
-MAX_IMPORT_MESSAGES = int(os.environ.get("ZENITHBOT_HISTORY_IMPORT_LIMIT", "400"))
-MAX_IMPORTED_TEXT_CHARS = int(os.environ.get("ZENITHBOT_HISTORY_IMPORT_TEXT_CHARS", "12000"))
-MAX_FORK_MEMORY_CHARS = int(os.environ.get("ZENITHBOT_FORK_MEMORY_CHARS", "24000"))
-MAX_FORK_MEMORY_ITEM_CHARS = int(os.environ.get("ZENITHBOT_FORK_MEMORY_ITEM_CHARS", "1800"))
-MAX_HANDOFF_DIGEST_CHARS = int(os.environ.get("ZENITHBOT_HANDOFF_DIGEST_CHARS", "56000"))
-MAX_SESSION_SYSTEM_PROMPT_CHARS = int(os.environ.get("ZENITHBOT_SESSION_SYSTEM_PROMPT_CHARS", "24000"))
-HANDOFF_DIGEST_TIMEOUT_SECONDS = int(os.environ.get("ZENITHBOT_HANDOFF_DIGEST_TIMEOUT_SECONDS", "180"))
-HANDOFF_DIGEST_BACKEND = os.environ.get("ZENITHBOT_HANDOFF_DIGEST_BACKEND", BACKEND_CLAUDE).lower()
+JOB_MAX_ACTIVE_RUNS = int(agentsdock_setting("JOB_MAX_ACTIVE_RUNS", "0"))
+JOB_MIN_AVAILABLE_MEM_MB = int(agentsdock_setting("JOB_MIN_AVAILABLE_MEM_MB", "4096"))
+JOB_DEFER_EVENT_MIN_SECONDS = int(agentsdock_setting("JOB_DEFER_EVENT_MIN_SECONDS", "300"))
+MAX_ACTIVE_AGENT_RUNS = int(agentsdock_setting("MAX_ACTIVE_AGENT_RUNS", "10"))
+MIN_START_AVAILABLE_MEM_MB = int(agentsdock_setting("MIN_START_AVAILABLE_MEM_MB", "2048"))
+HOST_MONITOR_INTERVAL_SECONDS = float(agentsdock_setting("HOST_MONITOR_INTERVAL_SECONDS", "15"))
+HOST_HEALTH_MAX_BYTES = int(agentsdock_setting("HOST_HEALTH_MAX_BYTES", str(20 * 1024 * 1024)))
+IDLE_WARN_SECONDS = int(agentsdock_setting("IDLE_WARN_SECONDS", "1800"))
+IDLE_KILL_SECONDS = int(agentsdock_setting("IDLE_KILL_SECONDS", "21600"))
+STOP_GRACE_SECONDS = float(agentsdock_setting("STOP_GRACE_SECONDS", "2.0"))
+PROCESS_STREAM_LIMIT = int(agentsdock_setting("PROCESS_STREAM_LIMIT", str(16 * 1024 * 1024)))
+MAX_UPLOAD_BYTES = int(agentsdock_setting("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024 * 1024)))
+MAX_IMPORT_MESSAGES = int(agentsdock_setting("HISTORY_IMPORT_LIMIT", "400"))
+MAX_IMPORTED_TEXT_CHARS = int(agentsdock_setting("HISTORY_IMPORT_TEXT_CHARS", "12000"))
+MAX_FORK_MEMORY_CHARS = int(agentsdock_setting("FORK_MEMORY_CHARS", "24000"))
+MAX_FORK_MEMORY_ITEM_CHARS = int(agentsdock_setting("FORK_MEMORY_ITEM_CHARS", "1800"))
+MAX_HANDOFF_DIGEST_CHARS = int(agentsdock_setting("HANDOFF_DIGEST_CHARS", "56000"))
+MAX_SESSION_SYSTEM_PROMPT_CHARS = int(agentsdock_setting("SESSION_SYSTEM_PROMPT_CHARS", "24000"))
+HANDOFF_DIGEST_TIMEOUT_SECONDS = int(agentsdock_setting("HANDOFF_DIGEST_TIMEOUT_SECONDS", "180"))
+HANDOFF_DIGEST_BACKEND = agentsdock_setting("HANDOFF_DIGEST_BACKEND", BACKEND_CLAUDE).lower()
 if HANDOFF_DIGEST_BACKEND not in VALID_BACKENDS:
     HANDOFF_DIGEST_BACKEND = BACKEND_CLAUDE
-HANDOFF_DIGEST_MODEL = os.environ.get("ZENITHBOT_HANDOFF_DIGEST_MODEL", "sonnet").strip()
-HANDOFF_DIGEST_EFFORT = os.environ.get("ZENITHBOT_HANDOFF_DIGEST_EFFORT", "").strip()
-DEFAULT_SESSION_EVENT_LIMIT = int(os.environ.get("ZENITHBOT_SESSION_EVENT_LIMIT", "100"))
-MAX_EVENT_RESPONSE_LIMIT = int(os.environ.get("ZENITHBOT_MAX_EVENT_RESPONSE_LIMIT", "1000"))
-AGENT_TOKEN = os.environ.get("ZENITHDOCK_AGENT_TOKEN") or os.environ.get("ZENITHBOT_AGENT_TOKEN") or ""
-SERVER_BIND_ADDRESS = os.environ.get("ZENITHBOT_AGENT_BIND", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("ZENITHBOT_AGENT_PORT", "7850"))
+HANDOFF_DIGEST_MODEL = agentsdock_setting("HANDOFF_DIGEST_MODEL", "sonnet").strip()
+HANDOFF_DIGEST_EFFORT = agentsdock_setting("HANDOFF_DIGEST_EFFORT", "").strip()
+DEFAULT_SESSION_EVENT_LIMIT = int(agentsdock_setting("SESSION_EVENT_LIMIT", "100"))
+MAX_EVENT_RESPONSE_LIMIT = int(agentsdock_setting("MAX_EVENT_RESPONSE_LIMIT", "1000"))
+AGENT_TOKEN = env_setting(
+    "AGENTSDOCK_AGENT_TOKEN",
+    "",
+    "ZENITHDOCK_AGENT_TOKEN",
+    "ZENITHBOT_AGENT_TOKEN",
+) or ""
+SERVER_BIND_ADDRESS = agentsdock_setting("AGENT_BIND", "0.0.0.0")
+SERVER_PORT = int(agentsdock_setting("AGENT_PORT", "7850"))
 API_CONTRACT_VERSION = 7
 SESSION_ORDER_STEP = 1000.0
-CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS = int(os.environ.get("ZENITHBOT_CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS", "120"))
+CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS = int(agentsdock_setting("CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS", "120"))
 
 SYSTEM_PROMPT = """\
-You are responding through Zenith Dock, a native Mac frontend for Zenithbot.
+You are responding through AgentsDock, backed by AgentsServer.
 
 Use concise Markdown. Prefer clear sections, bullets, code fences, and direct
 answers. The UI renders rich traces separately, so do not narrate every tool
@@ -270,8 +313,8 @@ Persistent chat terminal:
 """
 
 CODEX_PROMPT_PRELUDE = """\
-[Zenith Dock context]
-You are responding through a native Mac frontend for Zenithbot.
+[AgentsDock context]
+You are responding through AgentsDock, backed by AgentsServer.
 
 Use concise Markdown. The UI renders tool calls, command output, reasoning
 summaries, and artifacts separately, so keep the final answer focused.
@@ -689,17 +732,17 @@ async def publish_turn_code_diff(
 
 EVENT_SEQ_CACHE: dict[str, int] = {}
 EVENT_SEQ_LOCK = asyncio.Lock()
-TIMELINE_INDEX_CACHE_MAX = int(os.environ.get("ZENITHBOT_TIMELINE_INDEX_CACHE_MAX", "24"))
+TIMELINE_INDEX_CACHE_MAX = int(agentsdock_setting("TIMELINE_INDEX_CACHE_MAX", "24"))
 TIMELINE_INDEX_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 TIMELINE_INDEX_LOCKS: dict[str, threading.Lock] = {}
 HISTORY_SEARCH_DB = STATE_DIR / "history_search.sqlite3"
 HISTORY_SEARCH_LOCK = threading.Lock()
 HISTORY_SEARCH_DIRTY: set[str] = set()
 HISTORY_SEARCH_SYNC_INTERVAL_SECONDS = max(
-    0.25, float(os.environ.get("ZENITHBOT_HISTORY_SEARCH_SYNC_INTERVAL_SECONDS", "1.0"))
+    0.25, float(agentsdock_setting("HISTORY_SEARCH_SYNC_INTERVAL_SECONDS", "1.0"))
 )
 HISTORY_SEARCH_FULL_SYNC_INTERVAL_SECONDS = max(
-    30.0, float(os.environ.get("ZENITHBOT_HISTORY_SEARCH_FULL_SYNC_INTERVAL_SECONDS", "300"))
+    30.0, float(agentsdock_setting("HISTORY_SEARCH_FULL_SYNC_INTERVAL_SECONDS", "300"))
 )
 
 
@@ -776,6 +819,7 @@ def request_authorized(request: Request) -> bool:
         return True
     return (
         token_matches(bearer_token(request.headers.get("authorization")))
+        or token_matches(request.headers.get("x-agentsdock-token"))
         or token_matches(request.headers.get("x-zenithdock-token"))
         or token_matches(request.query_params.get("token"))
     )
@@ -786,6 +830,7 @@ def websocket_authorized(ws: WebSocket) -> bool:
         return True
     return (
         token_matches(bearer_token(ws.headers.get("authorization")))
+        or token_matches(ws.headers.get("x-agentsdock-token"))
         or token_matches(ws.headers.get("x-zenithdock-token"))
         or token_matches(ws.query_params.get("token"))
     )
@@ -2704,7 +2749,7 @@ TMUX_NOISE_TOKENS = {
     "bash", "chat", "codex", "claude", "default", "false", "general",
     "home", "launch", "local", "login", "none", "null", "osmo", "python",
     "python3", "script", "scripts", "server", "sleep", "submit", "submitter",
-    "tail", "this", "true", "wandb", "zenithbot", "zenithdock",
+    "tail", "this", "true", "wandb", "agentsdock", "agentsserver",
 }
 
 
@@ -6179,10 +6224,10 @@ def parse_claude_help_catalog() -> dict[str, Any]:
     default_model = (
         os.environ.get("CLAUDE_MODEL")
         or os.environ.get("ANTHROPIC_MODEL")
-        or os.environ.get("ZENITHBOT_CLAUDE_MODEL")
+        or agentsdock_setting("CLAUDE_MODEL", "")
         or "sonnet"
     )
-    default_effort = os.environ.get("CLAUDE_EFFORT") or os.environ.get("ZENITHBOT_CLAUDE_EFFORT") or ""
+    default_effort = os.environ.get("CLAUDE_EFFORT") or agentsdock_setting("CLAUDE_EFFORT", "")
     try:
         help_text = run_catalog_command([CLAUDE_BIN, "--help"])
     except Exception as exc:
@@ -7570,6 +7615,8 @@ async def signed_release_manifest() -> dict[str, Any]:
         raise HTTPException(status_code=503, detail="release verification key is missing from this server installation")
     try:
         return await asyncio.to_thread(check_release, SERVER_UPDATE_PUBLIC_KEY)
+    except ReleaseUnavailableError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"signed release check failed: {exc}") from exc
 
@@ -7676,7 +7723,17 @@ async def check_server_update() -> dict[str, Any]:
     status = read_server_update_status()
     if await asyncio.to_thread(server_update_is_active, status):
         raise HTTPException(status_code=409, detail="a server update is already running")
-    manifest = await signed_release_manifest()
+    try:
+        manifest = await signed_release_manifest()
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        return write_server_update_status(
+            phase="unavailable",
+            update_available=False,
+            message=str(exc.detail),
+            checked_at=update_utc_now(),
+        )
     latest = str(manifest["version"])
     return write_server_update_status(
         phase="available" if latest != SERVER_VERSION else "current",
@@ -8551,10 +8608,10 @@ async def get_file(file_id: str) -> FileResponse:
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-    parser = argparse.ArgumentParser(description="Zenithbot Agent Server")
+    parser = argparse.ArgumentParser(description="AgentsServer")
     parser.add_argument("cmd", nargs="?", default="serve", choices=["serve"])
-    parser.add_argument("--bind", default=os.environ.get("ZENITHBOT_AGENT_BIND", "0.0.0.0"))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("ZENITHBOT_AGENT_PORT", "7850")))
+    parser.add_argument("--bind", default=agentsdock_setting("AGENT_BIND", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=int(agentsdock_setting("AGENT_PORT", "7850")))
     args = parser.parse_args()
     uvicorn.run("agent_server:app", host=args.bind, port=args.port, app_dir=str(Path(__file__).parent), log_level="info")
     return 0

@@ -14,6 +14,7 @@ import tarfile
 import tempfile
 import time
 import urllib.request
+from urllib.error import HTTPError
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,10 @@ LATEST_SIGNATURE_URL = f"{RELEASE_BASE}/latest/download/agents-server-manifest.s
 MAX_METADATA_BYTES = 1_000_000
 MAX_ARCHIVE_BYTES = 200 * 1024 * 1024
 VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$")
+
+
+class ReleaseUnavailableError(RuntimeError):
+    """Raised when the repository has not published a signed release yet."""
 
 
 def utc_now() -> str:
@@ -92,8 +97,13 @@ def verify_manifest(manifest_bytes: bytes, signature: bytes, public_key_path: Pa
 
 
 def check_release(public_key_path: Path) -> dict[str, Any]:
-    manifest_bytes = download_bytes(LATEST_MANIFEST_URL, MAX_METADATA_BYTES)
-    signature = download_bytes(LATEST_SIGNATURE_URL, MAX_METADATA_BYTES)
+    try:
+        manifest_bytes = download_bytes(LATEST_MANIFEST_URL, MAX_METADATA_BYTES)
+        signature = download_bytes(LATEST_SIGNATURE_URL, MAX_METADATA_BYTES)
+    except HTTPError as exc:
+        if exc.code == 404:
+            raise ReleaseUnavailableError("No signed AgentsServer release has been published yet.") from exc
+        raise
     return verify_manifest(manifest_bytes, signature, public_key_path)
 
 

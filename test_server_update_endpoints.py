@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import agent_server
+from fastapi import HTTPException
 
 
 class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
@@ -18,6 +19,18 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["phase"], "available")
         self.assertEqual(status["latest_version"], "1.1.0")
         self.assertTrue(status["update_available"])
+
+    async def test_check_reports_an_unpublished_release_without_failing_ipc(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+             patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", Path(temporary) / "status.json"), \
+             patch.object(agent_server, "server_update_is_active", return_value=False), \
+             patch.object(agent_server, "signed_release_manifest", new=AsyncMock(side_effect=HTTPException(status_code=404, detail="No signed AgentsServer release has been published yet."))):
+            status = await agent_server.check_server_update()
+
+        self.assertEqual(status["phase"], "unavailable")
+        self.assertFalse(status["update_available"])
+        self.assertIn("No signed AgentsServer release", status["message"])
 
     async def test_start_on_current_version_does_not_require_tmux(self):
         with tempfile.TemporaryDirectory() as temporary, \

@@ -3697,6 +3697,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
     by_key: dict[str, dict[str, Any]] = {record["key"]: record for record in records}
     active_turn_key: str | None = cached.get("active_turn_key") if can_append else None
     current_turn_by_run: dict[str, str] = dict(cached.get("current_turn_by_run") or {}) if can_append else {}
+    job_by_run: dict[str, str] = dict(cached.get("job_by_run") or {}) if can_append else {}
     visible_count = int(cached.get("visible_count") or 0) if can_append else 0
     latest_seq = int(cached.get("latest_seq") or 0) if can_append else 0
     scan_offset = int(cached.get("offset") or 0) if can_append else 0
@@ -3761,6 +3762,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                 continue
             seq = int(event.get("seq") or 0)
             event_type = str(event.get("type") or "")
+            run_id = str(event.get("run_id") or "").strip()
             if seq <= 0:
                 continue
             latest_seq = max(latest_seq, seq)
@@ -3773,7 +3775,6 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
             is_digest_generation = event.get("purpose") == "handoff_digest"
             if digest_id and (is_digest_lifecycle or is_digest_generation):
                 record = ensure_record(f"digest:{digest_id}", "digest", event)
-                run_id = str(event.get("run_id") or "").strip()
                 if run_id and is_digest_generation:
                     current_turn_by_run[run_id] = record["key"]
                     active_turn_key = record["key"]
@@ -3796,14 +3797,17 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                         current_turn_by_run.pop(run_id, None)
                 continue
 
-            if event_type in TIMELINE_INDEX_JOB_TYPES or event.get("job_id"):
+            if event_type in TIMELINE_INDEX_JOB_TYPES or event.get("job_id") or (run_id and run_id in job_by_run):
                 job = event.get("job") if isinstance(event.get("job"), dict) else {}
-                job_id = event.get("job_id") or job.get("id") or event.get("run_id") or f"job-{seq}"
+                job_id = event.get("job_id") or job.get("id") or job_by_run.get(run_id) or run_id or f"job-{seq}"
+                if run_id:
+                    job_by_run[run_id] = str(job_id)
                 record = ensure_record(f"job:{job_id}", "job", event)
                 record["title"] = compact_timeline_index_text(job.get("title") or record["title"] or event.get("message") or "Scheduled job", 72)
                 text = timeline_index_event_text(event)
                 if text:
                     record["preview"] = text
+                record["timestamp"] = event.get("ts") or record.get("timestamp")
                 add_search_entry(record, event, "job")
                 continue
 
@@ -3815,7 +3819,6 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                 add_search_entry(record, event, "error")
                 continue
 
-            run_id = str(event.get("run_id") or "").strip()
             if event_type == "turn_started":
                 run_key = run_id or f"seq-{seq}"
                 key = f"turn:{run_key}"
@@ -3919,16 +3922,19 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
             meta_parts.append(f"{len(file_names)} file{'s' if len(file_names) != 1 else ''}")
         if kind == "job" and not meta_parts:
             meta_parts.append(f"{event_count} update{'s' if event_count != 1 else ''}")
+        landmark_seq = stored["end_seq"] if kind == "job" else stored["start_seq"]
         landmarks.append({
             "key": stored["key"],
             "kind": kind,
-            "start_seq": stored["start_seq"],
+            "start_seq": landmark_seq,
             "end_seq": stored["end_seq"],
             "title": title,
             "preview": preview,
             "meta": " · ".join(meta_parts),
             "timestamp": stored.get("timestamp"),
         })
+
+    landmarks.sort(key=lambda item: (int(item["start_seq"]), int(item["end_seq"]), str(item["key"])))
 
     payload = {
         "session_id": session_id,
@@ -3943,6 +3949,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
         "records": records,
         "active_turn_key": active_turn_key,
         "current_turn_by_run": current_turn_by_run,
+        "job_by_run": job_by_run,
         "visible_count": visible_count,
         "latest_seq": latest_seq,
         "offset": final_offset,

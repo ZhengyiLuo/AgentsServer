@@ -3803,6 +3803,30 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                 if run_id:
                     job_by_run[run_id] = str(job_id)
                 record = ensure_record(f"job:{job_id}", "job", event)
+                prior_key = current_turn_by_run.pop(run_id, None) if run_id else None
+                if prior_key and prior_key != record["key"]:
+                    prior = by_key.pop(prior_key, None)
+                    if prior is not None:
+                        record["start_seq"] = min(int(record["start_seq"]), int(prior["start_seq"]))
+                        record["end_seq"] = max(int(record["end_seq"]), int(prior["end_seq"]))
+                        for field in ("event_count", "tool_count", "thought_count"):
+                            record[field] = int(record.get(field) or 0) + int(prior.get(field) or 0)
+                        for file_name in prior.get("file_names") or []:
+                            if file_name not in record["file_names"]:
+                                record["file_names"].append(file_name)
+                        for field in ("prompt", "trace_preview"):
+                            if not record.get(field) and prior.get(field):
+                                record[field] = prior[field]
+                        search_values = record.setdefault("_search_values", set())
+                        for entry in prior.get("search_entries") or []:
+                            fingerprint = (entry.get("role"), entry.get("text"))
+                            if fingerprint in search_values:
+                                continue
+                            search_values.add(fingerprint)
+                            record.setdefault("search_entries", []).append(entry)
+                        records.remove(prior)
+                    if active_turn_key == prior_key:
+                        active_turn_key = None
                 record["title"] = compact_timeline_index_text(job.get("title") or record["title"] or event.get("message") or "Scheduled job", 72)
                 text = timeline_index_event_text(event)
                 if text:

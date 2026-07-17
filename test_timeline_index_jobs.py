@@ -26,7 +26,10 @@ class TimelineIndexJobTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         events = [
             self.event(1, "job_created", job_id="job-1", job={"id": "job-1", "title": "Status check"}),
-            self.event(2, "turn_started", run_id="job-run", job_id="job-1", purpose="scheduled_job", prompt="Check status"),
+            # Legacy scheduled runs reveal their job only in the following
+            # job_ran event. The index must fold this provisional turn back
+            # into the job instead of leaving a fake user landmark behind.
+            self.event(2, "turn_started", run_id="job-run", prompt="Check status"),
             self.event(3, "job_ran", run_id="job-run", job_id="job-1"),
             self.event(4, "turn_started", run_id="user-run", prompt="What changed?"),
             self.event(5, "turn_finished", run_id="user-run", result_text="Nothing yet."),

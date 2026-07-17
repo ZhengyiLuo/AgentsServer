@@ -890,6 +890,7 @@ class TurnRequest(BaseModel):
     digest_detail: str | None = None
     source_session_id: str | None = None
     target_session_id: str | None = None
+    steer_interrupted_run_id: str | None = None
 
 
 class UpdateQueuedTurnRequest(BaseModel):
@@ -1577,11 +1578,13 @@ class SubscriberHub:
 HUB = SubscriberHub()
 ACTIVE: dict[str, dict[str, Any]] = {}
 BUSY_SESSIONS: set[str] = set()
+CURRENT_TURNS: dict[str, dict[str, Any]] = {}
 STOP_REQUESTS: set[str] = set()
 STOPPED_RUNS: set[str] = set()
 ACTIVE_LOCK = asyncio.Lock()
 QUEUED_TURNS: dict[str, deque[dict[str, Any]]] = {}
 RUN_NOW_TURNS: dict[str, dict[str, Any]] = {}
+STEERING_SESSIONS: set[str] = set()
 QUEUE_LOCK = asyncio.Lock()
 RUN_METADATA: dict[str, dict[str, Any]] = {}
 HANDOFF_DIGEST_JOBS: dict[str, dict[str, Any]] = {}
@@ -1786,11 +1789,53 @@ def queue_positions(queue: deque[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def merged_file_ids(*groups: list[str] | tuple[str, ...]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for value in group:
+            file_id = str(value or "").strip()
+            if file_id and file_id not in seen:
+                seen.add(file_id)
+                merged.append(file_id)
+    return merged
+
+
+def prepare_steered_turn(selected: dict[str, Any], interrupted: dict[str, Any] | None) -> dict[str, Any]:
+    """Build the provider request for a real steer without changing its UI prompt."""
+    turn = dict(selected)
+    steering_prompt = str(selected.get("prompt") or "").strip()
+    interrupted_prompt = str((interrupted or {}).get("prompt") or "").strip()
+    if not steering_prompt or not interrupted_prompt or steering_prompt == interrupted_prompt:
+        return turn
+
+    turn["steering_prompt"] = steering_prompt
+    turn["display_prompt"] = str(selected.get("display_prompt") or steering_prompt)
+    turn["prompt"] = (
+        "The previous agent turn was interrupted before completion. Continue that request while "
+        "applying the steering instruction below. Treat both messages as user input, and give the "
+        "steering instruction priority wherever they conflict.\n\n"
+        "[Interrupted message]\n"
+        f"{interrupted_prompt}\n"
+        "[End interrupted message]\n\n"
+        "[Steering message]\n"
+        f"{steering_prompt}\n"
+        "[End steering message]"
+    )
+    turn["file_ids"] = merged_file_ids(
+        list((interrupted or {}).get("file_ids") or []),
+        list(selected.get("file_ids") or []),
+    )
+    turn["steer_interrupted_run_id"] = (interrupted or {}).get("run_id")
+    turn["replays_interrupted_message"] = True
+    return turn
+
+
 def public_queued_turn(session_id: str, item: dict[str, Any], position: int) -> dict[str, Any]:
     return {
         "queued_id": str(item.get("queued_id") or ""),
         "session_id": session_id,
-        "prompt": str(item.get("display_prompt") or item.get("prompt") or ""),
+        "prompt": str(item.get("display_prompt") or item.get("steering_prompt") or item.get("prompt") or ""),
         "file_ids": list(item.get("file_ids") or []),
         "backend": item.get("backend"),
         "model": item.get("model"),
@@ -1895,9 +1940,14 @@ async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
 
+    async with ACTIVE_LOCK:
+        interrupted_turn = dict(CURRENT_TURNS.get(session_id) or {})
+
     selected: dict[str, Any] | None = None
     remaining: int
     async with QUEUE_LOCK:
+        if session_id in STEERING_SESSIONS or RUN_NOW_TURNS.get(session_id) is not None:
+            raise HTTPException(status_code=409, detail="another steering handoff is already in progress")
         queue = QUEUED_TURNS.get(session_id)
         if queue:
             kept: deque[dict[str, Any]] = deque()
@@ -1916,22 +1966,45 @@ async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]
             remaining = 0
         if selected is not None:
             RUN_NOW_TURNS[session_id] = selected
+            STEERING_SESSIONS.add(session_id)
 
     if selected is None:
         raise HTTPException(status_code=404, detail="queued turn not found")
 
-    await append_event(session_id, "turn_queue_run_now", {
-        "queued_id": queued_id,
-        "backend": selected.get("backend") or STORE.sessions[session_id].get("backend") or DEFAULT_BACKEND,
-        "prompt": selected.get("prompt") or "",
-        "file_ids": list(selected.get("file_ids") or []),
-        "message": "Queued message moved to the front and current turn interrupted.",
-        "remaining": remaining,
-    })
-    stop_result = await stop_turn(session_id, emit_event=False, schedule_queue=False)
-    if not stop_result.get("stopped") and not stop_result.get("pending"):
+    try:
+        stop_result = await stop_turn(session_id, emit_event=False, schedule_queue=False)
+        interrupted = bool(stop_result.get("stopped") or stop_result.get("pending"))
+        prepared = prepare_steered_turn(selected, interrupted_turn if interrupted else None)
+        async with QUEUE_LOCK:
+            current = RUN_NOW_TURNS.get(session_id)
+            if current and current.get("queued_id") == queued_id:
+                RUN_NOW_TURNS[session_id] = prepared
+
+        display_prompt = str(prepared.get("display_prompt") or prepared.get("steering_prompt") or selected.get("prompt") or "")
+        await append_event(session_id, "turn_queue_run_now", {
+            "queued_id": queued_id,
+            "backend": prepared.get("backend") or STORE.sessions[session_id].get("backend") or DEFAULT_BACKEND,
+            "prompt": display_prompt,
+            "request_prompt": prepared.get("prompt") or display_prompt,
+            "display_prompt": display_prompt,
+            "file_ids": list(prepared.get("file_ids") or []),
+            "interrupted_run_id": prepared.get("steer_interrupted_run_id"),
+            "replays_interrupted_message": bool(prepared.get("replays_interrupted_message")),
+            "message": "Steering message promoted; the interrupted request will be replayed with it.",
+            "remaining": remaining,
+        })
+        asyncio.create_task(wait_for_steered_turn_slot(session_id))
+        return {
+            "ok": True,
+            "queued_id": queued_id,
+            "interrupted": interrupted,
+            "replays_interrupted_message": bool(prepared.get("replays_interrupted_message")),
+        }
+    except Exception:
+        async with QUEUE_LOCK:
+            STEERING_SESSIONS.discard(session_id)
         schedule_next_queued_turn(session_id)
-    return {"ok": True, "queued_id": queued_id, "interrupted": bool(stop_result.get("stopped"))}
+        raise
 
 
 async def requeue_turn_front(session_id: str, item: dict[str, Any]) -> None:
@@ -1945,8 +2018,22 @@ async def retry_next_queued_turn_later(session_id: str, delay_seconds: int | Non
     await start_next_queued_turn(session_id)
 
 
+async def wait_for_steered_turn_slot(session_id: str) -> None:
+    while True:
+        async with ACTIVE_LOCK:
+            busy = session_id in BUSY_SESSIONS
+        if not busy:
+            break
+        await asyncio.sleep(0.05)
+    async with QUEUE_LOCK:
+        STEERING_SESSIONS.discard(session_id)
+    await start_next_queued_turn(session_id)
+
+
 async def start_next_queued_turn(session_id: str) -> None:
     async with QUEUE_LOCK:
+        if session_id in STEERING_SESSIONS:
+            return
         item = RUN_NOW_TURNS.pop(session_id, None)
         if item is None:
             queue = QUEUED_TURNS.get(session_id)
@@ -1968,6 +2055,7 @@ async def start_next_queued_turn(session_id: str) -> None:
         digest_detail=item.get("digest_detail"),
         source_session_id=item.get("source_session_id"),
         target_session_id=item.get("target_session_id"),
+        steer_interrupted_run_id=item.get("steer_interrupted_run_id"),
     )
     try:
         await start_turn(session_id, req, queue_if_busy=False, queued_id=str(item["queued_id"]))
@@ -2028,6 +2116,8 @@ def queued_turn_from_event(event: dict[str, Any], sess: dict[str, Any], position
         "digest_detail": event.get("digest_detail"),
         "source_session_id": event.get("source_session_id"),
         "target_session_id": event.get("target_session_id"),
+        "steer_interrupted_run_id": event.get("interrupted_run_id") or event.get("steer_interrupted_run_id"),
+        "replays_interrupted_message": bool(event.get("replays_interrupted_message")),
         "created_at": event.get("ts") or now_iso(),
         "position": int(event.get("position") or position),
     }
@@ -2055,10 +2145,18 @@ def rebuild_queued_turns_from_events() -> int:
                 if queued_id not in order:
                     order.append(queued_id)
             elif event_type in {"turn_queue_updated", "turn_queue_run_now"} and queued_id in pending:
-                if event.get("prompt") is not None:
+                if event.get("request_prompt") is not None:
+                    pending[queued_id]["prompt"] = event.get("request_prompt") or ""
+                elif event.get("prompt") is not None:
                     pending[queued_id]["prompt"] = event.get("prompt") or ""
+                if event.get("display_prompt") is not None:
+                    pending[queued_id]["display_prompt"] = event.get("display_prompt")
                 if event.get("file_ids") is not None:
                     pending[queued_id]["file_ids"] = list(event.get("file_ids") or [])
+                if event.get("interrupted_run_id") is not None:
+                    pending[queued_id]["steer_interrupted_run_id"] = event.get("interrupted_run_id")
+                if event.get("replays_interrupted_message") is not None:
+                    pending[queued_id]["replays_interrupted_message"] = bool(event.get("replays_interrupted_message"))
                 if event_type == "turn_queue_run_now" and queued_id in order:
                     order.remove(queued_id)
                     order.insert(0, queued_id)
@@ -3301,6 +3399,7 @@ async def release_turn_slot(session_id: str) -> None:
     async with ACTIVE_LOCK:
         ACTIVE.pop(session_id, None)
         BUSY_SESSIONS.discard(session_id)
+        CURRENT_TURNS.pop(session_id, None)
         STOP_REQUESTS.discard(session_id)
 
 
@@ -6355,7 +6454,11 @@ def session_system_prompt(session_id: str, sess: dict[str, Any], manifest_path: 
 
 
 def build_claude_cmd(session_id: str, sess: dict[str, Any], manifest_path: Path, *, provider_id: str | None = None) -> list[str]:
-    system_prompt = session_system_prompt(session_id, sess, manifest_path)
+    system_prompt = session_system_prompt(
+        session_id,
+        sess,
+        manifest_path,
+    )
     cmd = [
         CLAUDE_BIN, "-p",
         "--output-format", "stream-json",
@@ -7499,6 +7602,15 @@ async def start_turn(
                 raise HTTPException(status_code=409, detail="session already has a running turn")
         else:
             BUSY_SESSIONS.add(session_id)
+            CURRENT_TURNS[session_id] = {
+                "run_id": None,
+                "prompt": req.prompt,
+                "display_prompt": req.display_prompt,
+                "file_ids": list(req.file_ids),
+                "backend": req.backend or sess.get("backend") or DEFAULT_BACKEND,
+                "purpose": req.purpose,
+                "queued_id": queued_id,
+            }
             reserved = True
     if should_queue:
         return await enqueue_turn(session_id, req, sess)
@@ -7526,6 +7638,11 @@ async def start_turn(
         await ensure_runtime_available(backend)
 
         run_id = f"run_{uuid.uuid4().hex[:16]}"
+        async with ACTIVE_LOCK:
+            current_turn = CURRENT_TURNS.get(session_id)
+            if current_turn is not None:
+                current_turn["run_id"] = run_id
+                current_turn["backend"] = backend
         manifest_path = manifests_dir(session_id) / f"{run_id}.json"
         prompt = req.prompt
         uploads = []
@@ -7577,6 +7694,7 @@ async def start_turn(
             "digest_detail": req.digest_detail,
             "source_session_id": req.source_session_id,
             "target_session_id": req.target_session_id,
+            "steer_interrupted_run_id": req.steer_interrupted_run_id,
         }
         run_metadata = {key: value for key, value in run_metadata.items() if value is not None}
         if run_metadata:

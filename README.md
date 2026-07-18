@@ -64,7 +64,8 @@ machine paths.
 - Linux or macOS host with Python 3.10+.
 - `uv` recommended for the runtime environment.
 - Claude CLI and/or Codex CLI installed and authenticated on the agent host.
-- `tmux` for persistent chat terminals and tmux-pane inspection.
+- `tmux` for persistent chat terminals, tmux-pane inspection, and detached
+  managed updates.
 - Tailscale on the agent host and each client device if you want to use the
   server from another Mac, iPhone, or iPad.
 - Optional: a user-level `systemd` service on Linux.
@@ -92,8 +93,15 @@ cd AgentsServer
 ./install.sh
 ```
 
-The installer uses `uv`, installs a user-level service, creates a private access
-token, verifies authenticated health, and preserves existing
+Before changing state, releases, configuration, or services, the installer
+checks for `tmux`, `curl`, and the platform service command (`launchctl` on
+macOS or `systemctl` on Linux), and verifies that the current user's service
+domain responds. Missing tools or an unavailable user service session produce
+platform-specific guidance. The preflight never invokes a package manager or
+`sudo` itself.
+
+After that preflight, the installer uses `uv`, installs a user-level service,
+creates a private access token, verifies authenticated health, and preserves existing
 `~/.agentsdock` chat state on every update. Existing
 `~/.zenithbot-agent` state is migrated automatically and left behind as a
 compatibility link. The installer does not use `sudo`.

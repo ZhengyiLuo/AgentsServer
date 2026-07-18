@@ -2457,6 +2457,32 @@ def tmux_bin() -> str:
     return found
 
 
+def tmux_capability() -> dict[str, Any]:
+    available = shutil.which("tmux") is not None
+    if available:
+        return {
+            "available": True,
+            "required": True,
+            "message": "tmux is available.",
+            "action": None,
+        }
+    if sys.platform == "darwin":
+        action = "Install tmux with Homebrew (brew install tmux), then rerun the AgentsServer installer."
+    elif sys.platform.startswith("linux"):
+        action = (
+            "Install tmux with your package manager (for example: sudo apt install tmux, "
+            "sudo dnf install tmux, or sudo pacman -S tmux), then rerun the AgentsServer installer."
+        )
+    else:
+        action = "Install tmux on the agent host, then rerun the AgentsServer installer."
+    return {
+        "available": False,
+        "required": True,
+        "message": "tmux is required for persistent terminals and detached managed updates but was not found on the server PATH.",
+        "action": action,
+    }
+
+
 def terminal_session_name(session_id: str) -> str:
     clean = re.sub(r"[^A-Za-z0-9_]", "_", session_id).strip("_") or "session"
     return f"zd_{clean[:80]}"
@@ -2723,6 +2749,8 @@ def scroll_terminal_history(session_id: str, delta: int) -> bool:
 
 
 def exit_terminal_auto_scroll(session_id: str) -> None:
+    if shutil.which("tmux") is None:
+        return
     name = terminal_session_name(session_id)
     if tmux_session_exists(name):
         run_tmux(["send-keys", "-X", "-t", name, "cancel"], check=False)
@@ -2732,9 +2760,11 @@ def kill_terminal_session(session_id: str) -> dict[str, Any]:
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
     name = terminal_session_name(session_id)
-    existed = tmux_session_exists(name)
-    if existed:
-        run_tmux(["kill-session", "-t", name], check=False)
+    existed = False
+    if shutil.which("tmux") is not None:
+        existed = tmux_session_exists(name)
+        if existed:
+            run_tmux(["kill-session", "-t", name], check=False)
     return {
         "session_id": session_id,
         "name": name,
@@ -7861,6 +7891,7 @@ async def health() -> dict[str, Any]:
     async with QUEUE_LOCK:
         queued = {sid: len(queue) for sid, queue in QUEUED_TURNS.items() if queue}
     pressure = host_pressure_snapshot()
+    tmux = tmux_capability()
     return {
         "ok": True,
         "server_version": SERVER_VERSION,
@@ -7870,7 +7901,12 @@ async def health() -> dict[str, Any]:
         "default_backend": DEFAULT_BACKEND,
         "default_cwd": existing_cwd(DEFAULT_CWD),
         "auth_required": bool(AGENT_TOKEN),
-        "managed_updates": SERVER_UPDATE_RUNNER.is_file() and SERVER_UPDATE_PUBLIC_KEY.is_file(),
+        "managed_updates": (
+            SERVER_UPDATE_RUNNER.is_file()
+            and SERVER_UPDATE_PUBLIC_KEY.is_file()
+            and bool(tmux["available"])
+        ),
+        "capabilities": {"tmux": tmux},
         "websocket_runtime": True,
         "websocket_runtime_version": websockets.__version__,
         "active": active,
@@ -7939,8 +7975,9 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
             message=f"AgentsServer {SERVER_VERSION} is already installed.",
             checked_at=update_utc_now(),
         )
-    if shutil.which("tmux") is None:
-        raise HTTPException(status_code=503, detail="tmux is required for detached server updates")
+    tmux = tmux_capability()
+    if not tmux["available"]:
+        raise HTTPException(status_code=503, detail=f"{tmux['message']} {tmux['action']}")
     if not SERVER_UPDATE_RUNNER.is_file() or not SERVER_UPDATE_PUBLIC_KEY.is_file():
         raise HTTPException(status_code=503, detail="this server installation predates managed updates; run the installer once")
 
@@ -8232,7 +8269,12 @@ async def send_handoff_digest_background(session_id: str, req: HandoffDigestSend
 async def update_session(session_id: str, req: UpdateSessionRequest) -> dict[str, Any]:
     sess = await STORE.update(session_id, req.model_dump(exclude_unset=True))
     if req.archived is True:
-        await asyncio.to_thread(kill_terminal_session, session_id)
+        try:
+            await asyncio.to_thread(kill_terminal_session, session_id)
+        except Exception as exc:
+            # Archiving is already durable at this point. Terminal cleanup is
+            # best-effort and must not turn a successful archive into a 500.
+            logger.warning("could not clean up terminal for archived session %s: %s", session_id, exc)
     return {"session": public_session(sess)}
 
 
@@ -8463,12 +8505,15 @@ async def session_terminal(
     cwd: str | None = None,
 ) -> None:
     if not websocket_authorized(ws):
+        await ws.accept()
         await ws.close(code=4401)
         return
     if session_id not in STORE.sessions:
+        await ws.accept()
         await ws.close(code=4404)
         return
     if bool(STORE.sessions[session_id].get("archived")):
+        await ws.accept()
         await ws.close(code=4409)
         return
 

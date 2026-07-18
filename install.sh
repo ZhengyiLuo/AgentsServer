@@ -19,6 +19,9 @@ else
 fi
 SERVICE_NAME="agents-server"
 LEGACY_SERVICE_NAME="zenithbot-agent"
+LAUNCHCTL_STOP_ATTEMPTS=50
+LAUNCHCTL_STOP_DELAY=0.1
+LAUNCHCTL_BOOTSTRAP_ATTEMPTS=3
 
 usage() {
   cat <<'USAGE'
@@ -83,9 +86,41 @@ if [[ ! -f "$LEGACY_ENV_FILE" && -f "$HOME/Zenithbot/.env" ]]; then
   LEGACY_ENV_FILE="$HOME/Zenithbot/.env"
 fi
 
+OS_NAME="$(uname -s)"
+SERVER_PATH=""
+append_server_path() {
+  local candidate="$1"
+  [[ -n "$candidate" ]] || return 0
+  case ":$SERVER_PATH:" in
+    *":$candidate:"*) ;;
+    *) SERVER_PATH="${SERVER_PATH:+$SERVER_PATH:}$candidate" ;;
+  esac
+}
+
+append_server_path_list() {
+  local path_list="$1"
+  local candidate
+  local old_ifs="$IFS"
+  IFS=":"
+  for candidate in $path_list; do
+    append_server_path "$candidate"
+  done
+  IFS="$old_ifs"
+}
+
 EXISTING_PATH="$(read_env_value "$ENV_FILE" PATH)"
 [[ -n "$EXISTING_PATH" ]] || EXISTING_PATH="$(read_env_value "$LEGACY_ENV_FILE" PATH)"
-SERVER_PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${EXISTING_PATH:-$PATH}"
+# Prefer the previously saved runtime PATH when present, otherwise retain the
+# launcher's PATH. Add standard user and Homebrew locations without allowing
+# repeated installs to grow the saved value indefinitely.
+append_server_path_list "${EXISTING_PATH:-${PATH:-}}"
+append_server_path "$HOME/.local/bin"
+append_server_path "$HOME/.cargo/bin"
+append_server_path "/opt/homebrew/bin"
+append_server_path "/usr/local/bin"
+append_server_path "/usr/bin"
+append_server_path "/bin"
+export PATH="$SERVER_PATH"
 RELEASE_FILES=(agent_server.py install.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem)
 
 for name in "${RELEASE_FILES[@]}"; do
@@ -95,7 +130,102 @@ for name in "${RELEASE_FILES[@]}"; do
   fi
 done
 
-cleanup() { rm -rf "$STAGE_DIR"; }
+PREFLIGHT_FAILED="false"
+MISSING_PREREQUISITE_NAMES=()
+MISSING_PREREQUISITE_GUIDANCE=()
+record_prerequisite_failure() {
+  local prerequisite_name="$1"
+  local guidance="$2"
+  PREFLIGHT_FAILED="true"
+  MISSING_PREREQUISITE_NAMES+=("$prerequisite_name")
+  MISSING_PREREQUISITE_GUIDANCE+=("$guidance")
+  echo "Unavailable prerequisite: $prerequisite_name" >&2
+  echo "  $guidance" >&2
+}
+
+require_command() {
+  local command_name="$1"
+  local guidance="$2"
+  command -v "$command_name" >/dev/null 2>&1 || record_prerequisite_failure "$command_name" "$guidance"
+}
+
+probe_service_manager() {
+  local output=""
+  if [[ "$OS_NAME" == "Darwin" ]] && command -v launchctl >/dev/null 2>&1; then
+    if ! output="$(launchctl print "gui/$UID" 2>&1)"; then
+      [[ -z "$output" ]] || echo "  launchctl: ${output//$'\n'/ }" >&2
+      record_prerequisite_failure \
+        "macOS launchd user domain gui/$UID" \
+        "Log into a macOS GUI user session and verify: launchctl print gui/$UID"
+    fi
+  elif [[ "$OS_NAME" == "Linux" ]] && command -v systemctl >/dev/null 2>&1; then
+    if ! output="$(systemctl --user show-environment 2>&1)"; then
+      [[ -z "$output" ]] || echo "  systemctl: ${output//$'\n'/ }" >&2
+      record_prerequisite_failure \
+        "systemctl --user session" \
+        "Log into a systemd user session and verify: systemctl --user show-environment"
+    fi
+  fi
+}
+
+preflight_prerequisites() {
+  case "$OS_NAME" in
+    Darwin)
+      require_command "tmux" "Install tmux with Homebrew: brew install tmux"
+      require_command "curl" "Install curl with Homebrew (brew install curl) or restore the curl included with macOS."
+      require_command "launchctl" "launchctl is included with macOS; run this installer from a supported macOS user session."
+      if command -v tmux >/dev/null 2>&1 && ! tmux -V >/dev/null 2>&1; then
+        record_prerequisite_failure "tmux" "Install a working tmux with Homebrew: brew install tmux"
+      fi
+      if command -v curl >/dev/null 2>&1 && ! curl --version >/dev/null 2>&1; then
+        record_prerequisite_failure "curl" "Install a working curl with Homebrew: brew install curl"
+      fi
+      ;;
+    Linux)
+      require_command "tmux" "Install tmux with your package manager, for example: sudo apt install tmux, sudo dnf install tmux, or sudo pacman -S tmux."
+      require_command "curl" "Install curl with your package manager, for example: sudo apt install curl, sudo dnf install curl, or sudo pacman -S curl."
+      require_command "systemctl" "AgentsServer's Linux installer requires systemd and a working systemctl --user session."
+      if command -v tmux >/dev/null 2>&1 && ! tmux -V >/dev/null 2>&1; then
+        record_prerequisite_failure "tmux" "Install a working tmux with your package manager, for example: sudo apt install tmux, sudo dnf install tmux, or sudo pacman -S tmux."
+      fi
+      if command -v curl >/dev/null 2>&1 && ! curl --version >/dev/null 2>&1; then
+        record_prerequisite_failure "curl" "Install a working curl with your package manager, for example: sudo apt install curl, sudo dnf install curl, or sudo pacman -S curl."
+      fi
+      ;;
+    *)
+      echo "Unsupported host OS: $OS_NAME" >&2
+      PREFLIGHT_FAILED="true"
+      ;;
+  esac
+  probe_service_manager
+  if [[ "$PREFLIGHT_FAILED" == "true" ]]; then
+    local names=""
+    local actions=""
+    local index
+    for ((index = 0; index < ${#MISSING_PREREQUISITE_NAMES[@]}; index++)); do
+      [[ -z "$names" ]] || names+=", "
+      names+="${MISSING_PREREQUISITE_NAMES[$index]}"
+      [[ -z "$actions" ]] || actions+=" "
+      actions+="${MISSING_PREREQUISITE_GUIDANCE[$index]}"
+    done
+    if [[ -n "$names" ]]; then
+      echo "Missing prerequisites: $names. $actions Then run install.sh again; no state, release, configuration, or service changes were made." >&2
+    else
+      echo "Prerequisite check failed for unsupported host OS $OS_NAME; no state, release, configuration, or service changes were made." >&2
+    fi
+    return 1
+  fi
+}
+
+# This deliberately runs before the cleanup trap, directory creation, state
+# migration, release staging, or service changes.
+preflight_prerequisites || exit 1
+
+SERVICE_CONFIG_BACKUP=""
+cleanup() {
+  rm -rf "$STAGE_DIR"
+  [[ -z "$SERVICE_CONFIG_BACKUP" ]] || rm -f "$SERVICE_CONFIG_BACKUP"
+}
 trap cleanup EXIT
 
 migrate_legacy_state() {
@@ -221,20 +351,100 @@ if [[ -n "$OLD_TARGET" && -e "$OLD_TARGET" ]]; then
 fi
 ln -sfn "$RELEASE_DIR" "$CURRENT_LINK"
 
+wait_for_launch_agent_removal() {
+  local service_target="$1"
+  local attempt
+  for ((attempt = 1; attempt <= LAUNCHCTL_STOP_ATTEMPTS; attempt++)); do
+    if ! launchctl print "$service_target" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep "$LAUNCHCTL_STOP_DELAY"
+  done
+  echo "Timed out waiting for $LABEL to stop." >&2
+  return 1
+}
+
+transient_launchctl_bootstrap_error() {
+  local status="$1"
+  local output="$2"
+  # launchctl collapses launchd's EALREADY into status 5 and this generic EIO text.
+  [[ "$output" == *"Operation already in progress"* ]] || \
+    { ((status == 5)) && [[ "$output" == *"Bootstrap failed: 5: Input/output error"* ]]; }
+}
+
+bootstrap_launch_agent() {
+  local domain="$1"
+  local service_target="$2"
+  local allow_transient_retry="$3"
+  local attempt=1
+  local output=""
+  local status=0
+
+  while ((attempt <= LAUNCHCTL_BOOTSTRAP_ATTEMPTS)); do
+    if output="$(launchctl bootstrap "$domain" "$PLIST" 2>&1)"; then
+      [[ -z "$output" ]] || printf '%s\n' "$output"
+      return 0
+    else
+      status=$?
+    fi
+    if [[ "$allow_transient_retry" != "true" ]] || \
+      ! transient_launchctl_bootstrap_error "$status" "$output" || \
+      ((attempt == LAUNCHCTL_BOOTSTRAP_ATTEMPTS)); then
+      [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+      return "$status"
+    fi
+    wait_for_launch_agent_removal "$service_target" || return 1
+    sleep "$LAUNCHCTL_STOP_DELAY"
+    ((attempt += 1))
+  done
+  return "$status"
+}
+
 restart_service() {
   if [[ "$OS_NAME" == "Linux" ]]; then
     systemctl --user disable --now "$LEGACY_SERVICE_NAME.service" >/dev/null 2>&1 || true
-    systemctl --user daemon-reload
-    systemctl --user enable "$SERVICE_NAME.service" >/dev/null
+    systemctl --user daemon-reload || return
+    systemctl --user enable "$SERVICE_NAME.service" >/dev/null || return
     systemctl --user restart "$SERVICE_NAME.service"
   else
-    launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
-    launchctl bootstrap "gui/$(id -u)" "$PLIST"
+    local domain="gui/$(id -u)"
+    local service_target="$domain/$LABEL"
+    local had_service="false"
+    local output=""
+    local status=0
+    if launchctl print "$service_target" >/dev/null 2>&1; then
+      had_service="true"
+      # bootout acknowledges the request before launchd has removed the job.
+      if output="$(launchctl bootout "$service_target" 2>&1)"; then
+        [[ -z "$output" ]] || printf '%s\n' "$output"
+      else
+        status=$?
+        if launchctl print "$service_target" >/dev/null 2>&1; then
+          [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+          return "$status"
+        fi
+      fi
+      wait_for_launch_agent_removal "$service_target" || return 1
+    fi
+    bootstrap_launch_agent "$domain" "$service_target" "$had_service"
   fi
 }
 
+restore_previous_release() {
+  local restore_service_config="${1:-false}"
+  [[ -n "$OLD_TARGET" && -e "$OLD_TARGET" ]] || return 1
+  ln -sfn "$OLD_TARGET" "$CURRENT_LINK" || return
+  if [[ "$restore_service_config" == "true" && "$OS_NAME" == "Darwin" && -n "$SERVICE_CONFIG_BACKUP" ]]; then
+    cp -p "$SERVICE_CONFIG_BACKUP" "$PLIST" || return
+  fi
+  if restart_service; then
+    return 0
+  fi
+  echo "The previous release link was restored, but its service could not be restarted." >&2
+  return 1
+}
+
 echo "[4/7] Installing the user service"
-OS_NAME="$(uname -s)"
 if [[ "$OS_NAME" == "Linux" ]]; then
   USER_SERVICE_DIR="$HOME/.config/systemd/user"
   mkdir -p "$USER_SERVICE_DIR"
@@ -260,6 +470,10 @@ elif [[ "$OS_NAME" == "Darwin" ]]; then
   LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
   PLIST="$LAUNCH_AGENTS/$LABEL.plist"
   mkdir -p "$LAUNCH_AGENTS" "$HOME/Library/Logs/AgentsServer"
+  if [[ -f "$PLIST" ]]; then
+    SERVICE_CONFIG_BACKUP="$(mktemp "${TMPDIR:-/tmp}/agents-server-launch-agent.XXXXXX")"
+    cp -p "$PLIST" "$SERVICE_CONFIG_BACKUP"
+  fi
   cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -292,7 +506,13 @@ else
   echo "Unsupported host OS: $OS_NAME" >&2
   exit 1
 fi
-restart_service
+if ! restart_service; then
+  echo "AgentsServer $RELEASE_VERSION could not start; restoring the previous service when possible." >&2
+  if restore_previous_release true; then
+    echo "The previous release and service were restored." >&2
+  fi
+  exit 1
+fi
 
 wait_for_health() {
   for _attempt in $(seq 1 45); do
@@ -307,9 +527,7 @@ wait_for_health() {
 echo "[5/7] Waiting for authenticated health"
 if ! wait_for_health; then
   echo "AgentsServer $RELEASE_VERSION did not become healthy; rolling back." >&2
-  if [[ -n "$OLD_TARGET" && -e "$OLD_TARGET" ]]; then
-    ln -sfn "$OLD_TARGET" "$CURRENT_LINK"
-    restart_service
+  if restore_previous_release false; then
     wait_for_health || true
     echo "The previous release was restored." >&2
   fi

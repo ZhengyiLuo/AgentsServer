@@ -6901,13 +6901,17 @@ def guess_content_type(filename: str) -> str:
     return "application/octet-stream"
 
 
+def effective_content_type(filename: str, recorded: str | None = None) -> str:
+    content_type = str(recorded or "").strip()
+    base_type = content_type.split(";", 1)[0].strip().lower()
+    if not base_type or base_type in {"application/octet-stream", "binary/octet-stream"}:
+        return guess_content_type(filename)
+    return content_type
+
+
 def file_response_media_type(meta: dict[str, Any]) -> str:
     filename = str(meta.get("filename") or Path(str(meta.get("path") or "")).name)
-    guessed = guess_content_type(filename)
-    recorded = str(meta.get("content_type") or "")
-    if not recorded or recorded == "application/octet-stream":
-        return guessed
-    return recorded
+    return effective_content_type(filename, str(meta.get("content_type") or ""))
 
 
 def manifest_entry_path(entry: str | dict[str, Any]) -> str:
@@ -8670,7 +8674,7 @@ async def upload_file(session_id: str, file: UploadFile = File(...)) -> dict[str
         "filename": dest.name,
         "path": str(dest),
         "size": size,
-        "content_type": file.content_type or guess_content_type(dest.name),
+        "content_type": effective_content_type(dest.name, file.content_type),
         "created_at": now_iso(),
     }
     (dest_dir / "meta.json").write_text(json.dumps(meta, indent=2))
@@ -8747,8 +8751,15 @@ def list_session_file_records(session_id: str) -> list[dict[str, Any]]:
                 out["event_type"] = event.get("type")
                 records[str(rec["id"])] = out
 
+    normalized = []
+    for rec in records.values():
+        current = dict(rec)
+        filename = str(current.get("filename") or Path(str(current.get("path") or "")).name)
+        current["content_type"] = effective_content_type(filename, str(current.get("content_type") or ""))
+        normalized.append(current)
+
     return sorted(
-        records.values(),
+        normalized,
         key=lambda rec: (str(rec.get("created_at") or ""), str(rec.get("filename") or "")),
         reverse=True,
     )

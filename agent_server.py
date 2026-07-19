@@ -3463,29 +3463,48 @@ def read_events(
     limit = max(1, min(int(limit or 500), MAX_EVENT_RESPONSE_LIMIT))
     out: list[dict[str, Any]] = []
     tail_out: deque[dict[str, Any]] | None = deque(maxlen=limit) if tail else None
-    for line in path.open("r", encoding="utf-8", errors="ignore"):
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except Exception:
-            continue
-        seq = int(event.get("seq", 0))
-        if seq > after and (before is None or seq < before):
-            event = client_safe_event(event)
-            if visible and not is_visible_timeline_event(event):
+    with path.open("r", encoding="utf-8", errors="ignore") as source:
+        for line in source:
+            if not line.strip():
                 continue
-            if tail_out is not None:
-                tail_out.append(event)
-            else:
-                out.append(event)
-        if tail_out is None and len(out) >= limit:
-            break
+            try:
+                event = json.loads(line)
+            except Exception:
+                continue
+            seq = int(event.get("seq", 0))
+            if seq > after and (before is None or seq < before):
+                event = client_safe_event(event)
+                if visible and not is_visible_timeline_event(event):
+                    continue
+                if tail_out is not None:
+                    tail_out.append(event)
+                else:
+                    out.append(event)
+            if tail_out is None and len(out) >= limit:
+                break
     return list(tail_out) if tail_out is not None else out
 
 
-def is_visible_timeline_event(event: dict[str, Any]) -> bool:
-    return str(event.get("type") or "") != "raw_event"
+COMPACT_TIMELINE_HIDDEN_TYPES = {
+    "raw_event",
+    "reasoning_summary",
+    "tool_started",
+    "tool_finished",
+    "process_started",
+    "provider_session",
+    "cwd_fallback",
+    "history_imported",
+    "backend_changed",
+    "session_created",
+    "code_diff",
+}
+
+
+def is_visible_timeline_event(event: dict[str, Any], *, compact: bool = False) -> bool:
+    event_type = str(event.get("type") or "")
+    if compact:
+        return event_type not in COMPACT_TIMELINE_HIDDEN_TYPES
+    return event_type != "raw_event"
 
 
 def read_visible_events_page(
@@ -3495,6 +3514,7 @@ def read_visible_events_page(
     limit: int = 500,
     *,
     tail: bool = False,
+    compact: bool = False,
 ) -> tuple[list[dict[str, Any]], int, int, int, int]:
     path = events_path(session_id)
     if not path.exists():
@@ -3504,26 +3524,27 @@ def read_visible_events_page(
     tail_out: deque[dict[str, Any]] | None = deque(maxlen=limit) if tail else None
     latest_seq = 0
     visible_count = 0
-    for line in path.open("r", encoding="utf-8", errors="ignore"):
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except Exception:
-            continue
-        seq = int(event.get("seq", 0))
-        if seq > 0:
-            latest_seq = seq
-        if seq <= after or (before is not None and seq >= before):
-            continue
-        event = client_safe_event(event)
-        if not is_visible_timeline_event(event):
-            continue
-        visible_count += 1
-        if tail_out is not None:
-            tail_out.append(event)
-        elif len(out) < limit:
-            out.append(event)
+    with path.open("r", encoding="utf-8", errors="ignore") as source:
+        for line in source:
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except Exception:
+                continue
+            seq = int(event.get("seq", 0))
+            if seq > 0:
+                latest_seq = seq
+            if seq <= after or (before is not None and seq >= before):
+                continue
+            event = client_safe_event(event)
+            if not is_visible_timeline_event(event, compact=compact):
+                continue
+            visible_count += 1
+            if tail_out is not None:
+                tail_out.append(event)
+            elif len(out) < limit:
+                out.append(event)
     events = list(tail_out) if tail_out is not None else out
     if tail:
         omitted_before = max(0, visible_count - len(events))
@@ -3538,6 +3559,8 @@ def read_visible_events_after_page(
     session_id: str,
     after: int,
     limit: int = 500,
+    *,
+    compact: bool = False,
 ) -> tuple[list[dict[str, Any]], int, int, int, int]:
     """Read a recent append-only delta without rescanning the whole transcript."""
     path = events_path(session_id)
@@ -3566,13 +3589,13 @@ def read_visible_events_after_page(
                 seq = int(event.get("seq", 0))
                 if seq <= after:
                     break
-                if not is_visible_timeline_event(event):
+                if not is_visible_timeline_event(event, compact=compact):
                     continue
                 visible_count += 1
                 selected.appendleft(client_safe_event(event))
     except Exception as exc:
         logger.warning("fast event delta failed session=%s: %s", session_id, exc)
-        return read_visible_events_page(session_id, after=after, limit=limit, tail=False)
+        return read_visible_events_page(session_id, after=after, limit=limit, tail=False, compact=compact)
 
     events = list(selected)
     return events, latest_seq, visible_count, 0, max(0, visible_count - len(events))
@@ -8165,25 +8188,30 @@ async def get_session(
     limit: int = DEFAULT_SESSION_EVENT_LIMIT,
     tail: bool = True,
     visible: bool = False,
+    compact: bool = False,
 ) -> dict[str, Any]:
     sess = STORE.sessions.get(session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="session not found")
     page_tail = tail and after <= 0
-    if visible:
+    if visible or compact:
         if after > 0 and before is None and not page_tail:
-            events, latest_seq, event_count, omitted_before, omitted_after = read_visible_events_after_page(
+            events, latest_seq, event_count, omitted_before, omitted_after = await asyncio.to_thread(
+                read_visible_events_after_page,
                 session_id,
                 after=after,
                 limit=limit,
+                compact=compact,
             )
         else:
-            events, latest_seq, event_count, omitted_before, omitted_after = read_visible_events_page(
+            events, latest_seq, event_count, omitted_before, omitted_after = await asyncio.to_thread(
+                read_visible_events_page,
                 session_id,
                 after=after,
                 before=before,
                 limit=limit,
                 tail=page_tail,
+                compact=compact,
             )
     elif after > 0 and before is None:
         events = read_events(session_id, after=after, before=before, limit=limit, tail=page_tail)

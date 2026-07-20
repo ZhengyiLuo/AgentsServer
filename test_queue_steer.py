@@ -1,10 +1,21 @@
 import asyncio
+import json
+import tempfile
 import unittest
 from collections import deque
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import agent_server
-from agent_server import prepare_steered_turn, run_queued_turn_now, start_next_queued_turn
+from agent_server import (
+    claude_result_error,
+    is_expected_claude_interruption_result,
+    prepare_steered_turn,
+    queued_turn_from_event,
+    rebuild_queued_turns_from_events,
+    run_queued_turn_now,
+    start_next_queued_turn,
+)
 
 
 class PrepareSteeredTurnTests(unittest.TestCase):
@@ -26,8 +37,30 @@ class PrepareSteeredTurnTests(unittest.TestCase):
         self.assertIn("Use the smaller batch instead.", turn["prompt"])
         self.assertEqual(turn["display_prompt"], "Use the smaller batch instead.")
         self.assertEqual(turn["file_ids"], ["original", "shared", "new"])
+        self.assertEqual(turn["display_file_ids"], ["new", "shared"])
         self.assertEqual(turn["steer_interrupted_run_id"], "run-original")
         self.assertTrue(turn["replays_interrupted_message"])
+
+    def test_text_only_steer_replays_but_does_not_claim_the_interrupted_image(self) -> None:
+        turn = prepare_steered_turn(
+            {"queued_id": "queued-steer", "prompt": "Look at the warning instead.", "file_ids": []},
+            {"run_id": "run-original", "prompt": "What is this?", "file_ids": ["original-image"]},
+        )
+
+        self.assertEqual(turn["file_ids"], ["original-image"])
+        self.assertEqual(turn["display_file_ids"], [])
+
+    def test_image_only_messages_remain_distinct_during_steering(self) -> None:
+        turn = prepare_steered_turn(
+            {"queued_id": "queued-steer", "prompt": "", "file_ids": ["new-image"]},
+            {"run_id": "run-original", "prompt": "", "file_ids": ["original-image"]},
+        )
+
+        self.assertIn("[Attachment-only message]", turn["prompt"])
+        self.assertIn("[Attachment-only steering message]", turn["prompt"])
+        self.assertEqual(turn["display_prompt"], "")
+        self.assertEqual(turn["file_ids"], ["original-image", "new-image"])
+        self.assertEqual(turn["display_file_ids"], ["new-image"])
 
     def test_plain_promotion_stays_unchanged_without_an_interrupted_turn(self) -> None:
         selected = {"queued_id": "queued-steer", "prompt": "Run this now.", "file_ids": []}
@@ -88,9 +121,12 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Change course now.", promoted["prompt"])
         self.assertEqual(promoted["display_prompt"], "Change course now.")
         self.assertEqual(promoted["file_ids"], ["original-file", "new-file"])
+        self.assertEqual(promoted["display_file_ids"], ["new-file"])
         event_payload = append_event.await_args.args[2]
         self.assertEqual(event_payload["prompt"], "Change course now.")
         self.assertIn("Finish the original investigation.", event_payload["request_prompt"])
+        self.assertEqual(event_payload["file_ids"], ["original-file", "new-file"])
+        self.assertEqual(event_payload["display_file_ids"], ["new-file"])
         self.assertTrue(event_payload["replays_interrupted_message"])
 
     async def test_no_active_turn_promotes_without_replaying_old_text(self) -> None:
@@ -125,6 +161,7 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
             "prompt": "Continue the original request, but use the smaller batch.",
             "display_prompt": "Use the smaller batch.",
             "file_ids": [],
+            "display_file_ids": [],
             "backend": "codex",
         }
         agent_server.RUN_NOW_TURNS["chat-1"] = promoted
@@ -142,7 +179,73 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         request = start_turn.await_args.args[1]
         self.assertEqual(request.prompt, promoted["prompt"])
         self.assertEqual(request.display_prompt, promoted["display_prompt"])
+        self.assertEqual(start_turn.await_args.kwargs["display_file_ids"], [])
         self.assertNotIn("chat-1", agent_server.RUN_NOW_TURNS)
+
+    def test_recovered_run_now_turn_keeps_provider_and_display_attachments_separate(self) -> None:
+        item = queued_turn_from_event(
+            {
+                "queued_id": "queued-steer",
+                "request_prompt": "Combined provider replay",
+                "prompt": "New steering text",
+                "file_ids": ["old-image", "new-image"],
+                "display_file_ids": ["new-image"],
+            },
+            agent_server.STORE.sessions["chat-1"],
+            1,
+        )
+
+        self.assertEqual(item["file_ids"], ["old-image", "new-image"])
+        self.assertEqual(item["display_file_ids"], ["new-image"])
+
+    def test_recovery_keeps_an_image_only_queued_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            path.write_text(json.dumps({
+                "id": "event-1",
+                "seq": 1,
+                "session_id": "chat-1",
+                "type": "turn_queued",
+                "ts": "2026-07-20T23:00:00Z",
+                "queued_id": "queued-image",
+                "prompt": "",
+                "request_prompt": "",
+                "file_ids": ["image-only"],
+            }) + "\n")
+            with patch.object(agent_server, "events_path", return_value=path):
+                rebuilt = rebuild_queued_turns_from_events()
+
+        self.assertEqual(rebuilt, 1)
+        self.assertEqual(agent_server.QUEUED_TURNS["chat-1"][0]["prompt"], "")
+        self.assertEqual(agent_server.QUEUED_TURNS["chat-1"][0]["file_ids"], ["image-only"])
+
+
+class ClaudeResultDiagnosticTests(unittest.TestCase):
+    def diagnostic_event(self, errors: list[str] | None = None) -> dict[str, object]:
+        return {
+            "type": "result",
+            "subtype": "error_during_execution",
+            "terminal_reason": "aborted_tools",
+            "stop_reason": "tool_use",
+            "errors": errors or ["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],
+        }
+
+    def test_expected_interruption_is_recognized_and_sanitized(self) -> None:
+        event = self.diagnostic_event()
+        self.assertTrue(is_expected_claude_interruption_result(event))
+        self.assertEqual(claude_result_error(event), "Claude stopped before completing the turn.")
+
+    def test_real_error_survives_alongside_internal_diagnostic(self) -> None:
+        event = self.diagnostic_event([
+            "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+            "Provider connection failed",
+        ])
+        self.assertFalse(is_expected_claude_interruption_result(event))
+        self.assertEqual(claude_result_error(event), "Provider connection failed")
+
+    def test_ordinary_claude_error_is_unchanged(self) -> None:
+        event = {"type": "result", "subtype": "error_during_execution", "errors": ["Authentication failed"]}
+        self.assertEqual(claude_result_error(event), "Authentication failed")
 
 
 if __name__ == "__main__":

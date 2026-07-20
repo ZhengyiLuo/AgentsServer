@@ -1703,12 +1703,13 @@ async def enqueue_turn(session_id: str, req: TurnRequest, sess: dict[str, Any]) 
         queue = QUEUED_TURNS.setdefault(session_id, deque())
         queue.append(item)
         position = len(queue)
+    display_prompt = req.display_prompt if req.display_prompt is not None else req.prompt
     queued_event = await append_event(session_id, "turn_queued", {
         "queued_id": queued_id,
         "backend": req.backend or sess.get("backend") or DEFAULT_BACKEND,
         "model": req.model,
         "effort": req.effort,
-        "prompt": req.display_prompt or req.prompt,
+        "prompt": display_prompt,
         "request_prompt": req.prompt,
         "display_prompt": req.display_prompt,
         "file_ids": list(req.file_ids),
@@ -1806,24 +1807,37 @@ def prepare_steered_turn(selected: dict[str, Any], interrupted: dict[str, Any] |
     turn = dict(selected)
     steering_prompt = str(selected.get("prompt") or "").strip()
     interrupted_prompt = str((interrupted or {}).get("prompt") or "").strip()
-    if not steering_prompt or not interrupted_prompt or steering_prompt == interrupted_prompt:
+    selected_file_ids = list(
+        selected.get("display_file_ids")
+        if selected.get("display_file_ids") is not None
+        else selected.get("file_ids") or []
+    )
+    interrupted_file_ids = list((interrupted or {}).get("file_ids") or [])
+    if not (steering_prompt or selected_file_ids) or not (interrupted_prompt or interrupted_file_ids):
+        return turn
+    if steering_prompt == interrupted_prompt and selected_file_ids == interrupted_file_ids:
         return turn
 
     turn["steering_prompt"] = steering_prompt
-    turn["display_prompt"] = str(selected.get("display_prompt") or steering_prompt)
+    turn["display_prompt"] = str(
+        selected.get("display_prompt")
+        if selected.get("display_prompt") is not None
+        else steering_prompt
+    )
     turn["prompt"] = (
         "The previous agent turn was interrupted before completion. Continue that request while "
         "applying the steering instruction below. Treat both messages as user input, and give the "
         "steering instruction priority wherever they conflict.\n\n"
         "[Interrupted message]\n"
-        f"{interrupted_prompt}\n"
+        f"{interrupted_prompt or '[Attachment-only message]'}\n"
         "[End interrupted message]\n\n"
         "[Steering message]\n"
-        f"{steering_prompt}\n"
+        f"{steering_prompt or '[Attachment-only steering message]'}\n"
         "[End steering message]"
     )
+    turn["display_file_ids"] = selected_file_ids
     turn["file_ids"] = merged_file_ids(
-        list((interrupted or {}).get("file_ids") or []),
+        interrupted_file_ids,
         list(selected.get("file_ids") or []),
     )
     turn["steer_interrupted_run_id"] = (interrupted or {}).get("run_id")
@@ -1832,11 +1846,17 @@ def prepare_steered_turn(selected: dict[str, Any], interrupted: dict[str, Any] |
 
 
 def public_queued_turn(session_id: str, item: dict[str, Any], position: int) -> dict[str, Any]:
+    display_file_ids = item.get("display_file_ids")
+    display_prompt = item.get("display_prompt")
     return {
         "queued_id": str(item.get("queued_id") or ""),
         "session_id": session_id,
-        "prompt": str(item.get("display_prompt") or item.get("steering_prompt") or item.get("prompt") or ""),
-        "file_ids": list(item.get("file_ids") or []),
+        "prompt": str(
+            display_prompt
+            if display_prompt is not None
+            else item.get("steering_prompt") or item.get("prompt") or ""
+        ),
+        "file_ids": list(display_file_ids if display_file_ids is not None else item.get("file_ids") or []),
         "backend": item.get("backend"),
         "model": item.get("model"),
         "effort": item.get("effort"),
@@ -1988,6 +2008,11 @@ async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]
             "request_prompt": prepared.get("prompt") or display_prompt,
             "display_prompt": display_prompt,
             "file_ids": list(prepared.get("file_ids") or []),
+            "display_file_ids": list(
+                prepared.get("display_file_ids")
+                if prepared.get("display_file_ids") is not None
+                else selected.get("file_ids") or []
+            ),
             "interrupted_run_id": prepared.get("steer_interrupted_run_id"),
             "replays_interrupted_message": bool(prepared.get("replays_interrupted_message")),
             "message": "Steering message promoted; the interrupted request will be replayed with it.",
@@ -2058,7 +2083,14 @@ async def start_next_queued_turn(session_id: str) -> None:
         steer_interrupted_run_id=item.get("steer_interrupted_run_id"),
     )
     try:
-        await start_turn(session_id, req, queue_if_busy=False, queued_id=str(item["queued_id"]))
+        display_file_ids = item.get("display_file_ids")
+        await start_turn(
+            session_id,
+            req,
+            queue_if_busy=False,
+            queued_id=str(item["queued_id"]),
+            display_file_ids=list(display_file_ids) if display_file_ids is not None else None,
+        )
     except HTTPException as e:
         if e.status_code in (409, 503):
             await requeue_turn_front(session_id, item)
@@ -2107,6 +2139,11 @@ def queued_turn_from_event(event: dict[str, Any], sess: dict[str, Any], position
         "queued_id": str(event.get("queued_id") or ""),
         "prompt": event.get("request_prompt") or event.get("prompt") or "",
         "file_ids": list(event.get("file_ids") or []),
+        "display_file_ids": (
+            list(event.get("display_file_ids") or [])
+            if event.get("display_file_ids") is not None
+            else None
+        ),
         "backend": event.get("backend") or sess.get("backend"),
         "model": event.get("model") if event.get("model") is not None else sess.get("model"),
         "effort": event.get("effort") if event.get("effort") is not None else sess.get("effort"),
@@ -2153,6 +2190,8 @@ def rebuild_queued_turns_from_events() -> int:
                     pending[queued_id]["display_prompt"] = event.get("display_prompt")
                 if event.get("file_ids") is not None:
                     pending[queued_id]["file_ids"] = list(event.get("file_ids") or [])
+                if event.get("display_file_ids") is not None:
+                    pending[queued_id]["display_file_ids"] = list(event.get("display_file_ids") or [])
                 if event.get("interrupted_run_id") is not None:
                     pending[queued_id]["steer_interrupted_run_id"] = event.get("interrupted_run_id")
                 if event.get("replays_interrupted_message") is not None:
@@ -2175,7 +2214,14 @@ def rebuild_queued_turns_from_events() -> int:
                 pending.pop(queued_id, None)
                 if queued_id in order:
                     order.remove(queued_id)
-        items = [pending[qid] for qid in order if qid in pending and str(pending[qid].get("prompt") or "").strip()]
+        items = [
+            pending[qid]
+            for qid in order
+            if qid in pending and (
+                str(pending[qid].get("prompt") or "").strip()
+                or bool(pending[qid].get("file_ids"))
+            )
+        ]
         if items:
             QUEUED_TURNS[session_id] = deque(items)
             rebuilt += len(items)
@@ -6605,10 +6651,34 @@ def claude_result_error(event: dict[str, Any]) -> str | None:
     errors = event.get("errors")
     if event.get("subtype") == "error_during_execution" or errors:
         if isinstance(errors, list) and errors:
-            return "; ".join(str(item) for item in errors if item)
+            visible_errors = [
+                str(item).strip()
+                for item in errors
+                if str(item or "").strip() and not is_claude_internal_diagnostic(item)
+            ]
+            if visible_errors:
+                return "; ".join(visible_errors)
+            return "Claude stopped before completing the turn."
         result = event.get("result")
         return str(result or "Claude execution failed")
     return None
+
+
+def is_claude_internal_diagnostic(value: Any) -> bool:
+    return str(value or "").strip().startswith("[ede_diagnostic]")
+
+
+def is_expected_claude_interruption_result(event: dict[str, Any]) -> bool:
+    errors = event.get("errors")
+    return (
+        event.get("type") == "result"
+        and event.get("subtype") == "error_during_execution"
+        and str(event.get("terminal_reason") or "") == "aborted_tools"
+        and str(event.get("stop_reason") or "") in {"tool_use", "interrupted"}
+        and isinstance(errors, list)
+        and bool(errors)
+        and all(is_claude_internal_diagnostic(item) for item in errors)
+    )
 
 
 def concise_error_message(value: Any) -> str:
@@ -7186,6 +7256,8 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
                             "is_error": block.get("is_error") is True,
                         })
             elif etype == "result":
+                if run_id in STOPPED_RUNS and is_expected_claude_interruption_result(event):
+                    continue
                 result_error = claude_result_error(event)
                 if result_error:
                     provider_id = None
@@ -7676,6 +7748,7 @@ async def start_turn(
     *,
     queue_if_busy: bool = True,
     queued_id: str | None = None,
+    display_file_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     sess = STORE.sessions.get(session_id)
     if not sess:
@@ -7766,11 +7839,12 @@ async def start_turn(
                 "message": "Applied memory fork context to this first Codex turn.",
             })
 
+        display_prompt = req.display_prompt if req.display_prompt is not None else req.prompt
         started_payload = {
             "run_id": run_id,
             "backend": backend,
-            "prompt": req.display_prompt or req.prompt,
-            "file_ids": req.file_ids,
+            "prompt": display_prompt,
+            "file_ids": display_file_ids if display_file_ids is not None else req.file_ids,
         }
         if queued_id:
             started_payload["queued_id"] = queued_id

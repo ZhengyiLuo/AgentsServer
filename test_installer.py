@@ -37,6 +37,7 @@ class InstallerContractTests(unittest.TestCase):
 
     def test_direct_deploy_includes_scheduler_runtime(self):
         source = DEPLOYER.read_text()
+        self.assertIn('"$SCRIPT_DIR/codex_app_server.py"', source)
         self.assertIn('"$SCRIPT_DIR/agentsdock_jobs.py"', source)
         self.assertIn("import croniter, cryptography, dateutil, tzdata", source)
         self.assertIn("python-dateutil>=2.9,<3", source)
@@ -51,6 +52,7 @@ class InstallerContractTests(unittest.TestCase):
         self.assertIn("AGENTSDOCK_AGENT_TOKEN", source)
         self.assertNotIn("AGENTS_SERVER_ADMIN_TOKEN", source)
         self.assertIn('RELEASES_ROOT="$INSTALL_ROOT/releases"', source)
+        self.assertIn("codex_app_server.py", source)
         self.assertIn('PREVIOUS_LINK="$INSTALL_ROOT/previous"', source)
         self.assertIn('REPLACED_DIR="$RELEASES_ROOT/$RELEASE_VERSION-replaced-', source)
         self.assertLess(source.index('OLD_TARGET=""'), source.index('mv "$STAGE_DIR" "$RELEASE_DIR"'))

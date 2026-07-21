@@ -26,12 +26,15 @@ jobs:
         run: |
           test "v$(cat VERSION)" = "$RELEASE_TAG"
           test "${RELEASE_TAG#v}" != "$RELEASE_TAG"
+          [[ "${RELEASE_TAG#v}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
       - name: Lock and test
         run: |
           uv lock --check
           uv run python -m unittest discover -p 'test_*.py'
       - name: Build release assets
-        run: uv run python scripts/package_release.py
+        run: |
+          rm -rf dist
+          uv run python scripts/package_release.py
       - name: Sign release manifest
         env:
           RELEASE_KEY_B64: ${{ secrets.AGENTS_SERVER_RELEASE_PRIVATE_KEY_B64 }}
@@ -48,6 +51,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          gh release create "$RELEASE_TAG" dist/* \
+          release_args=()
+          if [[ "${RELEASE_TAG#v}" == *-* ]]; then
+            release_args+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" dist/* "${release_args[@]}" \
             --title "AgentsServer $RELEASE_TAG" \
             --generate-notes

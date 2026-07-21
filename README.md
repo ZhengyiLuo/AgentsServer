@@ -30,6 +30,10 @@ machine paths.
 ## What It Gives AgentsDock
 
 - Creates and resumes chat sessions for Claude and Codex CLI backends.
+- Lets each Codex chat select `auto`, native app-server, or per-turn `exec`
+  transport without changing its canonical AgentsDock session. Native turns
+  support live steering and interruption; automatic mode safely falls back to
+  `exec` only before app-server accepts a turn.
 - Streams live agent events over WebSocket while preserving a JSONL event
   history on disk.
 - Accepts file uploads and serves generated artifacts, including videos.
@@ -123,6 +127,14 @@ from this repository's GitHub Releases page, verifies an Ed25519-signed
 manifest and the archive SHA-256, installs into a versioned directory, restarts
 the user service, and accepts the release only after authenticated health
 passes. The previous healthy release remains available for automatic rollback.
+
+Managed updates have two signed tracks. `stable` is the default and never
+selects a prerelease. `beta` selects the newest SemVer release across stable and
+prerelease tags, so beta installations naturally move to the final stable build
+when it becomes newer. Track changes never downgrade or reinstall an older
+version. Prerelease manifests, signatures, and archives are downloaded from
+their immutable version-tagged release URLs rather than GitHub's mutable
+`latest` asset alias.
 
 ## Manual Onboarding
 
@@ -296,6 +308,25 @@ POST /api/admin/update/check
 POST /api/admin/update/start
 ```
 
+`GET` returns the persisted `track` plus current/latest version and prerelease
+metadata. Existing installations default to `stable`. To switch tracks and
+check, send:
+
+```json
+{"track":"beta"}
+```
+
+Then start the exact checked release with both values so the server can
+re-resolve and verify it before launching the detached updater:
+
+```json
+{"track":"beta","version":"0.1.12-beta.1"}
+```
+
+The check and start request bodies remain optional for older clients; omitted
+tracks reuse the persisted selection. New clients should always send their
+explicit selection.
+
 The update runs in a detached tmux session so restarting AgentsServer cannot
 terminate its own installer. Progress is written to
 `~/.agentsdock/admin/server-update.json`, and installer output is kept in
@@ -412,6 +443,12 @@ The backend selection in AgentsDock only chooses which CLI the server invokes.
 The model, effort, authentication, provider-side session storage, and available
 commands still come from the installed CLI tools and their local configuration.
 
+API contract v10 adds the per-session `codex_transport` field. It accepts
+`auto`, `app_server`, or `exec` on session creation/update and on individual
+turn requests. Switching it affects future turns only; both transports resume
+the same native Codex thread ID. `GET /api/health` advertises availability in
+`capabilities.codex_transports`.
+
 Recommended checks before connecting clients:
 
 ```bash
@@ -430,7 +467,7 @@ environment, and any provider-specific auth/config files.
 
 ### Runtime diagnostics
 
-API contract v9 exposes privacy-safe runtime status in two places:
+API contract v10 exposes privacy-safe runtime status in two places:
 
 ```text
 GET /api/health
@@ -566,6 +603,10 @@ Large clients should page history instead of loading every event at once.
 The subagents endpoint folds Claude local-agent lifecycle records into bounded
 `subagent_state` snapshots without returning provider prompts, raw events,
 tool-result output, commands, or output-file paths.
+
+The update check body accepts `{"track":"stable"}` or `{"track":"beta"}`.
+Stable excludes prereleases; beta follows the newest signed SemVer across both
+stable and prerelease releases. Managed updates reject downgrades.
 
 ## Repository Hygiene
 

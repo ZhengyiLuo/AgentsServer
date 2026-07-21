@@ -12,6 +12,7 @@ HEALTH_ATTEMPTS="${AGENTSDOCK_HEALTH_ATTEMPTS:-${ZENITHDOCK_HEALTH_ATTEMPTS:-45}
 HEALTH_TOKEN="${AGENTSDOCK_AGENT_TOKEN:-${ZENITHDOCK_AGENT_TOKEN:-}}"
 RUNTIME_FILES=(
   "$SCRIPT_DIR/agent_server.py"
+  "$SCRIPT_DIR/codex_app_server.py"
   "$SCRIPT_DIR/agentsdock_jobs.py"
   "$SCRIPT_DIR/update_runner.py"
   "$SCRIPT_DIR/release-public-key.pem"
@@ -51,7 +52,7 @@ ssh "$REMOTE_HOST" "
 "
 
 echo "Compiling server on $REMOTE_HOST"
-ssh "$REMOTE_HOST" "chmod 755 '$REMOTE_SERVER_DIR/agentsdock_jobs.py' && '$REMOTE_PYTHON' -m py_compile '$REMOTE_SERVER_PATH' '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/update_runner.py'"
+ssh "$REMOTE_HOST" "chmod 755 '$REMOTE_SERVER_DIR/agentsdock_jobs.py' && '$REMOTE_PYTHON' -m py_compile '$REMOTE_SERVER_PATH' '$REMOTE_SERVER_DIR/codex_app_server.py' '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/update_runner.py'"
 
 echo "Restarting $SERVICE_NAME"
 ssh "$REMOTE_HOST" "systemctl --user restart '$SERVICE_NAME'"

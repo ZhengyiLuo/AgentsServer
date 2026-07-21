@@ -38,7 +38,7 @@ from collections import OrderedDict, deque
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import unquote, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -53,7 +53,19 @@ import uvicorn
 import websockets
 
 from update_runner import atomic_json as atomic_update_json
-from update_runner import ReleaseUnavailableError, check_release, utc_now as update_utc_now
+from update_runner import (
+    ReleaseUnavailableError,
+    check_release,
+    utc_now as update_utc_now,
+    version_is_prerelease,
+    version_key,
+)
+from codex_app_server import (
+    CodexAppServerClient,
+    CodexAppServerDisconnected,
+    CodexAppServerError,
+    CodexAppServerRequestError,
+)
 
 try:
     import tomllib
@@ -65,6 +77,14 @@ logger = logging.getLogger("agents-server")
 BACKEND_CLAUDE = "claude"
 BACKEND_CODEX = "codex"
 VALID_BACKENDS = {BACKEND_CLAUDE, BACKEND_CODEX}
+CODEX_TRANSPORT_AUTO = "auto"
+CODEX_TRANSPORT_APP_SERVER = "app_server"
+CODEX_TRANSPORT_EXEC = "exec"
+VALID_CODEX_TRANSPORTS = {
+    CODEX_TRANSPORT_AUTO,
+    CODEX_TRANSPORT_APP_SERVER,
+    CODEX_TRANSPORT_EXEC,
+}
 CODEX_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 CODEX_EFFORT_ALIASES = {
     "extra high": "xhigh",
@@ -208,7 +228,7 @@ AGENT_TOKEN = env_setting(
 ) or ""
 SERVER_BIND_ADDRESS = agentsdock_setting("AGENT_BIND", "0.0.0.0")
 SERVER_PORT = int(agentsdock_setting("AGENT_PORT", "7850"))
-API_CONTRACT_VERSION = 9
+API_CONTRACT_VERSION = 10
 SESSION_ORDER_STEP = 1000.0
 CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS = int(agentsdock_setting("CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS", "120"))
 SUBAGENT_SNAPSHOT_STATE_LIMIT = 256
@@ -1203,6 +1223,7 @@ class CreateSessionRequest(BaseModel):
     session_id: str | None = None
     claude_session_id: str | None = None
     codex_thread_id: str | None = None
+    codex_transport: str | None = None
     import_history: bool | None = None
 
 
@@ -1213,6 +1234,7 @@ class UpdateSessionRequest(BaseModel):
     backend: str | None = None
     model: str | None = None
     effort: str | None = None
+    codex_transport: str | None = None
     system_prompt: str | None = Field(default=None, max_length=MAX_SESSION_SYSTEM_PROMPT_CHARS)
     pinned: bool | None = None
     archived: bool | None = None
@@ -1234,6 +1256,7 @@ class TurnRequest(BaseModel):
     backend: str | None = None
     model: str | None = None
     effort: str | None = None
+    codex_transport: str | None = None
     display_prompt: str | None = None
     purpose: str | None = None
     job_id: str | None = None
@@ -1336,6 +1359,16 @@ def normalize_runtime_effort(backend: str, effort: Any, *, strict: bool = False)
     return None
 
 
+def normalize_codex_transport(value: Any, *, strict: bool = False) -> str:
+    clean = str(value or CODEX_TRANSPORT_AUTO).strip().lower().replace("-", "_")
+    if clean in VALID_CODEX_TRANSPORTS:
+        return clean
+    if strict:
+        supported = ", ".join(sorted(VALID_CODEX_TRANSPORTS))
+        raise HTTPException(status_code=400, detail=f"codex_transport must be one of: {supported}")
+    return CODEX_TRANSPORT_AUTO
+
+
 def clean_session_system_prompt(value: Any) -> str | None:
     clean = str(value or "").strip()
     if not clean:
@@ -1363,8 +1396,16 @@ class UpdateJobRequest(BaseModel):
     backend: str | None = None
 
 
+ServerUpdateTrack = Literal["stable", "beta"]
+
+
+class ServerUpdateCheckRequest(BaseModel):
+    track: ServerUpdateTrack | None = None
+
+
 class ServerUpdateRequest(BaseModel):
     version: str | None = None
+    track: ServerUpdateTrack | None = None
 
 
 def session_folder(sess: dict[str, Any]) -> str:
@@ -1431,6 +1472,11 @@ class SessionStore:
             if normalized_effort != previous_effort:
                 sess["effort"] = normalized_effort
                 runtime_changed = True
+            previous_transport = sess.get("codex_transport")
+            normalized_transport = normalize_codex_transport(previous_transport)
+            if normalized_transport != previous_transport:
+                sess["codex_transport"] = normalized_transport
+                runtime_changed = True
         await self.ensure_sort_orders()
         if runtime_changed:
             await self.save()
@@ -1490,6 +1536,7 @@ class SessionStore:
             "session_id": active_provider_id,
             "claude_session_id": claude_session_id,
             "codex_thread_id": codex_thread_id,
+            "codex_transport": normalize_codex_transport(req.codex_transport, strict=True),
             "parent_id": parent_id,
             "fork_from": None,
             "pinned": pinned,
@@ -1537,6 +1584,8 @@ class SessionStore:
                     sess[key] = patch[key]
             if "system_prompt" in patch:
                 sess["system_prompt"] = clean_session_system_prompt(patch["system_prompt"])
+            if "codex_transport" in patch and patch["codex_transport"] is not None:
+                sess["codex_transport"] = normalize_codex_transport(patch["codex_transport"], strict=True)
             for key in ("model", "effort"):
                 if key in patch:
                     value = patch[key]
@@ -2360,6 +2409,9 @@ async def enqueue_turn(session_id: str, req: TurnRequest, sess: dict[str, Any]) 
         "backend": req.backend,
         "model": req.model,
         "effort": req.effort,
+        "codex_transport": normalize_codex_transport(
+            req.codex_transport if req.codex_transport is not None else sess.get("codex_transport")
+        ),
         "display_prompt": req.display_prompt,
         "purpose": req.purpose,
         "digest_job_id": req.digest_job_id,
@@ -2378,6 +2430,9 @@ async def enqueue_turn(session_id: str, req: TurnRequest, sess: dict[str, Any]) 
         "backend": req.backend or sess.get("backend") or DEFAULT_BACKEND,
         "model": req.model,
         "effort": req.effort,
+        "codex_transport": normalize_codex_transport(
+            req.codex_transport if req.codex_transport is not None else sess.get("codex_transport")
+        ),
         "prompt": display_prompt,
         "request_prompt": req.prompt,
         "display_prompt": req.display_prompt,
@@ -2485,6 +2540,16 @@ def file_attachment_prompt_lines(file_ids: list[str] | tuple[str, ...]) -> list[
     return lines
 
 
+def prompt_with_file_attachments(prompt: str, file_ids: list[str] | tuple[str, ...]) -> str:
+    value = str(prompt or "")
+    attachment_lines = file_attachment_prompt_lines(file_ids)
+    if attachment_lines:
+        value += "\n\n[Attached files]\n"
+        value += "\n".join(attachment_lines) + "\n"
+        value += "Use these local paths directly when needed.\n"
+    return value
+
+
 def prepare_steered_turn(selected: dict[str, Any], interrupted: dict[str, Any] | None) -> dict[str, Any]:
     """Build the provider request for a real steer without changing its UI prompt."""
     turn = dict(selected)
@@ -2550,6 +2615,7 @@ def public_queued_turn(session_id: str, item: dict[str, Any], position: int) -> 
         "backend": item.get("backend"),
         "model": item.get("model"),
         "effort": item.get("effort"),
+        "codex_transport": item.get("codex_transport"),
         "display_prompt": item.get("display_prompt"),
         "purpose": item.get("purpose"),
         "digest_job_id": item.get("digest_job_id"),
@@ -2651,9 +2717,13 @@ async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]
         raise HTTPException(status_code=404, detail="session not found")
 
     async with ACTIVE_LOCK:
+        active_turn = dict(ACTIVE.get(session_id) or {})
         interrupted_turn = dict(CURRENT_TURNS.get(session_id) or {})
 
     selected: dict[str, Any] | None = None
+    selected_index: int | None = None
+    native_steer = False
+    native_turn = active_turn.get("codex_app_server_turn")
     remaining: int
     async with QUEUE_LOCK:
         if session_id in STEERING_SESSIONS or RUN_NOW_TURNS.get(session_id) is not None:
@@ -2667,6 +2737,18 @@ async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]
             )
             if selected_index is not None:
                 selected = items[selected_index]
+                selected_backend = selected.get("backend") or STORE.sessions[session_id].get("backend") or DEFAULT_BACKEND
+                selected_transport = normalize_codex_transport(
+                    selected.get("codex_transport")
+                    if selected.get("codex_transport") is not None
+                    else STORE.sessions[session_id].get("codex_transport")
+                )
+                native_steer = bool(
+                    active_turn.get("transport") == CODEX_TRANSPORT_APP_SERVER
+                    and native_turn is not None
+                    and selected_backend == BACKEND_CODEX
+                    and selected_transport != CODEX_TRANSPORT_EXEC
+                )
                 kept = deque(
                     item
                     for idx, item in enumerate(items)
@@ -2683,11 +2765,72 @@ async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]
         else:
             remaining = 0
         if selected is not None:
-            RUN_NOW_TURNS[session_id] = selected
             STEERING_SESSIONS.add(session_id)
+            if not native_steer:
+                RUN_NOW_TURNS[session_id] = selected
 
     if selected is None:
         raise HTTPException(status_code=404, detail="queued turn not found")
+
+    if native_steer:
+        steer_accepted = False
+        try:
+            request_prompt = prompt_with_file_attachments(
+                str(selected.get("prompt") or ""),
+                list(selected.get("file_ids") or []),
+            )
+            await native_turn.steer([
+                {"type": "text", "text": request_prompt, "text_elements": []},
+            ])
+            steer_accepted = True
+            display_prompt = str(
+                selected.get("display_prompt")
+                if selected.get("display_prompt") is not None
+                else selected.get("prompt") or ""
+            )
+            display_file_ids = list(
+                selected.get("display_file_ids")
+                if selected.get("display_file_ids") is not None
+                else selected.get("file_ids") or []
+            )
+            await append_event(session_id, "turn_queue_run_now", {
+                "queued_id": queued_id,
+                "backend": BACKEND_CODEX,
+                "codex_transport": CODEX_TRANSPORT_APP_SERVER,
+                "prompt": display_prompt,
+                "request_prompt": str(selected.get("prompt") or ""),
+                "display_prompt": display_prompt,
+                "file_ids": list(selected.get("file_ids") or []),
+                "display_file_ids": display_file_ids,
+                "interrupted_run_id": active_turn.get("run_id"),
+                "replays_interrupted_message": False,
+                "native_steer": True,
+                "message": "Steering message sent to the active Codex app-server turn.",
+                "remaining": remaining,
+                "superseded_queued_ids": [],
+            })
+            return {
+                "ok": True,
+                "queued_id": queued_id,
+                "interrupted": False,
+                "native_steer": True,
+                "replays_interrupted_message": False,
+                "superseded_queued_ids": [],
+            }
+        except Exception:
+            if not steer_accepted and selected_index is not None:
+                async with QUEUE_LOCK:
+                    items = list(QUEUED_TURNS.get(session_id) or [])
+                    items.insert(min(selected_index, len(items)), selected)
+                    QUEUED_TURNS[session_id] = deque(items)
+            raise
+        finally:
+            async with QUEUE_LOCK:
+                STEERING_SESSIONS.discard(session_id)
+            async with ACTIVE_LOCK:
+                still_busy = session_id in BUSY_SESSIONS
+            if not still_busy:
+                schedule_next_queued_turn(session_id)
 
     try:
         stop_result = await stop_turn(session_id, emit_event=False, schedule_queue=False)
@@ -2774,6 +2917,7 @@ async def start_next_queued_turn(session_id: str) -> None:
         backend=item.get("backend"),
         model=item.get("model"),
         effort=item.get("effort"),
+        codex_transport=item.get("codex_transport"),
         display_prompt=item.get("display_prompt"),
         purpose=item.get("purpose"),
         digest_job_id=item.get("digest_job_id"),
@@ -2854,6 +2998,9 @@ def queued_turn_from_event(event: dict[str, Any], sess: dict[str, Any], position
         "backend": event.get("backend") or sess.get("backend"),
         "model": event.get("model") if event.get("model") is not None else sess.get("model"),
         "effort": event.get("effort") if event.get("effort") is not None else sess.get("effort"),
+        "codex_transport": normalize_codex_transport(
+            event.get("codex_transport") if event.get("codex_transport") is not None else sess.get("codex_transport")
+        ),
         "display_prompt": event.get("display_prompt"),
         "purpose": event.get("purpose"),
         "digest_job_id": event.get("digest_job_id"),
@@ -2909,7 +3056,11 @@ def rebuild_queued_turns_from_events() -> int:
                     pending[queued_id]["steer_interrupted_run_id"] = event.get("interrupted_run_id")
                 if event.get("replays_interrupted_message") is not None:
                     pending[queued_id]["replays_interrupted_message"] = bool(event.get("replays_interrupted_message"))
-                if event_type == "turn_queue_run_now" and queued_id in order:
+                if event_type == "turn_queue_run_now" and event.get("native_steer"):
+                    pending.pop(queued_id, None)
+                    if queued_id in order:
+                        order.remove(queued_id)
+                elif event_type == "turn_queue_run_now" and queued_id in order:
                     order.remove(queued_id)
                     order.insert(0, queued_id)
             elif event_type == "turn_queue_reordered":
@@ -4200,7 +4351,7 @@ async def clear_active_process(session_id: str) -> None:
 def active_snapshot_input(active: dict[str, Any]) -> dict[str, Any]:
     snapshot_input = {
         key: value for key, value in active.items()
-        if key not in {"proc", "stdout_tail"}
+        if key not in {"proc", "stdout_tail", "codex_app_server_client", "codex_app_server_turn"}
     }
     snapshot_input["proc"] = active.get("proc")
     snapshot_input["stdout_lines"] = list(active.get("stdout_tail") or [])
@@ -7016,7 +7167,7 @@ def public_session(sess: dict[str, Any]) -> dict[str, Any]:
     return {
         k: sess.get(k)
         for k in (
-            "id", "title", "folder", "cwd", "backend", "model", "effort", "system_prompt",
+            "id", "title", "folder", "cwd", "backend", "model", "effort", "codex_transport", "system_prompt",
             "session_id", "claude_session_id", "codex_thread_id",
             "parent_id", "fork_from", "memory_forked", "memory_seed_used",
             "pinned", "pinned_at", "archived", "archived_at", "sort_order", "created_at", "updated_at",
@@ -7808,15 +7959,19 @@ def build_claude_cmd(session_id: str, sess: dict[str, Any], manifest_path: Path,
     return cmd
 
 
+def build_codex_prompt(session_id: str, sess: dict[str, Any], prompt: str, manifest_path: Path) -> str:
+    return CODEX_PROMPT_PRELUDE.format(
+        manifest_path=str(manifest_path),
+        terminal_session=terminal_session_name(session_id),
+    ) + scheduled_jobs_prompt_context(session_id) + session_prompt_addendum(sess) + prompt
+
+
 def build_codex_cmd(session_id: str, sess: dict[str, Any], prompt: str, manifest_path: Path) -> list[str]:
     provider_id = sess.get("codex_thread_id") or (
         sess.get("session_id") if sess.get("backend") == BACKEND_CODEX else None
     )
     configured_model, configured_effort, configured_service_tier = codex_user_config_defaults()
-    full_prompt = CODEX_PROMPT_PRELUDE.format(
-        manifest_path=str(manifest_path),
-        terminal_session=terminal_session_name(session_id),
-    ) + scheduled_jobs_prompt_context(session_id) + session_prompt_addendum(sess) + prompt
+    full_prompt = build_codex_prompt(session_id, sess, prompt, manifest_path)
     model = str(sess.get("model") or configured_model or CODEX_DEFAULT_MODEL).strip()
     normalized_effort = normalize_runtime_effort(
         BACKEND_CODEX,
@@ -8944,6 +9099,428 @@ async def run_codex(
         schedule_next_queued_turn(session_id)
 
 
+def codex_app_server_tool(item: dict[str, Any]) -> dict[str, Any] | None:
+    item_type = str(item.get("type") or "")
+    item_id = str(item.get("id") or f"tool_{uuid.uuid4().hex[:8]}")
+    if item_type == "commandExecution":
+        tool_input: dict[str, Any] = {"command": str(item.get("command") or "")}
+        if item.get("cwd"):
+            tool_input["workdir"] = item.get("cwd")
+        return {"id": item_id, "name": "Bash", "input": tool_input}
+    if item_type == "fileChange":
+        return {"id": item_id, "name": "apply_patch", "input": {"changes": item.get("changes") or []}}
+    if item_type == "mcpToolCall":
+        server = str(item.get("server") or "mcp")
+        name = str(item.get("tool") or "tool")
+        return {"id": item_id, "name": f"{server}/{name}", "input": item.get("arguments") or {}}
+    if item_type == "dynamicToolCall":
+        namespace = str(item.get("namespace") or "dynamic")
+        name = str(item.get("tool") or "tool")
+        return {"id": item_id, "name": f"{namespace}/{name}", "input": item.get("arguments") or {}}
+    if item_type == "collabAgentToolCall":
+        return {
+            "id": item_id,
+            "name": "Agent",
+            "input": {
+                "description": str(item.get("tool") or "Codex subagent"),
+                "model": item.get("model"),
+                "reasoning_effort": item.get("reasoningEffort"),
+            },
+        }
+    if item_type == "webSearch":
+        return {"id": item_id, "name": "WebSearch", "input": {"query": item.get("query") or ""}}
+    if item_type == "imageView":
+        return {"id": item_id, "name": "ViewImage", "input": {"path": item.get("path") or ""}}
+    if item_type == "imageGeneration":
+        return {"id": item_id, "name": "ImageGeneration", "input": {}}
+    return None
+
+
+def codex_app_server_tool_output(item: dict[str, Any], delta_text: str = "") -> tuple[Any, int | None, bool]:
+    item_type = str(item.get("type") or "")
+    status = str(item.get("status") or "").lower()
+    is_error = status in {"failed", "declined", "cancelled", "canceled", "errored"}
+    if item_type == "commandExecution":
+        output = item.get("aggregatedOutput") or delta_text
+        exit_code = item.get("exitCode")
+        return output, int(exit_code) if isinstance(exit_code, int) else None, is_error
+    if item_type == "fileChange":
+        return item.get("changes") or delta_text, None, is_error
+    if item_type in {"mcpToolCall", "dynamicToolCall"}:
+        output = item.get("result") or item.get("contentItems") or item.get("error") or delta_text
+        return output, None, is_error or bool(item.get("error")) or item.get("success") is False
+    if item_type == "collabAgentToolCall":
+        return item.get("agentsStates") or status or delta_text, None, is_error
+    if item_type == "webSearch":
+        return item.get("action") or item.get("query") or delta_text, None, is_error
+    if item_type == "imageView":
+        return item.get("path") or delta_text, None, is_error
+    if item_type == "imageGeneration":
+        return item.get("result") or item.get("savedPath") or delta_text, None, is_error
+    return delta_text, None, is_error
+
+
+def codex_app_server_changed_paths(item: dict[str, Any]) -> set[str]:
+    paths: set[str] = set()
+    if str(item.get("type") or "") != "fileChange":
+        return paths
+    for change in item.get("changes") or []:
+        if isinstance(change, dict):
+            path = str(change.get("path") or change.get("filePath") or "").strip()
+            if path:
+                paths.add(path)
+    return paths
+
+
+async def run_codex_app_server(
+    session_id: str,
+    run_id: str,
+    prompt: str,
+    sess: dict[str, Any],
+    manifest_path: Path,
+    *,
+    allow_exec_fallback: bool,
+) -> None:
+    requested_cwd = str(sess.get("cwd") or DEFAULT_CWD)
+    cwd = existing_cwd(requested_cwd)
+    diff_baseline = await capture_git_baseline(session_id, run_id, cwd)
+    if str(Path(requested_cwd).expanduser()) != cwd:
+        await append_event(session_id, "cwd_fallback", {
+            "run_id": run_id,
+            "requested_cwd": requested_cwd,
+            "cwd": cwd,
+        })
+
+    env = agent_runner_env(session_id)
+    codex_dir = os.path.dirname(os.path.abspath(CODEX_BIN))
+    if codex_dir and codex_dir not in env.get("PATH", "").split(os.pathsep):
+        env["PATH"] = codex_dir + os.pathsep + env.get("PATH", "")
+    client = CodexAppServerClient(
+        CODEX_BIN,
+        cwd=cwd,
+        env_factory=lambda: dict(env),
+        request_timeout=CODEX_APP_SERVER_TIMEOUT_SECONDS,
+        process_stream_limit=PROCESS_STREAM_LIMIT,
+    )
+    await append_event(session_id, "process_started", {
+        "run_id": run_id,
+        "backend": BACKEND_CODEX,
+        "transport": CODEX_TRANSPORT_APP_SERVER,
+        "argv": [CODEX_BIN, "app-server", "--listen", "stdio://"],
+        "cwd": cwd,
+    })
+
+    provider_id = str(sess.get("codex_thread_id") or (
+        sess.get("session_id") if sess.get("backend") == BACKEND_CODEX else ""
+    ) or "")
+    turn = None
+    turn_start_attempted = False
+    stopped = False
+    terminal_status = "failed"
+    terminal_error: str | None = None
+    text_parts: list[str] = []
+    seen_text: set[str] = set()
+    seen_reasoning: set[str] = set()
+    assistant_deltas: dict[str, str] = {}
+    reasoning_deltas: dict[str, str] = {}
+    tool_output_deltas: dict[str, str] = {}
+    tool_calls: dict[str, dict[str, Any]] = {}
+    started_tools: set[str] = set()
+    finished_tools: set[str] = set()
+    changed_paths: set[str] = set()
+    seen_artifacts: set[str] = set()
+    manifest_watch_task: asyncio.Task[None] | None = None
+
+    async def emit_text(value: Any) -> None:
+        text = clean_assistant_text(str(value or ""))
+        if not text or text in seen_text:
+            return
+        seen_text.add(text)
+        text_parts.append(text)
+        await append_event(session_id, "assistant_text", {
+            "run_id": run_id,
+            "text": text,
+            **run_event_metadata(run_id),
+        })
+
+    async def emit_reasoning(value: Any) -> None:
+        text = str(value or "").strip()
+        if not text or text in seen_reasoning:
+            return
+        seen_reasoning.add(text)
+        await append_event(session_id, "reasoning_summary", {"run_id": run_id, "text": text})
+
+    async def emit_tool_started(tool: dict[str, Any]) -> None:
+        tool_id = str(tool.get("id") or "")
+        if not tool_id or tool_id in started_tools:
+            return
+        started_tools.add(tool_id)
+        tool_calls[tool_id] = tool
+        await append_event(session_id, "tool_started", {"run_id": run_id, "tool": tool})
+
+    async def emit_tool_finished(item: dict[str, Any]) -> None:
+        tool = codex_app_server_tool(item)
+        if not tool:
+            return
+        tool_id = str(tool["id"])
+        if tool_id in finished_tools:
+            return
+        await emit_tool_started(tool)
+        finished_tools.add(tool_id)
+        output, exit_code, is_error = codex_app_server_tool_output(
+            item,
+            tool_output_deltas.get(tool_id, ""),
+        )
+        await append_event(session_id, "tool_finished", {
+            "run_id": run_id,
+            "tool_id": tool_id,
+            "tool": tool_calls.get(tool_id) or tool,
+            "output": codex_output_text(output),
+            "exit_code": exit_code,
+            "is_error": is_error,
+        })
+
+    try:
+        await client.start()
+        proc = getattr(client, "process", None) or getattr(client, "_proc", None)
+        async with ACTIVE_LOCK:
+            stop_requested = session_id in STOP_REQUESTS
+            if stop_requested:
+                STOP_REQUESTS.discard(session_id)
+                STOPPED_RUNS.add(run_id)
+            ACTIVE[session_id] = {
+                "proc": proc,
+                "run_id": run_id,
+                "backend": BACKEND_CODEX,
+                "transport": CODEX_TRANSPORT_APP_SERVER,
+                "pid": proc.pid if proc else None,
+                "pgid": process_group_for_pid(proc.pid) if proc and proc.pid else None,
+                "cwd": cwd,
+                "argv": [CODEX_BIN, "app-server", "--listen", "stdio://"],
+                "started_at": time.time(),
+                "started_at_iso": now_iso(),
+                "stop_requested": stop_requested,
+                "stdout_tail": deque(maxlen=LIVE_STDOUT_MAX_LINES),
+                "stdout_total_lines": 0,
+                "stdout_updated_at": None,
+                "codex_app_server_client": client,
+                "codex_app_server_turn": None,
+            }
+        if stop_requested:
+            stopped = True
+            terminal_status = "interrupted"
+            raise CodexAppServerError("turn stopped before Codex app-server accepted it")
+
+        configured_model, configured_effort, configured_service_tier = codex_user_config_defaults()
+        model = str(sess.get("model") or configured_model or CODEX_DEFAULT_MODEL).strip()
+        effort = normalize_runtime_effort(
+            BACKEND_CODEX,
+            sess.get("effort") or configured_effort or CODEX_DEFAULT_EFFORT,
+        )
+        service_tier = configured_service_tier or codex_default_service_tier(model)
+        thread_params: dict[str, Any] = {
+            "cwd": cwd,
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+        }
+        if model:
+            thread_params["model"] = model
+        if service_tier:
+            thread_params["serviceTier"] = service_tier
+        provider_id = await client.start_or_resume_thread(provider_id or None, thread_params)
+        await STORE.save_provider_session(session_id, provider_id, BACKEND_CODEX)
+        await append_event(session_id, "provider_session", {
+            "run_id": run_id,
+            "backend": BACKEND_CODEX,
+            "provider_session_id": provider_id,
+            "transport": CODEX_TRANSPORT_APP_SERVER,
+        })
+
+        overrides: dict[str, Any] = {
+            "cwd": cwd,
+            "approvalPolicy": "never",
+            "summary": "detailed",
+        }
+        if model:
+            overrides["model"] = model
+        if effort:
+            overrides["effort"] = effort
+        if service_tier:
+            overrides["serviceTier"] = service_tier
+        turn_start_attempted = True
+        turn = await client.start_turn(
+            provider_id,
+            [{"type": "text", "text": build_codex_prompt(session_id, sess, prompt, manifest_path), "text_elements": []}],
+            overrides=overrides,
+        )
+        async with ACTIVE_LOCK:
+            active = ACTIVE.get(session_id)
+            if active and active.get("run_id") == run_id:
+                active["codex_app_server_turn"] = turn
+                active["provider_thread_id"] = provider_id
+                active["provider_turn_id"] = turn.turn_id
+        manifest_watch_task = asyncio.create_task(
+            watch_manifest_artifacts(session_id, run_id, manifest_path, seen_artifacts)
+        )
+
+        while True:
+            notification = await turn.next_notification()
+            method = str(notification.get("method") or "")
+            params = notification.get("params") if isinstance(notification.get("params"), dict) else {}
+            notification_thread = str(params.get("threadId") or provider_id)
+            if notification_thread and notification_thread != provider_id:
+                continue
+            notification_turn = str(params.get("turnId") or "")
+            if notification_turn and notification_turn != turn.turn_id:
+                continue
+            item = params.get("item") if isinstance(params.get("item"), dict) else {}
+            item_id = str(params.get("itemId") or item.get("id") or "")
+
+            if method == "item/agentMessage/delta" and item_id:
+                assistant_deltas[item_id] = assistant_deltas.get(item_id, "") + str(params.get("delta") or "")
+                continue
+            if method in {"item/reasoning/summaryTextDelta", "item/reasoning/textDelta", "item/plan/delta"} and item_id:
+                reasoning_deltas[item_id] = reasoning_deltas.get(item_id, "") + str(params.get("delta") or "")
+                continue
+            if method in {"item/commandExecution/outputDelta", "item/fileChange/outputDelta"} and item_id:
+                tool_output_deltas[item_id] = tool_output_deltas.get(item_id, "") + str(params.get("delta") or "")
+                continue
+            if method == "item/started" and item:
+                tool = codex_app_server_tool(item)
+                if tool:
+                    await emit_tool_started(tool)
+                changed_paths.update(codex_app_server_changed_paths(item))
+                continue
+            if method == "item/completed" and item:
+                item_type = str(item.get("type") or "")
+                if item_type == "agentMessage":
+                    await emit_text(item.get("text") or assistant_deltas.get(str(item.get("id") or ""), ""))
+                elif item_type in {"reasoning", "plan"}:
+                    reasoning = codex_reasoning_text(item) or reasoning_deltas.get(str(item.get("id") or ""), "")
+                    await emit_reasoning(reasoning)
+                else:
+                    changed_paths.update(codex_app_server_changed_paths(item))
+                    await emit_tool_finished(item)
+                continue
+            if method == "error":
+                error_value = params.get("error") or params.get("message") or params
+                terminal_error = concise_error_message(error_value)
+                if not params.get("willRetry"):
+                    await append_event(session_id, "error", {
+                        "run_id": run_id,
+                        "backend": BACKEND_CODEX,
+                        "message": terminal_error,
+                        "transport": CODEX_TRANSPORT_APP_SERVER,
+                        **run_event_metadata(run_id),
+                    })
+                continue
+            if method == "turn/completed":
+                completed_turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+                completed_id = str(completed_turn.get("id") or "")
+                if completed_id and completed_id != turn.turn_id:
+                    continue
+                terminal_status = str(completed_turn.get("status") or "failed")
+                if completed_turn.get("error"):
+                    terminal_error = concise_error_message(completed_turn.get("error"))
+                break
+
+        for item_id, text in assistant_deltas.items():
+            await emit_text(text)
+        for item_id, text in reasoning_deltas.items():
+            await emit_reasoning(text)
+        stopped = terminal_status == "interrupted" or run_id in STOPPED_RUNS
+    except Exception as exc:
+        stop_requested = run_id in STOPPED_RUNS
+        safe_rejection = isinstance(exc, CodexAppServerRequestError)
+        can_fallback = allow_exec_fallback and not stop_requested and (
+            not turn_start_attempted or safe_rejection
+        )
+        if can_fallback:
+            await client.close()
+            await clear_active_process(session_id)
+            await append_event(session_id, "codex_transport_fallback", {
+                "run_id": run_id,
+                "from": CODEX_TRANSPORT_APP_SERVER,
+                "to": CODEX_TRANSPORT_EXEC,
+                "message": f"Codex app-server was unavailable before the turn was accepted; using codex exec. {concise_error_message(exc)}",
+            })
+            await run_codex(
+                session_id,
+                run_id,
+                prompt,
+                sess,
+                manifest_path,
+                diff_baseline=diff_baseline,
+            )
+            return
+        terminal_error = terminal_error or concise_error_message(exc)
+        stopped = stop_requested
+        terminal_status = "interrupted" if stopped else "failed"
+        if not stopped:
+            await append_event(session_id, "error", {
+                "run_id": run_id,
+                "backend": BACKEND_CODEX,
+                "message": terminal_error,
+                "transport": CODEX_TRANSPORT_APP_SERVER,
+                **run_event_metadata(run_id),
+            })
+    finally:
+        if manifest_watch_task:
+            manifest_watch_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await manifest_watch_task
+        if turn:
+            await turn.close()
+        await client.close()
+
+    if terminal_error and terminal_status == "failed":
+        record_runtime_failure(BACKEND_CODEX, terminal_error)
+    elif not stopped:
+        record_runtime_success(BACKEND_CODEX)
+    await collect_manifest(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts, final=True)
+    await collect_recent_leftover_manifests(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts)
+    await publish_turn_code_diff(session_id, run_id, BACKEND_CODEX, cwd, diff_baseline, changed_paths)
+    exit_code = 0 if terminal_status == "completed" else None if stopped else 1
+    await append_turn_finished_event(session_id, {
+        "run_id": run_id,
+        "backend": BACKEND_CODEX,
+        "transport": CODEX_TRANSPORT_APP_SERVER,
+        "provider_thread_id": provider_id or None,
+        "provider_turn_id": turn.turn_id if turn else None,
+        "exit_code": exit_code,
+        "result_text": clean_assistant_text("\n\n".join(text_parts).strip()),
+        "stopped": stopped,
+        **run_event_metadata(run_id),
+    })
+    RUN_METADATA.pop(run_id, None)
+    await release_turn_slot(session_id)
+    drain_queue = should_schedule_queue_after_finish(session_id, stopped)
+    STOPPED_RUNS.discard(run_id)
+    if drain_queue:
+        schedule_next_queued_turn(session_id)
+
+
+async def run_codex_selected(
+    session_id: str,
+    run_id: str,
+    prompt: str,
+    sess: dict[str, Any],
+    manifest_path: Path,
+) -> None:
+    transport = normalize_codex_transport(sess.get("codex_transport"))
+    if transport == CODEX_TRANSPORT_EXEC:
+        await run_codex(session_id, run_id, prompt, sess, manifest_path)
+        return
+    await run_codex_app_server(
+        session_id,
+        run_id,
+        prompt,
+        sess,
+        manifest_path,
+        allow_exec_fallback=transport == CODEX_TRANSPORT_AUTO,
+    )
+
+
 async def start_turn(
     session_id: str,
     req: TurnRequest,
@@ -8955,6 +9532,10 @@ async def start_turn(
     sess = STORE.sessions.get(session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="session not found")
+    requested_codex_transport = normalize_codex_transport(
+        req.codex_transport if req.codex_transport is not None else sess.get("codex_transport"),
+        strict=req.codex_transport is not None,
+    )
     reserved = False
     should_queue = False
     async with ACTIVE_LOCK:
@@ -8971,6 +9552,7 @@ async def start_turn(
                 "display_prompt": req.display_prompt,
                 "file_ids": list(req.file_ids),
                 "backend": req.backend or sess.get("backend") or DEFAULT_BACKEND,
+                "codex_transport": requested_codex_transport,
                 "purpose": req.purpose,
                 "queued_id": queued_id,
             }
@@ -8988,7 +9570,11 @@ async def start_turn(
     try:
         if req.backend:
             sess = await STORE.update(session_id, {"backend": req.backend})
-        fields_set = getattr(req, "model_fields_set", getattr(req, "__fields_set__", set()))
+        fields_set = (
+            req.model_fields_set
+            if hasattr(req, "model_fields_set")
+            else getattr(req, "__fields_set__", set())
+        )
         runtime_patch: dict[str, Any] = {}
         if "model" in fields_set and req.model is not None:
             runtime_patch["model"] = req.model
@@ -9007,12 +9593,7 @@ async def start_turn(
                 current_turn["run_id"] = run_id
                 current_turn["backend"] = backend
         manifest_path = manifests_dir(session_id) / f"{run_id}.json"
-        prompt = req.prompt
-        attachment_lines = file_attachment_prompt_lines(req.file_ids)
-        if attachment_lines:
-            prompt += "\n\n[Attached files]\n"
-            prompt += "\n".join(attachment_lines) + "\n"
-            prompt += "Use these local paths directly when needed.\n"
+        prompt = prompt_with_file_attachments(req.prompt, req.file_ids)
 
         memory_seed = str(sess.get("memory_seed") or "").strip()
         if (
@@ -9043,6 +9624,8 @@ async def start_turn(
         }
         if queued_id:
             started_payload["queued_id"] = queued_id
+        if backend == BACKEND_CODEX:
+            started_payload["codex_transport"] = requested_codex_transport
         run_metadata = {
             "purpose": req.purpose,
             "job_id": req.job_id,
@@ -9058,7 +9641,9 @@ async def start_turn(
             RUN_METADATA[run_id] = run_metadata
             started_payload.update(run_metadata)
         started_event = await append_event(session_id, "turn_started", started_payload)
-        task = run_codex(session_id, run_id, prompt, dict(sess), manifest_path) if backend == BACKEND_CODEX else run_claude(session_id, run_id, prompt, dict(sess), manifest_path)
+        turn_session = dict(sess)
+        turn_session["codex_transport"] = requested_codex_transport
+        task = run_codex_selected(session_id, run_id, prompt, turn_session, manifest_path) if backend == BACKEND_CODEX else run_claude(session_id, run_id, prompt, turn_session, manifest_path)
         asyncio.create_task(task)
         current_title = str(sess.get("title") or "").strip()
         if not current_title or current_title == "New chat":
@@ -9074,6 +9659,29 @@ async def start_turn(
 
 
 SERVER_UPDATE_ACTIVE_PHASES = {"starting", "checking", "downloading", "verifying", "installing", "restarting"}
+SERVER_UPDATE_TRACKS = ("stable", "beta")
+
+
+def normalize_server_update_track(value: Any) -> str:
+    track = str(value or "stable").strip().lower()
+    return track if track in SERVER_UPDATE_TRACKS else "stable"
+
+
+def server_version_is_prerelease(version: str) -> bool:
+    try:
+        version_key(version)
+    except ValueError:
+        return False
+    return version_is_prerelease(version)
+
+
+def server_release_is_newer(latest: str, current: str) -> bool:
+    try:
+        return version_key(latest) > version_key(current)
+    except ValueError:
+        # Development builds predate the versioned updater contract. Preserve
+        # their historical ability to install a signed release.
+        return latest != current
 
 
 def read_server_update_status() -> dict[str, Any]:
@@ -9084,7 +9692,9 @@ def read_server_update_status() -> dict[str, Any]:
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         value = {}
     value.setdefault("phase", "idle")
+    value["track"] = normalize_server_update_track(value.get("track"))
     value["current_version"] = SERVER_VERSION
+    value["current_is_prerelease"] = server_version_is_prerelease(SERVER_VERSION)
     value["api_contract_version"] = API_CONTRACT_VERSION
     return value
 
@@ -9111,11 +9721,11 @@ def server_update_is_active(status: dict[str, Any]) -> bool:
     return run_tmux(["has-session", "-t", server_update_tmux_name(update_id)], check=False).returncode == 0
 
 
-async def signed_release_manifest() -> dict[str, Any]:
+async def signed_release_manifest(track: str = "stable") -> dict[str, Any]:
     if not SERVER_UPDATE_PUBLIC_KEY.is_file():
         raise HTTPException(status_code=503, detail="release verification key is missing from this server installation")
     try:
-        return await asyncio.to_thread(check_release, SERVER_UPDATE_PUBLIC_KEY)
+        return await asyncio.to_thread(check_release, SERVER_UPDATE_PUBLIC_KEY, track)
     except ReleaseUnavailableError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
@@ -9188,6 +9798,10 @@ async def health() -> dict[str, Any]:
         queued = {sid: len(queue) for sid, queue in QUEUED_TURNS.items() if queue}
     pressure = host_pressure_snapshot()
     tmux = tmux_capability()
+    codex_app_server_available = bool(
+        shutil.which(CODEX_BIN, path=runner_env().get("PATH"))
+        or Path(CODEX_BIN).expanduser().is_file()
+    )
     return {
         "ok": True,
         "server_version": SERVER_VERSION,
@@ -9202,7 +9816,15 @@ async def health() -> dict[str, Any]:
             and SERVER_UPDATE_PUBLIC_KEY.is_file()
             and bool(tmux["available"])
         ),
-        "capabilities": {"tmux": tmux},
+        "capabilities": {
+            "tmux": tmux,
+            "server_update_tracks": list(SERVER_UPDATE_TRACKS),
+            "codex_transports": {
+                "supported": [CODEX_TRANSPORT_AUTO, CODEX_TRANSPORT_APP_SERVER, CODEX_TRANSPORT_EXEC],
+                "default": CODEX_TRANSPORT_AUTO,
+                "app_server_available": codex_app_server_available,
+            },
+        },
         "websocket_runtime": True,
         "websocket_runtime_version": websockets.__version__,
         "active": active,
@@ -9228,27 +9850,43 @@ async def server_update_status() -> dict[str, Any]:
 
 
 @app.post("/api/admin/update/check")
-async def check_server_update() -> dict[str, Any]:
+async def check_server_update(body: ServerUpdateCheckRequest | None = None) -> dict[str, Any]:
     status = read_server_update_status()
     if await asyncio.to_thread(server_update_is_active, status):
         raise HTTPException(status_code=409, detail="a server update is already running")
+    track = normalize_server_update_track(body.track if body and body.track else status.get("track"))
     try:
-        manifest = await signed_release_manifest()
+        manifest = await signed_release_manifest(track)
     except HTTPException as exc:
         if exc.status_code != 404:
             raise
         return write_server_update_status(
             phase="unavailable",
+            track=track,
+            latest_version=None,
+            latest_is_prerelease=None,
             update_available=False,
             message=str(exc.detail),
             checked_at=update_utc_now(),
         )
     latest = str(manifest["version"])
+    latest_is_prerelease = version_is_prerelease(latest)
+    update_available = server_release_is_newer(latest, SERVER_VERSION)
     return write_server_update_status(
-        phase="available" if latest != SERVER_VERSION else "current",
+        phase="available" if update_available else "current",
+        track=track,
         latest_version=latest,
-        update_available=latest != SERVER_VERSION,
-        message=(f"AgentsServer {latest} is available." if latest != SERVER_VERSION else f"AgentsServer {SERVER_VERSION} is current."),
+        latest_is_prerelease=latest_is_prerelease,
+        update_available=update_available,
+        message=(
+            f"AgentsServer {latest} is available on the {track} track."
+            if update_available
+            else (
+                f"AgentsServer {SERVER_VERSION} is current."
+                if latest == SERVER_VERSION
+                else f"The {track} track has no newer release than installed AgentsServer {SERVER_VERSION}."
+            )
+        ),
         checked_at=update_utc_now(),
     )
 
@@ -9258,18 +9896,30 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
     status = read_server_update_status()
     if await asyncio.to_thread(server_update_is_active, status):
         raise HTTPException(status_code=409, detail="a server update is already running")
-    manifest = await signed_release_manifest()
+    track = normalize_server_update_track(body.track or status.get("track"))
+    manifest = await signed_release_manifest(track)
     latest = str(manifest["version"])
+    latest_is_prerelease = version_is_prerelease(latest)
     requested = str(body.version or latest).strip()
     if requested != latest:
-        raise HTTPException(status_code=409, detail=f"the latest signed release is {latest}")
+        raise HTTPException(status_code=409, detail=f"the latest signed release on the {track} track is {latest}")
     if requested == SERVER_VERSION:
         return write_server_update_status(
             phase="current",
+            track=track,
             latest_version=latest,
+            latest_is_prerelease=latest_is_prerelease,
             update_available=False,
             message=f"AgentsServer {SERVER_VERSION} is already installed.",
             checked_at=update_utc_now(),
+        )
+    if not server_release_is_newer(requested, SERVER_VERSION):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"the latest signed {track} release is {latest}, which is not newer than installed "
+                f"AgentsServer {SERVER_VERSION}; managed updates do not perform downgrades"
+            ),
         )
     tmux = tmux_capability()
     if not tmux["available"]:
@@ -9287,12 +9937,21 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
         "--port", str(SERVER_PORT),
         "--bind", SERVER_BIND_ADDRESS,
         "--expected-version", requested,
+        "--track", track,
     ]
+    try:
+        version_key(SERVER_VERSION)
+    except ValueError:
+        pass
+    else:
+        command.extend(["--current-version", SERVER_VERSION])
     status = write_server_update_status(
         update_id=update_id,
         phase="starting",
+        track=track,
         target_version=requested,
         latest_version=latest,
+        latest_is_prerelease=latest_is_prerelease,
         update_available=True,
         message=f"Starting detached update to AgentsServer {requested}.",
         started_at=update_utc_now(),
@@ -9663,6 +10322,7 @@ async def fork_session(session_id: str, req: ForkSessionRequest) -> dict[str, An
             backend=parent_backend,
             model=parent.get("model"),
             effort=parent.get("effort"),
+            codex_transport=parent.get("codex_transport"),
             system_prompt=parent.get("system_prompt"),
             pinned=bool(parent.get("pinned")),
             archived=bool(parent.get("archived")),
@@ -9764,14 +10424,23 @@ async def stop_turn(session_id: str, *, emit_event: bool = True, schedule_queue:
             schedule_next_queued_turn(session_id)
         return {"ok": True, "stopped": False}
     proc = active.get("proc") if active else None
-    if proc:
+    native_turn = active.get("codex_app_server_turn") if active else None
+    interrupted_natively = False
+    if active.get("transport") == CODEX_TRANSPORT_APP_SERVER and native_turn is not None:
+        try:
+            await native_turn.interrupt()
+            interrupted_natively = True
+        except Exception as exc:
+            logger.warning("Codex app-server interrupt failed session=%s error=%s", session_id, exc)
+    if proc and not interrupted_natively:
         await terminate_process_tree(proc)
     if emit_event:
         await append_event(session_id, "turn_stopped", {
             "run_id": active.get("run_id") if active else None,
             "backend": active.get("backend") if active else None,
+            "native_interrupt": interrupted_natively,
         })
-    return {"ok": True, "stopped": True}
+    return {"ok": True, "stopped": True, "native_interrupt": interrupted_natively}
 
 
 @app.get("/api/jobs")

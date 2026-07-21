@@ -146,11 +146,11 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["replays_interrupted_message"])
         self.assertEqual(promoted["prompt"], "Change course now.")
 
-    async def test_later_steer_supersedes_earlier_user_turn_but_keeps_later_work(self) -> None:
+    async def test_later_steer_runs_first_then_keeps_other_messages_in_original_order(self) -> None:
         agent_server.QUEUED_TURNS["chat-1"] = deque([
             {
                 "queued_id": "queued-first",
-                "prompt": "Stale first message.",
+                "prompt": "First queued message.",
                 "file_ids": [],
                 "backend": "codex",
             },
@@ -178,32 +178,30 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
             result = await run_queued_turn_now("chat-1", "queued-steer")
             await asyncio.sleep(0)
 
-        self.assertEqual(result["superseded_queued_ids"], ["queued-first"])
+        self.assertEqual(result["superseded_queued_ids"], [])
         self.assertEqual(agent_server.RUN_NOW_TURNS["chat-1"]["queued_id"], "queued-steer")
         self.assertEqual(
             [item["queued_id"] for item in agent_server.QUEUED_TURNS["chat-1"]],
-            ["queued-later"],
+            ["queued-first", "queued-later"],
         )
         event_types = [call.args[1] for call in append_event.await_args_list]
-        self.assertEqual(event_types, ["turn_queue_run_now", "turn_unqueued"])
+        self.assertEqual(event_types, ["turn_queue_run_now"])
         run_now_payload = append_event.await_args_list[0].args[2]
-        self.assertEqual(run_now_payload["remaining"], 1)
-        self.assertEqual(run_now_payload["superseded_queued_ids"], ["queued-first"])
-        unqueued_payload = append_event.await_args_list[1].args[2]
-        self.assertEqual(unqueued_payload["queued_id"], "queued-first")
-        self.assertEqual(unqueued_payload["superseded_by_queued_id"], "queued-steer")
+        self.assertEqual(run_now_payload["remaining"], 2)
+        self.assertEqual(run_now_payload["superseded_queued_ids"], [])
 
         agent_server.STEERING_SESSIONS.discard("chat-1")
         with patch.object(agent_server, "start_turn", new_callable=AsyncMock) as start_turn:
             await start_next_queued_turn("chat-1")
             await start_next_queued_turn("chat-1")
+            await start_next_queued_turn("chat-1")
 
         self.assertEqual(
             [call.kwargs["queued_id"] for call in start_turn.await_args_list],
-            ["queued-steer", "queued-later"],
+            ["queued-steer", "queued-first", "queued-later"],
         )
 
-    async def test_later_steer_preserves_purpose_bearing_internal_work(self) -> None:
+    async def test_later_steer_preserves_user_and_internal_work_in_original_order(self) -> None:
         agent_server.QUEUED_TURNS["chat-1"] = deque([
             {
                 "queued_id": "queued-first",
@@ -237,7 +235,7 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [item["queued_id"] for item in agent_server.QUEUED_TURNS["chat-1"]],
-            ["queued-digest"],
+            ["queued-first", "queued-digest"],
         )
 
     async def test_second_steer_cannot_overwrite_the_first_handoff(self) -> None:
@@ -314,13 +312,13 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent_server.QUEUED_TURNS["chat-1"][0]["prompt"], "")
         self.assertEqual(agent_server.QUEUED_TURNS["chat-1"][0]["file_ids"], ["image-only"])
 
-    def test_recovery_does_not_resurrect_turns_superseded_by_run_now(self) -> None:
+    def test_recovery_keeps_unselected_turns_in_original_order_after_run_now_starts(self) -> None:
         events = [
             {
                 "seq": 1,
                 "type": "turn_queued",
                 "queued_id": "queued-first",
-                "prompt": "Stale first message.",
+                "prompt": "First queued message.",
                 "file_ids": [],
             },
             {
@@ -341,7 +339,7 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
                 "seq": 4,
                 "type": "turn_queue_run_now",
                 "queued_id": "queued-steer",
-                "superseded_queued_ids": ["queued-first"],
+                "superseded_queued_ids": [],
             },
             {
                 "seq": 5,
@@ -360,11 +358,54 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(agent_server, "events_path", return_value=path):
                 rebuilt = rebuild_queued_turns_from_events()
 
-        self.assertEqual(rebuilt, 1)
+        self.assertEqual(rebuilt, 2)
         self.assertEqual(
             [item["queued_id"] for item in agent_server.QUEUED_TURNS["chat-1"]],
-            ["queued-later"],
+            ["queued-first", "queued-later"],
         )
+
+    def test_recovery_honors_legacy_run_now_supersession_records(self) -> None:
+        agent_server.QUEUED_TURNS.pop("chat-1", None)
+        events = [
+            {
+                "seq": 1,
+                "type": "turn_queued",
+                "queued_id": "queued-first",
+                "prompt": "Legacy superseded message.",
+                "file_ids": [],
+            },
+            {
+                "seq": 2,
+                "type": "turn_queued",
+                "queued_id": "queued-steer",
+                "prompt": "Run this now.",
+                "file_ids": [],
+            },
+            {
+                "seq": 3,
+                "type": "turn_queue_run_now",
+                "queued_id": "queued-steer",
+                "superseded_queued_ids": ["queued-first"],
+            },
+            {
+                "seq": 4,
+                "type": "turn_started",
+                "queued_id": "queued-steer",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            path.write_text("".join(json.dumps({
+                "id": f"event-{event['seq']}",
+                "session_id": "chat-1",
+                "ts": "2026-07-21T00:00:00Z",
+                **event,
+            }) + "\n" for event in events))
+            with patch.object(agent_server, "events_path", return_value=path):
+                rebuilt = rebuild_queued_turns_from_events()
+
+        self.assertEqual(rebuilt, 0)
+        self.assertNotIn("chat-1", agent_server.QUEUED_TURNS)
 
     def test_stopped_runner_does_not_schedule_a_second_steering_drain(self) -> None:
         agent_server.RUN_NOW_TURNS["chat-1"] = {
@@ -380,7 +421,7 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         agent_server.STEERING_SESSIONS.clear()
         self.assertTrue(should_schedule_queue_after_finish("chat-1", stopped=False))
 
-    async def test_append_failure_restores_superseded_predecessor(self) -> None:
+    async def test_append_failure_keeps_unselected_messages_in_original_order(self) -> None:
         agent_server.QUEUED_TURNS["chat-1"] = deque([
             {
                 "queued_id": "queued-first",
@@ -438,11 +479,23 @@ class ClaudeResultDiagnosticTests(unittest.TestCase):
         self.assertTrue(is_expected_claude_interruption_result(event))
         self.assertEqual(claude_result_error(event), "Claude stopped before completing the turn.")
 
+    def test_aborted_streaming_interruption_with_null_stop_reason_is_recognized(self) -> None:
+        event = self.diagnostic_event([
+            "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null",
+        ])
+        event["terminal_reason"] = "aborted_streaming"
+        event["stop_reason"] = None
+
+        self.assertTrue(is_expected_claude_interruption_result(event))
+        self.assertEqual(claude_result_error(event), "Claude stopped before completing the turn.")
+
     def test_real_error_survives_alongside_internal_diagnostic(self) -> None:
         event = self.diagnostic_event([
-            "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+            "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null",
             "Provider connection failed",
         ])
+        event["terminal_reason"] = "aborted_streaming"
+        event["stop_reason"] = None
         self.assertFalse(is_expected_claude_interruption_result(event))
         self.assertEqual(claude_result_error(event), "Provider connection failed")
 

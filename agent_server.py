@@ -1802,6 +1802,20 @@ def merged_file_ids(*groups: list[str] | tuple[str, ...]) -> list[str]:
     return merged
 
 
+def file_attachment_prompt_lines(file_ids: list[str] | tuple[str, ...]) -> list[str]:
+    lines: list[str] = []
+    for file_id in merged_file_ids(file_ids):
+        rec_path = FILES_ROOT / file_id / "meta.json"
+        if not rec_path.exists():
+            continue
+        with suppress(Exception):
+            rec = json.loads(rec_path.read_text())
+            lines.append(
+                f"- {rec.get('path')} ({rec.get('filename')}, {rec.get('content_type')})"
+            )
+    return lines
+
+
 def prepare_steered_turn(selected: dict[str, Any], interrupted: dict[str, Any] | None) -> dict[str, Any]:
     """Build the provider request for a real steer without changing its UI prompt."""
     turn = dict(selected)
@@ -1818,6 +1832,16 @@ def prepare_steered_turn(selected: dict[str, Any], interrupted: dict[str, Any] |
     if steering_prompt == interrupted_prompt and selected_file_ids == interrupted_file_ids:
         return turn
 
+    interrupted_message = interrupted_prompt or "[Attachment-only message]"
+    interrupted_attachment_lines = file_attachment_prompt_lines(interrupted_file_ids)
+    if interrupted_attachment_lines:
+        interrupted_message += (
+            "\n\n[Interrupted message attachments]\n"
+            + "\n".join(interrupted_attachment_lines)
+            + "\nThese files belong to the interrupted message above, not the steering message.\n"
+            "[End interrupted message attachments]"
+        )
+
     turn["steering_prompt"] = steering_prompt
     turn["display_prompt"] = str(
         selected.get("display_prompt")
@@ -1829,17 +1853,14 @@ def prepare_steered_turn(selected: dict[str, Any], interrupted: dict[str, Any] |
         "applying the steering instruction below. Treat both messages as user input, and give the "
         "steering instruction priority wherever they conflict.\n\n"
         "[Interrupted message]\n"
-        f"{interrupted_prompt or '[Attachment-only message]'}\n"
+        f"{interrupted_message}\n"
         "[End interrupted message]\n\n"
         "[Steering message]\n"
         f"{steering_prompt or '[Attachment-only steering message]'}\n"
         "[End steering message]"
     )
     turn["display_file_ids"] = selected_file_ids
-    turn["file_ids"] = merged_file_ids(
-        interrupted_file_ids,
-        list(selected.get("file_ids") or []),
-    )
+    turn["file_ids"] = selected_file_ids
     turn["steer_interrupted_run_id"] = (interrupted or {}).get("run_id")
     turn["replays_interrupted_message"] = True
     return turn
@@ -7832,17 +7853,10 @@ async def start_turn(
                 current_turn["backend"] = backend
         manifest_path = manifests_dir(session_id) / f"{run_id}.json"
         prompt = req.prompt
-        uploads = []
-        for file_id in req.file_ids:
-            rec_path = FILES_ROOT / file_id / "meta.json"
-            if rec_path.exists():
-                with suppress(Exception):
-                    rec = json.loads(rec_path.read_text())
-                    uploads.append(rec)
-        if uploads:
+        attachment_lines = file_attachment_prompt_lines(req.file_ids)
+        if attachment_lines:
             prompt += "\n\n[Attached files]\n"
-            for rec in uploads:
-                prompt += f"- {rec.get('path')} ({rec.get('filename')}, {rec.get('content_type')})\n"
+            prompt += "\n".join(attachment_lines) + "\n"
             prompt += "Use these local paths directly when needed.\n"
 
         memory_seed = str(sess.get("memory_seed") or "").strip()

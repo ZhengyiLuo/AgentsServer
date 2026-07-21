@@ -20,35 +20,64 @@ from agent_server import (
 
 
 class PrepareSteeredTurnTests(unittest.TestCase):
-    def test_replays_both_messages_and_merges_attachments(self) -> None:
-        turn = prepare_steered_turn(
-            {
-                "queued_id": "queued-steer",
-                "prompt": "Use the smaller batch instead.",
-                "file_ids": ["new", "shared"],
-            },
-            {
-                "run_id": "run-original",
-                "prompt": "Launch the complete training sweep.",
-                "file_ids": ["original", "shared"],
-            },
-        )
+    def test_replays_both_messages_and_scopes_attachments_to_their_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            files_root = Path(tmp)
+            for file_id in ("original", "shared", "new"):
+                file_dir = files_root / file_id
+                file_dir.mkdir()
+                (file_dir / "meta.json").write_text(json.dumps({
+                    "path": f"/uploads/{file_id}.png",
+                    "filename": f"{file_id}.png",
+                    "content_type": "image/png",
+                }))
+            with patch.object(agent_server, "FILES_ROOT", files_root):
+                turn = prepare_steered_turn(
+                    {
+                        "queued_id": "queued-steer",
+                        "prompt": "Use the smaller batch instead.",
+                        "file_ids": ["new", "shared"],
+                    },
+                    {
+                        "run_id": "run-original",
+                        "prompt": "Launch the complete training sweep.",
+                        "file_ids": ["original", "shared"],
+                    },
+                )
 
         self.assertIn("Launch the complete training sweep.", turn["prompt"])
         self.assertIn("Use the smaller batch instead.", turn["prompt"])
+        self.assertIn("[Interrupted message attachments]", turn["prompt"])
+        self.assertIn("/uploads/original.png", turn["prompt"])
+        self.assertIn("/uploads/shared.png", turn["prompt"])
+        self.assertNotIn("/uploads/new.png", turn["prompt"])
         self.assertEqual(turn["display_prompt"], "Use the smaller batch instead.")
-        self.assertEqual(turn["file_ids"], ["original", "shared", "new"])
+        self.assertEqual(turn["file_ids"], ["new", "shared"])
         self.assertEqual(turn["display_file_ids"], ["new", "shared"])
         self.assertEqual(turn["steer_interrupted_run_id"], "run-original")
         self.assertTrue(turn["replays_interrupted_message"])
 
-    def test_text_only_steer_replays_but_does_not_claim_the_interrupted_image(self) -> None:
-        turn = prepare_steered_turn(
-            {"queued_id": "queued-steer", "prompt": "Look at the warning instead.", "file_ids": []},
-            {"run_id": "run-original", "prompt": "What is this?", "file_ids": ["original-image"]},
-        )
+    def test_text_only_steer_keeps_the_interrupted_image_scoped_to_old_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            files_root = Path(tmp)
+            file_dir = files_root / "original-image"
+            file_dir.mkdir()
+            (file_dir / "meta.json").write_text(json.dumps({
+                "path": "/uploads/original.png",
+                "filename": "original.png",
+                "content_type": "image/png",
+            }))
+            with patch.object(agent_server, "FILES_ROOT", files_root):
+                turn = prepare_steered_turn(
+                    {"queued_id": "queued-steer", "prompt": "Look at the warning instead.", "file_ids": []},
+                    {"run_id": "run-original", "prompt": "What is this?", "file_ids": ["original-image"]},
+                )
 
-        self.assertEqual(turn["file_ids"], ["original-image"])
+        interrupted_section = turn["prompt"].split("[End interrupted message]", 1)[0]
+        steering_section = turn["prompt"].split("[Steering message]", 1)[1]
+        self.assertIn("/uploads/original.png", interrupted_section)
+        self.assertNotIn("/uploads/original.png", steering_section)
+        self.assertEqual(turn["file_ids"], [])
         self.assertEqual(turn["display_file_ids"], [])
 
     def test_image_only_messages_remain_distinct_during_steering(self) -> None:
@@ -60,7 +89,7 @@ class PrepareSteeredTurnTests(unittest.TestCase):
         self.assertIn("[Attachment-only message]", turn["prompt"])
         self.assertIn("[Attachment-only steering message]", turn["prompt"])
         self.assertEqual(turn["display_prompt"], "")
-        self.assertEqual(turn["file_ids"], ["original-image", "new-image"])
+        self.assertEqual(turn["file_ids"], ["new-image"])
         self.assertEqual(turn["display_file_ids"], ["new-image"])
 
     def test_plain_promotion_stays_unchanged_without_an_interrupted_turn(self) -> None:
@@ -121,12 +150,12 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Finish the original investigation.", promoted["prompt"])
         self.assertIn("Change course now.", promoted["prompt"])
         self.assertEqual(promoted["display_prompt"], "Change course now.")
-        self.assertEqual(promoted["file_ids"], ["original-file", "new-file"])
+        self.assertEqual(promoted["file_ids"], ["new-file"])
         self.assertEqual(promoted["display_file_ids"], ["new-file"])
         event_payload = append_event.await_args.args[2]
         self.assertEqual(event_payload["prompt"], "Change course now.")
         self.assertIn("Finish the original investigation.", event_payload["request_prompt"])
-        self.assertEqual(event_payload["file_ids"], ["original-file", "new-file"])
+        self.assertEqual(event_payload["file_ids"], ["new-file"])
         self.assertEqual(event_payload["display_file_ids"], ["new-file"])
         self.assertTrue(event_payload["replays_interrupted_message"])
 
@@ -275,20 +304,28 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(start_turn.await_args.kwargs["display_file_ids"], [])
         self.assertNotIn("chat-1", agent_server.RUN_NOW_TURNS)
 
-    def test_recovered_run_now_turn_keeps_provider_and_display_attachments_separate(self) -> None:
+    def test_recovered_run_now_turn_keeps_interrupted_paths_in_scoped_prompt_only(self) -> None:
         item = queued_turn_from_event(
             {
                 "queued_id": "queued-steer",
-                "request_prompt": "Combined provider replay",
+                "request_prompt": (
+                    "[Interrupted message]\nOld request\n\n"
+                    "[Interrupted message attachments]\n"
+                    "- /uploads/old.png (old.png, image/png)\n"
+                    "[End interrupted message attachments]\n"
+                    "[End interrupted message]\n\n"
+                    "[Steering message]\nNew steering text\n[End steering message]"
+                ),
                 "prompt": "New steering text",
-                "file_ids": ["old-image", "new-image"],
+                "file_ids": ["new-image"],
                 "display_file_ids": ["new-image"],
             },
             agent_server.STORE.sessions["chat-1"],
             1,
         )
 
-        self.assertEqual(item["file_ids"], ["old-image", "new-image"])
+        self.assertIn("/uploads/old.png", item["prompt"])
+        self.assertEqual(item["file_ids"], ["new-image"])
         self.assertEqual(item["display_file_ids"], ["new-image"])
 
     def test_recovery_keeps_an_image_only_queued_turn(self) -> None:

@@ -430,7 +430,7 @@ environment, and any provider-specific auth/config files.
 
 ### Runtime diagnostics
 
-API contract v7 exposes privacy-safe runtime status in two places:
+API contract v9 exposes privacy-safe runtime status in two places:
 
 ```text
 GET /api/health
@@ -537,6 +537,7 @@ The server exposes JSON endpoints under `/api`.
 - `POST /api/sessions`
 - `PATCH /api/sessions/{session_id}`
 - `GET /api/sessions/{session_id}/events`
+- `GET /api/sessions/{session_id}/subagents`
 - `POST /api/sessions/{session_id}/prompt`
 - `POST /api/sessions/{session_id}/stop`
 - `POST /api/sessions/{session_id}/fork`
@@ -562,6 +563,9 @@ The server exposes JSON endpoints under `/api`.
 
 The event stream is append-only JSONL on disk and paged through the events API.
 Large clients should page history instead of loading every event at once.
+The subagents endpoint folds Claude local-agent lifecycle records into bounded
+`subagent_state` snapshots without returning provider prompts, raw events,
+tool-result output, commands, or output-file paths.
 
 ## Repository Hygiene
 

@@ -58,7 +58,7 @@ def main() -> int:
     manifest = {
         "schema": 1,
         "version": version,
-        "api_contract_version": 8,
+        "api_contract_version": 9,
         "commit": commit,
         "archive": {
             "name": archive_name,

@@ -19,7 +19,7 @@ class UpdateRunnerTests(unittest.TestCase):
         manifest = {
             "schema": 1,
             "version": version,
-            "api_contract_version": 8,
+            "api_contract_version": 9,
             "archive": {
                 "name": f"agents-server-{version}.tar.gz",
                 "url": f"https://github.com/ZhengyiLuo/AgentsServer/releases/download/v{version}/agents-server-{version}.tar.gz",

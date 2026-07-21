@@ -12,6 +12,7 @@ HEALTH_ATTEMPTS="${AGENTSDOCK_HEALTH_ATTEMPTS:-${ZENITHDOCK_HEALTH_ATTEMPTS:-45}
 HEALTH_TOKEN="${AGENTSDOCK_AGENT_TOKEN:-${ZENITHDOCK_AGENT_TOKEN:-}}"
 RUNTIME_FILES=(
   "$SCRIPT_DIR/agent_server.py"
+  "$SCRIPT_DIR/agentsdock_jobs.py"
   "$SCRIPT_DIR/update_runner.py"
   "$SCRIPT_DIR/release-public-key.pem"
   "$SCRIPT_DIR/VERSION"
@@ -38,17 +39,19 @@ scp "${RUNTIME_FILES[@]}" "$REMOTE_HOST:$REMOTE_SERVER_DIR/"
 
 echo "Checking server runtime dependencies"
 ssh "$REMOTE_HOST" "
-  if ! '$REMOTE_PYTHON' -c 'import cryptography' >/dev/null 2>&1; then
+  if ! '$REMOTE_PYTHON' -c 'import croniter, cryptography, dateutil, tzdata' >/dev/null 2>&1; then
     if [[ -x \"\$HOME/.local/bin/uv\" ]]; then
-      \"\$HOME/.local/bin/uv\" pip install --python '$REMOTE_PYTHON' cryptography
+      \"\$HOME/.local/bin/uv\" pip install --python '$REMOTE_PYTHON' \
+        'croniter>=6,<7' 'cryptography>=44,<47' 'python-dateutil>=2.9,<3' 'tzdata>=2025.2'
     else
-      '$REMOTE_PYTHON' -m pip install cryptography
+      '$REMOTE_PYTHON' -m pip install \
+        'croniter>=6,<7' 'cryptography>=44,<47' 'python-dateutil>=2.9,<3' 'tzdata>=2025.2'
     fi
   fi
 "
 
 echo "Compiling server on $REMOTE_HOST"
-ssh "$REMOTE_HOST" "'$REMOTE_PYTHON' -m py_compile '$REMOTE_SERVER_PATH' '$REMOTE_SERVER_DIR/update_runner.py'"
+ssh "$REMOTE_HOST" "chmod 755 '$REMOTE_SERVER_DIR/agentsdock_jobs.py' && '$REMOTE_PYTHON' -m py_compile '$REMOTE_SERVER_PATH' '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/update_runner.py'"
 
 echo "Restarting $SERVICE_NAME"
 ssh "$REMOTE_HOST" "systemctl --user restart '$SERVICE_NAME'"

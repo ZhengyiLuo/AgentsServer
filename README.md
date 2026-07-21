@@ -449,6 +449,54 @@ the selected CLI is unavailable, the endpoint returns a structured
 `last_error` on a ready runtime so model overloads, bad thread IDs, and ordinary
 provider failures are not mislabeled as missing installations.
 
+## Agent-managed scheduled jobs
+
+Every Claude and Codex turn receives a compact snapshot of up to 25 jobs
+belonging to that chat. The snapshot contains only job ID, title, enabled
+state, schedule, IANA timezone, and next-run time; job prompts are omitted.
+The helper's `list` command returns the complete current set. Agents are
+instructed to change jobs only after an explicit scheduling request.
+
+The installed `agentsdock_jobs.py` helper is the authoritative interface from
+an agent turn. AgentsServer supplies its URL, bearer token, executable path,
+and active chat ID through the child-process environment. Those values cannot
+be overridden with CLI flags. The helper uses server-enforced chat-scoped
+routes for `list`, `create`, `update`, and `delete`, and deliberately provides
+no run-now command. For example, from an active agent process:
+
+```bash
+"$AGENTSDOCK_JOBS_CLI" list
+"$AGENTSDOCK_JOBS_CLI" create --title "Daily status" \
+  --prompt "Summarize the current project status." \
+  --interval-seconds 86400 --loop
+"$AGENTSDOCK_JOBS_CLI" create --title "Weekday status" \
+  --prompt "Summarize the current project status." \
+  --cron "0 9 * * MON-FRI" --timezone America/Los_Angeles
+"$AGENTSDOCK_JOBS_CLI" update JOB_ID \
+  --rrule "FREQ=WEEKLY;BYDAY=MO,WE,FR;BYHOUR=8;BYMINUTE=0;BYSECOND=0" \
+  --timezone Europe/London
+"$AGENTSDOCK_JOBS_CLI" delete JOB_ID
+```
+
+Cron accepts Vixie five-field expressions, aliases such as `@daily`, and
+seconds-first six- or seven-field expressions (the seventh field is year).
+Hashed `H` fields are stable per job; nondeterministic `R` fields are rejected.
+RRULE accepts one RFC 5545 recurrence-rule property with an optional `RRULE:`
+prefix. Explicit first-run timestamps run exactly once even when off-rule;
+subsequent runs return to the calendar schedule. Missed occurrences are
+skipped, retries do not move the canonical schedule, nonexistent DST times are
+skipped, and ambiguous fall-back times run once.
+
+Interval schedules are capped at ten years. RRULE `COUNT` is capped at 10,000,
+and leap-second `BYSECOND=60` is rejected because the runtime clock cannot
+represent second 60.
+
+Agent-created jobs use the same job store as the desktop and mobile clients,
+so they immediately appear in the Jobs panel. The scoped helper routes are:
+
+- `GET/POST /api/sessions/{session_id}/jobs`
+- `PATCH/DELETE /api/sessions/{session_id}/jobs/{job_id}`
+
 ## Whole-History Search
 
 `GET /api/search?q=<query>&limit=<chat-count>` searches user, assistant, error,
@@ -496,6 +544,14 @@ The server exposes JSON endpoints under `/api`.
 - `GET /api/sessions/{session_id}/files`
 - `GET /api/sessions/{session_id}/diffs/{run_id}`
 - `POST /api/sessions/{session_id}/upload`
+- `GET /api/jobs`
+- `POST /api/jobs`
+- `PATCH /api/jobs/{job_id}`
+- `DELETE /api/jobs/{job_id}`
+- `GET /api/sessions/{session_id}/jobs`
+- `POST /api/sessions/{session_id}/jobs`
+- `PATCH /api/sessions/{session_id}/jobs/{job_id}`
+- `DELETE /api/sessions/{session_id}/jobs/{job_id}`
 - `GET /api/sessions/{session_id}/processes`
 - `GET /api/sessions/{session_id}/tmux`
 - `GET /api/runtime/catalog`

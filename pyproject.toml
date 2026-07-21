@@ -3,10 +3,13 @@ name = "agents-server-runtime"
 version = "0.1.6"
 requires-python = ">=3.10"
 dependencies = [
+  "croniter>=6,<7",
   "cryptography>=44,<47",
   "fastapi>=0.115,<1",
   "pydantic>=2.10,<3",
+  "python-dateutil>=2.9,<3",
   "python-multipart>=0.0.20,<1",
+  "tzdata>=2025.2",
   "uvicorn>=0.34,<1",
   "websockets>=13,<16",
 ]

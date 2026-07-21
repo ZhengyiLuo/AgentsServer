@@ -15,6 +15,7 @@ from pathlib import Path
 
 FILES = (
     "agent_server.py",
+    "agentsdock_jobs.py",
     "install.sh",
     "update_runner.py",
     "pyproject.toml",
@@ -46,6 +47,7 @@ def main() -> int:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(root / name, target)
         (package_root / "install.sh").chmod(0o755)
+        (package_root / "agentsdock_jobs.py").chmod(0o755)
         (package_root / "update_runner.py").chmod(0o755)
         with tarfile.open(archive_path, "w:gz", format=tarfile.PAX_FORMAT) as archive:
             archive.add(package_root, arcname=package_root.name)
@@ -56,7 +58,7 @@ def main() -> int:
     manifest = {
         "schema": 1,
         "version": version,
-        "api_contract_version": 7,
+        "api_contract_version": 8,
         "commit": commit,
         "archive": {
             "name": archive_name,

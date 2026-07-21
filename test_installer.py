@@ -10,6 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 INSTALLER = ROOT / "install.sh"
+DEPLOYER = ROOT / "deploy.sh"
 
 
 class InstallerContractTests(unittest.TestCase):
@@ -17,16 +18,28 @@ class InstallerContractTests(unittest.TestCase):
         project = tomllib.loads((ROOT / "pyproject.toml").read_text())
         dependencies = project["project"]["dependencies"]
         self.assertTrue(any(item.startswith("websockets") for item in dependencies))
+        self.assertTrue(any(item.startswith("croniter") for item in dependencies))
+        self.assertTrue(any(item.startswith("python-dateutil") for item in dependencies))
+        self.assertTrue(any(item.startswith("tzdata") for item in dependencies))
         self.assertIn("-c 'import websockets'", INSTALLER.read_text())
+        self.assertIn("import croniter, dateutil", INSTALLER.read_text())
 
     def test_shell_syntax_is_valid(self):
-        result = subprocess.run(
-            ["bash", "-n", str(INSTALLER)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
+        for script in (INSTALLER, DEPLOYER):
+            with self.subTest(script=script.name):
+                result = subprocess.run(
+                    ["bash", "-n", str(script)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_direct_deploy_includes_scheduler_runtime(self):
+        source = DEPLOYER.read_text()
+        self.assertIn('"$SCRIPT_DIR/agentsdock_jobs.py"', source)
+        self.assertIn("import croniter, cryptography, dateutil, tzdata", source)
+        self.assertIn("python-dateutil>=2.9,<3", source)
 
     def test_installer_preserves_state_and_emits_private_result(self):
         source = INSTALLER.read_text()

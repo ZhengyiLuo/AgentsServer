@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import mmap
 import os
 import pty
@@ -39,7 +40,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from croniter import CroniterBadDateError, CroniterError, croniter
+from dateutil.rrule import rrulestr
+from dateutil.tz import datetime_exists
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -203,7 +208,7 @@ AGENT_TOKEN = env_setting(
 ) or ""
 SERVER_BIND_ADDRESS = agentsdock_setting("AGENT_BIND", "0.0.0.0")
 SERVER_PORT = int(agentsdock_setting("AGENT_PORT", "7850"))
-API_CONTRACT_VERSION = 7
+API_CONTRACT_VERSION = 8
 SESSION_ORDER_STEP = 1000.0
 CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS = int(agentsdock_setting("CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS", "120"))
 
@@ -387,27 +392,371 @@ User prompt follows.
 
 """
 
+SCHEDULED_JOBS_PROMPT = """\
+
+Scheduled jobs:
+- The current-jobs snapshot below is context only. Create, update, or delete a
+  job only when the user explicitly asks to schedule or manage automation; do
+  not infer a schedule from requests to wait, monitor, or check again later.
+- The helper uses server-enforced chat-scoped job routes. Use its authoritative
+  list before changes and its help for the complete cron/RRULE syntax:
+  `"$AGENTSDOCK_JOBS_CLI" list`
+  `"$AGENTSDOCK_JOBS_CLI" create --title TITLE --prompt PROMPT --cron '0 9 * * *' --timezone America/Los_Angeles`
+  `"$AGENTSDOCK_JOBS_CLI" update JOB_ID --rrule 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0;BYSECOND=0' --timezone America/Los_Angeles`
+  `"$AGENTSDOCK_JOBS_CLI" delete JOB_ID`
+- The injected authentication environment is privileged. Do not call the jobs
+  API directly, pass alternate server/chat credentials, expose the token, or
+  attempt a run-now action.
+"""
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def parse_job_timestamp(value: str | None) -> float | None:
+VALID_JOB_SCHEDULE_KINDS = {"interval", "cron", "rrule"}
+CRON_RANDOM_TOKEN_RE = re.compile(r"(?i)\bR\b")
+CRON_HASH_TOKEN_RE = re.compile(r"(?i)\bH\b")
+RRULE_FREQUENCIES = {"SECONDLY", "MINUTELY", "HOURLY", "DAILY", "WEEKLY", "MONTHLY", "YEARLY"}
+RRULE_WEEKDAYS = {"MO", "TU", "WE", "TH", "FR", "SA", "SU"}
+RRULE_ALLOWED_PARTS = {
+    "FREQ", "UNTIL", "COUNT", "INTERVAL", "BYSECOND", "BYMINUTE", "BYHOUR", "BYDAY",
+    "BYMONTHDAY", "BYYEARDAY", "BYWEEKNO", "BYMONTH", "BYSETPOS", "WKST",
+}
+RRULE_INTEGER_LIST_RANGES = {
+    # Python datetime cannot represent RFC leap-second value 60.
+    "BYSECOND": (0, 59, True),
+    "BYMINUTE": (0, 59, True),
+    "BYHOUR": (0, 23, True),
+    "BYMONTHDAY": (-31, 31, False),
+    "BYYEARDAY": (-366, 366, False),
+    "BYWEEKNO": (-53, 53, False),
+    "BYMONTH": (1, 12, True),
+    "BYSETPOS": (-366, 366, False),
+}
+MAX_RRULE_COUNT = 10_000
+MAX_RRULE_SCAN = MAX_RRULE_COUNT + 10_000
+MAX_JOB_INTERVAL_SECONDS = 10 * 366 * 24 * 60 * 60
+
+
+def normalize_job_timezone(value: Any) -> str:
+    name = str(value or "UTC").strip() or "UTC"
+    try:
+        zone = ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid IANA timezone: {name}") from exc
+    return str(getattr(zone, "key", name) or name)
+
+
+def parse_job_timestamp(value: str | None, timezone_name: str = "UTC") -> float | None:
     if value is None:
         return None
     clean = str(value).strip()
     if not clean:
         return None
-    with suppress(ValueError):
-        return float(clean)
+    try:
+        numeric = float(clean)
+    except ValueError:
+        pass
+    else:
+        if not math.isfinite(numeric):
+            raise HTTPException(status_code=400, detail="job timestamp must be finite")
+        try:
+            datetime.fromtimestamp(numeric, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="job timestamp is outside the supported range") from exc
+        return numeric
     normalized = clean[:-1] + "+00:00" if clean.endswith("Z") else clean
     try:
         parsed = datetime.fromisoformat(normalized)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="invalid job timestamp") from exc
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=ZoneInfo(normalize_job_timezone(timezone_name)))
+        if not datetime_exists(parsed):
+            raise HTTPException(status_code=400, detail="job timestamp does not exist in the selected timezone")
     return parsed.timestamp()
+
+
+def job_schedule_kind(job: dict[str, Any]) -> str:
+    kind = str(job.get("schedule_kind") or "").strip().lower()
+    if kind in VALID_JOB_SCHEDULE_KINDS:
+        return kind
+    if str(job.get("cron_expression") or "").strip():
+        return "cron"
+    if str(job.get("rrule") or "").strip():
+        return "rrule"
+    return "interval"
+
+
+def normalize_cron_expression(value: Any, job_id: str) -> str:
+    expression = " ".join(str(value or "").split())
+    if not expression:
+        raise HTTPException(status_code=400, detail="cron_expression is required for a cron schedule")
+    if CRON_RANDOM_TOKEN_RE.search(expression):
+        raise HTTPException(
+            status_code=400,
+            detail="cron random (R) fields are not supported; use hashed (H) fields for stable schedules",
+        )
+    hash_id = job_id if CRON_HASH_TOKEN_RE.search(expression) else None
+    try:
+        valid = croniter.is_valid(
+            expression,
+            hash_id=hash_id,
+            second_at_beginning=True,
+            strict=True,
+        )
+    except CroniterError as exc:
+        raise HTTPException(status_code=400, detail=f"invalid cron expression: {exc}") from exc
+    if not valid:
+        raise HTTPException(status_code=400, detail="invalid cron expression")
+    return expression
+
+
+def validate_rrule_parts(expression: str) -> dict[str, str]:
+    parts: dict[str, str] = {}
+    for raw_part in expression.split(";"):
+        key, separator, raw_value = raw_part.partition("=")
+        key = key.strip().upper()
+        item = raw_value.strip()
+        if not separator or not key or not item:
+            raise HTTPException(status_code=400, detail="invalid RFC 5545 RRULE property")
+        if key not in RRULE_ALLOWED_PARTS:
+            raise HTTPException(status_code=400, detail=f"unsupported RFC 5545 RRULE part: {key}")
+        if key in parts:
+            raise HTTPException(status_code=400, detail=f"RRULE part may appear only once: {key}")
+        parts[key] = item
+
+    frequency = parts.get("FREQ", "").upper()
+    if frequency not in RRULE_FREQUENCIES:
+        raise HTTPException(status_code=400, detail="RRULE requires a valid FREQ part")
+    if "COUNT" in parts and "UNTIL" in parts:
+        raise HTTPException(status_code=400, detail="RRULE cannot contain both COUNT and UNTIL")
+    for key in ("COUNT", "INTERVAL"):
+        if key not in parts:
+            continue
+        if not re.fullmatch(r"\d+", parts[key]):
+            raise HTTPException(status_code=400, detail=f"RRULE {key} must be a positive integer")
+        if len(parts[key]) > 10:
+            raise HTTPException(status_code=400, detail=f"RRULE {key} is too large")
+        number = int(parts[key])
+        if number < 1:
+            raise HTTPException(status_code=400, detail=f"RRULE {key} must be at least 1")
+        if key == "COUNT" and number > MAX_RRULE_COUNT:
+            raise HTTPException(status_code=400, detail=f"RRULE COUNT must be at most {MAX_RRULE_COUNT}")
+
+    for key, (minimum, maximum, zero_allowed) in RRULE_INTEGER_LIST_RANGES.items():
+        if key not in parts:
+            continue
+        values = parts[key].split(",")
+        if any(not re.fullmatch(r"[+-]?\d+", item) for item in values):
+            raise HTTPException(status_code=400, detail=f"RRULE {key} contains an invalid integer")
+        if any(len(item.lstrip("+-")) > 3 for item in values):
+            raise HTTPException(status_code=400, detail=f"RRULE {key} contains an integer that is too large")
+        numbers = [int(item) for item in values]
+        if any(number < minimum or number > maximum or (number == 0 and not zero_allowed) for number in numbers):
+            raise HTTPException(status_code=400, detail=f"RRULE {key} contains a value outside its RFC 5545 range")
+
+    if "BYDAY" in parts:
+        for item in parts["BYDAY"].upper().split(","):
+            match = re.fullmatch(r"([+-]?\d{1,2})?(MO|TU|WE|TH|FR|SA|SU)", item)
+            if not match:
+                raise HTTPException(status_code=400, detail="RRULE BYDAY contains an invalid weekday")
+            if match.group(1):
+                ordinal = int(match.group(1))
+                if ordinal == 0 or abs(ordinal) > 53:
+                    raise HTTPException(status_code=400, detail="RRULE BYDAY ordinal must be between 1 and 53")
+                if frequency not in {"MONTHLY", "YEARLY"}:
+                    raise HTTPException(status_code=400, detail="numeric BYDAY is only valid with MONTHLY or YEARLY")
+                if frequency == "MONTHLY" and abs(ordinal) > 5:
+                    raise HTTPException(status_code=400, detail="numeric MONTHLY BYDAY must be between 1 and 5")
+                if frequency == "YEARLY" and "BYWEEKNO" in parts:
+                    raise HTTPException(status_code=400, detail="numeric BYDAY cannot be combined with YEARLY BYWEEKNO")
+    if "WKST" in parts and parts["WKST"].upper() not in RRULE_WEEKDAYS:
+        raise HTTPException(status_code=400, detail="RRULE WKST must be a weekday")
+    if "BYWEEKNO" in parts and frequency != "YEARLY":
+        raise HTTPException(status_code=400, detail="RRULE BYWEEKNO is only valid with YEARLY")
+    if "BYMONTHDAY" in parts and frequency == "WEEKLY":
+        raise HTTPException(status_code=400, detail="RRULE BYMONTHDAY is not valid with WEEKLY")
+    if "BYYEARDAY" in parts and frequency in {"DAILY", "WEEKLY", "MONTHLY"}:
+        raise HTTPException(status_code=400, detail=f"RRULE BYYEARDAY is not valid with {frequency}")
+    if "BYSETPOS" in parts and not any(key.startswith("BY") and key != "BYSETPOS" for key in parts):
+        raise HTTPException(status_code=400, detail="RRULE BYSETPOS requires another BY rule part")
+    return parts
+
+
+def normalize_rrule_expression(value: Any, timezone_name: str, schedule_start_at: float) -> str:
+    expression = str(value or "").strip()
+    if expression.upper().startswith("RRULE:"):
+        expression = expression[6:].strip()
+    if not expression:
+        raise HTTPException(status_code=400, detail="rrule is required for an RRULE schedule")
+    if "\n" in expression or "\r" in expression:
+        raise HTTPException(
+            status_code=400,
+            detail="rrule must be one RFC 5545 RRULE property, not an iCalendar document",
+        )
+    validate_rrule_parts(expression)
+    zone = ZoneInfo(normalize_job_timezone(timezone_name))
+    anchor = datetime.fromtimestamp(float(schedule_start_at), tz=zone)
+    try:
+        rrulestr(expression, dtstart=anchor)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid RFC 5545 RRULE: {exc}") from exc
+    return expression
+
+
+def cron_hash_id(expression: str, job_id: str) -> str | None:
+    return job_id if CRON_HASH_TOKEN_RE.search(expression) else None
+
+
+def cron_clock_field_allows(values: list[Any], actual: int) -> bool:
+    if values == ["*"] or "*" in values:
+        return True
+    return actual in values
+
+
+def cron_candidate_has_requested_clock(iterator: croniter, candidate: datetime) -> bool:
+    """Reject croniter's synthetic spring-gap clock time.
+
+    croniter correctly keeps ordinary jobs at local wall time across DST, but
+    for a nonexistent clock time it may return the first valid time after the
+    gap. We use normal cron semantics instead: skip that nonexistent slot.
+    """
+    expanded = iterator.expanded
+    if not cron_clock_field_allows(expanded[0], candidate.minute):
+        return False
+    if not cron_clock_field_allows(expanded[1], candidate.hour):
+        return False
+    expected_seconds = expanded[5] if len(expanded) >= 6 else [0]
+    return cron_clock_field_allows(expected_seconds, candidate.second)
+
+
+def next_job_occurrence(
+    job: dict[str, Any],
+    after_timestamp: float,
+    *,
+    inclusive: bool = False,
+) -> float | None:
+    """Return the next canonical occurrence without anchoring to completion time."""
+    kind = job_schedule_kind(job)
+    after = float(after_timestamp)
+    anchor_value = job.get("schedule_start_at")
+    if anchor_value is None:
+        anchor_value = job.get("scheduled_run_at")
+    if anchor_value is None:
+        anchor_value = job.get("next_run_at")
+
+    if kind == "interval":
+        if anchor_value is None:
+            return None
+        anchor = float(anchor_value)
+        interval_value = job.get("interval_seconds")
+        if not interval_value:
+            if anchor > after or (inclusive and anchor >= after):
+                return anchor
+            return None
+        interval = int(interval_value)
+        if interval <= 0:
+            return None
+        if anchor > after or (inclusive and anchor >= after):
+            return anchor
+        elapsed = max(0.0, after - anchor)
+        steps = int(elapsed // interval)
+        candidate = anchor + (steps * interval)
+        if candidate < after or (not inclusive and candidate <= after):
+            candidate += interval
+        return candidate
+
+    timezone_name = normalize_job_timezone(job.get("timezone"))
+    zone = ZoneInfo(timezone_name)
+    anchor = float(anchor_value if anchor_value is not None else after)
+
+    if kind == "cron":
+        expression = normalize_cron_expression(job.get("cron_expression"), str(job.get("id") or "job"))
+        after = max(after, anchor)
+        base = datetime.fromtimestamp(after, tz=zone)
+        hashed = cron_hash_id(expression, str(job.get("id") or "job"))
+        if inclusive and base.microsecond == 0 and not hashed:
+            try:
+                if (
+                    base.fold == 0
+                    and datetime_exists(base)
+                    and croniter.match(expression, base, second_at_beginning=True)
+                ):
+                    return base.timestamp()
+            except CroniterError:
+                pass
+        try:
+            iterator = croniter(
+                expression,
+                base,
+                ret_type=datetime,
+                hash_id=hashed,
+                second_at_beginning=True,
+            )
+            for _ in range(10000):
+                candidate = iterator.get_next(datetime)
+                if candidate.tzinfo is None:
+                    candidate = candidate.replace(tzinfo=zone)
+                if candidate.fold == 1 or not datetime_exists(candidate):
+                    continue
+                if not cron_candidate_has_requested_clock(iterator, candidate):
+                    continue
+                timestamp = candidate.timestamp()
+                if timestamp > after or (inclusive and timestamp >= after):
+                    return timestamp
+            raise HTTPException(status_code=400, detail="cron expression produced too many invalid occurrences")
+        except CroniterBadDateError:
+            return None
+        except CroniterError as exc:
+            raise HTTPException(status_code=400, detail=f"invalid cron expression: {exc}") from exc
+
+    expression = normalize_rrule_expression(job.get("rrule"), timezone_name, anchor)
+    rule_anchor = datetime.fromtimestamp(anchor, tz=zone)
+    try:
+        parts = validate_rrule_parts(expression)
+        count_limit = int(parts["COUNT"]) if "COUNT" in parts else None
+        rule_expression = ";".join(
+            part for part in expression.split(";") if not part.strip().upper().startswith("COUNT=")
+        ) if count_limit is not None else expression
+        rule = rrulestr(rule_expression, dtstart=rule_anchor)
+        valid_seen = 0
+        if count_limit is not None:
+            for iteration, candidate in enumerate(rule):
+                if iteration >= MAX_RRULE_SCAN:
+                    return None
+                if candidate.tzinfo is None:
+                    candidate = candidate.replace(tzinfo=zone)
+                if candidate.fold == 1 or not datetime_exists(candidate):
+                    continue
+                valid_seen += 1
+                if valid_seen > count_limit:
+                    return None
+                timestamp = candidate.timestamp()
+                if timestamp > after or (inclusive and timestamp >= after):
+                    return timestamp
+            return None
+
+        cursor = datetime.fromtimestamp(after, tz=zone)
+        include_cursor = inclusive
+        for _ in range(10_000):
+            candidate = rule.after(cursor, inc=include_cursor)
+            if candidate is None:
+                return None
+            include_cursor = False
+            if candidate.tzinfo is None:
+                candidate = candidate.replace(tzinfo=zone)
+            if candidate.fold == 1 or not datetime_exists(candidate):
+                cursor = candidate
+                continue
+            timestamp = candidate.timestamp()
+            if timestamp > after or (inclusive and timestamp >= after):
+                return timestamp
+            cursor = candidate
+        raise HTTPException(status_code=400, detail="rrule produced too many invalid occurrences")
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid RFC 5545 RRULE: {exc}") from exc
 
 
 def safe_name(name: str) -> str:
@@ -944,16 +1293,27 @@ class TerminalActionRequest(BaseModel):
     target: str | None = None
 
 
-class CreateJobRequest(BaseModel):
-    session_id: str
+class JobCreateFields(BaseModel):
     title: str
     prompt: str
+    schedule_kind: str | None = None
     interval_seconds: int | None = None
+    cron_expression: str | None = None
+    rrule: str | None = None
+    timezone: str | None = None
     first_run_at: str | None = None
     loop: bool = False
     max_runs: int | None = None
     enabled: bool = True
     backend: str | None = None
+
+
+class CreateJobRequest(JobCreateFields):
+    session_id: str
+
+
+class CreateScopedJobRequest(JobCreateFields):
+    pass
 
 
 def normalize_runtime_effort(backend: str, effort: Any, *, strict: bool = False) -> str | None:
@@ -988,7 +1348,11 @@ def clean_session_system_prompt(value: Any) -> str | None:
 class UpdateJobRequest(BaseModel):
     title: str | None = None
     prompt: str | None = None
+    schedule_kind: str | None = None
     interval_seconds: int | None = None
+    cron_expression: str | None = None
+    rrule: str | None = None
+    timezone: str | None = None
     next_run_at: str | None = None
     loop: bool | None = None
     max_runs: int | None = None
@@ -1327,6 +1691,54 @@ class SessionStore:
 STORE = SessionStore()
 
 
+def requested_job_schedule_kind(
+    schedule_kind: Any,
+    interval_seconds: Any,
+    cron_expression: Any,
+    rrule_expression: Any,
+) -> str:
+    explicit = str(schedule_kind or "").strip().lower()
+    if explicit and explicit not in VALID_JOB_SCHEDULE_KINDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"schedule_kind must be one of {sorted(VALID_JOB_SCHEDULE_KINDS)}",
+        )
+    supplied: list[str] = []
+    if interval_seconds is not None:
+        supplied.append("interval")
+    if str(cron_expression or "").strip():
+        supplied.append("cron")
+    if str(rrule_expression or "").strip():
+        supplied.append("rrule")
+    if len(supplied) > 1:
+        raise HTTPException(status_code=400, detail="choose only one of interval_seconds, cron_expression, or rrule")
+    inferred = supplied[0] if supplied else "interval"
+    if explicit and supplied and explicit != inferred:
+        raise HTTPException(status_code=400, detail=f"{supplied[0]} schedule fields conflict with schedule_kind={explicit}")
+    return explicit or inferred
+
+
+def normalize_interval_seconds(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        interval = int(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="interval_seconds must be a positive integer") from exc
+    if interval <= 0:
+        raise HTTPException(status_code=400, detail="interval_seconds must be a positive integer")
+    if interval > MAX_JOB_INTERVAL_SECONDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"interval_seconds must be at most {MAX_JOB_INTERVAL_SECONDS}",
+        )
+    return interval
+
+
+def event_job(job: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in public_job(job).items() if key != "prompt"}
+
+
 class JobStore:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -1335,12 +1747,30 @@ class JobStore:
 
     async def load(self) -> None:
         ensure_dirs()
+        changed = False
         if JOBS_FILE.exists():
             try:
                 self.jobs = json.loads(JOBS_FILE.read_text())
             except Exception as e:
                 logger.warning("failed to load jobs: %s", e)
                 self.jobs = {}
+        for job in self.jobs.values():
+            if job.get("schedule_kind") not in VALID_JOB_SCHEDULE_KINDS:
+                job["schedule_kind"] = job_schedule_kind(job)
+                changed = True
+            if not str(job.get("timezone") or "").strip():
+                job["timezone"] = "UTC"
+                changed = True
+            if "schedule_start_at" not in job:
+                # Keep an upgraded interval job's exact next_run_at. This is a
+                # recurrence anchor only; load must not reschedule legacy jobs.
+                job["schedule_start_at"] = job.get("scheduled_run_at", job.get("next_run_at"))
+                changed = True
+            if "scheduled_run_at" not in job:
+                job["scheduled_run_at"] = job.get("next_run_at") if job.get("enabled") else None
+                changed = True
+        if changed:
+            await self.save()
 
     async def save(self) -> None:
         ensure_dirs()
@@ -1355,71 +1785,262 @@ class JobStore:
             raise HTTPException(status_code=400, detail=f"backend must be one of {sorted(VALID_BACKENDS)}")
         jid = f"job_{uuid.uuid4().hex[:16]}"
         now = now_iso()
-        first_run_at = parse_job_timestamp(req.first_run_at)
-        max_runs = None if req.loop else max(1, int(req.max_runs or 1))
+        now_timestamp = time.time()
+        schedule_kind = requested_job_schedule_kind(
+            req.schedule_kind,
+            req.interval_seconds,
+            req.cron_expression,
+            req.rrule,
+        )
+        timezone_name = normalize_job_timezone(req.timezone)
+        interval_seconds = normalize_interval_seconds(req.interval_seconds) if schedule_kind == "interval" else None
+        first_run_at = parse_job_timestamp(req.first_run_at, timezone_name)
+        schedule_start_at = first_run_at if first_run_at is not None else now_timestamp
+        if schedule_kind == "rrule" and first_run_at is None:
+            # Keep DTSTART strictly after the request instant so COUNT includes
+            # the first scheduled execution instead of consuming a past anchor.
+            schedule_start_at = float(math.ceil(now_timestamp))
+        cron_expression = None
+        rrule_expression = None
+        if schedule_kind == "cron":
+            cron_expression = normalize_cron_expression(req.cron_expression, jid)
+        elif schedule_kind == "rrule":
+            rrule_expression = normalize_rrule_expression(req.rrule, timezone_name, schedule_start_at)
+
+        recurring_calendar = schedule_kind in {"cron", "rrule"}
+        loop = True if recurring_calendar else bool(req.loop)
+        if recurring_calendar:
+            max_runs = max(1, int(req.max_runs)) if req.max_runs is not None else None
+        else:
+            max_runs = None if loop else max(1, int(req.max_runs or 1))
+        if schedule_kind == "interval" and first_run_at is None and interval_seconds:
+            schedule_start_at = now_timestamp + interval_seconds
         job = {
             "id": jid,
             "session_id": req.session_id,
             "title": req.title,
             "prompt": req.prompt,
-            "interval_seconds": req.interval_seconds,
-            "loop": req.loop,
+            "schedule_kind": schedule_kind,
+            "interval_seconds": interval_seconds,
+            "cron_expression": cron_expression,
+            "rrule": rrule_expression,
+            "timezone": timezone_name,
+            "schedule_start_at": schedule_start_at,
+            "scheduled_run_at": None,
+            "loop": loop,
             "max_runs": max_runs,
             "enabled": req.enabled,
             "backend": req.backend,
             "created_at": now,
             "updated_at": now,
             "last_run_at": None,
-            "next_run_at": first_run_at if req.enabled and first_run_at is not None else time.time() + req.interval_seconds if req.enabled and req.interval_seconds else None,
+            "next_run_at": None,
             "run_count": 0,
         }
+        if req.enabled:
+            if first_run_at is not None:
+                # An explicit first run is exact, even when it is off-rule.
+                next_run_at = first_run_at
+            elif schedule_kind == "interval":
+                next_run_at = schedule_start_at if interval_seconds else None
+            else:
+                next_run_at = next_job_occurrence(job, now_timestamp, inclusive=False)
+            job["next_run_at"] = next_run_at
+            job["scheduled_run_at"] = next_run_at
+            if next_run_at is None and schedule_kind in {"cron", "rrule"}:
+                job["enabled"] = False
         async with self._lock:
             self.jobs[jid] = job
             await self.save()
         await append_event(req.session_id, "job_created", {
-            "job": public_job(job),
+            "job": event_job(job),
             "job_id": jid,
             "message": f"Scheduled job created: {req.title}",
         })
         return job
 
-    async def update(self, jid: str, patch: dict[str, Any]) -> dict[str, Any]:
+    async def update(
+        self,
+        jid: str,
+        patch: dict[str, Any],
+        *,
+        expected_session_id: str | None = None,
+    ) -> dict[str, Any]:
+        updated_job: dict[str, Any]
         async with self._lock:
-            job = self.jobs.get(jid)
-            if not job:
+            stored_job = self.jobs.get(jid)
+            if not stored_job or (expected_session_id is not None and stored_job.get("session_id") != expected_session_id):
                 raise HTTPException(status_code=404, detail="job not found")
+            job = dict(stored_job)
+            was_enabled = bool(job.get("enabled"))
             if "backend" in patch and patch["backend"] is not None and patch["backend"] not in VALID_BACKENDS:
                 raise HTTPException(status_code=400, detail=f"backend must be one of {sorted(VALID_BACKENDS)}")
+            current_kind = job_schedule_kind(job)
+            requested_kind = str(patch.get("schedule_kind") or "").strip().lower()
+            legacy_interval_patch = (
+                current_kind in {"cron", "rrule"}
+                and not requested_kind
+                and patch.get("interval_seconds") is not None
+                and not str(patch.get("cron_expression") or "").strip()
+                and not str(patch.get("rrule") or "").strip()
+            )
+            if legacy_interval_patch:
+                # Contract-v7 clients only understand intervals and include
+                # interval/mode fields whenever they save a job. Preserve a
+                # v8 calendar schedule unless the caller explicitly selects a
+                # new schedule kind.
+                patch = dict(patch)
+                for key in ("interval_seconds", "loop", "max_runs"):
+                    patch.pop(key, None)
+            supplied_kinds: list[str] = []
+            if patch.get("interval_seconds") is not None:
+                supplied_kinds.append("interval")
+            if str(patch.get("cron_expression") or "").strip():
+                supplied_kinds.append("cron")
+            if str(patch.get("rrule") or "").strip():
+                supplied_kinds.append("rrule")
+            if len(supplied_kinds) > 1:
+                raise HTTPException(status_code=400, detail="choose only one schedule expression")
+            if requested_kind and requested_kind not in VALID_JOB_SCHEDULE_KINDS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"schedule_kind must be one of {sorted(VALID_JOB_SCHEDULE_KINDS)}",
+                )
+            if requested_kind and supplied_kinds and requested_kind != supplied_kinds[0]:
+                raise HTTPException(status_code=400, detail="schedule fields conflict with schedule_kind")
+            next_kind = requested_kind or (supplied_kinds[0] if supplied_kinds else current_kind)
+
             has_next_run_patch = "next_run_at" in patch and patch["next_run_at"] is not None
-            next_run_at = parse_job_timestamp(patch.get("next_run_at")) if has_next_run_patch else None
-            should_reschedule = any(key in patch for key in ("interval_seconds", "loop", "max_runs", "enabled"))
-            for key in ("title", "prompt", "interval_seconds", "loop", "enabled", "backend"):
+            timezone_name = normalize_job_timezone(
+                patch.get("timezone") if patch.get("timezone") is not None else job.get("timezone")
+            )
+            schedule_changed = next_kind != current_kind or timezone_name != normalize_job_timezone(job.get("timezone"))
+            if next_kind == "interval" and patch.get("interval_seconds") is not None:
+                schedule_changed = schedule_changed or normalize_interval_seconds(patch["interval_seconds"]) != job.get("interval_seconds")
+            elif next_kind == "cron" and str(patch.get("cron_expression") or "").strip():
+                schedule_changed = schedule_changed or normalize_cron_expression(patch["cron_expression"], jid) != job.get("cron_expression")
+            elif next_kind == "rrule" and str(patch.get("rrule") or "").strip():
+                comparison_anchor = float(job.get("schedule_start_at") or time.time())
+                schedule_changed = schedule_changed or normalize_rrule_expression(
+                    patch["rrule"], timezone_name, comparison_anchor
+                ) != job.get("rrule")
+            next_run_at = parse_job_timestamp(patch.get("next_run_at"), timezone_name) if has_next_run_patch else None
+            for key in ("title", "prompt", "enabled", "backend"):
                 if key in patch and patch[key] is not None:
                     job[key] = patch[key]
-            if "max_runs" in patch:
-                if job.get("loop"):
+            job["schedule_kind"] = next_kind
+            job["timezone"] = timezone_name
+
+            if next_kind == "interval":
+                interval_value = patch.get("interval_seconds") if "interval_seconds" in patch else job.get("interval_seconds")
+                job["interval_seconds"] = normalize_interval_seconds(interval_value)
+                job["cron_expression"] = None
+                job["rrule"] = None
+                if "loop" in patch and patch["loop"] is not None:
+                    job["loop"] = bool(patch["loop"])
+                elif current_kind != "interval":
+                    job["loop"] = False
+                if "max_runs" in patch:
+                    if job.get("loop"):
+                        job["max_runs"] = None
+                    elif patch["max_runs"] is not None:
+                        job["max_runs"] = max(1, int(patch["max_runs"]))
+                elif "loop" in patch and job.get("loop"):
                     job["max_runs"] = None
-                elif patch["max_runs"] is not None:
-                    job["max_runs"] = max(1, int(patch["max_runs"]))
-            elif "loop" in patch and job.get("loop"):
-                job["max_runs"] = None
-            elif "loop" in patch and not job.get("loop") and not job.get("max_runs"):
-                job["max_runs"] = max(1, int(job.get("run_count") or 0) + 1)
+                elif (current_kind != "interval" or "loop" in patch) and not job.get("loop"):
+                    job["max_runs"] = max(
+                        int(job.get("run_count") or 0) + 1,
+                        int(job.get("max_runs") or 1),
+                    )
+            elif next_kind == "cron":
+                expression = patch.get("cron_expression") if "cron_expression" in patch else job.get("cron_expression")
+                job["cron_expression"] = normalize_cron_expression(expression, jid)
+                job["interval_seconds"] = None
+                job["rrule"] = None
+                job["loop"] = True
+                if "max_runs" in patch:
+                    job["max_runs"] = max(1, int(patch["max_runs"])) if patch["max_runs"] is not None else None
+            else:
+                expression = patch.get("rrule") if "rrule" in patch else job.get("rrule")
+                if current_kind != "rrule" or job.get("schedule_start_at") is None:
+                    job["schedule_start_at"] = time.time()
+                job["rrule"] = normalize_rrule_expression(
+                    expression,
+                    timezone_name,
+                    float(job.get("schedule_start_at") or time.time()),
+                )
+                job["interval_seconds"] = None
+                job["cron_expression"] = None
+                job["loop"] = True
+                if "max_runs" in patch:
+                    job["max_runs"] = max(1, int(patch["max_runs"])) if patch["max_runs"] is not None else None
+
+            if schedule_changed:
+                schedule_reference = time.time()
+                if next_kind == "interval" and job.get("interval_seconds"):
+                    job["schedule_start_at"] = schedule_reference + int(job["interval_seconds"])
+                elif next_kind == "rrule":
+                    job["schedule_start_at"] = float(math.ceil(schedule_reference))
+                else:
+                    job["schedule_start_at"] = schedule_reference
+            elif job.get("schedule_start_at") is None:
+                job["schedule_start_at"] = job.get("scheduled_run_at") or job.get("next_run_at") or time.time()
+
+            max_runs = job.get("max_runs")
+            exhausted = max_runs is not None and int(job.get("run_count") or 0) >= int(max_runs)
+            if exhausted:
+                job["enabled"] = False
             if job.get("enabled") and has_next_run_patch:
                 job["next_run_at"] = next_run_at
-            elif job.get("enabled") and job.get("interval_seconds") and (should_reschedule or not job.get("next_run_at")):
-                job["next_run_at"] = time.time() + int(job["interval_seconds"])
+                job["scheduled_run_at"] = next_run_at
+            elif job.get("enabled") and (schedule_changed or patch.get("enabled") is True or not job.get("next_run_at")):
+                reference = time.time()
+                if (
+                    next_kind == "interval"
+                    and job.get("interval_seconds")
+                    and patch.get("enabled") is True
+                    and not was_enabled
+                ):
+                    job["schedule_start_at"] = reference + int(job["interval_seconds"])
+                next_occurrence = next_job_occurrence(job, reference, inclusive=False)
+                job["next_run_at"] = next_occurrence
+                job["scheduled_run_at"] = next_occurrence
+                if next_occurrence is None:
+                    job["enabled"] = False
             if not job.get("enabled"):
                 job["next_run_at"] = None
+                job["scheduled_run_at"] = None
             job["updated_at"] = now_iso()
-            await self.save()
-            return job
+            self.jobs[jid] = job
+            try:
+                await self.save()
+            except Exception:
+                self.jobs[jid] = stored_job
+                raise
+            updated_job = dict(job)
+        await append_event(str(updated_job.get("session_id") or ""), "job_updated", {
+            "job": event_job(updated_job),
+            "job_id": jid,
+            "message": f"Scheduled job updated: {updated_job.get('title') or jid}",
+        })
+        return updated_job
 
-    async def delete(self, jid: str) -> bool:
+    async def delete(self, jid: str, *, expected_session_id: str | None = None) -> bool:
+        deleted_job: dict[str, Any] | None = None
         async with self._lock:
-            existed = self.jobs.pop(jid, None)
+            current = self.jobs.get(jid)
+            if current and (expected_session_id is None or current.get("session_id") == expected_session_id):
+                deleted_job = self.jobs.pop(jid)
+            elif expected_session_id is not None:
+                raise HTTPException(status_code=404, detail="job not found")
             await self.save()
-            return existed is not None
+        if deleted_job:
+            await append_event(str(deleted_job.get("session_id") or ""), "job_deleted", {
+                "job": event_job(deleted_job),
+                "job_id": jid,
+                "message": f"Scheduled job deleted: {deleted_job.get('title') or jid}",
+            })
+        return deleted_job is not None
 
     async def delete_for_session(self, session_id: str) -> int:
         async with self._lock:
@@ -1434,16 +2055,37 @@ class JobStore:
             job = self.jobs.get(jid)
             if not job:
                 return
+            completed_at = time.time()
+            scheduled_at = float(
+                job.get("scheduled_run_at")
+                or job.get("next_run_at")
+                or completed_at
+            )
             job["last_run_at"] = now_iso()
+            job["last_scheduled_run_at"] = scheduled_at
             job["run_count"] = int(job.get("run_count") or 0) + 1
             run_count = int(job.get("run_count") or 0)
-            max_runs = int(job.get("max_runs") or 1)
-            finite_has_more = not job.get("loop") and run_count < max_runs
-            if job.get("enabled") and job.get("interval_seconds") and (job.get("loop") or finite_has_more):
-                job["next_run_at"] = time.time() + int(job["interval_seconds"])
+            max_runs = job.get("max_runs")
+            limit_reached = max_runs is not None and run_count >= int(max_runs)
+            recurring = (
+                job_schedule_kind(job) in {"cron", "rrule"}
+                or bool(job.get("loop"))
+                or (job.get("interval_seconds") is not None and max_runs is not None and run_count < int(max_runs))
+            )
+            if job.get("enabled") and recurring and not limit_reached:
+                next_occurrence = next_job_occurrence(
+                    job,
+                    max(scheduled_at, completed_at),
+                    inclusive=False,
+                )
+                job["next_run_at"] = next_occurrence
+                job["scheduled_run_at"] = next_occurrence
+                if next_occurrence is None:
+                    job["enabled"] = False
             else:
                 job["enabled"] = False
                 job["next_run_at"] = None
+                job["scheduled_run_at"] = None
             job["updated_at"] = now_iso()
             await self.save()
 
@@ -1527,14 +2169,38 @@ class JobStore:
                             "job_id": jid,
                             "message": f"Scheduled job failed: {job.get('title') or jid} — {e}",
                         })
+                    failed_at = time.time()
+                    scheduled_at = float(
+                        job.get("scheduled_run_at")
+                        or job.get("next_run_at")
+                        or failed_at
+                    )
                     run_count = int(job.get("run_count") or 0)
-                    max_runs = int(job.get("max_runs") or 1)
-                    finite_has_more = not job.get("loop") and run_count < max_runs
-                    if job.get("interval_seconds") and (job.get("loop") or finite_has_more):
-                        job["next_run_at"] = time.time() + int(job.get("interval_seconds") or 300)
+                    max_runs = job.get("max_runs")
+                    limit_reached = max_runs is not None and run_count >= int(max_runs)
+                    recurring = (
+                        job_schedule_kind(job) in {"cron", "rrule"}
+                        or bool(job.get("loop"))
+                        or (
+                            job.get("interval_seconds") is not None
+                            and max_runs is not None
+                            and run_count < int(max_runs)
+                        )
+                    )
+                    if job.get("enabled") and recurring and not limit_reached:
+                        next_occurrence = next_job_occurrence(
+                            job,
+                            max(scheduled_at, failed_at),
+                            inclusive=False,
+                        )
+                        job["next_run_at"] = next_occurrence
+                        job["scheduled_run_at"] = next_occurrence
+                        if next_occurrence is None:
+                            job["enabled"] = False
                     else:
                         job["enabled"] = False
                         job["next_run_at"] = None
+                        job["scheduled_run_at"] = None
                     await self.save()
 
 
@@ -5933,9 +6599,65 @@ def public_session(sess: dict[str, Any]) -> dict[str, Any]:
 
 def public_job(job: dict[str, Any]) -> dict[str, Any]:
     out = {k: v for k, v in job.items() if not str(k).startswith("_")}
-    if out.get("next_run_at"):
-        out["next_run_at_iso"] = datetime.fromtimestamp(float(out["next_run_at"]), tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    out["schedule_kind"] = job_schedule_kind(out)
+    out["timezone"] = str(out.get("timezone") or "UTC")
+    for key in ("next_run_at", "scheduled_run_at", "schedule_start_at", "last_scheduled_run_at"):
+        if out.get(key) is not None:
+            out[f"{key}_iso"] = datetime.fromtimestamp(
+                float(out[key]),
+                tz=timezone.utc,
+            ).isoformat(timespec="seconds").replace("+00:00", "Z")
     return out
+
+
+def compact_job_interval(value: Any) -> str:
+    try:
+        seconds = max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return "unspecified"
+    if seconds <= 0:
+        return "unspecified"
+    parts: list[str] = []
+    for suffix, unit in (("d", 86400), ("h", 3600), ("m", 60), ("s", 1)):
+        amount, seconds = divmod(seconds, unit)
+        if amount:
+            parts.append(f"{amount}{suffix}")
+        if len(parts) == 2:
+            break
+    return " ".join(parts)
+
+
+def scheduled_jobs_prompt_context(session_id: str) -> str:
+    jobs = sorted(
+        (public_job(job) for job in JOBS.jobs.values() if job.get("session_id") == session_id),
+        key=lambda job: (str(job.get("title") or "").casefold(), str(job.get("id") or "")),
+    )
+    lines = [SCHEDULED_JOBS_PROMPT.rstrip(), "", "Current jobs for this chat (turn-start snapshot; prompts omitted):"]
+    if not jobs:
+        lines.append("- none")
+    for job in jobs[:25]:
+        title = " ".join(str(job.get("title") or "Untitled").split())[:120]
+        kind = job_schedule_kind(job)
+        if kind == "cron":
+            cadence = f"cron={json.dumps(str(job.get('cron_expression') or ''), ensure_ascii=False)}"
+        elif kind == "rrule":
+            cadence = f"rrule={json.dumps(str(job.get('rrule') or ''), ensure_ascii=False)}"
+        else:
+            interval = compact_job_interval(job.get("interval_seconds"))
+            if job.get("loop"):
+                cadence = f"every {interval}"
+            else:
+                runs = max(1, int(job.get("max_runs") or 1))
+                cadence = "once" if runs == 1 else f"{runs} runs / {interval}"
+        enabled = "enabled" if job.get("enabled") else "disabled"
+        next_run = str(job.get("next_run_at_iso") or "none")
+        lines.append(
+            f"- id={job.get('id')} | title={json.dumps(title, ensure_ascii=False)} | "
+            f"{enabled} | kind={kind} | {cadence} | timezone={job.get('timezone')} | next={next_run}"
+        )
+    if len(jobs) > 25:
+        lines.append(f"- ... {len(jobs) - 25} more; use the jobs CLI list command for complete state")
+    return "\n".join(lines) + "\n\n"
 
 
 def host_pressure_snapshot() -> dict[str, Any]:
@@ -6031,6 +6753,9 @@ def agent_runner_env(session_id: str) -> dict[str, str]:
     env = runner_env()
     env["AGENTSDOCK_CHAT_ID"] = session_id
     env["AGENTSDOCK_TMUX_SESSION"] = terminal_session_name(session_id)
+    env["AGENTSDOCK_SERVER_URL"] = f"http://127.0.0.1:{SERVER_PORT}"
+    env["AGENTSDOCK_JOBS_CLI"] = str(SERVER_ROOT / "agentsdock_jobs.py")
+    env["AGENTSDOCK_AGENT_TOKEN"] = AGENT_TOKEN
     return env
 
 
@@ -6624,7 +7349,7 @@ def session_system_prompt(session_id: str, sess: dict[str, Any], manifest_path: 
     return SYSTEM_PROMPT.format(
         manifest_path=str(manifest_path),
         terminal_session=terminal_session_name(session_id),
-    ) + session_prompt_addendum(sess)
+    ) + scheduled_jobs_prompt_context(session_id) + session_prompt_addendum(sess)
 
 
 def build_claude_cmd(session_id: str, sess: dict[str, Any], manifest_path: Path, *, provider_id: str | None = None) -> list[str]:
@@ -6661,7 +7386,7 @@ def build_codex_cmd(session_id: str, sess: dict[str, Any], prompt: str, manifest
     full_prompt = CODEX_PROMPT_PRELUDE.format(
         manifest_path=str(manifest_path),
         terminal_session=terminal_session_name(session_id),
-    ) + session_prompt_addendum(sess) + prompt
+    ) + scheduled_jobs_prompt_context(session_id) + session_prompt_addendum(sess) + prompt
     model = str(sess.get("model") or configured_model or CODEX_DEFAULT_MODEL).strip()
     normalized_effort = normalize_runtime_effort(
         BACKEND_CODEX,
@@ -8610,10 +9335,26 @@ async def stop_turn(session_id: str, *, emit_event: bool = True, schedule_queue:
 
 
 @app.get("/api/jobs")
-async def list_jobs() -> dict[str, Any]:
+async def list_jobs(session_id: str | None = None) -> dict[str, Any]:
     jobs = sorted(
-        (public_job(j) for j in JOBS.jobs.values()),
+        (
+            public_job(job)
+            for job in JOBS.jobs.values()
+            if session_id is None or job.get("session_id") == session_id
+        ),
         key=lambda j: j.get("updated_at") or "",
+        reverse=True,
+    )
+    return {"jobs": jobs}
+
+
+@app.get("/api/sessions/{session_id}/jobs")
+async def list_session_jobs(session_id: str) -> dict[str, Any]:
+    if session_id not in STORE.sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+    jobs = sorted(
+        (public_job(job) for job in JOBS.jobs.values() if job.get("session_id") == session_id),
+        key=lambda job: job.get("updated_at") or "",
         reverse=True,
     )
     return {"jobs": jobs}
@@ -8625,15 +9366,37 @@ async def create_job(req: CreateJobRequest) -> dict[str, Any]:
     return {"job": public_job(job)}
 
 
+@app.post("/api/sessions/{session_id}/jobs")
+async def create_session_job(session_id: str, req: CreateScopedJobRequest) -> dict[str, Any]:
+    job = await JOBS.create(CreateJobRequest(session_id=session_id, **req.model_dump()))
+    return {"job": public_job(job)}
+
+
 @app.patch("/api/jobs/{job_id}")
 async def update_job(job_id: str, req: UpdateJobRequest) -> dict[str, Any]:
     job = await JOBS.update(job_id, req.model_dump(exclude_unset=True))
     return {"job": public_job(job)}
 
 
+@app.patch("/api/sessions/{session_id}/jobs/{job_id}")
+async def update_session_job(session_id: str, job_id: str, req: UpdateJobRequest) -> dict[str, Any]:
+    job = await JOBS.update(
+        job_id,
+        req.model_dump(exclude_unset=True),
+        expected_session_id=session_id,
+    )
+    return {"job": public_job(job)}
+
+
 @app.delete("/api/jobs/{job_id}")
 async def delete_job(job_id: str) -> dict[str, Any]:
     deleted = await JOBS.delete(job_id)
+    return {"ok": True, "deleted": deleted}
+
+
+@app.delete("/api/sessions/{session_id}/jobs/{job_id}")
+async def delete_session_job(session_id: str, job_id: str) -> dict[str, Any]:
+    deleted = await JOBS.delete(job_id, expected_session_id=session_id)
     return {"ok": True, "deleted": deleted}
 
 

@@ -1790,6 +1790,11 @@ def queue_positions(queue: deque[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def is_supersedable_queued_turn(item: dict[str, Any]) -> bool:
+    """Only ordinary composer messages are superseded by a later steer."""
+    return not str(item.get("purpose") or "").strip()
+
+
 def merged_file_ids(*groups: list[str] | tuple[str, ...]) -> list[str]:
     merged: list[str] = []
     seen: set[str] = set()
@@ -1964,24 +1969,41 @@ async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]
         interrupted_turn = dict(CURRENT_TURNS.get(session_id) or {})
 
     selected: dict[str, Any] | None = None
+    superseded: list[dict[str, Any]] = []
+    predecessors: list[dict[str, Any]] = []
     remaining: int
     async with QUEUE_LOCK:
         if session_id in STEERING_SESSIONS or RUN_NOW_TURNS.get(session_id) is not None:
             raise HTTPException(status_code=409, detail="another steering handoff is already in progress")
         queue = QUEUED_TURNS.get(session_id)
         if queue:
-            kept: deque[dict[str, Any]] = deque()
-            for item in queue:
-                if selected is None and item.get("queued_id") == queued_id:
-                    selected = item
-                    continue
-                kept.append(item)
-            if kept:
-                QUEUED_TURNS[session_id] = kept
-                remaining = len(kept)
+            items = list(queue)
+            selected_index = next(
+                (idx for idx, item in enumerate(items) if item.get("queued_id") == queued_id),
+                None,
+            )
+            if selected_index is not None:
+                selected = items[selected_index]
+                predecessors = items[:selected_index]
+                superseded_indexes = {
+                    idx
+                    for idx, item in enumerate(predecessors)
+                    if is_supersedable_queued_turn(selected) and is_supersedable_queued_turn(item)
+                }
+                superseded = [items[idx] for idx in sorted(superseded_indexes)]
+                kept = deque(
+                    item
+                    for idx, item in enumerate(items)
+                    if idx != selected_index and idx not in superseded_indexes
+                )
+                if kept:
+                    QUEUED_TURNS[session_id] = kept
+                    remaining = len(kept)
+                else:
+                    QUEUED_TURNS.pop(session_id, None)
+                    remaining = 0
             else:
-                QUEUED_TURNS.pop(session_id, None)
-                remaining = 0
+                remaining = len(items)
         else:
             remaining = 0
         if selected is not None:
@@ -1992,6 +2014,7 @@ async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]
         raise HTTPException(status_code=404, detail="queued turn not found")
 
     try:
+        superseded_ids = [str(item.get("queued_id") or "") for item in superseded]
         stop_result = await stop_turn(session_id, emit_event=False, schedule_queue=False)
         interrupted = bool(stop_result.get("stopped") or stop_result.get("pending"))
         prepared = prepare_steered_turn(selected, interrupted_turn if interrupted else None)
@@ -2017,17 +2040,73 @@ async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]
             "replays_interrupted_message": bool(prepared.get("replays_interrupted_message")),
             "message": "Steering message promoted; the interrupted request will be replayed with it.",
             "remaining": remaining,
+            "superseded_queued_ids": superseded_ids,
         })
+        for item in superseded:
+            try:
+                await append_event(session_id, "turn_unqueued", {
+                    "queued_id": item.get("queued_id"),
+                    "backend": item.get("backend") or STORE.sessions[session_id].get("backend") or DEFAULT_BACKEND,
+                    "prompt": item.get("prompt") or "",
+                    "file_ids": list(item.get("file_ids") or []),
+                    "message": "Superseded by a later steering message.",
+                    "remaining": remaining,
+                    "superseded_by_queued_id": queued_id,
+                    "purpose": item.get("purpose"),
+                    "digest_job_id": item.get("digest_job_id"),
+                    "digest_detail": item.get("digest_detail"),
+                    "source_session_id": item.get("source_session_id"),
+                    "target_session_id": item.get("target_session_id"),
+                })
+            except Exception as exc:
+                # turn_queue_run_now is the durable supersession record. A
+                # redundant tombstone should not abort an accepted handoff.
+                logger.warning(
+                    "failed to append superseded queue tombstone session=%s queued_id=%s: %s",
+                    session_id,
+                    item.get("queued_id"),
+                    exc,
+                )
         asyncio.create_task(wait_for_steered_turn_slot(session_id))
         return {
             "ok": True,
             "queued_id": queued_id,
             "interrupted": interrupted,
             "replays_interrupted_message": bool(prepared.get("replays_interrupted_message")),
+            "superseded_queued_ids": superseded_ids,
         }
     except Exception:
         async with QUEUE_LOCK:
             STEERING_SESSIONS.discard(session_id)
+            if superseded:
+                current = list(QUEUED_TURNS.get(session_id) or [])
+                current_by_id = {
+                    str(item.get("queued_id") or ""): item
+                    for item in current
+                    if str(item.get("queued_id") or "")
+                }
+                superseded_by_id = {
+                    str(item.get("queued_id") or ""): item
+                    for item in superseded
+                    if str(item.get("queued_id") or "")
+                }
+                restored_prefix: list[dict[str, Any]] = []
+                restored_ids: set[str] = set()
+                for original in predecessors:
+                    item_id = str(original.get("queued_id") or "")
+                    item = current_by_id.get(item_id) or superseded_by_id.get(item_id)
+                    if item is not None and item_id not in restored_ids:
+                        restored_prefix.append(item)
+                        restored_ids.add(item_id)
+                restored = restored_prefix + [
+                    item
+                    for item in current
+                    if str(item.get("queued_id") or "") not in restored_ids
+                ]
+                if restored:
+                    QUEUED_TURNS[session_id] = deque(restored)
+                else:
+                    QUEUED_TURNS.pop(session_id, None)
         schedule_next_queued_turn(session_id)
         raise
 
@@ -2131,7 +2210,14 @@ def schedule_rebuilt_queued_turns() -> int:
 
 
 def should_schedule_queue_after_finish(session_id: str, stopped: bool) -> bool:
-    return not stopped or session_id in RUN_NOW_TURNS
+    # A steering handoff has one owner: wait_for_steered_turn_slot. Scheduling
+    # here as well races that waiter and can pop a second queued item, including
+    # when the interrupted provider finishes naturally just before stop_turn.
+    return (
+        not stopped
+        and session_id not in STEERING_SESSIONS
+        and session_id not in RUN_NOW_TURNS
+    )
 
 
 def queued_turn_from_event(event: dict[str, Any], sess: dict[str, Any], position: int) -> dict[str, Any]:
@@ -2177,6 +2263,12 @@ def rebuild_queued_turns_from_events() -> int:
                 continue
             queued_id = str(event.get("queued_id") or "")
             event_type = str(event.get("type") or "")
+            if event_type == "turn_queue_run_now":
+                for superseded_id in event.get("superseded_queued_ids") or []:
+                    superseded_id = str(superseded_id or "")
+                    pending.pop(superseded_id, None)
+                    if superseded_id in order:
+                        order.remove(superseded_id)
             if event_type == "turn_queued" and queued_id:
                 pending[queued_id] = queued_turn_from_event(event, sess, len(order) + 1)
                 if queued_id not in order:

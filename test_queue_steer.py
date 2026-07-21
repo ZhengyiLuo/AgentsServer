@@ -14,6 +14,7 @@ from agent_server import (
     queued_turn_from_event,
     rebuild_queued_turns_from_events,
     run_queued_turn_now,
+    should_schedule_queue_after_finish,
     start_next_queued_turn,
 )
 
@@ -145,6 +146,100 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["replays_interrupted_message"])
         self.assertEqual(promoted["prompt"], "Change course now.")
 
+    async def test_later_steer_supersedes_earlier_user_turn_but_keeps_later_work(self) -> None:
+        agent_server.QUEUED_TURNS["chat-1"] = deque([
+            {
+                "queued_id": "queued-first",
+                "prompt": "Stale first message.",
+                "file_ids": [],
+                "backend": "codex",
+            },
+            {
+                "queued_id": "queued-steer",
+                "prompt": "Change course now.",
+                "file_ids": ["new-file"],
+                "backend": "codex",
+            },
+            {
+                "queued_id": "queued-later",
+                "prompt": "Keep this for afterward.",
+                "file_ids": [],
+                "backend": "codex",
+            },
+        ])
+        append_event = AsyncMock(return_value={})
+
+        async def completed_wait(_session_id: str) -> None:
+            return None
+
+        with patch.object(agent_server, "stop_turn", new_callable=AsyncMock, return_value={"stopped": True}), \
+                patch.object(agent_server, "append_event", append_event), \
+                patch.object(agent_server, "wait_for_steered_turn_slot", completed_wait):
+            result = await run_queued_turn_now("chat-1", "queued-steer")
+            await asyncio.sleep(0)
+
+        self.assertEqual(result["superseded_queued_ids"], ["queued-first"])
+        self.assertEqual(agent_server.RUN_NOW_TURNS["chat-1"]["queued_id"], "queued-steer")
+        self.assertEqual(
+            [item["queued_id"] for item in agent_server.QUEUED_TURNS["chat-1"]],
+            ["queued-later"],
+        )
+        event_types = [call.args[1] for call in append_event.await_args_list]
+        self.assertEqual(event_types, ["turn_queue_run_now", "turn_unqueued"])
+        run_now_payload = append_event.await_args_list[0].args[2]
+        self.assertEqual(run_now_payload["remaining"], 1)
+        self.assertEqual(run_now_payload["superseded_queued_ids"], ["queued-first"])
+        unqueued_payload = append_event.await_args_list[1].args[2]
+        self.assertEqual(unqueued_payload["queued_id"], "queued-first")
+        self.assertEqual(unqueued_payload["superseded_by_queued_id"], "queued-steer")
+
+        agent_server.STEERING_SESSIONS.discard("chat-1")
+        with patch.object(agent_server, "start_turn", new_callable=AsyncMock) as start_turn:
+            await start_next_queued_turn("chat-1")
+            await start_next_queued_turn("chat-1")
+
+        self.assertEqual(
+            [call.kwargs["queued_id"] for call in start_turn.await_args_list],
+            ["queued-steer", "queued-later"],
+        )
+
+    async def test_later_steer_preserves_purpose_bearing_internal_work(self) -> None:
+        agent_server.QUEUED_TURNS["chat-1"] = deque([
+            {
+                "queued_id": "queued-first",
+                "prompt": "Stale first message.",
+                "file_ids": [],
+                "backend": "codex",
+            },
+            {
+                "queued_id": "queued-digest",
+                "prompt": "Internal digest.",
+                "file_ids": [],
+                "backend": "codex",
+                "purpose": "handoff_digest",
+            },
+            {
+                "queued_id": "queued-steer",
+                "prompt": "Change course now.",
+                "file_ids": [],
+                "backend": "codex",
+            },
+        ])
+
+        async def completed_wait(_session_id: str) -> None:
+            return None
+
+        with patch.object(agent_server, "stop_turn", new_callable=AsyncMock, return_value={"stopped": True}), \
+                patch.object(agent_server, "append_event", new_callable=AsyncMock), \
+                patch.object(agent_server, "wait_for_steered_turn_slot", completed_wait):
+            await run_queued_turn_now("chat-1", "queued-steer")
+            await asyncio.sleep(0)
+
+        self.assertEqual(
+            [item["queued_id"] for item in agent_server.QUEUED_TURNS["chat-1"]],
+            ["queued-digest"],
+        )
+
     async def test_second_steer_cannot_overwrite_the_first_handoff(self) -> None:
         agent_server.RUN_NOW_TURNS["chat-1"] = {
             "queued_id": "already-steering",
@@ -218,6 +313,114 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rebuilt, 1)
         self.assertEqual(agent_server.QUEUED_TURNS["chat-1"][0]["prompt"], "")
         self.assertEqual(agent_server.QUEUED_TURNS["chat-1"][0]["file_ids"], ["image-only"])
+
+    def test_recovery_does_not_resurrect_turns_superseded_by_run_now(self) -> None:
+        events = [
+            {
+                "seq": 1,
+                "type": "turn_queued",
+                "queued_id": "queued-first",
+                "prompt": "Stale first message.",
+                "file_ids": [],
+            },
+            {
+                "seq": 2,
+                "type": "turn_queued",
+                "queued_id": "queued-steer",
+                "prompt": "Run this now.",
+                "file_ids": [],
+            },
+            {
+                "seq": 3,
+                "type": "turn_queued",
+                "queued_id": "queued-later",
+                "prompt": "Keep this for afterward.",
+                "file_ids": [],
+            },
+            {
+                "seq": 4,
+                "type": "turn_queue_run_now",
+                "queued_id": "queued-steer",
+                "superseded_queued_ids": ["queued-first"],
+            },
+            {
+                "seq": 5,
+                "type": "turn_started",
+                "queued_id": "queued-steer",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            path.write_text("".join(json.dumps({
+                "id": f"event-{event['seq']}",
+                "session_id": "chat-1",
+                "ts": "2026-07-21T00:00:00Z",
+                **event,
+            }) + "\n" for event in events))
+            with patch.object(agent_server, "events_path", return_value=path):
+                rebuilt = rebuild_queued_turns_from_events()
+
+        self.assertEqual(rebuilt, 1)
+        self.assertEqual(
+            [item["queued_id"] for item in agent_server.QUEUED_TURNS["chat-1"]],
+            ["queued-later"],
+        )
+
+    def test_stopped_runner_does_not_schedule_a_second_steering_drain(self) -> None:
+        agent_server.RUN_NOW_TURNS["chat-1"] = {
+            "queued_id": "queued-steer",
+            "prompt": "Run this next.",
+        }
+
+        self.assertFalse(should_schedule_queue_after_finish("chat-1", stopped=True))
+        self.assertFalse(should_schedule_queue_after_finish("chat-1", stopped=False))
+        agent_server.RUN_NOW_TURNS.clear()
+        agent_server.STEERING_SESSIONS.add("chat-1")
+        self.assertFalse(should_schedule_queue_after_finish("chat-1", stopped=False))
+        agent_server.STEERING_SESSIONS.clear()
+        self.assertTrue(should_schedule_queue_after_finish("chat-1", stopped=False))
+
+    async def test_append_failure_restores_superseded_predecessor(self) -> None:
+        agent_server.QUEUED_TURNS["chat-1"] = deque([
+            {
+                "queued_id": "queued-first",
+                "prompt": "Do not lose this message.",
+                "file_ids": [],
+                "backend": "codex",
+            },
+            {
+                "queued_id": "queued-internal",
+                "prompt": "Internal work.",
+                "file_ids": [],
+                "backend": "codex",
+                "purpose": "scheduled_job",
+            },
+            {
+                "queued_id": "queued-second",
+                "prompt": "Do not lose this one either.",
+                "file_ids": [],
+                "backend": "codex",
+            },
+            {
+                "queued_id": "queued-steer",
+                "prompt": "Run this now.",
+                "file_ids": [],
+                "backend": "codex",
+            },
+        ])
+
+        with patch.object(agent_server, "stop_turn", new_callable=AsyncMock, return_value={"stopped": True}), \
+                patch.object(agent_server, "append_event", new_callable=AsyncMock, side_effect=OSError("disk full")), \
+                patch.object(agent_server, "schedule_next_queued_turn") as schedule_next:
+            with self.assertRaisesRegex(OSError, "disk full"):
+                await run_queued_turn_now("chat-1", "queued-steer")
+
+        self.assertEqual(
+            [item["queued_id"] for item in agent_server.QUEUED_TURNS["chat-1"]],
+            ["queued-first", "queued-internal", "queued-second"],
+        )
+        self.assertNotIn("chat-1", agent_server.STEERING_SESSIONS)
+        schedule_next.assert_called_once_with("chat-1")
 
 
 class ClaudeResultDiagnosticTests(unittest.TestCase):

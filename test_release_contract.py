@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parent
 
 class ReleaseContractTests(unittest.TestCase):
     def test_candidate_version_stays_on_0_1_12_beta_line(self):
-        self.assertEqual((ROOT / "VERSION").read_text().strip(), "0.1.12-beta.2")
+        self.assertEqual((ROOT / "VERSION").read_text().strip(), "0.1.12-beta.3")
 
     def test_workflow_marks_prerelease_tags(self):
         workflow = (ROOT / ".github" / "workflows" / "server-release.yml").read_text()
@@ -39,14 +39,14 @@ class ReleaseContractTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             manifest = json.loads((Path(temporary) / "agents-server-manifest.json").read_text())
-            self.assertEqual(manifest["version"], "0.1.12-beta.2")
+            self.assertEqual(manifest["version"], "0.1.12-beta.3")
             self.assertEqual(manifest["api_contract_version"], 10)
             self.assertTrue(manifest["prerelease"])
             self.assertEqual(manifest["track"], "beta")
             archive = Path(temporary) / manifest["archive"]["name"]
             with tarfile.open(archive, "r:gz") as bundle:
                 names = set(bundle.getnames())
-            prefix = "agents-server-0.1.12-beta.2"
+            prefix = "agents-server-0.1.12-beta.3"
             self.assertIn(f"{prefix}/agent_server.py", names)
             self.assertIn(f"{prefix}/codex_app_server.py", names)
             self.assertIn(f"{prefix}/update_runner.py", names)

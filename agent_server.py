@@ -1109,8 +1109,12 @@ EVENT_SEQ_LOCK = asyncio.Lock()
 TIMELINE_INDEX_CACHE_MAX = int(agentsdock_setting("TIMELINE_INDEX_CACHE_MAX", "24"))
 TIMELINE_INDEX_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 TIMELINE_INDEX_LOCKS: dict[str, threading.Lock] = {}
+FORK_INTERNAL_RUN_CACHE_MAX = int(agentsdock_setting("FORK_INTERNAL_RUN_CACHE_MAX", "128"))
+FORK_INTERNAL_RUN_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
+FORK_INTERNAL_RUN_LOCKS: dict[str, threading.Lock] = {}
 HISTORY_SEARCH_DB = STATE_DIR / "history_search.sqlite3"
 HISTORY_SEARCH_LOCK = threading.Lock()
+HISTORY_SEARCH_INDEX_VERSION = "2"
 HISTORY_SEARCH_DIRTY: set[str] = set()
 HISTORY_SEARCH_SYNC_INTERVAL_SECONDS = max(
     0.25, float(agentsdock_setting("HISTORY_SEARCH_SYNC_INTERVAL_SECONDS", "1.0"))
@@ -1169,6 +1173,8 @@ async def forget_event_seq(session_id: str) -> None:
         EVENT_SEQ_CACHE.pop(session_id, None)
     TIMELINE_INDEX_CACHE.pop(session_id, None)
     TIMELINE_INDEX_LOCKS.pop(session_id, None)
+    FORK_INTERNAL_RUN_CACHE.pop(session_id, None)
+    FORK_INTERNAL_RUN_LOCKS.pop(session_id, None)
 
 
 def token_matches(candidate: str | None) -> bool:
@@ -4359,6 +4365,63 @@ def active_snapshot_input(active: dict[str, Any]) -> dict[str, Any]:
     return snapshot_input
 
 
+def fork_internal_run_ids(session_id: str) -> set[str]:
+    """Return copied digest workflow run IDs, incrementally cached per transcript."""
+    path = events_path(session_id)
+    if not path.exists():
+        return set()
+    lock = FORK_INTERNAL_RUN_LOCKS.setdefault(session_id, threading.Lock())
+    with lock:
+        stat = path.stat()
+        signature = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        cached = FORK_INTERNAL_RUN_CACHE.get(session_id)
+        if cached and cached.get("signature") == signature:
+            FORK_INTERNAL_RUN_CACHE.move_to_end(session_id)
+            return set(cached.get("run_ids") or ())
+
+        can_append = bool(
+            cached and cached.get("inode") == stat.st_ino and
+            0 <= int(cached.get("offset") or 0) < stat.st_size
+        )
+        run_ids = set(cached.get("run_ids") or ()) if can_append else set()
+        offset = int(cached.get("offset") or 0) if can_append else 0
+        final_offset = offset
+        with path.open("rb") as source:
+            source.seek(offset)
+            for raw_line in source:
+                if not raw_line.strip():
+                    continue
+                with suppress(Exception):
+                    event = json.loads(raw_line.decode("utf-8", "replace"))
+                    if event.get("forked") is not True or event.get("purpose") not in FORK_INTERNAL_PURPOSES:
+                        continue
+                    run_id = str(event.get("run_id") or "").strip()
+                    if run_id:
+                        run_ids.add(run_id)
+            final_offset = source.tell()
+
+        FORK_INTERNAL_RUN_CACHE[session_id] = {
+            "signature": signature,
+            "inode": stat.st_ino,
+            "offset": final_offset,
+            "run_ids": run_ids,
+        }
+        FORK_INTERNAL_RUN_CACHE.move_to_end(session_id)
+        while len(FORK_INTERNAL_RUN_CACHE) > max(1, FORK_INTERNAL_RUN_CACHE_MAX):
+            stale_session_id, _ = FORK_INTERNAL_RUN_CACHE.popitem(last=False)
+            FORK_INTERNAL_RUN_LOCKS.pop(stale_session_id, None)
+        return set(run_ids)
+
+
+def is_fork_internal_event(event: dict[str, Any], internal_run_ids: set[str] | None = None) -> bool:
+    if event.get("forked") is not True:
+        return False
+    if event.get("purpose") in FORK_INTERNAL_PURPOSES:
+        return True
+    run_id = str(event.get("run_id") or "").strip()
+    return bool(run_id and internal_run_ids and run_id in internal_run_ids)
+
+
 def read_events(
     session_id: str,
     after: int = 0,
@@ -4372,6 +4435,7 @@ def read_events(
     if not path.exists():
         return []
     limit = max(1, min(int(limit or 500), MAX_EVENT_RESPONSE_LIMIT))
+    internal_run_ids = fork_internal_run_ids(session_id) if visible else set()
     out: list[dict[str, Any]] = []
     tail_out: deque[dict[str, Any]] | None = deque(maxlen=limit) if tail else None
     with path.open("r", encoding="utf-8", errors="ignore") as source:
@@ -4385,7 +4449,7 @@ def read_events(
             seq = int(event.get("seq", 0))
             if seq > after and (before is None or seq < before):
                 event = client_safe_event(event)
-                if visible and not is_visible_timeline_event(event):
+                if visible and not is_visible_timeline_event(event, fork_internal_run_ids=internal_run_ids):
                     continue
                 if tail_out is not None:
                     tail_out.append(event)
@@ -4411,7 +4475,14 @@ COMPACT_TIMELINE_HIDDEN_TYPES = {
 }
 
 
-def is_visible_timeline_event(event: dict[str, Any], *, compact: bool = False) -> bool:
+def is_visible_timeline_event(
+    event: dict[str, Any],
+    *,
+    compact: bool = False,
+    fork_internal_run_ids: set[str] | None = None,
+) -> bool:
+    if is_fork_internal_event(event, fork_internal_run_ids):
+        return False
     event_type = str(event.get("type") or "")
     if compact:
         return event_type not in COMPACT_TIMELINE_HIDDEN_TYPES
@@ -4433,6 +4504,7 @@ def read_visible_events_page(
     limit = max(1, min(int(limit or 500), MAX_EVENT_RESPONSE_LIMIT))
     out: list[dict[str, Any]] = []
     tail_out: deque[dict[str, Any]] | None = deque(maxlen=limit) if tail else None
+    internal_run_ids = fork_internal_run_ids(session_id)
     latest_seq = 0
     visible_count = 0
     with path.open("r", encoding="utf-8", errors="ignore") as source:
@@ -4449,7 +4521,11 @@ def read_visible_events_page(
             if seq <= after or (before is not None and seq >= before):
                 continue
             event = client_safe_event(event)
-            if not is_visible_timeline_event(event, compact=compact):
+            if not is_visible_timeline_event(
+                event,
+                compact=compact,
+                fork_internal_run_ids=internal_run_ids,
+            ):
                 continue
             visible_count += 1
             if tail_out is not None:
@@ -4479,6 +4555,7 @@ def read_visible_events_after_page(
         return [], 0, 0, 0, 0
     limit = max(1, min(int(limit or 500), MAX_EVENT_RESPONSE_LIMIT))
     selected: deque[dict[str, Any]] = deque(maxlen=limit)
+    internal_run_ids = fork_internal_run_ids(session_id)
     visible_count = 0
     latest_seq = last_event_seq_from_file(path)
 
@@ -4500,7 +4577,11 @@ def read_visible_events_after_page(
                 seq = int(event.get("seq", 0))
                 if seq <= after:
                     break
-                if not is_visible_timeline_event(event, compact=compact):
+                if not is_visible_timeline_event(
+                    event,
+                    compact=compact,
+                    fork_internal_run_ids=internal_run_ids,
+                ):
                     continue
                 visible_count += 1
                 selected.appendleft(client_safe_event(event))
@@ -5427,7 +5508,12 @@ HISTORY_SEARCH_LINE_MARKERS = tuple(
 ) + (b'_error"',)
 
 
-def history_search_event_record(event: dict[str, Any]) -> tuple[str, str] | None:
+def history_search_event_record(
+    event: dict[str, Any],
+    internal_run_ids: set[str] | None = None,
+) -> tuple[str, str] | None:
+    if is_fork_internal_event(event, internal_run_ids):
+        return None
     event_type = str(event.get("type") or "")
     if event_type not in HISTORY_SEARCH_EVENT_TYPES and not event_type.endswith("_error"):
         return None
@@ -5481,7 +5567,23 @@ def history_search_connection() -> sqlite3.Connection:
             session_id TEXT PRIMARY KEY,
             active INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS history_search_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
     """)
+    version = connection.execute(
+        "SELECT value FROM history_search_meta WHERE key = 'index_version'"
+    ).fetchone()
+    if not version or str(version[0]) != HISTORY_SEARCH_INDEX_VERSION:
+        connection.execute("DELETE FROM history_search")
+        connection.execute("DELETE FROM history_search_state")
+        connection.execute(
+            "INSERT INTO history_search_meta(key, value) VALUES ('index_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (HISTORY_SEARCH_INDEX_VERSION,),
+        )
+        connection.commit()
     return connection
 
 
@@ -5546,6 +5648,7 @@ def sync_history_search_index(
             continue
 
         indexed_sessions += 1
+        internal_run_ids = fork_internal_run_ids(session_id)
         pending: list[tuple[str, str, str, int, str | None, str]] = []
         committed_offset = offset
         with path.open("rb") as source:
@@ -5563,7 +5666,7 @@ def sync_history_search_index(
                     continue
                 with suppress(Exception):
                     event = json.loads(raw_line.decode("utf-8", "replace"))
-                    record = history_search_event_record(event)
+                    record = history_search_event_record(event, internal_run_ids)
                     if record:
                         role, text = record
                         pending.append((

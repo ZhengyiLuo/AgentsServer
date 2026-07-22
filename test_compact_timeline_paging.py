@@ -13,6 +13,8 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.previous_state_dir = agent_server.STATE_DIR
         agent_server.STATE_DIR = Path(self.temporary.name)
+        agent_server.FORK_INTERNAL_RUN_CACHE.clear()
+        agent_server.FORK_INTERNAL_RUN_LOCKS.clear()
         self.session_id = "compact-history-chat"
         path = agent_server.events_path(self.session_id)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -45,6 +47,8 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def tearDown(self) -> None:
+        agent_server.FORK_INTERNAL_RUN_CACHE.clear()
+        agent_server.FORK_INTERNAL_RUN_LOCKS.clear()
         agent_server.STATE_DIR = self.previous_state_dir
         self.temporary.cleanup()
 
@@ -103,6 +107,28 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event["seq"] for event in after_page[0]], [12, 14, 16])
         self.assertEqual(after_page[1:], (22, 6, 0, 3))
 
+    def test_legacy_fork_digest_runs_do_not_count_as_visible_page_events(self) -> None:
+        path = agent_server.events_path(self.session_id)
+        events = [
+            self.event(1, "turn_started", run_id="digest-run", purpose="handoff_digest", forked=True, prompt="Generate digest"),
+            self.event(2, "reasoning_summary", run_id="digest-run", forked=True, text="Private digest reasoning"),
+            self.event(3, "assistant_text", run_id="digest-run", forked=True, text="Private digest body"),
+            self.event(4, "turn_started", run_id="normal-run", forked=True, prompt="Retained question"),
+            self.event(5, "assistant_text", run_id="normal-run", forked=True, text="Retained answer"),
+        ]
+        path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+        agent_server.FORK_INTERNAL_RUN_CACHE.clear()
+
+        page = agent_server.read_visible_events_page(self.session_id, limit=100, tail=False)
+        after_page = agent_server.read_visible_events_after_page(self.session_id, after=0, limit=100)
+        generic = agent_server.read_events(self.session_id, limit=100, visible=True)
+
+        self.assertEqual([event["seq"] for event in page[0]], [4, 5])
+        self.assertEqual(page[1:], (5, 2, 0, 0))
+        self.assertEqual([event["seq"] for event in after_page[0]], [4, 5])
+        self.assertEqual(after_page[1:], (5, 2, 0, 0))
+        self.assertEqual([event["seq"] for event in generic], [4, 5])
+
     async def test_endpoint_keeps_default_payload_and_offloads_visible_scans(self) -> None:
         session = {
             "id": self.session_id,
@@ -146,7 +172,7 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(offload.await_args_list[1].args[0], agent_server.read_visible_events_after_page)
         self.assertTrue(offload.await_args_list[1].kwargs["compact"])
 
-    def event(self, seq: int, event_type: str) -> dict[str, object]:
+    def event(self, seq: int, event_type: str, **fields: object) -> dict[str, object]:
         event: dict[str, object] = {
             "id": f"event-{seq}",
             "session_id": self.session_id,
@@ -166,6 +192,7 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
             event["job_id"] = "job-1"
         elif event_type == "raw_event":
             event["raw"] = "provider packet"
+        event.update(fields)
         return event
 
 

@@ -230,6 +230,7 @@ SERVER_BIND_ADDRESS = agentsdock_setting("AGENT_BIND", "0.0.0.0")
 SERVER_PORT = int(agentsdock_setting("AGENT_PORT", "7850"))
 API_CONTRACT_VERSION = 10
 SESSION_ORDER_STEP = 1000.0
+FORK_INTERNAL_PURPOSES = {"handoff_digest", "handoff_digest_delivery"}
 CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS = int(agentsdock_setting("CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS", "120"))
 SUBAGENT_SNAPSHOT_STATE_LIMIT = 256
 SUBAGENT_SNAPSHOT_LOG_LIMIT = 80
@@ -5088,6 +5089,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
     active_turn_key: str | None = cached.get("active_turn_key") if can_append else None
     current_turn_by_run: dict[str, str] = dict(cached.get("current_turn_by_run") or {}) if can_append else {}
     job_by_run: dict[str, str] = dict(cached.get("job_by_run") or {}) if can_append else {}
+    fork_internal_run_ids: set[str] = set(cached.get("fork_internal_run_ids") or ()) if can_append else set()
     visible_count = int(cached.get("visible_count") or 0) if can_append else 0
     latest_seq = int(cached.get("latest_seq") or 0) if can_append else 0
     scan_offset = int(cached.get("offset") or 0) if can_append else 0
@@ -5156,6 +5158,12 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
             if seq <= 0:
                 continue
             latest_seq = max(latest_seq, seq)
+            is_forked = event.get("forked") is True
+            is_fork_internal = event.get("purpose") in FORK_INTERNAL_PURPOSES
+            if is_forked and is_fork_internal and run_id:
+                fork_internal_run_ids.add(run_id)
+            if is_forked and (is_fork_internal or run_id in fork_internal_run_ids):
+                continue
             if event_type in TIMELINE_INDEX_HIDDEN_TYPES:
                 continue
             visible_count += 1
@@ -5364,6 +5372,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
         "active_turn_key": active_turn_key,
         "current_turn_by_run": current_turn_by_run,
         "job_by_run": job_by_run,
+        "fork_internal_run_ids": fork_internal_run_ids,
         "visible_count": visible_count,
         "latest_seq": latest_seq,
         "offset": final_offset,
@@ -6965,6 +6974,11 @@ async def copy_fork_history(parent_id: str, child_id: str) -> int:
     # Fork history copy is an internal clone operation, not an API page. Do not
     # route it through read_events(), which clamps responses for UI pagination.
     parent_events = list(iter_session_events(parent_id))
+    internal_run_ids = {
+        str(event.get("run_id"))
+        for event in parent_events
+        if event.get("purpose") in FORK_INTERNAL_PURPOSES and str(event.get("run_id") or "").strip()
+    }
     assistant_runs = {
         event.get("run_id")
         for event in parent_events
@@ -6973,6 +6987,9 @@ async def copy_fork_history(parent_id: str, child_id: str) -> int:
     copied = 0
     for event in parent_events:
         event_type = event.get("type")
+        run_id = str(event.get("run_id") or "").strip()
+        if event.get("purpose") in FORK_INTERNAL_PURPOSES or run_id in internal_run_ids:
+            continue
         if event_type not in {"turn_started", "assistant_text", "reasoning_summary", "tool_started", "tool_finished", "artifact_created", "turn_finished"}:
             continue
         if event_type == "turn_finished":

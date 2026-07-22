@@ -320,7 +320,7 @@ Then start the exact checked release with both values so the server can
 re-resolve and verify it before launching the detached updater:
 
 ```json
-{"track":"beta","version":"0.1.12-beta.1"}
+{"track":"beta","version":"0.1.12-beta.2"}
 ```
 
 The check and start request bodies remain optional for older clients; omitted

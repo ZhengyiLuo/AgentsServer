@@ -49,6 +49,24 @@ class TimelineIndexJobTests(unittest.TestCase):
         self.assertEqual(job["timestamp"], "2026-07-16T10:00:09Z")
         self.assertEqual(job["preview"], "Everything is healthy.")
 
+    def test_forked_internal_digest_run_is_not_a_landmark(self) -> None:
+        session_id = "forked-chat"
+        path = agent_server.events_path(session_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        events = [
+            self.event(1, "turn_started", run_id="digest-run", purpose="handoff_digest", digest_job_id="digest-1", forked=True, prompt="Generate digest"),
+            self.event(2, "reasoning_summary", run_id="digest-run", forked=True, text="Selecting context"),
+            self.event(3, "assistant_text", run_id="digest-run", forked=True, text="Generated digest"),
+            self.event(4, "turn_started", run_id="normal-run", forked=True, prompt="Retained question"),
+            self.event(5, "assistant_text", run_id="normal-run", forked=True, text="Retained answer"),
+        ]
+        path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+
+        index = agent_server.build_timeline_index(session_id)
+
+        self.assertEqual([item["key"] for item in index["landmarks"]], ["turn:normal-run"])
+        self.assertEqual(index["event_count"], 2)
+
     @staticmethod
     def event(seq: int, event_type: str, **fields: object) -> dict[str, object]:
         return {

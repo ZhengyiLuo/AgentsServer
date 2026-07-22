@@ -47,6 +47,33 @@ class DigestQueuePersistenceTests(unittest.TestCase):
         self.assertEqual(item["effort"], "xhigh")
 
 
+class ForkHistoryDigestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_internal_digest_runs_are_not_copied_into_a_fork(self) -> None:
+        events = [
+            {"seq": 1, "id": "normal-start", "type": "turn_started", "run_id": "normal-run", "prompt": "Keep this"},
+            {"seq": 2, "id": "normal-answer", "type": "assistant_text", "run_id": "normal-run", "text": "Kept"},
+            {"seq": 3, "id": "digest-start", "type": "turn_started", "run_id": "digest-run", "purpose": "handoff_digest", "digest_job_id": "digest-1", "prompt": "Generate a digest"},
+            # Provider trace events do not always repeat the workflow metadata;
+            # the run ID must still keep them out of forked conversation history.
+            {"seq": 4, "id": "digest-thought", "type": "reasoning_summary", "run_id": "digest-run", "text": "Selecting context"},
+            {"seq": 5, "id": "digest-tool", "type": "tool_started", "run_id": "digest-run", "tool": {"name": "Read"}},
+            {"seq": 6, "id": "digest-answer", "type": "assistant_text", "run_id": "digest-run", "text": "# AgentsDock Context Digest"},
+            {"seq": 7, "id": "delivery-start", "type": "turn_started", "run_id": "delivery-run", "purpose": "handoff_digest_delivery", "digest_job_id": "digest-1", "prompt": "Delivered context"},
+            {"seq": 8, "id": "delivery-answer", "type": "assistant_text", "run_id": "delivery-run", "text": "I have the context."},
+        ]
+
+        with patch.object(agent_server, "iter_session_events", return_value=iter(events)), \
+                patch.object(agent_server, "append_event", new_callable=AsyncMock, return_value={}) as append_event:
+            copied = await agent_server.copy_fork_history("parent-1", "child-1")
+
+        child_calls = [call for call in append_event.await_args_list if call.args[0] == "child-1"]
+        self.assertEqual(copied, 2)
+        self.assertEqual([call.args[1] for call in child_calls], ["turn_started", "assistant_text"])
+        self.assertEqual([call.args[2]["run_id"] for call in child_calls], ["normal-run", "normal-run"])
+        self.assertTrue(all(call.args[2]["forked"] is True for call in child_calls))
+        self.assertEqual(append_event.await_args.args, ("parent-1", "session_forked", {"child_id": "child-1"}))
+
+
 class DigestDeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.previous_sessions = agent_server.STORE.sessions

@@ -121,7 +121,7 @@ append_server_path "/usr/local/bin"
 append_server_path "/usr/bin"
 append_server_path "/bin"
 export PATH="$SERVER_PATH"
-RELEASE_FILES=(agent_server.py codex_app_server.py agentsdock_jobs.py install.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem)
+RELEASE_FILES=(agent_server.py agentsdock_jobs.py install.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem)
 
 for name in "${RELEASE_FILES[@]}"; do
   if [[ ! -f "$SOURCE_DIR/$name" ]]; then

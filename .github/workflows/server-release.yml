@@ -26,7 +26,7 @@ jobs:
         run: |
           test "v$(cat VERSION)" = "$RELEASE_TAG"
           test "${RELEASE_TAG#v}" != "$RELEASE_TAG"
-          [[ "${RELEASE_TAG#v}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          [[ "${RELEASE_TAG#v}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
       - name: Lock and test
         run: |
           uv lock --check
@@ -51,10 +51,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          release_args=()
-          if [[ "${RELEASE_TAG#v}" == *-* ]]; then
-            release_args+=(--prerelease)
-          fi
-          gh release create "$RELEASE_TAG" dist/* "${release_args[@]}" \
+          gh release create "$RELEASE_TAG" dist/* \
             --title "AgentsServer $RELEASE_TAG" \
             --generate-notes

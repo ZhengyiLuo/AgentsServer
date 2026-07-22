@@ -29,7 +29,6 @@ RELEASES_PAGE_URL = f"https://github.com/{RELEASE_REPOSITORY}/releases"
 MAX_METADATA_BYTES = 1_000_000
 MAX_ARCHIVE_BYTES = 200 * 1024 * 1024
 VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$")
-UPDATE_TRACKS = {"stable", "beta"}
 
 
 class ReleaseUnavailableError(RuntimeError):
@@ -76,7 +75,7 @@ def version_is_prerelease(version: str) -> bool:
 
 
 def version_key(version: str) -> tuple[Any, ...]:
-    """Return a SemVer-compatible comparison key for trusted release versions."""
+    """Return a SemVer-compatible key for a trusted release version."""
     if not VERSION_PATTERN.fullmatch(version):
         raise ValueError(f"invalid release version: {version}")
     without_build = version.split("+", 1)[0]
@@ -88,8 +87,6 @@ def version_key(version: str) -> tuple[Any, ...]:
             (0, int(part)) if part.isdigit() else (1, part)
             for part in prerelease.split(".")
         )
-    # A release without prerelease identifiers sorts after all prereleases of
-    # the same core version, as required by SemVer.
     return major, minor, patch, 0 if separator else 1, identifiers
 
 
@@ -101,9 +98,7 @@ def release_signature_url(version: str) -> str:
     return f"{RELEASE_BASE}/download/v{version}/agents-server-manifest.sig"
 
 
-def release_candidates(releases: Any, track: str) -> list[str]:
-    if track not in UPDATE_TRACKS:
-        raise ValueError(f"update track must be one of: {', '.join(sorted(UPDATE_TRACKS))}")
+def stable_release_candidates(releases: Any) -> list[str]:
     if not isinstance(releases, list):
         raise RuntimeError("GitHub releases response must be a JSON array")
     candidates: set[str] = set()
@@ -114,52 +109,34 @@ def release_candidates(releases: Any, track: str) -> list[str]:
         if not tag.startswith("v"):
             continue
         version = tag[1:]
-        if not VERSION_PATTERN.fullmatch(version):
+        if not VERSION_PATTERN.fullmatch(version) or version_is_prerelease(version):
             continue
-        prerelease = version_is_prerelease(version)
-        # Require GitHub release metadata and SemVer to agree. This prevents a
-        # stable-looking tag accidentally published as a prerelease, or vice
-        # versa, from crossing tracks.
-        if bool(release.get("prerelease")) != prerelease:
-            continue
-        if track == "stable" and prerelease:
+        if release.get("prerelease") is True:
             continue
         candidates.add(version)
     return sorted(candidates, key=version_key, reverse=True)
 
 
 def release_versions_from_html(content: bytes) -> set[str]:
-    """Extract public release tags from GitHub's release-list fallback page."""
     text = content.decode("utf-8", "replace")
     prefix = f"/{RELEASE_REPOSITORY}/releases/tag/v"
-    versions = {
+    return {
         match.group(1)
         for match in re.finditer(re.escape(prefix) + r"([^\"'<>/?#]+)", text)
-        if VERSION_PATTERN.fullmatch(match.group(1))
+        if VERSION_PATTERN.fullmatch(match.group(1)) and not version_is_prerelease(match.group(1))
     }
-    return versions
 
 
-def release_candidates_from_public_pages(track: str, max_pages: int = 20) -> list[str]:
-    """Resolve public releases without consuming GitHub API rate limit."""
+def stable_release_candidates_from_public_pages(max_pages: int = 20) -> list[str]:
     versions: set[str] = set()
     for page in range(1, max_pages + 1):
         url = RELEASES_PAGE_URL if page == 1 else f"{RELEASES_PAGE_URL}?page={page}"
         content = download_bytes(url, MAX_METADATA_BYTES)
-        page_versions = release_versions_from_html(content)
-        versions.update(page_versions)
+        versions.update(release_versions_from_html(content))
         next_page = f"{RELEASES_PAGE_URL.removeprefix('https://github.com')}?page={page + 1}"
         if next_page not in content.decode("utf-8", "replace"):
             break
-    releases = [
-        {
-            "tag_name": f"v{version}",
-            "prerelease": version_is_prerelease(version),
-            "draft": False,
-        }
-        for version in versions
-    ]
-    return release_candidates(releases, track)
+    return sorted(versions, key=version_key, reverse=True)
 
 
 def verify_manifest(
@@ -179,14 +156,13 @@ def verify_manifest(
     version = str(manifest.get("version") or "")
     if not VERSION_PATTERN.fullmatch(version):
         raise RuntimeError("release manifest contains an invalid version")
+    if version_is_prerelease(version):
+        raise RuntimeError("managed updates accept stable releases only")
     if expected_version is not None and version != expected_version:
         raise RuntimeError("release manifest version does not match its immutable release tag")
-    manifest_prerelease = manifest.get("prerelease")
-    if manifest_prerelease is not None and bool(manifest_prerelease) != version_is_prerelease(version):
+    if manifest.get("prerelease") not in {None, False}:
         raise RuntimeError("release manifest prerelease metadata is inconsistent")
-    manifest_track = manifest.get("track")
-    expected_track = "beta" if version_is_prerelease(version) else "stable"
-    if manifest_track is not None and manifest_track != expected_track:
+    if manifest.get("track") not in {None, "stable"}:
         raise RuntimeError("release manifest track metadata is inconsistent")
     archive = manifest.get("archive")
     if not isinstance(archive, dict):
@@ -203,9 +179,7 @@ def verify_manifest(
     return manifest
 
 
-def check_release(public_key_path: Path, track: str = "stable") -> dict[str, Any]:
-    if track not in UPDATE_TRACKS:
-        raise ValueError(f"update track must be one of: {', '.join(sorted(UPDATE_TRACKS))}")
+def check_release(public_key_path: Path) -> dict[str, Any]:
     try:
         releases_bytes = download_bytes(RELEASES_API_URL, MAX_METADATA_BYTES)
     except HTTPError as exc:
@@ -213,40 +187,31 @@ def check_release(public_key_path: Path, track: str = "stable") -> dict[str, Any
             raise ReleaseUnavailableError("No signed AgentsServer release has been published yet.") from exc
         if exc.code not in {403, 429}:
             raise
-        candidates = release_candidates_from_public_pages(track)
+        candidates = stable_release_candidates_from_public_pages()
     else:
         try:
             releases = json.loads(releases_bytes)
         except json.JSONDecodeError as exc:
             raise RuntimeError("GitHub releases response is invalid JSON") from exc
-        candidates = release_candidates(releases, track)
+        candidates = stable_release_candidates(releases)
     if not candidates:
-        raise ReleaseUnavailableError(f"No signed AgentsServer release is available on the {track} track.")
+        raise ReleaseUnavailableError("No signed stable AgentsServer release is available.")
 
     for version in candidates:
         try:
             manifest_bytes = download_bytes(release_manifest_url(version), MAX_METADATA_BYTES)
             signature = download_bytes(release_signature_url(version), MAX_METADATA_BYTES)
         except HTTPError as exc:
-            # A release can briefly exist before its workflow finishes
-            # uploading assets. Only missing assets are skipped; malformed or
-            # incorrectly signed assets fail closed.
             if exc.code == 404:
                 continue
             raise
-        manifest = verify_manifest(
+        return verify_manifest(
             manifest_bytes,
             signature,
             public_key_path,
             expected_version=version,
         )
-        prerelease = version_is_prerelease(version)
-        if track == "stable" and prerelease:
-            raise RuntimeError("stable update track resolved a prerelease")
-        manifest["resolved_track"] = track
-        manifest["prerelease"] = prerelease
-        return manifest
-    raise ReleaseUnavailableError(f"No signed AgentsServer release is available on the {track} track.")
+    raise ReleaseUnavailableError("No signed stable AgentsServer release is available.")
 
 
 def safe_extract(archive_path: Path, destination: Path) -> Path:
@@ -269,22 +234,16 @@ def safe_extract(archive_path: Path, destination: Path) -> Path:
 def run_update(args: argparse.Namespace) -> None:
     status_path = Path(args.status_file).expanduser().resolve()
     public_key = Path(args.public_key).expanduser().resolve()
-    update_status(
-        status_path,
-        phase="checking",
-        track=args.track,
-        message=f"Checking the signed {args.track} release track.",
-    )
-    manifest = check_release(public_key, args.track)
+    update_status(status_path, phase="checking", message="Checking the signed release manifest.")
+    manifest = check_release(public_key)
     version = str(manifest["version"])
     if args.expected_version and version != args.expected_version:
         raise RuntimeError(f"latest signed release is {version}, not {args.expected_version}")
-    if args.current_version:
-        if version_key(version) <= version_key(args.current_version):
-            raise RuntimeError(
-                f"resolved release {version} is not newer than installed version {args.current_version}; "
-                "managed updates do not perform downgrades or reinstalls"
-            )
+    if args.current_version and version_key(version) <= version_key(args.current_version):
+        raise RuntimeError(
+            f"resolved release {version} is not newer than installed version {args.current_version}; "
+            "managed updates do not perform downgrades or reinstalls"
+        )
 
     with tempfile.TemporaryDirectory(prefix="agents-server-update-") as temporary:
         root = Path(temporary)
@@ -319,7 +278,6 @@ def run_update(args: argparse.Namespace) -> None:
     update_status(
         status_path,
         phase="complete",
-        track=args.track,
         message=f"AgentsServer {version} is installed and healthy.",
         installed_version=version,
         finished_at=utc_now(),
@@ -334,7 +292,6 @@ def main() -> int:
     parser.add_argument("--bind", required=True)
     parser.add_argument("--expected-version")
     parser.add_argument("--current-version")
-    parser.add_argument("--track", choices=sorted(UPDATE_TRACKS), default="stable")
     args = parser.parse_args()
     try:
         run_update(args)

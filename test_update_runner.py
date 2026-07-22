@@ -1,6 +1,8 @@
-import io
 import argparse
+import io
+import hashlib
 import json
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -17,13 +19,10 @@ import update_runner
 class UpdateRunnerTests(unittest.TestCase):
     def signed_manifest(self, version: str = "1.2.3"):
         private = Ed25519PrivateKey.generate()
-        prerelease = update_runner.version_is_prerelease(version)
         manifest = {
             "schema": 1,
             "version": version,
-            "prerelease": prerelease,
-            "track": "beta" if prerelease else "stable",
-            "api_contract_version": 10,
+            "api_contract_version": 9,
             "archive": {
                 "name": f"agents-server-{version}.tar.gz",
                 "url": f"https://github.com/ZhengyiLuo/AgentsServer/releases/download/v{version}/agents-server-{version}.tar.gz",
@@ -37,7 +36,7 @@ class UpdateRunnerTests(unittest.TestCase):
     def release(version: str, *, prerelease: bool | None = None, draft: bool = False):
         return {
             "tag_name": f"v{version}",
-            "prerelease": update_runner.version_is_prerelease(version) if prerelease is None else prerelease,
+            "prerelease": ("-" in version) if prerelease is None else prerelease,
             "draft": draft,
         }
 
@@ -64,7 +63,7 @@ class UpdateRunnerTests(unittest.TestCase):
                 update_runner.verify_manifest(payload + b" ", signature, public_path)
 
     def test_manifest_must_match_immutable_release_tag(self):
-        private, payload, signature = self.signed_manifest("1.2.3-beta.1")
+        private, payload, signature = self.signed_manifest("1.2.3")
         with tempfile.TemporaryDirectory() as temporary:
             public_path = Path(temporary) / "public.pem"
             public_path.write_bytes(private.public_key().public_bytes(
@@ -76,81 +75,36 @@ class UpdateRunnerTests(unittest.TestCase):
                     payload,
                     signature,
                     public_path,
-                    expected_version="1.2.3-beta.2",
+                    expected_version="1.2.4",
                 )
 
-    def test_stable_track_excludes_prereleases_and_beta_uses_semver_order(self):
+    def test_stable_release_candidates_exclude_prereleases_and_drafts(self):
         releases = [
-            self.release("1.2.4-beta.10"),
             self.release("1.2.4-beta.2"),
             self.release("1.2.3"),
             self.release("1.2.2"),
             self.release("9.0.0", draft=True),
-            self.release("8.0.0-beta.1", prerelease=False),
+            self.release("8.0.0", prerelease=True),
         ]
-        self.assertEqual(
-            update_runner.release_candidates(releases, "stable"),
-            ["1.2.3", "1.2.2"],
-        )
-        self.assertEqual(
-            update_runner.release_candidates(releases, "beta"),
-            ["1.2.4-beta.10", "1.2.4-beta.2", "1.2.3", "1.2.2"],
-        )
+        self.assertEqual(update_runner.stable_release_candidates(releases), ["1.2.3", "1.2.2"])
 
-    def test_beta_track_moves_to_a_newer_stable_release(self):
-        releases = [
-            self.release("1.2.4-beta.3"),
-            self.release("1.2.4"),
-            self.release("1.2.3"),
-        ]
-        self.assertEqual(update_runner.release_candidates(releases, "beta")[0], "1.2.4")
-
-    def test_signed_beta_release_uses_only_versioned_asset_urls(self):
-        private, payload, signature = self.signed_manifest("1.2.4-beta.2")
-        releases = json.dumps([
-            self.release("1.2.4-beta.2"),
-            self.release("1.2.3"),
-        ]).encode()
-        expected_urls = {
-            update_runner.RELEASES_API_URL: releases,
-            update_runner.release_manifest_url("1.2.4-beta.2"): payload,
-            update_runner.release_signature_url("1.2.4-beta.2"): signature,
-        }
-
-        def download(url, _limit, timeout=30.0):
-            self.assertNotIn("/latest/", url)
-            return expected_urls[url]
-
-        with tempfile.TemporaryDirectory() as temporary:
-            public_path = Path(temporary) / "public.pem"
-            public_path.write_bytes(private.public_key().public_bytes(
-                serialization.Encoding.PEM,
-                serialization.PublicFormat.SubjectPublicKeyInfo,
-            ))
-            with patch.object(update_runner, "download_bytes", side_effect=download):
-                manifest = update_runner.check_release(public_path, "beta")
-
-        self.assertEqual(manifest["version"], "1.2.4-beta.2")
-        self.assertTrue(manifest["prerelease"])
-        self.assertEqual(manifest["resolved_track"], "beta")
-
-    def test_signed_stable_track_never_fetches_prerelease_assets(self):
+    def test_signed_stable_release_uses_only_versioned_asset_urls(self):
         private, payload, signature = self.signed_manifest("1.2.3")
         releases = json.dumps([
             self.release("2.0.0-beta.1"),
             self.release("1.2.3"),
         ]).encode()
+        assets = {
+            update_runner.RELEASES_API_URL: releases,
+            update_runner.release_manifest_url("1.2.3"): payload,
+            update_runner.release_signature_url("1.2.3"): signature,
+        }
         seen: list[str] = []
 
         def download(url, _limit, timeout=30.0):
             seen.append(url)
-            if url == update_runner.RELEASES_API_URL:
-                return releases
-            if url == update_runner.release_manifest_url("1.2.3"):
-                return payload
-            if url == update_runner.release_signature_url("1.2.3"):
-                return signature
-            raise AssertionError(f"unexpected download: {url}")
+            self.assertNotIn("/latest/", url)
+            return assets[url]
 
         with tempfile.TemporaryDirectory() as temporary:
             public_path = Path(temporary) / "public.pem"
@@ -159,34 +113,10 @@ class UpdateRunnerTests(unittest.TestCase):
                 serialization.PublicFormat.SubjectPublicKeyInfo,
             ))
             with patch.object(update_runner, "download_bytes", side_effect=download):
-                manifest = update_runner.check_release(public_path, "stable")
+                manifest = update_runner.check_release(public_path)
 
         self.assertEqual(manifest["version"], "1.2.3")
         self.assertFalse(any("2.0.0-beta.1" in url for url in seen))
-
-    def test_beta_track_resolves_final_release_after_its_prerelease(self):
-        private, payload, signature = self.signed_manifest("1.2.4")
-        releases = json.dumps([
-            self.release("1.2.4-beta.9"),
-            self.release("1.2.4"),
-        ]).encode()
-        assets = {
-            update_runner.RELEASES_API_URL: releases,
-            update_runner.release_manifest_url("1.2.4"): payload,
-            update_runner.release_signature_url("1.2.4"): signature,
-        }
-        with tempfile.TemporaryDirectory() as temporary:
-            public_path = Path(temporary) / "public.pem"
-            public_path.write_bytes(private.public_key().public_bytes(
-                serialization.Encoding.PEM,
-                serialization.PublicFormat.SubjectPublicKeyInfo,
-            ))
-            with patch.object(update_runner, "download_bytes", side_effect=lambda url, *_args, **_kwargs: assets[url]):
-                manifest = update_runner.check_release(public_path, "beta")
-
-        self.assertEqual(manifest["version"], "1.2.4")
-        self.assertFalse(manifest["prerelease"])
-        self.assertEqual(manifest["resolved_track"], "beta")
 
     def test_safe_extract_rejects_path_traversal(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -214,59 +144,68 @@ class UpdateRunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(update_runner.ReleaseUnavailableError, "No signed AgentsServer release"):
                 update_runner.check_release(Path("unused.pem"))
 
-    def test_track_without_any_matching_release_has_a_clear_error(self):
-        releases = json.dumps([self.release("2.0.0-beta.1")]).encode()
-        with patch.object(update_runner, "download_bytes", return_value=releases):
-            with self.assertRaisesRegex(update_runner.ReleaseUnavailableError, "stable track"):
-                update_runner.check_release(Path("unused.pem"), "stable")
-
-    def test_rate_limited_release_api_uses_public_release_pages(self):
-        private, payload, signature = self.signed_manifest("1.2.4-beta.1")
-        limited = HTTPError(update_runner.RELEASES_API_URL, 403, "rate limit", {}, None)
-        release_html = (
-            f'<a href="/ZhengyiLuo/AgentsServer/releases/tag/v1.2.3">stable</a>'
-            f'<a href="/ZhengyiLuo/AgentsServer/releases/tag/v1.2.4-beta.1">beta</a>'
-        ).encode()
-
-        def download(url, _limit, timeout=30.0):
-            if url == update_runner.RELEASES_API_URL:
-                raise limited
-            if url == update_runner.RELEASES_PAGE_URL:
-                return release_html
-            if url == update_runner.release_manifest_url("1.2.4-beta.1"):
-                return payload
-            if url == update_runner.release_signature_url("1.2.4-beta.1"):
-                return signature
-            raise AssertionError(f"unexpected download: {url}")
-
-        with tempfile.TemporaryDirectory() as temporary:
-            public_path = Path(temporary) / "public.pem"
-            public_path.write_bytes(private.public_key().public_bytes(
-                serialization.Encoding.PEM,
-                serialization.PublicFormat.SubjectPublicKeyInfo,
-            ))
-            with patch.object(update_runner, "download_bytes", side_effect=download):
-                manifest = update_runner.check_release(public_path, "beta")
-
-        self.assertEqual(manifest["version"], "1.2.4-beta.1")
-
     def test_detached_runner_rejects_downgrades_before_download(self):
         args = argparse.Namespace(
             status_file="unused-status.json",
             public_key="unused-key.pem",
             port=7850,
             bind="127.0.0.1",
-            expected_version="1.2.3-beta.1",
-            current_version="1.2.3",
-            track="beta",
+            expected_version="1.2.3",
+            current_version="1.2.4",
         )
-        manifest = {"version": "1.2.3-beta.1"}
         with patch.object(update_runner, "update_status"), \
-             patch.object(update_runner, "check_release", return_value=manifest), \
+             patch.object(update_runner, "check_release", return_value={"version": "1.2.3"}), \
              patch.object(update_runner, "download_bytes") as download:
             with self.assertRaisesRegex(RuntimeError, "do not perform downgrades"):
                 update_runner.run_update(args)
         download.assert_not_called()
+
+    def test_successful_update_completes_without_track_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive_buffer = io.BytesIO()
+            with tarfile.open(fileobj=archive_buffer, mode="w:gz") as archive:
+                installer = b"#!/bin/sh\nexit 0\n"
+                entry = tarfile.TarInfo("agents-server-1.2.4/install.sh")
+                entry.mode = 0o755
+                entry.size = len(installer)
+                archive.addfile(entry, io.BytesIO(installer))
+            archive_bytes = archive_buffer.getvalue()
+            manifest = {
+                "version": "1.2.4",
+                "archive": {
+                    "name": "agents-server-1.2.4.tar.gz",
+                    "url": "https://example.invalid/agents-server-1.2.4.tar.gz",
+                    "sha256": hashlib.sha256(archive_bytes).hexdigest(),
+                },
+            }
+            args = argparse.Namespace(
+                status_file=str(root / "server-update.json"),
+                public_key=str(root / "release-public-key.pem"),
+                port=7850,
+                bind="127.0.0.1",
+                expected_version="1.2.4",
+                current_version="1.2.3",
+            )
+            statuses: list[dict] = []
+
+            def record_status(_path, **changes):
+                statuses.append(changes)
+                return changes
+
+            with patch.object(update_runner, "check_release", return_value=manifest), \
+                 patch.object(update_runner, "download_bytes", return_value=archive_bytes), \
+                 patch.object(update_runner, "update_status", side_effect=record_status), \
+                 patch.object(
+                     update_runner.subprocess,
+                     "run",
+                     return_value=subprocess.CompletedProcess([], 0, stdout="installed\n", stderr=""),
+                 ):
+                update_runner.run_update(args)
+
+        self.assertEqual(statuses[-1]["phase"], "complete")
+        self.assertEqual(statuses[-1]["installed_version"], "1.2.4")
+        self.assertNotIn("track", statuses[-1])
 
 
 if __name__ == "__main__":

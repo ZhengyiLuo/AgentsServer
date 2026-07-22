@@ -15,7 +15,6 @@ from pathlib import Path
 
 FILES = (
     "agent_server.py",
-    "codex_app_server.py",
     "agentsdock_jobs.py",
     "install.sh",
     "update_runner.py",
@@ -59,9 +58,7 @@ def main() -> int:
     manifest = {
         "schema": 1,
         "version": version,
-        "prerelease": "-" in version.split("+", 1)[0],
-        "track": "beta" if "-" in version.split("+", 1)[0] else "stable",
-        "api_contract_version": 10,
+        "api_contract_version": 9,
         "commit": commit,
         "archive": {
             "name": archive_name,

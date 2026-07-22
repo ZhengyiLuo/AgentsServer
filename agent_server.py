@@ -2305,7 +2305,7 @@ async def append_event(session_id: str, event_type: str, payload: dict[str, Any]
         f.write(json.dumps(event, separators=(",", ":")) + "\n")
     HISTORY_SEARCH_DIRTY.add(session_id)
     await update_session_event_metadata(session_id, event)
-    await HUB.broadcast(session_id, event)
+    await HUB.broadcast(session_id, client_safe_event(event))
     return event
 
 
@@ -4183,11 +4183,18 @@ def event_output_text(value: Any) -> str:
 
 
 def client_safe_event(event: dict[str, Any]) -> dict[str, Any]:
+    safe = event
     output = event.get("output")
-    if output is None or isinstance(output, str):
-        return event
-    safe = dict(event)
-    safe["output"] = event_output_text(output)
+    if output is not None and not isinstance(output, str):
+        safe = dict(event)
+        safe["output"] = event_output_text(output)
+    job = event.get("job")
+    # Timeline job summaries omit the private prompt. Older clients still
+    # require a string field, so add an empty compatibility value at egress.
+    if isinstance(job, dict) and not isinstance(job.get("prompt"), str):
+        if safe is event:
+            safe = dict(event)
+        safe["job"] = {**job, "prompt": ""}
     return safe
 
 

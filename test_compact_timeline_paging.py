@@ -49,8 +49,56 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         agent_server.FORK_INTERNAL_RUN_CACHE.clear()
         agent_server.FORK_INTERNAL_RUN_LOCKS.clear()
+        agent_server.EVENT_SEQ_CACHE.pop(self.session_id, None)
+        agent_server.HISTORY_SEARCH_DIRTY.discard(self.session_id)
         agent_server.STATE_DIR = self.previous_state_dir
         self.temporary.cleanup()
+
+    def test_client_safe_job_projection_is_immutable(self) -> None:
+        for prompt in (None, 42):
+            with self.subTest(prompt=prompt):
+                job = {"id": "job-1", "title": "Data Repeater"}
+                if prompt is not None:
+                    job["prompt"] = prompt
+                event = self.event(23, "job_created", job=job)
+
+                projected = agent_server.client_safe_event(event)
+
+                self.assertIsNot(projected, event)
+                self.assertIsNot(projected["job"], job)
+                self.assertEqual(projected["job"]["prompt"], "")
+                if prompt is None:
+                    self.assertNotIn("prompt", job)
+                else:
+                    self.assertEqual(job["prompt"], prompt)
+
+    def test_history_projects_promptless_job_for_older_clients(self) -> None:
+        path = agent_server.events_path(self.session_id)
+        stored = self.event(1, "job_created", job={"id": "job-1", "title": "Data Repeater"})
+        path.write_text(json.dumps(stored) + "\n", encoding="utf-8")
+
+        events = agent_server.read_visible_events_page(self.session_id, limit=100, tail=False)[0]
+
+        self.assertEqual(events[0]["job"]["prompt"], "")
+        persisted = json.loads(path.read_text(encoding="utf-8"))
+        self.assertNotIn("prompt", persisted["job"])
+
+    async def test_append_event_broadcasts_compatible_job_without_persisting_prompt(self) -> None:
+        broadcast = AsyncMock()
+        with patch.object(agent_server.HUB, "broadcast", new=broadcast), patch.object(
+            agent_server,
+            "ensure_dirs",
+        ):
+            event = await agent_server.append_event(self.session_id, "job_created", {
+                "job": {"id": "job-1", "title": "Data Repeater"},
+                "job_id": "job-1",
+            })
+
+        live_event = broadcast.await_args.args[1]
+        self.assertEqual(live_event["job"]["prompt"], "")
+        self.assertNotIn("prompt", event["job"])
+        persisted = json.loads(agent_server.events_path(self.session_id).read_text(encoding="utf-8").splitlines()[-1])
+        self.assertNotIn("prompt", persisted["job"])
 
     def test_compact_filter_preserves_conversation_system_job_and_file_events(self) -> None:
         default_page = agent_server.read_visible_events_page(

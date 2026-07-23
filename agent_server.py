@@ -406,6 +406,8 @@ User prompt follows.
 
 """
 
+AGENTSDOCK_CONTEXT_END_MARKER = "[End AgentsDock context]"
+
 SCHEDULED_JOBS_PROMPT = """\
 
 Scheduled jobs:
@@ -3005,31 +3007,224 @@ def file_attachment_prompt_lines(file_ids: list[str] | tuple[str, ...]) -> list[
     return lines
 
 
+def normalize_steering_lineage(value: Any) -> list[dict[str, Any]]:
+    """Return persisted steering messages without any generated provider text."""
+    if not isinstance(value, list):
+        return []
+    lineage: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        prompt = str(item.get("prompt") or "")
+        file_ids_value = item.get("file_ids")
+        file_ids = merged_file_ids(file_ids_value if isinstance(file_ids_value, (list, tuple)) else [])
+        if prompt.strip() or file_ids:
+            lineage.append({"prompt": prompt, "file_ids": file_ids})
+    return lineage
+
+
+def turn_steering_lineage(turn: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not turn:
+        return []
+    lineage = normalize_steering_lineage(turn.get("steering_lineage"))
+    if lineage:
+        return lineage
+    prompt = str(turn.get("prompt") or "")
+    file_ids_value = turn.get("file_ids")
+    file_ids = merged_file_ids(file_ids_value if isinstance(file_ids_value, (list, tuple)) else [])
+    if not (prompt.strip() or file_ids):
+        return []
+    return [{"prompt": prompt, "file_ids": file_ids}]
+
+
+def build_user_provider_prompt(prompt: str, file_ids: list[str] | tuple[str, ...]) -> str:
+    provider_prompt = prompt
+    attachment_lines = file_attachment_prompt_lines(file_ids)
+    if attachment_lines:
+        provider_prompt += "\n\n[Attached files]\n"
+        provider_prompt += "\n".join(attachment_lines) + "\n"
+        provider_prompt += "Use these local paths directly when needed.\n"
+    return provider_prompt
+
+
+def build_memory_augmented_prompt(label: str, memory: str, prompt: str) -> str:
+    """Wrap fallback memory with an exact character length for collision-free recovery."""
+    return (
+        f"[{label}; chars={len(memory)}]\n"
+        f"{memory}\n"
+        f"[End {label}]\n\n"
+        "[Current user prompt]\n"
+        f"{prompt}"
+    )
+
+
+def build_turn_provider_prompt(
+    prompt: str,
+    file_ids: list[str] | tuple[str, ...],
+    steering_lineage: list[dict[str, Any]] | None = None,
+) -> str:
+    """Return only the newest immutable user message for the resumed provider thread."""
+    lineage = normalize_steering_lineage(steering_lineage)
+    if len(lineage) >= 2:
+        current = lineage[-1]
+        return build_user_provider_prompt(
+            str(current.get("prompt") or ""),
+            list(current.get("file_ids") or []),
+        )
+    return build_user_provider_prompt(prompt, file_ids)
+
+
+LEGACY_STEERING_PREFIX = (
+    "The previous agent turn was interrupted before completion. Continue that request while "
+    "applying the steering instruction below. Treat both messages as user input, and give the "
+    "steering instruction priority wherever they conflict.\n\n"
+)
+
+
+def legacy_file_ids_for_paths(paths: list[str]) -> list[str]:
+    wanted = {str(path or "").strip() for path in paths if str(path or "").strip()}
+    if not wanted or not FILES_ROOT.exists():
+        return []
+    found: list[str] = []
+    for meta_path in FILES_ROOT.glob("*/meta.json"):
+        with suppress(Exception):
+            record = json.loads(meta_path.read_text(encoding="utf-8"))
+            if str(record.get("path") or "").strip() in wanted:
+                found.append(meta_path.parent.name)
+    return merged_file_ids(found)
+
+
+def legacy_attachment_paths(lines: str) -> list[str]:
+    paths: list[str] = []
+    for line in lines.splitlines():
+        if not line.startswith("- "):
+            continue
+        value = line[2:].strip()
+        path, separator, _metadata = value.rpartition(" (")
+        paths.append(path if separator else value)
+    return paths
+
+
+def split_legacy_scoped_attachments(
+    text: str,
+    heading: str,
+    *,
+    recover_file_ids: bool = True,
+) -> tuple[str, list[str]]:
+    marker = f"\n\n[{heading}]\n"
+    end_marker = f"\n[End {heading.lower()}]"
+    marker_index = text.rfind(marker)
+    if marker_index < 0 or not text.endswith(end_marker):
+        return text, []
+    attachment_text = text[marker_index + len(marker):-len(end_marker)]
+    file_ids = (
+        legacy_file_ids_for_paths(legacy_attachment_paths(attachment_text))
+        if recover_file_ids
+        else []
+    )
+    return text[:marker_index], file_ids
+
+
+def split_legacy_attached_files(
+    text: str,
+    *,
+    recover_file_ids: bool = True,
+) -> tuple[str, list[str]]:
+    marker = "\n\n[Attached files]\n"
+    footer = "\nUse these local paths directly when needed."
+    marker_index = text.rfind(marker)
+    normalized = text[:-1] if text.endswith("\n") else text
+    if marker_index < 0 or not normalized.endswith(footer):
+        return text, []
+    attachment_text = normalized[marker_index + len(marker):-len(footer)]
+    file_ids = (
+        legacy_file_ids_for_paths(legacy_attachment_paths(attachment_text))
+        if recover_file_ids
+        else []
+    )
+    return text[:marker_index], file_ids
+
+
+def parse_legacy_steering_lineage(
+    text: str,
+    latest_file_ids: list[str] | tuple[str, ...] = (),
+    *,
+    recover_file_ids: bool = True,
+) -> list[dict[str, Any]]:
+    """Recover immutable messages from the exact legacy generated replay envelope."""
+    if not text.startswith(LEGACY_STEERING_PREFIX):
+        return []
+    interrupted_start_marker = "[Interrupted message]\n"
+    interrupted_end_marker = "\n[End interrupted message]"
+    steering_start_marker = "\n\n[Steering message]\n"
+    steering_end_marker = "\n[End steering message]"
+    if not text.endswith(steering_end_marker):
+        return []
+    interrupted_start = len(LEGACY_STEERING_PREFIX)
+    if not text.startswith(interrupted_start_marker, interrupted_start):
+        return []
+    steering_start = text.rfind(steering_start_marker)
+    interrupted_end = text.rfind(interrupted_end_marker, 0, steering_start)
+    if steering_start < 0 or interrupted_end < 0:
+        return []
+    if interrupted_end + len(interrupted_end_marker) != steering_start:
+        return []
+
+    interrupted_text = text[
+        interrupted_start + len(interrupted_start_marker):interrupted_end
+    ]
+    interrupted_text, interrupted_file_ids = split_legacy_scoped_attachments(
+        interrupted_text,
+        "Interrupted message attachments",
+        recover_file_ids=recover_file_ids,
+    )
+    nested = parse_legacy_steering_lineage(
+        interrupted_text,
+        interrupted_file_ids,
+        recover_file_ids=recover_file_ids,
+    )
+    if nested:
+        if interrupted_file_ids and not nested[-1].get("file_ids"):
+            nested[-1]["file_ids"] = interrupted_file_ids
+        lineage = nested
+    else:
+        lineage = [{
+            "prompt": strip_agentsdock_provider_context(interrupted_text),
+            "file_ids": interrupted_file_ids,
+        }]
+
+    steering_text = text[
+        steering_start + len(steering_start_marker):-len(steering_end_marker)
+    ]
+    lineage.append({
+        "prompt": steering_text,
+        "file_ids": merged_file_ids(latest_file_ids),
+    })
+    return normalize_steering_lineage(lineage)
+
+
 def prepare_steered_turn(selected: dict[str, Any], interrupted: dict[str, Any] | None) -> dict[str, Any]:
-    """Build the provider request for a real steer without changing its UI prompt."""
+    """Persist flat steering lineage while keeping the selected user text immutable."""
     turn = dict(selected)
-    steering_prompt = str(selected.get("prompt") or "").strip()
-    interrupted_prompt = str((interrupted or {}).get("prompt") or "").strip()
+    steering_prompt = str(
+        selected.get("steering_prompt")
+        if selected.get("steering_prompt") is not None
+        else selected.get("prompt") or ""
+    )
     selected_file_ids = list(
         selected.get("display_file_ids")
         if selected.get("display_file_ids") is not None
         else selected.get("file_ids") or []
     )
-    interrupted_file_ids = list((interrupted or {}).get("file_ids") or [])
-    if not (steering_prompt or selected_file_ids) or not (interrupted_prompt or interrupted_file_ids):
+    interrupted_lineage = turn_steering_lineage(interrupted)
+    if not (steering_prompt.strip() or selected_file_ids) or not interrupted_lineage:
         return turn
-    if steering_prompt == interrupted_prompt and selected_file_ids == interrupted_file_ids:
+    steering_message = {
+        "prompt": steering_prompt,
+        "file_ids": merged_file_ids(selected_file_ids),
+    }
+    if steering_message == interrupted_lineage[-1]:
         return turn
-
-    interrupted_message = interrupted_prompt or "[Attachment-only message]"
-    interrupted_attachment_lines = file_attachment_prompt_lines(interrupted_file_ids)
-    if interrupted_attachment_lines:
-        interrupted_message += (
-            "\n\n[Interrupted message attachments]\n"
-            + "\n".join(interrupted_attachment_lines)
-            + "\nThese files belong to the interrupted message above, not the steering message.\n"
-            "[End interrupted message attachments]"
-        )
 
     turn["steering_prompt"] = steering_prompt
     turn["display_prompt"] = str(
@@ -3037,17 +3232,8 @@ def prepare_steered_turn(selected: dict[str, Any], interrupted: dict[str, Any] |
         if selected.get("display_prompt") is not None
         else steering_prompt
     )
-    turn["prompt"] = (
-        "The previous agent turn was interrupted before completion. Continue that request while "
-        "applying the steering instruction below. Treat both messages as user input, and give the "
-        "steering instruction priority wherever they conflict.\n\n"
-        "[Interrupted message]\n"
-        f"{interrupted_message}\n"
-        "[End interrupted message]\n\n"
-        "[Steering message]\n"
-        f"{steering_prompt or '[Attachment-only steering message]'}\n"
-        "[End steering message]"
-    )
+    turn["prompt"] = steering_prompt
+    turn["steering_lineage"] = interrupted_lineage + [steering_message]
     turn["display_file_ids"] = selected_file_ids
     turn["file_ids"] = selected_file_ids
     turn["steer_interrupted_run_id"] = (interrupted or {}).get("run_id")
@@ -3174,6 +3360,7 @@ async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]
         interrupted_turn = dict(CURRENT_TURNS.get(session_id) or {})
 
     selected: dict[str, Any] | None = None
+    selected_index: int | None = None
     remaining: int
     async with QUEUE_LOCK:
         if session_id in STEERING_SESSIONS or RUN_NOW_TURNS.get(session_id) is not None:
@@ -3210,8 +3397,46 @@ async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]
         raise HTTPException(status_code=404, detail="queued turn not found")
 
     try:
-        stop_result = await stop_turn(session_id, emit_event=False, schedule_queue=False)
+        stop_result = await stop_turn(
+            session_id,
+            emit_event=False,
+            schedule_queue=False,
+            require_provider_turn_ready=True,
+        )
         interrupted = bool(stop_result.get("stopped") or stop_result.get("pending"))
+        deferred = bool(stop_result.get("deferred"))
+        if deferred:
+            async with QUEUE_LOCK:
+                RUN_NOW_TURNS.pop(session_id, None)
+                STEERING_SESSIONS.discard(session_id)
+                queue_items = list(QUEUED_TURNS.get(session_id) or [])
+                insert_at = max(0, min(int(selected_index or 0), len(queue_items)))
+                queue_items.insert(insert_at, selected)
+                QUEUED_TURNS[session_id] = deque(queue_items)
+                remaining = len(queue_items)
+            message = (
+                "The provider is still starting, so the current turn was not interrupted. "
+                "This message remains queued; try Force Send again shortly."
+            )
+            await append_event(session_id, "turn_deferred", {
+                "queued_id": queued_id,
+                "message": message,
+                "remaining": remaining,
+            })
+            async with ACTIVE_LOCK:
+                still_busy = session_id in BUSY_SESSIONS
+            if not still_busy:
+                schedule_next_queued_turn(session_id)
+            return {
+                "ok": False,
+                "queued_id": queued_id,
+                "interrupted": False,
+                "deferred": True,
+                "replays_interrupted_message": False,
+                "message": message,
+                "remaining": remaining,
+                "superseded_queued_ids": [],
+            }
         prepared = prepare_steered_turn(selected, interrupted_turn if interrupted else None)
         async with QUEUE_LOCK:
             current = RUN_NOW_TURNS.get(session_id)
@@ -3223,7 +3448,7 @@ async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]
             "queued_id": queued_id,
             "backend": prepared.get("backend") or STORE.sessions[session_id].get("backend") or DEFAULT_BACKEND,
             "prompt": display_prompt,
-            "request_prompt": prepared.get("prompt") or display_prompt,
+            "request_prompt": prepared.get("prompt") or "",
             "display_prompt": display_prompt,
             "file_ids": list(prepared.get("file_ids") or []),
             "display_file_ids": list(
@@ -3233,7 +3458,12 @@ async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]
             ),
             "interrupted_run_id": prepared.get("steer_interrupted_run_id"),
             "replays_interrupted_message": bool(prepared.get("replays_interrupted_message")),
-            "message": "Steering message promoted; the interrupted request will be replayed with it.",
+            "steering_lineage": normalize_steering_lineage(prepared.get("steering_lineage")),
+            "message": (
+                "Steering message promoted; it will continue the confirmed native provider thread."
+                if interrupted
+                else "Queued message promoted to run next."
+            ),
             "remaining": remaining,
             "superseded_queued_ids": [],
         })
@@ -3242,6 +3472,7 @@ async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]
             "ok": True,
             "queued_id": queued_id,
             "interrupted": interrupted,
+            "deferred": deferred,
             "replays_interrupted_message": bool(prepared.get("replays_interrupted_message")),
             "superseded_queued_ids": [],
         }
@@ -3310,6 +3541,7 @@ async def start_next_queued_turn(session_id: str) -> None:
             queue_if_busy=False,
             queued_id=str(item["queued_id"]),
             display_file_ids=list(display_file_ids) if display_file_ids is not None else None,
+            steering_lineage=normalize_steering_lineage(item.get("steering_lineage")) or None,
         )
     except HTTPException as e:
         if e.status_code in (409, 503):
@@ -3362,9 +3594,27 @@ def should_schedule_queue_after_finish(session_id: str, stopped: bool) -> bool:
 
 
 def queued_turn_from_event(event: dict[str, Any], sess: dict[str, Any], position: int) -> dict[str, Any]:
+    request_prompt = event.get("request_prompt")
+    steering_lineage = normalize_steering_lineage(event.get("steering_lineage"))
+    if (
+        event.get("type") == "turn_queue_run_now"
+        and event.get("replays_interrupted_message")
+        and not steering_lineage
+    ):
+        # Legacy run-now events persisted a generated replay envelope in
+        # request_prompt. Recover its immutable messages when possible.
+        steering_lineage = parse_legacy_steering_lineage(
+            str(request_prompt or ""),
+            list(event.get("file_ids") or []),
+        )
+        request_prompt = (
+            steering_lineage[-1]["prompt"]
+            if steering_lineage
+            else event.get("prompt")
+        )
     return {
         "queued_id": str(event.get("queued_id") or ""),
-        "prompt": event.get("request_prompt") or event.get("prompt") or "",
+        "prompt": request_prompt if request_prompt is not None else event.get("prompt") or "",
         "file_ids": list(event.get("file_ids") or []),
         "display_file_ids": (
             list(event.get("display_file_ids") or [])
@@ -3382,6 +3632,7 @@ def queued_turn_from_event(event: dict[str, Any], sess: dict[str, Any], position
         "target_session_id": event.get("target_session_id"),
         "steer_interrupted_run_id": event.get("interrupted_run_id") or event.get("steer_interrupted_run_id"),
         "replays_interrupted_message": bool(event.get("replays_interrupted_message")),
+        "steering_lineage": steering_lineage,
         "created_at": event.get("ts") or now_iso(),
         "position": int(event.get("position") or position),
     }
@@ -3415,7 +3666,23 @@ def rebuild_queued_turns_from_events() -> int:
                 if queued_id not in order:
                     order.append(queued_id)
             elif event_type in {"turn_queue_updated", "turn_queue_run_now"} and queued_id in pending:
-                if event.get("request_prompt") is not None:
+                legacy_generated_replay = (
+                    event_type == "turn_queue_run_now"
+                    and event.get("replays_interrupted_message")
+                    and not normalize_steering_lineage(event.get("steering_lineage"))
+                )
+                if legacy_generated_replay:
+                    lineage = parse_legacy_steering_lineage(
+                        str(event.get("request_prompt") or ""),
+                        list(event.get("file_ids") or []),
+                    )
+                    pending[queued_id]["prompt"] = (
+                        lineage[-1]["prompt"]
+                        if lineage
+                        else event.get("prompt") or ""
+                    )
+                    pending[queued_id]["steering_lineage"] = lineage
+                elif event.get("request_prompt") is not None:
                     pending[queued_id]["prompt"] = event.get("request_prompt") or ""
                 elif event.get("prompt") is not None:
                     pending[queued_id]["prompt"] = event.get("prompt") or ""
@@ -3429,6 +3696,8 @@ def rebuild_queued_turns_from_events() -> int:
                     pending[queued_id]["steer_interrupted_run_id"] = event.get("interrupted_run_id")
                 if event.get("replays_interrupted_message") is not None:
                     pending[queued_id]["replays_interrupted_message"] = bool(event.get("replays_interrupted_message"))
+                if event.get("steering_lineage") is not None:
+                    pending[queued_id]["steering_lineage"] = normalize_steering_lineage(event.get("steering_lineage"))
                 if event_type == "turn_queue_run_now" and queued_id in order:
                     order.remove(queued_id)
                     order.insert(0, queued_id)
@@ -4722,6 +4991,22 @@ async def release_turn_slot(session_id: str) -> None:
 async def clear_active_process(session_id: str) -> None:
     async with ACTIVE_LOCK:
         ACTIVE.pop(session_id, None)
+
+
+async def mark_provider_turn_ready(
+    session_id: str,
+    run_id: str,
+    provider_session_id: str | None = None,
+) -> None:
+    """Mark that the provider accepted this turn before it can be interrupted."""
+    if not provider_session_id:
+        return
+    async with ACTIVE_LOCK:
+        active = ACTIVE.get(session_id)
+        if not active or str(active.get("run_id") or "") != run_id:
+            return
+        active["provider_turn_ready"] = True
+        active["provider_session_id"] = provider_session_id
 
 
 def active_snapshot_input(active: dict[str, Any]) -> dict[str, Any]:
@@ -7322,10 +7607,103 @@ def parse_claude_history(path: Path, limit: int | None) -> list[dict[str, str]]:
             event = json.loads(line)
             event_type = event.get("type")
             if event_type == "user":
-                add_history_item(items, "user", message_text(event.get("message")))
+                add_history_item(
+                    items,
+                    "user",
+                    strip_agentsdock_generated_user_text(message_text(event.get("message"))),
+                )
             elif event_type == "assistant":
                 add_history_item(items, "assistant", message_text(event.get("message")))
     return tail_limit_items(items, limit)
+
+
+def strip_agentsdock_provider_context(text: str) -> str:
+    """Remove launch-only context from a Codex transcript user message."""
+    if not text.startswith("[AgentsDock context]"):
+        return text
+    exact_marker = f"\n{AGENTSDOCK_CONTEXT_END_MARKER}\n\n"
+    marker_index = text.find(exact_marker)
+    if marker_index >= 0:
+        return text[marker_index + len(exact_marker):]
+
+    # Legacy codex-exec turns put the base context, job snapshot, and optional
+    # per-chat instructions directly in the user message. Parse only those
+    # server-owned boundaries; never strip a marker from ordinary API input.
+    legacy_base_marker = "User prompt follows.\n]\n\n"
+    base_index = text.find(legacy_base_marker)
+    if base_index < 0:
+        return text
+    remainder = text[base_index + len(legacy_base_marker):]
+    scheduled_start = remainder.find("Scheduled jobs:")
+    snapshot_start = remainder.find(
+        "Current jobs for this chat (turn-start snapshot; prompts omitted):",
+        max(scheduled_start, 0),
+    )
+    if scheduled_start < 0 or snapshot_start < 0:
+        return text
+    scheduled_end = remainder.find("\n\n", snapshot_start)
+    if scheduled_end < 0:
+        return text
+    remainder = remainder[scheduled_end + 2:]
+    if remainder.startswith("\n[Per-chat system instructions]\n"):
+        remainder = remainder[1:]
+    if remainder.startswith("[Per-chat system instructions]\n"):
+        system_end_marker = "\n[End per-chat system instructions]\n\n"
+        system_end = remainder.find(system_end_marker)
+        if system_end < 0:
+            return text
+        remainder = remainder[system_end + len(system_end_marker):]
+    return remainder
+
+
+def strip_agentsdock_memory_context(text: str) -> str:
+    """Remove exact fallback-memory wrappers while preserving the current user text."""
+    cleaned = text
+    while True:
+        previous = cleaned
+        length_match = re.match(
+            r"^\[(Fork memory context|Codex rollover memory); chars=(\d+)\]\n",
+            cleaned,
+        )
+        if length_match:
+            label = length_match.group(1)
+            memory_chars = int(length_match.group(2))
+            memory_end = length_match.end() + memory_chars
+            boundary = f"\n[End {label}]\n\n[Current user prompt]\n"
+            if cleaned.startswith(boundary, memory_end):
+                cleaned = cleaned[memory_end + len(boundary):]
+                continue
+        for label, end_label in (
+            ("Fork memory context", "fork memory context"),
+            ("Codex rollover memory", "Codex rollover memory"),
+        ):
+            prefix = f"[{label}]\n"
+            boundary = f"\n[End {end_label}]\n\n[Current user prompt]\n"
+            if cleaned.startswith(prefix):
+                boundary_index = cleaned.rfind(boundary, len(prefix))
+                if boundary_index >= 0:
+                    cleaned = cleaned[boundary_index + len(boundary):]
+                    break
+        if cleaned == previous:
+            return cleaned
+
+
+def strip_agentsdock_generated_user_text(text: str) -> str:
+    """Project legacy Codex user records back to their immutable user text."""
+    cleaned = strip_agentsdock_provider_context(text)
+    cleaned = strip_agentsdock_memory_context(cleaned)
+    cleaned, latest_file_ids = split_legacy_attached_files(
+        cleaned,
+        recover_file_ids=False,
+    )
+    lineage = parse_legacy_steering_lineage(
+        cleaned,
+        latest_file_ids,
+        recover_file_ids=False,
+    )
+    if lineage:
+        return str(lineage[-1].get("prompt") or "")
+    return cleaned
 
 
 def parse_codex_history(path: Path, limit: int | None) -> list[dict[str, str]]:
@@ -7340,13 +7718,21 @@ def parse_codex_history(path: Path, limit: int | None) -> list[dict[str, str]]:
             if event_type == "event_msg":
                 payload_type = payload.get("type")
                 if payload_type == "user_message":
-                    add_history_item(items, "user", str(payload.get("message") or ""))
+                    add_history_item(
+                        items,
+                        "user",
+                        strip_agentsdock_generated_user_text(str(payload.get("message") or "")),
+                    )
                 elif payload_type == "agent_message":
                     add_history_item(items, "assistant", str(payload.get("message") or ""))
             elif event_type == "response_item" and payload.get("type") == "message":
                 role = payload.get("role")
                 if role == "user":
-                    add_history_item(items, "user", text_from_content(payload.get("content")))
+                    add_history_item(
+                        items,
+                        "user",
+                        strip_agentsdock_generated_user_text(text_from_content(payload.get("content"))),
+                    )
                 elif role == "assistant":
                     add_history_item(items, "assistant", text_from_content(payload.get("content")))
     return tail_limit_items(items, limit)
@@ -8153,7 +8539,7 @@ def load_codex_user_config(path: Path) -> dict[str, Any]:
 
     # Python 3.10 has no stdlib TOML parser. Only these top-level strings are
     # needed here; nested Codex configuration remains owned by the CLI.
-    wanted = {"model", "model_reasoning_effort", "service_tier"}
+    wanted = {"model", "model_reasoning_effort", "service_tier", "developer_instructions"}
     payload: dict[str, Any] = {}
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
@@ -8185,6 +8571,15 @@ def codex_user_config_defaults() -> tuple[str, str, str]:
     effort = str(payload.get("model_reasoning_effort") or "").strip()
     service_tier = str(payload.get("service_tier") or "").strip()
     return model, effort, service_tier
+
+
+def codex_user_developer_instructions() -> str:
+    try:
+        payload = load_codex_user_config(codex_user_config_path())
+    except Exception as exc:
+        logger.debug("codex developer instruction discovery skipped: %s", exc)
+        return ""
+    return str(payload.get("developer_instructions") or "").strip()
 
 
 def codex_default_service_tier(model: str) -> str:
@@ -8422,7 +8817,13 @@ def session_system_prompt(session_id: str, sess: dict[str, Any], manifest_path: 
     ) + scheduled_jobs_prompt_context(session_id) + session_prompt_addendum(sess)
 
 
-def build_claude_cmd(session_id: str, sess: dict[str, Any], manifest_path: Path, *, provider_id: str | None = None) -> list[str]:
+def build_claude_cmd(
+    session_id: str,
+    sess: dict[str, Any],
+    manifest_path: Path,
+    *,
+    provider_id: str | None = None,
+) -> list[str]:
     system_prompt = session_system_prompt(
         session_id,
         sess,
@@ -8448,15 +8849,44 @@ def build_claude_cmd(session_id: str, sess: dict[str, Any], manifest_path: Path,
     return cmd
 
 
-def build_codex_cmd(session_id: str, sess: dict[str, Any], prompt: str, manifest_path: Path) -> list[str]:
+def redacted_provider_argv(cmd: list[str], backend: str) -> list[str]:
+    """Keep generated provider context and user prompts out of stored diagnostics."""
+    redacted = list(cmd)
+    if backend == BACKEND_CLAUDE:
+        with suppress(ValueError, IndexError):
+            prompt_index = redacted.index("--append-system-prompt") + 1
+            redacted[prompt_index] = "<system-prompt>"
+        return redacted
+    if backend == BACKEND_CODEX:
+        redacted = [
+            'developer_instructions="<developer-instructions>"'
+            if value.startswith("developer_instructions=")
+            else value
+            for value in redacted
+        ]
+        if redacted:
+            redacted[-1] = "<prompt>"
+    return redacted
+
+
+def build_codex_cmd(
+    session_id: str,
+    sess: dict[str, Any],
+    prompt: str,
+    manifest_path: Path,
+) -> list[str]:
     provider_id = sess.get("codex_thread_id") or (
         sess.get("session_id") if sess.get("backend") == BACKEND_CODEX else None
     )
     configured_model, configured_effort, configured_service_tier = codex_user_config_defaults()
-    full_prompt = CODEX_PROMPT_PRELUDE.format(
+    provider_context = CODEX_PROMPT_PRELUDE.format(
         manifest_path=str(manifest_path),
         terminal_session=terminal_session_name(session_id),
-    ) + scheduled_jobs_prompt_context(session_id) + session_prompt_addendum(sess) + prompt
+    ) + scheduled_jobs_prompt_context(session_id) + session_prompt_addendum(sess)
+    user_developer_instructions = codex_user_developer_instructions()
+    combined_developer_instructions = "\n\n".join(
+        value for value in (user_developer_instructions, provider_context.rstrip()) if value
+    )
     model = str(sess.get("model") or configured_model or CODEX_DEFAULT_MODEL).strip()
     normalized_effort = normalize_runtime_effort(
         BACKEND_CODEX,
@@ -8472,6 +8902,10 @@ def build_codex_cmd(session_id: str, sess: dict[str, Any], prompt: str, manifest
         cmd.extend(["-c", f"model_reasoning_effort={normalized_effort}"])
     if effective_service_tier:
         cmd.extend(["-c", f"service_tier={effective_service_tier}"])
+    cmd.extend([
+        "-c",
+        f"developer_instructions={json.dumps(combined_developer_instructions, ensure_ascii=False)}",
+    ])
     if provider_id:
         cmd.append(str(provider_id))
     cmd.append("--json")
@@ -8480,7 +8914,7 @@ def build_codex_cmd(session_id: str, sess: dict[str, Any], prompt: str, manifest
     if not provider_id:
         cmd.append("--skip-git-repo-check")
     cmd.append("--dangerously-bypass-approvals-and-sandbox")
-    cmd.append(full_prompt)
+    cmd.append(prompt)
     return cmd
 
 
@@ -8957,12 +9391,23 @@ async def collect_recent_leftover_manifests(
         await collect_manifest(session_id, run_id, candidate, seen_artifacts=seen_artifacts, final=True)
 
 
-async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, Any], manifest_path: Path) -> None:
+async def run_claude(
+    session_id: str,
+    run_id: str,
+    prompt: str,
+    sess: dict[str, Any],
+    manifest_path: Path,
+) -> None:
     requested_cwd = str(sess.get("cwd") or DEFAULT_CWD)
     cwd = existing_cwd(requested_cwd)
     diff_baseline = await capture_git_baseline(session_id, run_id, cwd)
     resume_provider_id, resume_skip_message = resolve_claude_resume_provider(sess, cwd)
-    cmd = build_claude_cmd(session_id, sess, manifest_path, provider_id=resume_provider_id)
+    cmd = build_claude_cmd(
+        session_id,
+        sess,
+        manifest_path,
+        provider_id=resume_provider_id,
+    )
     if str(Path(requested_cwd).expanduser()) != cwd:
         await append_event(session_id, "cwd_fallback", {"run_id": run_id, "requested_cwd": requested_cwd, "cwd": cwd})
     if resume_skip_message:
@@ -8973,7 +9418,8 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
             "provider_session_id": claude_provider_id_for_session(sess),
             "message": resume_skip_message,
         })
-    await append_event(session_id, "process_started", {"run_id": run_id, "backend": BACKEND_CLAUDE, "argv": cmd, "cwd": cwd})
+    public_cmd = redacted_provider_argv(cmd, BACKEND_CLAUDE)
+    await append_event(session_id, "process_started", {"run_id": run_id, "backend": BACKEND_CLAUDE, "argv": public_cmd, "cwd": cwd})
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -9013,10 +9459,11 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
             "pid": proc.pid,
             "pgid": pgid,
             "cwd": cwd,
-            "argv": cmd,
+            "argv": public_cmd,
             "started_at": time.time(),
             "started_at_iso": now_iso(),
             "stop_requested": stop_requested,
+            "provider_turn_ready": False,
             "stdout_tail": deque(maxlen=LIVE_STDOUT_MAX_LINES),
             "stdout_total_lines": 0,
             "stdout_updated_at": None,
@@ -9066,8 +9513,14 @@ async def run_claude(session_id: str, run_id: str, prompt: str, sess: dict[str, 
                 event = json.loads(line)
             except Exception:
                 continue
-            if event.get("session_id") and not provider_id:
-                provider_id = event["session_id"]
+            if event.get("session_id"):
+                if not provider_id:
+                    provider_id = event["session_id"]
+                await mark_provider_turn_ready(
+                    session_id,
+                    run_id,
+                    str(event["session_id"]),
+                )
             etype = event.get("type")
             if etype == "assistant":
                 for block in event.get("message", {}).get("content", []):
@@ -9166,14 +9619,20 @@ async def run_codex(
     diff_baseline: dict[str, str] | None = None,
 ) -> None:
     resumed_provider_id = session_provider_id(sess)
-    cmd = build_codex_cmd(session_id, sess, prompt, manifest_path)
+    cmd = build_codex_cmd(
+        session_id,
+        sess,
+        prompt,
+        manifest_path,
+    )
     requested_cwd = str(sess.get("cwd") or DEFAULT_CWD)
     cwd = existing_cwd(requested_cwd)
     if diff_baseline is None:
         diff_baseline = await capture_git_baseline(session_id, run_id, cwd)
     if str(Path(requested_cwd).expanduser()) != cwd:
         await append_event(session_id, "cwd_fallback", {"run_id": run_id, "requested_cwd": requested_cwd, "cwd": cwd})
-    await append_event(session_id, "process_started", {"run_id": run_id, "backend": BACKEND_CODEX, "argv": cmd[:-1] + ["<prompt>"], "cwd": cwd})
+    public_cmd = redacted_provider_argv(cmd, BACKEND_CODEX)
+    await append_event(session_id, "process_started", {"run_id": run_id, "backend": BACKEND_CODEX, "argv": public_cmd, "cwd": cwd})
     env = agent_runner_env(session_id)
     codex_dir = os.path.dirname(os.path.abspath(CODEX_BIN))
     if codex_dir and codex_dir not in env.get("PATH", "").split(os.pathsep):
@@ -9216,10 +9675,11 @@ async def run_codex(
             "pid": proc.pid,
             "pgid": pgid,
             "cwd": cwd,
-            "argv": cmd[:-1] + ["<prompt>"],
+            "argv": public_cmd,
             "started_at": time.time(),
             "started_at_iso": now_iso(),
             "stop_requested": stop_requested,
+            "provider_turn_ready": False,
             "stdout_tail": deque(maxlen=LIVE_STDOUT_MAX_LINES),
             "stdout_total_lines": 0,
             "stdout_updated_at": None,
@@ -9312,6 +9772,9 @@ async def run_codex(
             return True
         if etype == "thread.started" and event.get("thread_id"):
             await emit_provider_session(str(event["thread_id"]))
+            return True
+        if etype == "turn.started":
+            await mark_provider_turn_ready(session_id, run_id, provider_id)
             return True
         if etype in ("item.started", "item.completed"):
             item = event.get("item", {}) or {}
@@ -9521,7 +9984,11 @@ async def run_codex(
         )
         if rollover:
             fresh_session, memory = rollover
-            retry_prompt = f"{memory}\n\n[Current user prompt]\n{prompt}"
+            retry_prompt = build_memory_augmented_prompt(
+                "Codex rollover memory",
+                memory,
+                prompt,
+            )
             await run_codex(
                 session_id,
                 run_id,
@@ -9591,10 +10058,12 @@ async def start_turn(
     queue_if_busy: bool = True,
     queued_id: str | None = None,
     display_file_ids: list[str] | None = None,
+    steering_lineage: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     sess = STORE.sessions.get(session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="session not found")
+    normalized_lineage = normalize_steering_lineage(steering_lineage)
     reserved = False
     should_queue = False
     async with ACTIVE_LOCK:
@@ -9613,6 +10082,7 @@ async def start_turn(
                 "backend": req.backend or sess.get("backend") or DEFAULT_BACKEND,
                 "purpose": req.purpose,
                 "queued_id": queued_id,
+                "steering_lineage": normalized_lineage,
             }
             reserved = True
     if should_queue:
@@ -9647,12 +10117,11 @@ async def start_turn(
                 current_turn["run_id"] = run_id
                 current_turn["backend"] = backend
         manifest_path = manifests_dir(session_id) / f"{run_id}.json"
-        prompt = req.prompt
-        attachment_lines = file_attachment_prompt_lines(req.file_ids)
-        if attachment_lines:
-            prompt += "\n\n[Attached files]\n"
-            prompt += "\n".join(attachment_lines) + "\n"
-            prompt += "Use these local paths directly when needed.\n"
+        prompt = build_turn_provider_prompt(
+            req.prompt,
+            req.file_ids,
+            normalized_lineage,
+        )
 
         memory_seed = str(sess.get("memory_seed") or "").strip()
         if (
@@ -9660,7 +10129,11 @@ async def start_turn(
             and memory_seed
             and (not sess.get("memory_seed_used") or not session_provider_id(sess))
         ):
-            prompt = f"{memory_seed}\n\n[Current user prompt]\n{prompt}"
+            prompt = build_memory_augmented_prompt(
+                "Fork memory context",
+                memory_seed,
+                prompt,
+            )
             async with STORE._lock:
                 current = STORE.sessions.get(session_id)
                 if current:
@@ -9698,7 +10171,23 @@ async def start_turn(
             RUN_METADATA[run_id] = run_metadata
             started_payload.update(run_metadata)
         started_event = await append_event(session_id, "turn_started", started_payload)
-        task = run_codex(session_id, run_id, prompt, dict(sess), manifest_path) if backend == BACKEND_CODEX else run_claude(session_id, run_id, prompt, dict(sess), manifest_path)
+        task = (
+            run_codex(
+                session_id,
+                run_id,
+                prompt,
+                dict(sess),
+                manifest_path,
+            )
+            if backend == BACKEND_CODEX
+            else run_claude(
+                session_id,
+                run_id,
+                prompt,
+                dict(sess),
+                manifest_path,
+            )
+        )
         asyncio.create_task(task)
         current_title = str(sess.get("title") or "").strip()
         if not current_title or current_title == "New chat":
@@ -10407,16 +10896,39 @@ async def stop_turn_endpoint(session_id: str) -> dict[str, Any]:
     return await stop_turn(session_id)
 
 
-async def stop_turn(session_id: str, *, emit_event: bool = True, schedule_queue: bool = True) -> dict[str, Any]:
+async def stop_turn(
+    session_id: str,
+    *,
+    emit_event: bool = True,
+    schedule_queue: bool = True,
+    require_provider_turn_ready: bool = False,
+) -> dict[str, Any]:
+    deferred = False
     async with ACTIVE_LOCK:
         active = ACTIVE.get(session_id)
         busy = session_id in BUSY_SESSIONS
         if active:
-            active["stop_requested"] = True
-            if active.get("run_id"):
-                STOPPED_RUNS.add(str(active["run_id"]))
+            if require_provider_turn_ready and (
+                not active.get("provider_turn_ready")
+                or not active.get("provider_session_id")
+            ):
+                deferred = True
+            else:
+                active["stop_requested"] = True
+                if active.get("run_id"):
+                    STOPPED_RUNS.add(str(active["run_id"]))
         elif busy:
-            STOP_REQUESTS.add(session_id)
+            if require_provider_turn_ready:
+                deferred = True
+            else:
+                STOP_REQUESTS.add(session_id)
+    if deferred:
+        return {
+            "ok": True,
+            "stopped": False,
+            "deferred": True,
+            "message": "The provider had not accepted the current turn yet, so it was left running.",
+        }
     if not active:
         if busy:
             if emit_event:

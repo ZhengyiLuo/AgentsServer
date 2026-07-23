@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import agent_server
 from agent_server import (
+    build_turn_provider_prompt,
     claude_result_error,
     is_expected_claude_interruption_result,
     prepare_steered_turn,
@@ -20,7 +21,7 @@ from agent_server import (
 
 
 class PrepareSteeredTurnTests(unittest.TestCase):
-    def test_replays_both_messages_and_scopes_attachments_to_their_owner(self) -> None:
+    def test_persists_raw_messages_and_generates_scoped_provider_prompt_at_launch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             files_root = Path(tmp)
             for file_id in ("original", "shared", "new"):
@@ -44,13 +45,30 @@ class PrepareSteeredTurnTests(unittest.TestCase):
                         "file_ids": ["original", "shared"],
                     },
                 )
+                provider_prompt = build_turn_provider_prompt(
+                    turn["prompt"],
+                    turn["file_ids"],
+                    turn["steering_lineage"],
+                )
 
-        self.assertIn("Launch the complete training sweep.", turn["prompt"])
-        self.assertIn("Use the smaller batch instead.", turn["prompt"])
-        self.assertIn("[Interrupted message attachments]", turn["prompt"])
-        self.assertIn("/uploads/original.png", turn["prompt"])
-        self.assertIn("/uploads/shared.png", turn["prompt"])
-        self.assertNotIn("/uploads/new.png", turn["prompt"])
+        self.assertEqual(turn["prompt"], "Use the smaller batch instead.")
+        self.assertEqual(turn["steering_lineage"], [
+            {
+                "prompt": "Launch the complete training sweep.",
+                "file_ids": ["original", "shared"],
+            },
+            {
+                "prompt": "Use the smaller batch instead.",
+                "file_ids": ["new", "shared"],
+            },
+        ])
+        self.assertNotIn("[Interrupted message]", json.dumps(turn))
+        self.assertNotIn("/uploads/", json.dumps(turn))
+        self.assertNotIn("Launch the complete training sweep.", provider_prompt)
+        self.assertNotIn("[Interrupted message]", provider_prompt)
+        self.assertNotIn("/uploads/original.png", provider_prompt)
+        self.assertIn("Use the smaller batch instead.", provider_prompt)
+        self.assertIn("/uploads/new.png", provider_prompt)
         self.assertEqual(turn["display_prompt"], "Use the smaller batch instead.")
         self.assertEqual(turn["file_ids"], ["new", "shared"])
         self.assertEqual(turn["display_file_ids"], ["new", "shared"])
@@ -72,22 +90,44 @@ class PrepareSteeredTurnTests(unittest.TestCase):
                     {"queued_id": "queued-steer", "prompt": "Look at the warning instead.", "file_ids": []},
                     {"run_id": "run-original", "prompt": "What is this?", "file_ids": ["original-image"]},
                 )
+                provider_prompt = build_turn_provider_prompt(
+                    turn["prompt"],
+                    turn["file_ids"],
+                    turn["steering_lineage"],
+                )
 
-        interrupted_section = turn["prompt"].split("[End interrupted message]", 1)[0]
-        steering_section = turn["prompt"].split("[Steering message]", 1)[1]
-        self.assertIn("/uploads/original.png", interrupted_section)
-        self.assertNotIn("/uploads/original.png", steering_section)
+        self.assertNotIn("/uploads/original.png", provider_prompt)
+        self.assertEqual(provider_prompt, "Look at the warning instead.")
+        self.assertEqual(turn["prompt"], "Look at the warning instead.")
         self.assertEqual(turn["file_ids"], [])
         self.assertEqual(turn["display_file_ids"], [])
 
     def test_image_only_messages_remain_distinct_during_steering(self) -> None:
-        turn = prepare_steered_turn(
-            {"queued_id": "queued-steer", "prompt": "", "file_ids": ["new-image"]},
-            {"run_id": "run-original", "prompt": "", "file_ids": ["original-image"]},
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            files_root = Path(tmp)
+            for file_id in ("original-image", "new-image"):
+                file_dir = files_root / file_id
+                file_dir.mkdir()
+                filename = "original.png" if file_id == "original-image" else "new.png"
+                (file_dir / "meta.json").write_text(json.dumps({
+                    "path": f"/uploads/{filename}",
+                    "filename": filename,
+                    "content_type": "image/png",
+                }))
+            with patch.object(agent_server, "FILES_ROOT", files_root):
+                turn = prepare_steered_turn(
+                    {"queued_id": "queued-steer", "prompt": "", "file_ids": ["new-image"]},
+                    {"run_id": "run-original", "prompt": "", "file_ids": ["original-image"]},
+                )
+                provider_prompt = build_turn_provider_prompt(
+                    turn["prompt"],
+                    turn["file_ids"],
+                    turn["steering_lineage"],
+                )
 
-        self.assertIn("[Attachment-only message]", turn["prompt"])
-        self.assertIn("[Attachment-only steering message]", turn["prompt"])
+        self.assertEqual(turn["prompt"], "")
+        self.assertIn("/uploads/new.png", provider_prompt)
+        self.assertNotIn("/uploads/original.png", provider_prompt)
         self.assertEqual(turn["display_prompt"], "")
         self.assertEqual(turn["file_ids"], ["new-image"])
         self.assertEqual(turn["display_file_ids"], ["new-image"])
@@ -95,6 +135,83 @@ class PrepareSteeredTurnTests(unittest.TestCase):
     def test_plain_promotion_stays_unchanged_without_an_interrupted_turn(self) -> None:
         selected = {"queued_id": "queued-steer", "prompt": "Run this now.", "file_ids": []}
         self.assertEqual(prepare_steered_turn(selected, None), selected)
+
+    def test_repeated_steering_stays_flat_instead_of_nesting_generated_wrappers(self) -> None:
+        first = prepare_steered_turn(
+            {"prompt": "First steering instruction.", "file_ids": []},
+            {"run_id": "run-original", "prompt": "Original request.", "file_ids": []},
+        )
+        second = prepare_steered_turn(
+            {"prompt": "Second steering instruction.", "file_ids": []},
+            {
+                "run_id": "run-first-steer",
+                "prompt": first["prompt"],
+                "file_ids": first["file_ids"],
+                "steering_lineage": first["steering_lineage"],
+            },
+        )
+        provider_prompt = build_turn_provider_prompt(
+            second["prompt"],
+            second["file_ids"],
+            second["steering_lineage"],
+        )
+
+        self.assertEqual(second["prompt"], "Second steering instruction.")
+        self.assertEqual(
+            [item["prompt"] for item in second["steering_lineage"]],
+            ["Original request.", "First steering instruction.", "Second steering instruction."],
+        )
+        self.assertEqual(provider_prompt, "Second steering instruction.")
+        self.assertNotIn("[AgentsDock steering context]", provider_prompt)
+        self.assertNotIn("[Interrupted user message]", provider_prompt)
+        self.assertNotIn("Original request.", provider_prompt)
+        self.assertNotIn("First steering instruction.", provider_prompt)
+
+    def test_nested_legacy_steering_envelopes_restore_flat_lineage(self) -> None:
+        first = (
+            agent_server.LEGACY_STEERING_PREFIX
+            + "[Interrupted message]\nOriginal request.\n"
+            "[End interrupted message]\n\n"
+            "[Steering message]\nFirst steering instruction.\n"
+            "[End steering message]"
+        )
+        second = (
+            agent_server.LEGACY_STEERING_PREFIX
+            + f"[Interrupted message]\n{first}\n"
+            "[End interrupted message]\n\n"
+            "[Steering message]\nSecond steering instruction.\n"
+            "[End steering message]"
+        )
+
+        lineage = agent_server.parse_legacy_steering_lineage(second)
+
+        self.assertEqual(
+            [message["prompt"] for message in lineage],
+            [
+                "Original request.",
+                "First steering instruction.",
+                "Second steering instruction.",
+            ],
+        )
+
+
+class StopTurnProviderReadinessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pre_spawn_force_send_defers_without_cancelling_the_original_turn(self) -> None:
+        stop_requests: set[str] = set()
+        with patch.object(agent_server, "ACTIVE", {}), \
+                patch.object(agent_server, "BUSY_SESSIONS", {"chat-1"}), \
+                patch.object(agent_server, "STOP_REQUESTS", stop_requests), \
+                patch.object(agent_server, "STOPPED_RUNS", set()):
+            result = await agent_server.stop_turn(
+                "chat-1",
+                emit_event=False,
+                schedule_queue=False,
+                require_provider_turn_ready=True,
+            )
+
+        self.assertFalse(result["stopped"])
+        self.assertTrue(result["deferred"])
+        self.assertNotIn("chat-1", stop_requests)
 
 
 class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
@@ -139,22 +256,33 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         async def completed_wait(_session_id: str) -> None:
             return None
 
-        with patch.object(agent_server, "stop_turn", new_callable=AsyncMock, return_value={"stopped": True}), \
+        with patch.object(
+                agent_server,
+                "stop_turn",
+                new_callable=AsyncMock,
+                return_value={"stopped": True},
+        ) as stop_turn, \
                 patch.object(agent_server, "append_event", append_event), \
                 patch.object(agent_server, "wait_for_steered_turn_slot", completed_wait):
             result = await run_queued_turn_now("chat-1", "queued-steer")
             await asyncio.sleep(0)
 
+        self.assertTrue(stop_turn.await_args.kwargs["require_provider_turn_ready"])
         promoted = agent_server.RUN_NOW_TURNS["chat-1"]
         self.assertTrue(result["replays_interrupted_message"])
-        self.assertIn("Finish the original investigation.", promoted["prompt"])
-        self.assertIn("Change course now.", promoted["prompt"])
+        self.assertEqual(promoted["prompt"], "Change course now.")
+        self.assertEqual(
+            [item["prompt"] for item in promoted["steering_lineage"]],
+            ["Finish the original investigation.", "Change course now."],
+        )
         self.assertEqual(promoted["display_prompt"], "Change course now.")
         self.assertEqual(promoted["file_ids"], ["new-file"])
         self.assertEqual(promoted["display_file_ids"], ["new-file"])
         event_payload = append_event.await_args.args[2]
         self.assertEqual(event_payload["prompt"], "Change course now.")
-        self.assertIn("Finish the original investigation.", event_payload["request_prompt"])
+        self.assertEqual(event_payload["request_prompt"], "Change course now.")
+        self.assertNotIn("[Interrupted message]", event_payload["request_prompt"])
+        self.assertEqual(event_payload["steering_lineage"], promoted["steering_lineage"])
         self.assertEqual(event_payload["file_ids"], ["new-file"])
         self.assertEqual(event_payload["display_file_ids"], ["new-file"])
         self.assertTrue(event_payload["replays_interrupted_message"])
@@ -174,6 +302,32 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         promoted = agent_server.RUN_NOW_TURNS["chat-1"]
         self.assertFalse(result["replays_interrupted_message"])
         self.assertEqual(promoted["prompt"], "Change course now.")
+
+    async def test_unready_provider_leaves_force_send_message_in_the_queue(self) -> None:
+        append_event = AsyncMock(return_value={})
+        with patch.object(
+                agent_server,
+                "stop_turn",
+                new_callable=AsyncMock,
+                return_value={"stopped": False, "deferred": True},
+        ) as stop_turn, \
+                patch.object(agent_server, "append_event", append_event), \
+                patch.object(agent_server, "BUSY_SESSIONS", {"chat-1"}), \
+                patch.object(agent_server, "schedule_next_queued_turn") as schedule_next:
+            result = await run_queued_turn_now("chat-1", "queued-steer")
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["deferred"])
+        self.assertFalse(result["interrupted"])
+        self.assertTrue(stop_turn.await_args.kwargs["require_provider_turn_ready"])
+        self.assertNotIn("chat-1", agent_server.RUN_NOW_TURNS)
+        self.assertNotIn("chat-1", agent_server.STEERING_SESSIONS)
+        self.assertEqual(
+            [item["queued_id"] for item in agent_server.QUEUED_TURNS["chat-1"]],
+            ["queued-steer"],
+        )
+        self.assertEqual(append_event.await_args.args[1], "turn_deferred")
+        schedule_next.assert_not_called()
 
     async def test_later_steer_runs_first_then_keeps_other_messages_in_original_order(self) -> None:
         agent_server.QUEUED_TURNS["chat-1"] = deque([
@@ -278,13 +432,18 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(agent_server.QUEUED_TURNS["chat-1"]), 1)
 
     async def test_handoff_barrier_keeps_the_promoted_turn_reserved(self) -> None:
+        lineage = [
+            {"prompt": "Continue the original request.", "file_ids": []},
+            {"prompt": "Use the smaller batch.", "file_ids": []},
+        ]
         promoted = {
             "queued_id": "queued-steer",
-            "prompt": "Continue the original request, but use the smaller batch.",
+            "prompt": "Use the smaller batch.",
             "display_prompt": "Use the smaller batch.",
             "file_ids": [],
             "display_file_ids": [],
             "backend": "codex",
+            "steering_lineage": lineage,
         }
         agent_server.RUN_NOW_TURNS["chat-1"] = promoted
         agent_server.STEERING_SESSIONS.add("chat-1")
@@ -302,14 +461,17 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.prompt, promoted["prompt"])
         self.assertEqual(request.display_prompt, promoted["display_prompt"])
         self.assertEqual(start_turn.await_args.kwargs["display_file_ids"], [])
+        self.assertEqual(start_turn.await_args.kwargs["steering_lineage"], lineage)
         self.assertNotIn("chat-1", agent_server.RUN_NOW_TURNS)
 
-    def test_recovered_run_now_turn_keeps_interrupted_paths_in_scoped_prompt_only(self) -> None:
+    def test_recovered_legacy_run_now_turn_restores_raw_lineage(self) -> None:
         item = queued_turn_from_event(
             {
+                "type": "turn_queue_run_now",
                 "queued_id": "queued-steer",
                 "request_prompt": (
-                    "[Interrupted message]\nOld request\n\n"
+                    agent_server.LEGACY_STEERING_PREFIX
+                    + "[Interrupted message]\nOld request\n\n"
                     "[Interrupted message attachments]\n"
                     "- /uploads/old.png (old.png, image/png)\n"
                     "[End interrupted message attachments]\n"
@@ -319,14 +481,43 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
                 "prompt": "New steering text",
                 "file_ids": ["new-image"],
                 "display_file_ids": ["new-image"],
+                "replays_interrupted_message": True,
             },
             agent_server.STORE.sessions["chat-1"],
             1,
         )
 
-        self.assertIn("/uploads/old.png", item["prompt"])
+        self.assertEqual(item["prompt"], "New steering text")
+        self.assertNotIn("/uploads/old.png", item["prompt"])
+        self.assertEqual(
+            [message["prompt"] for message in item["steering_lineage"]],
+            ["Old request", "New steering text"],
+        )
         self.assertEqual(item["file_ids"], ["new-image"])
         self.assertEqual(item["display_file_ids"], ["new-image"])
+
+    def test_recovered_run_now_turn_keeps_structured_lineage(self) -> None:
+        lineage = [
+            {"prompt": "Old request", "file_ids": ["old-image"]},
+            {"prompt": "New steering text", "file_ids": ["new-image"]},
+        ]
+        item = queued_turn_from_event(
+            {
+                "type": "turn_queue_run_now",
+                "queued_id": "queued-steer",
+                "request_prompt": "New steering text",
+                "prompt": "New steering text",
+                "file_ids": ["new-image"],
+                "display_file_ids": ["new-image"],
+                "replays_interrupted_message": True,
+                "steering_lineage": lineage,
+            },
+            agent_server.STORE.sessions["chat-1"],
+            1,
+        )
+
+        self.assertEqual(item["prompt"], "New steering text")
+        self.assertEqual(item["steering_lineage"], lineage)
 
     def test_recovery_keeps_an_image_only_queued_turn(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

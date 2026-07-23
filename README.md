@@ -497,6 +497,27 @@ so they immediately appear in the Jobs panel. The scoped helper routes are:
 - `GET/POST /api/sessions/{session_id}/jobs`
 - `PATCH/DELETE /api/sessions/{session_id}/jobs/{job_id}`
 
+## Workspace Files
+
+The optional `workspace_files` health capability exposes a chat-scoped text
+workspace rooted at that chat's exact `cwd`. It is additive to API contract v9,
+so older clients continue to work without a global compatibility failure.
+
+```text
+GET /api/sessions/{session_id}/workspace
+GET /api/sessions/{session_id}/workspace/entries?path=&offset=0&limit=500
+GET /api/sessions/{session_id}/workspace/search?q=app&limit=100
+GET /api/sessions/{session_id}/workspace/file?path=src/App.tsx
+PUT /api/sessions/{session_id}/workspace/file
+```
+
+Reads accept UTF-8 regular files up to 2 MiB by default. Writes are atomic,
+require the SHA-256 revision returned by the read endpoint, and reject stale
+revisions, symlinks, special files, hard links, archived chats, and read-only
+targets. Directory traversal is descriptor-relative and fails closed when the
+host lacks secure no-follow file APIs. Configure the text limit with
+`AGENTSDOCK_WORKSPACE_TEXT_MAX_BYTES`.
+
 ## Whole-History Search
 
 `GET /api/search?q=<query>&limit=<chat-count>` searches user, assistant, error,

@@ -27,6 +27,7 @@ import shlex
 import shutil
 import signal
 import sqlite3
+import stat
 import struct
 import subprocess
 import sys
@@ -200,6 +201,15 @@ HANDOFF_DIGEST_MODEL = agentsdock_setting("HANDOFF_DIGEST_MODEL", "sonnet").stri
 HANDOFF_DIGEST_EFFORT = agentsdock_setting("HANDOFF_DIGEST_EFFORT", "").strip()
 DEFAULT_SESSION_EVENT_LIMIT = int(agentsdock_setting("SESSION_EVENT_LIMIT", "100"))
 MAX_EVENT_RESPONSE_LIMIT = int(agentsdock_setting("MAX_EVENT_RESPONSE_LIMIT", "1000"))
+MAX_WORKSPACE_TEXT_BYTES = int(agentsdock_setting("WORKSPACE_TEXT_MAX_BYTES", str(2 * 1024 * 1024)))
+MAX_WORKSPACE_PATH_CHARS = int(agentsdock_setting("WORKSPACE_PATH_MAX_CHARS", "4096"))
+MAX_WORKSPACE_SEARCH_SCAN = int(agentsdock_setting("WORKSPACE_SEARCH_MAX_ENTRIES", "20000"))
+WORKSPACE_SECURE_OPEN_AVAILABLE = all(hasattr(os, flag) for flag in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK"))
+WORKSPACE_WRITE_LOCKS = tuple(threading.Lock() for _ in range(256))
+WORKSPACE_SEARCH_IGNORED_DIRECTORIES = {
+    ".git", ".hg", ".svn", ".cache", ".next", ".turbo", ".venv",
+    "__pycache__", "DerivedData", "build", "dist", "node_modules", "target", "venv",
+}
 AGENT_TOKEN = env_setting(
     "AGENTSDOCK_AGENT_TOKEN",
     "",
@@ -799,6 +809,503 @@ def existing_cwd(requested: str | None) -> str:
     return "/tmp"
 
 
+def workspace_http_error(status_code: int, code: str, message: str, action: str | None = None) -> HTTPException:
+    detail: dict[str, Any] = {"code": code, "message": message}
+    if action:
+        detail["action"] = action
+    return HTTPException(status_code=status_code, detail=detail)
+
+
+def session_workspace_root(session_id: str, *, for_write: bool = False) -> tuple[dict[str, Any], Path]:
+    if not WORKSPACE_SECURE_OPEN_AVAILABLE:
+        raise workspace_http_error(
+            501,
+            "workspace_secure_open_unavailable",
+            "Secure workspace file access is unavailable on this host.",
+        )
+    sess = STORE.sessions.get(session_id)
+    if not sess:
+        raise workspace_http_error(404, "session_not_found", "Chat not found.")
+    if for_write and bool(sess.get("archived")):
+        raise workspace_http_error(409, "workspace_read_only", "Archived chats have read-only workspaces.")
+    configured = str(sess.get("cwd") or "").strip()
+    if not configured:
+        raise workspace_http_error(
+            409,
+            "workspace_unavailable",
+            "This chat does not have a working directory.",
+            "Set its working directory in the inspector.",
+        )
+    try:
+        root = Path(configured).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise workspace_http_error(
+            409,
+            "workspace_unavailable",
+            f"The chat working directory is unavailable: {configured}",
+            "Update the working directory in the inspector.",
+        ) from exc
+    if not root.is_dir():
+        raise workspace_http_error(
+            409,
+            "workspace_unavailable",
+            f"The chat working directory is not a directory: {configured}",
+            "Update the working directory in the inspector.",
+        )
+    return sess, root
+
+
+def normalize_workspace_path(value: str | None, *, allow_root: bool = False) -> str:
+    raw = str(value or "")
+    if "\x00" in raw:
+        raise workspace_http_error(400, "invalid_workspace_path", "Workspace paths cannot contain NUL bytes.")
+    if len(raw) > MAX_WORKSPACE_PATH_CHARS:
+        raise workspace_http_error(400, "invalid_workspace_path", "Workspace path is too long.")
+    portable = raw.replace("\\", "/") if os.name == "nt" else raw
+    if portable.startswith("/") or re.match(r"^[A-Za-z]:/", portable):
+        raise workspace_http_error(400, "invalid_workspace_path", "Workspace paths must be relative.")
+    parts: list[str] = []
+    for part in portable.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            raise workspace_http_error(400, "invalid_workspace_path", "Workspace paths cannot leave the chat working directory.")
+        parts.append(part)
+    normalized = "/".join(parts)
+    if not normalized and not allow_root:
+        raise workspace_http_error(400, "invalid_workspace_path", "A workspace file path is required.")
+    return normalized
+
+
+def workspace_open_flags(*, directory: bool = False) -> int:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    if directory:
+        flags |= os.O_DIRECTORY
+    return flags
+
+
+def translate_workspace_os_error(exc: OSError, path: str, *, directory: bool = False) -> HTTPException:
+    if exc.errno in {errno.ELOOP}:
+        return workspace_http_error(403, "workspace_symlink_blocked", "Workspace symlinks cannot be opened.")
+    if exc.errno in {errno.ENOENT}:
+        noun = "directory" if directory else "file"
+        return workspace_http_error(404, f"workspace_{noun}_not_found", f"Workspace {noun} not found: {path or '.'}")
+    if exc.errno in {errno.ENOTDIR, errno.EISDIR}:
+        return workspace_http_error(400, "invalid_workspace_path", f"Workspace path has the wrong type: {path or '.'}")
+    if exc.errno in {errno.EACCES, errno.EPERM}:
+        return workspace_http_error(403, "workspace_permission_denied", f"Permission denied: {path or '.'}")
+    return workspace_http_error(500, "workspace_io_error", f"Could not access workspace path: {path or '.'}")
+
+
+def open_workspace_directory_fd(root: Path, relative_path: str = "") -> int:
+    flags = workspace_open_flags(directory=True)
+    try:
+        current = os.open(root, flags)
+    except OSError as exc:
+        raise translate_workspace_os_error(exc, str(root), directory=True) from exc
+    try:
+        for part in relative_path.split("/") if relative_path else ():
+            try:
+                next_fd = os.open(part, flags, dir_fd=current)
+            except OSError as exc:
+                raise translate_workspace_os_error(exc, relative_path, directory=True) from exc
+            os.close(current)
+            current = next_fd
+        return current
+    except Exception:
+        os.close(current)
+        raise
+
+
+def open_workspace_parent_fd(root: Path, relative_path: str) -> tuple[int, str]:
+    parts = relative_path.split("/")
+    parent = "/".join(parts[:-1])
+    return open_workspace_directory_fd(root, parent), parts[-1]
+
+
+def workspace_revision(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def workspace_entry(relative_path: str, name: str, item_stat: os.stat_result) -> dict[str, Any] | None:
+    path = f"{relative_path}/{name}" if relative_path else name
+    if stat.S_ISDIR(item_stat.st_mode):
+        kind = "directory"
+    elif stat.S_ISREG(item_stat.st_mode):
+        kind = "file"
+    elif stat.S_ISLNK(item_stat.st_mode):
+        kind = "symlink"
+    else:
+        return None
+    return {
+        "name": name,
+        "path": path,
+        "kind": kind,
+        "size": int(item_stat.st_size) if kind == "file" else None,
+        "mtime_ns": int(item_stat.st_mtime_ns),
+        "hidden": name.startswith("."),
+        "writable": kind == "file" and bool(item_stat.st_mode & 0o222),
+    }
+
+
+def workspace_info_sync(session_id: str) -> dict[str, Any]:
+    sess, root = session_workspace_root(session_id)
+    return {
+        "root": str(root),
+        "name": root.name or str(root),
+        "read_only": bool(sess.get("archived")),
+        "capability_version": 1,
+        "max_text_file_bytes": MAX_WORKSPACE_TEXT_BYTES,
+    }
+
+
+def list_workspace_entries_sync(
+    session_id: str,
+    relative_path: str,
+    offset: int,
+    limit: int,
+) -> dict[str, Any]:
+    sess, root = session_workspace_root(session_id)
+    normalized = normalize_workspace_path(relative_path, allow_root=True)
+    directory_fd = open_workspace_directory_fd(root, normalized)
+    try:
+        records: list[dict[str, Any]] = []
+        for name in os.listdir(directory_fd):
+            try:
+                item_stat = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                if exc.errno in {errno.EACCES, errno.EPERM}:
+                    continue
+                raise translate_workspace_os_error(exc, f"{normalized}/{name}".strip("/")) from exc
+            record = workspace_entry(normalized, name, item_stat)
+            if record:
+                if bool(sess.get("archived")):
+                    record["writable"] = False
+                records.append(record)
+    finally:
+        os.close(directory_fd)
+    records.sort(key=lambda item: (item["kind"] != "directory", str(item["name"]).casefold(), str(item["name"])))
+    total = len(records)
+    page = records[offset:offset + limit]
+    return {
+        "root": str(root),
+        "path": normalized,
+        "entries": page,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "has_more": offset + len(page) < total,
+    }
+
+
+def read_workspace_file_sync(session_id: str, relative_path: str) -> dict[str, Any]:
+    sess, root = session_workspace_root(session_id)
+    normalized = normalize_workspace_path(relative_path)
+    parent_fd, name = open_workspace_parent_fd(root, normalized)
+    file_fd = -1
+    try:
+        try:
+            file_fd = os.open(name, workspace_open_flags(), dir_fd=parent_fd)
+        except OSError as exc:
+            raise translate_workspace_os_error(exc, normalized) from exc
+        item_stat = os.fstat(file_fd)
+        if not stat.S_ISREG(item_stat.st_mode):
+            raise workspace_http_error(400, "workspace_not_regular_file", f"Not a regular workspace file: {normalized}")
+        if item_stat.st_size > MAX_WORKSPACE_TEXT_BYTES:
+            raise workspace_http_error(
+                413,
+                "workspace_file_too_large",
+                f"{normalized} is larger than the {MAX_WORKSPACE_TEXT_BYTES // (1024 * 1024)} MiB editor limit.",
+            )
+        chunks: list[bytes] = []
+        remaining = MAX_WORKSPACE_TEXT_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(file_fd, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        if len(data) > MAX_WORKSPACE_TEXT_BYTES:
+            raise workspace_http_error(413, "workspace_file_too_large", f"{normalized} exceeds the editor size limit.")
+        if b"\x00" in data:
+            raise workspace_http_error(415, "workspace_binary_file", f"{normalized} is binary and cannot be opened in the text editor.")
+        try:
+            content = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise workspace_http_error(415, "workspace_encoding_unsupported", f"{normalized} is not UTF-8 text.") from exc
+        return {
+            "root": str(root),
+            "path": normalized,
+            "name": name,
+            "content": content,
+            "revision": workspace_revision(data),
+            "size": len(data),
+            "mtime_ns": int(item_stat.st_mtime_ns),
+            "writable": not bool(sess.get("archived")) and bool(item_stat.st_mode & 0o222),
+        }
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        os.close(parent_fd)
+
+
+def write_all(file_fd: int, data: bytes) -> None:
+    offset = 0
+    while offset < len(data):
+        written = os.write(file_fd, data[offset:])
+        if written <= 0:
+            raise OSError(errno.EIO, "short workspace write")
+        offset += written
+
+
+def workspace_write_lock(root: Path, relative_path: str) -> threading.Lock:
+    key = hashlib.sha256(f"{root}\0{relative_path}".encode("utf-8", errors="surrogatepass")).digest()
+    return WORKSPACE_WRITE_LOCKS[int.from_bytes(key[:2], "big") % len(WORKSPACE_WRITE_LOCKS)]
+
+
+def preserve_workspace_metadata(source_fd: int, destination_fd: int, source_stat: os.stat_result) -> None:
+    os.fchmod(destination_fd, stat.S_IMODE(source_stat.st_mode))
+    with suppress(PermissionError):
+        os.fchown(destination_fd, source_stat.st_uid, source_stat.st_gid)
+    if not all(hasattr(os, name) for name in ("listxattr", "getxattr", "setxattr")):
+        return
+    try:
+        names = os.listxattr(source_fd)
+    except OSError:
+        return
+    for attribute in names:
+        try:
+            os.setxattr(destination_fd, attribute, os.getxattr(source_fd, attribute))
+        except OSError:
+            logger.warning("could not preserve workspace xattr %s", attribute)
+
+
+def write_workspace_file_sync(
+    session_id: str,
+    relative_path: str,
+    content: str,
+    expected_revision: str,
+) -> dict[str, Any]:
+    _, root = session_workspace_root(session_id, for_write=True)
+    normalized = normalize_workspace_path(relative_path)
+    with workspace_write_lock(root, normalized):
+        return write_workspace_file_locked(session_id, normalized, content, expected_revision)
+
+
+def write_workspace_file_locked(
+    session_id: str,
+    relative_path: str,
+    content: str,
+    expected_revision: str,
+) -> dict[str, Any]:
+    _, root = session_workspace_root(session_id, for_write=True)
+    normalized = normalize_workspace_path(relative_path)
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_revision or ""):
+        raise workspace_http_error(400, "invalid_workspace_revision", "A valid workspace file revision is required.")
+    data = content.encode("utf-8")
+    if b"\x00" in data:
+        raise workspace_http_error(415, "workspace_binary_file", "Edited content cannot contain NUL bytes.")
+    if len(data) > MAX_WORKSPACE_TEXT_BYTES:
+        raise workspace_http_error(413, "workspace_file_too_large", "Edited content exceeds the workspace editor size limit.")
+    parent_fd, name = open_workspace_parent_fd(root, normalized)
+    current_fd = -1
+    temp_fd = -1
+    temp_name = f".{name}.agentsdock-{uuid.uuid4().hex}.tmp"
+    try:
+        try:
+            current_fd = os.open(name, workspace_open_flags(), dir_fd=parent_fd)
+        except OSError as exc:
+            raise translate_workspace_os_error(exc, normalized) from exc
+        current_stat = os.fstat(current_fd)
+        if not stat.S_ISREG(current_stat.st_mode):
+            raise workspace_http_error(400, "workspace_not_regular_file", f"Not a regular workspace file: {normalized}")
+        if current_stat.st_nlink > 1:
+            raise workspace_http_error(
+                409,
+                "workspace_hard_link_blocked",
+                f"{normalized} has multiple hard links and cannot be replaced safely.",
+            )
+        if not bool(current_stat.st_mode & 0o222):
+            raise workspace_http_error(403, "workspace_permission_denied", f"Workspace file is read-only: {normalized}")
+        if current_stat.st_size > MAX_WORKSPACE_TEXT_BYTES:
+            raise workspace_http_error(413, "workspace_file_too_large", f"{normalized} exceeds the editor size limit.")
+        current_chunks: list[bytes] = []
+        current_size = 0
+        while True:
+            chunk = os.read(current_fd, 1024 * 1024)
+            if not chunk:
+                break
+            current_chunks.append(chunk)
+            current_size += len(chunk)
+            if current_size > MAX_WORKSPACE_TEXT_BYTES:
+                raise workspace_http_error(413, "workspace_file_too_large", f"{normalized} exceeds the editor size limit.")
+        current_data = b"".join(current_chunks)
+        actual_revision = workspace_revision(current_data)
+        if not hmac.compare_digest(actual_revision, expected_revision.lower()):
+            raise workspace_http_error(
+                409,
+                "workspace_file_conflict",
+                f"{normalized} changed on disk. Reload it before saving your edits.",
+            )
+        try:
+            temp_fd = os.open(
+                temp_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                stat.S_IMODE(current_stat.st_mode),
+                dir_fd=parent_fd,
+            )
+            write_all(temp_fd, data)
+            preserve_workspace_metadata(current_fd, temp_fd, current_stat)
+            os.fsync(temp_fd)
+            os.close(temp_fd)
+            temp_fd = -1
+            latest_fd = -1
+            try:
+                latest_fd = os.open(name, workspace_open_flags(), dir_fd=parent_fd)
+                latest_stat = os.fstat(latest_fd)
+                if not stat.S_ISREG(latest_stat.st_mode):
+                    raise workspace_http_error(409, "workspace_file_conflict", f"{normalized} changed while it was being saved.")
+                latest_chunks: list[bytes] = []
+                latest_size = 0
+                while True:
+                    chunk = os.read(latest_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    latest_chunks.append(chunk)
+                    latest_size += len(chunk)
+                    if latest_size > MAX_WORKSPACE_TEXT_BYTES:
+                        raise workspace_http_error(409, "workspace_file_conflict", f"{normalized} changed while it was being saved.")
+                latest_data = b"".join(latest_chunks)
+            finally:
+                if latest_fd >= 0:
+                    os.close(latest_fd)
+            if (
+                latest_stat.st_dev != current_stat.st_dev
+                or latest_stat.st_ino != current_stat.st_ino
+                or stat.S_IMODE(latest_stat.st_mode) != stat.S_IMODE(current_stat.st_mode)
+                or latest_stat.st_uid != current_stat.st_uid
+                or latest_stat.st_gid != current_stat.st_gid
+                or latest_stat.st_nlink != current_stat.st_nlink
+                or not hmac.compare_digest(workspace_revision(latest_data), actual_revision)
+            ):
+                raise workspace_http_error(
+                    409,
+                    "workspace_file_conflict",
+                    f"{normalized} changed while it was being saved. Reload it and try again.",
+                )
+            os.replace(temp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            try:
+                os.fsync(parent_fd)
+            except OSError as exc:
+                logger.warning("workspace directory fsync failed after saving %s: %s", normalized, exc)
+        except HTTPException:
+            raise
+        except OSError as exc:
+            raise translate_workspace_os_error(exc, normalized) from exc
+        updated_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        return {
+            "root": str(root),
+            "path": normalized,
+            "name": name,
+            "content": content,
+            "revision": workspace_revision(data),
+            "size": len(data),
+            "mtime_ns": int(updated_stat.st_mtime_ns),
+            "writable": bool(updated_stat.st_mode & 0o222),
+        }
+    finally:
+        if current_fd >= 0:
+            os.close(current_fd)
+        if temp_fd >= 0:
+            os.close(temp_fd)
+        with suppress(OSError):
+            os.unlink(temp_name, dir_fd=parent_fd)
+        os.close(parent_fd)
+
+
+def workspace_search_rank(path: str, query: str) -> tuple[int, int, str]:
+    lower = path.casefold()
+    name = path.rsplit("/", 1)[-1].casefold()
+    if not query:
+        return (0, len(path), lower)
+    if name == query:
+        score = 0
+    elif name.startswith(query):
+        score = 1
+    elif f"/{query}" in lower:
+        score = 2
+    elif query in name:
+        score = 3
+    else:
+        score = 4
+    return (score, len(path), lower)
+
+
+def search_workspace_files_sync(session_id: str, query: str, limit: int) -> dict[str, Any]:
+    sess, root = session_workspace_root(session_id)
+    clean_query = str(query or "").strip().casefold()
+    queue: deque[str] = deque([""])
+    results: list[dict[str, Any]] = []
+    scanned = 0
+    truncated = False
+    while queue:
+        directory = queue.popleft()
+        try:
+            directory_fd = open_workspace_directory_fd(root, directory)
+        except HTTPException:
+            if not directory:
+                raise
+            continue
+        try:
+            names = sorted(os.listdir(directory_fd), key=lambda value: (value.casefold(), value))
+            for name in names:
+                try:
+                    item_stat = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                except OSError:
+                    continue
+                scanned += 1
+                if scanned > MAX_WORKSPACE_SEARCH_SCAN:
+                    truncated = True
+                    queue.clear()
+                    break
+                path = f"{directory}/{name}" if directory else name
+                if stat.S_ISDIR(item_stat.st_mode):
+                    if name not in WORKSPACE_SEARCH_IGNORED_DIRECTORIES and not stat.S_ISLNK(item_stat.st_mode):
+                        queue.append(path)
+                    continue
+                if not stat.S_ISREG(item_stat.st_mode):
+                    continue
+                if clean_query and clean_query not in path.casefold():
+                    continue
+                results.append({
+                    "name": name,
+                    "path": path,
+                    "kind": "file",
+                    "size": int(item_stat.st_size),
+                    "mtime_ns": int(item_stat.st_mtime_ns),
+                    "hidden": name.startswith("."),
+                    "writable": not bool(sess.get("archived")) and bool(item_stat.st_mode & 0o222),
+                })
+                if not clean_query and len(results) > limit:
+                    truncated = True
+                    queue.clear()
+                    break
+        finally:
+            os.close(directory_fd)
+    results.sort(key=lambda item: workspace_search_rank(str(item["path"]), clean_query))
+    return {
+        "root": str(root),
+        "query": str(query or ""),
+        "entries": results[:limit],
+        "scanned": min(scanned, MAX_WORKSPACE_SEARCH_SCAN),
+        "truncated": truncated or len(results) > limit,
+        "limit": limit,
+    }
+
+
 def server_identity() -> str:
     machine = ""
     for path in (Path("/etc/machine-id"), Path("/var/lib/dbus/machine-id")):
@@ -1372,6 +1879,12 @@ class UpdateJobRequest(BaseModel):
 
 class ServerUpdateRequest(BaseModel):
     version: str | None = None
+
+
+class WorkspaceWriteRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=MAX_WORKSPACE_PATH_CHARS)
+    content: str = Field(max_length=MAX_WORKSPACE_TEXT_BYTES)
+    expected_revision: str = Field(min_length=64, max_length=64)
 
 
 def session_folder(sess: dict[str, Any]) -> str:
@@ -9338,7 +9851,21 @@ async def health() -> dict[str, Any]:
             and SERVER_UPDATE_PUBLIC_KEY.is_file()
             and bool(tmux["available"])
         ),
-        "capabilities": {"tmux": tmux},
+        "capabilities": {
+            "tmux": tmux,
+            "workspace_files": {
+                "available": WORKSPACE_SECURE_OPEN_AVAILABLE,
+                "required": False,
+                "message": (
+                    "Workspace file browsing and editing are available."
+                    if WORKSPACE_SECURE_OPEN_AVAILABLE
+                    else "Secure workspace file access is unavailable on this host."
+                ),
+                "action": None if WORKSPACE_SECURE_OPEN_AVAILABLE else "Use a supported macOS or Linux host.",
+                "version": 1,
+                "max_text_file_bytes": MAX_WORKSPACE_TEXT_BYTES,
+            },
+        },
         "websocket_runtime": True,
         "websocket_runtime_version": websockets.__version__,
         "active": active,
@@ -10129,6 +10656,49 @@ async def get_turn_code_diff(session_id: str, run_id: str) -> FileResponse:
         media_type="text/x-diff; charset=utf-8",
         filename=f"{run_id}.patch",
         content_disposition_type="inline",
+    )
+
+
+@app.get("/api/sessions/{session_id}/workspace")
+async def get_session_workspace(session_id: str) -> dict[str, Any]:
+    return await asyncio.to_thread(workspace_info_sync, session_id)
+
+
+@app.get("/api/sessions/{session_id}/workspace/entries")
+async def get_session_workspace_entries(
+    session_id: str,
+    path: str = Query(default="", max_length=MAX_WORKSPACE_PATH_CHARS),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=500, ge=1, le=1000),
+) -> dict[str, Any]:
+    return await asyncio.to_thread(list_workspace_entries_sync, session_id, path, offset, limit)
+
+
+@app.get("/api/sessions/{session_id}/workspace/search")
+async def search_session_workspace(
+    session_id: str,
+    q: str = Query(default="", max_length=500),
+    limit: int = Query(default=100, ge=1, le=200),
+) -> dict[str, Any]:
+    return await asyncio.to_thread(search_workspace_files_sync, session_id, q, limit)
+
+
+@app.get("/api/sessions/{session_id}/workspace/file")
+async def get_session_workspace_file(
+    session_id: str,
+    path: str = Query(min_length=1, max_length=MAX_WORKSPACE_PATH_CHARS),
+) -> dict[str, Any]:
+    return await asyncio.to_thread(read_workspace_file_sync, session_id, path)
+
+
+@app.put("/api/sessions/{session_id}/workspace/file")
+async def put_session_workspace_file(session_id: str, req: WorkspaceWriteRequest) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        write_workspace_file_sync,
+        session_id,
+        req.path,
+        req.content,
+        req.expected_revision,
     )
 
 

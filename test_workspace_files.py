@@ -1,5 +1,6 @@
 import os
 import stat
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -287,6 +288,30 @@ class WorkspaceFilesTests(unittest.TestCase):
 
         self.assertEqual([item["path"] for item in result["entries"]], ["src/agent_server.py"])
         self.assertLessEqual(result["scanned"], agent_server.MAX_WORKSPACE_SEARCH_SCAN)
+
+    def test_search_uses_git_index_to_reach_deep_files_before_the_scan_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "groot" / "control" / "sonic_vla" / "policy_runner.py"
+            target.parent.mkdir(parents=True)
+            target.write_text("pass\n")
+            def list_git_files(*_args: object, stdout: object, **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+                stdout.write(b"groot/control/sonic_vla/policy_runner.py\0")
+                return subprocess.CompletedProcess(args=["git", "ls-files"], returncode=0)
+            with (
+                patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}),
+                patch.object(agent_server.subprocess, "run", side_effect=list_git_files) as run,
+            ):
+                result = agent_server.search_workspace_files_sync("session-1", "policy_runner", 20)
+
+        self.assertEqual([item["path"] for item in result["entries"]], [
+            "groot/control/sonic_vla/policy_runner.py"
+        ])
+        self.assertEqual(result["scanned"], 1)
+        self.assertFalse(result["truncated"])
+        run.assert_called_once()
+        command = run.call_args.args[0]
+        self.assertIn(":(icase,glob)**/*policy_runner*", command)
 
     def test_empty_search_reports_truncation_and_posix_backslashes_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

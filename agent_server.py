@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import errno
 import fcntl
+import glob
 import hashlib
 import hmac
 import json
@@ -32,6 +33,7 @@ import struct
 import subprocess
 import sys
 import termios
+import tempfile
 import threading
 import time
 import uuid
@@ -204,6 +206,7 @@ MAX_EVENT_RESPONSE_LIMIT = int(agentsdock_setting("MAX_EVENT_RESPONSE_LIMIT", "1
 MAX_WORKSPACE_TEXT_BYTES = int(agentsdock_setting("WORKSPACE_TEXT_MAX_BYTES", str(2 * 1024 * 1024)))
 MAX_WORKSPACE_PATH_CHARS = int(agentsdock_setting("WORKSPACE_PATH_MAX_CHARS", "4096"))
 MAX_WORKSPACE_SEARCH_SCAN = int(agentsdock_setting("WORKSPACE_SEARCH_MAX_ENTRIES", "20000"))
+MAX_WORKSPACE_GIT_SEARCH_BYTES = int(agentsdock_setting("WORKSPACE_GIT_SEARCH_MAX_BYTES", str(8 * 1024 * 1024)))
 WORKSPACE_SECURE_OPEN_AVAILABLE = all(hasattr(os, flag) for flag in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK"))
 WORKSPACE_WRITE_LOCKS = tuple(threading.Lock() for _ in range(256))
 WORKSPACE_SEARCH_IGNORED_DIRECTORIES = {
@@ -1245,9 +1248,112 @@ def workspace_search_rank(path: str, query: str) -> tuple[int, int, str]:
     return (score, len(path), lower)
 
 
+def search_git_workspace_files(
+    sess: dict[str, Any],
+    root: Path,
+    query: str,
+    limit: int,
+) -> dict[str, Any] | None:
+    escaped_query = glob.escape(query.replace("\\", "/"))
+    pathspecs = [
+        f":(icase,glob)*{escaped_query}*",
+        f":(icase,glob)**/*{escaped_query}*",
+    ]
+    try:
+        with tempfile.TemporaryFile() as output:
+            listed = subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-C",
+                    str(root),
+                    "ls-files",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                    "-z",
+                    "--",
+                    *pathspecs,
+                ],
+                stdout=output,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=3,
+                env={
+                    **os.environ,
+                    "GIT_OPTIONAL_LOCKS": "0",
+                    "GIT_TERMINAL_PROMPT": "0",
+                },
+            )
+            output_size = output.tell()
+            output.seek(0)
+            raw_paths = output.read(max(1024, MAX_WORKSPACE_GIT_SEARCH_BYTES))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if listed.returncode != 0:
+        return None
+    output_truncated = output_size > len(raw_paths)
+    if output_truncated and raw_paths and not raw_paths.endswith(b"\0"):
+        raw_paths = raw_paths.rsplit(b"\0", 1)[0] + b"\0"
+
+    clean_query = query.casefold()
+    results: list[dict[str, Any]] = []
+    scanned = 0
+    seen: set[str] = set()
+    scan_truncated = False
+    for encoded_path in raw_paths.split(b"\0"):
+        if not encoded_path:
+            continue
+        if scanned >= MAX_WORKSPACE_SEARCH_SCAN:
+            scan_truncated = True
+            break
+        try:
+            path = normalize_workspace_path(encoded_path.decode("utf-8"))
+        except (UnicodeDecodeError, HTTPException):
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        scanned += 1
+        if clean_query not in path.casefold():
+            continue
+        parent_fd = -1
+        try:
+            parent_fd, name = open_workspace_parent_fd(root, path)
+            item_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except (HTTPException, OSError):
+            continue
+        finally:
+            if parent_fd >= 0:
+                os.close(parent_fd)
+        if not stat.S_ISREG(item_stat.st_mode):
+            continue
+        record = workspace_entry(path.rsplit("/", 1)[0] if "/" in path else "", name, item_stat)
+        if not record:
+            continue
+        record["writable"] = not bool(sess.get("archived")) and bool(item_stat.st_mode & 0o222)
+        results.append(record)
+
+    results.sort(key=lambda item: workspace_search_rank(str(item["path"]), clean_query))
+    return {
+        "root": str(root),
+        "query": query,
+        "entries": results[:limit],
+        "scanned": scanned,
+        "truncated": output_truncated or scan_truncated or len(results) > limit,
+        "limit": limit,
+    }
+
+
 def search_workspace_files_sync(session_id: str, query: str, limit: int) -> dict[str, Any]:
     sess, root = session_workspace_root(session_id)
     clean_query = str(query or "").strip().casefold()
+    if clean_query:
+        indexed = search_git_workspace_files(sess, root, clean_query, limit)
+        if indexed is not None:
+            indexed["query"] = str(query or "")
+            return indexed
     queue: deque[str] = deque([""])
     results: list[dict[str, Any]] = []
     scanned = 0

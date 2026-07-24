@@ -123,6 +123,42 @@ class WorkspaceFilesTests(unittest.TestCase):
             self.assertEqual(conflict.exception.detail["code"], "workspace_file_conflict")
             self.assertEqual(list(root.glob(".*.agentsdock-*.tmp")), [])
 
+    def test_save_keeps_the_root_used_to_select_its_write_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            original_root = base / "original"
+            replacement_root = base / "replacement"
+            original_root.mkdir()
+            replacement_root.mkdir()
+            original_path = original_root / "shared.txt"
+            replacement_path = replacement_root / "shared.txt"
+            original_path.write_text("original\n")
+            replacement_path.write_text("original\n")
+            session = self.session(original_root)
+            original_write_lock = agent_server.workspace_write_lock
+
+            def change_cwd_after_lock_selection(root: Path, relative_path: str) -> threading.Lock:
+                session["cwd"] = str(replacement_root)
+                return original_write_lock(root, relative_path)
+
+            with patch.object(agent_server.STORE, "sessions", {"session-1": session}):
+                revision = agent_server.read_workspace_file_sync("session-1", "shared.txt")["revision"]
+                with patch.object(
+                    agent_server,
+                    "workspace_write_lock",
+                    side_effect=change_cwd_after_lock_selection,
+                ):
+                    updated = agent_server.write_workspace_file_sync(
+                        "session-1",
+                        "shared.txt",
+                        "saved\n",
+                        revision,
+                    )
+
+            self.assertEqual(original_path.read_text(), "saved\n")
+            self.assertEqual(replacement_path.read_text(), "original\n")
+            self.assertEqual(updated["root"], str(original_root.resolve()))
+
     def test_atomic_save_does_not_overwrite_a_concurrent_permission_change(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

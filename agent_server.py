@@ -1094,16 +1094,15 @@ def write_workspace_file_sync(
     _, root = session_workspace_root(session_id, for_write=True)
     normalized = normalize_workspace_path(relative_path)
     with workspace_write_lock(root, normalized):
-        return write_workspace_file_locked(session_id, normalized, content, expected_revision)
+        return write_workspace_file_locked(root, normalized, content, expected_revision)
 
 
 def write_workspace_file_locked(
-    session_id: str,
+    root: Path,
     relative_path: str,
     content: str,
     expected_revision: str,
 ) -> dict[str, Any]:
-    _, root = session_workspace_root(session_id, for_write=True)
     normalized = normalize_workspace_path(relative_path)
     if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_revision or ""):
         raise workspace_http_error(400, "invalid_workspace_revision", "A valid workspace file revision is required.")

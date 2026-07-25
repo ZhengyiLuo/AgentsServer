@@ -82,10 +82,16 @@ Get the client and current installation instructions from the
 desktop app is available as a Developer ID-signed and Apple-notarized build;
 Apple-platform test builds are also distributed through TestFlight.
 
-## One-Command Setup
+## Guided Setup
 
-Clone the repository and run the idempotent installer as the user who will run
-Claude Code or Codex:
+The recommended first install is **AgentsDock > Set up AgentsServer**. The
+direct desktop app downloads a pinned release archive, verifies its SHA-256,
+and runs the same idempotent installer locally or over an existing SSH key.
+The app shows live progress, a finite deadline, cancellation, and a persistent
+diagnostic log instead of leaving a setup spinner running indefinitely.
+
+For a manual fallback, clone the repository and run the installer as the user
+who will run Claude Code or Codex:
 
 ```bash
 git clone https://github.com/ZhengyiLuo/AgentsServer.git
@@ -94,15 +100,18 @@ cd AgentsServer
 ```
 
 Before changing state, releases, configuration, or services, the installer
-checks for `tmux`, `curl`, and the platform service command (`launchctl` on
-macOS or `systemctl` on Linux), and verifies that the current user's service
-domain responds. Missing tools or an unavailable user service session produce
-platform-specific guidance. The preflight never invokes a package manager or
-`sudo` itself.
+checks for `tmux`, either `curl` or `wget`, and the platform service command
+(`launchctl` on macOS or `systemctl` on Linux), and verifies that the current
+user's service domain responds. Missing tools or an unavailable user service
+session produce platform-specific guidance. The preflight never invokes a
+package manager or `sudo` itself.
 
 After that preflight, the installer uses `uv`, installs a user-level service,
-creates a private access token, verifies authenticated health, and preserves existing
-`~/.agentsdock` chat state on every update. Existing
+creates a private access token, verifies authenticated health, and preserves
+existing `~/.agentsdock` chat state on every update. Network downloads retry
+with bounded timeouts, and the longer runtime/dependency stages print output
+and periodic heartbeats with hard deadlines. A failure leaves the active
+release unchanged and prints recovery guidance. Existing
 `~/.zenithbot-agent` state is migrated automatically and left behind as a
 compatibility link. The installer does not use `sudo`.
 

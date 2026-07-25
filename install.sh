@@ -5,6 +5,12 @@ PORT="7850"
 BIND_ADDRESS="0.0.0.0"
 RELEASE_VERSION=""
 UV_VERSION="${AGENTS_SERVER_UV_VERSION:-0.10.10}"
+UV_DOWNLOAD_CONNECT_TIMEOUT_SECONDS="${AGENTS_SERVER_DOWNLOAD_CONNECT_TIMEOUT_SECONDS:-15}"
+UV_DOWNLOAD_TIMEOUT_SECONDS="${AGENTS_SERVER_DOWNLOAD_TIMEOUT_SECONDS:-180}"
+UV_DOWNLOAD_RETRIES="${AGENTS_SERVER_DOWNLOAD_RETRIES:-3}"
+UV_INSTALL_TIMEOUT_SECONDS="${AGENTS_SERVER_UV_INSTALL_TIMEOUT_SECONDS:-300}"
+DEPENDENCY_SYNC_TIMEOUT_SECONDS="${AGENTS_SERVER_DEPENDENCY_TIMEOUT_SECONDS:-1200}"
+INSTALL_HEARTBEAT_SECONDS="${AGENTS_SERVER_INSTALL_HEARTBEAT_SECONDS:-15}"
 INSTALL_ROOT="${AGENTS_SERVER_INSTALL_DIR:-$HOME/.local/share/agents-server}"
 CONFIG_ROOT="${AGENTS_SERVER_CONFIG_DIR:-$HOME/.config/agents-server}"
 LEGACY_STATE_ROOT="$HOME/.zenithbot-agent"
@@ -58,6 +64,22 @@ if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.-]+)?$ ]]; 
   echo "Release version is missing or invalid." >&2
   exit 2
 fi
+
+validate_positive_integer() {
+  local name="$1"
+  local value="$2"
+  if [[ ! "$value" =~ ^[0-9]+$ ]] || ((value < 1)); then
+    echo "$name must be a positive integer, got: $value" >&2
+    exit 2
+  fi
+}
+
+validate_positive_integer "AGENTS_SERVER_DOWNLOAD_CONNECT_TIMEOUT_SECONDS" "$UV_DOWNLOAD_CONNECT_TIMEOUT_SECONDS"
+validate_positive_integer "AGENTS_SERVER_DOWNLOAD_TIMEOUT_SECONDS" "$UV_DOWNLOAD_TIMEOUT_SECONDS"
+validate_positive_integer "AGENTS_SERVER_DOWNLOAD_RETRIES" "$UV_DOWNLOAD_RETRIES"
+validate_positive_integer "AGENTS_SERVER_UV_INSTALL_TIMEOUT_SECONDS" "$UV_INSTALL_TIMEOUT_SECONDS"
+validate_positive_integer "AGENTS_SERVER_DEPENDENCY_TIMEOUT_SECONDS" "$DEPENDENCY_SYNC_TIMEOUT_SECONDS"
+validate_positive_integer "AGENTS_SERVER_INSTALL_HEARTBEAT_SECONDS" "$INSTALL_HEARTBEAT_SECONDS"
 
 RELEASES_ROOT="$INSTALL_ROOT/releases"
 RELEASE_DIR="$RELEASES_ROOT/$RELEASE_VERSION"
@@ -149,6 +171,17 @@ require_command() {
   command -v "$command_name" >/dev/null 2>&1 || record_prerequisite_failure "$command_name" "$guidance"
 }
 
+require_download_client() {
+  local guidance="$1"
+  if command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v wget >/dev/null 2>&1 && wget --version >/dev/null 2>&1; then
+    return 0
+  fi
+  record_prerequisite_failure "curl or wget" "$guidance"
+}
+
 probe_service_manager() {
   local output=""
   if [[ "$OS_NAME" == "Darwin" ]] && command -v launchctl >/dev/null 2>&1; then
@@ -172,24 +205,18 @@ preflight_prerequisites() {
   case "$OS_NAME" in
     Darwin)
       require_command "tmux" "Install tmux with Homebrew: brew install tmux"
-      require_command "curl" "Install curl with Homebrew (brew install curl) or restore the curl included with macOS."
+      require_download_client "Restore the curl included with macOS, or install curl or wget with Homebrew: brew install curl."
       require_command "launchctl" "launchctl is included with macOS; run this installer from a supported macOS user session."
       if command -v tmux >/dev/null 2>&1 && ! tmux -V >/dev/null 2>&1; then
         record_prerequisite_failure "tmux" "Install a working tmux with Homebrew: brew install tmux"
       fi
-      if command -v curl >/dev/null 2>&1 && ! curl --version >/dev/null 2>&1; then
-        record_prerequisite_failure "curl" "Install a working curl with Homebrew: brew install curl"
-      fi
       ;;
     Linux)
       require_command "tmux" "Install tmux with your package manager, for example: sudo apt install tmux, sudo dnf install tmux, or sudo pacman -S tmux."
-      require_command "curl" "Install curl with your package manager, for example: sudo apt install curl, sudo dnf install curl, or sudo pacman -S curl."
+      require_download_client "Install curl or wget with your package manager, for example: sudo apt install curl, sudo dnf install curl, or sudo pacman -S curl."
       require_command "systemctl" "AgentsServer's Linux installer requires systemd and a working systemctl --user session."
       if command -v tmux >/dev/null 2>&1 && ! tmux -V >/dev/null 2>&1; then
         record_prerequisite_failure "tmux" "Install a working tmux with your package manager, for example: sudo apt install tmux, sudo dnf install tmux, or sudo pacman -S tmux."
-      fi
-      if command -v curl >/dev/null 2>&1 && ! curl --version >/dev/null 2>&1; then
-        record_prerequisite_failure "curl" "Install a working curl with your package manager, for example: sudo apt install curl, sudo dnf install curl, or sudo pacman -S curl."
       fi
       ;;
     *)
@@ -222,11 +249,94 @@ preflight_prerequisites() {
 preflight_prerequisites || exit 1
 
 SERVICE_CONFIG_BACKUP=""
+UV_INSTALLER=""
+ACTIVE_STAGE_PID=""
 cleanup() {
+  if [[ -n "$ACTIVE_STAGE_PID" ]] && kill -0 "$ACTIVE_STAGE_PID" >/dev/null 2>&1; then
+    kill -KILL "$ACTIVE_STAGE_PID" >/dev/null 2>&1 || true
+    wait "$ACTIVE_STAGE_PID" 2>/dev/null || true
+  fi
+  [[ -z "$UV_INSTALLER" ]] || rm -f "$UV_INSTALLER"
   rm -rf "$STAGE_DIR"
   [[ -z "$SERVICE_CONFIG_BACKUP" ]] || rm -f "$SERVICE_CONFIG_BACKUP"
 }
 trap cleanup EXIT
+
+run_timed_stage() {
+  local label="$1"
+  local timeout_seconds="$2"
+  local guidance="$3"
+  shift 3
+  local started_at="$SECONDS"
+  local next_heartbeat=$((SECONDS + INSTALL_HEARTBEAT_SECONDS))
+  local elapsed=0
+  local status=0
+
+  echo "      $label (timeout: ${timeout_seconds}s)"
+  "$@" &
+  ACTIVE_STAGE_PID="$!"
+  while kill -0 "$ACTIVE_STAGE_PID" >/dev/null 2>&1; do
+    elapsed=$((SECONDS - started_at))
+    if ((SECONDS >= next_heartbeat)); then
+      echo "      Still working on $label (${elapsed}s elapsed)"
+      next_heartbeat=$((SECONDS + INSTALL_HEARTBEAT_SECONDS))
+    fi
+    if ((elapsed >= timeout_seconds)); then
+      echo "$label timed out after ${timeout_seconds}s." >&2
+      echo "  $guidance" >&2
+      kill -KILL "$ACTIVE_STAGE_PID" >/dev/null 2>&1 || true
+      wait "$ACTIVE_STAGE_PID" 2>/dev/null || true
+      ACTIVE_STAGE_PID=""
+      return 124
+    fi
+    sleep 1
+  done
+
+  if wait "$ACTIVE_STAGE_PID"; then
+    ACTIVE_STAGE_PID=""
+    return 0
+  else
+    status=$?
+  fi
+  ACTIVE_STAGE_PID=""
+  echo "$label failed with exit code $status." >&2
+  echo "  $guidance" >&2
+  return "$status"
+}
+
+download_uv_installer() {
+  local source_url="$1"
+  local destination="$2"
+  local attempts=$((UV_DOWNLOAD_RETRIES + 1))
+  if command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1; then
+    if curl \
+      --fail \
+      --location \
+      --silent \
+      --show-error \
+      --connect-timeout "$UV_DOWNLOAD_CONNECT_TIMEOUT_SECONDS" \
+      --max-time "$UV_DOWNLOAD_TIMEOUT_SECONDS" \
+      --retry "$UV_DOWNLOAD_RETRIES" \
+      --retry-delay 1 \
+      --retry-connrefused \
+      --output "$destination" \
+      "$source_url"; then
+      return 0
+    fi
+  elif command -v wget >/dev/null 2>&1 && wget --version >/dev/null 2>&1; then
+    if wget \
+      --timeout="$UV_DOWNLOAD_TIMEOUT_SECONDS" \
+      --tries="$attempts" \
+      --waitretry=1 \
+      --output-document="$destination" \
+      "$source_url"; then
+      return 0
+    fi
+  fi
+  echo "Could not download uv $UV_VERSION after up to $attempts attempts." >&2
+  echo "  Check DNS, proxy, firewall, and outbound HTTPS access to astral.sh, then run install.sh again." >&2
+  return 1
+}
 
 migrate_legacy_state() {
   [[ "$STATE_ROOT" == "$HOME/.agentsdock" ]] || return 0
@@ -253,16 +363,21 @@ chmod 700 "$CONFIG_ROOT" "$STATE_ROOT" "$STATE_ROOT/admin"
 if ! command -v uv >/dev/null 2>&1; then
   echo "      Installing uv $UV_VERSION for the current user"
   UV_INSTALLER="$(mktemp "${TMPDIR:-/tmp}/agents-server-uv.XXXXXX")"
-  if command -v curl >/dev/null 2>&1; then
-    curl -LsSf "https://astral.sh/uv/$UV_VERSION/install.sh" -o "$UV_INSTALLER"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$UV_INSTALLER" "https://astral.sh/uv/$UV_VERSION/install.sh"
-  else
-    echo "Install uv first: https://docs.astral.sh/uv/getting-started/installation/" >&2
+  if ! download_uv_installer "https://astral.sh/uv/$UV_VERSION/install.sh" "$UV_INSTALLER"; then
     exit 1
   fi
-  sh "$UV_INSTALLER"
+  if run_timed_stage \
+    "uv installation" \
+    "$UV_INSTALL_TIMEOUT_SECONDS" \
+    "Install uv manually from https://docs.astral.sh/uv/getting-started/installation/, then run install.sh again." \
+    sh "$UV_INSTALLER"; then
+    :
+  else
+    stage_status=$?
+    exit "$stage_status"
+  fi
   rm -f "$UV_INSTALLER"
+  UV_INSTALLER=""
   export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 fi
 command -v uv >/dev/null 2>&1 || { echo "uv is not available on PATH." >&2; exit 1; }
@@ -275,7 +390,16 @@ done
 chmod 755 "$STAGE_DIR/agent_server.py" "$STAGE_DIR/agentsdock_jobs.py" "$STAGE_DIR/install.sh" "$STAGE_DIR/update_runner.py"
 
 echo "[2/7] Resolving the release dependencies with uv"
-uv sync --project "$STAGE_DIR" --python '>=3.10' --no-dev --frozen >/dev/null
+if run_timed_stage \
+  "dependency resolution" \
+  "$DEPENDENCY_SYNC_TIMEOUT_SECONDS" \
+  "Review the uv output above. Verify disk space and outbound HTTPS access, then run install.sh again; the active release was not changed." \
+  uv sync --project "$STAGE_DIR" --python '>=3.10' --no-dev --frozen; then
+  :
+else
+  stage_status=$?
+  exit "$stage_status"
+fi
 "$STAGE_DIR/.venv/bin/python" -c 'import websockets' >/dev/null
 "$STAGE_DIR/.venv/bin/python" -c 'import croniter, dateutil; from zoneinfo import ZoneInfo; ZoneInfo("America/Los_Angeles")' >/dev/null
 
@@ -517,7 +641,19 @@ fi
 
 wait_for_health() {
   for _attempt in $(seq 1 45); do
-    if curl -fsS -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1; then
+    if command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1; then
+      if curl --fail --silent --show-error --connect-timeout 1 --max-time 2 \
+        -H "Authorization: Bearer $TOKEN" \
+        "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1; then
+        return 0
+      fi
+    elif wget \
+      --quiet \
+      --timeout=2 \
+      --tries=1 \
+      --header="Authorization: Bearer $TOKEN" \
+      --output-document=/dev/null \
+      "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1; then
       return 0
     fi
     sleep 1

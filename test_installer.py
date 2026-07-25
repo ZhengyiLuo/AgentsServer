@@ -239,6 +239,7 @@ chmod 755 "$project/.venv/bin/python"
             self.prepare_preflight_path(fake_bin, os_name="Linux", commands=("tmux", "curl"))
             self.write_executable(fake_bin / "tmux", "#!/bin/sh\nexit 127\n")
             self.write_executable(fake_bin / "curl", "#!/bin/sh\nexit 127\n")
+            self.write_executable(fake_bin / "wget", "#!/bin/sh\nexit 127\n")
             self.write_executable(fake_bin / "systemctl", "#!/bin/sh\nexit 1\n")
             result = subprocess.run(
                 ["/bin/bash", str(INSTALLER), "--non-interactive"],
@@ -257,11 +258,122 @@ chmod 755 "$project/.venv/bin/python"
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Unavailable prerequisite: tmux", result.stderr)
-            self.assertIn("Unavailable prerequisite: curl", result.stderr)
+            self.assertIn("Unavailable prerequisite: curl or wget", result.stderr)
             self.assertIn("Unavailable prerequisite: systemctl --user session", result.stderr)
             self.assertFalse((root / "install").exists())
             self.assertFalse((root / "config").exists())
             self.assertFalse((root / "state").exists())
+
+    def test_uv_bootstrap_curl_is_bounded_and_reports_recovery_steps(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            curl_log = root / "curl.log"
+            self.write_executable(fake_bin / "curl", """#!/bin/sh
+for argument in "$@"; do
+  [ "$argument" != "--version" ] || exit 0
+done
+printf '%s\n' "$*" >> "$FAKE_CURL_LOG"
+echo 'curl: simulated network timeout' >&2
+exit 28
+""")
+            self.write_executable(fake_bin / "wget", "#!/bin/sh\nexit 127\n")
+            environment.update({
+                "FAKE_CURL_LOG": str(curl_log),
+                "AGENTS_SERVER_DOWNLOAD_CONNECT_TIMEOUT_SECONDS": "1",
+                "AGENTS_SERVER_DOWNLOAD_TIMEOUT_SECONDS": "2",
+                "AGENTS_SERVER_DOWNLOAD_RETRIES": "2",
+            })
+
+            result = subprocess.run(
+                ["/bin/bash", str(INSTALLER), "--non-interactive"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            invocation = curl_log.read_text()
+            self.assertIn("--connect-timeout 1", invocation)
+            self.assertIn("--max-time 2", invocation)
+            self.assertIn("--retry 2", invocation)
+            self.assertIn("--retry-delay 1", invocation)
+            self.assertIn("Could not download uv", result.stderr)
+            self.assertIn("Check DNS, proxy, firewall, and outbound HTTPS access", result.stderr)
+            self.assertTrue((install_root / "current" / "runtime-marker").is_file())
+
+    def test_uv_bootstrap_wget_fallback_is_bounded_and_retried(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            wget_log = root / "wget.log"
+            self.write_executable(fake_bin / "curl", "#!/bin/sh\nexit 127\n")
+            self.write_executable(fake_bin / "wget", """#!/bin/sh
+for argument in "$@"; do
+  [ "$argument" != "--version" ] || exit 0
+done
+printf '%s\n' "$*" >> "$FAKE_WGET_LOG"
+echo 'wget: simulated network timeout' >&2
+exit 4
+""")
+            environment.update({
+                "FAKE_WGET_LOG": str(wget_log),
+                "AGENTS_SERVER_DOWNLOAD_TIMEOUT_SECONDS": "2",
+                "AGENTS_SERVER_DOWNLOAD_RETRIES": "2",
+            })
+
+            result = subprocess.run(
+                ["/bin/bash", str(INSTALLER), "--non-interactive"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            invocation = wget_log.read_text()
+            self.assertIn("--timeout=2", invocation)
+            self.assertIn("--tries=3", invocation)
+            self.assertIn("--waitretry=1", invocation)
+            self.assertIn("Could not download uv", result.stderr)
+            self.assertTrue((install_root / "current" / "runtime-marker").is_file())
+
+    def test_dependency_sync_streams_progress_and_times_out_before_activation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_executable(fake_bin / "curl", """#!/bin/sh
+for argument in "$@"; do
+  [ "$argument" != "--version" ] || exit 0
+done
+exit 22
+""")
+            self.write_executable(fake_bin / "uv", """#!/bin/sh
+echo 'FAKE_UV_VISIBLE_PROGRESS'
+exec /bin/sleep 30
+""")
+            environment.update({
+                "AGENTS_SERVER_DEPENDENCY_TIMEOUT_SECONDS": "2",
+                "AGENTS_SERVER_INSTALL_HEARTBEAT_SECONDS": "1",
+            })
+
+            result = subprocess.run(
+                ["/bin/bash", str(INSTALLER), "--non-interactive"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 124, result.stderr)
+            self.assertIn("FAKE_UV_VISIBLE_PROGRESS", result.stdout)
+            self.assertIn("Still working on dependency resolution", result.stdout)
+            self.assertIn("dependency resolution timed out after 2s.", result.stderr)
+            self.assertIn("Review the uv output above.", result.stderr)
+            self.assertIn("the active release was not changed.", result.stderr)
+            self.assertTrue((install_root / "current" / "runtime-marker").is_file())
+            self.assertEqual(list((install_root / "releases").glob(".staging-*")), [])
 
     def test_unavailable_systemd_user_domain_fails_without_mutation(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -538,6 +650,27 @@ chmod 755 "$project/.venv/bin/python"
             "AGENTS_SERVER_CONFIG_DIR": str(root / "config"),
             "AGENTSDOCK_STATE_DIR": str(root / "state"),
             "FAKE_LAUNCHCTL_LOG": str(root / "launchctl.log"),
+        }
+        return home, fake_bin, install_root, environment
+
+    def fake_linux_preinstall_environment(self, root: Path):
+        home = root / "home"
+        fake_bin = root / "bin"
+        install_root = root / "install"
+        home.mkdir()
+        fake_bin.mkdir()
+        self.prepare_preflight_path(fake_bin, os_name="Linux", commands=("tmux", "systemctl"))
+        old_release = install_root / "releases" / "0.0.9"
+        old_release.mkdir(parents=True)
+        (old_release / "runtime-marker").write_text("preserved\n")
+        (install_root / "current").symlink_to(old_release, target_is_directory=True)
+        environment = {
+            **os.environ,
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "AGENTS_SERVER_INSTALL_DIR": str(install_root),
+            "AGENTS_SERVER_CONFIG_DIR": str(root / "config"),
+            "AGENTSDOCK_STATE_DIR": str(root / "state"),
         }
         return home, fake_bin, install_root, environment
 

@@ -251,16 +251,81 @@ preflight_prerequisites || exit 1
 SERVICE_CONFIG_BACKUP=""
 UV_INSTALLER=""
 ACTIVE_STAGE_PID=""
-cleanup() {
-  if [[ -n "$ACTIVE_STAGE_PID" ]] && kill -0 "$ACTIVE_STAGE_PID" >/dev/null 2>&1; then
-    kill -KILL "$ACTIVE_STAGE_PID" >/dev/null 2>&1 || true
-    wait "$ACTIVE_STAGE_PID" 2>/dev/null || true
+ACTIVE_STAGE_PGID=""
+INSTALL_LOCK_DIR="$INSTALL_ROOT/.install-lock"
+INSTALL_LOCK_HELD="false"
+
+signal_active_stage() {
+  local signal_name="$1"
+  if [[ -n "$ACTIVE_STAGE_PGID" ]] && kill "-$signal_name" -- "-$ACTIVE_STAGE_PGID" >/dev/null 2>&1; then
+    return 0
   fi
+  [[ -z "$ACTIVE_STAGE_PID" ]] || kill "-$signal_name" "$ACTIVE_STAGE_PID" >/dev/null 2>&1 || true
+}
+
+stop_active_stage() {
+  [[ -n "$ACTIVE_STAGE_PID" ]] || return 0
+  signal_active_stage TERM
+  local attempt
+  for attempt in $(seq 1 20); do
+    kill -0 "$ACTIVE_STAGE_PID" >/dev/null 2>&1 || break
+    sleep 0.05
+  done
+  if kill -0 "$ACTIVE_STAGE_PID" >/dev/null 2>&1; then
+    signal_active_stage KILL
+  fi
+  wait "$ACTIVE_STAGE_PID" 2>/dev/null || true
+  ACTIVE_STAGE_PID=""
+  ACTIVE_STAGE_PGID=""
+}
+
+release_install_lock() {
+  [[ "$INSTALL_LOCK_HELD" == "true" ]] || return 0
+  if [[ "$(cat "$INSTALL_LOCK_DIR/pid" 2>/dev/null || true)" == "$$" ]]; then
+    rm -rf "$INSTALL_LOCK_DIR"
+  fi
+  INSTALL_LOCK_HELD="false"
+}
+
+cleanup() {
+  stop_active_stage
   [[ -z "$UV_INSTALLER" ]] || rm -f "$UV_INSTALLER"
   rm -rf "$STAGE_DIR"
   [[ -z "$SERVICE_CONFIG_BACKUP" ]] || rm -f "$SERVICE_CONFIG_BACKUP"
+  release_install_lock
 }
 trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+
+acquire_install_lock() {
+  mkdir -p "$INSTALL_ROOT"
+  if ! mkdir "$INSTALL_LOCK_DIR" 2>/dev/null; then
+    local owner_pid=""
+    owner_pid="$(cat "$INSTALL_LOCK_DIR/pid" 2>/dev/null || true)"
+    if [[ "$owner_pid" =~ ^[0-9]+$ ]] && kill -0 "$owner_pid" >/dev/null 2>&1; then
+      echo "Another AgentsServer installation is already running (PID $owner_pid)." >&2
+      echo "  Wait for it to finish, or cancel it from AgentsDock before retrying." >&2
+      return 1
+    fi
+    local stale_lock="$INSTALL_ROOT/.install-lock-stale-$$"
+    if ! mv "$INSTALL_LOCK_DIR" "$stale_lock" 2>/dev/null; then
+      echo "Another AgentsServer installation started while setup was retrying." >&2
+      echo "  Wait for it to finish, then run install.sh again." >&2
+      return 1
+    fi
+    rm -rf "$stale_lock"
+    if ! mkdir "$INSTALL_LOCK_DIR" 2>/dev/null; then
+      echo "Another AgentsServer installation is already running." >&2
+      echo "  Wait for it to finish, then run install.sh again." >&2
+      return 1
+    fi
+  fi
+  printf '%s\n' "$$" > "$INSTALL_LOCK_DIR/pid"
+  chmod 700 "$INSTALL_LOCK_DIR"
+  INSTALL_LOCK_HELD="true"
+}
+
+acquire_install_lock || exit 1
 
 run_timed_stage() {
   local label="$1"
@@ -273,8 +338,13 @@ run_timed_stage() {
   local status=0
 
   echo "      $label (timeout: ${timeout_seconds}s)"
+  # A separate process group lets timeout/cancellation terminate workers
+  # spawned by uv or by the uv bootstrap script, not only their parent shell.
+  set -m
   "$@" &
   ACTIVE_STAGE_PID="$!"
+  ACTIVE_STAGE_PGID="$ACTIVE_STAGE_PID"
+  set +m
   while kill -0 "$ACTIVE_STAGE_PID" >/dev/null 2>&1; do
     elapsed=$((SECONDS - started_at))
     if ((SECONDS >= next_heartbeat)); then
@@ -284,9 +354,7 @@ run_timed_stage() {
     if ((elapsed >= timeout_seconds)); then
       echo "$label timed out after ${timeout_seconds}s." >&2
       echo "  $guidance" >&2
-      kill -KILL "$ACTIVE_STAGE_PID" >/dev/null 2>&1 || true
-      wait "$ACTIVE_STAGE_PID" 2>/dev/null || true
-      ACTIVE_STAGE_PID=""
+      stop_active_stage
       return 124
     fi
     sleep 1
@@ -294,11 +362,13 @@ run_timed_stage() {
 
   if wait "$ACTIVE_STAGE_PID"; then
     ACTIVE_STAGE_PID=""
+    ACTIVE_STAGE_PGID=""
     return 0
   else
     status=$?
   fi
   ACTIVE_STAGE_PID=""
+  ACTIVE_STAGE_PGID=""
   echo "$label failed with exit code $status." >&2
   echo "  $guidance" >&2
   return "$status"

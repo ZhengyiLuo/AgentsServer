@@ -2,6 +2,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 import re
 import tomllib
@@ -343,6 +344,7 @@ exit 4
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            descendant_marker = root / "uv-descendant-survived"
             self.write_executable(fake_bin / "curl", """#!/bin/sh
 for argument in "$@"; do
   [ "$argument" != "--version" ] || exit 0
@@ -351,11 +353,16 @@ exit 22
 """)
             self.write_executable(fake_bin / "uv", """#!/bin/sh
 echo 'FAKE_UV_VISIBLE_PROGRESS'
-exec /bin/sleep 30
+(
+  /bin/sleep 2
+  echo survived > "$FAKE_DESCENDANT_MARKER"
+) &
+wait
 """)
             environment.update({
-                "AGENTS_SERVER_DEPENDENCY_TIMEOUT_SECONDS": "2",
+                "AGENTS_SERVER_DEPENDENCY_TIMEOUT_SECONDS": "1",
                 "AGENTS_SERVER_INSTALL_HEARTBEAT_SECONDS": "1",
+                "FAKE_DESCENDANT_MARKER": str(descendant_marker),
             })
 
             result = subprocess.run(
@@ -365,15 +372,43 @@ exec /bin/sleep 30
                 text=True,
                 check=False,
             )
+            # If timeout cleanup killed only the uv parent, its worker would
+            # outlive setup and create this marker two seconds after launch.
+            time.sleep(1.5)
 
             self.assertEqual(result.returncode, 124, result.stderr)
             self.assertIn("FAKE_UV_VISIBLE_PROGRESS", result.stdout)
             self.assertIn("Still working on dependency resolution", result.stdout)
-            self.assertIn("dependency resolution timed out after 2s.", result.stderr)
+            self.assertIn("dependency resolution timed out after 1s.", result.stderr)
             self.assertIn("Review the uv output above.", result.stderr)
             self.assertIn("the active release was not changed.", result.stderr)
             self.assertTrue((install_root / "current" / "runtime-marker").is_file())
             self.assertEqual(list((install_root / "releases").glob(".staging-*")), [])
+            self.assertFalse(descendant_marker.exists())
+            self.assertFalse((install_root / ".install-lock").exists())
+
+    def test_active_install_lock_rejects_a_second_installer_without_mutation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_executable(fake_bin / "curl", "#!/bin/sh\nexit 0\n")
+            lock = install_root / ".install-lock"
+            lock.mkdir()
+            (lock / "pid").write_text(f"{os.getpid()}\n")
+            before = self.snapshot_trees(install_root)
+
+            result = subprocess.run(
+                ["/bin/bash", str(INSTALLER), "--non-interactive"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Another AgentsServer installation is already running", result.stderr)
+            self.assertIn("cancel it from AgentsDock before retrying", result.stderr)
+            self.assertEqual(self.snapshot_trees(install_root), before)
 
     def test_unavailable_systemd_user_domain_fails_without_mutation(self):
         with tempfile.TemporaryDirectory() as temporary:

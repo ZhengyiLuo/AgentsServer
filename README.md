@@ -111,7 +111,9 @@ creates a private access token, verifies authenticated health, and preserves
 existing `~/.agentsdock` chat state on every update. Network downloads retry
 with bounded timeouts, and the longer runtime/dependency stages print output
 and periodic heartbeats with hard deadlines. A failure leaves the active
-release unchanged and prints recovery guidance. Existing
+release unchanged and prints recovery guidance. An install lock prevents a
+cancelled or disconnected SSH attempt from racing a retry, and timeout cleanup
+terminates the complete dependency-worker process group. Existing
 `~/.zenithbot-agent` state is migrated automatically and left behind as a
 compatibility link. The installer does not use `sudo`.
 

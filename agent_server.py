@@ -6959,8 +6959,14 @@ def semantic_job_summary_event(
         if isinstance(state.get("latest_result_event"), dict)
         else None
     )
+    standalone_status_candidates = [
+        event
+        for event in standalone
+        if str(event.get("type") or "") == "job_deferred"
+        or timeline_index_is_error(event)
+    ]
     latest_standalone = max(
-        standalone,
+        standalone_status_candidates,
         key=lambda event: int(event.get("seq") or 0),
         default=None,
     )

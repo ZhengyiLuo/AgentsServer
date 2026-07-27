@@ -387,6 +387,12 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
             ),
             self.event(72, "turn_stopped", **latest_run),
             self.event(73, "turn_finished", result_text="", **latest_run),
+            self.event(
+                74,
+                "job_finished",
+                job_id="job-1",
+                job_title="Capacity monitor",
+            ),
         ])
         self.write_events(events)
 

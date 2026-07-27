@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import agent_server
+from fastapi import HTTPException
 
 
 class FileContentTypeTests(unittest.TestCase):
@@ -65,6 +66,55 @@ class FileContentTypeTests(unittest.TestCase):
         self.assertEqual(records[0]["content_type"], "image/jpeg")
         self.assertEqual(records[0]["event_id"], "event-1")
 
+    def test_file_listing_rejects_an_explicit_foreign_owner_from_fork_history(self) -> None:
+        event = {
+            "id": "forked-artifact",
+            "seq": 10,
+            "session_id": "child-session",
+            "type": "artifact_created",
+            "forked": True,
+            "artifact": {
+                "id": "parent-file",
+                "session_id": "parent-session",
+                "filename": "parent-output.png",
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            agent_server, "FILES_ROOT", Path(temporary)
+        ), patch.object(agent_server, "iter_session_events", return_value=iter((event,))):
+            records = agent_server.list_session_file_records("child-session")
+
+        self.assertEqual(records, [])
+
+    def test_transcript_read_suppresses_foreign_file_events_but_keeps_legacy_files(self) -> None:
+        events = [
+            {
+                "id": "foreign",
+                "seq": 1,
+                "session_id": "child-session",
+                "type": "artifact_created",
+                "artifact": {
+                    "id": "parent-file",
+                    "session_id": "parent-session",
+                    "filename": "parent.png",
+                },
+            },
+            {
+                "id": "legacy",
+                "seq": 2,
+                "session_id": "child-session",
+                "type": "artifact_created",
+                "artifact": {"id": "legacy-file", "filename": "legacy.png"},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "events.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            with patch.object(agent_server, "events_path", return_value=path):
+                result = agent_server.read_events("child-session")
+
+        self.assertEqual([event["id"] for event in result], ["legacy"])
+
 
 class FileContentTypeEndpointTests(unittest.IsolatedAsyncioTestCase):
     async def test_image_filter_includes_legacy_generic_png(self) -> None:
@@ -90,6 +140,28 @@ class FileContentTypeEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response["total"], 1)
         self.assertEqual(response["files"][0]["content_type"], "image/png")
+
+    async def test_file_event_lookup_rejects_an_explicit_foreign_owner(self) -> None:
+        event = {
+            "id": "forked-artifact",
+            "seq": 10,
+            "session_id": "child-session",
+            "type": "artifact_created",
+            "artifact": {
+                "id": "parent-file",
+                "session_id": "parent-session",
+                "filename": "parent-output.png",
+            },
+        }
+        with patch.object(
+            agent_server, "iter_session_events", return_value=iter((event,))
+        ), patch.object(
+            agent_server.STORE, "sessions", {"child-session": {"id": "child-session"}}
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await agent_server.get_session_file_event("child-session", "parent-file")
+
+        self.assertEqual(raised.exception.status_code, 404)
 
 
 if __name__ == "__main__":

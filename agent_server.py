@@ -2329,7 +2329,7 @@ FORK_INTERNAL_RUN_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 FORK_INTERNAL_RUN_LOCKS: dict[str, threading.Lock] = {}
 HISTORY_SEARCH_DB = STATE_DIR / "history_search.sqlite3"
 HISTORY_SEARCH_LOCK = threading.Lock()
-HISTORY_SEARCH_INDEX_VERSION = "2"
+HISTORY_SEARCH_INDEX_VERSION = "3"
 HISTORY_SEARCH_DIRTY: set[str] = set()
 HISTORY_SEARCH_SYNC_INTERVAL_SECONDS = max(
     0.25, float(agentsdock_setting("HISTORY_SEARCH_SYNC_INTERVAL_SECONDS", "1.0"))
@@ -3555,7 +3555,8 @@ async def append_event(session_id: str, event_type: str, payload: dict[str, Any]
         f.write(json.dumps(event, separators=(",", ":")) + "\n")
     HISTORY_SEARCH_DIRTY.add(session_id)
     await update_session_event_metadata(session_id, event)
-    await HUB.broadcast(session_id, client_safe_event(event))
+    if event_files_belong_to_session(event, session_id):
+        await HUB.broadcast(session_id, client_safe_event(event))
     return event
 
 
@@ -5753,6 +5754,23 @@ def event_output_text(value: Any) -> str:
     return str(value)
 
 
+def file_record_belongs_to_session(record: Any, session_id: str) -> bool:
+    if not isinstance(record, dict):
+        return True
+    owner = str(record.get("session_id") or "").strip()
+    return not owner or owner == session_id
+
+
+def event_files_belong_to_session(event: dict[str, Any], session_id: str | None = None) -> bool:
+    owner = str(session_id or event.get("session_id") or "").strip()
+    if not owner:
+        return True
+    return all(
+        file_record_belongs_to_session(event.get(key), owner)
+        for key in ("file", "artifact")
+    )
+
+
 def client_safe_event(event: dict[str, Any]) -> dict[str, Any]:
     safe = event
     output = event.get("output")
@@ -5891,6 +5909,8 @@ def read_events(
                 continue
             seq = int(event.get("seq", 0))
             if seq > after and (before is None or seq < before):
+                if not event_files_belong_to_session(event, session_id):
+                    continue
                 event = client_safe_event(event)
                 if visible and not is_visible_timeline_event(event, fork_internal_run_ids=internal_run_ids):
                     continue
@@ -5963,6 +5983,8 @@ def read_visible_events_page(
                 latest_seq = seq
             if seq <= after or (before is not None and seq >= before):
                 continue
+            if not event_files_belong_to_session(event, session_id):
+                continue
             event = client_safe_event(event)
             if not is_visible_timeline_event(
                 event,
@@ -6020,6 +6042,8 @@ def read_visible_events_after_page(
                 seq = int(event.get("seq", 0))
                 if seq <= after:
                     break
+                if not event_files_belong_to_session(event, session_id):
+                    continue
                 if not is_visible_timeline_event(
                     event,
                     compact=compact,
@@ -6691,6 +6715,8 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
             run_id = str(event.get("run_id") or "").strip()
             if seq <= 0:
                 continue
+            if not event_files_belong_to_session(event, session_id):
+                continue
             latest_seq = max(latest_seq, seq)
             is_forked = event.get("forked") is True
             is_fork_internal = event.get("purpose") in FORK_INTERNAL_PURPOSES
@@ -7323,6 +7349,8 @@ def collect_semantic_timeline_events(
 
             if not key or key not in selected_by_key:
                 continue
+            if not event_files_belong_to_session(event, session_id):
+                continue
             event = client_safe_event(event)
             if key in selected_jobs:
                 resolved_job_id = key.removeprefix("job:")
@@ -7720,6 +7748,8 @@ def sync_history_search_index(
                     continue
                 with suppress(Exception):
                     event = json.loads(raw_line.decode("utf-8", "replace"))
+                    if not event_files_belong_to_session(event, session_id):
+                        continue
                     record = history_search_event_record(event, internal_run_ids)
                     if record:
                         role, text = record
@@ -8362,6 +8392,8 @@ def discover_recent_handoff_digest_jobs(max_sessions: int = 32) -> dict[str, dic
         if not session_id:
             continue
         for event in tail_jsonl_file(events_path(session_id), limit=200, max_bytes=2 * 1024 * 1024):
+            if not event_files_belong_to_session(event, session_id):
+                continue
             digest_job_id = str(event.get("digest_job_id") or "")
             if digest_job_id:
                 grouped.setdefault(digest_job_id, []).append((session_id, event))
@@ -8496,7 +8528,8 @@ def digest_job_events(session_id: str, digest_job_id: str) -> list[dict[str, Any
     return [
         event
         for event in tail_jsonl_file(events_path(session_id), limit=200, max_bytes=8 * 1024 * 1024)
-        if str(event.get("digest_job_id") or "") == digest_job_id
+        if event_files_belong_to_session(event, session_id)
+        and str(event.get("digest_job_id") or "") == digest_job_id
     ]
 
 
@@ -9250,7 +9283,7 @@ async def copy_fork_history(parent_id: str, child_id: str) -> int:
         run_id = str(event.get("run_id") or "").strip()
         if event.get("purpose") in FORK_INTERNAL_PURPOSES or run_id in internal_run_ids:
             continue
-        if event_type not in {"turn_started", "assistant_text", "reasoning_summary", "tool_started", "tool_finished", "artifact_created", "turn_finished"}:
+        if event_type not in {"turn_started", "assistant_text", "reasoning_summary", "tool_started", "tool_finished", "turn_finished"}:
             continue
         if event_type == "turn_finished":
             if not str(event.get("result_text") or "").strip() or event.get("run_id") in assistant_runs:
@@ -12833,15 +12866,19 @@ def iter_session_events(session_id: str):
         if not line.strip():
             continue
         try:
-            yield json.loads(line)
+            event = json.loads(line)
         except Exception:
             continue
+        if event_files_belong_to_session(event, session_id):
+            yield event
 
 
-def file_event_record(event: dict[str, Any], file_id: str) -> dict[str, Any] | None:
+def file_event_record(event: dict[str, Any], file_id: str, session_id: str | None = None) -> dict[str, Any] | None:
     for key in ("file", "artifact"):
         rec = event.get(key)
         if isinstance(rec, dict) and str(rec.get("id") or "") == file_id:
+            if session_id is not None and not file_record_belongs_to_session(rec, session_id):
+                continue
             out = dict(rec)
             out["event_id"] = event.get("id")
             out["event_seq"] = event.get("seq")
@@ -12863,7 +12900,11 @@ def list_session_file_records(session_id: str) -> list[dict[str, Any]]:
     for event in iter_session_events(session_id):
         for key in ("file", "artifact"):
             rec = event.get(key)
-            if isinstance(rec, dict) and rec.get("id"):
+            if (
+                isinstance(rec, dict)
+                and rec.get("id")
+                and file_record_belongs_to_session(rec, session_id)
+            ):
                 out = dict(rec)
                 out["event_id"] = event.get("id")
                 out["event_seq"] = event.get("seq")
@@ -12927,7 +12968,7 @@ async def get_session_file_event(session_id: str, file_id: str) -> dict[str, Any
     if not clean_file_id:
         raise HTTPException(status_code=404, detail="file not found")
     for event in iter_session_events(session_id):
-        if file_event_record(event, clean_file_id):
+        if file_event_record(event, clean_file_id, session_id):
             return {"event": event}
     raise HTTPException(status_code=404, detail="file event not found")
 

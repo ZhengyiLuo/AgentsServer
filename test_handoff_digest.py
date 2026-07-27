@@ -52,6 +52,9 @@ class ForkHistoryDigestTests(unittest.IsolatedAsyncioTestCase):
         events = [
             {"seq": 1, "id": "normal-start", "type": "turn_started", "run_id": "normal-run", "prompt": "Keep this"},
             {"seq": 2, "id": "normal-answer", "type": "assistant_text", "run_id": "normal-run", "text": "Kept"},
+            {"seq": 9, "id": "normal-artifact", "type": "artifact_created", "run_id": "normal-run", "artifact": {
+                "id": "parent-file", "session_id": "parent-1", "filename": "parent-output.png",
+            }},
             {"seq": 3, "id": "digest-start", "type": "turn_started", "run_id": "digest-run", "purpose": "handoff_digest", "digest_job_id": "digest-1", "prompt": "Generate a digest"},
             # Provider trace events do not always repeat the workflow metadata;
             # the run ID must still keep them out of forked conversation history.

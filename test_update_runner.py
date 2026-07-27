@@ -2,7 +2,8 @@ import argparse
 import io
 import hashlib
 import json
-import subprocess
+import os
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -144,6 +145,68 @@ class UpdateRunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(update_runner.ReleaseUnavailableError, "No signed AgentsServer release"):
                 update_runner.check_release(Path("unused.pem"))
 
+    def test_installer_streams_log_and_records_heartbeat(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            status_path = root / "server-update.json"
+            log_path = root / "server-update.log"
+            update_runner.run_installer(
+                [
+                    sys.executable,
+                    "-c",
+                    "import time; print('started', flush=True); time.sleep(0.08); print('finished')",
+                ],
+                cwd=root,
+                status_path=status_path,
+                log_path=log_path,
+                version="1.2.3",
+                timeout_seconds=2,
+                heartbeat_seconds=0.02,
+            )
+
+            self.assertEqual(log_path.read_text().splitlines(), ["started", "finished"])
+            self.assertEqual(os.stat(log_path).st_mode & 0o777, 0o600)
+            status = json.loads(status_path.read_text())
+            self.assertEqual(status["phase"], "installing")
+            self.assertGreaterEqual(status["elapsed_seconds"], 1)
+            self.assertIn("elapsed", status["message"])
+
+    def test_installer_failure_includes_bounded_log_tail(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(RuntimeError, r"installer failed \(7\): useful diagnostic"):
+                update_runner.run_installer(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import sys; print('useful diagnostic', file=sys.stderr, flush=True); raise SystemExit(7)",
+                    ],
+                    cwd=root,
+                    status_path=root / "server-update.json",
+                    log_path=root / "server-update.log",
+                    version="1.2.3",
+                    timeout_seconds=2,
+                    heartbeat_seconds=0.02,
+                )
+
+    def test_installer_timeout_includes_log_tail_and_stops_process(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(RuntimeError, r"timed out after 0.08 seconds: started"):
+                update_runner.run_installer(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import time; print('started', flush=True); time.sleep(5)",
+                    ],
+                    cwd=root,
+                    status_path=root / "server-update.json",
+                    log_path=root / "server-update.log",
+                    version="1.2.3",
+                    timeout_seconds=0.08,
+                    heartbeat_seconds=0.02,
+                )
+
     def test_detached_runner_rejects_downgrades_before_download(self):
         args = argparse.Namespace(
             status_file="unused-status.json",
@@ -196,16 +259,13 @@ class UpdateRunnerTests(unittest.TestCase):
             with patch.object(update_runner, "check_release", return_value=manifest), \
                  patch.object(update_runner, "download_bytes", return_value=archive_bytes), \
                  patch.object(update_runner, "update_status", side_effect=record_status), \
-                 patch.object(
-                     update_runner.subprocess,
-                     "run",
-                     return_value=subprocess.CompletedProcess([], 0, stdout="installed\n", stderr=""),
-                 ):
+                 patch.object(update_runner, "run_installer") as install:
                 update_runner.run_update(args)
 
         self.assertEqual(statuses[-1]["phase"], "complete")
         self.assertEqual(statuses[-1]["installed_version"], "1.2.4")
         self.assertNotIn("track", statuses[-1])
+        install.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import tarfile
@@ -29,6 +30,15 @@ RELEASES_PAGE_URL = f"https://github.com/{RELEASE_REPOSITORY}/releases"
 MAX_METADATA_BYTES = 1_000_000
 MAX_ARCHIVE_BYTES = 200 * 1024 * 1024
 VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$")
+# The standalone installer allows dependency synchronization to run for up to
+# 1,200 seconds. Keep this enclosing budget comfortably above that so the
+# updater cannot terminate a healthy installer first.
+INSTALLER_TIMEOUT_SECONDS = 1_800
+INSTALLER_HEARTBEAT_SECONDS = 10.0
+INSTALLER_TERMINATION_GRACE_SECONDS = 10.0
+INSTALLER_LOG_TAIL_BYTES = 64 * 1024
+INSTALLER_LOG_TAIL_LINES = 12
+INSTALLER_ERROR_MAX_CHARS = 4_000
 
 
 class ReleaseUnavailableError(RuntimeError):
@@ -56,6 +66,100 @@ def update_status(path: Path, **changes: Any) -> dict[str, Any]:
     current["updated_at"] = utc_now()
     atomic_json(path, current)
     return current
+
+
+def installer_log_tail(log_path: Path) -> str:
+    """Read a bounded diagnostic tail without loading a large install log."""
+    try:
+        with log_path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - INSTALLER_LOG_TAIL_BYTES))
+            content = stream.read(INSTALLER_LOG_TAIL_BYTES)
+    except OSError:
+        return ""
+    tail = "\n".join(content.decode("utf-8", "replace").splitlines()[-INSTALLER_LOG_TAIL_LINES:])
+    return tail[-INSTALLER_ERROR_MAX_CHARS:].strip()
+
+
+def terminate_installer(process: subprocess.Popen[Any]) -> None:
+    """Terminate the installer's process group so child workers do not linger."""
+    if process.poll() is not None:
+        return
+    if os.name != "nt":
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except OSError:
+            process.terminate()
+    else:
+        process.terminate()
+    try:
+        process.wait(timeout=INSTALLER_TERMINATION_GRACE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    if os.name != "nt":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            process.kill()
+    else:
+        process.kill()
+    process.wait()
+
+
+def run_installer(
+    command: list[str],
+    *,
+    cwd: Path,
+    status_path: Path,
+    log_path: Path,
+    version: str,
+    timeout_seconds: float = INSTALLER_TIMEOUT_SECONDS,
+    heartbeat_seconds: float = INSTALLER_HEARTBEAT_SECONDS,
+) -> None:
+    """Run the installer with live logging and a durable status heartbeat."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    with log_path.open("wb") as log:
+        os.chmod(log_path, 0o600)
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                terminate_installer(process)
+                log.flush()
+                tail = installer_log_tail(log_path)
+                detail = f": {tail}" if tail else ""
+                raise RuntimeError(
+                    f"installer timed out after {timeout_seconds:g} seconds{detail}"
+                )
+            try:
+                returncode = process.wait(timeout=min(heartbeat_seconds, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                elapsed = max(1, int(time.monotonic() - started))
+                update_status(
+                    status_path,
+                    phase="installing",
+                    message=f"Installing AgentsServer {version} ({elapsed}s elapsed).",
+                    heartbeat_at=utc_now(),
+                    elapsed_seconds=elapsed,
+                )
+        log.flush()
+
+    if returncode != 0:
+        tail = installer_log_tail(log_path)
+        raise RuntimeError(
+            f"installer failed ({returncode}): {tail or 'no output; inspect server-update.log'}"
+        )
 
 
 def download_bytes(url: str, limit: int, timeout: float = 30.0) -> bytes:
@@ -267,13 +371,14 @@ def run_update(args: argparse.Namespace) -> None:
             "--bind", args.bind,
         ]
         update_status(status_path, phase="installing", message=f"Installing AgentsServer {version} with rollback protection.")
-        result = subprocess.run(command, cwd=source, text=True, capture_output=True, timeout=600, check=False)
         log_path = status_path.with_name("server-update.log")
-        log_path.write_text((result.stdout or "") + (result.stderr or ""))
-        os.chmod(log_path, 0o600)
-        if result.returncode != 0:
-            tail = "\n".join(((result.stderr or result.stdout or "").strip().splitlines())[-8:])
-            raise RuntimeError(f"installer failed ({result.returncode}): {tail or 'no output'}")
+        run_installer(
+            command,
+            cwd=source,
+            status_path=status_path,
+            log_path=log_path,
+            version=version,
+        )
 
     update_status(
         status_path,

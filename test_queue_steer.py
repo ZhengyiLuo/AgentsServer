@@ -287,6 +287,32 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event_payload["display_file_ids"], ["new-file"])
         self.assertTrue(event_payload["replays_interrupted_message"])
 
+    async def test_background_recovery_preserves_messages_queued_after_startup(self) -> None:
+        agent_server.QUEUED_TURNS["chat-1"] = deque([{
+            "queued_id": "queued-new",
+            "prompt": "Queued while recovery was scanning.",
+            "file_ids": [],
+        }])
+        recovered = {
+            "chat-1": [{
+                "queued_id": "queued-restored",
+                "prompt": "Restored after restart.",
+                "file_ids": [],
+            }]
+        }
+
+        with patch.object(agent_server, "scan_queued_turns_from_events", return_value=recovered), \
+             patch.object(agent_server, "schedule_next_queued_turn") as schedule:
+            rebuilt, scheduled = await agent_server.recover_queued_turns_after_start()
+
+        self.assertEqual(rebuilt, 1)
+        self.assertEqual(scheduled, 1)
+        self.assertEqual(
+            [item["queued_id"] for item in agent_server.QUEUED_TURNS["chat-1"]],
+            ["queued-restored", "queued-new"],
+        )
+        schedule.assert_called_once_with("chat-1")
+
     async def test_no_active_turn_promotes_without_replaying_old_text(self) -> None:
         append_event = AsyncMock(return_value={})
 

@@ -84,24 +84,66 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(status["update_available"])
         self.assertIn("No signed AgentsServer release", status["message"])
 
+    async def test_status_keeps_a_just_started_update_active_while_tmux_appears(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+             patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", Path(temporary) / "status.json"), \
+             patch.object(agent_server, "SERVER_UPDATE_START_GRACE_SECONDS", 45.0), \
+             patch.object(agent_server, "server_update_status_age_seconds", return_value=44.9), \
+             patch.object(agent_server.shutil, "which", return_value=None):
+            agent_server.write_server_update_status(
+                update_id="new-update",
+                phase="starting",
+                target_version="1.1.0",
+                message="Starting detached update.",
+            )
+            status = await agent_server.server_update_status()
+
+        self.assertEqual(status["phase"], "starting")
+        self.assertEqual(status["target_version"], "1.1.0")
+        self.assertNotIn("finished_at", status)
+
+    async def test_status_normalizes_an_active_target_that_is_now_current(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(agent_server, "SERVER_VERSION", "1.1.0"), \
+             patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", Path(temporary) / "status.json"), \
+             patch.object(agent_server.shutil, "which", return_value=None):
+            agent_server.write_server_update_status(
+                update_id="completed-update",
+                phase="restarting",
+                target_version="1.1.0",
+                update_available=True,
+                message="Restarting updated server.",
+            )
+            status = await agent_server.server_update_status()
+
+        self.assertEqual(status["phase"], "complete")
+        self.assertFalse(status["update_available"])
+        self.assertEqual(status["installed_version"], "1.1.0")
+        self.assertIn("installed and healthy", status["message"])
+        self.assertTrue(status["finished_at"])
+
     async def test_start_on_current_version_does_not_require_tmux(self):
+        manifest = AsyncMock(side_effect=AssertionError("/start must not perform release discovery"))
         with tempfile.TemporaryDirectory() as temporary, \
              patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
              patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", Path(temporary) / "status.json"), \
              patch.object(agent_server, "server_update_is_active", return_value=False), \
-             patch.object(agent_server, "signed_release_manifest", new=AsyncMock(return_value={"version": "1.0.0"})), \
+             patch.object(agent_server, "signed_release_manifest", new=manifest), \
              patch.object(agent_server.shutil, "which", return_value=None):
             status = await agent_server.start_server_update(agent_server.ServerUpdateRequest(version="1.0.0"))
 
         self.assertEqual(status["phase"], "current")
         self.assertFalse(status["update_available"])
+        manifest.assert_not_awaited()
 
     async def test_start_newer_version_without_tmux_returns_actionable_503(self):
+        manifest = AsyncMock(side_effect=AssertionError("/start must not perform release discovery"))
         with tempfile.TemporaryDirectory() as temporary, \
              patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
              patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", Path(temporary) / "status.json"), \
              patch.object(agent_server, "server_update_is_active", return_value=False), \
-             patch.object(agent_server, "signed_release_manifest", new=AsyncMock(return_value={"version": "1.1.0"})), \
+             patch.object(agent_server, "signed_release_manifest", new=manifest), \
              patch.object(agent_server.shutil, "which", return_value=None):
             with self.assertRaises(HTTPException) as raised:
                 await agent_server.start_server_update(agent_server.ServerUpdateRequest(version="1.1.0"))
@@ -109,26 +151,29 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 503)
         self.assertIn("tmux", str(raised.exception.detail))
         self.assertIn("Install tmux", str(raised.exception.detail))
+        manifest.assert_not_awaited()
 
-    async def test_start_launches_a_detached_verified_update(self):
+    async def test_start_launches_a_detached_verified_update_without_manifest_discovery(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             runner = root / "update_runner.py"
             key = root / "release-public-key.pem"
             runner.write_text("# runner\n")
             key.write_text("public key\n")
+            manifest = AsyncMock(side_effect=AssertionError("/start must not perform release discovery"))
             with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
                  patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", root / "status.json"), \
                  patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
                  patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
                  patch.object(agent_server, "server_update_is_active", return_value=False), \
-                 patch.object(agent_server, "signed_release_manifest", new=AsyncMock(return_value={"version": "1.1.0"})), \
+                 patch.object(agent_server, "signed_release_manifest", new=manifest), \
                  patch.object(agent_server.shutil, "which", return_value="/usr/bin/tmux"), \
                  patch.object(agent_server, "run_tmux", return_value=None) as run_tmux:
                 status = await agent_server.start_server_update(agent_server.ServerUpdateRequest(version="1.1.0"))
 
         self.assertEqual(status["phase"], "starting")
         self.assertEqual(status["target_version"], "1.1.0")
+        manifest.assert_not_awaited()
         command = run_tmux.call_args.args[0]
         self.assertEqual(command[:3], ["new-session", "-d", "-s"])
         self.assertIn("--expected-version 1.1.0", command[-1])

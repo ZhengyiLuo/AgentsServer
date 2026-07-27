@@ -301,6 +301,38 @@ class AgentTerminalContextTests(unittest.TestCase):
 
         self.assertEqual(public["system_prompt"], "Use the staging cluster.")
 
+    def test_both_agent_prompts_explain_renderable_latex_delimiters(self) -> None:
+        claude_prompt = agent_server.SYSTEM_PROMPT.format(
+            manifest_path="/tmp/manifest.json",
+            terminal_session="zd_sess_123",
+        )
+        codex_prompt = agent_server.CODEX_PROMPT_PRELUDE.format(
+            manifest_path="/tmp/manifest.json",
+            terminal_session="zd_sess_123",
+        )
+
+        for prompt in (claude_prompt, codex_prompt):
+            self.assertIn("inline LaTeX as `$...$`", prompt)
+            self.assertIn("display equations as `$$...$$`", prompt)
+
+    def test_both_agent_prompts_explain_clickable_workspace_file_links(self) -> None:
+        claude_prompt = agent_server.SYSTEM_PROMPT.format(
+            manifest_path="/tmp/manifest.json",
+            terminal_session="zd_sess_123",
+        )
+        codex_prompt = agent_server.CODEX_PROMPT_PRELUDE.format(
+            manifest_path="/tmp/manifest.json",
+            terminal_session="zd_sess_123",
+        )
+
+        for prompt in (claude_prompt, codex_prompt):
+            compact = " ".join(prompt.split())
+            self.assertIn("relative path under", compact)
+            self.assertIn("`#L42`", compact)
+            self.assertIn("Do not use", compact)
+            self.assertIn("`file://`", compact)
+            self.assertIn("/tmp/manifest.json", compact)
+
 
 class SessionSystemPromptPersistenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_session_store_updates_and_clears_system_prompt(self) -> None:

@@ -42,7 +42,7 @@ from collections import OrderedDict, deque
 from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import unquote, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -211,6 +211,9 @@ MAX_WORKSPACE_PREVIEW_BYTES = max(
 )
 MAX_WORKSPACE_PATH_CHARS = int(agentsdock_setting("WORKSPACE_PATH_MAX_CHARS", "4096"))
 MAX_WORKSPACE_SEARCH_SCAN = int(agentsdock_setting("WORKSPACE_SEARCH_MAX_ENTRIES", "20000"))
+MAX_WORKSPACE_SEARCH_SECONDS = max(
+    0.1, float(agentsdock_setting("WORKSPACE_SEARCH_MAX_SECONDS", "2.0"))
+)
 MAX_WORKSPACE_GIT_SEARCH_BYTES = int(agentsdock_setting("WORKSPACE_GIT_SEARCH_MAX_BYTES", str(8 * 1024 * 1024)))
 WORKSPACE_SECURE_OPEN_AVAILABLE = all(hasattr(os, flag) for flag in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK"))
 WORKSPACE_WRITE_LOCKS = tuple(threading.Lock() for _ in range(256))
@@ -354,6 +357,10 @@ Code changes and diffs:
 Files and artifacts:
 - User uploads are available as local paths in the prompt.
 - This is not Slack. Do not call Slack upload APIs or Slack file helpers.
+- To open an existing file in AgentsDock's editor, link to a relative path
+  under this chat's working directory, optionally with `#L42`. Absolute paths
+  are allowed only when they remain under that working directory. Do not use
+  `file://`.
 - If your response creates files the user should receive, write a JSON manifest
   at exactly this path:
   {manifest_path}
@@ -425,6 +432,11 @@ Skills and environment playbooks:
 
 This is AgentsDock, not Slack. Do not call Slack upload APIs or Slack file
 helpers. Create files locally on the agent host and publish them through the manifest.
+
+To open an existing file in AgentsDock's editor, link to a relative path under
+this chat's working directory, optionally with `#L42`. Absolute paths are
+allowed only when they remain under that working directory. Do not use
+`file://`.
 
 If you create files the user should receive, write a JSON manifest at exactly:
 {manifest_path}
@@ -1958,7 +1970,11 @@ def search_workspace_files_sync(session_id: str, query: str, limit: int) -> dict
     results: list[dict[str, Any]] = []
     scanned = 0
     truncated = False
+    deadline = time.monotonic() + MAX_WORKSPACE_SEARCH_SECONDS
     while queue:
+        if time.monotonic() >= deadline:
+            truncated = True
+            break
         directory = queue.popleft()
         try:
             directory_fd = open_workspace_directory_fd(root, directory)
@@ -1975,6 +1991,10 @@ def search_workspace_files_sync(session_id: str, query: str, limit: int) -> dict
                     continue
                 scanned += 1
                 if scanned > MAX_WORKSPACE_SEARCH_SCAN:
+                    truncated = True
+                    queue.clear()
+                    break
+                if scanned % 128 == 0 and time.monotonic() >= deadline:
                     truncated = True
                     queue.clear()
                     break
@@ -2313,6 +2333,9 @@ HISTORY_SEARCH_INDEX_VERSION = "2"
 HISTORY_SEARCH_DIRTY: set[str] = set()
 HISTORY_SEARCH_SYNC_INTERVAL_SECONDS = max(
     0.25, float(agentsdock_setting("HISTORY_SEARCH_SYNC_INTERVAL_SECONDS", "1.0"))
+)
+HISTORY_SEARCH_INITIAL_DELAY_SECONDS = max(
+    0.0, float(agentsdock_setting("HISTORY_SEARCH_INITIAL_DELAY_SECONDS", "30.0"))
 )
 HISTORY_SEARCH_FULL_SYNC_INTERVAL_SECONDS = max(
     30.0, float(agentsdock_setting("HISTORY_SEARCH_FULL_SYNC_INTERVAL_SECONDS", "300"))
@@ -4350,19 +4373,30 @@ def queued_turn_from_event(event: dict[str, Any], sess: dict[str, Any], position
     }
 
 
-def rebuild_queued_turns_from_events() -> int:
-    rebuilt = 0
-    for session_id, sess in STORE.sessions.items():
+def queued_event_lines(path: Path) -> Iterator[bytes]:
+    with path.open("rb") as source:
+        for raw_line in source:
+            if b'"queued_id"' in raw_line:
+                yield raw_line
+
+
+def scan_queued_turns_from_events(
+    sessions: list[tuple[str, dict[str, Any]]] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    recovered: dict[str, list[dict[str, Any]]] = {}
+    session_items = sessions if sessions is not None else [
+        (session_id, dict(sess))
+        for session_id, sess in STORE.sessions.items()
+    ]
+    for session_id, sess in session_items:
         path = events_path(session_id)
         if not path.exists():
             continue
         pending: dict[str, dict[str, Any]] = {}
         order: list[str] = []
-        for line in path.open("r", encoding="utf-8", errors="ignore"):
-            if not line.strip():
-                continue
+        for raw_line in queued_event_lines(path):
             try:
-                event = json.loads(line)
+                event = json.loads(raw_line.decode("utf-8", "replace"))
             except Exception:
                 continue
             queued_id = str(event.get("queued_id") or "")
@@ -4437,9 +4471,52 @@ def rebuild_queued_turns_from_events() -> int:
             )
         ]
         if items:
-            QUEUED_TURNS[session_id] = deque(items)
-            rebuilt += len(items)
-    return rebuilt
+            recovered[session_id] = items
+    return recovered
+
+
+def rebuild_queued_turns_from_events() -> int:
+    recovered = scan_queued_turns_from_events()
+    for session_id, items in recovered.items():
+        QUEUED_TURNS[session_id] = deque(items)
+    return sum(len(items) for items in recovered.values())
+
+
+async def recover_queued_turns_after_start() -> tuple[int, int]:
+    started = time.monotonic()
+    session_items = [
+        (session_id, dict(sess))
+        for session_id, sess in STORE.sessions.items()
+    ]
+    recovered = await asyncio.to_thread(scan_queued_turns_from_events, session_items)
+    scheduled_session_ids: list[str] = []
+    rebuilt = 0
+    async with QUEUE_LOCK:
+        for session_id, recovered_items in recovered.items():
+            existing_items = list(QUEUED_TURNS.get(session_id) or ())
+            existing_ids = {
+                str(item.get("queued_id") or "")
+                for item in existing_items
+            }
+            restored = [
+                item for item in recovered_items
+                if str(item.get("queued_id") or "") not in existing_ids
+            ]
+            if not restored:
+                continue
+            QUEUED_TURNS[session_id] = deque([*restored, *existing_items])
+            rebuilt += len(restored)
+            scheduled_session_ids.append(session_id)
+    for session_id in scheduled_session_ids:
+        schedule_next_queued_turn(session_id)
+    scheduled = len(scheduled_session_ids)
+    logger.info(
+        "queued turn recovery complete rebuilt=%d scheduled_sessions=%d elapsed=%.2fs",
+        rebuilt,
+        scheduled,
+        time.monotonic() - started,
+    )
+    return rebuilt, scheduled
 
 
 async def terminate_process_tree(proc: asyncio.subprocess.Process, *, grace: float = STOP_GRACE_SECONDS) -> bool:
@@ -6554,16 +6631,28 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
     visible_count = int(cached.get("visible_count") or 0) if can_append else 0
     latest_seq = int(cached.get("latest_seq") or 0) if can_append else 0
     scan_offset = int(cached.get("offset") or 0) if can_append else 0
+    event_offset = scan_offset
 
-    def ensure_record(key: str, kind: str, event: dict[str, Any]) -> dict[str, Any]:
+    def ensure_record(
+        key: str,
+        kind: str,
+        event: dict[str, Any],
+        *,
+        safe_start_offset: int | None = None,
+    ) -> dict[str, Any]:
         record = by_key.get(key)
         seq = int(event.get("seq") or 0)
+        record_start_offset = max(
+            0,
+            int(event_offset if safe_start_offset is None else safe_start_offset),
+        )
         if record is None:
             record = {
                 "key": key,
                 "kind": kind,
                 "start_seq": seq,
                 "end_seq": seq,
+                "start_offset": record_start_offset,
                 "title": "",
                 "preview": "",
                 "meta": "",
@@ -6578,6 +6667,10 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
             records.append(record)
         record["start_seq"] = min(int(record["start_seq"]), seq)
         record["end_seq"] = max(int(record["end_seq"]), seq)
+        record["start_offset"] = min(
+            int(record.get("start_offset", record_start_offset)),
+            record_start_offset,
+        )
         record["event_count"] += 1
         return record
 
@@ -6585,6 +6678,8 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
     with path.open("rb") as source:
         source.seek(scan_offset)
         for raw_line in source:
+            event_offset = final_offset
+            final_offset += len(raw_line)
             if not raw_line.strip():
                 continue
             try:
@@ -6656,6 +6751,10 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                     if prior is not None:
                         record["start_seq"] = min(int(record["start_seq"]), int(prior["start_seq"]))
                         record["end_seq"] = max(int(record["end_seq"]), int(prior["end_seq"]))
+                        record["start_offset"] = min(
+                            int(record.get("start_offset", event_offset)),
+                            int(prior.get("start_offset", event_offset)),
+                        )
                         for field in ("event_count", "tool_count", "thought_count"):
                             record[field] = int(record.get(field) or 0) + int(prior.get(field) or 0)
                         for file_name in prior.get("file_names") or []:
@@ -6684,15 +6783,31 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
             if event_type == "turn_started":
                 run_key = run_id or f"seq-{seq}"
                 key = f"turn:{run_key}"
-                if key in by_key and by_key[key].get("has_user"):
+                base_record = by_key.get(key)
+                safe_start_offset = None
+                if base_record is not None and base_record.get("has_user"):
+                    # Replaying from a later repeated run ID needs to see the
+                    # original turn first so the collector assigns the same
+                    # ``:start-{seq}`` disambiguated key as the index.
+                    safe_start_offset = int(base_record.get("start_offset") or 0)
                     key = f"turn:{run_key}:start-{seq}"
                 active_turn_key = key
                 if run_id:
                     current_turn_by_run[run_id] = key
                 if event.get("purpose") == "handoff_digest_delivery":
-                    ensure_record(key, "assistant", event)
+                    ensure_record(
+                        key,
+                        "assistant",
+                        event,
+                        safe_start_offset=safe_start_offset,
+                    )
                     continue
-                record = ensure_record(key, "user", event)
+                record = ensure_record(
+                    key,
+                    "user",
+                    event,
+                    safe_start_offset=safe_start_offset,
+                )
                 record["has_user"] = True
                 prompt = compact_timeline_index_text(event.get("prompt"))
                 if prompt:
@@ -6749,7 +6864,6 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
             record = ensure_record(f"event:{event.get('id') or seq}", "system", event)
             record["title"] = compact_timeline_index_text(event_type.replace("_", " ").title() or "System", 72)
             record["preview"] = text or record["title"]
-        final_offset = source.tell()
 
     landmarks: list[dict[str, Any]] = []
     for stored in records:
@@ -7117,13 +7231,24 @@ def collect_semantic_timeline_events(
     current_turn_by_run: dict[str, str] = {}
     active_turn_key: str | None = None
     seen_user_turn_keys: set[str] = set()
+    scan_offset = min(
+        (
+            max(0, int(landmark.get("_semantic_start_offset") or 0))
+            for landmark in selected
+        ),
+        default=0,
+    )
+    with suppress(OSError):
+        if scan_offset >= path.stat().st_size:
+            scan_offset = 0
 
-    with path.open("r", encoding="utf-8", errors="ignore") as source:
-        for line in source:
-            if not line.strip():
+    with path.open("rb") as source:
+        source.seek(scan_offset)
+        for raw_line in source:
+            if not raw_line.strip():
                 continue
             try:
-                event = json.loads(line)
+                event = json.loads(raw_line.decode("utf-8", "replace"))
             except Exception:
                 continue
             seq = int(event.get("seq") or 0)
@@ -7316,6 +7441,10 @@ def read_semantic_timeline_page(
         str(record.get("key") or ""): int(record.get("start_seq") or 0)
         for record in cached.get("records") or []
     }
+    start_offset_by_key = {
+        str(record.get("key") or ""): max(0, int(record.get("start_offset") or 0))
+        for record in cached.get("records") or []
+    }
     landmarks = sorted(
         (
             {
@@ -7323,6 +7452,10 @@ def read_semantic_timeline_page(
                 "_semantic_original_start_seq": original_start_by_key.get(
                     str(landmark.get("key") or ""),
                     int(landmark.get("start_seq") or 0),
+                ),
+                "_semantic_start_offset": start_offset_by_key.get(
+                    str(landmark.get("key") or ""),
+                    0,
                 ),
             }
             for landmark in index.get("landmarks") or []
@@ -7632,6 +7765,8 @@ def run_history_search_sync(
 
 
 async def history_search_index_loop() -> None:
+    if HISTORY_SEARCH_INITIAL_DELAY_SECONDS:
+        await asyncio.sleep(HISTORY_SEARCH_INITIAL_DELAY_SECONDS)
     last_full_sync: float | None = None
     while True:
         active_session_ids = {
@@ -9305,12 +9440,15 @@ async def rollover_codex_provider_session(
     return fresh_session, memory
 
 
-def public_session(sess: dict[str, Any]) -> dict[str, Any]:
+def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, Any]:
+    detail_fields = () if summary else (
+        "system_prompt", "session_id", "claude_session_id", "codex_thread_id",
+    )
     return {
         k: sess.get(k)
         for k in (
-            "id", "title", "folder", "cwd", "backend", "model", "effort", "system_prompt",
-            "session_id", "claude_session_id", "codex_thread_id",
+            "id", "title", "folder", "cwd", "backend", "model", "effort",
+            *detail_fields,
             "parent_id", "fork_from", "memory_forked", "memory_seed_used",
             "pinned", "pinned_at", "archived", "archived_at", "sort_order", "created_at", "updated_at",
             "latest_event_seq", "latest_event_at", "latest_event_type",
@@ -11470,6 +11608,8 @@ async def start_turn(
 
 
 SERVER_UPDATE_ACTIVE_PHASES = {"starting", "checking", "downloading", "verifying", "installing", "restarting"}
+SERVER_UPDATE_OPERATION_LOCK = asyncio.Lock()
+SERVER_UPDATE_START_GRACE_SECONDS = 45.0
 
 
 def server_release_is_newer(latest: str, current: str) -> bool:
@@ -11516,6 +11656,16 @@ def server_update_is_active(status: dict[str, Any]) -> bool:
     return run_tmux(["has-session", "-t", server_update_tmux_name(update_id)], check=False).returncode == 0
 
 
+def server_update_status_age_seconds(status: dict[str, Any]) -> float:
+    try:
+        updated_at = datetime.fromisoformat(str(status.get("updated_at") or "").replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return float("inf")
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - updated_at).total_seconds())
+
+
 async def signed_release_manifest() -> dict[str, Any]:
     if not SERVER_UPDATE_PUBLIC_KEY.is_file():
         raise HTTPException(status_code=503, detail="release verification key is missing from this server installation")
@@ -11533,31 +11683,37 @@ async def lifespan(app: FastAPI):
     await JOBS.load()
     ensure_dirs()
     digest_job_count = await load_handoff_digest_jobs()
-    rebuilt_queue_count = rebuild_queued_turns_from_events()
     JOBS.start_scheduler()
-    scheduled_queue_drains = schedule_rebuilt_queued_turns()
-    digest_recovery_task = asyncio.create_task(reconcile_handoff_digest_jobs())
+    queue_recovery_task = asyncio.create_task(recover_queued_turns_after_start())
+
+    async def reconcile_digests_after_queue_recovery() -> None:
+        with suppress(Exception):
+            await queue_recovery_task
+        await reconcile_handoff_digest_jobs()
+
+    digest_recovery_task = asyncio.create_task(reconcile_digests_after_queue_recovery())
     host_monitor_task = asyncio.create_task(host_monitor_loop())
     history_search_task = asyncio.create_task(history_search_index_loop())
     runtime_probe_task = asyncio.create_task(asyncio.to_thread(refresh_runtime_diagnostics, force=True))
     logger.info(
-        "agent server ready state=%s sessions=%d jobs=%d digests=%d queued=%d queue_drains=%d",
+        "agent server ready state=%s sessions=%d jobs=%d digests=%d queue_recovery=background",
         STATE_DIR,
         len(STORE.sessions),
         len(JOBS.jobs),
         digest_job_count,
-        rebuilt_queue_count,
-        scheduled_queue_drains,
     )
     try:
         yield
     finally:
         digest_recovery_task.cancel()
+        queue_recovery_task.cancel()
         host_monitor_task.cancel()
         history_search_task.cancel()
         runtime_probe_task.cancel()
-        with suppress(asyncio.CancelledError):
+        with suppress(asyncio.CancelledError, Exception):
             await digest_recovery_task
+        with suppress(asyncio.CancelledError, Exception):
+            await queue_recovery_task
         with suppress(asyncio.CancelledError):
             await host_monitor_task
         with suppress(asyncio.CancelledError):
@@ -11641,7 +11797,21 @@ async def health() -> dict[str, Any]:
 @app.get("/api/admin/update")
 async def server_update_status() -> dict[str, Any]:
     status = read_server_update_status()
-    if str(status.get("phase") or "") in SERVER_UPDATE_ACTIVE_PHASES and not await asyncio.to_thread(server_update_is_active, status):
+    phase = str(status.get("phase") or "")
+    target_version = str(status.get("target_version") or "")
+    if phase in SERVER_UPDATE_ACTIVE_PHASES and target_version == SERVER_VERSION:
+        status = write_server_update_status(
+            phase="complete",
+            update_available=False,
+            installed_version=SERVER_VERSION,
+            message=f"AgentsServer {SERVER_VERSION} is installed and healthy.",
+            finished_at=status.get("finished_at") or update_utc_now(),
+        )
+    elif (
+        phase in SERVER_UPDATE_ACTIVE_PHASES
+        and not await asyncio.to_thread(server_update_is_active, status)
+        and server_update_status_age_seconds(status) >= SERVER_UPDATE_START_GRACE_SECONDS
+    ):
         status = write_server_update_status(
             phase="failed",
             message="The detached updater exited before reporting completion. See server-update.log.",
@@ -11652,83 +11822,89 @@ async def server_update_status() -> dict[str, Any]:
 
 @app.post("/api/admin/update/check")
 async def check_server_update() -> dict[str, Any]:
-    status = read_server_update_status()
-    if await asyncio.to_thread(server_update_is_active, status):
-        raise HTTPException(status_code=409, detail="a server update is already running")
-    try:
-        manifest = await signed_release_manifest()
-    except HTTPException as exc:
-        if exc.status_code != 404:
-            raise
+    async with SERVER_UPDATE_OPERATION_LOCK:
+        status = read_server_update_status()
+        if await asyncio.to_thread(server_update_is_active, status):
+            raise HTTPException(status_code=409, detail="a server update is already running")
+        try:
+            manifest = await signed_release_manifest()
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            return write_server_update_status(
+                phase="unavailable",
+                update_available=False,
+                message=str(exc.detail),
+                checked_at=update_utc_now(),
+            )
+        latest = str(manifest["version"])
+        update_available = server_release_is_newer(latest, SERVER_VERSION)
         return write_server_update_status(
-            phase="unavailable",
-            update_available=False,
-            message=str(exc.detail),
+            phase="available" if update_available else "current",
+            latest_version=latest,
+            update_available=update_available,
+            message=(f"AgentsServer {latest} is available." if update_available else f"AgentsServer {SERVER_VERSION} is current."),
             checked_at=update_utc_now(),
         )
-    latest = str(manifest["version"])
-    update_available = server_release_is_newer(latest, SERVER_VERSION)
-    return write_server_update_status(
-        phase="available" if update_available else "current",
-        latest_version=latest,
-        update_available=update_available,
-        message=(f"AgentsServer {latest} is available." if update_available else f"AgentsServer {SERVER_VERSION} is current."),
-        checked_at=update_utc_now(),
-    )
 
 
 @app.post("/api/admin/update/start")
 async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
-    status = read_server_update_status()
-    if await asyncio.to_thread(server_update_is_active, status):
-        raise HTTPException(status_code=409, detail="a server update is already running")
-    manifest = await signed_release_manifest()
-    latest = str(manifest["version"])
-    requested = str(body.version or latest).strip()
-    if requested != latest:
-        raise HTTPException(status_code=409, detail=f"the latest signed release is {latest}")
-    if not server_release_is_newer(requested, SERVER_VERSION):
-        return write_server_update_status(
-            phase="current",
-            latest_version=latest,
-            update_available=False,
-            message=f"AgentsServer {SERVER_VERSION} is current; managed updates do not downgrade or reinstall.",
-            checked_at=update_utc_now(),
-        )
-    tmux = tmux_capability()
-    if not tmux["available"]:
-        raise HTTPException(status_code=503, detail=f"{tmux['message']} {tmux['action']}")
-    if not SERVER_UPDATE_RUNNER.is_file() or not SERVER_UPDATE_PUBLIC_KEY.is_file():
-        raise HTTPException(status_code=503, detail="this server installation predates managed updates; run the installer once")
+    async with SERVER_UPDATE_OPERATION_LOCK:
+        status = read_server_update_status()
+        if await asyncio.to_thread(server_update_is_active, status):
+            raise HTTPException(status_code=409, detail="a server update is already running")
+        requested = str(body.version or status.get("latest_version") or "").strip()
+        if not requested:
+            raise HTTPException(status_code=409, detail="check for a signed server update before installing")
+        try:
+            version_key(requested)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="the requested server version is invalid") from exc
+        if "-" in requested.split("+", 1)[0]:
+            raise HTTPException(status_code=400, detail="managed server updates accept stable releases only")
+        if not server_release_is_newer(requested, SERVER_VERSION):
+            return write_server_update_status(
+                phase="current",
+                latest_version=requested,
+                update_available=False,
+                message=f"AgentsServer {SERVER_VERSION} is current; managed updates do not downgrade or reinstall.",
+                checked_at=update_utc_now(),
+            )
+        tmux = tmux_capability()
+        if not tmux["available"]:
+            raise HTTPException(status_code=503, detail=f"{tmux['message']} {tmux['action']}")
+        if not SERVER_UPDATE_RUNNER.is_file() or not SERVER_UPDATE_PUBLIC_KEY.is_file():
+            raise HTTPException(status_code=503, detail="this server installation predates managed updates; run the installer once")
 
-    update_id = uuid.uuid4().hex
-    tmux_name = server_update_tmux_name(update_id)
-    command = [
-        sys.executable,
-        str(SERVER_UPDATE_RUNNER),
-        "--status-file", str(SERVER_UPDATE_STATUS_FILE),
-        "--public-key", str(SERVER_UPDATE_PUBLIC_KEY),
-        "--port", str(SERVER_PORT),
-        "--bind", SERVER_BIND_ADDRESS,
-        "--expected-version", requested,
-        "--current-version", SERVER_VERSION,
-    ]
-    status = write_server_update_status(
-        update_id=update_id,
-        phase="starting",
-        target_version=requested,
-        latest_version=latest,
-        update_available=True,
-        message=f"Starting detached update to AgentsServer {requested}.",
-        started_at=update_utc_now(),
-        finished_at=None,
-    )
-    try:
-        await asyncio.to_thread(run_tmux, ["new-session", "-d", "-s", tmux_name, shlex.join(command)])
-    except Exception as exc:
-        write_server_update_status(phase="failed", message=f"Could not start detached updater: {exc}", finished_at=update_utc_now())
-        raise HTTPException(status_code=500, detail="could not start detached updater") from exc
-    return status
+        update_id = uuid.uuid4().hex
+        tmux_name = server_update_tmux_name(update_id)
+        command = [
+            sys.executable,
+            str(SERVER_UPDATE_RUNNER),
+            "--status-file", str(SERVER_UPDATE_STATUS_FILE),
+            "--public-key", str(SERVER_UPDATE_PUBLIC_KEY),
+            "--port", str(SERVER_PORT),
+            "--bind", SERVER_BIND_ADDRESS,
+            "--expected-version", requested,
+            "--current-version", SERVER_VERSION,
+        ]
+        status = write_server_update_status(
+            update_id=update_id,
+            phase="starting",
+            target_version=requested,
+            latest_version=requested,
+            update_available=True,
+            message=f"Starting detached update to AgentsServer {requested}.",
+            started_at=update_utc_now(),
+            finished_at=None,
+        )
+        try:
+            await asyncio.to_thread(run_tmux, ["new-session", "-d", "-s", tmux_name, shlex.join(command)])
+        except Exception as exc:
+            write_server_update_status(phase="failed", message=f"Could not start detached updater: {exc}", finished_at=update_utc_now())
+            raise HTTPException(status_code=500, detail="could not start detached updater") from exc
+        return status
 
 
 @app.get("/api/diagnostics/host")
@@ -11832,9 +12008,12 @@ async def tail_session_process_log(session_id: str, path: str, lines: int = 200)
 
 
 @app.get("/api/sessions")
-async def list_sessions() -> dict[str, Any]:
+async def list_sessions(summary: bool = False) -> dict[str, Any]:
     await STORE.ensure_sort_orders()
-    sessions = [public_session(s) for s in sorted_sessions(list(STORE.sessions.values()))]
+    sessions = [
+        public_session(session, summary=summary)
+        for session in sorted_sessions(list(STORE.sessions.values()))
+    ]
     return {"sessions": sessions}
 
 

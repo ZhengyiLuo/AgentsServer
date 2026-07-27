@@ -15,6 +15,8 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
         agent_server.STATE_DIR = Path(self.temporary.name)
         agent_server.FORK_INTERNAL_RUN_CACHE.clear()
         agent_server.FORK_INTERNAL_RUN_LOCKS.clear()
+        agent_server.TIMELINE_INDEX_CACHE.clear()
+        agent_server.TIMELINE_INDEX_LOCKS.clear()
         self.session_id = "compact-history-chat"
         path = agent_server.events_path(self.session_id)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -49,6 +51,8 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         agent_server.FORK_INTERNAL_RUN_CACHE.clear()
         agent_server.FORK_INTERNAL_RUN_LOCKS.clear()
+        agent_server.TIMELINE_INDEX_CACHE.clear()
+        agent_server.TIMELINE_INDEX_LOCKS.clear()
         agent_server.EVENT_SEQ_CACHE.pop(self.session_id, None)
         agent_server.HISTORY_SEARCH_DIRTY.discard(self.session_id)
         agent_server.STATE_DIR = self.previous_state_dir
@@ -177,6 +181,403 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(after_page[1:], (5, 2, 0, 0))
         self.assertEqual([event["seq"] for event in generic], [4, 5])
 
+    def test_semantic_page_counts_a_recurring_job_once_and_bounds_its_history(self) -> None:
+        events = [
+            self.event(1, "turn_started", run_id="human-old", prompt="Old question"),
+            self.event(2, "turn_finished", run_id="human-old", result_text="Old answer"),
+            self.event(3, "job_created", job_id="job-1", job={
+                "id": "job-1", "title": "Capacity monitor", "run_count": 0,
+            }),
+        ]
+        seq = 3
+        expected_job_events = 1
+        for run_number in range(1, 13):
+            run_id = f"job-run-{run_number}"
+            common = {
+                "run_id": run_id,
+                "purpose": "scheduled_job",
+                "job_id": "job-1",
+                "job_title": "Capacity monitor",
+            }
+            seq += 1
+            events.append(self.event(seq, "turn_started", prompt="Check capacity", **common))
+            seq += 1
+            events.append(self.event(seq, "reasoning_summary", text="Checking capacity", **common))
+            seq += 1
+            events.append(self.event(seq, "assistant_text", text=f"Status {run_number}", **common))
+            if run_number == 12:
+                seq += 1
+                events.append(self.event(seq, "artifact_created", artifact={
+                    "id": "latest-report", "filename": "latest.txt",
+                }, **common))
+                seq += 1
+                events.append(self.event(seq, "code_diff", diff_files=[{
+                    "path": "status.py", "additions": 1, "deletions": 0,
+                }], **common))
+                expected_job_events += 2
+            seq += 1
+            events.append(self.event(seq, "turn_finished", result_text=f"Status {run_number}", **common))
+            expected_job_events += 4
+        seq += 1
+        events.append(self.event(seq, "turn_started", run_id="human-new", prompt="Latest question"))
+        seq += 1
+        events.append(self.event(seq, "turn_finished", run_id="human-new", result_text="Latest answer"))
+        self.write_events(events)
+
+        page = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            limit=2,
+            tail=True,
+        )
+
+        self.assertEqual(page["semantic_total"], 3)
+        self.assertEqual(page["semantic_item_count"], 2)
+        self.assertEqual(page["semantic_omitted_before"], 1)
+        summaries = [event for event in page["events"] if event["type"] == "job_summary"]
+        self.assertEqual(len(summaries), 1)
+        summary = summaries[0]
+        self.assertEqual(summary["job_id"], "job-1")
+        self.assertEqual(summary["job_run_count"], 12)
+        self.assertEqual(summary["job_event_count"], expected_job_events)
+        self.assertTrue(summary["job_history_truncated"])
+        self.assertEqual(page["next_semantic_before"], summary["seq"])
+        self.assertNotEqual(page["next_semantic_before"], min(event["seq"] for event in page["events"]))
+
+        representative_runs = {
+            event["run_id"]
+            for event in page["events"]
+            if event["type"] == "turn_finished" and str(event.get("run_id") or "").startswith("job-run-")
+        }
+        self.assertEqual(representative_runs, {f"job-run-{number}" for number in range(6, 13)})
+        self.assertIn("artifact_created", [event["type"] for event in page["events"]])
+        self.assertIn("code_diff", [event["type"] for event in page["events"]])
+        self.assertIn("human-new", [event.get("run_id") for event in page["events"]])
+        self.assertNotIn("human-old", [event.get("run_id") for event in page["events"]])
+
+        older = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            semantic_before=page["next_semantic_before"],
+            limit=2,
+            tail=True,
+        )
+        self.assertEqual(older["semantic_item_count"], 1)
+        self.assertEqual(older["semantic_omitted_before"], 0)
+        self.assertEqual({event.get("run_id") for event in older["events"]}, {"human-old"})
+        self.assertFalse(any(event["type"] == "job_summary" for event in older["events"]))
+
+    def test_semantic_cursor_keeps_each_job_global_and_does_not_repeat_old_runs(self) -> None:
+        events: list[dict[str, object]] = []
+        seq = 0
+        for job_id, run_id in (
+            ("job-1", "job-1-run-1"),
+            ("job-2", "job-2-run-1"),
+            ("job-1", "job-1-run-2"),
+        ):
+            common = {
+                "run_id": run_id,
+                "purpose": "scheduled_job",
+                "job_id": job_id,
+                "job_title": job_id,
+            }
+            seq += 1
+            events.append(self.event(seq, "turn_started", prompt="Poll", **common))
+            seq += 1
+            events.append(self.event(seq, "turn_finished", result_text=run_id, **common))
+        self.write_events(events)
+
+        latest = agent_server.read_semantic_timeline_page(self.session_id, limit=1, tail=True)
+        latest_summary = next(event for event in latest["events"] if event["type"] == "job_summary")
+        self.assertEqual(latest["semantic_total"], 2)
+        self.assertEqual(latest_summary["job_id"], "job-1")
+        self.assertEqual(latest_summary["job_run_count"], 2)
+
+        older = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            semantic_before=latest["next_semantic_before"],
+            limit=1,
+            tail=True,
+        )
+        older_summary = next(event for event in older["events"] if event["type"] == "job_summary")
+        self.assertEqual(older_summary["job_id"], "job-2")
+        self.assertFalse(any(event.get("job_id") == "job-1" for event in older["events"]))
+
+    def test_semantic_job_summary_uses_a_newer_runless_error_as_latest_status(self) -> None:
+        common = {
+            "run_id": "job-run-1",
+            "purpose": "scheduled_job",
+            "job_id": "job-1",
+            "job_title": "Capacity monitor",
+        }
+        self.write_events([
+            self.event(1, "turn_started", prompt="Check capacity", **common),
+            self.event(2, "turn_finished", result_text="All good", **common),
+            self.event(3, "job_error", job_id="job-1", message="Capacity monitor failed"),
+        ])
+
+        page = agent_server.read_semantic_timeline_page(self.session_id, limit=1, tail=True)
+        summary = next(event for event in page["events"] if event["type"] == "job_summary")
+
+        self.assertEqual(page["semantic_total"], 1)
+        self.assertEqual(summary["message"], "Capacity monitor failed")
+        self.assertEqual(summary["error"], "Capacity monitor failed")
+        self.assertTrue(summary["is_error"])
+        self.assertNotIn("result_text", summary)
+        self.assertIn("job_error", [event["type"] for event in page["events"]])
+
+    def test_semantic_job_summary_uses_a_newer_runless_defer_as_latest_status(self) -> None:
+        common = {
+            "run_id": "job-run-1",
+            "purpose": "scheduled_job",
+            "job_id": "job-1",
+            "job_title": "Capacity monitor",
+        }
+        self.write_events([
+            self.event(1, "turn_started", prompt="Check capacity", **common),
+            self.event(2, "turn_finished", result_text="All good", **common),
+            self.event(3, "job_deferred", job_id="job-1", message="Capacity monitor deferred"),
+        ])
+
+        page = agent_server.read_semantic_timeline_page(self.session_id, limit=1, tail=True)
+        summary = next(event for event in page["events"] if event["type"] == "job_summary")
+
+        self.assertEqual(page["semantic_total"], 1)
+        self.assertEqual(summary["message"], "Capacity monitor deferred")
+        self.assertNotIn("result_text", summary)
+        self.assertIn("job_deferred", [event["type"] for event in page["events"]])
+
+    def test_semantic_page_retroactively_folds_a_legacy_late_job_link(self) -> None:
+        initial_turn = [
+            self.event(1, "turn_started", run_id="legacy-job-run", prompt="Legacy poll"),
+            self.event(2, "reasoning_summary", run_id="legacy-job-run", text="Checking"),
+            self.event(3, "assistant_text", run_id="legacy-job-run", text="Healthy"),
+            self.event(4, "turn_finished", run_id="legacy-job-run", result_text="Healthy"),
+        ]
+        self.write_events(initial_turn)
+        before_link = agent_server.build_timeline_index(self.session_id)
+        self.assertEqual(len(before_link["landmarks"]), 1)
+
+        late_link = self.event(5, "job_ran", run_id="legacy-job-run", job_id="job-legacy", job={
+                "id": "job-legacy", "title": "Legacy monitor", "run_count": 1,
+            })
+        with agent_server.events_path(self.session_id).open("a", encoding="utf-8") as destination:
+            destination.write(json.dumps(late_link) + "\n")
+
+        page = agent_server.read_semantic_timeline_page(self.session_id, limit=10, tail=True)
+
+        self.assertEqual(page["semantic_total"], 1)
+        self.assertEqual(page["semantic_item_count"], 1)
+        summary = next(event for event in page["events"] if event["type"] == "job_summary")
+        self.assertEqual(summary["job_id"], "job-legacy")
+        self.assertEqual(summary["job_run_count"], 1)
+        self.assertEqual(summary["job_event_count"], 5)
+        self.assertEqual(summary["job_start_seq"], 1)
+        self.assertEqual(summary["job_end_seq"], 5)
+        returned_run_events = [
+            event
+            for event in page["events"]
+            if event.get("run_id") == "legacy-job-run"
+        ]
+        self.assertTrue(returned_run_events)
+        self.assertTrue(all(
+            event.get("job_id") == "job-legacy"
+            and event.get("purpose") == "scheduled_job"
+            for event in returned_run_events
+        ))
+        self.assertFalse(any(
+            event["type"] == "turn_started" and event.get("prompt") == "Legacy poll"
+            for event in page["events"]
+        ))
+
+    def test_semantic_cursor_uses_the_same_start_anchor_as_rendered_item_order(self) -> None:
+        self.write_events([
+            self.event(1, "turn_started", run_id="long-run", prompt="Long turn"),
+            self.event(2, "error", message="Intervening error"),
+            self.event(3, "assistant_text", run_id="long-run", text="Recovered"),
+            self.event(4, "turn_finished", run_id="long-run", result_text="Recovered"),
+            self.event(5, "turn_started", run_id="latest-run", prompt="Latest"),
+            self.event(6, "turn_finished", run_id="latest-run", result_text="Done"),
+        ])
+
+        latest = agent_server.read_semantic_timeline_page(self.session_id, limit=1, tail=True)
+        self.assertEqual(latest["next_semantic_before"], 5)
+        middle = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            semantic_before=latest["next_semantic_before"],
+            limit=1,
+            tail=True,
+        )
+        self.assertEqual(middle["next_semantic_before"], 2)
+        self.assertEqual([event["type"] for event in middle["events"]], ["error"])
+        oldest = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            semantic_before=middle["next_semantic_before"],
+            limit=1,
+            tail=True,
+        )
+        self.assertEqual({event.get("run_id") for event in oldest["events"]}, {"long-run"})
+        self.assertIsNone(oldest["next_semantic_before"])
+
+    def test_semantic_response_is_bounded_and_keeps_every_selected_item_represented(self) -> None:
+        events = [
+            self.event(1, "turn_started", run_id="large-run", prompt="Large turn"),
+        ]
+        final_large_seq = agent_server.MAX_EVENT_RESPONSE_LIMIT + 152
+        for seq in range(2, final_large_seq):
+            events.append(self.event(
+                seq,
+                "reasoning_summary",
+                run_id="large-run",
+                text=f"Trace {seq}",
+            ))
+        events.extend([
+            self.event(final_large_seq, "turn_finished", run_id="large-run", result_text="Large done"),
+            self.event(final_large_seq + 1, "turn_started", run_id="latest-run", prompt="Latest turn"),
+            self.event(final_large_seq + 2, "turn_finished", run_id="latest-run", result_text="Latest done"),
+        ])
+        self.write_events(events)
+
+        page = agent_server.read_semantic_timeline_page(self.session_id, limit=2, tail=True)
+
+        self.assertEqual(page["semantic_item_count"], 2)
+        self.assertLessEqual(len(page["events"]), agent_server.MAX_EVENT_RESPONSE_LIMIT)
+        self.assertLessEqual(
+            len(page["events"]),
+            page["semantic_item_count"]
+            * agent_server.SEMANTIC_TIMELINE_EVENT_BUDGET_PER_ITEM,
+        )
+        represented_runs = {
+            str(event.get("run_id") or "")
+            for event in page["events"]
+        }
+        self.assertIn("large-run", represented_runs)
+        self.assertIn("latest-run", represented_runs)
+        self.assertIn(1, [event["seq"] for event in page["events"]])
+        self.assertIn(final_large_seq, [event["seq"] for event in page["events"]])
+
+    def test_semantic_scan_projects_only_events_in_selected_units(self) -> None:
+        events = []
+        for index in range(100):
+            seq = index * 2 + 1
+            events.extend([
+                self.event(seq, "turn_started", run_id=f"run-{index}", prompt=f"Question {index}"),
+                self.event(seq + 1, "turn_finished", run_id=f"run-{index}", result_text=f"Answer {index}"),
+            ])
+        self.write_events(events)
+
+        original_projection = agent_server.client_safe_event
+        with patch.object(
+            agent_server,
+            "client_safe_event",
+            wraps=original_projection,
+        ) as projection:
+            page = agent_server.read_semantic_timeline_page(self.session_id, limit=1, tail=True)
+
+        self.assertEqual(page["semantic_item_count"], 1)
+        self.assertEqual(projection.call_count, 2)
+
+    def test_timeline_index_does_not_retain_duplicate_search_payloads(self) -> None:
+        self.write_events([
+            self.event(1, "turn_started", run_id="run-1", prompt="Question"),
+            self.event(2, "reasoning_summary", run_id="run-1", text="Private trace"),
+            self.event(3, "turn_finished", run_id="run-1", result_text="Answer"),
+        ])
+
+        agent_server.build_timeline_index(self.session_id)
+        records = agent_server.TIMELINE_INDEX_CACHE[self.session_id]["records"]
+
+        self.assertTrue(records)
+        self.assertTrue(all("search_entries" not in record for record in records))
+        self.assertTrue(all("_search_values" not in record for record in records))
+
+    def test_semantic_job_summary_id_stays_stable_across_incremental_refresh(self) -> None:
+        first_run = [
+            self.event(
+                1,
+                "turn_started",
+                run_id="job-run-1",
+                purpose="scheduled_job",
+                job_id="job-1",
+                job_title="Capacity monitor",
+                prompt="Check capacity",
+            ),
+            self.event(
+                2,
+                "turn_finished",
+                run_id="job-run-1",
+                purpose="scheduled_job",
+                job_id="job-1",
+                job_title="Capacity monitor",
+                result_text="First result",
+            ),
+        ]
+        self.write_events(first_run)
+        first = agent_server.read_semantic_timeline_page(self.session_id, limit=1, tail=True)
+        first_summary = next(event for event in first["events"] if event["type"] == "job_summary")
+
+        path = agent_server.events_path(self.session_id)
+        second_run = [
+            self.event(
+                3,
+                "turn_started",
+                run_id="job-run-2",
+                purpose="scheduled_job",
+                job_id="job-1",
+                job_title="Capacity monitor",
+                prompt="Check capacity",
+            ),
+            self.event(
+                4,
+                "turn_finished",
+                run_id="job-run-2",
+                purpose="scheduled_job",
+                job_id="job-1",
+                job_title="Capacity monitor",
+                result_text="Second result",
+            ),
+        ]
+        with path.open("a", encoding="utf-8") as destination:
+            destination.write("".join(json.dumps(event) + "\n" for event in second_run))
+
+        refreshed = agent_server.read_semantic_timeline_page(self.session_id, limit=1, tail=True)
+        summaries = [event for event in refreshed["events"] if event["type"] == "job_summary"]
+
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(first_summary["id"], "job_summary:job-1")
+        self.assertEqual(summaries[0]["id"], first_summary["id"])
+        self.assertGreater(summaries[0]["seq"], first_summary["seq"])
+        self.assertEqual(summaries[0]["job_run_count"], 2)
+        self.assertEqual(summaries[0]["job_event_count"], 4)
+
+    def test_semantic_paging_ignores_renderer_hidden_lifecycle_events(self) -> None:
+        self.write_events([
+            self.event(1, "turn_started", run_id="human-run", prompt="Question"),
+            self.event(2, "turn_finished", run_id="human-run", result_text="Answer"),
+            self.event(3, "job_started", run_id="job-run", job_id="job-1"),
+            self.event(4, "job_finished", run_id="job-run", job_id="job-1"),
+            self.event(5, "turn_queue_updated"),
+            self.event(6, "turn_queue_reordered"),
+            self.event(7, "turn_queue_run_now"),
+            self.event(8, "subagent_state"),
+            self.event(9, "job_updated", job_id="job-1"),
+            self.event(10, "job_deleted", job_id="job-1"),
+        ])
+
+        page = agent_server.read_semantic_timeline_page(self.session_id, limit=10, tail=True)
+        summary = next(event for event in page["events"] if event["type"] == "job_summary")
+
+        self.assertEqual(page["semantic_total"], 2)
+        self.assertEqual(page["semantic_item_count"], 2)
+        self.assertEqual(summary["seq"], 4)
+        self.assertEqual(summary["job_event_count"], 2)
+        self.assertFalse({
+            "turn_queue_updated",
+            "turn_queue_reordered",
+            "turn_queue_run_now",
+            "subagent_state",
+            "job_updated",
+            "job_deleted",
+        }.intersection(event["type"] for event in page["events"]))
+
     async def test_endpoint_keeps_default_payload_and_offloads_visible_scans(self) -> None:
         session = {
             "id": self.session_id,
@@ -219,6 +620,41 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(offload.await_args_list[0].args[0], agent_server.read_visible_events_page)
         self.assertIs(offload.await_args_list[1].args[0], agent_server.read_visible_events_after_page)
         self.assertTrue(offload.await_args_list[1].kwargs["compact"])
+
+    async def test_endpoint_exposes_additive_semantic_paging_fields(self) -> None:
+        session = {
+            "id": self.session_id,
+            "title": "Semantic history",
+            "backend": "codex",
+            "created_at": "2026-07-19T00:00:00Z",
+            "updated_at": "2026-07-19T00:00:00Z",
+        }
+        self.write_events([
+            self.event(1, "turn_started", run_id="run-1", prompt="Question"),
+            self.event(2, "turn_finished", run_id="run-1", result_text="Answer"),
+        ])
+        with patch.dict(agent_server.STORE.sessions, {self.session_id: session}, clear=True):
+            response = await agent_server.get_session(
+                self.session_id,
+                limit=1,
+                tail=True,
+                page_mode="semantic",
+            )
+
+        self.assertEqual(response["semantic_item_count"], 1)
+        self.assertEqual(response["semantic_total"], 1)
+        self.assertEqual(response["semantic_omitted_before"], 0)
+        self.assertEqual(response["semantic_omitted_after"], 0)
+        self.assertIsNone(response["next_semantic_before"])
+        self.assertEqual(response["event_count"], 1)
+        self.assertEqual([event["seq"] for event in response["events"]], [1, 2])
+
+    def write_events(self, events: list[dict[str, object]]) -> None:
+        agent_server.events_path(self.session_id).write_text(
+            "".join(json.dumps(event) + "\n" for event in events),
+            encoding="utf-8",
+        )
+        agent_server.TIMELINE_INDEX_CACHE.clear()
 
     def event(self, seq: int, event_type: str, **fields: object) -> dict[str, object]:
         event: dict[str, object] = {

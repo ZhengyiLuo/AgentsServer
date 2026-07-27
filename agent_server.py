@@ -51,7 +51,7 @@ from dateutil.rrule import rrulestr
 from dateutil.tz import datetime_exists
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 import uvicorn
 import websockets
@@ -205,11 +205,28 @@ HANDOFF_DIGEST_EFFORT = agentsdock_setting("HANDOFF_DIGEST_EFFORT", "").strip()
 DEFAULT_SESSION_EVENT_LIMIT = int(agentsdock_setting("SESSION_EVENT_LIMIT", "100"))
 MAX_EVENT_RESPONSE_LIMIT = int(agentsdock_setting("MAX_EVENT_RESPONSE_LIMIT", "1000"))
 MAX_WORKSPACE_TEXT_BYTES = int(agentsdock_setting("WORKSPACE_TEXT_MAX_BYTES", str(2 * 1024 * 1024)))
+MAX_WORKSPACE_PREVIEW_BYTES = max(
+    1,
+    int(agentsdock_setting("WORKSPACE_PREVIEW_MAX_BYTES", str(100 * 1024 * 1024))),
+)
 MAX_WORKSPACE_PATH_CHARS = int(agentsdock_setting("WORKSPACE_PATH_MAX_CHARS", "4096"))
 MAX_WORKSPACE_SEARCH_SCAN = int(agentsdock_setting("WORKSPACE_SEARCH_MAX_ENTRIES", "20000"))
 MAX_WORKSPACE_GIT_SEARCH_BYTES = int(agentsdock_setting("WORKSPACE_GIT_SEARCH_MAX_BYTES", str(8 * 1024 * 1024)))
 WORKSPACE_SECURE_OPEN_AVAILABLE = all(hasattr(os, flag) for flag in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK"))
 WORKSPACE_WRITE_LOCKS = tuple(threading.Lock() for _ in range(256))
+WORKSPACE_PREVIEW_MEDIA_TYPES = {
+    ".avif": "image/avif",
+    ".bmp": "image/bmp",
+    ".gif": "image/gif",
+    ".ico": "image/x-icon",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+    ".webp": "image/webp",
+}
 WORKSPACE_SEARCH_IGNORED_DIRECTORIES = {
     ".git", ".hg", ".svn", ".cache", ".next", ".turbo", ".venv",
     "__pycache__", "DerivedData", "build", "dist", "node_modules", "target", "venv",
@@ -1032,8 +1049,10 @@ def workspace_info_sync(session_id: str) -> dict[str, Any]:
         "root": str(root),
         "name": root.name or str(root),
         "read_only": bool(sess.get("archived")),
-        "capability_version": 2 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
+        "capability_version": 3 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
         "max_text_file_bytes": MAX_WORKSPACE_TEXT_BYTES,
+        "max_preview_file_bytes": MAX_WORKSPACE_PREVIEW_BYTES,
+        "preview_media_types": sorted(set(WORKSPACE_PREVIEW_MEDIA_TYPES.values())),
     }
 
 
@@ -1128,6 +1147,124 @@ def read_workspace_file_sync(session_id: str, relative_path: str) -> dict[str, A
         if file_fd >= 0:
             os.close(file_fd)
         os.close(parent_fd)
+
+
+def workspace_preview_media_type(relative_path: str) -> str:
+    media_type = WORKSPACE_PREVIEW_MEDIA_TYPES.get(Path(relative_path).suffix.lower())
+    if media_type is None:
+        raise workspace_http_error(
+            415,
+            "workspace_preview_unsupported",
+            (
+                f"{relative_path} is not a supported image or PDF preview. "
+                "SVG and text files must be opened in the text editor."
+            ),
+        )
+    return media_type
+
+
+def open_workspace_preview_sync(session_id: str, relative_path: str) -> dict[str, Any]:
+    """Securely open one preview resource and transfer ownership of its file descriptor."""
+    _, root = session_workspace_root(session_id)
+    normalized = normalize_workspace_path(relative_path)
+    parent_fd, name = open_workspace_parent_fd(root, normalized)
+    file_fd = -1
+    try:
+        try:
+            file_fd = os.open(name, workspace_open_flags(), dir_fd=parent_fd)
+        except OSError as exc:
+            raise translate_workspace_os_error(exc, normalized) from exc
+        item_stat = os.fstat(file_fd)
+        if not stat.S_ISREG(item_stat.st_mode):
+            raise workspace_http_error(
+                400,
+                "workspace_not_regular_file",
+                f"Not a regular workspace file: {normalized}",
+            )
+        if item_stat.st_size > MAX_WORKSPACE_PREVIEW_BYTES:
+            raise workspace_http_error(
+                413,
+                "workspace_preview_too_large",
+                (
+                    f"{normalized} is larger than the "
+                    f"{MAX_WORKSPACE_PREVIEW_BYTES // (1024 * 1024)} MiB preview limit."
+                ),
+            )
+        media_type = workspace_preview_media_type(normalized)
+        result = {
+            "file_fd": file_fd,
+            "root": str(root),
+            "path": normalized,
+            "name": name,
+            "media_type": media_type,
+            "revision": workspace_entry_revision(item_stat),
+            "size": int(item_stat.st_size),
+            "mtime_ns": int(item_stat.st_mtime_ns),
+        }
+        file_fd = -1
+        return result
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        os.close(parent_fd)
+
+
+def workspace_preview_range_error(size: int) -> HTTPException:
+    return HTTPException(
+        status_code=416,
+        detail={
+            "code": "workspace_preview_range_unsatisfiable",
+            "message": "The requested byte range cannot be served.",
+        },
+        headers={
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-store",
+            "Content-Range": f"bytes */{size}",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+def parse_workspace_preview_range(value: str | None, size: int) -> tuple[int, int] | None:
+    """Parse one HTTP byte range and return an inclusive start/end pair."""
+    if value is None or not value.strip():
+        return None
+    match = re.fullmatch(r"bytes=(\d{0,20})-(\d{0,20})", value.strip(), flags=re.IGNORECASE)
+    if match is None or size <= 0:
+        raise workspace_preview_range_error(size)
+    start_text, end_text = match.groups()
+    if not start_text and not end_text:
+        raise workspace_preview_range_error(size)
+    if not start_text:
+        suffix_length = int(end_text)
+        if suffix_length <= 0:
+            raise workspace_preview_range_error(size)
+        start = max(0, size - suffix_length)
+        return start, size - 1
+    start = int(start_text)
+    if start >= size:
+        raise workspace_preview_range_error(size)
+    if not end_text:
+        return start, size - 1
+    end = int(end_text)
+    if end < start:
+        raise workspace_preview_range_error(size)
+    return start, min(end, size - 1)
+
+
+def stream_workspace_preview(file_fd: int, start: int, length: int):
+    """Yield a bounded byte window from an already-validated workspace file."""
+    try:
+        os.lseek(file_fd, start, os.SEEK_SET)
+        remaining = length
+        while remaining > 0:
+            chunk = os.read(file_fd, min(256 * 1024, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+    finally:
+        os.close(file_fd)
 
 
 def write_all(file_fd: int, data: bytes) -> None:
@@ -6704,6 +6841,26 @@ def semantic_job_event_priority(event: dict[str, Any]) -> int:
     return 0
 
 
+def semantic_job_event_is_result(event: dict[str, Any]) -> bool:
+    """Return whether an event carries a result worth preserving in the summary."""
+    event_type = str(event.get("type") or "")
+    if event_type == "turn_finished":
+        return bool(str(event.get("result_text") or "").strip())
+    if event_type == "assistant_text":
+        return bool(str(event.get("text") or "").strip())
+    if event_type == "job_finished":
+        return any(
+            str(event.get(field) or "").strip()
+            for field in ("result_text", "text", "message")
+        )
+    if timeline_index_is_error(event):
+        return any(
+            str(event.get(field) or "").strip()
+            for field in ("result_text", "text", "message", "error", "output")
+        )
+    return False
+
+
 def new_semantic_job_state(landmark: dict[str, Any]) -> dict[str, Any]:
     return {
         "landmark": landmark,
@@ -6713,6 +6870,7 @@ def new_semantic_job_state(landmark: dict[str, Any]) -> dict[str, Any]:
         "representatives": OrderedDict(),
         "standalone": deque(maxlen=SEMANTIC_TIMELINE_JOB_EXTRA_LIMIT),
         "latest_event": None,
+        "latest_result_event": None,
         "latest_run_id": None,
         "latest_run_seq": 0,
         "latest_run_extras": deque(maxlen=SEMANTIC_TIMELINE_JOB_EXTRA_LIMIT),
@@ -6727,6 +6885,15 @@ def add_semantic_job_event(state: dict[str, Any], event: dict[str, Any]) -> None
     latest = state.get("latest_event")
     if not isinstance(latest, dict) or seq >= int(latest.get("seq") or 0):
         state["latest_event"] = event
+    latest_result = state.get("latest_result_event")
+    if semantic_job_event_is_result(event) and (
+        not isinstance(latest_result, dict)
+        or seq >= int(latest_result.get("seq") or 0)
+    ):
+        # Keep one canonical result outside the bounded representative/history
+        # collections. A later marker-only or stopped run must not erase the
+        # last useful output merely because optional page detail was exhausted.
+        state["latest_result_event"] = event
 
     title = str(event.get("job_title") or "").strip()
     job = event.get("job") if isinstance(event.get("job"), dict) else None
@@ -6782,11 +6949,35 @@ def semantic_job_summary_event(
     anchor_seq = int(landmark.get("end_seq") or landmark.get("start_seq") or 0)
     representatives: list[dict[str, Any]] = list(state["representatives"].values())
     standalone: list[dict[str, Any]] = list(state["standalone"])
-    latest_display = max(
+    latest_fallback = max(
         [*representatives, *standalone],
         key=lambda event: int(event.get("seq") or 0),
         default=state.get("latest_event") if isinstance(state.get("latest_event"), dict) else {},
     )
+    latest_result = (
+        state.get("latest_result_event")
+        if isinstance(state.get("latest_result_event"), dict)
+        else None
+    )
+    latest_standalone = max(
+        standalone,
+        key=lambda event: int(event.get("seq") or 0),
+        default=None,
+    )
+    result_seq = int(latest_result.get("seq") or 0) if latest_result else 0
+    latest_run_seq = int(state.get("latest_run_seq") or 0)
+    # A runless error/defer after the most recent run is the current status.
+    # Otherwise retain the newest real assistant/final result, even when a
+    # marker-only or stopped run is newer and bounded detail omits that result.
+    if (
+        latest_standalone is not None
+        and int(latest_standalone.get("seq") or 0) > max(result_seq, latest_run_seq)
+    ):
+        latest_display = latest_standalone
+    elif latest_result is not None:
+        latest_display = latest_result
+    else:
+        latest_display = latest_fallback
     latest_event = state.get("latest_event") if isinstance(state.get("latest_event"), dict) else latest_display
     title = str(state.get("title") or landmark.get("title") or "Scheduled job")
     run_count = max(len(state["run_ids"]), int(state.get("reported_run_count") or 0))
@@ -11416,15 +11607,17 @@ async def health() -> dict[str, Any]:
                 "available": WORKSPACE_SECURE_OPEN_AVAILABLE,
                 "required": False,
                 "message": (
-                    "Workspace file browsing, editing, rename, and deletion are available."
+                    "Workspace file browsing, editing, previews, rename, and deletion are available."
                     if WORKSPACE_MUTATIONS_AVAILABLE
-                    else "Workspace file browsing and editing are available."
+                    else "Workspace file browsing, editing, and previews are available."
                     if WORKSPACE_SECURE_OPEN_AVAILABLE
                     else "Secure workspace file access is unavailable on this host."
                 ),
                 "action": None if WORKSPACE_SECURE_OPEN_AVAILABLE else "Use a supported macOS or Linux host.",
-                "version": 2 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
+                "version": 3 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
                 "max_text_file_bytes": MAX_WORKSPACE_TEXT_BYTES,
+                "max_preview_file_bytes": MAX_WORKSPACE_PREVIEW_BYTES,
+                "preview_media_types": sorted(set(WORKSPACE_PREVIEW_MEDIA_TYPES.values())),
             },
         },
         "websocket_runtime": True,
@@ -12302,6 +12495,54 @@ async def get_session_workspace_file(
     path: str = Query(min_length=1, max_length=MAX_WORKSPACE_PATH_CHARS),
 ) -> dict[str, Any]:
     return await asyncio.to_thread(read_workspace_file_sync, session_id, path)
+
+
+@app.api_route("/api/sessions/{session_id}/workspace/preview", methods=["GET", "HEAD"])
+async def get_session_workspace_preview(
+    request: Request,
+    session_id: str,
+    path: str = Query(min_length=1, max_length=MAX_WORKSPACE_PATH_CHARS),
+) -> Response:
+    preview = await asyncio.to_thread(open_workspace_preview_sync, session_id, path)
+    file_fd = int(preview["file_fd"])
+    try:
+        size = int(preview["size"])
+        byte_range = parse_workspace_preview_range(request.headers.get("range"), size)
+        start, end = byte_range if byte_range is not None else (0, max(0, size - 1))
+        length = end - start + 1 if size else 0
+        status_code = 206 if byte_range is not None else 200
+        revision = str(preview["revision"])
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-store",
+            "Content-Length": str(length),
+            "Content-Disposition": "inline",
+            "ETag": f'"{revision}"',
+            "X-AgentsDock-Revision": revision,
+            "X-Content-Type-Options": "nosniff",
+        }
+        if byte_range is not None:
+            headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+        if request.method.upper() == "HEAD":
+            os.close(file_fd)
+            file_fd = -1
+            return Response(
+                content=b"",
+                status_code=status_code,
+                headers=headers,
+                media_type=str(preview["media_type"]),
+            )
+        body = stream_workspace_preview(file_fd, start, length)
+        file_fd = -1
+        return StreamingResponse(
+            body,
+            status_code=status_code,
+            headers=headers,
+            media_type=str(preview["media_type"]),
+        )
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
 
 
 @app.put("/api/sessions/{session_id}/workspace/file")

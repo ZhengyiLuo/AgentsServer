@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 
 import agent_server
 
@@ -18,6 +18,33 @@ import agent_server
 class WorkspaceFilesTests(unittest.TestCase):
     def session(self, root: Path, *, archived: bool = False) -> dict[str, object]:
         return {"id": "session-1", "cwd": str(root), "archived": archived}
+
+    def request(self, method: str = "GET", **headers: str) -> Request:
+        return Request({
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": method,
+            "scheme": "http",
+            "path": "/workspace/preview",
+            "raw_path": b"/workspace/preview",
+            "query_string": b"",
+            "headers": [
+                (name.lower().replace("_", "-").encode("ascii"), value.encode("ascii"))
+                for name, value in headers.items()
+            ],
+            "client": ("test", 123),
+            "server": ("test", 80),
+        })
+
+    def response_body(self, response: object) -> bytes:
+        async def collect() -> bytes:
+            chunks: list[bytes] = []
+            async for chunk in response.body_iterator:  # type: ignore[attr-defined]
+                chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode("utf-8"))
+            return b"".join(chunks)
+
+        return asyncio.run(collect())
 
     def test_workspace_uses_the_exact_session_cwd_without_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -49,7 +76,7 @@ class WorkspaceFilesTests(unittest.TestCase):
         ])
         self.assertEqual(second["entries"][0]["kind"], "symlink")
 
-    def test_workspace_capability_v2_entries_have_opaque_revisions(self) -> None:
+    def test_workspace_capability_v3_entries_have_opaque_revisions_and_preview_limits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             path = root / "app.py"
@@ -61,7 +88,12 @@ class WorkspaceFilesTests(unittest.TestCase):
                 path.write_text("second, longer\n")
                 changed = agent_server.list_workspace_entries_sync("session-1", "", 0, 20)["entries"][0]
 
-        self.assertEqual(info["capability_version"], 2)
+        self.assertEqual(info["capability_version"], 3)
+        self.assertEqual(info["max_preview_file_bytes"], agent_server.MAX_WORKSPACE_PREVIEW_BYTES)
+        self.assertIn("application/pdf", info["preview_media_types"])
+        self.assertIn("image/png", info["preview_media_types"])
+        self.assertIn("image/tiff", info["preview_media_types"])
+        self.assertNotIn("image/svg+xml", info["preview_media_types"])
         self.assertRegex(listed["revision"], r"^[0-9a-f]{64}$")
         self.assertEqual(searched["revision"], listed["revision"])
         self.assertNotEqual(changed["revision"], listed["revision"])
@@ -311,6 +343,105 @@ class WorkspaceFilesTests(unittest.TestCase):
                     with self.assertRaises(HTTPException) as too_large:
                         agent_server.read_workspace_file_sync("session-1", "large.txt")
                     self.assertEqual(too_large.exception.status_code, 413)
+
+    def test_preview_get_and_head_stream_safe_media_with_revision_and_ranges(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image_data = b"\x89PNG\r\n\x1a\npreview-data"
+            pdf_data = b"%PDF-1.7\n0123456789\n%%EOF\n"
+            (root / "preview.png").write_bytes(image_data)
+            (root / "report.pdf").write_bytes(pdf_data)
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
+                image_revision = agent_server.list_workspace_entries_sync(
+                    "session-1", "", 0, 20
+                )["entries"][0]["revision"]
+                image_response = asyncio.run(agent_server.get_session_workspace_preview(
+                    self.request(),
+                    "session-1",
+                    "preview.png",
+                ))
+                image_body = self.response_body(image_response)
+                range_response = asyncio.run(agent_server.get_session_workspace_preview(
+                    self.request(Range="bytes=5-9"),
+                    "session-1",
+                    "report.pdf",
+                ))
+                range_body = self.response_body(range_response)
+                head_response = asyncio.run(agent_server.get_session_workspace_preview(
+                    self.request("HEAD", Range="bytes=-4"),
+                    "session-1",
+                    "report.pdf",
+                ))
+
+        self.assertEqual(image_response.status_code, 200)
+        self.assertEqual(image_response.headers["content-type"], "image/png")
+        self.assertEqual(image_response.headers["content-length"], str(len(image_data)))
+        self.assertEqual(image_response.headers["etag"], f'"{image_revision}"')
+        self.assertEqual(image_response.headers["x-agentsdock-revision"], image_revision)
+        self.assertEqual(image_response.headers["accept-ranges"], "bytes")
+        self.assertEqual(image_response.headers["cache-control"], "no-store")
+        self.assertEqual(image_response.headers["x-content-type-options"], "nosniff")
+        self.assertEqual(image_body, image_data)
+        self.assertEqual(range_response.status_code, 206)
+        self.assertEqual(range_response.headers["content-type"], "application/pdf")
+        self.assertEqual(range_response.headers["content-range"], f"bytes 5-9/{len(pdf_data)}")
+        self.assertEqual(range_response.headers["content-length"], "5")
+        self.assertEqual(range_body, pdf_data[5:10])
+        self.assertEqual(head_response.status_code, 206)
+        self.assertEqual(head_response.headers["content-range"], (
+            f"bytes {len(pdf_data) - 4}-{len(pdf_data) - 1}/{len(pdf_data)}"
+        ))
+        self.assertEqual(head_response.headers["content-length"], "4")
+        self.assertEqual(head_response.body, b"")
+
+    def test_preview_rejects_unsupported_oversized_nonregular_and_escaping_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "workspace"
+            root.mkdir()
+            outside = Path(temporary) / "outside.png"
+            outside.write_bytes(b"outside")
+            (root / "vector.svg").write_text("<svg></svg>\n")
+            (root / "large.png").write_bytes(b"12345")
+            (root / "escape.png").symlink_to(outside)
+            (root / "directory.png").mkdir()
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
+                for path, status, code in (
+                    ("vector.svg", 415, "workspace_preview_unsupported"),
+                    ("escape.png", 403, "workspace_symlink_blocked"),
+                    ("directory.png", 400, "workspace_not_regular_file"),
+                    ("../outside.png", 400, "invalid_workspace_path"),
+                ):
+                    with self.subTest(path=path), self.assertRaises(HTTPException) as raised:
+                        agent_server.open_workspace_preview_sync("session-1", path)
+                    self.assertEqual(raised.exception.status_code, status)
+                    self.assertEqual(raised.exception.detail["code"], code)
+                with patch.object(agent_server, "MAX_WORKSPACE_PREVIEW_BYTES", 4):
+                    with self.assertRaises(HTTPException) as oversized:
+                        agent_server.open_workspace_preview_sync("session-1", "large.png")
+                outside_data = outside.read_bytes()
+
+        self.assertEqual(oversized.exception.status_code, 413)
+        self.assertEqual(oversized.exception.detail["code"], "workspace_preview_too_large")
+        self.assertEqual(outside_data, b"outside")
+
+    def test_preview_parses_only_one_satisfiable_byte_range(self) -> None:
+        self.assertIsNone(agent_server.parse_workspace_preview_range(None, 10))
+        self.assertEqual(agent_server.parse_workspace_preview_range("bytes=2-", 10), (2, 9))
+        self.assertEqual(agent_server.parse_workspace_preview_range("bytes=2-99", 10), (2, 9))
+        self.assertEqual(agent_server.parse_workspace_preview_range("bytes=-3", 10), (7, 9))
+        for value, size in (
+            ("bytes=1-2,4-5", 10),
+            ("items=1-2", 10),
+            ("bytes=-0", 10),
+            ("bytes=10-", 10),
+            ("bytes=4-2", 10),
+            ("bytes=0-0", 0),
+            ("bytes=999999999999999999999999999999-", 10),
+        ):
+            with self.subTest(value=value, size=size), self.assertRaises(HTTPException) as raised:
+                agent_server.parse_workspace_preview_range(value, size)
+            self.assertEqual(raised.exception.status_code, 416)
+            self.assertEqual(raised.exception.headers["Content-Range"], f"bytes */{size}")
 
     def test_atomic_save_preserves_mode_and_detects_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

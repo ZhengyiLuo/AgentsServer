@@ -345,6 +345,62 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("result_text", summary)
         self.assertIn("job_deferred", [event["type"] for event in page["events"]])
 
+    def test_semantic_job_summary_retains_latest_result_after_marker_only_stopped_run(self) -> None:
+        first_run = {
+            "run_id": "job-run-170",
+            "purpose": "scheduled_job",
+            "job_id": "job-1",
+            "job_title": "Capacity monitor",
+        }
+        latest_run = {
+            "run_id": "job-run-171",
+            "purpose": "scheduled_job",
+            "job_id": "job-1",
+            "job_title": "Capacity monitor",
+        }
+        events = [
+            self.event(1, "turn_started", prompt="Check capacity", **first_run),
+            self.event(
+                2,
+                "turn_finished",
+                result_text="Latest completed capacity result",
+                **first_run,
+            ),
+        ]
+        # Reproduce a busy recurring job whose bounded optional history is
+        # dominated by runless deferrals before the next run starts.
+        for seq in range(3, 70):
+            events.append(self.event(
+                seq,
+                "job_deferred",
+                job_id="job-1",
+                job_title="Capacity monitor",
+                message="Capacity monitor deferred",
+            ))
+        events.extend([
+            self.event(70, "turn_started", prompt="Check capacity", **latest_run),
+            self.event(
+                71,
+                "job_ran",
+                message="Scheduled job ran: Capacity monitor",
+                **latest_run,
+            ),
+            self.event(72, "turn_stopped", **latest_run),
+            self.event(73, "turn_finished", result_text="", **latest_run),
+        ])
+        self.write_events(events)
+
+        page = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            limit=1,
+            tail=True,
+        )
+        summary = next(event for event in page["events"] if event["type"] == "job_summary")
+
+        self.assertEqual(summary["job_run_count"], 2)
+        self.assertEqual(summary["result_text"], "Latest completed capacity result")
+        self.assertNotEqual(summary.get("message"), "Scheduled job ran: Capacity monitor")
+
     def test_semantic_page_retroactively_folds_a_legacy_late_job_link(self) -> None:
         initial_turn = [
             self.event(1, "turn_started", run_id="legacy-job-run", prompt="Legacy poll"),

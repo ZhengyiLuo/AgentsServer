@@ -28,6 +28,7 @@ class PrepareSteeredTurnTests(unittest.TestCase):
                 file_dir = files_root / file_id
                 file_dir.mkdir()
                 (file_dir / "meta.json").write_text(json.dumps({
+                    "session_id": "session-steer",
                     "path": f"/uploads/{file_id}.png",
                     "filename": f"{file_id}.png",
                     "content_type": "image/png",
@@ -46,6 +47,7 @@ class PrepareSteeredTurnTests(unittest.TestCase):
                     },
                 )
                 provider_prompt = build_turn_provider_prompt(
+                    "session-steer",
                     turn["prompt"],
                     turn["file_ids"],
                     turn["steering_lineage"],
@@ -81,6 +83,7 @@ class PrepareSteeredTurnTests(unittest.TestCase):
             file_dir = files_root / "original-image"
             file_dir.mkdir()
             (file_dir / "meta.json").write_text(json.dumps({
+                "session_id": "session-steer",
                 "path": "/uploads/original.png",
                 "filename": "original.png",
                 "content_type": "image/png",
@@ -91,6 +94,7 @@ class PrepareSteeredTurnTests(unittest.TestCase):
                     {"run_id": "run-original", "prompt": "What is this?", "file_ids": ["original-image"]},
                 )
                 provider_prompt = build_turn_provider_prompt(
+                    "session-steer",
                     turn["prompt"],
                     turn["file_ids"],
                     turn["steering_lineage"],
@@ -110,6 +114,7 @@ class PrepareSteeredTurnTests(unittest.TestCase):
                 file_dir.mkdir()
                 filename = "original.png" if file_id == "original-image" else "new.png"
                 (file_dir / "meta.json").write_text(json.dumps({
+                    "session_id": "session-steer",
                     "path": f"/uploads/{filename}",
                     "filename": filename,
                     "content_type": "image/png",
@@ -120,6 +125,7 @@ class PrepareSteeredTurnTests(unittest.TestCase):
                     {"run_id": "run-original", "prompt": "", "file_ids": ["original-image"]},
                 )
                 provider_prompt = build_turn_provider_prompt(
+                    "session-steer",
                     turn["prompt"],
                     turn["file_ids"],
                     turn["steering_lineage"],
@@ -151,6 +157,7 @@ class PrepareSteeredTurnTests(unittest.TestCase):
             },
         )
         provider_prompt = build_turn_provider_prompt(
+            "session-steer",
             second["prompt"],
             second["file_ids"],
             second["steering_lineage"],
@@ -354,6 +361,53 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(append_event.await_args.args[1], "turn_deferred")
         schedule_next.assert_not_called()
+
+    async def test_repeated_force_send_emits_one_deferred_notice_for_the_queue_item(self) -> None:
+        append_event = AsyncMock(return_value={})
+        with patch.object(
+                agent_server,
+                "stop_turn",
+                new_callable=AsyncMock,
+                return_value={"stopped": False, "deferred": True},
+        ), \
+                patch.object(agent_server, "append_event", append_event), \
+                patch.object(agent_server, "BUSY_SESSIONS", {"chat-1"}):
+            first = await run_queued_turn_now("chat-1", "queued-steer")
+            second = await run_queued_turn_now("chat-1", "queued-steer")
+
+        self.assertTrue(first["deferred"])
+        self.assertTrue(second["deferred"])
+        self.assertEqual(append_event.await_count, 1)
+        self.assertEqual(
+            [item["queued_id"] for item in agent_server.QUEUED_TURNS["chat-1"]],
+            ["queued-steer"],
+        )
+
+    async def test_background_retry_emits_one_deferred_notice_for_the_queue_item(self) -> None:
+        append_event = AsyncMock(return_value={})
+
+        async def completed_retry(_session_id: str, _delay_seconds: int | None = None) -> None:
+            return None
+
+        with patch.object(
+                agent_server,
+                "start_turn",
+                new_callable=AsyncMock,
+                side_effect=agent_server.HTTPException(status_code=409, detail="turn already active"),
+        ), \
+                patch.object(agent_server, "append_event", append_event), \
+                patch.object(agent_server, "retry_next_queued_turn_later", completed_retry):
+            await start_next_queued_turn("chat-1")
+            await asyncio.sleep(0)
+            await start_next_queued_turn("chat-1")
+            await asyncio.sleep(0)
+
+        self.assertEqual(append_event.await_count, 1)
+        self.assertEqual(append_event.await_args.args[1], "turn_deferred")
+        self.assertEqual(
+            [item["queued_id"] for item in agent_server.QUEUED_TURNS["chat-1"]],
+            ["queued-steer"],
+        )
 
     async def test_later_steer_runs_first_then_keeps_other_messages_in_original_order(self) -> None:
         agent_server.QUEUED_TURNS["chat-1"] = deque([

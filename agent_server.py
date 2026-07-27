@@ -3610,6 +3610,7 @@ async def update_session_event_metadata(session_id: str, event: dict[str, Any]) 
 
 
 async def enqueue_turn(session_id: str, req: TurnRequest, sess: dict[str, Any]) -> dict[str, Any]:
+    req.file_ids = validate_session_file_ids(session_id, req.file_ids)
     queued_id = f"queued_{uuid.uuid4().hex[:16]}"
     item = {
         "queued_id": queued_id,
@@ -3729,14 +3730,14 @@ def merged_file_ids(*groups: list[str] | tuple[str, ...]) -> list[str]:
     return merged
 
 
-def file_attachment_prompt_lines(file_ids: list[str] | tuple[str, ...]) -> list[str]:
+def file_attachment_prompt_lines(
+    session_id: str,
+    file_ids: list[str] | tuple[str, ...],
+) -> list[str]:
     lines: list[str] = []
-    for file_id in merged_file_ids(file_ids):
-        rec_path = FILES_ROOT / file_id / "meta.json"
-        if not rec_path.exists():
-            continue
+    for file_id in validate_session_file_ids(session_id, file_ids, reject_invalid=False):
         with suppress(Exception):
-            rec = json.loads(rec_path.read_text())
+            rec = load_file_meta(file_id)
             lines.append(
                 f"- {rec.get('path')} ({rec.get('filename')}, {rec.get('content_type')})"
             )
@@ -3773,9 +3774,13 @@ def turn_steering_lineage(turn: dict[str, Any] | None) -> list[dict[str, Any]]:
     return [{"prompt": prompt, "file_ids": file_ids}]
 
 
-def build_user_provider_prompt(prompt: str, file_ids: list[str] | tuple[str, ...]) -> str:
+def build_user_provider_prompt(
+    session_id: str,
+    prompt: str,
+    file_ids: list[str] | tuple[str, ...],
+) -> str:
     provider_prompt = prompt
-    attachment_lines = file_attachment_prompt_lines(file_ids)
+    attachment_lines = file_attachment_prompt_lines(session_id, file_ids)
     if attachment_lines:
         provider_prompt += "\n\n[Attached files]\n"
         provider_prompt += "\n".join(attachment_lines) + "\n"
@@ -3795,6 +3800,7 @@ def build_memory_augmented_prompt(label: str, memory: str, prompt: str) -> str:
 
 
 def build_turn_provider_prompt(
+    session_id: str,
     prompt: str,
     file_ids: list[str] | tuple[str, ...],
     steering_lineage: list[dict[str, Any]] | None = None,
@@ -3804,10 +3810,11 @@ def build_turn_provider_prompt(
     if len(lineage) >= 2:
         current = lineage[-1]
         return build_user_provider_prompt(
+            session_id,
             str(current.get("prompt") or ""),
             list(current.get("file_ids") or []),
         )
-    return build_user_provider_prompt(prompt, file_ids)
+    return build_user_provider_prompt(session_id, prompt, file_ids)
 
 
 LEGACY_STEERING_PREFIX = (
@@ -4021,6 +4028,11 @@ async def queued_turns_snapshot(session_id: str) -> list[dict[str, Any]]:
 async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedTurnRequest) -> dict[str, Any]:
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
+    validated_file_ids = (
+        validate_session_file_ids(session_id, req.file_ids)
+        if req.file_ids is not None
+        else None
+    )
 
     updated: dict[str, Any] | None = None
     async with QUEUE_LOCK:
@@ -4034,7 +4046,7 @@ async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedT
                             raise HTTPException(status_code=400, detail="prompt is empty")
                         item["prompt"] = prompt
                     if req.file_ids is not None:
-                        item["file_ids"] = list(req.file_ids)
+                        item["file_ids"] = list(validated_file_ids or [])
                     updated = dict(item)
                     updated["position"] = idx + 1
                     break
@@ -4142,6 +4154,8 @@ async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]
         interrupted = bool(stop_result.get("stopped") or stop_result.get("pending"))
         deferred = bool(stop_result.get("deferred"))
         if deferred:
+            already_notified = bool(selected.get("_turn_deferred_notified"))
+            selected["_turn_deferred_notified"] = True
             async with QUEUE_LOCK:
                 RUN_NOW_TURNS.pop(session_id, None)
                 STEERING_SESSIONS.discard(session_id)
@@ -4154,11 +4168,12 @@ async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]
                 "The provider is still starting, so the current turn was not interrupted. "
                 "This message remains queued; try Force Send again shortly."
             )
-            await append_event(session_id, "turn_deferred", {
-                "queued_id": queued_id,
-                "message": message,
-                "remaining": remaining,
-            })
+            if not already_notified:
+                await append_event(session_id, "turn_deferred", {
+                    "queued_id": queued_id,
+                    "message": message,
+                    "remaining": remaining,
+                })
             async with ACTIVE_LOCK:
                 still_busy = session_id in BUSY_SESSIONS
             if not still_busy:
@@ -4281,11 +4296,14 @@ async def start_next_queued_turn(session_id: str) -> None:
         )
     except HTTPException as e:
         if e.status_code in (409, 503):
+            already_notified = bool(item.get("_turn_deferred_notified"))
+            item["_turn_deferred_notified"] = True
             await requeue_turn_front(session_id, item)
-            await append_event(session_id, "turn_deferred", {
-                "queued_id": item.get("queued_id"),
-                "message": f"Queued turn deferred: {e.detail}",
-            })
+            if not already_notified:
+                await append_event(session_id, "turn_deferred", {
+                    "queued_id": item.get("queued_id"),
+                    "message": f"Queued turn deferred: {e.detail}",
+                })
             asyncio.create_task(retry_next_queued_turn_later(session_id))
             return
         logger.warning("queued turn failed session=%s queued_id=%s: %s", session_id, item.get("queued_id"), e.detail)
@@ -5761,14 +5779,133 @@ def file_record_belongs_to_session(record: Any, session_id: str) -> bool:
     return not owner or owner == session_id
 
 
+def event_establishes_session_file_origin(event: dict[str, Any], session_id: str) -> bool:
+    """Return whether a nested file record genuinely originated in this chat."""
+    event_owner = str(event.get("session_id") or "").strip()
+    original_owner = str(event.get("original_session_id") or "").strip()
+    return (
+        event.get("forked") is not True
+        and (not event_owner or event_owner == session_id)
+        and (not original_owner or original_owner == session_id)
+    )
+
+
+def normalized_file_id(value: Any) -> str:
+    file_id = str(value or "").strip()
+    if (
+        not file_id
+        or file_id in {".", ".."}
+        or Path(file_id).name != file_id
+        or "/" in file_id
+        or "\\" in file_id
+    ):
+        return ""
+    return file_id
+
+
+def read_file_meta_record(file_id: str) -> dict[str, Any] | None:
+    clean_file_id = normalized_file_id(file_id)
+    if not clean_file_id:
+        return None
+    meta_path = FILES_ROOT / clean_file_id / "meta.json"
+    if not meta_path.is_file():
+        return None
+    with suppress(Exception):
+        record = json.loads(meta_path.read_text(encoding="utf-8"))
+        if isinstance(record, dict):
+            return record
+    return None
+
+
+def legacy_session_event_file_ids(session_id: str) -> set[str]:
+    """Return ownerless/owned file IDs whose origin is recorded in this chat.
+
+    A historical turn merely referencing a file ID is not proof of ownership:
+    only the nested record emitted when the file was uploaded or created
+    establishes legacy membership.
+    """
+    path = events_path(session_id)
+    if not path.is_file():
+        return set()
+    found: set[str] = set()
+    with path.open("r", encoding="utf-8", errors="ignore") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            with suppress(Exception):
+                event = json.loads(line)
+                if not isinstance(event, dict):
+                    continue
+                event_owner = str(event.get("session_id") or "").strip()
+                if event_owner and event_owner != session_id:
+                    continue
+                if not event_establishes_session_file_origin(event, session_id):
+                    continue
+                for key in ("file", "artifact"):
+                    record = event.get(key)
+                    if not isinstance(record, dict):
+                        continue
+                    file_id = normalized_file_id(record.get("id"))
+                    if file_id and file_record_belongs_to_session(record, session_id):
+                        found.add(file_id)
+    return found
+
+
+def validate_session_file_ids(
+    session_id: str,
+    file_ids: list[str] | tuple[str, ...],
+    *,
+    reject_invalid: bool = True,
+) -> list[str]:
+    """Resolve file IDs only within ``session_id``.
+
+    Modern metadata has an explicit owner. Ownerless legacy metadata is
+    accepted only when that chat's own upload/artifact event establishes its
+    origin. Missing and foreign IDs share the same 404 to avoid leaking file
+    existence across chats.
+    """
+    valid: list[str] = []
+    legacy_membership: set[str] | None = None
+    for raw_file_id in merged_file_ids(file_ids):
+        file_id = normalized_file_id(raw_file_id)
+        record = read_file_meta_record(file_id) if file_id else None
+        owner = str((record or {}).get("session_id") or "").strip()
+        belongs = bool(file_id and owner == session_id)
+        if file_id and not owner:
+            if legacy_membership is None:
+                legacy_membership = legacy_session_event_file_ids(session_id)
+            belongs = file_id in legacy_membership
+        if belongs:
+            valid.append(file_id)
+            continue
+        if reject_invalid:
+            raise HTTPException(status_code=404, detail="file not found in session")
+    return valid
+
+
+def require_session_file_meta(session_id: str, file_id: str) -> dict[str, Any]:
+    clean_file_id = normalized_file_id(file_id)
+    validated = validate_session_file_ids(session_id, [clean_file_id])
+    if not validated:
+        raise HTTPException(status_code=404, detail="file not found in session")
+    return load_file_meta(validated[0])
+
+
 def event_files_belong_to_session(event: dict[str, Any], session_id: str | None = None) -> bool:
     owner = str(session_id or event.get("session_id") or "").strip()
     if not owner:
         return True
-    return all(
-        file_record_belongs_to_session(event.get(key), owner)
-        for key in ("file", "artifact")
-    )
+    for key in ("file", "artifact"):
+        record = event.get(key)
+        if not file_record_belongs_to_session(record, owner):
+            return False
+        if (
+            isinstance(record, dict)
+            and not str(record.get("session_id") or "").strip()
+            and not event_establishes_session_file_origin(event, owner)
+        ):
+            return False
+    return True
 
 
 def client_safe_event(event: dict[str, Any]) -> dict[str, Any]:
@@ -11501,7 +11638,15 @@ async def start_turn(
     sess = STORE.sessions.get(session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="session not found")
+    req.file_ids = validate_session_file_ids(session_id, req.file_ids)
+    if display_file_ids is not None:
+        display_file_ids = validate_session_file_ids(session_id, display_file_ids)
     normalized_lineage = normalize_steering_lineage(steering_lineage)
+    for item in normalized_lineage:
+        item["file_ids"] = validate_session_file_ids(
+            session_id,
+            list(item.get("file_ids") or []),
+        )
     reserved = False
     should_queue = False
     async with ACTIVE_LOCK:
@@ -11556,6 +11701,7 @@ async def start_turn(
                 current_turn["backend"] = backend
         manifest_path = manifests_dir(session_id) / f"{run_id}.json"
         prompt = build_turn_provider_prompt(
+            session_id,
             req.prompt,
             req.file_ids,
             normalized_lineage,
@@ -12835,10 +12981,13 @@ async def upload_file(session_id: str, file: UploadFile = File(...)) -> dict[str
 
 
 def load_file_meta(file_id: str) -> dict[str, Any]:
-    meta_path = FILES_ROOT / file_id / "meta.json"
+    clean_file_id = normalized_file_id(file_id)
+    if not clean_file_id:
+        raise HTTPException(status_code=404, detail="file not found")
+    meta_path = FILES_ROOT / clean_file_id / "meta.json"
     if meta_path.exists():
         return json.loads(meta_path.read_text())
-    file_dir = FILES_ROOT / file_id
+    file_dir = FILES_ROOT / clean_file_id
     if not file_dir.is_dir():
         raise HTTPException(status_code=404, detail="file not found")
     files = [p for p in file_dir.iterdir() if p.is_file() and p.name != "meta.json"]
@@ -12846,7 +12995,7 @@ def load_file_meta(file_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="file not found")
     path = files[0]
     meta = {
-        "id": file_id,
+        "id": clean_file_id,
         "kind": "artifact",
         "filename": path.name,
         "path": str(path),
@@ -12905,6 +13054,15 @@ def list_session_file_records(session_id: str) -> list[dict[str, Any]]:
                 and rec.get("id")
                 and file_record_belongs_to_session(rec, session_id)
             ):
+                if (
+                    not str(rec.get("session_id") or "").strip()
+                    and not event_establishes_session_file_origin(event, session_id)
+                ):
+                    continue
+                meta = read_file_meta_record(str(rec.get("id") or ""))
+                meta_owner = str((meta or {}).get("session_id") or "").strip()
+                if meta_owner and meta_owner != session_id:
+                    continue
                 out = dict(rec)
                 out["event_id"] = event.get("id")
                 out["event_seq"] = event.get("seq")
@@ -12964,9 +13122,7 @@ async def list_session_files(
 async def get_session_file_event(session_id: str, file_id: str) -> dict[str, Any]:
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
-    clean_file_id = str(file_id or "").strip()
-    if not clean_file_id:
-        raise HTTPException(status_code=404, detail="file not found")
+    clean_file_id = validate_session_file_ids(session_id, [file_id])[0]
     for event in iter_session_events(session_id):
         if file_event_record(event, clean_file_id, session_id):
             return {"event": event}
@@ -12987,10 +13143,39 @@ async def get_session_linked_file(session_id: str, target: str) -> FileResponse:
     )
 
 
+@app.get("/api/sessions/{session_id}/files/{file_id}")
+@app.head("/api/sessions/{session_id}/files/{file_id}")
+async def get_session_file(session_id: str, file_id: str) -> FileResponse:
+    if session_id not in STORE.sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+    meta = require_session_file_meta(session_id, file_id)
+    return FileResponse(
+        meta["path"],
+        media_type=file_response_media_type(meta),
+        filename=meta.get("filename"),
+        content_disposition_type="inline",
+    )
+
+
 @app.get("/api/files/{file_id}")
 @app.head("/api/files/{file_id}")
-async def get_file(file_id: str) -> FileResponse:
-    meta = load_file_meta(file_id)
+async def get_file(
+    file_id: str,
+    session_id: str | None = Query(default=None, min_length=1),
+) -> FileResponse:
+    """Compatibility alias for clients predating chat-scoped download URLs.
+
+    New clients use ``/api/sessions/{session_id}/files/{file_id}``. Keep the
+    historical route during the transition so a server-first rollout does not
+    break already-installed desktop and mobile clients.
+    """
+    if session_id is not None:
+        if session_id not in STORE.sessions:
+            raise HTTPException(status_code=404, detail="session not found")
+        meta = require_session_file_meta(session_id, file_id)
+    else:
+        logger.warning("legacy unscoped file download file_id=%s", normalized_file_id(file_id))
+        meta = load_file_meta(file_id)
     return FileResponse(
         meta["path"],
         media_type=file_response_media_type(meta),

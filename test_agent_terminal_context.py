@@ -223,6 +223,7 @@ class AgentTerminalContextTests(unittest.TestCase):
 
     def test_steering_history_never_enters_privileged_provider_context(self) -> None:
         provider_prompt = agent_server.build_turn_provider_prompt(
+            "sess-123",
             "Latest raw user text.",
             [],
             [

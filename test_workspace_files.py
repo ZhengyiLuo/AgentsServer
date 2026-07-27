@@ -1,6 +1,8 @@
+import asyncio
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -47,12 +49,201 @@ class WorkspaceFilesTests(unittest.TestCase):
         ])
         self.assertEqual(second["entries"][0]["kind"], "symlink")
 
+    def test_workspace_capability_v2_entries_have_opaque_revisions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "app.py"
+            path.write_text("first\n")
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
+                info = agent_server.workspace_info_sync("session-1")
+                listed = agent_server.list_workspace_entries_sync("session-1", "", 0, 20)["entries"][0]
+                searched = agent_server.search_workspace_files_sync("session-1", "app.py", 20)["entries"][0]
+                path.write_text("second, longer\n")
+                changed = agent_server.list_workspace_entries_sync("session-1", "", 0, 20)["entries"][0]
+
+        self.assertEqual(info["capability_version"], 2)
+        self.assertRegex(listed["revision"], r"^[0-9a-f]{64}$")
+        self.assertEqual(searched["revision"], listed["revision"])
+        self.assertNotEqual(changed["revision"], listed["revision"])
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" or sys.platform.startswith("linux"),
+        "atomic no-replace rename is supported on macOS and Linux",
+    )
+    def test_rename_is_same_parent_atomic_and_never_overwrites(self) -> None:
+        self.assertTrue(agent_server.WORKSPACE_MUTATIONS_AVAILABLE)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.txt"
+            destination = root / "renamed.txt"
+            collision = root / "occupied.txt"
+            source.write_text("source\n")
+            collision.write_text("occupied\n")
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
+                entries = agent_server.list_workspace_entries_sync(
+                    "session-1", "", 0, 20
+                )["entries"]
+                revision = next(entry["revision"] for entry in entries if entry["path"] == "source.txt")
+                renamed = agent_server.rename_workspace_entry_sync(
+                    "session-1", "source.txt", "renamed.txt", revision
+                )
+                renamed_revision = renamed["entry"]["revision"]
+                with self.assertRaises(HTTPException) as exists:
+                    agent_server.rename_workspace_entry_sync(
+                        "session-1", "renamed.txt", "occupied.txt", renamed_revision
+                    )
+                source_exists = source.exists()
+                destination_content = destination.read_text()
+                collision_content = collision.read_text()
+
+        self.assertEqual(renamed["previous_path"], "source.txt")
+        self.assertEqual(renamed["entry"]["path"], "renamed.txt")
+        self.assertEqual(renamed["entry"]["kind"], "file")
+        self.assertFalse(source_exists)
+        self.assertEqual(destination_content, "source\n")
+        self.assertEqual(collision_content, "occupied\n")
+        self.assertEqual(exists.exception.status_code, 409)
+        self.assertEqual(exists.exception.detail["code"], "workspace_entry_exists")
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" or sys.platform.startswith("linux"),
+        "atomic no-replace rename is supported on macOS and Linux",
+    )
+    def test_rename_rolls_back_when_source_is_replaced_after_revision_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.txt"
+            displaced = root / "displaced.txt"
+            destination = root / "renamed.txt"
+            source.write_text("expected\n")
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
+                revision = agent_server.list_workspace_entries_sync(
+                    "session-1", "", 0, 20
+                )["entries"][0]["revision"]
+                atomic_rename = agent_server.atomic_rename_workspace_entry
+                first_call = True
+
+                def replace_then_rename(
+                    parent_fd: int,
+                    old_name: str,
+                    new_name: str,
+                    path: str,
+                ) -> None:
+                    nonlocal first_call
+                    if first_call:
+                        first_call = False
+                        os.rename(source, displaced)
+                        source.write_text("replacement\n")
+                    atomic_rename(parent_fd, old_name, new_name, path)
+
+                with patch.object(
+                    agent_server,
+                    "atomic_rename_workspace_entry",
+                    side_effect=replace_then_rename,
+                ), self.assertRaises(HTTPException) as raced:
+                    agent_server.rename_workspace_entry_sync(
+                        "session-1", "source.txt", "renamed.txt", revision
+                    )
+
+            source_content = source.read_text()
+            displaced_content = displaced.read_text()
+            destination_exists = destination.exists()
+
+        self.assertEqual(raced.exception.status_code, 409)
+        self.assertEqual(raced.exception.detail["code"], "workspace_entry_conflict")
+        self.assertEqual(source_content, "replacement\n")
+        self.assertEqual(displaced_content, "expected\n")
+        self.assertFalse(destination_exists)
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" or sys.platform.startswith("linux"),
+        "atomic no-replace rename is supported on macOS and Linux",
+    )
+    def test_rename_rejects_stale_revisions_invalid_names_and_archived_chats(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "source.txt"
+            path.write_text("first\n")
+            session = self.session(root)
+            with patch.object(agent_server.STORE, "sessions", {"session-1": session}):
+                revision = agent_server.list_workspace_entries_sync(
+                    "session-1", "", 0, 20
+                )["entries"][0]["revision"]
+                path.write_text("changed\n")
+                with self.assertRaises(HTTPException) as stale:
+                    agent_server.rename_workspace_entry_sync(
+                        "session-1", "source.txt", "renamed.txt", revision
+                    )
+                current_revision = agent_server.list_workspace_entries_sync(
+                    "session-1", "", 0, 20
+                )["entries"][0]["revision"]
+                for name in ("", ".", "..", "nested/name.txt"):
+                    with self.subTest(name=name), self.assertRaises(HTTPException) as invalid:
+                        agent_server.rename_workspace_entry_sync(
+                            "session-1", "source.txt", name, current_revision
+                        )
+                    self.assertEqual(invalid.exception.status_code, 400)
+                session["archived"] = True
+                with self.assertRaises(HTTPException) as archived:
+                    agent_server.rename_workspace_entry_sync(
+                        "session-1", "source.txt", "renamed.txt", current_revision
+                    )
+                source_exists = path.exists()
+
+        self.assertTrue(source_exists)
+        self.assertEqual(stale.exception.status_code, 409)
+        self.assertEqual(stale.exception.detail["code"], "workspace_entry_conflict")
+        self.assertEqual(archived.exception.detail["code"], "workspace_read_only")
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" or sys.platform.startswith("linux"),
+        "atomic no-replace rename is supported on macOS and Linux",
+    )
+    def test_rename_moves_directories_and_symlinks_without_following_links(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "workspace"
+            root.mkdir()
+            directory = root / "folder"
+            directory.mkdir()
+            (directory / "child.txt").write_text("child\n")
+            outside = base / "outside.txt"
+            outside.write_text("outside\n")
+            (root / "link.txt").symlink_to(outside)
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
+                entries = {
+                    entry["path"]: entry
+                    for entry in agent_server.list_workspace_entries_sync(
+                        "session-1", "", 0, 20
+                    )["entries"]
+                }
+                renamed_directory = agent_server.rename_workspace_entry_sync(
+                    "session-1", "folder", "renamed-folder", entries["folder"]["revision"]
+                )
+                renamed_link = agent_server.rename_workspace_entry_sync(
+                    "session-1", "link.txt", "renamed-link.txt", entries["link.txt"]["revision"]
+                )
+            child_content = (root / "renamed-folder" / "child.txt").read_text()
+            link_target = (root / "renamed-link.txt").readlink()
+            outside_content = outside.read_text()
+
+        self.assertEqual(renamed_directory["entry"]["kind"], "directory")
+        self.assertEqual(renamed_link["entry"]["kind"], "symlink")
+        self.assertEqual(child_content, "child\n")
+        self.assertEqual(link_target, outside)
+        self.assertEqual(outside_content, "outside\n")
+
     def test_rejects_absolute_parent_and_symlink_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             outside = root.parent / f"{root.name}-outside.txt"
             outside.write_text("outside")
+            outside_directory = root.parent / f"{root.name}-outside"
+            outside_directory.mkdir()
+            outside_child = outside_directory / "outside.txt"
+            outside_child.write_text("outside")
             (root / "escape").symlink_to(outside)
+            (root / "escape-dir").symlink_to(outside_directory, target_is_directory=True)
             try:
                 with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
                     for path in ("/etc/passwd", "../outside.txt", "safe/../../outside.txt"):
@@ -63,8 +254,34 @@ class WorkspaceFilesTests(unittest.TestCase):
                         agent_server.read_workspace_file_sync("session-1", "escape")
                     self.assertEqual(symlink_error.exception.status_code, 403)
                     self.assertEqual(symlink_error.exception.detail["code"], "workspace_symlink_blocked")
+                    outside_revision = agent_server.workspace_entry_revision(outside_child.stat())
+                    with self.assertRaises(HTTPException) as rename_symlink_parent:
+                        agent_server.rename_workspace_entry_sync(
+                            "session-1",
+                            "escape-dir/outside.txt",
+                            "renamed.txt",
+                            outside_revision,
+                        )
+                    with self.assertRaises(HTTPException) as delete_symlink_parent:
+                        agent_server.remove_workspace_entry_sync(
+                            "session-1",
+                            "escape-dir/outside.txt",
+                            outside_revision,
+                            False,
+                        )
+                    self.assertIn(
+                        rename_symlink_parent.exception.detail["code"],
+                        {"workspace_symlink_blocked", "invalid_workspace_path"},
+                    )
+                    self.assertIn(
+                        delete_symlink_parent.exception.detail["code"],
+                        {"workspace_symlink_blocked", "invalid_workspace_path"},
+                    )
+                    self.assertEqual(outside_child.read_text(), "outside")
             finally:
                 outside.unlink(missing_ok=True)
+                outside_child.unlink(missing_ok=True)
+                outside_directory.rmdir()
 
     def test_reads_utf8_without_changing_bom_or_newlines(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -275,6 +492,188 @@ class WorkspaceFilesTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(raised.exception.detail["code"], "workspace_read_only")
+
+    def test_delete_removes_files_symlinks_and_empty_directories_without_following_links(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "workspace"
+            root.mkdir()
+            outside = base / "outside.txt"
+            outside.write_text("keep\n")
+            (root / "file.txt").write_text("remove\n")
+            (root / "link.txt").symlink_to(outside)
+            (root / "empty").mkdir()
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
+                entries = {
+                    entry["path"]: entry
+                    for entry in agent_server.list_workspace_entries_sync(
+                        "session-1", "", 0, 20
+                    )["entries"]
+                }
+                removed_file = agent_server.remove_workspace_entry_sync(
+                    "session-1", "file.txt", entries["file.txt"]["revision"], False
+                )
+                removed_link = agent_server.remove_workspace_entry_sync(
+                    "session-1", "link.txt", entries["link.txt"]["revision"], False
+                )
+                removed_directory = agent_server.remove_workspace_entry_sync(
+                    "session-1", "empty", entries["empty"]["revision"], False
+                )
+            remaining = sorted(path.name for path in root.iterdir())
+            outside_content = outside.read_text()
+
+        self.assertEqual(removed_file["kind"], "file")
+        self.assertEqual(removed_link["kind"], "symlink")
+        self.assertEqual(removed_directory["kind"], "directory")
+        self.assertTrue(removed_file["removed"])
+        self.assertEqual(remaining, [])
+        self.assertEqual(outside_content, "keep\n")
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" or sys.platform.startswith("linux"),
+        "atomic no-replace rename is supported on macOS and Linux",
+    )
+    def test_patch_and_delete_route_contracts_return_v2_mutation_shapes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "before.txt").write_text("content\n")
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
+                revision = agent_server.list_workspace_entries_sync(
+                    "session-1", "", 0, 20
+                )["entries"][0]["revision"]
+                renamed = asyncio.run(agent_server.patch_session_workspace_entry(
+                    "session-1",
+                    agent_server.WorkspaceRenameRequest(
+                        path="before.txt",
+                        new_name="after.txt",
+                        expected_revision=revision,
+                    ),
+                ))
+                removed = asyncio.run(agent_server.delete_session_workspace_entry(
+                    "session-1",
+                    "after.txt",
+                    renamed["entry"]["revision"],
+                    False,
+                ))
+
+        self.assertEqual(set(renamed), {"root", "previous_path", "entry"})
+        self.assertEqual(renamed["previous_path"], "before.txt")
+        self.assertEqual(renamed["entry"]["path"], "after.txt")
+        self.assertEqual(removed, {
+            "root": str(root.resolve()),
+            "path": "after.txt",
+            "kind": "file",
+            "removed": True,
+        })
+
+    def test_recursive_delete_requires_recursive_confirmation_and_does_not_follow_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "workspace"
+            root.mkdir()
+            outside = base / "outside"
+            outside.mkdir()
+            (outside / "keep.txt").write_text("keep\n")
+            tree = root / "tree"
+            (tree / "nested").mkdir(parents=True)
+            (tree / "nested" / "remove.txt").write_text("remove\n")
+            (tree / "outside-link").symlink_to(outside, target_is_directory=True)
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
+                revision = agent_server.list_workspace_entries_sync(
+                    "session-1", "", 0, 20
+                )["entries"][0]["revision"]
+                with self.assertRaises(HTTPException) as non_recursive:
+                    agent_server.remove_workspace_entry_sync(
+                        "session-1", "tree", revision, False
+                    )
+                removed = agent_server.remove_workspace_entry_sync(
+                    "session-1", "tree", revision, True
+                )
+            tree_exists = tree.exists()
+            outside_content = (outside / "keep.txt").read_text()
+
+        self.assertEqual(non_recursive.exception.status_code, 409)
+        self.assertEqual(non_recursive.exception.detail["code"], "workspace_directory_not_empty")
+        self.assertEqual(removed["kind"], "directory")
+        self.assertFalse(tree_exists)
+        self.assertEqual(outside_content, "keep\n")
+
+    def test_delete_rejects_stale_revisions_archived_chats_and_unsafe_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "notes.txt"
+            path.write_text("first\n")
+            session = self.session(root)
+            with patch.object(agent_server.STORE, "sessions", {"session-1": session}):
+                revision = agent_server.list_workspace_entries_sync(
+                    "session-1", "", 0, 20
+                )["entries"][0]["revision"]
+                path.write_text("changed and longer\n")
+                with self.assertRaises(HTTPException) as stale:
+                    agent_server.remove_workspace_entry_sync(
+                        "session-1", "notes.txt", revision, False
+                    )
+                current_revision = agent_server.list_workspace_entries_sync(
+                    "session-1", "", 0, 20
+                )["entries"][0]["revision"]
+                for unsafe_path in ("", "/notes.txt", "../notes.txt"):
+                    with self.subTest(path=unsafe_path), self.assertRaises(HTTPException) as unsafe:
+                        agent_server.remove_workspace_entry_sync(
+                            "session-1", unsafe_path, current_revision, False
+                        )
+                    self.assertEqual(unsafe.exception.status_code, 400)
+                session["archived"] = True
+                with self.assertRaises(HTTPException) as archived:
+                    agent_server.remove_workspace_entry_sync(
+                        "session-1", "notes.txt", current_revision, False
+                    )
+                path_exists = path.exists()
+
+        self.assertTrue(path_exists)
+        self.assertEqual(stale.exception.status_code, 409)
+        self.assertEqual(stale.exception.detail["code"], "workspace_entry_conflict")
+        self.assertEqual(archived.exception.detail["code"], "workspace_read_only")
+
+    def test_recursive_delete_rejects_a_nested_mounted_filesystem_before_removing_entries(self) -> None:
+        class CrossDeviceStat:
+            def __init__(self, original: os.stat_result):
+                self.original = original
+                self.st_dev = original.st_dev + 1
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self.original, name)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tree = root / "tree"
+            mounted = tree / "mounted"
+            mounted.mkdir(parents=True)
+            (mounted / "keep.txt").write_text("keep\n")
+            (tree / "ordinary.txt").write_text("keep\n")
+            real_stat = agent_server.os.stat
+
+            def report_nested_mount(path: object, *args: object, **kwargs: object) -> object:
+                result = real_stat(path, *args, **kwargs)
+                if path == "mounted" and kwargs.get("dir_fd") is not None:
+                    return CrossDeviceStat(result)
+                return result
+
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
+                revision = agent_server.list_workspace_entries_sync(
+                    "session-1", "", 0, 20
+                )["entries"][0]["revision"]
+                with (
+                    patch.object(agent_server.os, "stat", side_effect=report_nested_mount),
+                    self.assertRaises(HTTPException) as mounted_error,
+                ):
+                    agent_server.remove_workspace_entry_sync(
+                        "session-1", "tree", revision, True
+                    )
+            preserved = sorted(str(path.relative_to(root)) for path in tree.rglob("*"))
+
+        self.assertEqual(mounted_error.exception.status_code, 409)
+        self.assertEqual(mounted_error.exception.detail["code"], "workspace_cross_device_delete")
+        self.assertEqual(preserved, ["tree/mounted", "tree/mounted/keep.txt", "tree/ordinary.txt"])
 
     def test_search_is_bounded_and_skips_generated_directories(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

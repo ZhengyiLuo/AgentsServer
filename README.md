@@ -520,6 +520,8 @@ GET /api/sessions/{session_id}/workspace/entries?path=&offset=0&limit=500
 GET /api/sessions/{session_id}/workspace/search?q=app&limit=100
 GET /api/sessions/{session_id}/workspace/file?path=src/App.tsx
 PUT /api/sessions/{session_id}/workspace/file
+PATCH /api/sessions/{session_id}/workspace/entry
+DELETE /api/sessions/{session_id}/workspace/entry?path=src/old.ts&expected_revision=...&recursive=false
 ```
 
 Reads accept UTF-8 regular files up to 2 MiB by default. Writes are atomic,
@@ -528,6 +530,15 @@ revisions, symlinks, special files, hard links, archived chats, and read-only
 targets. Directory traversal is descriptor-relative and fails closed when the
 host lacks secure no-follow file APIs. Configure the text limit with
 `AGENTSDOCK_WORKSPACE_TEXT_MAX_BYTES`.
+
+Workspace-files capability v2 adds an opaque `revision` to every explorer and
+search entry. Rename accepts `{path, new_name, expected_revision}`, is limited
+to the same parent directory, and uses the host's atomic no-replace primitive,
+so it never overwrites another entry. Delete requires the current entry
+revision. A non-recursive delete removes files, symlinks, or empty
+directories; `recursive=true` confirms deletion of a non-empty directory.
+Recursive traversal remains descriptor-relative, never follows symlinks, and
+rejects mounted filesystems rather than crossing them.
 
 ## Whole-History Search
 

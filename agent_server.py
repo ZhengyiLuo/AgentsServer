@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
 import errno
 import fcntl
 import glob
@@ -38,7 +39,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, deque
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -213,6 +214,31 @@ WORKSPACE_SEARCH_IGNORED_DIRECTORIES = {
     ".git", ".hg", ".svn", ".cache", ".next", ".turbo", ".venv",
     "__pycache__", "DerivedData", "build", "dist", "node_modules", "target", "venv",
 }
+
+
+def configure_atomic_workspace_rename() -> tuple[Any | None, int]:
+    """Return a descriptor-relative, atomic no-replace rename function and flag."""
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+    except OSError:
+        return None, 0
+    if sys.platform.startswith("linux"):
+        function = getattr(libc, "renameat2", None)
+        flag = 1  # RENAME_NOREPLACE
+    elif sys.platform == "darwin":
+        function = getattr(libc, "renameatx_np", None)
+        flag = 0x00000004  # RENAME_EXCL
+    else:
+        return None, 0
+    if function is None:
+        return None, 0
+    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    return function, flag
+
+
+WORKSPACE_ATOMIC_RENAME, WORKSPACE_ATOMIC_RENAME_FLAG = configure_atomic_workspace_rename()
+WORKSPACE_MUTATIONS_AVAILABLE = WORKSPACE_SECURE_OPEN_AVAILABLE and WORKSPACE_ATOMIC_RENAME is not None
 AGENT_TOKEN = env_setting(
     "AGENTSDOCK_AGENT_TOKEN",
     "",
@@ -932,6 +958,52 @@ def workspace_revision(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def workspace_entry_revision(item_stat: os.stat_result) -> str:
+    """Opaque revision for guarding metadata mutations against stale tree state."""
+    identity = "\0".join(str(value) for value in (
+        item_stat.st_dev,
+        item_stat.st_ino,
+        item_stat.st_mode,
+        item_stat.st_nlink,
+        item_stat.st_uid,
+        item_stat.st_gid,
+        item_stat.st_size,
+        item_stat.st_mtime_ns,
+        item_stat.st_ctime_ns,
+    ))
+    return hashlib.sha256(identity.encode("ascii")).hexdigest()
+
+
+def validate_workspace_entry_revision(expected_revision: str, item_stat: os.stat_result, path: str) -> None:
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_revision or ""):
+        raise workspace_http_error(
+            400,
+            "invalid_workspace_entry_revision",
+            "A valid workspace entry revision is required.",
+        )
+    actual_revision = workspace_entry_revision(item_stat)
+    if not hmac.compare_digest(actual_revision, expected_revision.lower()):
+        raise workspace_http_error(
+            409,
+            "workspace_entry_conflict",
+            f"{path} changed on disk. Refresh the file explorer and try again.",
+        )
+
+
+def workspace_entry_kind(item_stat: os.stat_result, path: str) -> str:
+    if stat.S_ISDIR(item_stat.st_mode):
+        return "directory"
+    if stat.S_ISREG(item_stat.st_mode):
+        return "file"
+    if stat.S_ISLNK(item_stat.st_mode):
+        return "symlink"
+    raise workspace_http_error(
+        400,
+        "workspace_entry_type_unsupported",
+        f"Workspace entry type cannot be changed: {path}",
+    )
+
+
 def workspace_entry(relative_path: str, name: str, item_stat: os.stat_result) -> dict[str, Any] | None:
     path = f"{relative_path}/{name}" if relative_path else name
     if stat.S_ISDIR(item_stat.st_mode):
@@ -950,6 +1022,7 @@ def workspace_entry(relative_path: str, name: str, item_stat: os.stat_result) ->
         "mtime_ns": int(item_stat.st_mtime_ns),
         "hidden": name.startswith("."),
         "writable": kind == "file" and bool(item_stat.st_mode & 0o222),
+        "revision": workspace_entry_revision(item_stat),
     }
 
 
@@ -959,7 +1032,7 @@ def workspace_info_sync(session_id: str) -> dict[str, Any]:
         "root": str(root),
         "name": root.name or str(root),
         "read_only": bool(sess.get("archived")),
-        "capability_version": 1,
+        "capability_version": 2 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
         "max_text_file_bytes": MAX_WORKSPACE_TEXT_BYTES,
     }
 
@@ -1069,6 +1142,22 @@ def write_all(file_fd: int, data: bytes) -> None:
 def workspace_write_lock(root: Path, relative_path: str) -> threading.Lock:
     key = hashlib.sha256(f"{root}\0{relative_path}".encode("utf-8", errors="surrogatepass")).digest()
     return WORKSPACE_WRITE_LOCKS[int.from_bytes(key[:2], "big") % len(WORKSPACE_WRITE_LOCKS)]
+
+
+@contextmanager
+def workspace_write_locks(root: Path, *relative_paths: str):
+    locks_by_identity = {
+        id(lock): lock
+        for lock in (workspace_write_lock(root, path) for path in relative_paths)
+    }
+    locks = [locks_by_identity[key] for key in sorted(locks_by_identity)]
+    for lock in locks:
+        lock.acquire()
+    try:
+        yield
+    finally:
+        for lock in reversed(locks):
+            lock.release()
 
 
 def preserve_workspace_metadata(source_fd: int, destination_fd: int, source_stat: os.stat_result) -> None:
@@ -1228,6 +1317,380 @@ def write_workspace_file_locked(
         with suppress(OSError):
             os.unlink(temp_name, dir_fd=parent_fd)
         os.close(parent_fd)
+
+
+def normalize_workspace_entry_name(value: str, source_path: str) -> str:
+    name = str(value or "")
+    if "\x00" in name:
+        raise workspace_http_error(400, "invalid_workspace_name", "Workspace names cannot contain NUL bytes.")
+    if not name or name in {".", ".."} or "/" in name or (os.name == "nt" and "\\" in name):
+        raise workspace_http_error(400, "invalid_workspace_name", "A single workspace entry name is required.")
+    parent = source_path.rsplit("/", 1)[0] if "/" in source_path else ""
+    destination = f"{parent}/{name}" if parent else name
+    if len(destination) > MAX_WORKSPACE_PATH_CHARS:
+        raise workspace_http_error(400, "invalid_workspace_path", "Workspace path is too long.")
+    return name
+
+
+def fsync_workspace_directory(directory_fd: int, path: str) -> None:
+    try:
+        os.fsync(directory_fd)
+    except OSError as exc:
+        logger.warning("workspace directory fsync failed after mutating %s: %s", path, exc)
+
+
+def atomic_rename_workspace_entry(parent_fd: int, old_name: str, new_name: str, path: str) -> None:
+    if WORKSPACE_ATOMIC_RENAME is None:
+        raise workspace_http_error(
+            501,
+            "workspace_atomic_rename_unavailable",
+            "Atomic workspace rename is unavailable on this host.",
+        )
+    ctypes.set_errno(0)
+    result = WORKSPACE_ATOMIC_RENAME(
+        parent_fd,
+        os.fsencode(old_name),
+        parent_fd,
+        os.fsencode(new_name),
+        WORKSPACE_ATOMIC_RENAME_FLAG,
+    )
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    if error in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise workspace_http_error(409, "workspace_entry_exists", f"Workspace entry already exists: {new_name}")
+    if error == errno.ENOENT:
+        raise workspace_http_error(404, "workspace_entry_not_found", f"Workspace entry not found: {path}")
+    if error in {errno.EACCES, errno.EPERM, errno.EROFS}:
+        raise workspace_http_error(403, "workspace_permission_denied", f"Permission denied: {path}")
+    if error == errno.ENAMETOOLONG:
+        raise workspace_http_error(400, "invalid_workspace_name", "Workspace entry name is too long.")
+    if error == errno.EXDEV:
+        raise workspace_http_error(409, "workspace_cross_device_move", "Workspace entries cannot be moved across filesystems.")
+    if error in {errno.ENOSYS, errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL)}:
+        raise workspace_http_error(
+            501,
+            "workspace_atomic_rename_unavailable",
+            "Atomic workspace rename is unavailable on this filesystem.",
+        )
+    if error == errno.EBUSY:
+        raise workspace_http_error(409, "workspace_entry_busy", f"Workspace entry is busy: {path}")
+    raise workspace_http_error(500, "workspace_io_error", f"Could not rename workspace entry: {path}")
+
+
+def workspace_rename_identity(item_stat: os.stat_result) -> tuple[int, ...]:
+    """Metadata that must survive a rename, excluding ctime changed by rename itself."""
+    return (
+        item_stat.st_dev,
+        item_stat.st_ino,
+        item_stat.st_mode,
+        item_stat.st_nlink,
+        item_stat.st_uid,
+        item_stat.st_gid,
+        item_stat.st_size,
+        item_stat.st_mtime_ns,
+    )
+
+
+def rollback_workspace_rename(
+    parent_fd: int,
+    old_name: str,
+    new_name: str,
+    source_path: str,
+    destination_path: str,
+) -> None:
+    """Put a raced rename back before reporting the revision conflict."""
+    try:
+        atomic_rename_workspace_entry(parent_fd, new_name, old_name, destination_path)
+        fsync_workspace_directory(parent_fd, source_path)
+    except HTTPException as exc:
+        logger.critical(
+            "workspace rename rollback failed for %s -> %s: %s",
+            source_path,
+            destination_path,
+            exc.detail,
+        )
+        raise workspace_http_error(
+            500,
+            "workspace_rename_rollback_failed",
+            (
+                f"{source_path} changed while it was being renamed, and the server "
+                "could not safely restore its original path. Refresh the file explorer "
+                "and inspect both paths before trying again."
+            ),
+        ) from exc
+
+
+def rename_workspace_entry_sync(
+    session_id: str,
+    relative_path: str,
+    new_name: str,
+    expected_revision: str,
+) -> dict[str, Any]:
+    _, root = session_workspace_root(session_id, for_write=True)
+    normalized = normalize_workspace_path(relative_path)
+    old_name = normalized.rsplit("/", 1)[-1]
+    clean_name = normalize_workspace_entry_name(new_name, normalized)
+    if clean_name == old_name:
+        raise workspace_http_error(400, "workspace_entry_unchanged", "The workspace entry already has that name.")
+    parent_path = normalized.rsplit("/", 1)[0] if "/" in normalized else ""
+    destination_path = f"{parent_path}/{clean_name}" if parent_path else clean_name
+    with workspace_write_locks(root, normalized, destination_path):
+        parent_fd = open_workspace_directory_fd(root, parent_path)
+        try:
+            try:
+                source_stat = os.stat(old_name, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    raise workspace_http_error(
+                        404,
+                        "workspace_entry_not_found",
+                        f"Workspace entry not found: {normalized}",
+                    ) from exc
+                raise translate_workspace_os_error(exc, normalized) from exc
+            workspace_entry_kind(source_stat, normalized)
+            validate_workspace_entry_revision(expected_revision, source_stat, normalized)
+            atomic_rename_workspace_entry(parent_fd, old_name, clean_name, normalized)
+            try:
+                updated_stat = os.stat(clean_name, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise translate_workspace_os_error(exc, destination_path) from exc
+            if workspace_rename_identity(updated_stat) != workspace_rename_identity(source_stat):
+                rollback_workspace_rename(
+                    parent_fd,
+                    old_name,
+                    clean_name,
+                    normalized,
+                    destination_path,
+                )
+                raise workspace_http_error(
+                    409,
+                    "workspace_entry_conflict",
+                    f"{normalized} changed while it was being renamed.",
+                )
+            fsync_workspace_directory(parent_fd, destination_path)
+            entry = workspace_entry(parent_path, clean_name, updated_stat)
+            if entry is None:
+                raise workspace_http_error(
+                    400,
+                    "workspace_entry_type_unsupported",
+                    f"Workspace entry type cannot be changed: {destination_path}",
+                )
+            return {
+                "root": str(root),
+                "previous_path": normalized,
+                "entry": entry,
+            }
+        finally:
+            os.close(parent_fd)
+
+
+def ensure_workspace_device(item_stat: os.stat_result, root_device: int, path: str) -> None:
+    if item_stat.st_dev != root_device:
+        raise workspace_http_error(
+            409,
+            "workspace_cross_device_delete",
+            f"Recursive deletion cannot cross a mounted filesystem: {path}",
+        )
+
+
+def open_workspace_delete_directory(
+    parent_fd: int,
+    name: str,
+    path: str,
+    root_device: int,
+) -> tuple[int, os.stat_result]:
+    try:
+        directory_fd = os.open(name, workspace_open_flags(directory=True), dir_fd=parent_fd)
+    except OSError as exc:
+        raise translate_workspace_os_error(exc, path, directory=True) from exc
+    try:
+        directory_stat = os.fstat(directory_fd)
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            raise workspace_http_error(
+                409,
+                "workspace_entry_conflict",
+                f"{path} changed while it was being deleted.",
+            )
+        ensure_workspace_device(directory_stat, root_device, path)
+        return directory_fd, directory_stat
+    except Exception:
+        os.close(directory_fd)
+        raise
+
+
+def validate_workspace_delete_tree(directory_fd: int, relative_path: str, root_device: int) -> None:
+    try:
+        names = os.listdir(directory_fd)
+    except OSError as exc:
+        raise translate_workspace_os_error(exc, relative_path, directory=True) from exc
+    for name in names:
+        path = f"{relative_path}/{name}"
+        try:
+            item_stat = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise translate_workspace_os_error(exc, path) from exc
+        ensure_workspace_device(item_stat, root_device, path)
+        if not stat.S_ISDIR(item_stat.st_mode):
+            continue
+        child_fd, child_stat = open_workspace_delete_directory(directory_fd, name, path, root_device)
+        try:
+            if child_stat.st_ino != item_stat.st_ino or child_stat.st_dev != item_stat.st_dev:
+                raise workspace_http_error(
+                    409,
+                    "workspace_entry_conflict",
+                    f"{path} changed while it was being deleted.",
+                )
+            validate_workspace_delete_tree(child_fd, path, root_device)
+        finally:
+            os.close(child_fd)
+
+
+def remove_workspace_tree_contents(directory_fd: int, relative_path: str, root_device: int) -> None:
+    try:
+        names = os.listdir(directory_fd)
+    except OSError as exc:
+        raise translate_workspace_os_error(exc, relative_path, directory=True) from exc
+    for name in names:
+        path = f"{relative_path}/{name}"
+        try:
+            item_stat = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise translate_workspace_os_error(exc, path) from exc
+        ensure_workspace_device(item_stat, root_device, path)
+        if stat.S_ISDIR(item_stat.st_mode):
+            child_fd, child_stat = open_workspace_delete_directory(directory_fd, name, path, root_device)
+            try:
+                if child_stat.st_ino != item_stat.st_ino or child_stat.st_dev != item_stat.st_dev:
+                    raise workspace_http_error(
+                        409,
+                        "workspace_entry_conflict",
+                        f"{path} changed while it was being deleted.",
+                    )
+                remove_workspace_tree_contents(child_fd, path, root_device)
+                try:
+                    latest_stat = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                except OSError as exc:
+                    raise translate_workspace_os_error(exc, path, directory=True) from exc
+                if latest_stat.st_ino != child_stat.st_ino or latest_stat.st_dev != child_stat.st_dev:
+                    raise workspace_http_error(
+                        409,
+                        "workspace_entry_conflict",
+                        f"{path} changed while it was being deleted.",
+                    )
+                try:
+                    os.rmdir(name, dir_fd=directory_fd)
+                except OSError as exc:
+                    raise translate_workspace_delete_error(exc, path, directory=True) from exc
+            finally:
+                os.close(child_fd)
+        else:
+            try:
+                os.unlink(name, dir_fd=directory_fd)
+            except OSError as exc:
+                raise translate_workspace_delete_error(exc, path) from exc
+
+
+def translate_workspace_delete_error(exc: OSError, path: str, *, directory: bool = False) -> HTTPException:
+    if exc.errno in {errno.ENOTEMPTY, errno.EEXIST}:
+        return workspace_http_error(
+            409,
+            "workspace_directory_not_empty",
+            f"Workspace directory is not empty: {path}",
+        )
+    if exc.errno in {errno.EBUSY, errno.EXDEV}:
+        return workspace_http_error(
+            409,
+            "workspace_cross_device_delete",
+            f"Workspace entry is a mounted filesystem and cannot be deleted: {path}",
+        )
+    if exc.errno == errno.EROFS:
+        return workspace_http_error(403, "workspace_permission_denied", f"Permission denied: {path}")
+    return translate_workspace_os_error(exc, path, directory=directory)
+
+
+def remove_workspace_entry_sync(
+    session_id: str,
+    relative_path: str,
+    expected_revision: str,
+    recursive: bool,
+) -> dict[str, Any]:
+    _, root = session_workspace_root(session_id, for_write=True)
+    normalized = normalize_workspace_path(relative_path)
+    with workspace_write_lock(root, normalized):
+        parent_fd, name = open_workspace_parent_fd(root, normalized)
+        try:
+            try:
+                item_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    raise workspace_http_error(
+                        404,
+                        "workspace_entry_not_found",
+                        f"Workspace entry not found: {normalized}",
+                    ) from exc
+                raise translate_workspace_os_error(exc, normalized) from exc
+            kind = workspace_entry_kind(item_stat, normalized)
+            validate_workspace_entry_revision(expected_revision, item_stat, normalized)
+            root_fd = open_workspace_directory_fd(root)
+            try:
+                root_device = os.fstat(root_fd).st_dev
+            finally:
+                os.close(root_fd)
+            ensure_workspace_device(item_stat, root_device, normalized)
+            if kind == "directory":
+                if recursive:
+                    directory_fd, directory_stat = open_workspace_delete_directory(
+                        parent_fd,
+                        name,
+                        normalized,
+                        root_device,
+                    )
+                    try:
+                        if directory_stat.st_ino != item_stat.st_ino or directory_stat.st_dev != item_stat.st_dev:
+                            raise workspace_http_error(
+                                409,
+                                "workspace_entry_conflict",
+                                f"{normalized} changed while it was being deleted.",
+                            )
+                        validate_workspace_delete_tree(directory_fd, normalized, root_device)
+                        remove_workspace_tree_contents(directory_fd, normalized, root_device)
+                        latest_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                        if latest_stat.st_ino != directory_stat.st_ino or latest_stat.st_dev != directory_stat.st_dev:
+                            raise workspace_http_error(
+                                409,
+                                "workspace_entry_conflict",
+                                f"{normalized} changed while it was being deleted.",
+                            )
+                        try:
+                            os.rmdir(name, dir_fd=parent_fd)
+                        except OSError as exc:
+                            raise translate_workspace_delete_error(exc, normalized, directory=True) from exc
+                    finally:
+                        os.close(directory_fd)
+                else:
+                    try:
+                        os.rmdir(name, dir_fd=parent_fd)
+                    except OSError as exc:
+                        raise translate_workspace_delete_error(exc, normalized, directory=True) from exc
+            else:
+                try:
+                    os.unlink(name, dir_fd=parent_fd)
+                except OSError as exc:
+                    raise translate_workspace_delete_error(exc, normalized) from exc
+            fsync_workspace_directory(parent_fd, normalized)
+            return {
+                "root": str(root),
+                "path": normalized,
+                "kind": kind,
+                "removed": True,
+            }
+        finally:
+            os.close(parent_fd)
 
 
 def workspace_search_rank(path: str, query: str) -> tuple[int, int, str]:
@@ -1395,6 +1858,7 @@ def search_workspace_files_sync(session_id: str, query: str, limit: int) -> dict
                     "mtime_ns": int(item_stat.st_mtime_ns),
                     "hidden": name.startswith("."),
                     "writable": not bool(sess.get("archived")) and bool(item_stat.st_mode & 0o222),
+                    "revision": workspace_entry_revision(item_stat),
                 })
                 if not clean_query and len(results) > limit:
                     truncated = True
@@ -1991,6 +2455,12 @@ class ServerUpdateRequest(BaseModel):
 class WorkspaceWriteRequest(BaseModel):
     path: str = Field(min_length=1, max_length=MAX_WORKSPACE_PATH_CHARS)
     content: str = Field(max_length=MAX_WORKSPACE_TEXT_BYTES)
+    expected_revision: str = Field(min_length=64, max_length=64)
+
+
+class WorkspaceRenameRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=MAX_WORKSPACE_PATH_CHARS)
+    new_name: str = Field(min_length=1, max_length=MAX_WORKSPACE_PATH_CHARS)
     expected_revision: str = Field(min_length=64, max_length=64)
 
 
@@ -10451,12 +10921,14 @@ async def health() -> dict[str, Any]:
                 "available": WORKSPACE_SECURE_OPEN_AVAILABLE,
                 "required": False,
                 "message": (
-                    "Workspace file browsing and editing are available."
+                    "Workspace file browsing, editing, rename, and deletion are available."
+                    if WORKSPACE_MUTATIONS_AVAILABLE
+                    else "Workspace file browsing and editing are available."
                     if WORKSPACE_SECURE_OPEN_AVAILABLE
                     else "Secure workspace file access is unavailable on this host."
                 ),
                 "action": None if WORKSPACE_SECURE_OPEN_AVAILABLE else "Use a supported macOS or Linux host.",
-                "version": 1,
+                "version": 2 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
                 "max_text_file_bytes": MAX_WORKSPACE_TEXT_BYTES,
             },
         },
@@ -11316,6 +11788,33 @@ async def put_session_workspace_file(session_id: str, req: WorkspaceWriteRequest
         req.path,
         req.content,
         req.expected_revision,
+    )
+
+
+@app.patch("/api/sessions/{session_id}/workspace/entry")
+async def patch_session_workspace_entry(session_id: str, req: WorkspaceRenameRequest) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        rename_workspace_entry_sync,
+        session_id,
+        req.path,
+        req.new_name,
+        req.expected_revision,
+    )
+
+
+@app.delete("/api/sessions/{session_id}/workspace/entry")
+async def delete_session_workspace_entry(
+    session_id: str,
+    path: str = Query(min_length=1, max_length=MAX_WORKSPACE_PATH_CHARS),
+    expected_revision: str = Query(min_length=64, max_length=64),
+    recursive: bool = Query(default=False),
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        remove_workspace_entry_sync,
+        session_id,
+        path,
+        expected_revision,
+        recursive,
     )
 
 

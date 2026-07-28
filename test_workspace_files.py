@@ -1,4 +1,5 @@
 import asyncio
+import errno
 import os
 import stat
 import subprocess
@@ -76,7 +77,7 @@ class WorkspaceFilesTests(unittest.TestCase):
         ])
         self.assertEqual(second["entries"][0]["kind"], "symlink")
 
-    def test_workspace_capability_v3_entries_have_opaque_revisions_and_preview_limits(self) -> None:
+    def test_workspace_capability_v4_entries_have_opaque_revisions_and_preview_limits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             path = root / "app.py"
@@ -88,7 +89,7 @@ class WorkspaceFilesTests(unittest.TestCase):
                 path.write_text("second, longer\n")
                 changed = agent_server.list_workspace_entries_sync("session-1", "", 0, 20)["entries"][0]
 
-        self.assertEqual(info["capability_version"], 3)
+        self.assertEqual(info["capability_version"], 4)
         self.assertEqual(info["max_preview_file_bytes"], agent_server.MAX_WORKSPACE_PREVIEW_BYTES)
         self.assertIn("application/pdf", info["preview_media_types"])
         self.assertIn("image/png", info["preview_media_types"])
@@ -97,6 +98,286 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertRegex(listed["revision"], r"^[0-9a-f]{64}$")
         self.assertEqual(searched["revision"], listed["revision"])
         self.assertNotEqual(changed["revision"], listed["revision"])
+
+    def test_create_file_and_directory_returns_editor_and_tree_shapes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "src").mkdir()
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
+                created_file = agent_server.create_workspace_entry_sync(
+                    "session-1", "src/new_file.py", "file"
+                )
+                created_directory = agent_server.create_workspace_entry_sync(
+                    "session-1", "notes", "directory"
+                )
+                listed = {
+                    entry["path"]: entry
+                    for entry in (
+                        agent_server.list_workspace_entries_sync("session-1", "", 0, 20)["entries"]
+                        + agent_server.list_workspace_entries_sync("session-1", "src", 0, 20)["entries"]
+                    )
+                }
+            file_bytes = (root / "src" / "new_file.py").read_bytes()
+            directory_is_empty = list((root / "notes").iterdir()) == []
+
+        self.assertEqual(set(created_file), {"root", "entry", "file"})
+        self.assertEqual(created_file["entry"]["path"], "src/new_file.py")
+        self.assertEqual(created_file["entry"]["kind"], "file")
+        self.assertEqual(created_file["file"]["path"], "src/new_file.py")
+        self.assertEqual(created_file["file"]["content"], "")
+        self.assertEqual(created_file["file"]["revision"], agent_server.workspace_revision(b""))
+        self.assertEqual(created_file["file"]["size"], 0)
+        self.assertEqual(set(created_directory), {"root", "entry"})
+        self.assertEqual(created_directory["entry"]["path"], "notes")
+        self.assertEqual(created_directory["entry"]["kind"], "directory")
+        self.assertEqual(listed["src/new_file.py"]["revision"], created_file["entry"]["revision"])
+        self.assertEqual(listed["notes"]["revision"], created_directory["entry"]["revision"])
+        self.assertEqual(file_bytes, b"")
+        self.assertTrue(directory_is_empty)
+
+    def test_create_never_overwrites_files_directories_or_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "workspace"
+            root.mkdir()
+            existing_file = root / "occupied.txt"
+            existing_file.write_text("keep\n")
+            (root / "occupied-directory").mkdir()
+            outside = base / "outside.txt"
+            outside.write_text("outside\n")
+            (root / "occupied-link").symlink_to(outside)
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
+                errors: list[HTTPException] = []
+                for path, kind in (
+                    ("occupied.txt", "file"),
+                    ("occupied.txt", "directory"),
+                    ("occupied-directory", "file"),
+                    ("occupied-directory", "directory"),
+                    ("occupied-link", "file"),
+                    ("occupied-link", "directory"),
+                ):
+                    with self.subTest(path=path, kind=kind), self.assertRaises(HTTPException) as raised:
+                        agent_server.create_workspace_entry_sync("session-1", path, kind)
+                    errors.append(raised.exception)
+            file_content = existing_file.read_text()
+            outside_content = outside.read_text()
+            link_target = (root / "occupied-link").readlink()
+
+        self.assertTrue(all(error.status_code == 409 for error in errors))
+        self.assertTrue(all(error.detail["code"] == "workspace_entry_exists" for error in errors))
+        self.assertEqual(file_content, "keep\n")
+        self.assertEqual(outside_content, "outside\n")
+        self.assertEqual(link_target, outside)
+
+    def test_create_rejects_unsafe_missing_symlinked_archived_and_denied_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "workspace"
+            root.mkdir()
+            outside = base / "outside"
+            outside.mkdir()
+            (root / "escape").symlink_to(outside, target_is_directory=True)
+            session = self.session(root)
+            real_open = agent_server.os.open
+
+            def deny_one_file(path: object, flags: int, *args: object, **kwargs: object) -> int:
+                if path == "denied.txt" and kwargs.get("dir_fd") is not None:
+                    raise OSError(errno.EACCES, "denied")
+                return real_open(path, flags, *args, **kwargs)
+
+            with patch.object(agent_server.STORE, "sessions", {"session-1": session}):
+                for unsafe_path in ("", "/absolute.txt", "../outside.txt", "safe/../../outside.txt"):
+                    with self.subTest(path=unsafe_path), self.assertRaises(HTTPException) as unsafe:
+                        agent_server.create_workspace_entry_sync("session-1", unsafe_path, "file")
+                    self.assertEqual(unsafe.exception.status_code, 400)
+                with self.assertRaises(HTTPException) as missing:
+                    agent_server.create_workspace_entry_sync("session-1", "missing/new.txt", "file")
+                with self.assertRaises(HTTPException) as symlink:
+                    agent_server.create_workspace_entry_sync("session-1", "escape/new.txt", "file")
+                with patch.object(agent_server.os, "open", side_effect=deny_one_file):
+                    with self.assertRaises(HTTPException) as denied:
+                        agent_server.create_workspace_entry_sync("session-1", "denied.txt", "file")
+                session["archived"] = True
+                with self.assertRaises(HTTPException) as archived:
+                    agent_server.create_workspace_entry_sync("session-1", "archived.txt", "file")
+
+        self.assertEqual(missing.exception.status_code, 404)
+        self.assertEqual(missing.exception.detail["code"], "workspace_directory_not_found")
+        self.assertIn(symlink.exception.status_code, {400, 403})
+        self.assertIn(
+            symlink.exception.detail["code"],
+            {"invalid_workspace_path", "workspace_symlink_blocked"},
+        )
+        self.assertEqual(denied.exception.status_code, 403)
+        self.assertEqual(denied.exception.detail["code"], "workspace_permission_denied")
+        self.assertEqual(archived.exception.status_code, 409)
+        self.assertEqual(archived.exception.detail["code"], "workspace_read_only")
+
+    def test_concurrent_create_allows_exactly_one_creator(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            barrier = threading.Barrier(2)
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
+                def create() -> str:
+                    barrier.wait()
+                    try:
+                        agent_server.create_workspace_entry_sync("session-1", "shared.txt", "file")
+                        return "created"
+                    except HTTPException as exc:
+                        return str(exc.detail["code"])
+
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    results = list(executor.map(lambda _: create(), range(2)))
+            entries = list(root.iterdir())
+            content = entries[0].read_bytes()
+
+        self.assertEqual(sorted(results), ["created", "workspace_entry_exists"])
+        self.assertEqual([entry.name for entry in entries], ["shared.txt"])
+        self.assertEqual(content, b"")
+
+    def test_create_post_create_failures_report_partial_success_without_deleting(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
+                real_fstat = agent_server.os.fstat
+                fstat_calls = 0
+
+                def fail_first_fstat(file_fd: int) -> os.stat_result:
+                    nonlocal fstat_calls
+                    fstat_calls += 1
+                    if fstat_calls == 1:
+                        raise OSError(errno.EIO, "fstat failed")
+                    return real_fstat(file_fd)
+
+                with patch.object(agent_server.os, "fstat", side_effect=fail_first_fstat):
+                    with self.assertRaises(HTTPException) as fstat_failure:
+                        agent_server.create_workspace_entry_sync(
+                            "session-1", "fstat-failure.txt", "file"
+                        )
+
+                real_fsync = agent_server.os.fsync
+
+                def fail_file_fsync(file_fd: int) -> None:
+                    if stat.S_ISREG(real_fstat(file_fd).st_mode):
+                        raise OSError(errno.EIO, "fsync failed")
+                    real_fsync(file_fd)
+
+                with patch.object(agent_server.os, "fsync", side_effect=fail_file_fsync):
+                    with self.assertRaises(HTTPException) as fsync_failure:
+                        agent_server.create_workspace_entry_sync(
+                            "session-1", "fsync-failure.txt", "file"
+                        )
+            remaining = sorted(entry.name for entry in root.iterdir())
+
+        self.assertEqual(
+            fstat_failure.exception.detail["code"],
+            "workspace_create_partial_success",
+        )
+        self.assertEqual(
+            fsync_failure.exception.detail["code"],
+            "workspace_create_partial_success",
+        )
+        self.assertEqual(remaining, ["fstat-failure.txt", "fsync-failure.txt"])
+
+    def test_create_directory_validation_failure_reports_partial_success_without_deleting(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            real_stat = agent_server.os.stat
+            target_stat_calls = 0
+
+            def fail_second_target_stat(path: object, *args: object, **kwargs: object) -> os.stat_result:
+                nonlocal target_stat_calls
+                if path == "drafts" and kwargs.get("dir_fd") is not None:
+                    target_stat_calls += 1
+                    if target_stat_calls == 2:
+                        raise OSError(errno.EIO, "validation stat failed")
+                return real_stat(path, *args, **kwargs)
+
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
+                with patch.object(agent_server.os, "stat", side_effect=fail_second_target_stat):
+                    with self.assertRaises(HTTPException) as failed:
+                        agent_server.create_workspace_entry_sync(
+                            "session-1", "drafts", "directory"
+                        )
+            remaining = [entry.name for entry in root.iterdir()]
+
+        self.assertEqual(failed.exception.detail["code"], "workspace_create_partial_success")
+        self.assertEqual(remaining, ["drafts"])
+
+    def test_create_rollback_never_removes_a_raced_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "raced.txt"
+            real_fstat = agent_server.os.fstat
+            real_fsync = agent_server.os.fsync
+            replaced = False
+
+            def replace_then_fail_fsync(file_fd: int) -> None:
+                nonlocal replaced
+                if stat.S_ISREG(real_fstat(file_fd).st_mode) and not replaced:
+                    replaced = True
+                    path.unlink()
+                    path.write_text("replacement\n")
+                    raise OSError(errno.EIO, "fsync failed after replacement")
+                real_fsync(file_fd)
+
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
+                with patch.object(agent_server.os, "fsync", side_effect=replace_then_fail_fsync):
+                    with self.assertRaises(HTTPException) as failed:
+                        agent_server.create_workspace_entry_sync(
+                            "session-1", "raced.txt", "file"
+                        )
+            content = path.read_text()
+
+        self.assertEqual(failed.exception.detail["code"], "workspace_create_partial_success")
+        self.assertEqual(content, "replacement\n")
+
+    def test_create_failure_never_attempts_automatic_deletion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "stuck.txt"
+            real_fstat = agent_server.os.fstat
+            real_fsync = agent_server.os.fsync
+
+            def fail_file_fsync(file_fd: int) -> None:
+                if stat.S_ISREG(real_fstat(file_fd).st_mode):
+                    raise OSError(errno.EIO, "fsync failed")
+                real_fsync(file_fd)
+
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
+                with (
+                    patch.object(agent_server.os, "fsync", side_effect=fail_file_fsync),
+                    patch.object(agent_server.os, "unlink") as unlink_entry,
+                    patch.object(agent_server.os, "rmdir") as remove_directory,
+                    self.assertRaises(HTTPException) as failed,
+                ):
+                    agent_server.create_workspace_entry_sync(
+                        "session-1", "stuck.txt", "file"
+                    )
+            exists = path.exists()
+
+        self.assertEqual(failed.exception.status_code, 500)
+        self.assertEqual(
+            failed.exception.detail["code"],
+            "workspace_create_partial_success",
+        )
+        self.assertTrue(exists)
+        unlink_entry.assert_not_called()
+        remove_directory.assert_not_called()
+
+    def test_post_workspace_entry_route_returns_create_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
+                result = asyncio.run(agent_server.post_session_workspace_entry(
+                    "session-1",
+                    agent_server.WorkspaceCreateRequest(path="draft.md", kind="file"),
+                ))
+
+        self.assertEqual(set(result), {"root", "entry", "file"})
+        self.assertEqual(result["entry"]["path"], "draft.md")
+        self.assertEqual(result["entry"]["kind"], "file")
+        self.assertEqual(result["file"]["content"], "")
 
     @unittest.skipUnless(
         sys.platform == "darwin" or sys.platform.startswith("linux"),

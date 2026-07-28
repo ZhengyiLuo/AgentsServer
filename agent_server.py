@@ -42,7 +42,7 @@ from collections import OrderedDict, deque
 from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal
 from urllib.parse import unquote, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -1061,7 +1061,7 @@ def workspace_info_sync(session_id: str) -> dict[str, Any]:
         "root": str(root),
         "name": root.name or str(root),
         "read_only": bool(sess.get("archived")),
-        "capability_version": 3 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
+        "capability_version": 4 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
         "max_text_file_bytes": MAX_WORKSPACE_TEXT_BYTES,
         "max_preview_file_bytes": MAX_WORKSPACE_PREVIEW_BYTES,
         "preview_media_types": sorted(set(WORKSPACE_PREVIEW_MEDIA_TYPES.values())),
@@ -1486,6 +1486,164 @@ def fsync_workspace_directory(directory_fd: int, path: str) -> None:
         os.fsync(directory_fd)
     except OSError as exc:
         logger.warning("workspace directory fsync failed after mutating %s: %s", path, exc)
+
+
+def translate_workspace_create_error(exc: OSError, path: str, kind: str) -> HTTPException:
+    if exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
+        return workspace_http_error(409, "workspace_entry_exists", f"Workspace entry already exists: {path}")
+    if exc.errno == errno.ENOENT:
+        return workspace_http_error(
+            404,
+            "workspace_directory_not_found",
+            f"Workspace parent directory not found: {path.rsplit('/', 1)[0] or '.'}",
+        )
+    if exc.errno in {errno.EACCES, errno.EPERM, errno.EROFS}:
+        return workspace_http_error(403, "workspace_permission_denied", f"Permission denied: {path}")
+    if exc.errno in {errno.ENOTDIR, errno.EISDIR}:
+        return workspace_http_error(400, "invalid_workspace_path", f"Workspace path has the wrong type: {path}")
+    if exc.errno == errno.ELOOP:
+        return workspace_http_error(403, "workspace_symlink_blocked", "Workspace symlinks cannot be opened.")
+    if exc.errno == errno.ENAMETOOLONG:
+        return workspace_http_error(400, "invalid_workspace_path", "Workspace path is too long.")
+    if exc.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)}:
+        return workspace_http_error(
+            507,
+            "workspace_storage_full",
+            f"Not enough storage is available to create the workspace {kind}: {path}",
+        )
+    return workspace_http_error(500, "workspace_io_error", f"Could not create workspace {kind}: {path}")
+
+
+def workspace_create_partial_success_error(path: str) -> HTTPException:
+    return workspace_http_error(
+        500,
+        "workspace_create_partial_success",
+        (
+            f"AgentsDock created or changed {path}, but could not finish validating the operation. "
+            "Refresh the file explorer and inspect the path before trying again."
+        ),
+    )
+
+
+def create_workspace_entry_sync(
+    session_id: str,
+    relative_path: str,
+    kind: Literal["file", "directory"],
+) -> dict[str, Any]:
+    _, root = session_workspace_root(session_id, for_write=True)
+    normalized = normalize_workspace_path(relative_path)
+    if kind not in {"file", "directory"}:
+        raise workspace_http_error(
+            400,
+            "invalid_workspace_entry_kind",
+            "Workspace entry kind must be file or directory.",
+        )
+    parent_path = normalized.rsplit("/", 1)[0] if "/" in normalized else ""
+    with workspace_write_lock(root, normalized):
+        parent_fd, name = open_workspace_parent_fd(root, normalized)
+        created_fd = -1
+        created = False
+        created_stat: os.stat_result | None = None
+        try:
+            try:
+                if kind == "file":
+                    created_fd = os.open(
+                        name,
+                        (
+                            os.O_WRONLY
+                            | os.O_CREAT
+                            | os.O_EXCL
+                            | getattr(os, "O_CLOEXEC", 0)
+                            | getattr(os, "O_NOFOLLOW", 0)
+                        ),
+                        0o666,
+                        dir_fd=parent_fd,
+                    )
+                    created = True
+                    created_stat = os.fstat(created_fd)
+                    if not stat.S_ISREG(created_stat.st_mode):
+                        raise workspace_http_error(
+                            409,
+                            "workspace_entry_conflict",
+                            f"{normalized} changed while it was being created.",
+                        )
+                    os.fsync(created_fd)
+                else:
+                    os.mkdir(name, 0o777, dir_fd=parent_fd)
+                    created = True
+                    created_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    if not stat.S_ISDIR(created_stat.st_mode):
+                        raise workspace_http_error(
+                            409,
+                            "workspace_entry_conflict",
+                            f"{normalized} changed while it was being created.",
+                        )
+                    created_fd = os.open(name, workspace_open_flags(directory=True), dir_fd=parent_fd)
+                    opened_stat = os.fstat(created_fd)
+                    if (
+                        opened_stat.st_dev != created_stat.st_dev
+                        or opened_stat.st_ino != created_stat.st_ino
+                    ):
+                        raise workspace_http_error(
+                            409,
+                            "workspace_entry_conflict",
+                            f"{normalized} changed while it was being created.",
+                        )
+                    created_stat = opened_stat
+                    fsync_workspace_directory(created_fd, normalized)
+            except HTTPException:
+                raise
+            except OSError as exc:
+                raise translate_workspace_create_error(exc, normalized, kind) from exc
+
+            try:
+                visible_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise translate_workspace_create_error(exc, normalized, kind) from exc
+            if (
+                created_stat is None
+                or visible_stat.st_dev != created_stat.st_dev
+                or visible_stat.st_ino != created_stat.st_ino
+                or workspace_entry_kind(visible_stat, normalized) != kind
+            ):
+                raise workspace_http_error(
+                    409,
+                    "workspace_entry_conflict",
+                    f"{normalized} changed while it was being created.",
+                )
+            fsync_workspace_directory(parent_fd, normalized)
+            entry = workspace_entry(parent_path, name, visible_stat)
+            if entry is None:
+                raise workspace_http_error(
+                    400,
+                    "workspace_entry_type_unsupported",
+                    f"Workspace entry type cannot be created: {normalized}",
+                )
+            result: dict[str, Any] = {
+                "root": str(root),
+                "entry": entry,
+            }
+            if kind == "file":
+                result["file"] = {
+                    "root": str(root),
+                    "path": normalized,
+                    "name": name,
+                    "content": "",
+                    "revision": workspace_revision(b""),
+                    "size": 0,
+                    "mtime_ns": int(visible_stat.st_mtime_ns),
+                    "writable": bool(visible_stat.st_mode & 0o222),
+                }
+            return result
+        except Exception as exc:
+            if created:
+                logger.error("workspace create may have partially succeeded for %s: %s", normalized, exc)
+                raise workspace_create_partial_success_error(normalized) from exc
+            raise
+        finally:
+            if created_fd >= 0:
+                os.close(created_fd)
+            os.close(parent_fd)
 
 
 def atomic_rename_workspace_entry(parent_fd: int, old_name: str, new_name: str, path: str) -> None:
@@ -2616,6 +2774,11 @@ class WorkspaceWriteRequest(BaseModel):
     path: str = Field(min_length=1, max_length=MAX_WORKSPACE_PATH_CHARS)
     content: str = Field(max_length=MAX_WORKSPACE_TEXT_BYTES)
     expected_revision: str = Field(min_length=64, max_length=64)
+
+
+class WorkspaceCreateRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=MAX_WORKSPACE_PATH_CHARS)
+    kind: Literal["file", "directory"]
 
 
 class WorkspaceRenameRequest(BaseModel):
@@ -11948,14 +12111,14 @@ async def health() -> dict[str, Any]:
                 "available": WORKSPACE_SECURE_OPEN_AVAILABLE,
                 "required": False,
                 "message": (
-                    "Workspace file browsing, editing, previews, rename, and deletion are available."
+                    "Workspace file browsing, editing, previews, creation, rename, and deletion are available."
                     if WORKSPACE_MUTATIONS_AVAILABLE
                     else "Workspace file browsing, editing, and previews are available."
                     if WORKSPACE_SECURE_OPEN_AVAILABLE
                     else "Secure workspace file access is unavailable on this host."
                 ),
                 "action": None if WORKSPACE_SECURE_OPEN_AVAILABLE else "Use a supported macOS or Linux host.",
-                "version": 3 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
+                "version": 4 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
                 "max_text_file_bytes": MAX_WORKSPACE_TEXT_BYTES,
                 "max_preview_file_bytes": MAX_WORKSPACE_PREVIEW_BYTES,
                 "preview_media_types": sorted(set(WORKSPACE_PREVIEW_MEDIA_TYPES.values())),
@@ -12917,6 +13080,16 @@ async def put_session_workspace_file(session_id: str, req: WorkspaceWriteRequest
         req.path,
         req.content,
         req.expected_revision,
+    )
+
+
+@app.post("/api/sessions/{session_id}/workspace/entry")
+async def post_session_workspace_entry(session_id: str, req: WorkspaceCreateRequest) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        create_workspace_entry_sync,
+        session_id,
+        req.path,
+        req.kind,
     )
 
 

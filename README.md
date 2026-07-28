@@ -520,6 +520,7 @@ GET /api/sessions/{session_id}/workspace/entries?path=&offset=0&limit=500
 GET /api/sessions/{session_id}/workspace/search?q=app&limit=100
 GET /api/sessions/{session_id}/workspace/file?path=src/App.tsx
 PUT /api/sessions/{session_id}/workspace/file
+POST /api/sessions/{session_id}/workspace/entry
 PATCH /api/sessions/{session_id}/workspace/entry
 DELETE /api/sessions/{session_id}/workspace/entry?path=src/old.ts&expected_revision=...&recursive=false
 ```
@@ -539,6 +540,12 @@ revision. A non-recursive delete removes files, symlinks, or empty
 directories; `recursive=true` confirms deletion of a non-empty directory.
 Recursive traversal remains descriptor-relative, never follows symlinks, and
 rejects mounted filesystems rather than crossing them.
+
+Workspace-files capability v4 adds no-overwrite creation. Post
+`{path, kind: "file"}` to create an empty UTF-8 file or
+`{path, kind: "directory"}` to create one directory. Creation is
+descriptor-relative, rejects symlinked parents and existing destinations, and
+is unavailable for archived chats.
 
 ## Whole-History Search
 

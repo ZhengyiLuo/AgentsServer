@@ -11382,8 +11382,7 @@ def bounded_codex_output_text(value: Any) -> str:
     text = codex_output_text(value)
     if len(text) <= CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS:
         return text
-    omitted = len(text) - CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS
-    marker = f"[AgentsDock omitted {omitted} earlier tool-output characters]\n"
+    marker = "[Earlier tool output truncated by AgentsServer]\n"
     tail_chars = max(0, CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS - len(marker))
     return marker + (text[-tail_chars:] if tail_chars else "")
 

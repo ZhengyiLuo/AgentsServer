@@ -280,7 +280,11 @@ class EventWebSocketCatchupTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event["output_truncated"])
         self.assertLessEqual(len(event["output"]), 80)
         self.assertEqual(persisted["output"], event["output"])
-        self.assertIn("omitted 120", event["output"])
+        self.assertTrue(
+            event["output"].startswith(
+                "[Earlier tool output truncated by AgentsServer]\n"
+            )
+        )
 
 
 if __name__ == "__main__":

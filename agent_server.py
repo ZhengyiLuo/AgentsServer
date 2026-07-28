@@ -4142,9 +4142,6 @@ def should_bump_session_updated_at(event_type: str, event: dict[str, Any]) -> bo
         "history_imported",
         "session_forked",
         "codex_interaction_resolved",
-        "codex_thread_status",
-        "codex_goal_updated",
-        "codex_goal_cleared",
         "codex_goal_budget_limited",
         "codex_compaction_started",
         "codex_compaction_completed",
@@ -7472,8 +7469,18 @@ TIMELINE_INDEX_HIDDEN_TYPES = {
     "job_updated",
     "job_deleted",
     "raw_event",
+    "codex_thread_status",
+    "codex_goal_updated",
+    "codex_goal_cleared",
+    "codex_compaction_started",
 }
 TIMELINE_INDEX_JOB_TYPES = {"job_created", "job_ran", "job_started", "job_deferred", "job_finished", "job_error"}
+TIMELINE_INDEX_CODEX_GOAL_TYPES = {
+    "codex_goal_budget_limited",
+}
+TIMELINE_INDEX_CODEX_COMPACTION_TYPES = {
+    "codex_compaction_completed",
+}
 TIMELINE_INDEX_TRACE_TYPES = {
     "reasoning_summary", "tool_started", "tool_finished", "process_started", "provider_session",
     "cwd_fallback", "history_imported", "backend_changed", "artifact_error", "session_created",
@@ -7482,6 +7489,64 @@ TIMELINE_INDEX_TRACE_TYPES = {
 SEMANTIC_TIMELINE_JOB_RUN_LIMIT = 7
 SEMANTIC_TIMELINE_JOB_EXTRA_LIMIT = 64
 SEMANTIC_TIMELINE_EVENT_BUDGET_PER_ITEM = 4
+
+
+def timeline_index_is_native_steer_transition_stop(
+    event: dict[str, Any],
+) -> bool:
+    """Return whether a stop only retires the pre-steer logical run."""
+    return (
+        str(event.get("type") or "") == "turn_stopped"
+        and (
+            event.get("native_steer") is True
+            or bool(str(event.get("superseded_by_run_id") or "").strip())
+        )
+    )
+
+
+def timeline_index_codex_lifecycle_key(
+    event: dict[str, Any],
+) -> str | None:
+    """Return the stable semantic key for durable Codex control markers."""
+    event_type = str(event.get("type") or "")
+    if event_type in TIMELINE_INDEX_CODEX_GOAL_TYPES:
+        return "codex:goal-budget"
+    if event_type not in TIMELINE_INDEX_CODEX_COMPACTION_TYPES:
+        return None
+    operation_id = str(event.get("operation_id") or "").strip()
+    if operation_id:
+        return f"codex:compaction:{operation_id}"
+    native_id = (
+        str(event.get("turn_id") or "").strip()
+        or str(event.get("item_id") or "").strip()
+        or str(event.get("id") or "").strip()
+        or str(event.get("seq") or "")
+    )
+    return f"codex:compaction:{native_id}"
+
+
+def timeline_index_event_is_hidden(event: dict[str, Any]) -> bool:
+    return (
+        str(event.get("type") or "") in TIMELINE_INDEX_HIDDEN_TYPES
+        or timeline_index_is_native_steer_transition_stop(event)
+    )
+
+
+def timeline_index_retire_native_steer_turn(
+    event: dict[str, Any],
+    current_turn_by_run: dict[str, str],
+    active_turn_key: str | None,
+) -> str | None:
+    """Retire hidden pre-steer routing state without adding a semantic row."""
+    if not timeline_index_is_native_steer_transition_stop(event):
+        return active_turn_key
+    run_id = str(event.get("run_id") or "").strip()
+    retired_key = (
+        current_turn_by_run.pop(run_id, None)
+        if run_id
+        else active_turn_key
+    )
+    return None if retired_key and retired_key == active_turn_key else active_turn_key
 
 
 def compact_timeline_index_text(value: Any, limit: int = 240) -> str:
@@ -7674,7 +7739,14 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                 fork_internal_run_ids.add(run_id)
             if is_forked and (is_fork_internal or run_id in fork_internal_run_ids):
                 continue
-            if event_type in TIMELINE_INDEX_HIDDEN_TYPES:
+            if timeline_index_is_native_steer_transition_stop(event):
+                active_turn_key = timeline_index_retire_native_steer_turn(
+                    event,
+                    current_turn_by_run,
+                    active_turn_key,
+                )
+                continue
+            if timeline_index_event_is_hidden(event):
                 continue
             visible_count += 1
 
@@ -7702,6 +7774,23 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                         active_turn_key = None
                     if run_id:
                         current_turn_by_run.pop(run_id, None)
+                continue
+
+            codex_lifecycle_key = timeline_index_codex_lifecycle_key(event)
+            if codex_lifecycle_key:
+                record = ensure_record(
+                    codex_lifecycle_key,
+                    "codex_lifecycle",
+                    event,
+                )
+                text = timeline_index_event_text(event)
+                record["title"] = (
+                    "Codex Goal"
+                    if event_type in TIMELINE_INDEX_CODEX_GOAL_TYPES
+                    else "Codex Compaction"
+                )
+                record["preview"] = text or record["title"]
+                record["timestamp"] = event.get("ts") or record.get("timestamp")
                 continue
 
             if event_type in TIMELINE_INDEX_JOB_TYPES or event.get("job_id") or (run_id and run_id in job_by_run):
@@ -7868,7 +7957,11 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
             meta_parts.append(f"{len(file_names)} file{'s' if len(file_names) != 1 else ''}")
         if kind == "job" and not meta_parts:
             meta_parts.append(f"{event_count} update{'s' if event_count != 1 else ''}")
-        landmark_seq = stored["end_seq"] if kind == "job" else stored["start_seq"]
+        landmark_seq = (
+            stored["end_seq"]
+            if kind in {"job", "codex_lifecycle"}
+            else stored["start_seq"]
+        )
         landmarks.append({
             "key": stored["key"],
             "kind": kind,
@@ -8231,9 +8324,16 @@ def collect_semantic_timeline_events(
             if seq <= 0 or is_fork_internal_event(event, fork_internal_run_ids):
                 continue
             event_type = str(event.get("type") or "")
-            if event_type in TIMELINE_INDEX_HIDDEN_TYPES:
-                continue
             run_id = str(event.get("run_id") or "").strip()
+            if timeline_index_is_native_steer_transition_stop(event):
+                active_turn_key = timeline_index_retire_native_steer_turn(
+                    event,
+                    current_turn_by_run,
+                    active_turn_key,
+                )
+                continue
+            if timeline_index_event_is_hidden(event):
+                continue
             key: str | None = None
 
             digest_id = str(event.get("digest_job_id") or "").strip()
@@ -8251,6 +8351,7 @@ def collect_semantic_timeline_events(
                     if run_id:
                         current_turn_by_run.pop(run_id, None)
             else:
+                codex_lifecycle_key = timeline_index_codex_lifecycle_key(event)
                 job_payload = event.get("job") if isinstance(event.get("job"), dict) else {}
                 explicit_job_id = str(event.get("job_id") or job_payload.get("id") or "").strip()
                 job_id = job_by_run.get(run_id) if run_id else None
@@ -8260,7 +8361,9 @@ def collect_semantic_timeline_events(
                     or explicit_job_id
                 ):
                     job_id = explicit_job_id or run_id or f"job-{seq}"
-                if job_id:
+                if codex_lifecycle_key:
+                    key = codex_lifecycle_key
+                elif job_id:
                     key = f"job:{job_id}"
                 elif timeline_index_is_error(event):
                     key = f"event:{event.get('id') or seq}"
@@ -8341,6 +8444,14 @@ def collect_semantic_timeline_events(
                     reverse=True,
                 ),
             ))
+        elif str(landmark.get("kind") or "") == "codex_lifecycle":
+            lifecycle_events = events_by_key.get(key, [])
+            latest = max(
+                lifecycle_events,
+                key=lambda event: int(event.get("seq") or 0),
+                default=None,
+            )
+            bundles.append(([latest] if latest is not None else [], [], []))
         else:
             bundles.append(semantic_timeline_ordinary_candidates(events_by_key.get(key, [])))
 
@@ -11250,6 +11361,10 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
                 session["codex_goal"] = goal
                 if codex_goal_time_budget_is_exhausted(session):
                     session["codex_goal_time_budget_exhausted"] = True
+                # Native goal notifications are durable control state. Persist
+                # them without changing updated_at so routine progress does not
+                # reorder the chat list.
+                await STORE.save()
         await append_event(session_id, "codex_goal_updated", {"goal": goal})
         return
 
@@ -11260,6 +11375,9 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
                 session["codex_goal"] = None
                 session["codex_goal_time_budget_seconds"] = None
                 session["codex_goal_time_budget_exhausted"] = False
+                # Clearing a goal must survive a restart even though the
+                # lifecycle notification is omitted from semantic history.
+                await STORE.save()
         await append_event(session_id, "codex_goal_cleared", {})
         return
 

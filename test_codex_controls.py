@@ -740,6 +740,7 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
     def test_goal_budget_and_native_completion_events_bump_timeline(self) -> None:
         for event_type in (
             "codex_goal_budget_limited",
+            "codex_compaction_started",
             "codex_compaction_completed",
             "codex_review_finished",
             "codex_shell_finished",
@@ -751,6 +752,75 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
                         {"type": event_type},
                     )
                 )
+
+    def test_routine_status_and_goal_state_do_not_bump_timeline(self) -> None:
+        for event_type in (
+            "codex_thread_status",
+            "codex_goal_updated",
+            "codex_goal_cleared",
+        ):
+            with self.subTest(event_type=event_type):
+                self.assertFalse(
+                    agent_server.should_bump_session_updated_at(
+                        event_type,
+                        {"type": event_type},
+                    )
+                )
+
+    async def test_native_goal_state_persists_without_reordering_session(
+        self,
+    ) -> None:
+        original_updated_at = "2026-07-28T10:00:00Z"
+        agent_server.STORE.sessions["chat"].update(
+            {
+                "updated_at": original_updated_at,
+                "codex_goal_time_budget_seconds": 30,
+                "codex_goal_time_budget_exhausted": False,
+            }
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sessions_file = Path(temp_dir) / "sessions.json"
+            with (
+                patch.object(agent_server, "SESSIONS_FILE", sessions_file),
+                patch.object(
+                    agent_server,
+                    "codex_session_id_for_thread",
+                    return_value="chat",
+                ),
+                patch.object(agent_server, "append_event", AsyncMock()),
+            ):
+                await agent_server.project_codex_notification(
+                    {
+                        "method": "thread/goal/updated",
+                        "params": {
+                            "threadId": "thread",
+                            "goal": {
+                                "objective": "Keep the projection compact",
+                                "status": "active",
+                                "timeUsedSeconds": 12,
+                            },
+                        },
+                    }
+                )
+                stored = json.loads(sessions_file.read_text())["chat"]
+                self.assertEqual(
+                    stored["codex_goal"]["objective"],
+                    "Keep the projection compact",
+                )
+                self.assertEqual(stored["updated_at"], original_updated_at)
+
+                await agent_server.project_codex_notification(
+                    {
+                        "method": "thread/goal/cleared",
+                        "params": {"threadId": "thread"},
+                    }
+                )
+                stored = json.loads(sessions_file.read_text())["chat"]
+
+        self.assertIsNone(stored["codex_goal"])
+        self.assertIsNone(stored["codex_goal_time_budget_seconds"])
+        self.assertFalse(stored["codex_goal_time_budget_exhausted"])
+        self.assertEqual(stored["updated_at"], original_updated_at)
 
     async def test_session_load_clears_process_owned_codex_runtime_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

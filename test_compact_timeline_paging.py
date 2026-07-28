@@ -640,6 +640,233 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
             "job_deleted",
         }.intersection(event["type"] for event in page["events"]))
 
+    def test_semantic_paging_projects_codex_lifecycle_without_polluting_pages(
+        self,
+    ) -> None:
+        self.write_events([
+            self.event(1, "turn_started", run_id="human-run", prompt="Question"),
+            self.event(2, "turn_finished", run_id="human-run", result_text="Answer"),
+            self.event(
+                3,
+                "codex_thread_status",
+                status={"type": "active"},
+                message="Codex is working.",
+            ),
+            self.event(
+                4,
+                "codex_goal_updated",
+                goal={"status": "inProgress"},
+            ),
+            self.event(5, "codex_goal_cleared"),
+            self.event(
+                6,
+                "codex_goal_budget_limited",
+                message="The persistent goal reached its time limit.",
+            ),
+            self.event(
+                7,
+                "codex_compaction_started",
+                operation_id="compact-explicit",
+                message="Codex started compacting this thread's context.",
+            ),
+            self.event(
+                8,
+                "codex_compaction_completed",
+                operation_id="compact-explicit",
+                status="completed",
+                message="Context compaction completed.",
+            ),
+            self.event(
+                9,
+                "turn_stopped",
+                run_id="superseded-run",
+                native_steer=True,
+                superseded_by_run_id="steered-run",
+            ),
+            self.event(
+                10,
+                "codex_compaction_completed",
+                turn_id="automatic-turn",
+                item_id="automatic-item",
+                status="completed",
+                message="Codex completed automatic context compaction.",
+            ),
+            self.event(
+                11,
+                "codex_thread_status",
+                status={"type": "idle"},
+                message="Codex is idle.",
+            ),
+        ])
+
+        index = agent_server.build_timeline_index(self.session_id)
+        page = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            limit=10,
+            tail=True,
+        )
+        raw_page = agent_server.read_visible_events_page(
+            self.session_id,
+            limit=100,
+            tail=False,
+        )[0]
+
+        self.assertEqual(
+            [landmark["key"] for landmark in index["landmarks"]],
+            [
+                "turn:human-run",
+                "codex:goal-budget",
+                "codex:compaction:compact-explicit",
+                "codex:compaction:automatic-turn",
+            ],
+        )
+        self.assertEqual(page["semantic_total"], 4)
+        self.assertEqual(page["semantic_item_count"], 4)
+        lifecycle_events = [
+            event
+            for event in page["events"]
+            if event["type"].startswith("codex_")
+        ]
+        self.assertEqual(
+            [(event["seq"], event["type"]) for event in lifecycle_events],
+            [
+                (6, "codex_goal_budget_limited"),
+                (8, "codex_compaction_completed"),
+                (10, "codex_compaction_completed"),
+            ],
+        )
+        self.assertFalse({
+            "codex_thread_status",
+            "codex_goal_updated",
+            "codex_goal_cleared",
+            "codex_compaction_started",
+            "turn_stopped",
+        }.intersection(event["type"] for event in page["events"]))
+        # Semantic projection is additive: durable/raw history remains
+        # backward-compatible for clients that do not request semantic pages.
+        self.assertTrue({
+            "codex_thread_status",
+            "codex_goal_updated",
+            "codex_goal_cleared",
+            "codex_compaction_started",
+            "turn_stopped",
+        }.issubset(event["type"] for event in raw_page))
+
+    def test_codex_lifecycle_landmarks_update_incrementally(self) -> None:
+        self.write_events([
+            self.event(
+                1,
+                "codex_goal_updated",
+                goal={"status": "inProgress"},
+            ),
+            self.event(
+                2,
+                "codex_compaction_started",
+                operation_id="compact-incremental",
+                message="Compaction started.",
+            ),
+        ])
+        first = agent_server.build_timeline_index(self.session_id)
+
+        with agent_server.events_path(self.session_id).open(
+            "a",
+            encoding="utf-8",
+        ) as destination:
+            destination.write(json.dumps(self.event(
+                3,
+                "codex_goal_cleared",
+            )) + "\n")
+            destination.write(json.dumps(self.event(
+                4,
+                "codex_goal_budget_limited",
+                message="The persistent goal reached its time limit.",
+            )) + "\n")
+            destination.write(json.dumps(self.event(
+                5,
+                "codex_compaction_completed",
+                operation_id="compact-incremental",
+                status="completed",
+                message="Compaction completed.",
+            )) + "\n")
+
+        refreshed = agent_server.build_timeline_index(self.session_id)
+        page = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            limit=10,
+            tail=True,
+        )
+
+        self.assertEqual(
+            [(item["key"], item["start_seq"]) for item in first["landmarks"]],
+            [],
+        )
+        self.assertEqual(
+            [
+                (item["key"], item["start_seq"])
+                for item in refreshed["landmarks"]
+            ],
+            [
+                ("codex:goal-budget", 4),
+                ("codex:compaction:compact-incremental", 5),
+            ],
+        )
+        self.assertEqual(page["semantic_total"], 2)
+        self.assertEqual(
+            [(event["seq"], event["type"]) for event in page["events"]],
+            [
+                (4, "codex_goal_budget_limited"),
+                (5, "codex_compaction_completed"),
+            ],
+        )
+
+    def test_native_steer_retires_incremental_turn_routing(self) -> None:
+        self.write_events([
+            self.event(
+                1,
+                "turn_started",
+                run_id="run-0",
+                prompt="Initial request",
+            ),
+        ])
+        agent_server.build_timeline_index(self.session_id)
+
+        path = agent_server.events_path(self.session_id)
+        for index in range(1, 11):
+            previous_run = f"run-{index - 1}"
+            current_run = f"run-{index}"
+            with path.open("a", encoding="utf-8") as destination:
+                destination.write(json.dumps(self.event(
+                    index * 2,
+                    "turn_stopped",
+                    run_id=previous_run,
+                    native_steer=True,
+                    superseded_by_run_id=current_run,
+                )) + "\n")
+                destination.write(json.dumps(self.event(
+                    index * 2 + 1,
+                    "turn_started",
+                    run_id=current_run,
+                    prompt=f"Steer {index}",
+                )) + "\n")
+
+            index_payload = agent_server.build_timeline_index(self.session_id)
+            cache = agent_server.TIMELINE_INDEX_CACHE[self.session_id]
+            self.assertEqual(
+                cache["current_turn_by_run"],
+                {current_run: f"turn:{current_run}"},
+            )
+            self.assertEqual(cache["active_turn_key"], f"turn:{current_run}")
+            self.assertEqual(len(index_payload["landmarks"]), index + 1)
+
+        page = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            limit=20,
+            tail=True,
+        )
+        self.assertFalse(
+            any(event["type"] == "turn_stopped" for event in page["events"])
+        )
+
     async def test_endpoint_keeps_default_payload_and_offloads_visible_scans(self) -> None:
         session = {
             "id": self.session_id,

@@ -229,11 +229,20 @@ CODEX_APP_SERVER_JSONL_LIMIT_BYTES = max(
     ),
 )
 CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS = max(
-    64 * 1024,
+    12_000,
     int(
         agentsdock_setting(
             "CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS",
-            str(1024 * 1024),
+            "12000",
+        )
+    ),
+)
+CODEX_EXEC_RAW_EVENT_MAX_CHARS = max(
+    4096,
+    int(
+        agentsdock_setting(
+            "CODEX_EXEC_RAW_EVENT_MAX_CHARS",
+            str(32 * 1024),
         )
     ),
 )
@@ -3661,6 +3670,17 @@ class SubscriberHub:
                 if not subs:
                     self._subscribers.pop(sid, None)
 
+    @asynccontextmanager
+    async def register_accepted_for_catchup(
+        self,
+        sid: str,
+        ws: WebSocket,
+    ) -> Iterator[None]:
+        """Register an accepted socket while broadcasts wait behind catch-up."""
+        async with self._lock:
+            self._subscribers.setdefault(sid, set()).add(ws)
+            yield
+
     async def broadcast(self, sid: str, event: dict[str, Any]) -> None:
         async with self._lock:
             subs = list(self._subscribers.get(sid, set()))
@@ -3735,13 +3755,21 @@ async def append_event(session_id: str, event_type: str, payload: dict[str, Any]
     path = events_path(session_id)
     seq = await next_event_seq(session_id, path)
     ts = now_iso()
+    stored_payload = dict(payload or {})
+    output = stored_payload.get("output")
+    if event_type == "tool_finished" and output is not None:
+        output_text = event_output_text(output)
+        if len(output_text) > CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS:
+            stored_payload["output"] = bounded_codex_output_text(output_text)
+            stored_payload["output_chars"] = len(output_text)
+            stored_payload["output_truncated"] = True
     event = {
         "seq": seq,
         "id": f"evt_{uuid.uuid4().hex[:16]}",
         "session_id": session_id,
         "type": event_type,
         "ts": ts,
-        **(payload or {}),
+        **stored_payload,
     }
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(event, separators=(",", ":")) + "\n")
@@ -6200,6 +6228,11 @@ def client_safe_event(event: dict[str, Any]) -> dict[str, Any]:
     if output is not None and not isinstance(output, str):
         safe = dict(event)
         safe["output"] = event_output_text(output)
+        output = safe["output"]
+    if isinstance(output, str) and len(output) > CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS:
+        if safe is event:
+            safe = dict(event)
+        safe["output"] = bounded_codex_output_text(output)
     job = event.get("job")
     # Timeline job summaries omit the private prompt. Older clients still
     # require a string field, so add an empty compatibility value at egress.
@@ -6349,6 +6382,89 @@ def read_events(
             if tail_out is None and len(out) >= limit:
                 break
     return list(tail_out) if tail_out is not None else out
+
+
+def read_event_catchup_batch(
+    session_id: str,
+    *,
+    after: int,
+    through: int,
+    offset: int = 0,
+    limit: int = 500,
+    visible: bool = False,
+) -> tuple[list[dict[str, Any]], int, bool]:
+    """Read one forward websocket catch-up batch without rescanning the file."""
+    path = events_path(session_id)
+    if not path.exists() or through <= after:
+        return [], max(0, offset), True
+    limit = max(1, min(int(limit or 500), MAX_EVENT_RESPONSE_LIMIT))
+    internal_run_ids = fork_internal_run_ids(session_id) if visible else set()
+    out: list[dict[str, Any]] = []
+    next_offset = max(0, int(offset or 0))
+    exhausted = True
+    with path.open("rb") as source:
+        with suppress(OSError):
+            source.seek(next_offset)
+        for raw_line in source:
+            next_offset = source.tell()
+            if not raw_line.strip():
+                continue
+            try:
+                event = json.loads(raw_line.decode("utf-8", "replace"))
+            except Exception:
+                continue
+            seq = int(event.get("seq", 0))
+            if seq <= after:
+                continue
+            if seq > through:
+                break
+            if not event_files_belong_to_session(event, session_id):
+                continue
+            event = client_safe_event(event)
+            if visible and not is_visible_timeline_event(
+                event,
+                fork_internal_run_ids=internal_run_ids,
+            ):
+                continue
+            out.append(event)
+            if len(out) >= limit:
+                exhausted = False
+                break
+    return out, next_offset, exhausted
+
+
+async def send_event_catchup(
+    session_id: str,
+    ws: WebSocket,
+    *,
+    after: int,
+    through: int,
+    visible: bool,
+) -> int:
+    """Stream every persisted event through a fixed boundary in sequence."""
+    cursor = max(0, int(after or 0))
+    offset = 0
+    completed_scan = False
+    while cursor < through:
+        events, offset, exhausted = await asyncio.to_thread(
+            read_event_catchup_batch,
+            session_id,
+            after=cursor,
+            through=through,
+            offset=offset,
+            limit=MAX_EVENT_RESPONSE_LIMIT,
+            visible=visible,
+        )
+        for event in events:
+            await asyncio.wait_for(
+                ws.send_json(event),
+                timeout=WEBSOCKET_SEND_TIMEOUT_SECONDS,
+            )
+            cursor = max(cursor, int(event.get("seq") or 0))
+        if exhausted or not events:
+            completed_scan = True
+            break
+    return through if completed_scan else cursor
 
 
 COMPACT_TIMELINE_HIDDEN_TYPES = {
@@ -11270,6 +11386,19 @@ def bounded_codex_output_text(value: Any) -> str:
     )
 
 
+def codex_exec_raw_event_text(line: str, *, handled: bool) -> str:
+    """Keep only bounded, unrecognized Codex exec packets for diagnostics."""
+    if handled:
+        return ""
+    if len(line) <= CODEX_EXEC_RAW_EVENT_MAX_CHARS:
+        return line
+    omitted = len(line) - CODEX_EXEC_RAW_EVENT_MAX_CHARS
+    return (
+        line[:CODEX_EXEC_RAW_EVENT_MAX_CHARS]
+        + f"\n[AgentsDock omitted {omitted} characters from this raw event]"
+    )
+
+
 def codex_output_exit_code(text: str) -> int | None:
     for pattern in (r"Process exited with code (-?\d+)", r"Exit code:\s*(-?\d+)"):
         match = re.search(pattern, text)
@@ -11295,6 +11424,84 @@ def codex_reasoning_text(payload: dict[str, Any]) -> str:
                 parts.append(item.strip())
         return "\n".join(parts).strip()
     return ""
+
+
+def codex_exec_agent_message(event: dict[str, Any]) -> tuple[str, str] | None:
+    """Return text and phase from every Codex exec agent-message shape."""
+    event_type = str(event.get("type") or "")
+    if event_type in {"item.started", "item.completed"}:
+        item = event.get("item") if isinstance(event.get("item"), dict) else {}
+        if (
+            event_type == "item.completed"
+            and str(item.get("type") or "") == "agent_message"
+        ):
+            return str(item.get("text") or ""), str(item.get("phase") or "")
+        return None
+    payload = (
+        event.get("payload")
+        if isinstance(event.get("payload"), dict)
+        else {}
+    )
+    if (
+        event_type == "event_msg"
+        and str(payload.get("type") or "") == "agent_message"
+    ):
+        return (
+            str(payload.get("message") or ""),
+            str(payload.get("phase") or ""),
+        )
+    if (
+        event_type == "response_item"
+        and str(payload.get("type") or "") == "message"
+        and str(payload.get("role") or "") == "assistant"
+    ):
+        return (
+            text_from_content(payload.get("content")),
+            str(payload.get("phase") or ""),
+        )
+    return None
+
+
+class CodexExecMessageBuffer:
+    """Reconcile phase-less CLI events with phased rollout records."""
+
+    def __init__(self) -> None:
+        self.pending = ""
+        self.classified: set[str] = set()
+
+    @property
+    def has_pending(self) -> bool:
+        return bool(self.pending)
+
+    def observe(self, text: str, phase: str = "") -> list[tuple[str, str]]:
+        normalized = clean_assistant_text(text)
+        if not normalized:
+            return []
+        normalized_phase = str(phase or "").strip()
+        if normalized_phase in {"commentary", "final_answer"}:
+            outputs: list[tuple[str, str]] = []
+            if self.pending and self.pending != normalized:
+                outputs.extend(self.flush(final=False))
+            elif self.pending == normalized:
+                self.pending = ""
+            if normalized in self.classified:
+                return outputs
+            self.classified.add(normalized)
+            outputs.append((normalized_phase, normalized))
+            return outputs
+        if normalized in self.classified or normalized == self.pending:
+            return []
+        outputs = self.flush(final=False)
+        self.pending = normalized
+        return outputs
+
+    def flush(self, *, final: bool) -> list[tuple[str, str]]:
+        text = self.pending
+        self.pending = ""
+        if not text or text in self.classified:
+            return []
+        self.classified.add(text)
+        return [("final_answer" if final else "commentary", text)]
 
 
 def codex_turn_matches_client_user_message(
@@ -12028,6 +12235,7 @@ async def run_codex_exec(
     seen_raw_lines: set[str] = set()
     seen_text_parts: set[str] = set()
     seen_reasoning: set[str] = set()
+    message_buffer = CodexExecMessageBuffer()
     tool_calls: dict[str, dict[str, Any]] = {}
     started_tool_ids: set[str] = set()
     finished_tool_ids: set[str] = set()
@@ -12055,14 +12263,33 @@ async def run_codex_exec(
         text_parts.append(text)
         await append_event(session_id, "assistant_text", {"run_id": run_id, "text": text, **run_event_metadata(run_id)})
 
-    async def emit_reasoning_text(text: str) -> None:
+    async def emit_reasoning_text(text: str, *, phase: str = "") -> None:
         text = str(text or "").strip()
         if not text or text in seen_reasoning:
             return
         seen_reasoning.add(text)
-        await append_event(session_id, "reasoning_summary", {"run_id": run_id, "text": text})
+        payload = {"run_id": run_id, "text": text}
+        if phase:
+            payload["phase"] = phase
+        await append_event(session_id, "reasoning_summary", payload)
+
+    async def emit_buffered_messages(
+        messages: list[tuple[str, str]],
+    ) -> None:
+        for phase, text in messages:
+            if phase == "final_answer":
+                await emit_assistant_text(text)
+            else:
+                await emit_reasoning_text(text, phase="commentary")
+
+    async def observe_agent_message(text: str, phase: str = "") -> None:
+        await emit_buffered_messages(message_buffer.observe(text, phase))
+
+    async def flush_agent_message(*, final: bool) -> None:
+        await emit_buffered_messages(message_buffer.flush(final=final))
 
     async def emit_tool_started(tool: dict[str, Any]) -> None:
+        await flush_agent_message(final=False)
         tool_id = str(tool.get("id") or f"tool_{uuid.uuid4().hex[:8]}")
         tool["id"] = tool_id
         tool_calls[tool_id] = tool
@@ -12073,6 +12300,7 @@ async def run_codex_exec(
         await append_event(session_id, "tool_started", {"run_id": run_id, "tool": tool})
 
     async def emit_tool_finished(tool_id: str, output: Any, exit_code: int | None = None) -> None:
+        await flush_agent_message(final=False)
         tool_id = str(tool_id or f"tool_{uuid.uuid4().hex[:8]}")
         if tool_id in finished_tool_ids:
             return
@@ -12085,7 +12313,7 @@ async def run_codex_exec(
             "run_id": run_id,
             "tool_id": tool_id,
             "tool": tool,
-            "output": output_text,
+            "output": bounded_codex_output_text(output_text),
             "exit_code": exit_code,
         })
 
@@ -12103,6 +12331,10 @@ async def run_codex_exec(
         if etype == "turn.started":
             await mark_provider_turn_ready(session_id, run_id, provider_id)
             return True
+        agent_message = codex_exec_agent_message(event)
+        if agent_message is not None:
+            await observe_agent_message(*agent_message)
+            return True
         if etype in ("item.started", "item.completed"):
             item = event.get("item", {}) or {}
             itype = item.get("type", "")
@@ -12117,28 +12349,21 @@ async def run_codex_exec(
                 else:
                     await emit_tool_finished(str(tool["id"]), item.get("aggregated_output", ""), item.get("exit_code"))
                 handled = True
-            elif itype == "agent_message" and etype == "item.completed":
-                await emit_assistant_text(str(item.get("text") or ""))
-                handled = True
             elif itype in ("reasoning", "agent_reasoning") and etype == "item.completed":
+                await flush_agent_message(final=False)
                 await emit_reasoning_text(codex_reasoning_text(item))
                 handled = True
             return handled
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
         if etype == "event_msg":
             payload_type = str(payload.get("type") or "")
-            if payload_type == "agent_message":
-                await emit_assistant_text(str(payload.get("message") or ""))
-                return True
             if payload_type == "agent_reasoning":
+                await flush_agent_message(final=False)
                 await emit_reasoning_text(str(payload.get("text") or ""))
                 return True
             return False
         if etype == "response_item":
             payload_type = str(payload.get("type") or "")
-            if payload_type == "message" and payload.get("role") == "assistant":
-                await emit_assistant_text(text_from_content(payload.get("content")))
-                return True
             if payload_type in {"function_call", "custom_tool_call"}:
                 call_id = str(payload.get("call_id") or payload.get("id") or f"tool_{uuid.uuid4().hex[:8]}")
                 arguments = payload.get("arguments") if "arguments" in payload else payload.get("input")
@@ -12148,6 +12373,7 @@ async def run_codex_exec(
                 await emit_tool_finished(str(payload.get("call_id") or payload.get("id") or ""), payload.get("output"))
                 return True
             if payload_type in {"reasoning", "agent_reasoning"}:
+                await flush_agent_message(final=False)
                 await emit_reasoning_text(codex_reasoning_text(payload))
                 return True
         return False
@@ -12157,13 +12383,26 @@ async def run_codex_exec(
         if not line or not line.startswith("{") or line in seen_raw_lines:
             return False
         seen_raw_lines.add(line)
-        if record_raw:
-            await append_event(session_id, "raw_event", {"run_id": run_id, "backend": BACKEND_CODEX, "raw": line})
         try:
             event = json.loads(line)
         except Exception:
+            raw_event = codex_exec_raw_event_text(line, handled=False)
+            if record_raw and raw_event:
+                await append_event(session_id, "raw_event", {
+                    "run_id": run_id,
+                    "backend": BACKEND_CODEX,
+                    "raw": raw_event,
+                })
             return False
-        return await handle_codex_event(event)
+        handled = await handle_codex_event(event)
+        raw_event = codex_exec_raw_event_text(line, handled=handled)
+        if record_raw and raw_event:
+            await append_event(session_id, "raw_event", {
+                "run_id": run_id,
+                "backend": BACKEND_CODEX,
+                "raw": raw_event,
+            })
+        return handled
 
     async def drain_codex_history() -> bool:
         nonlocal codex_history_path, codex_history_pos
@@ -12202,6 +12441,7 @@ async def run_codex_exec(
                 produced_activity = bool(
                     text_parts
                     or seen_reasoning
+                    or message_buffer.has_pending
                     or started_tool_ids
                     or finished_tool_ids
                     or seen_artifacts
@@ -12256,6 +12496,15 @@ async def run_codex_exec(
     if proc.stderr:
         stderr = (await proc.stderr.read()).decode("utf-8", "replace").strip()
     stopped = run_id in STOPPED_RUNS
+    await flush_agent_message(
+        final=(
+            not stopped
+            and not stream_error
+            and not idle_killed
+            and not resume_stalled
+            and proc.returncode in (0, None)
+        )
+    )
     terminal_error = codex_error or stderr
     produced_activity = bool(
         text_parts
@@ -12522,15 +12771,18 @@ async def run_codex_app_server(
             **current_metadata(),
         })
 
-    async def emit_reasoning(value: Any) -> None:
+    async def emit_reasoning(value: Any, *, phase: str = "") -> None:
         text = str(value or "").strip()
         if not text or text in seen_reasoning:
             return
         seen_reasoning.add(text)
-        await append_event(session_id, "reasoning_summary", {
+        payload = {
             "run_id": current_run_id,
             "text": text,
-        })
+        }
+        if phase:
+            payload["phase"] = phase
+        await append_event(session_id, "reasoning_summary", payload)
 
     async def flush_pending_unknown(*, final: bool) -> None:
         nonlocal pending_unknown_message
@@ -12541,7 +12793,7 @@ async def run_codex_app_server(
         if final:
             await emit_final_text(text)
         else:
-            await emit_reasoning(text)
+            await emit_reasoning(text, phase="commentary")
 
     async def emit_tool_started(tool: dict[str, Any]) -> None:
         tool_id = str(tool.get("id") or "")
@@ -12960,7 +13212,7 @@ async def run_codex_app_server(
                 phase = str(item.get("phase") or "")
                 if phase == "commentary":
                     await flush_pending_unknown(final=False)
-                    await emit_reasoning(text)
+                    await emit_reasoning(text, phase="commentary")
                 elif phase == "final_answer":
                     await flush_pending_unknown(final=False)
                     await emit_final_text(text)
@@ -14780,17 +15032,38 @@ async def session_terminal(
 
 
 @app.websocket("/api/sessions/{session_id}/events")
-async def session_events(session_id: str, ws: WebSocket, after: int = 0) -> None:
+async def session_events(
+    session_id: str,
+    ws: WebSocket,
+    after: int = 0,
+    visible: bool = False,
+) -> None:
     if not websocket_authorized(ws):
         await ws.close(code=4401)
         return
     if session_id not in STORE.sessions:
         await ws.close(code=4404)
         return
-    await HUB.subscribe(session_id, ws)
+    await ws.accept()
     try:
-        for event in read_events(session_id, after=after):
-            await ws.send_json(event)
+        cursor = max(0, int(after or 0))
+        boundary = last_event_seq_from_file(events_path(session_id))
+        cursor = await send_event_catchup(
+            session_id,
+            ws,
+            after=cursor,
+            through=boundary,
+            visible=visible,
+        )
+        async with HUB.register_accepted_for_catchup(session_id, ws):
+            gap_boundary = last_event_seq_from_file(events_path(session_id))
+            await send_event_catchup(
+                session_id,
+                ws,
+                after=cursor,
+                through=gap_boundary,
+                visible=visible,
+            )
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:

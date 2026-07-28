@@ -461,6 +461,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             [payload["text"] for payload in reasoning],
             ["Working through it."],
         )
+        self.assertEqual(reasoning[0]["phase"], "commentary")
         self.assertEqual(
             [payload["text"] for payload in assistant],
             ["Completed result."],

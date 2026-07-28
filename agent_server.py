@@ -2490,6 +2490,7 @@ async def publish_turn_code_diff(
 
 EVENT_SEQ_CACHE: dict[str, int] = {}
 EVENT_SEQ_LOCK = asyncio.Lock()
+EVENT_DELIVERY_LOCKS: dict[str, asyncio.Lock] = {}
 TIMELINE_INDEX_CACHE_MAX = int(agentsdock_setting("TIMELINE_INDEX_CACHE_MAX", "24"))
 TIMELINE_INDEX_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 TIMELINE_INDEX_LOCKS: dict[str, threading.Lock] = {}
@@ -2555,9 +2556,15 @@ async def next_event_seq(session_id: str, path: Path) -> int:
         return seq
 
 
+def event_delivery_lock(session_id: str) -> asyncio.Lock:
+    """Serialize persisted and live event delivery within one chat."""
+    return EVENT_DELIVERY_LOCKS.setdefault(session_id, asyncio.Lock())
+
+
 async def forget_event_seq(session_id: str) -> None:
     async with EVENT_SEQ_LOCK:
         EVENT_SEQ_CACHE.pop(session_id, None)
+    EVENT_DELIVERY_LOCKS.pop(session_id, None)
     TIMELINE_INDEX_CACHE.pop(session_id, None)
     TIMELINE_INDEX_LOCKS.pop(session_id, None)
     FORK_INTERNAL_RUN_CACHE.pop(session_id, None)
@@ -3670,16 +3677,10 @@ class SubscriberHub:
                 if not subs:
                     self._subscribers.pop(sid, None)
 
-    @asynccontextmanager
-    async def register_accepted_for_catchup(
-        self,
-        sid: str,
-        ws: WebSocket,
-    ) -> Iterator[None]:
-        """Register an accepted socket while broadcasts wait behind catch-up."""
+    async def register_accepted(self, sid: str, ws: WebSocket) -> None:
+        """Register a socket that has already completed its catch-up."""
         async with self._lock:
             self._subscribers.setdefault(sid, set()).add(ws)
-            yield
 
     async def broadcast(self, sid: str, event: dict[str, Any]) -> None:
         async with self._lock:
@@ -3751,33 +3752,34 @@ def run_event_metadata(run_id: str) -> dict[str, Any]:
 
 
 async def append_event(session_id: str, event_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    ensure_dirs(session_id)
-    path = events_path(session_id)
-    seq = await next_event_seq(session_id, path)
-    ts = now_iso()
-    stored_payload = dict(payload or {})
-    output = stored_payload.get("output")
-    if event_type == "tool_finished" and output is not None:
-        output_text = event_output_text(output)
-        if len(output_text) > CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS:
-            stored_payload["output"] = bounded_codex_output_text(output_text)
-            stored_payload["output_chars"] = len(output_text)
-            stored_payload["output_truncated"] = True
-    event = {
-        "seq": seq,
-        "id": f"evt_{uuid.uuid4().hex[:16]}",
-        "session_id": session_id,
-        "type": event_type,
-        "ts": ts,
-        **stored_payload,
-    }
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(event, separators=(",", ":")) + "\n")
-    HISTORY_SEARCH_DIRTY.add(session_id)
-    await update_session_event_metadata(session_id, event)
-    if event_files_belong_to_session(event, session_id):
-        await HUB.broadcast(session_id, client_safe_event(event))
-    return event
+    async with event_delivery_lock(session_id):
+        ensure_dirs(session_id)
+        path = events_path(session_id)
+        seq = await next_event_seq(session_id, path)
+        ts = now_iso()
+        stored_payload = dict(payload or {})
+        output = stored_payload.get("output")
+        if event_type == "tool_finished" and output is not None:
+            output_text = event_output_text(output)
+            if len(output_text) > CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS:
+                stored_payload["output"] = bounded_codex_output_text(output_text)
+                stored_payload["output_chars"] = len(output_text)
+                stored_payload["output_truncated"] = True
+        event = {
+            "seq": seq,
+            "id": f"evt_{uuid.uuid4().hex[:16]}",
+            "session_id": session_id,
+            "type": event_type,
+            "ts": ts,
+            **stored_payload,
+        }
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, separators=(",", ":")) + "\n")
+        HISTORY_SEARCH_DIRTY.add(session_id)
+        await update_session_event_metadata(session_id, event)
+        if event_files_belong_to_session(event, session_id):
+            await HUB.broadcast(session_id, client_safe_event(event))
+        return event
 
 
 def is_agent_visible_event(event_type: str, event: dict[str, Any]) -> bool:
@@ -11380,10 +11382,10 @@ def bounded_codex_output_text(value: Any) -> str:
     text = codex_output_text(value)
     if len(text) <= CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS:
         return text
-    return (
-        "[Earlier tool output truncated by AgentsServer]\n"
-        + text[-CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS:]
-    )
+    omitted = len(text) - CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS
+    marker = f"[AgentsDock omitted {omitted} earlier tool-output characters]\n"
+    tail_chars = max(0, CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS - len(marker))
+    return marker + (text[-tail_chars:] if tail_chars else "")
 
 
 def codex_exec_raw_event_text(line: str, *, handled: bool) -> str:
@@ -11467,13 +11469,16 @@ class CodexExecMessageBuffer:
 
     def __init__(self) -> None:
         self.pending = ""
-        self.classified: set[str] = set()
+        self.commentary_emitted: set[str] = set()
+        self.final_emitted = False
 
     @property
     def has_pending(self) -> bool:
         return bool(self.pending)
 
     def observe(self, text: str, phase: str = "") -> list[tuple[str, str]]:
+        if self.final_emitted:
+            return []
         normalized = clean_assistant_text(text)
         if not normalized:
             return []
@@ -11484,12 +11489,16 @@ class CodexExecMessageBuffer:
                 outputs.extend(self.flush(final=False))
             elif self.pending == normalized:
                 self.pending = ""
-            if normalized in self.classified:
+            if normalized_phase == "final_answer":
+                self.final_emitted = True
+                outputs.append(("final_answer", normalized))
                 return outputs
-            self.classified.add(normalized)
-            outputs.append((normalized_phase, normalized))
+            if normalized in self.commentary_emitted:
+                return outputs
+            self.commentary_emitted.add(normalized)
+            outputs.append(("commentary", normalized))
             return outputs
-        if normalized in self.classified or normalized == self.pending:
+        if normalized == self.pending:
             return []
         outputs = self.flush(final=False)
         self.pending = normalized
@@ -11498,10 +11507,15 @@ class CodexExecMessageBuffer:
     def flush(self, *, final: bool) -> list[tuple[str, str]]:
         text = self.pending
         self.pending = ""
-        if not text or text in self.classified:
+        if not text or self.final_emitted:
             return []
-        self.classified.add(text)
-        return [("final_answer" if final else "commentary", text)]
+        if final:
+            self.final_emitted = True
+            return [("final_answer", text)]
+        if text in self.commentary_emitted:
+            return []
+        self.commentary_emitted.add(text)
+        return [("commentary", text)]
 
 
 def codex_turn_matches_client_user_message(
@@ -12313,7 +12327,7 @@ async def run_codex_exec(
             "run_id": run_id,
             "tool_id": tool_id,
             "tool": tool,
-            "output": bounded_codex_output_text(output_text),
+            "output": output_text,
             "exit_code": exit_code,
         })
 
@@ -12502,6 +12516,7 @@ async def run_codex_exec(
             and not stream_error
             and not idle_killed
             and not resume_stalled
+            and not codex_error
             and proc.returncode in (0, None)
         )
     )
@@ -12824,7 +12839,7 @@ async def run_codex_app_server(
             "run_id": current_run_id,
             "tool_id": tool_id,
             "tool": tool_calls.get(tool_id) or tool,
-            "output": bounded_codex_output_text(output),
+            "output": output,
             "exit_code": exit_code,
             "is_error": is_error,
         })
@@ -15036,7 +15051,7 @@ async def session_events(
     session_id: str,
     ws: WebSocket,
     after: int = 0,
-    visible: bool = False,
+    visible: bool | None = None,
 ) -> None:
     if not websocket_authorized(ws):
         await ws.close(code=4401)
@@ -15047,23 +15062,43 @@ async def session_events(
     await ws.accept()
     try:
         cursor = max(0, int(after or 0))
-        boundary = last_event_seq_from_file(events_path(session_id))
-        cursor = await send_event_catchup(
-            session_id,
-            ws,
-            after=cursor,
-            through=boundary,
-            visible=visible,
-        )
-        async with HUB.register_accepted_for_catchup(session_id, ws):
-            gap_boundary = last_event_seq_from_file(events_path(session_id))
-            await send_event_catchup(
+        if visible is None:
+            # Preserve the bounded legacy handshake for clients that have not
+            # opted into full filtered catch-up (including current iOS builds).
+            async with event_delivery_lock(session_id):
+                legacy_events = await asyncio.to_thread(
+                    read_events,
+                    session_id,
+                    after=cursor,
+                )
+                for event in legacy_events:
+                    await asyncio.wait_for(
+                        ws.send_json(event),
+                        timeout=WEBSOCKET_SEND_TIMEOUT_SECONDS,
+                    )
+                await HUB.register_accepted(session_id, ws)
+        else:
+            boundary = last_event_seq_from_file(events_path(session_id))
+            cursor = await send_event_catchup(
                 session_id,
                 ws,
                 after=cursor,
-                through=gap_boundary,
+                through=boundary,
                 visible=visible,
             )
+            # The delivery lock closes the replay/register race for this chat:
+            # racing appends finish before the gap boundary, while later
+            # appends cannot write until the socket has been registered.
+            async with event_delivery_lock(session_id):
+                gap_boundary = last_event_seq_from_file(events_path(session_id))
+                await send_event_catchup(
+                    session_id,
+                    ws,
+                    after=cursor,
+                    through=gap_boundary,
+                    visible=visible,
+                )
+                await HUB.register_accepted(session_id, ws)
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:

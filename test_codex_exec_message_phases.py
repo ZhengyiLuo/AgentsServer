@@ -77,6 +77,59 @@ class CodexExecMessagePhaseTests(unittest.TestCase):
             [("commentary", "I am checking that now.")],
         )
 
+    def test_delayed_phase_markers_do_not_lose_the_final_answer(self) -> None:
+        buffer = CodexExecMessageBuffer()
+
+        self.assertEqual(buffer.observe("Completed result."), [])
+        self.assertEqual(
+            buffer.observe("Still working.", "commentary"),
+            [
+                ("commentary", "Completed result."),
+                ("commentary", "Still working."),
+            ],
+        )
+        self.assertEqual(
+            buffer.observe("Completed result.", "final_answer"),
+            [("final_answer", "Completed result.")],
+        )
+        self.assertEqual(buffer.flush(final=True), [])
+
+    def test_same_text_can_be_promoted_from_commentary_to_final(self) -> None:
+        buffer = CodexExecMessageBuffer()
+
+        self.assertEqual(
+            buffer.observe("Result text.", "commentary"),
+            [("commentary", "Result text.")],
+        )
+        self.assertEqual(buffer.observe("Result text."), [])
+        self.assertEqual(
+            buffer.flush(final=True),
+            [("final_answer", "Result text.")],
+        )
+
+    def test_only_one_explicit_final_is_emitted(self) -> None:
+        buffer = CodexExecMessageBuffer()
+
+        self.assertEqual(
+            buffer.observe("Done.", "final_answer"),
+            [("final_answer", "Done.")],
+        )
+        self.assertEqual(buffer.observe("Late progress.", "commentary"), [])
+        self.assertEqual(buffer.observe("Different final.", "final_answer"), [])
+        self.assertEqual(buffer.observe("Phase-less late copy."), [])
+
+    def test_pending_commentary_precedes_a_different_explicit_final(self) -> None:
+        buffer = CodexExecMessageBuffer()
+
+        self.assertEqual(buffer.observe("Checking now."), [])
+        self.assertEqual(
+            buffer.observe("Finished.", "final_answer"),
+            [
+                ("commentary", "Checking now."),
+                ("final_answer", "Finished."),
+            ],
+        )
+
     def test_recognized_raw_events_are_not_persisted_twice(self) -> None:
         self.assertEqual(
             codex_exec_raw_event_text('{"type":"item.completed"}', handled=True),

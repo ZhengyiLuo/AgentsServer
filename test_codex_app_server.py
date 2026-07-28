@@ -9,6 +9,7 @@ from codex_app_server import (
     CodexAppServerClient,
     CodexAppServerDisconnected,
     CodexAppServerManager,
+    CodexAppServerProtocolError,
     CodexAppServerRequestError,
     CodexAppServerSubscriptionClosed,
     CodexAppServerTimeout,
@@ -310,6 +311,283 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(CodexAppServerSubscriptionClosed):
             await fork_events.next_notification(timeout=1)
         await wait_until(lambda: not client.is_thread_loaded("thr_fork"))
+
+    async def test_native_thread_controls_validate_and_send_exact_payloads(self) -> None:
+        factory = FakeProcessFactory()
+        process = factory.process
+        goal = {
+            "threadId": "thr_controls",
+            "objective": "Finish the integration",
+            "status": "active",
+            "tokenBudget": 40000,
+            "tokensUsed": 123,
+            "timeUsedSeconds": 9,
+            "createdAt": 100,
+            "updatedAt": 101,
+        }
+
+        def profiles(message: dict[str, Any]) -> dict[str, Any]:
+            if message["params"].get("cursor") == "profiles-page-2":
+                return {
+                    "data": [
+                        {
+                            "id": "workspace",
+                            "allowed": True,
+                            "description": "Workspace access",
+                        }
+                    ],
+                    "nextCursor": None,
+                }
+            return {
+                "data": [
+                    {
+                        "id": "read-only",
+                        "allowed": True,
+                        "description": None,
+                    }
+                ],
+                "nextCursor": "profiles-page-2",
+            }
+
+        def terminals(message: dict[str, Any]) -> dict[str, Any]:
+            process_id = (
+                "terminal-2"
+                if message["params"].get("cursor") == "terminals-page-2"
+                else "terminal-1"
+            )
+            return {
+                "data": [
+                    {
+                        "itemId": f"item-{process_id}",
+                        "processId": process_id,
+                        "command": "python3 -m http.server",
+                        "cwd": "/repo",
+                        "osPid": 1234,
+                        "cpuPercent": 1.5,
+                        "rssKb": 2048,
+                    }
+                ],
+                "nextCursor": (
+                    None
+                    if process_id == "terminal-2"
+                    else "terminals-page-2"
+                ),
+            }
+
+        process.responders.update(
+            {
+                "permissionProfile/list": profiles,
+                "thread/goal/set": lambda _: {"goal": goal},
+                "thread/goal/get": lambda _: {"goal": goal},
+                "thread/goal/clear": lambda _: {"cleared": True},
+                "thread/compact/start": lambda _: {},
+                "thread/rollback": lambda _: {
+                    "thread": {"id": "thr_controls", "turns": []}
+                },
+                "review/start": lambda _: {
+                    "reviewThreadId": "thr_controls",
+                    "turn": {
+                        "id": "turn_review",
+                        "status": "inProgress",
+                        "items": [],
+                    },
+                },
+                "thread/shellCommand": lambda _: {},
+                "thread/backgroundTerminals/list": terminals,
+                "thread/backgroundTerminals/terminate": lambda _: {
+                    "terminated": True
+                },
+                "thread/backgroundTerminals/clean": lambda _: {},
+            }
+        )
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+
+        self.assertEqual(
+            await client.list_permission_profiles(cwd="/repo", page_size=1),
+            [
+                {"id": "read-only", "allowed": True, "description": None},
+                {
+                    "id": "workspace",
+                    "allowed": True,
+                    "description": "Workspace access",
+                },
+            ],
+        )
+        self.assertEqual(
+            await client.set_thread_goal(
+                "thr_controls",
+                objective="Finish the integration",
+                status="active",
+                token_budget=40000,
+            ),
+            goal,
+        )
+        self.assertEqual(await client.get_thread_goal("thr_controls"), goal)
+        self.assertTrue(await client.clear_thread_goal("thr_controls"))
+        await client.compact_thread("thr_controls")
+        self.assertEqual(
+            await client.rollback_thread("thr_controls", num_turns=2),
+            {"id": "thr_controls", "turns": []},
+        )
+        self.assertEqual(
+            await client.start_review(
+                "thr_controls",
+                {"type": "commit", "sha": "abc123", "title": "The change"},
+            ),
+            {
+                "reviewThreadId": "thr_controls",
+                "turn": {
+                    "id": "turn_review",
+                    "status": "inProgress",
+                    "items": [],
+                },
+            },
+        )
+        await client.run_thread_shell_command("thr_controls", "git status --short")
+        self.assertEqual(
+            [item["processId"] for item in await client.list_background_terminals(
+                "thr_controls",
+                page_size=1,
+            )],
+            ["terminal-1", "terminal-2"],
+        )
+        self.assertTrue(
+            await client.terminate_background_terminal(
+                "thr_controls",
+                "terminal-1",
+            )
+        )
+        await client.clean_background_terminals("thr_controls")
+
+        requests = [
+            message
+            for message in process.messages
+            if message.get("id") is not None and message.get("method") != "initialize"
+        ]
+        by_method: dict[str, list[dict[str, Any]]] = {}
+        for message in requests:
+            by_method.setdefault(message["method"], []).append(message)
+        self.assertEqual(
+            [message["params"] for message in by_method["permissionProfile/list"]],
+            [
+                {"cwd": "/repo", "limit": 1},
+                {"cwd": "/repo", "limit": 1, "cursor": "profiles-page-2"},
+            ],
+        )
+        self.assertEqual(
+            by_method["thread/goal/set"][0]["params"],
+            {
+                "threadId": "thr_controls",
+                "objective": "Finish the integration",
+                "status": "active",
+                "tokenBudget": 40000,
+            },
+        )
+        self.assertEqual(
+            by_method["thread/goal/get"][0]["params"],
+            {"threadId": "thr_controls"},
+        )
+        self.assertEqual(
+            by_method["thread/goal/clear"][0]["params"],
+            {"threadId": "thr_controls"},
+        )
+        self.assertEqual(
+            by_method["thread/rollback"][0]["params"],
+            {"threadId": "thr_controls", "numTurns": 2},
+        )
+        self.assertEqual(
+            by_method["review/start"][0]["params"],
+            {
+                "threadId": "thr_controls",
+                "target": {
+                    "type": "commit",
+                    "sha": "abc123",
+                    "title": "The change",
+                },
+                "delivery": "inline",
+            },
+        )
+        self.assertEqual(
+            by_method["thread/shellCommand"][0]["params"],
+            {
+                "threadId": "thr_controls",
+                "command": "git status --short",
+            },
+        )
+        self.assertEqual(
+            [
+                message["params"]
+                for message in by_method["thread/backgroundTerminals/list"]
+            ],
+            [
+                {"threadId": "thr_controls", "limit": 1},
+                {
+                    "threadId": "thr_controls",
+                    "limit": 1,
+                    "cursor": "terminals-page-2",
+                },
+            ],
+        )
+        self.assertEqual(
+            by_method["thread/backgroundTerminals/terminate"][0]["params"],
+            {"threadId": "thr_controls", "processId": "terminal-1"},
+        )
+
+    async def test_native_thread_controls_fail_closed_on_invalid_contracts(
+        self,
+    ) -> None:
+        factory = FakeProcessFactory()
+        process = factory.process
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+
+        with self.assertRaises(ValueError):
+            await client.set_thread_goal("thr", objective="")
+        with self.assertRaises(ValueError):
+            await client.set_thread_goal("thr", status="finished")
+        with self.assertRaises(ValueError):
+            await client.rollback_thread("thr", num_turns=0)
+        with self.assertRaises(ValueError):
+            await client.start_review("thr", {"type": "commit", "sha": ""})
+        with self.assertRaises(ValueError):
+            await client.run_thread_shell_command("thr", " ")
+
+        process.responders["thread/goal/get"] = lambda _: {
+            "goal": {
+                "threadId": "different-thread",
+                "objective": "Wrong",
+                "status": "active",
+                "tokensUsed": 0,
+                "timeUsedSeconds": 0,
+                "createdAt": 1,
+                "updatedAt": 1,
+            }
+        }
+        with self.assertRaises(CodexAppServerProtocolError):
+            await client.get_thread_goal("thr")
+
+        process.responders["permissionProfile/list"] = lambda _: {
+            "data": [{"id": "broken", "allowed": "yes"}],
+            "nextCursor": None,
+        }
+        with self.assertRaises(CodexAppServerProtocolError):
+            await client.list_permission_profiles()
+
+        process.responders["thread/backgroundTerminals/list"] = lambda _: {
+            "data": [
+                {
+                    "itemId": "item",
+                    "processId": "1",
+                    "command": "sleep 1",
+                    "cwd": "/repo",
+                    "cpuPercent": "busy",
+                }
+            ],
+            "nextCursor": None,
+        }
+        with self.assertRaises(CodexAppServerProtocolError):
+            await client.list_background_terminals("thr")
 
     async def test_multiplexed_turns_route_by_thread_and_turn(self) -> None:
         factory = FakeProcessFactory()
@@ -751,6 +1029,7 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
         factory.process.responders["thread/start"] = lambda _: {
             "thread": {"id": "thr_manager"}
         }
+        factory.process.responders["thread/compact/start"] = lambda _: {}
         manager = CodexAppServerManager(
             "codex",
             cwd="/tmp",
@@ -765,6 +1044,11 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(manager.ready)
         self.assertTrue(manager.is_thread_loaded("thr_manager"))
         self.assertEqual(len(factory.calls), 1)
+        await manager.compact_thread("thr_manager")
+        self.assertEqual(
+            factory.process.messages[-1]["method"],
+            "thread/compact/start",
+        )
 
 
 if __name__ == "__main__":

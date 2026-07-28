@@ -87,6 +87,134 @@ ServerRequestHandler = Callable[
     Awaitable[dict[str, Any]] | dict[str, Any],
 ]
 
+_THREAD_GOAL_STATUSES = frozenset(
+    {
+        "active",
+        "paused",
+        "blocked",
+        "usageLimited",
+        "budgetLimited",
+        "complete",
+    }
+)
+_TURN_STATUSES = frozenset({"completed", "interrupted", "failed", "inProgress"})
+_REVIEW_DELIVERIES = frozenset({"inline", "detached"})
+_REVIEW_TARGET_TYPES = frozenset(
+    {"uncommittedChanges", "baseBranch", "commit", "custom"}
+)
+
+
+class _OmittedType:
+    """Sentinel that distinguishes an omitted optional field from JSON null."""
+
+
+_OMITTED = _OmittedType()
+
+
+def _require_nonempty_string(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+    return value
+
+
+def _protocol_object(method: str, result: Any) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        raise CodexAppServerProtocolError(
+            f"{method} did not return an object",
+            request_sent=True,
+            safe_to_retry=False,
+        )
+    return result
+
+
+def _protocol_empty_object(method: str, result: Any) -> None:
+    _protocol_object(method, result)
+
+
+def _protocol_cursor(method: str, result: dict[str, Any]) -> str | None:
+    cursor = result.get("nextCursor")
+    if cursor is not None and not isinstance(cursor, str):
+        raise CodexAppServerProtocolError(
+            f"{method} returned an invalid next cursor",
+            request_sent=True,
+            safe_to_retry=False,
+        )
+    return cursor
+
+
+def _protocol_thread_goal(
+    method: str,
+    goal: Any,
+    *,
+    thread_id: str,
+) -> dict[str, Any]:
+    if not isinstance(goal, dict):
+        raise CodexAppServerProtocolError(
+            f"{method} did not return a goal object",
+            request_sent=True,
+            safe_to_retry=False,
+        )
+    if goal.get("threadId") != thread_id:
+        raise CodexAppServerProtocolError(
+            f"{method} returned a goal for a different thread",
+            request_sent=True,
+            safe_to_retry=False,
+        )
+    if not isinstance(goal.get("objective"), str) or not goal["objective"]:
+        raise CodexAppServerProtocolError(
+            f"{method} returned an invalid goal objective",
+            request_sent=True,
+            safe_to_retry=False,
+        )
+    if goal.get("status") not in _THREAD_GOAL_STATUSES:
+        raise CodexAppServerProtocolError(
+            f"{method} returned an invalid goal status",
+            request_sent=True,
+            safe_to_retry=False,
+        )
+    for field in (
+        "createdAt",
+        "updatedAt",
+        "tokensUsed",
+        "timeUsedSeconds",
+    ):
+        value = goal.get(field)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise CodexAppServerProtocolError(
+                f"{method} returned an invalid goal {field}",
+                request_sent=True,
+                safe_to_retry=False,
+            )
+    token_budget = goal.get("tokenBudget")
+    if (
+        token_budget is not None
+        and (isinstance(token_budget, bool) or not isinstance(token_budget, int))
+    ):
+        raise CodexAppServerProtocolError(
+            f"{method} returned an invalid goal tokenBudget",
+            request_sent=True,
+            safe_to_retry=False,
+        )
+    return dict(goal)
+
+
+def _protocol_turn(method: str, turn: Any) -> dict[str, Any]:
+    if not isinstance(turn, dict) or not isinstance(turn.get("id"), str) or not turn["id"]:
+        raise CodexAppServerProtocolError(
+            f"{method} did not return a valid turn",
+            request_sent=True,
+            safe_to_retry=False,
+        )
+    if turn.get("status") not in _TURN_STATUSES or not isinstance(
+        turn.get("items"), list
+    ):
+        raise CodexAppServerProtocolError(
+            f"{method} returned an invalid turn payload",
+            request_sent=True,
+            safe_to_retry=False,
+        )
+    return dict(turn)
+
 
 def _notification_scope(notification: dict[str, Any]) -> tuple[str, str]:
     params = notification.get("params")
@@ -939,6 +1067,370 @@ class CodexAppServerClient:
             )
         return [turn for turn in data if isinstance(turn, dict)]
 
+    async def list_permission_profiles(
+        self,
+        *,
+        cwd: str | None = None,
+        page_size: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return every selectable permission profile across cursor pages."""
+
+        if cwd is not None:
+            _require_nonempty_string(cwd, "cwd")
+        if page_size is not None and (
+            isinstance(page_size, bool)
+            or not isinstance(page_size, int)
+            or page_size < 1
+        ):
+            raise ValueError("page_size must be a positive integer")
+
+        profiles: list[dict[str, Any]] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        while True:
+            params: dict[str, Any] = {}
+            if cwd is not None:
+                params["cwd"] = cwd
+            if page_size is not None:
+                params["limit"] = page_size
+            if cursor is not None:
+                params["cursor"] = cursor
+
+            method = "permissionProfile/list"
+            result = _protocol_object(method, await self.request(method, params))
+            data = result.get("data")
+            if not isinstance(data, list):
+                raise CodexAppServerProtocolError(
+                    f"{method} did not return a profile list",
+                    request_sent=True,
+                    safe_to_retry=False,
+                )
+            for profile in data:
+                if not isinstance(profile, dict):
+                    raise CodexAppServerProtocolError(
+                        f"{method} returned a non-object profile",
+                        request_sent=True,
+                        safe_to_retry=False,
+                    )
+                profile_id = profile.get("id")
+                allowed = profile.get("allowed")
+                description = profile.get("description")
+                if not isinstance(profile_id, str) or not profile_id:
+                    raise CodexAppServerProtocolError(
+                        f"{method} returned a profile without an id",
+                        request_sent=True,
+                        safe_to_retry=False,
+                    )
+                if not isinstance(allowed, bool) or (
+                    description is not None and not isinstance(description, str)
+                ):
+                    raise CodexAppServerProtocolError(
+                        f"{method} returned an invalid profile",
+                        request_sent=True,
+                        safe_to_retry=False,
+                    )
+                profiles.append(dict(profile))
+
+            cursor = _protocol_cursor(method, result)
+            if cursor is None:
+                return profiles
+            if cursor in seen_cursors:
+                raise CodexAppServerProtocolError(
+                    f"{method} repeated a pagination cursor",
+                    request_sent=True,
+                    safe_to_retry=False,
+                )
+            seen_cursors.add(cursor)
+
+    async def set_thread_goal(
+        self,
+        thread_id: str,
+        *,
+        objective: str | None | _OmittedType = _OMITTED,
+        status: str | None | _OmittedType = _OMITTED,
+        token_budget: int | None | _OmittedType = _OMITTED,
+    ) -> dict[str, Any]:
+        """Set or update the native persisted goal for a thread."""
+
+        thread_id = _require_nonempty_string(thread_id, "thread_id")
+        params: dict[str, Any] = {"threadId": thread_id}
+        if objective is not _OMITTED:
+            if objective is not None:
+                if not isinstance(objective, str) or not objective.strip():
+                    raise ValueError("objective must be a non-empty string")
+                if len(objective) > 4000:
+                    raise ValueError("objective must be at most 4000 characters")
+            params["objective"] = objective
+        if status is not _OMITTED:
+            if status is not None and status not in _THREAD_GOAL_STATUSES:
+                raise ValueError(f"invalid thread goal status: {status}")
+            params["status"] = status
+        if token_budget is not _OMITTED:
+            if token_budget is not None and (
+                isinstance(token_budget, bool) or not isinstance(token_budget, int)
+            ):
+                raise ValueError("token_budget must be an integer or null")
+            params["tokenBudget"] = token_budget
+
+        method = "thread/goal/set"
+        result = _protocol_object(method, await self.request(method, params))
+        return _protocol_thread_goal(
+            method,
+            result.get("goal"),
+            thread_id=thread_id,
+        )
+
+    async def get_thread_goal(self, thread_id: str) -> dict[str, Any] | None:
+        thread_id = _require_nonempty_string(thread_id, "thread_id")
+        method = "thread/goal/get"
+        result = _protocol_object(
+            method,
+            await self.request(method, {"threadId": thread_id}),
+        )
+        goal = result.get("goal")
+        if goal is None:
+            return None
+        return _protocol_thread_goal(method, goal, thread_id=thread_id)
+
+    async def clear_thread_goal(self, thread_id: str) -> bool:
+        thread_id = _require_nonempty_string(thread_id, "thread_id")
+        method = "thread/goal/clear"
+        result = _protocol_object(
+            method,
+            await self.request(method, {"threadId": thread_id}),
+        )
+        cleared = result.get("cleared")
+        if not isinstance(cleared, bool):
+            raise CodexAppServerProtocolError(
+                f"{method} did not return a cleared flag",
+                request_sent=True,
+                safe_to_retry=False,
+            )
+        return cleared
+
+    async def compact_thread(self, thread_id: str) -> None:
+        thread_id = _require_nonempty_string(thread_id, "thread_id")
+        method = "thread/compact/start"
+        _protocol_empty_object(
+            method,
+            await self.request(method, {"threadId": thread_id}),
+        )
+
+    async def rollback_thread(
+        self,
+        thread_id: str,
+        *,
+        num_turns: int,
+    ) -> dict[str, Any]:
+        thread_id = _require_nonempty_string(thread_id, "thread_id")
+        if (
+            isinstance(num_turns, bool)
+            or not isinstance(num_turns, int)
+            or num_turns < 1
+        ):
+            raise ValueError("num_turns must be a positive integer")
+        method = "thread/rollback"
+        result = _protocol_object(
+            method,
+            await self.request(
+                method,
+                {"threadId": thread_id, "numTurns": num_turns},
+                timeout=self.lifecycle_timeout,
+            ),
+        )
+        thread = result.get("thread")
+        if not isinstance(thread, dict) or thread.get("id") != thread_id:
+            raise CodexAppServerProtocolError(
+                f"{method} did not return the requested thread",
+                request_sent=True,
+                safe_to_retry=False,
+            )
+        return dict(thread)
+
+    async def start_review(
+        self,
+        thread_id: str,
+        target: dict[str, Any],
+        *,
+        delivery: str = "inline",
+    ) -> dict[str, Any]:
+        thread_id = _require_nonempty_string(thread_id, "thread_id")
+        if delivery not in _REVIEW_DELIVERIES:
+            raise ValueError(f"invalid review delivery: {delivery}")
+        if not isinstance(target, dict):
+            raise ValueError("review target must be an object")
+        review_target = dict(target)
+        target_type = review_target.get("type")
+        if target_type not in _REVIEW_TARGET_TYPES:
+            raise ValueError(f"invalid review target type: {target_type}")
+        if target_type == "baseBranch":
+            _require_nonempty_string(review_target.get("branch"), "target.branch")
+        elif target_type == "commit":
+            _require_nonempty_string(review_target.get("sha"), "target.sha")
+            title = review_target.get("title")
+            if title is not None and not isinstance(title, str):
+                raise ValueError("target.title must be a string or null")
+        elif target_type == "custom":
+            _require_nonempty_string(
+                review_target.get("instructions"),
+                "target.instructions",
+            )
+
+        method = "review/start"
+        result = _protocol_object(
+            method,
+            await self.request(
+                method,
+                {
+                    "threadId": thread_id,
+                    "target": review_target,
+                    "delivery": delivery,
+                },
+                timeout=self.lifecycle_timeout,
+            ),
+        )
+        review_thread_id = result.get("reviewThreadId")
+        if not isinstance(review_thread_id, str) or not review_thread_id:
+            raise CodexAppServerProtocolError(
+                f"{method} did not return a review thread id",
+                request_sent=True,
+                safe_to_retry=False,
+            )
+        if delivery == "inline" and review_thread_id != thread_id:
+            raise CodexAppServerProtocolError(
+                f"{method} returned a detached thread for an inline review",
+                request_sent=True,
+                safe_to_retry=False,
+            )
+        validated = dict(result)
+        validated["turn"] = _protocol_turn(method, result.get("turn"))
+        return validated
+
+    async def run_thread_shell_command(self, thread_id: str, command: str) -> None:
+        thread_id = _require_nonempty_string(thread_id, "thread_id")
+        command = _require_nonempty_string(command, "command")
+        method = "thread/shellCommand"
+        _protocol_empty_object(
+            method,
+            await self.request(
+                method,
+                {"threadId": thread_id, "command": command},
+            ),
+        )
+
+    async def list_background_terminals(
+        self,
+        thread_id: str,
+        *,
+        page_size: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return every live background terminal across cursor pages."""
+
+        thread_id = _require_nonempty_string(thread_id, "thread_id")
+        if page_size is not None and (
+            isinstance(page_size, bool)
+            or not isinstance(page_size, int)
+            or page_size < 1
+        ):
+            raise ValueError("page_size must be a positive integer")
+
+        method = "thread/backgroundTerminals/list"
+        terminals: list[dict[str, Any]] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        while True:
+            params: dict[str, Any] = {"threadId": thread_id}
+            if page_size is not None:
+                params["limit"] = page_size
+            if cursor is not None:
+                params["cursor"] = cursor
+            result = _protocol_object(method, await self.request(method, params))
+            data = result.get("data")
+            if not isinstance(data, list):
+                raise CodexAppServerProtocolError(
+                    f"{method} did not return a terminal list",
+                    request_sent=True,
+                    safe_to_retry=False,
+                )
+            for terminal in data:
+                if not isinstance(terminal, dict):
+                    raise CodexAppServerProtocolError(
+                        f"{method} returned a non-object terminal",
+                        request_sent=True,
+                        safe_to_retry=False,
+                    )
+                for field in ("itemId", "processId", "command", "cwd"):
+                    if not isinstance(terminal.get(field), str):
+                        raise CodexAppServerProtocolError(
+                            f"{method} returned a terminal with invalid {field}",
+                            request_sent=True,
+                            safe_to_retry=False,
+                        )
+                for field in ("osPid", "rssKb"):
+                    value = terminal.get(field)
+                    if value is not None and (
+                        isinstance(value, bool) or not isinstance(value, int)
+                    ):
+                        raise CodexAppServerProtocolError(
+                            f"{method} returned a terminal with invalid {field}",
+                            request_sent=True,
+                            safe_to_retry=False,
+                        )
+                cpu_percent = terminal.get("cpuPercent")
+                if cpu_percent is not None and (
+                    isinstance(cpu_percent, bool)
+                    or not isinstance(cpu_percent, (int, float))
+                ):
+                    raise CodexAppServerProtocolError(
+                        f"{method} returned a terminal with invalid cpuPercent",
+                        request_sent=True,
+                        safe_to_retry=False,
+                    )
+                terminals.append(dict(terminal))
+
+            cursor = _protocol_cursor(method, result)
+            if cursor is None:
+                return terminals
+            if cursor in seen_cursors:
+                raise CodexAppServerProtocolError(
+                    f"{method} repeated a pagination cursor",
+                    request_sent=True,
+                    safe_to_retry=False,
+                )
+            seen_cursors.add(cursor)
+
+    async def terminate_background_terminal(
+        self,
+        thread_id: str,
+        process_id: str,
+    ) -> bool:
+        thread_id = _require_nonempty_string(thread_id, "thread_id")
+        process_id = _require_nonempty_string(process_id, "process_id")
+        method = "thread/backgroundTerminals/terminate"
+        result = _protocol_object(
+            method,
+            await self.request(
+                method,
+                {"threadId": thread_id, "processId": process_id},
+            ),
+        )
+        terminated = result.get("terminated")
+        if not isinstance(terminated, bool):
+            raise CodexAppServerProtocolError(
+                f"{method} did not return a terminated flag",
+                request_sent=True,
+                safe_to_retry=False,
+            )
+        return terminated
+
+    async def clean_background_terminals(self, thread_id: str) -> None:
+        thread_id = _require_nonempty_string(thread_id, "thread_id")
+        method = "thread/backgroundTerminals/clean"
+        _protocol_empty_object(
+            method,
+            await self.request(method, {"threadId": thread_id}),
+        )
+
     async def unsubscribe_thread(self, thread_id: str) -> str:
         result = await self.request("thread/unsubscribe", {"threadId": thread_id})
         status = str(result.get("status") or "") if isinstance(result, dict) else ""
@@ -1214,6 +1706,86 @@ class CodexAppServerManager:
             items_view=items_view,
             sort_direction=sort_direction,
         )
+
+    async def list_permission_profiles(
+        self,
+        *,
+        cwd: str | None = None,
+        page_size: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return await self.client.list_permission_profiles(
+            cwd=cwd,
+            page_size=page_size,
+        )
+
+    async def set_thread_goal(
+        self,
+        thread_id: str,
+        *,
+        objective: str | None | _OmittedType = _OMITTED,
+        status: str | None | _OmittedType = _OMITTED,
+        token_budget: int | None | _OmittedType = _OMITTED,
+    ) -> dict[str, Any]:
+        return await self.client.set_thread_goal(
+            thread_id,
+            objective=objective,
+            status=status,
+            token_budget=token_budget,
+        )
+
+    async def get_thread_goal(self, thread_id: str) -> dict[str, Any] | None:
+        return await self.client.get_thread_goal(thread_id)
+
+    async def clear_thread_goal(self, thread_id: str) -> bool:
+        return await self.client.clear_thread_goal(thread_id)
+
+    async def compact_thread(self, thread_id: str) -> None:
+        await self.client.compact_thread(thread_id)
+
+    async def rollback_thread(
+        self,
+        thread_id: str,
+        *,
+        num_turns: int,
+    ) -> dict[str, Any]:
+        return await self.client.rollback_thread(thread_id, num_turns=num_turns)
+
+    async def start_review(
+        self,
+        thread_id: str,
+        target: dict[str, Any],
+        *,
+        delivery: str = "inline",
+    ) -> dict[str, Any]:
+        return await self.client.start_review(
+            thread_id,
+            target,
+            delivery=delivery,
+        )
+
+    async def run_thread_shell_command(self, thread_id: str, command: str) -> None:
+        await self.client.run_thread_shell_command(thread_id, command)
+
+    async def list_background_terminals(
+        self,
+        thread_id: str,
+        *,
+        page_size: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return await self.client.list_background_terminals(
+            thread_id,
+            page_size=page_size,
+        )
+
+    async def terminate_background_terminal(
+        self,
+        thread_id: str,
+        process_id: str,
+    ) -> bool:
+        return await self.client.terminate_background_terminal(thread_id, process_id)
+
+    async def clean_background_terminals(self, thread_id: str) -> None:
+        await self.client.clean_background_terminals(thread_id)
 
     async def unsubscribe_thread(self, thread_id: str) -> str:
         return await self.client.unsubscribe_thread(thread_id)

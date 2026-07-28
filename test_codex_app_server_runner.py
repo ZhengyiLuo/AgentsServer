@@ -346,6 +346,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.session,
             manifest,
             allow_exec_fallback=True,
+            interactive_app_server=False,
         )
         exec_runner.assert_not_awaited()
 
@@ -470,6 +471,72 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             finished.await_args.args[1]["result_text"],
             "Completed result.",
         )
+
+    async def test_interactive_turn_applies_saved_security_controls(self) -> None:
+        turn = FakeTurn(
+            [
+                agent_message("interactive-final", "Done.", "final_answer"),
+                completed_notification(),
+            ]
+        )
+        manager = FakeManager(turn)
+        session = {
+            **self.session,
+            "codex_approval_policy": "on-request",
+            "codex_sandbox_mode": "workspace-write",
+            "codex_approvals_reviewer": "user",
+        }
+        stack, _events, _finished, exec_fallback = self.runner_patches(manager)
+        with stack:
+            await agent_server.run_codex_app_server(
+                "chat-native",
+                "run-original",
+                "Interactive request",
+                session,
+                Path(self.cwd) / ".runner-test-manifest.json",
+                allow_exec_fallback=False,
+                interactive_app_server=True,
+            )
+
+        overrides = manager.turn_calls[0][2]
+        self.assertEqual(overrides["approvalPolicy"], "on-request")
+        self.assertEqual(
+            overrides["sandboxPolicy"],
+            {"type": "workspaceWrite"},
+        )
+        self.assertEqual(overrides["approvalsReviewer"], "user")
+        exec_fallback.assert_not_awaited()
+
+    async def test_permission_profile_never_combines_with_sandbox_policy(self) -> None:
+        turn = FakeTurn(
+            [
+                agent_message("profile-final", "Done.", "final_answer"),
+                completed_notification(),
+            ]
+        )
+        manager = FakeManager(turn)
+        session = {
+            **self.session,
+            "codex_permission_profile": ":read-only",
+            "codex_approval_policy": "on-request",
+            "codex_sandbox_mode": "workspace-write",
+        }
+        stack, _events, _finished, _exec_fallback = self.runner_patches(manager)
+        with stack:
+            await agent_server.run_codex_app_server(
+                "chat-native",
+                "run-original",
+                "Profile request",
+                session,
+                Path(self.cwd) / ".runner-test-manifest.json",
+                allow_exec_fallback=False,
+                interactive_app_server=True,
+            )
+
+        overrides = manager.turn_calls[0][2]
+        self.assertEqual(overrides["permissions"], ":read-only")
+        self.assertNotIn("sandboxPolicy", overrides)
+        self.assertEqual(overrides["approvalPolicy"], "on-request")
 
     async def test_explicit_turn_start_rejection_uses_exec_fallback(self) -> None:
         rejection = CodexAppServerRequestError(

@@ -62,6 +62,7 @@ from codex_app_server import (
     CodexAppServerManager,
     CodexAppServerRequestError,
     CodexAppServerSubscriptionClosed,
+    decline_server_request,
 )
 from update_runner import atomic_json as atomic_update_json
 from update_runner import ReleaseUnavailableError, check_release, utc_now as update_utc_now, version_key
@@ -194,6 +195,27 @@ CODEX_APP_SERVER_AMBIGUOUS_ACCEPT_SECONDS = max(
 CODEX_TRANSPORT_AUTO = "auto"
 CODEX_TRANSPORT_APP_SERVER = "app-server"
 CODEX_TRANSPORT_EXEC = "exec"
+CODEX_INTERACTIVE_CLIENT_CAPABILITY = "codex_interactive_v1"
+CODEX_APPROVAL_POLICIES = {"never", "on-request", "untrusted"}
+CODEX_SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
+CODEX_APPROVAL_REVIEWERS = {"user", "auto_review", "guardian_subagent"}
+CODEX_GOAL_STATUSES = {
+    "active",
+    "paused",
+    "blocked",
+    "usageLimited",
+    "budgetLimited",
+    "complete",
+}
+CODEX_INTERACTION_METHODS = {
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/tool/requestUserInput",
+    "item/permissions/requestApproval",
+    "mcpServer/elicitation/request",
+    "applyPatchApproval",
+    "execCommandApproval",
+}
 CODEX_TRANSPORT = agentsdock_setting("CODEX_TRANSPORT", CODEX_TRANSPORT_AUTO).strip().lower()
 if CODEX_TRANSPORT not in {CODEX_TRANSPORT_AUTO, CODEX_TRANSPORT_APP_SERVER, CODEX_TRANSPORT_EXEC}:
     CODEX_TRANSPORT = CODEX_TRANSPORT_AUTO
@@ -266,6 +288,11 @@ MAX_FORK_MEMORY_CHARS = int(agentsdock_setting("FORK_MEMORY_CHARS", "24000"))
 MAX_FORK_MEMORY_ITEM_CHARS = int(agentsdock_setting("FORK_MEMORY_ITEM_CHARS", "1800"))
 MAX_HANDOFF_DIGEST_CHARS = int(agentsdock_setting("HANDOFF_DIGEST_CHARS", "56000"))
 MAX_SESSION_SYSTEM_PROMPT_CHARS = int(agentsdock_setting("SESSION_SYSTEM_PROMPT_CHARS", "24000"))
+MAX_CODEX_GOAL_CHARS = 4_000
+MAX_CODEX_INTERACTION_TEXT_CHARS = 24_000
+MAX_CODEX_PENDING_INTERACTIONS = 128
+MAX_CODEX_APPROVAL_ITEM_CACHE = 256
+CODEX_PERMISSION_PROFILES_CACHE_SECONDS = 60.0
 HANDOFF_DIGEST_TIMEOUT_SECONDS = int(agentsdock_setting("HANDOFF_DIGEST_TIMEOUT_SECONDS", "180"))
 HANDOFF_DIGEST_BACKEND = agentsdock_setting("HANDOFF_DIGEST_BACKEND", BACKEND_CLAUDE).lower()
 if HANDOFF_DIGEST_BACKEND not in VALID_BACKENDS:
@@ -2624,6 +2651,10 @@ class CreateSessionRequest(BaseModel):
     session_id: str | None = None
     claude_session_id: str | None = None
     codex_thread_id: str | None = None
+    codex_approval_policy: Literal["never", "on-request", "untrusted"] | None = None
+    codex_sandbox_mode: Literal["read-only", "workspace-write", "danger-full-access"] | None = None
+    codex_permission_profile: str | None = Field(default=None, max_length=240)
+    codex_approvals_reviewer: Literal["user", "auto_review", "guardian_subagent"] | None = None
     import_history: bool | None = None
 
 
@@ -2637,6 +2668,10 @@ class UpdateSessionRequest(BaseModel):
     system_prompt: str | None = Field(default=None, max_length=MAX_SESSION_SYSTEM_PROMPT_CHARS)
     pinned: bool | None = None
     archived: bool | None = None
+    codex_approval_policy: Literal["never", "on-request", "untrusted"] | None = None
+    codex_sandbox_mode: Literal["read-only", "workspace-write", "danger-full-access"] | None = None
+    codex_permission_profile: str | None = Field(default=None, max_length=240)
+    codex_approvals_reviewer: Literal["user", "auto_review", "guardian_subagent"] | None = None
 
 
 class ReorderSessionRequest(BaseModel):
@@ -2664,6 +2699,7 @@ class TurnRequest(BaseModel):
     source_session_id: str | None = None
     target_session_id: str | None = None
     steer_interrupted_run_id: str | None = None
+    client_capabilities: list[str] = Field(default_factory=list, max_length=16)
 
 
 class UpdateQueuedTurnRequest(BaseModel):
@@ -2788,6 +2824,47 @@ class ServerUpdateRequest(BaseModel):
     version: str | None = None
 
 
+class CodexInteractionResponseRequest(BaseModel):
+    response: dict[str, Any]
+
+
+class CodexGoalRequest(BaseModel):
+    objective: str | None = Field(default=None, max_length=MAX_CODEX_GOAL_CHARS)
+    status: Literal[
+        "active",
+        "paused",
+        "blocked",
+        "usageLimited",
+        "budgetLimited",
+        "complete",
+    ] | None = None
+    token_budget: int | None = Field(default=None, ge=1)
+    time_budget_seconds: int | None = Field(default=None, ge=1)
+
+
+class CodexRollbackRequest(BaseModel):
+    num_turns: int = Field(ge=1, le=100)
+    confirmed: bool = False
+
+
+class CodexReviewRequest(BaseModel):
+    target: dict[str, Any]
+    delivery: Literal["inline", "detached"] = "inline"
+
+
+class CodexShellCommandRequest(BaseModel):
+    command: str = Field(min_length=1, max_length=32_000)
+    confirmed: bool = False
+
+
+class CodexBackgroundTerminalRequest(BaseModel):
+    process_id: str = Field(min_length=1, max_length=240)
+
+
+class CodexBackgroundTerminalsCleanRequest(BaseModel):
+    confirmed: bool = False
+
+
 class WorkspaceWriteRequest(BaseModel):
     path: str = Field(min_length=1, max_length=MAX_WORKSPACE_PATH_CHARS)
     content: str = Field(max_length=MAX_WORKSPACE_TEXT_BYTES)
@@ -2856,6 +2933,7 @@ class SessionStore:
     async def load(self) -> None:
         ensure_dirs()
         runtime_changed = False
+        CODEX_THREAD_SESSION_INDEX.clear()
         if SESSIONS_FILE.exists():
             try:
                 self.sessions = json.loads(SESSIONS_FILE.read_text())
@@ -2869,6 +2947,28 @@ class SessionStore:
             if normalized_effort != previous_effort:
                 sess["effort"] = normalized_effort
                 runtime_changed = True
+            if backend == BACKEND_CODEX:
+                provider_id = str(
+                    sess.get("codex_thread_id") or sess.get("session_id") or ""
+                ).strip()
+                if provider_id:
+                    CODEX_THREAD_SESSION_INDEX[provider_id] = str(
+                        sess.get("id") or ""
+                    )
+                # App-server status, token usage, and approval cards describe
+                # one live process. They cannot survive a server restart.
+                reset_values = {
+                    "codex_thread_status": {"type": "notLoaded"},
+                    "codex_pending_interaction_count": 0,
+                    "codex_needs_user_action": False,
+                }
+                for key, value in reset_values.items():
+                    if sess.get(key) != value:
+                        sess[key] = value
+                        runtime_changed = True
+                if "codex_token_usage" in sess:
+                    sess.pop("codex_token_usage", None)
+                    runtime_changed = True
         await self.ensure_sort_orders()
         if runtime_changed:
             await self.save()
@@ -2928,6 +3028,12 @@ class SessionStore:
             "session_id": active_provider_id,
             "claude_session_id": claude_session_id,
             "codex_thread_id": codex_thread_id,
+            "codex_approval_policy": req.codex_approval_policy or "never",
+            "codex_sandbox_mode": req.codex_sandbox_mode or "danger-full-access",
+            "codex_permission_profile": (
+                str(req.codex_permission_profile or "").strip() or None
+            ),
+            "codex_approvals_reviewer": req.codex_approvals_reviewer or "user",
             "parent_id": parent_id,
             "fork_from": None,
             "pinned": pinned,
@@ -2973,6 +3079,28 @@ class SessionStore:
             for key in ("title", "folder", "cwd"):
                 if key in patch and patch[key] is not None:
                     sess[key] = patch[key]
+            for key, default, allowed in (
+                ("codex_approval_policy", "never", CODEX_APPROVAL_POLICIES),
+                ("codex_sandbox_mode", "danger-full-access", CODEX_SANDBOX_MODES),
+                ("codex_approvals_reviewer", "user", CODEX_APPROVAL_REVIEWERS),
+            ):
+                if key not in patch:
+                    continue
+                value = str(patch[key] or default).strip()
+                if value not in allowed:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{key} must be one of {sorted(allowed)}",
+                    )
+                sess[key] = value
+            if "codex_permission_profile" in patch:
+                profile = str(patch["codex_permission_profile"] or "").strip()
+                if len(profile) > 240:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="codex_permission_profile must be at most 240 characters",
+                    )
+                sess["codex_permission_profile"] = profile or None
             if "system_prompt" in patch:
                 sess["system_prompt"] = clean_session_system_prompt(patch["system_prompt"])
             for key in ("model", "effort"):
@@ -3126,6 +3254,11 @@ class SessionStore:
             sess = self.sessions.get(sid)
             if not sess:
                 return
+            previous_codex_thread_id = (
+                str(sess.get("codex_thread_id") or sess.get("session_id") or "")
+                if backend == BACKEND_CODEX
+                else ""
+            )
             sess["session_id"] = provider_id
             sess["backend"] = sess.get("backend") or backend
             sess["claude_session_id" if backend == BACKEND_CLAUDE else "codex_thread_id"] = provider_id
@@ -3138,6 +3271,14 @@ class SessionStore:
                 sess["fork_from"] = None
             sess["updated_at"] = now_iso()
             await self.save()
+        if backend == BACKEND_CODEX:
+            if (
+                previous_codex_thread_id
+                and previous_codex_thread_id != provider_id
+                and CODEX_THREAD_SESSION_INDEX.get(previous_codex_thread_id) == sid
+            ):
+                CODEX_THREAD_SESSION_INDEX.pop(previous_codex_thread_id, None)
+            CODEX_THREAD_SESSION_INDEX[provider_id] = sid
 
 
 STORE = SessionStore()
@@ -3726,11 +3867,48 @@ CODEX_APP_SERVER_THREAD_LRU: OrderedDict[str, float] = OrderedDict()
 CODEX_APP_SERVER_PINNED_THREADS: set[str] = set()
 CODEX_APP_SERVER_EVICTING_THREADS: dict[str, asyncio.Event] = {}
 CODEX_APP_SERVER_THREAD_LRU_LOCK = asyncio.Lock()
+CODEX_THREAD_SESSION_INDEX: dict[str, str] = {}
+CODEX_PENDING_INTERACTIONS: dict[str, dict[str, Any]] = {}
+CODEX_PENDING_INTERACTIONS_LOCK = asyncio.Lock()
+CODEX_APPROVAL_ITEM_CACHE: OrderedDict[
+    tuple[str, str],
+    dict[str, Any],
+] = OrderedDict()
+CODEX_INTERACTIVE_CONTROL_THREADS: set[str] = set()
+CODEX_NATIVE_ACTION_TASKS: dict[tuple[str, str], asyncio.Task[Any]] = {}
+CODEX_BACKGROUND_TERMINALS_SUPPORTED: bool | None = None
+CODEX_PERMISSION_PROFILES_CACHE: dict[
+    str,
+    tuple[float, list[dict[str, Any]]],
+] = {}
 HANDOFF_DIGEST_JOBS: dict[str, dict[str, Any]] = {}
 HANDOFF_DIGEST_JOBS_LOCK = asyncio.Lock()
 HANDOFF_DIGEST_FINALIZING: set[str] = set()
 RUNTIME_DIAGNOSTICS: dict[str, dict[str, Any]] = {}
 RUNTIME_DIAGNOSTICS_LOCK = threading.RLock()
+
+
+async def reset_codex_ephemeral_runtime_metadata() -> None:
+    """Clear process-owned Codex state after transport shutdown or restart."""
+    changed = False
+    async with STORE._lock:
+        for session in STORE.sessions.values():
+            if str(session.get("backend") or DEFAULT_BACKEND) != BACKEND_CODEX:
+                continue
+            reset_values = {
+                "codex_thread_status": {"type": "notLoaded"},
+                "codex_pending_interaction_count": 0,
+                "codex_needs_user_action": False,
+            }
+            for key, value in reset_values.items():
+                if session.get(key) != value:
+                    session[key] = value
+                    changed = True
+            if "codex_token_usage" in session:
+                session.pop("codex_token_usage", None)
+                changed = True
+        if changed:
+            await STORE.save()
 
 LOG_PATH_SUFFIXES = {
     ".log", ".out", ".err", ".stderr", ".stdout", ".txt", ".jsonl", ".trace"
@@ -3787,7 +3965,14 @@ def is_agent_visible_event(event_type: str, event: dict[str, Any]) -> bool:
         return bool(str(event.get("text") or "").strip())
     if event_type == "turn_finished":
         return bool(str(event.get("result_text") or "").strip())
-    return event_type in {"error", "artifact_created", "job_ran", "job_error", "handoff_digest_received"}
+    return event_type in {
+        "error",
+        "artifact_created",
+        "job_ran",
+        "job_error",
+        "handoff_digest_received",
+        "codex_interaction_requested",
+    }
 
 
 def should_bump_session_updated_at(event_type: str, event: dict[str, Any]) -> bool:
@@ -3811,6 +3996,15 @@ def should_bump_session_updated_at(event_type: str, event: dict[str, Any]) -> bo
         "backend_changed",
         "history_imported",
         "session_forked",
+        "codex_interaction_resolved",
+        "codex_thread_status",
+        "codex_goal_updated",
+        "codex_goal_cleared",
+        "codex_compaction_started",
+        "codex_compaction_completed",
+        "codex_rollback",
+        "codex_review_started",
+        "codex_shell_started",
     }
 
 
@@ -3847,6 +4041,7 @@ async def enqueue_turn(session_id: str, req: TurnRequest, sess: dict[str, Any]) 
         "digest_detail": req.digest_detail,
         "source_session_id": req.source_session_id,
         "target_session_id": req.target_session_id,
+        "client_capabilities": list(req.client_capabilities),
         "created_at": now_iso(),
     }
     async with QUEUE_LOCK:
@@ -3869,6 +4064,7 @@ async def enqueue_turn(session_id: str, req: TurnRequest, sess: dict[str, Any]) 
         "digest_detail": req.digest_detail,
         "source_session_id": req.source_session_id,
         "target_session_id": req.target_session_id,
+        "client_capabilities": list(req.client_capabilities),
     })
     return {
         "queued": True,
@@ -4573,6 +4769,7 @@ async def start_next_queued_turn(session_id: str) -> None:
         source_session_id=item.get("source_session_id"),
         target_session_id=item.get("target_session_id"),
         steer_interrupted_run_id=item.get("steer_interrupted_run_id"),
+        client_capabilities=list(item.get("client_capabilities") or []),
     )
     try:
         display_file_ids = item.get("display_file_ids")
@@ -4677,6 +4874,7 @@ def queued_turn_from_event(event: dict[str, Any], sess: dict[str, Any], position
         "steer_interrupted_run_id": event.get("interrupted_run_id") or event.get("steer_interrupted_run_id"),
         "replays_interrupted_message": bool(event.get("replays_interrupted_message")),
         "steering_lineage": steering_lineage,
+        "client_capabilities": list(event.get("client_capabilities") or []),
         "created_at": event.get("ts") or now_iso(),
         "position": int(event.get("position") or position),
     }
@@ -10012,6 +10210,8 @@ async def rollover_codex_provider_session(
         current["updated_at"] = now_iso()
         await STORE.save()
         fresh_session = dict(current)
+    if CODEX_THREAD_SESSION_INDEX.get(provider_id) == session_id:
+        CODEX_THREAD_SESSION_INDEX.pop(provider_id, None)
     await append_event(session_id, "provider_rollover", {
         "run_id": run_id,
         "backend": BACKEND_CODEX,
@@ -10025,12 +10225,17 @@ async def rollover_codex_provider_session(
 def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, Any]:
     detail_fields = () if summary else (
         "system_prompt", "session_id", "claude_session_id", "codex_thread_id",
+        "codex_approval_policy", "codex_sandbox_mode",
+        "codex_permission_profile", "codex_approvals_reviewer",
+        "codex_goal", "codex_goal_time_budget_seconds",
     )
     return {
         k: sess.get(k)
         for k in (
             "id", "title", "folder", "cwd", "backend", "model", "effort",
             *detail_fields,
+            "codex_thread_status",
+            "codex_pending_interaction_count", "codex_needs_user_action",
             "parent_id", "fork_from", "memory_forked", "memory_seed_used",
             "pinned", "pinned_at", "archived", "archived_at", "sort_order", "created_at", "updated_at",
             "latest_event_seq", "latest_event_at", "latest_event_type",
@@ -10214,6 +10419,551 @@ def codex_app_server_env() -> dict[str, str]:
     return env
 
 
+def codex_session_id_for_thread(thread_id: str) -> str | None:
+    if not thread_id:
+        return None
+    indexed = CODEX_THREAD_SESSION_INDEX.get(thread_id)
+    if indexed:
+        session = STORE.sessions.get(indexed)
+        if session and str(session_provider_id(session) or "") == thread_id:
+            return indexed
+        CODEX_THREAD_SESSION_INDEX.pop(thread_id, None)
+    for session_id, session in STORE.sessions.items():
+        if str(session_provider_id(session) or "") == thread_id:
+            CODEX_THREAD_SESSION_INDEX[thread_id] = session_id
+            return session_id
+    return None
+
+
+def codex_request_is_interactive(session_id: str, thread_id: str) -> bool:
+    if thread_id in CODEX_INTERACTIVE_CONTROL_THREADS:
+        return True
+    active = ACTIVE.get(session_id)
+    return bool(
+        active
+        and str(active.get("provider_thread_id") or "") == thread_id
+        and active.get("interactive_app_server") is True
+    )
+
+
+def bounded_codex_interaction_value(
+    value: Any,
+    *,
+    remaining: int = MAX_CODEX_INTERACTION_TEXT_CHARS,
+) -> Any:
+    """Bound untrusted app-server prompt data before persistence or UI delivery."""
+    if remaining <= 0:
+        return "[truncated]"
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:remaining]
+    if isinstance(value, list):
+        output: list[Any] = []
+        budget = remaining
+        for item in value[:100]:
+            bounded = bounded_codex_interaction_value(item, remaining=budget)
+            output.append(bounded)
+            budget -= len(json.dumps(bounded, ensure_ascii=False, default=str))
+            if budget <= 0:
+                break
+        return output
+    if isinstance(value, dict):
+        output_dict: dict[str, Any] = {}
+        budget = remaining
+        for raw_key, item in list(value.items())[:100]:
+            key = str(raw_key)[:240]
+            bounded = bounded_codex_interaction_value(item, remaining=budget)
+            output_dict[key] = bounded
+            budget -= len(key) + len(
+                json.dumps(bounded, ensure_ascii=False, default=str)
+            )
+            if budget <= 0:
+                break
+        return output_dict
+    return str(value)[:remaining]
+
+
+def public_codex_interaction(pending: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": pending["id"],
+        "session_id": pending["session_id"],
+        "thread_id": pending["thread_id"],
+        "turn_id": pending.get("turn_id"),
+        "item_id": pending.get("item_id"),
+        "method": pending["method"],
+        "params": pending["params"],
+        "created_at": pending["created_at"],
+        "auto_resolution_ms": pending.get("auto_resolution_ms"),
+    }
+
+
+def cache_codex_approval_item(notification: dict[str, Any]) -> None:
+    """Keep bounded item/started details so approval cards can show their scope."""
+    method = str(notification.get("method") or "")
+    params = (
+        notification.get("params")
+        if isinstance(notification.get("params"), dict)
+        else {}
+    )
+    thread_id = str(params.get("threadId") or "")
+    item = params.get("item") if isinstance(params.get("item"), dict) else {}
+    item_id = str(params.get("itemId") or item.get("id") or "")
+    if method == "item/started" and thread_id and item_id:
+        bounded = bounded_codex_interaction_value(item)
+        if isinstance(bounded, dict):
+            key = (thread_id, item_id)
+            CODEX_APPROVAL_ITEM_CACHE.pop(key, None)
+            CODEX_APPROVAL_ITEM_CACHE[key] = bounded
+            while len(CODEX_APPROVAL_ITEM_CACHE) > MAX_CODEX_APPROVAL_ITEM_CACHE:
+                CODEX_APPROVAL_ITEM_CACHE.popitem(last=False)
+        return
+    if method == "item/completed" and thread_id and item_id:
+        CODEX_APPROVAL_ITEM_CACHE.pop((thread_id, item_id), None)
+        return
+    if method in {"turn/completed", "thread/closed"} and thread_id:
+        for key in tuple(CODEX_APPROVAL_ITEM_CACHE):
+            if key[0] == thread_id:
+                CODEX_APPROVAL_ITEM_CACHE.pop(key, None)
+
+
+async def update_codex_pending_session_metadata(session_id: str) -> None:
+    async with CODEX_PENDING_INTERACTIONS_LOCK:
+        count = sum(
+            1
+            for pending in CODEX_PENDING_INTERACTIONS.values()
+            if pending.get("session_id") == session_id
+            and not pending.get("responded")
+        )
+    async with STORE._lock:
+        session = STORE.sessions.get(session_id)
+        if not session:
+            return
+        changed = (
+            int(session.get("codex_pending_interaction_count") or 0) != count
+            or bool(session.get("codex_needs_user_action")) != bool(count)
+        )
+        session["codex_pending_interaction_count"] = count
+        session["codex_needs_user_action"] = bool(count)
+        if changed:
+            session["updated_at"] = now_iso()
+            await STORE.save()
+
+
+def codex_permission_value_is_subset(granted: Any, requested: Any) -> bool:
+    """Conservatively ensure a grant cannot exceed the requested permission."""
+    if granted in (None, False, "", [], {}):
+        return True
+    if isinstance(granted, dict):
+        return isinstance(requested, dict) and all(
+            key in requested
+            and codex_permission_value_is_subset(item, requested[key])
+            for key, item in granted.items()
+        )
+    if isinstance(granted, list):
+        if not isinstance(requested, list):
+            return False
+        return all(
+            any(
+                codex_permission_value_is_subset(item, candidate)
+                and codex_permission_value_is_subset(candidate, item)
+                for candidate in requested
+            )
+            for item in granted
+        )
+    return granted == requested
+
+
+def validate_codex_interaction_response(
+    pending: dict[str, Any],
+    response: dict[str, Any],
+) -> dict[str, Any]:
+    method = str(pending.get("method") or "")
+    params = pending.get("params") if isinstance(pending.get("params"), dict) else {}
+    if method in {
+        "item/commandExecution/requestApproval",
+        "item/fileChange/requestApproval",
+    }:
+        if set(response) != {"decision"}:
+            raise HTTPException(status_code=400, detail="approval response requires only decision")
+        decision = response.get("decision")
+        allowed = {"accept", "acceptForSession", "decline", "cancel"}
+        if isinstance(decision, str):
+            if decision not in allowed:
+                raise HTTPException(status_code=400, detail="invalid approval decision")
+            available = params.get("availableDecisions")
+            if isinstance(available, list) and decision not in available:
+                raise HTTPException(status_code=400, detail="approval decision is unavailable")
+            return {"decision": decision}
+        if method != "item/commandExecution/requestApproval" or not isinstance(decision, dict):
+            raise HTTPException(status_code=400, detail="invalid approval decision")
+        if set(decision) == {"acceptWithExecpolicyAmendment"}:
+            body = decision["acceptWithExecpolicyAmendment"]
+            amendment = body.get("execpolicy_amendment") if isinstance(body, dict) else None
+            proposed = params.get("proposedExecpolicyAmendment")
+            if not isinstance(amendment, list) or amendment != proposed:
+                raise HTTPException(status_code=400, detail="exec policy amendment must match the proposal")
+            return {"decision": decision}
+        raise HTTPException(status_code=400, detail="invalid command approval decision")
+
+    if method == "item/tool/requestUserInput":
+        if set(response) != {"answers"} or not isinstance(response.get("answers"), dict):
+            raise HTTPException(status_code=400, detail="question response requires an answers map")
+        questions = {
+            str(question.get("id") or ""): question
+            for question in params.get("questions") or []
+            if isinstance(question, dict) and question.get("id")
+        }
+        answers: dict[str, Any] = {}
+        for question_id, answer in response["answers"].items():
+            if question_id not in questions:
+                raise HTTPException(status_code=400, detail=f"unknown question id: {question_id}")
+            values = answer.get("answers") if isinstance(answer, dict) else None
+            if (
+                not isinstance(values, list)
+                or len(values) > 20
+                or any(not isinstance(value, str) or len(value) > 8_000 for value in values)
+            ):
+                raise HTTPException(status_code=400, detail=f"invalid answer for {question_id}")
+            answers[question_id] = {"answers": list(values)}
+        return {"answers": answers}
+
+    if method == "item/permissions/requestApproval":
+        allowed_keys = {"permissions", "scope", "strictAutoReview"}
+        if not set(response).issubset(allowed_keys) or not isinstance(response.get("permissions"), dict):
+            raise HTTPException(status_code=400, detail="invalid permission grant")
+        scope = str(response.get("scope") or "turn")
+        if scope not in {"turn", "session"}:
+            raise HTTPException(status_code=400, detail="permission scope must be turn or session")
+        requested = params.get("permissions")
+        if not codex_permission_value_is_subset(response["permissions"], requested):
+            raise HTTPException(status_code=400, detail="permission grant exceeds the requested subset")
+        return {
+            "permissions": response["permissions"],
+            "scope": scope,
+            "strictAutoReview": bool(response.get("strictAutoReview", False)),
+        }
+
+    if method == "mcpServer/elicitation/request":
+        if not set(response).issubset({"action", "content"}):
+            raise HTTPException(status_code=400, detail="invalid MCP elicitation response")
+        action = str(response.get("action") or "")
+        if action not in {"accept", "decline", "cancel"}:
+            raise HTTPException(status_code=400, detail="invalid MCP elicitation action")
+        content = response.get("content")
+        if action == "accept" and content is None:
+            raise HTTPException(status_code=400, detail="accepted MCP elicitation requires content")
+        return {"action": action, "content": content if action == "accept" else None}
+
+    if method in {"applyPatchApproval", "execCommandApproval"}:
+        decision = str(response.get("decision") or "")
+        if decision not in {"approved", "approved_for_session", "denied", "abort"}:
+            raise HTTPException(status_code=400, detail="invalid legacy approval decision")
+        return {"decision": decision}
+
+    raise HTTPException(status_code=400, detail=f"unsupported Codex interaction: {method}")
+
+
+_CODEX_CANCEL_INTERACTION_FUTURE = object()
+
+
+def finish_codex_interaction_locked(
+    pending: dict[str, Any],
+    *,
+    resolution: str,
+    response: dict[str, Any] | object,
+) -> bool:
+    """Atomically claim one pending interaction and settle its waiter.
+
+    Callers must hold ``CODEX_PENDING_INTERACTIONS_LOCK``. Keeping the state
+    transition and Future settlement in the same critical section prevents a
+    user response, timeout, and session cancellation from all believing they
+    won the same prompt.
+    """
+    future = pending.get("future")
+    if (
+        pending.get("responded")
+        or not isinstance(future, asyncio.Future)
+        or future.done()
+    ):
+        return False
+    pending["responded"] = True
+    pending["resolution"] = resolution
+    if response is _CODEX_CANCEL_INTERACTION_FUTURE:
+        future.cancel()
+    else:
+        future.set_result(response)
+    return True
+
+
+async def resolve_codex_interaction(
+    session_id: str,
+    interaction_id: str,
+    response: dict[str, Any],
+) -> dict[str, Any]:
+    async with CODEX_PENDING_INTERACTIONS_LOCK:
+        pending = CODEX_PENDING_INTERACTIONS.get(interaction_id)
+        if not pending or pending.get("session_id") != session_id:
+            raise HTTPException(status_code=404, detail="pending Codex interaction not found")
+        if pending.get("responded") or pending["future"].done():
+            raise HTTPException(status_code=409, detail="Codex interaction is already resolved")
+        validated = validate_codex_interaction_response(pending, response)
+        if not finish_codex_interaction_locked(
+            pending,
+            resolution="answered",
+            response=validated,
+        ):
+            raise HTTPException(status_code=409, detail="Codex interaction is already resolved")
+        interaction = public_codex_interaction(pending)
+    return interaction
+
+
+async def cancel_codex_interactions(
+    session_id: str | None = None,
+    *,
+    resolution: str = "dismissed",
+) -> None:
+    """Resolve pending prompts with least privilege so shutdown never wedges."""
+    async with CODEX_PENDING_INTERACTIONS_LOCK:
+        pending_items = [
+            (interaction_id, pending)
+            for interaction_id, pending in CODEX_PENDING_INTERACTIONS.items()
+            if session_id is None or pending.get("session_id") == session_id
+        ]
+    affected: set[str] = set()
+    for interaction_id, pending in pending_items:
+        try:
+            response = await decline_server_request(
+                pending.get("native_request_id"),
+                str(pending.get("method") or ""),
+                dict(pending.get("params") or {}),
+            )
+        except Exception:
+            response = _CODEX_CANCEL_INTERACTION_FUTURE
+        async with CODEX_PENDING_INTERACTIONS_LOCK:
+            if CODEX_PENDING_INTERACTIONS.get(interaction_id) is not pending:
+                continue
+            won = finish_codex_interaction_locked(
+                pending,
+                resolution=resolution,
+                response=response,
+            )
+        if won:
+            affected.add(str(pending.get("session_id") or ""))
+    for affected_session_id in affected:
+        if affected_session_id:
+            with suppress(Exception):
+                await update_codex_pending_session_metadata(affected_session_id)
+
+
+async def handle_codex_server_request(
+    request_id: Any,
+    method: str,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Bridge one app-server prompt to the owning AgentsDock chat, fail closed."""
+    thread_id = str(params.get("threadId") or "")
+    session_id = codex_session_id_for_thread(thread_id)
+    if (
+        method not in CODEX_INTERACTION_METHODS
+        or not session_id
+        or not codex_request_is_interactive(session_id, thread_id)
+    ):
+        return await decline_server_request(request_id, method, params)
+
+    manager = CODEX_APP_SERVER_MANAGER
+    generation = manager.generation if manager is not None else 0
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[dict[str, Any]] = loop.create_future()
+    interaction_id = f"codexreq_{generation}_{uuid.uuid4().hex[:16]}"
+    display_params = dict(params)
+    item_id = str(params.get("itemId") or "")
+    approval_item = CODEX_APPROVAL_ITEM_CACHE.get((thread_id, item_id))
+    if approval_item is not None:
+        display_params["approvalItem"] = approval_item
+        if (
+            method == "item/fileChange/requestApproval"
+            and "changes" not in display_params
+            and isinstance(approval_item.get("changes"), list)
+        ):
+            display_params["changes"] = approval_item["changes"]
+    public_params = bounded_codex_interaction_value(display_params)
+    pending = {
+        "id": interaction_id,
+        "native_request_id": request_id,
+        "generation": generation,
+        "session_id": session_id,
+        "thread_id": thread_id,
+        "turn_id": str(params.get("turnId") or "") or None,
+        "item_id": str(params.get("itemId") or "") or None,
+        "method": method,
+        "params": public_params if isinstance(public_params, dict) else {},
+        "created_at": now_iso(),
+        "auto_resolution_ms": (
+            int(params["autoResolutionMs"])
+            if isinstance(params.get("autoResolutionMs"), int)
+            else None
+        ),
+        "future": future,
+        "responded": False,
+        "resolution": "dismissed",
+    }
+    async with CODEX_PENDING_INTERACTIONS_LOCK:
+        if len(CODEX_PENDING_INTERACTIONS) >= MAX_CODEX_PENDING_INTERACTIONS:
+            return await decline_server_request(request_id, method, params)
+        CODEX_PENDING_INTERACTIONS[interaction_id] = pending
+    await update_codex_pending_session_metadata(session_id)
+    await append_event(
+        session_id,
+        "codex_interaction_requested",
+        {"interaction": public_codex_interaction(pending)},
+    )
+
+    try:
+        timeout_ms = pending.get("auto_resolution_ms")
+        if method == "item/tool/requestUserInput" and timeout_ms is not None:
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.shield(future),
+                    timeout=max(0.001, timeout_ms / 1000),
+                )
+            except asyncio.TimeoutError:
+                fallback = await decline_server_request(request_id, method, params)
+                async with CODEX_PENDING_INTERACTIONS_LOCK:
+                    current = CODEX_PENDING_INTERACTIONS.get(interaction_id)
+                    won = (
+                        current is pending
+                        and finish_codex_interaction_locked(
+                            pending,
+                            resolution="auto_resolved",
+                            response=fallback,
+                        )
+                    )
+                result = fallback if won else await asyncio.shield(future)
+        else:
+            result = await asyncio.shield(future)
+        return result
+    except asyncio.CancelledError:
+        async with CODEX_PENDING_INTERACTIONS_LOCK:
+            current = CODEX_PENDING_INTERACTIONS.get(interaction_id)
+            if current is pending and not pending.get("responded"):
+                finish_codex_interaction_locked(
+                    pending,
+                    resolution="dismissed",
+                    response=_CODEX_CANCEL_INTERACTION_FUTURE,
+                )
+        raise
+    finally:
+        async with CODEX_PENDING_INTERACTIONS_LOCK:
+            current = CODEX_PENDING_INTERACTIONS.get(interaction_id)
+            if current is pending:
+                CODEX_PENDING_INTERACTIONS.pop(interaction_id, None)
+        with suppress(Exception):
+            await asyncio.shield(update_codex_pending_session_metadata(session_id))
+        with suppress(Exception):
+            await asyncio.shield(
+                append_event(
+                    session_id,
+                    "codex_interaction_resolved",
+                    {
+                        "interaction_id": interaction_id,
+                        "request_method": method,
+                        "resolution": pending.get("resolution") or "dismissed",
+                    },
+                )
+            )
+
+
+async def project_codex_notification(notification: dict[str, Any]) -> None:
+    """Project durable thread control state without duplicating turn output."""
+    method = str(notification.get("method") or "")
+    params = (
+        notification.get("params")
+        if isinstance(notification.get("params"), dict)
+        else {}
+    )
+    thread_id = str(params.get("threadId") or "")
+    session_id = codex_session_id_for_thread(thread_id)
+    if not session_id:
+        return
+
+    if method == "thread/status/changed":
+        status = bounded_codex_interaction_value(params.get("status"), remaining=4_000)
+        if not isinstance(status, dict):
+            return
+        changed = False
+        async with STORE._lock:
+            session = STORE.sessions.get(session_id)
+            if session and session.get("codex_thread_status") != status:
+                session["codex_thread_status"] = status
+                changed = True
+        if changed:
+            await append_event(
+                session_id,
+                "codex_thread_status",
+                {"status": status},
+            )
+        return
+
+    if method == "thread/goal/updated":
+        goal = bounded_codex_interaction_value(params.get("goal"), remaining=12_000)
+        if not isinstance(goal, dict):
+            return
+        async with STORE._lock:
+            session = STORE.sessions.get(session_id)
+            if session:
+                session["codex_goal"] = goal
+        await append_event(session_id, "codex_goal_updated", {"goal": goal})
+        return
+
+    if method == "thread/goal/cleared":
+        async with STORE._lock:
+            session = STORE.sessions.get(session_id)
+            if session:
+                session["codex_goal"] = None
+                session["codex_goal_time_budget_seconds"] = None
+        await append_event(session_id, "codex_goal_cleared", {})
+        return
+
+    if method == "thread/tokenUsage/updated":
+        usage = bounded_codex_interaction_value(
+            params.get("tokenUsage"),
+            remaining=8_000,
+        )
+        if isinstance(usage, dict):
+            # High-frequency usage notifications remain runtime-only. Native
+            # goal updates are persisted separately and contain budget usage.
+            session = STORE.sessions.get(session_id)
+            if session is not None:
+                session["codex_token_usage"] = usage
+        return
+
+    if method == "item/completed":
+        item = params.get("item") if isinstance(params.get("item"), dict) else {}
+        if str(item.get("type") or "") != "contextCompaction":
+            return
+        async with ACTIVE_LOCK:
+            active = ACTIVE.get(session_id)
+            explicit_native_compaction = bool(
+                active
+                and active.get("codex_native_operation")
+                and active.get("codex_native_operation_kind") == "compaction"
+            )
+        if explicit_native_compaction:
+            # Its owner emits one terminal event after canonical
+            # turn/completed, while the chat remains reserved.
+            return
+        await append_event(
+            session_id,
+            "codex_compaction_completed",
+            {
+                "turn_id": params.get("turnId"),
+                "item_id": item.get("id"),
+                "status": "completed",
+            },
+        )
+
+
 async def codex_app_server_manager() -> CodexAppServerManager:
     """Return the one lazy, multiplexed Codex app-server for this server."""
     global CODEX_APP_SERVER_MANAGER
@@ -10233,13 +10983,29 @@ async def codex_app_server_manager() -> CodexAppServerManager:
                 notification_queue_limit=(
                     CODEX_APP_SERVER_NOTIFICATION_QUEUE_LIMIT
                 ),
+                server_request_handler=handle_codex_server_request,
+                initialize_params={
+                    "clientInfo": {
+                        "name": "agents_server",
+                        "title": "AgentsServer",
+                        "version": SERVER_VERSION,
+                    },
+                    "capabilities": {
+                        "experimentalApi": True,
+                        "mcpServerOpenaiFormElicitation": True,
+                    },
+                },
             )
+            manager.add_notification_handler(project_codex_notification)
+            manager.add_notification_handler(cache_codex_approval_item)
             CODEX_APP_SERVER_MANAGER = manager
         return manager
 
 
 async def close_codex_app_server_manager() -> None:
     global CODEX_APP_SERVER_MANAGER
+    await cancel_codex_interactions(resolution="server_closed")
+    await cancel_codex_native_actions()
     async with CODEX_APP_SERVER_MANAGER_LOCK:
         manager = CODEX_APP_SERVER_MANAGER
         CODEX_APP_SERVER_MANAGER = None
@@ -10251,6 +11017,438 @@ async def close_codex_app_server_manager() -> None:
         CODEX_APP_SERVER_PINNED_THREADS.clear()
     if manager is not None:
         await manager.close()
+    CODEX_APPROVAL_ITEM_CACHE.clear()
+    CODEX_PERMISSION_PROFILES_CACHE.clear()
+    await reset_codex_ephemeral_runtime_metadata()
+
+
+def codex_control_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, CodexAppServerRequestError) and exc.code in {
+        -32600,
+        -32601,
+    }:
+        return HTTPException(
+            status_code=501,
+            detail=f"This Codex app-server does not support that control: {exc}",
+        )
+    if isinstance(exc, CodexAppServerError):
+        return HTTPException(
+            status_code=502,
+            detail=f"Codex app-server control failed: {concise_error_message(exc)}",
+        )
+    if isinstance(exc, (ValueError, TypeError)):
+        return HTTPException(status_code=400, detail=str(exc))
+    return HTTPException(
+        status_code=500,
+        detail=f"Codex control failed: {concise_error_message(exc)}",
+    )
+
+
+async def acquire_codex_control_thread(
+    session_id: str,
+    *,
+    reserve_session: bool = False,
+) -> tuple[CodexAppServerManager, str, dict[str, Any]]:
+    """Load and pin an idle Codex thread for an explicit desktop control."""
+    session = STORE.sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="session not found")
+    if str(session.get("backend") or DEFAULT_BACKEND) != BACKEND_CODEX:
+        raise HTTPException(status_code=409, detail="Codex controls require a Codex chat")
+    if CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC:
+        raise HTTPException(
+            status_code=503,
+            detail="Codex controls require the app-server transport",
+        )
+
+    reserved = False
+    async with ACTIVE_LOCK:
+        if session_id in BUSY_SESSIONS:
+            raise HTTPException(
+                status_code=409,
+                detail="wait for the active Codex turn to finish",
+            )
+        if reserve_session:
+            BUSY_SESSIONS.add(session_id)
+            CURRENT_TURNS[session_id] = {
+                "run_id": None,
+                "backend": BACKEND_CODEX,
+                "purpose": "codex_native_control",
+                "interactive_app_server": True,
+            }
+            reserved = True
+
+    manager: CodexAppServerManager | None = None
+    thread_id = ""
+    try:
+        manager = await codex_app_server_manager()
+        await manager.start()
+        cwd = existing_cwd(str(session.get("cwd") or DEFAULT_CWD))
+        thread_id, _instruction_hash = await ensure_codex_app_server_thread(
+            manager,
+            session_id,
+            session,
+            cwd,
+        )
+        CODEX_INTERACTIVE_CONTROL_THREADS.add(thread_id)
+        if reserved:
+            async with ACTIVE_LOCK:
+                ACTIVE[session_id] = {
+                    "proc": None,
+                    "run_id": None,
+                    "backend": BACKEND_CODEX,
+                    "transport": CODEX_TRANSPORT_APP_SERVER,
+                    "provider_thread_id": thread_id,
+                    "provider_session_id": thread_id,
+                    "provider_turn_id": None,
+                    "provider_turn_ready": False,
+                    "interactive_app_server": True,
+                    "codex_native_operation": True,
+                    "codex_native_operation_kind": None,
+                    "started_at": time.time(),
+                    "started_at_iso": now_iso(),
+                    "stop_requested": False,
+                }
+        return manager, thread_id, dict(STORE.sessions.get(session_id) or session)
+    except Exception as exc:
+        if thread_id and manager is not None:
+            CODEX_INTERACTIVE_CONTROL_THREADS.discard(thread_id)
+            with suppress(Exception):
+                await unpin_codex_app_server_thread(manager, thread_id)
+        if reserved:
+            await release_turn_slot(session_id)
+        if isinstance(exc, HTTPException):
+            raise
+        raise codex_control_http_error(exc) from exc
+
+
+async def release_codex_control_thread(
+    session_id: str,
+    manager: CodexAppServerManager,
+    thread_id: str,
+    *,
+    reserved_session: bool = False,
+    schedule_queue: bool = True,
+) -> None:
+    CODEX_INTERACTIVE_CONTROL_THREADS.discard(thread_id)
+    with suppress(Exception):
+        await unpin_codex_app_server_thread(manager, thread_id)
+    if reserved_session:
+        await release_turn_slot(session_id)
+        if schedule_queue:
+            schedule_next_queued_turn(session_id)
+
+
+def register_codex_native_action(
+    session_id: str,
+    operation_id: str,
+    task: asyncio.Task[Any],
+) -> None:
+    key = (session_id, operation_id)
+    CODEX_NATIVE_ACTION_TASKS[key] = task
+
+    def discard(completed: asyncio.Task[Any]) -> None:
+        if CODEX_NATIVE_ACTION_TASKS.get(key) is completed:
+            CODEX_NATIVE_ACTION_TASKS.pop(key, None)
+        if completed.cancelled():
+            return
+        error = completed.exception()
+        if error is not None:
+            logger.error(
+                "Codex native control failed session=%s operation=%s error=%s",
+                session_id,
+                operation_id,
+                concise_error_message(error),
+            )
+
+    task.add_done_callback(discard)
+
+
+async def cancel_codex_native_actions(session_id: str | None = None) -> None:
+    """Cancel and join native control consumers before their owner disappears."""
+    selected = [
+        (task_session_id, operation_id, task)
+        for (task_session_id, operation_id), task in tuple(
+            CODEX_NATIVE_ACTION_TASKS.items()
+        )
+        if session_id is None or task_session_id == session_id
+    ]
+    selected_session_ids = {task_session_id for task_session_id, _, _ in selected}
+    interrupts: list[tuple[str, dict[str, Any]]] = []
+    async with ACTIVE_LOCK:
+        for task_session_id in selected_session_ids:
+            active = ACTIVE.get(task_session_id)
+            if not active or not active.get("codex_native_operation"):
+                continue
+            thread_id = str(active.get("provider_thread_id") or "")
+            turn_id = str(active.get("provider_turn_id") or "")
+            if (
+                thread_id
+                and turn_id
+                and not active.get("native_interrupt_sent")
+            ):
+                active["native_interrupt_sent"] = True
+                interrupts.append((task_session_id, {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                }))
+    manager = CODEX_APP_SERVER_MANAGER
+    if manager is not None:
+        for task_session_id, params in interrupts:
+            try:
+                await manager.request("turn/interrupt", params)
+            except Exception as exc:
+                async with ACTIVE_LOCK:
+                    active = ACTIVE.get(task_session_id)
+                    if active:
+                        active["native_interrupt_sent"] = False
+                logger.warning(
+                    "Codex native control cleanup interrupt failed "
+                    "session=%s error=%s",
+                    task_session_id,
+                    concise_error_message(exc),
+                )
+    tasks = [task for _, _, task in selected]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def consume_codex_native_turn(
+    session_id: str,
+    operation_id: str,
+    operation: str,
+    manager: CodexAppServerManager,
+    thread_id: str,
+    subscription: Any,
+    *,
+    turn_id: str | None = None,
+) -> None:
+    """Project a native control turn and own its reserved chat slot."""
+    assistant_deltas: dict[str, list[str]] = {}
+    reasoning_deltas: dict[str, list[str]] = {}
+    terminal_status = "completed"
+    terminal_error: str | None = None
+    schedule_queue = True
+    try:
+        while True:
+            notification = await subscription.next_notification(
+                timeout=max(
+                    CODEX_APP_SERVER_LIFECYCLE_TIMEOUT_SECONDS,
+                    IDLE_KILL_SECONDS,
+                )
+            )
+            method = str(notification.get("method") or "")
+            params = (
+                notification.get("params")
+                if isinstance(notification.get("params"), dict)
+                else {}
+            )
+            notification_turn_id = str(
+                params.get("turnId")
+                or (
+                    params.get("turn", {}).get("id")
+                    if isinstance(params.get("turn"), dict)
+                    else ""
+                )
+                or ""
+            )
+            if turn_id and notification_turn_id and notification_turn_id != turn_id:
+                continue
+            if method == "turn/started":
+                interrupt_after_start = False
+                if notification_turn_id and not turn_id:
+                    turn_id = notification_turn_id
+                if notification_turn_id:
+                    async with ACTIVE_LOCK:
+                        active = ACTIVE.get(session_id)
+                        if (
+                            active
+                            and str(active.get("run_id") or "") == operation_id
+                        ):
+                            active["provider_turn_id"] = notification_turn_id
+                            active["provider_turn_ready"] = True
+                            if (
+                                active.get("stop_requested")
+                                and not active.get("native_interrupt_sent")
+                            ):
+                                active["native_interrupt_sent"] = True
+                                interrupt_after_start = True
+                if interrupt_after_start:
+                    try:
+                        await manager.request(
+                            "turn/interrupt",
+                            {
+                                "threadId": thread_id,
+                                "turnId": notification_turn_id,
+                            },
+                        )
+                    except Exception as exc:
+                        async with ACTIVE_LOCK:
+                            active = ACTIVE.get(session_id)
+                            if (
+                                active
+                                and str(active.get("run_id") or "")
+                                == operation_id
+                            ):
+                                active["native_interrupt_sent"] = False
+                        logger.warning(
+                            "Deferred Codex native control interrupt failed "
+                            "session=%s operation=%s error=%s",
+                            session_id,
+                            operation_id,
+                            concise_error_message(exc),
+                        )
+                continue
+            item = params.get("item") if isinstance(params.get("item"), dict) else {}
+            item_id = str(params.get("itemId") or item.get("id") or "")
+            if method == "item/agentMessage/delta" and item_id:
+                assistant_deltas.setdefault(item_id, []).append(
+                    str(params.get("delta") or "")
+                )
+                continue
+            if method in {
+                "item/reasoning/summaryTextDelta",
+                "item/reasoning/textDelta",
+                "item/plan/delta",
+            } and item_id:
+                reasoning_deltas.setdefault(item_id, []).append(
+                    str(params.get("delta") or "")
+                )
+                continue
+            if method == "item/started" and item:
+                tool = codex_app_server_tool(item)
+                if tool:
+                    await append_event(
+                        session_id,
+                        "tool_started",
+                        {
+                            "run_id": operation_id,
+                            "tool": tool,
+                            "purpose": f"codex_{operation}",
+                        },
+                    )
+                continue
+            if method == "item/completed" and item:
+                item_type = str(item.get("type") or "")
+                if item_type == "agentMessage":
+                    text = clean_assistant_text(
+                        str(
+                            item.get("text")
+                            or "".join(assistant_deltas.pop(item_id, []))
+                        )
+                    )
+                    if text:
+                        event_type = (
+                            "reasoning_summary"
+                            if str(item.get("phase") or "") == "commentary"
+                            else "assistant_text"
+                        )
+                        await append_event(
+                            session_id,
+                            event_type,
+                            {
+                                "run_id": operation_id,
+                                "text": text,
+                                "purpose": f"codex_{operation}",
+                            },
+                        )
+                elif item_type in {"reasoning", "plan"}:
+                    text = codex_reasoning_text(item) or "".join(
+                        reasoning_deltas.pop(item_id, [])
+                    )
+                    if text:
+                        await append_event(
+                            session_id,
+                            "reasoning_summary",
+                            {
+                                "run_id": operation_id,
+                                "text": text,
+                                "purpose": f"codex_{operation}",
+                            },
+                        )
+                else:
+                    tool = codex_app_server_tool(item)
+                    if tool:
+                        output, exit_code, is_error = codex_app_server_tool_output(item)
+                        await append_event(
+                            session_id,
+                            "tool_finished",
+                            {
+                                "run_id": operation_id,
+                                "tool_id": tool["id"],
+                                "tool": tool,
+                                "output": output,
+                                "exit_code": exit_code,
+                                "is_error": is_error,
+                                "purpose": f"codex_{operation}",
+                            },
+                        )
+                continue
+            if method == "error":
+                terminal_status = "failed"
+                terminal_error = concise_error_message(
+                    params.get("error") or params.get("message") or params
+                )
+                continue
+            if method == "turn/completed":
+                completed_turn = (
+                    params.get("turn")
+                    if isinstance(params.get("turn"), dict)
+                    else {}
+                )
+                terminal_status = str(completed_turn.get("status") or "failed")
+                if completed_turn.get("error"):
+                    terminal_error = concise_error_message(completed_turn["error"])
+                break
+    except (asyncio.TimeoutError, CodexAppServerSubscriptionClosed) as exc:
+        terminal_status = "failed"
+        terminal_error = concise_error_message(exc)
+    except asyncio.CancelledError:
+        terminal_status = "interrupted"
+        schedule_queue = False
+        raise
+    except Exception as exc:
+        terminal_status = "failed"
+        terminal_error = concise_error_message(exc)
+    finally:
+        subscription.close()
+        try:
+            if session_id in STORE.sessions and terminal_error:
+                await append_event(
+                    session_id,
+                    "error",
+                    {
+                        "run_id": operation_id,
+                        "message": terminal_error,
+                        "purpose": f"codex_{operation}",
+                    },
+                )
+            if session_id in STORE.sessions:
+                terminal_event_type = (
+                    "codex_compaction_completed"
+                    if operation == "compaction"
+                    else f"codex_{operation}_finished"
+                )
+                await append_event(
+                    session_id,
+                    terminal_event_type,
+                    {
+                        "operation_id": operation_id,
+                        "turn_id": turn_id,
+                        "status": terminal_status,
+                        "error": terminal_error,
+                    },
+                )
+        finally:
+            await release_codex_control_thread(
+                session_id,
+                manager,
+                thread_id,
+                reserved_session=True,
+                schedule_queue=schedule_queue,
+            )
 
 
 async def pin_codex_app_server_thread(thread_id: str) -> None:
@@ -11004,6 +12202,26 @@ def codex_runtime_settings(sess: dict[str, Any]) -> tuple[str, str, str]:
     return model, effort, service_tier
 
 
+def codex_goal_time_budget_remaining(sess: dict[str, Any]) -> float | None:
+    goal = sess.get("codex_goal")
+    limit = sess.get("codex_goal_time_budget_seconds")
+    if (
+        not isinstance(goal, dict)
+        or str(goal.get("status") or "") != "active"
+        or isinstance(limit, bool)
+        or not isinstance(limit, (int, float))
+        or limit <= 0
+    ):
+        return None
+    used = goal.get("timeUsedSeconds")
+    used_seconds = (
+        float(used)
+        if isinstance(used, (int, float)) and not isinstance(used, bool)
+        else 0.0
+    )
+    return max(0.0, float(limit) - used_seconds)
+
+
 def codex_thread_params(
     sess: dict[str, Any],
     cwd: str,
@@ -11041,6 +12259,7 @@ async def ensure_codex_app_server_thread(
 ) -> tuple[str, str]:
     """Load/create and lease a provider thread, applying changed policy once."""
     provider_id = str(session_provider_id(sess) or "")
+    original_provider_id = provider_id
     had_provider_id = bool(provider_id)
     instructions = codex_thread_instructions(session_id, sess)
     instruction_hash = codex_thread_instruction_hash(session_id, sess)
@@ -11141,6 +12360,10 @@ async def ensure_codex_app_server_thread(
                 BACKEND_CODEX,
                 codex_instruction_hash=instruction_hash,
             )
+        if original_provider_id and original_provider_id != provider_id:
+            if CODEX_THREAD_SESSION_INDEX.get(original_provider_id) == session_id:
+                CODEX_THREAD_SESSION_INDEX.pop(original_provider_id, None)
+        CODEX_THREAD_SESSION_INDEX[provider_id] = session_id
         await touch_codex_app_server_thread(manager, provider_id)
         return provider_id, instruction_hash
     except Exception:
@@ -12682,6 +13905,7 @@ async def run_codex_app_server(
     manifest_path: Path,
     *,
     allow_exec_fallback: bool,
+    interactive_app_server: bool = False,
     allow_resume_rollover: bool = True,
     diff_baseline: dict[str, Any] | None = None,
 ) -> None:
@@ -12725,6 +13949,7 @@ async def run_codex_app_server(
     current_run_id = run_id
     current_diff_baseline = diff_baseline
     manifest_watch_task: asyncio.Task[None] | None = None
+    goal_time_budget_task: asyncio.Task[None] | None = None
     logical_state_lock = asyncio.Lock()
     steer_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
@@ -12851,6 +14076,94 @@ async def run_codex_app_server(
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+
+    async def enforce_goal_time_budget() -> None:
+        def native_time_used(goal_value: dict[str, Any]) -> float:
+            value = goal_value.get("timeUsedSeconds")
+            return (
+                float(value)
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+                else 0.0
+            )
+
+        latest = STORE.sessions.get(session_id) or sess
+        goal = latest.get("codex_goal")
+        if not isinstance(goal, dict):
+            return
+        goal_identity = str(goal.get("id") or goal.get("objective") or "")
+        base_used = native_time_used(goal)
+        base_started_at = time.monotonic()
+        paused = False
+        while True:
+            latest = STORE.sessions.get(session_id) or {}
+            goal = latest.get("codex_goal")
+            limit = latest.get("codex_goal_time_budget_seconds")
+            if (
+                not isinstance(goal, dict)
+                or isinstance(limit, bool)
+                or not isinstance(limit, (int, float))
+                or limit <= 0
+            ):
+                return
+            status = str(goal.get("status") or "")
+            if status == "paused":
+                paused = True
+                await asyncio.sleep(0.5)
+                continue
+            if status != "active":
+                return
+            current_identity = str(
+                goal.get("id") or goal.get("objective") or ""
+            )
+            reported_used = native_time_used(goal)
+            if paused or current_identity != goal_identity:
+                goal_identity = current_identity
+                base_used = reported_used
+                base_started_at = time.monotonic()
+                paused = False
+            projected_used = max(
+                reported_used,
+                base_used + max(0.0, time.monotonic() - base_started_at),
+            )
+            remaining = float(limit) - projected_used
+            if remaining <= 0:
+                break
+            # Re-evaluate at least twice per second so edits to the time limit,
+            # goal pause/resume, and native elapsed-time updates take effect.
+            await asyncio.sleep(min(0.5, max(0.01, remaining)))
+        goal: dict[str, Any] | None = None
+        with suppress(Exception):
+            goal = await manager.set_thread_goal(
+                provider_id,
+                status="budgetLimited",
+            )
+        if isinstance(goal, dict):
+            async with STORE._lock:
+                current = STORE.sessions.get(session_id)
+                if current:
+                    current["codex_goal"] = goal
+                    current["updated_at"] = now_iso()
+                    await STORE.save()
+        async with ACTIVE_LOCK:
+            active = ACTIVE.get(session_id)
+            if active:
+                active["stop_requested"] = True
+                STOPPED_RUNS.add(str(active.get("run_id") or current_run_id))
+        await append_event(
+            session_id,
+            "codex_goal_budget_limited",
+            {
+                "run_id": current_run_id,
+                "time_budget_seconds": latest.get(
+                    "codex_goal_time_budget_seconds"
+                ),
+                "time_budget_owner": "AgentsDock",
+                "message": "The persistent goal reached its AgentsDock time limit.",
+            },
+        )
+        if turn is not None and turn.turn_id:
+            with suppress(CodexAppServerError):
+                await turn.interrupt()
 
     async def finish_logical_outputs(
         logical_run_id: str,
@@ -13407,6 +14720,7 @@ async def run_codex_app_server(
                 "provider_service_tier": service_tier,
                 "native_interrupt_sent": False,
                 "codex_app_server_turn": None,
+                "interactive_app_server": interactive_app_server,
                 "native_steer_queue": steer_queue,
                 "stdout_tail": deque(maxlen=LIVE_STDOUT_MAX_LINES),
                 "stdout_total_lines": 0,
@@ -13441,11 +14755,58 @@ async def run_codex_app_server(
             else:
                 overrides: dict[str, Any] = {
                     "cwd": cwd,
-                    "approvalPolicy": "never",
-                    "sandboxPolicy": {"type": "dangerFullAccess"},
                     "summary": "detailed",
                     "clientUserMessageId": current_run_id,
                 }
+                permission_profile = (
+                    str(sess.get("codex_permission_profile") or "").strip()
+                    if interactive_app_server
+                    else ""
+                )
+                approval_policy = (
+                    str(sess.get("codex_approval_policy") or "never")
+                    if interactive_app_server
+                    else "never"
+                )
+                overrides["approvalPolicy"] = (
+                    approval_policy
+                    if approval_policy in CODEX_APPROVAL_POLICIES
+                    else "never"
+                )
+                if permission_profile:
+                    # Permission profiles are an experimental app-server
+                    # override and are mutually exclusive with sandbox policy,
+                    # but approvalPolicy still controls when Codex asks.
+                    overrides["permissions"] = permission_profile
+                else:
+                    sandbox_mode = (
+                        str(
+                            sess.get("codex_sandbox_mode")
+                            or "danger-full-access"
+                        )
+                        if interactive_app_server
+                        else "danger-full-access"
+                    )
+                    sandbox_policy_types = {
+                        "read-only": "readOnly",
+                        "workspace-write": "workspaceWrite",
+                        "danger-full-access": "dangerFullAccess",
+                    }
+                    overrides["sandboxPolicy"] = {
+                        "type": sandbox_policy_types.get(
+                            sandbox_mode,
+                            "dangerFullAccess",
+                        )
+                    }
+                if interactive_app_server:
+                    approvals_reviewer = str(
+                        sess.get("codex_approvals_reviewer") or "user"
+                    )
+                    overrides["approvalsReviewer"] = (
+                        approvals_reviewer
+                        if approvals_reviewer in CODEX_APPROVAL_REVIEWERS
+                        else "user"
+                    )
                 if model:
                     overrides["model"] = model
                 if effort:
@@ -13487,6 +14848,10 @@ async def run_codex_app_server(
                         stop_requested = bool(active.get("stop_requested"))
                 await bind_active_turn_and_reconcile_stop()
 
+                if codex_goal_time_budget_remaining(sess) is not None:
+                    goal_time_budget_task = asyncio.create_task(
+                        enforce_goal_time_budget()
+                    )
                 manifest_watch_task = asyncio.create_task(
                     watch_manifest_artifacts(
                         session_id,
@@ -13651,6 +15016,10 @@ async def run_codex_app_server(
             })
             error_emitted = True
     finally:
+        if goal_time_budget_task is not None:
+            goal_time_budget_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await goal_time_budget_task
         await stop_manifest_watcher()
         if turn is not None:
             await turn.close()
@@ -13706,6 +15075,7 @@ async def run_codex_app_server(
                 fresh_session,
                 manifest_path,
                 allow_exec_fallback=allow_exec_fallback,
+                interactive_app_server=interactive_app_server,
                 allow_resume_rollover=False,
                 diff_baseline=current_diff_baseline,
             )
@@ -13788,6 +15158,8 @@ async def run_codex(
     prompt: str,
     sess: dict[str, Any],
     manifest_path: Path,
+    *,
+    interactive_app_server: bool = False,
 ) -> None:
     if CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC:
         await run_codex_exec(
@@ -13804,7 +15176,13 @@ async def run_codex(
         prompt,
         sess,
         manifest_path,
-        allow_exec_fallback=CODEX_TRANSPORT == CODEX_TRANSPORT_AUTO,
+        # Interactive approvals/questions cannot be represented by the exec
+        # fallback. Never silently change security semantics after opt-in.
+        allow_exec_fallback=(
+            CODEX_TRANSPORT == CODEX_TRANSPORT_AUTO
+            and not interactive_app_server
+        ),
+        interactive_app_server=interactive_app_server,
     )
 
 
@@ -13820,10 +15198,24 @@ async def start_turn(
     sess = STORE.sessions.get(session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="session not found")
+    if (
+        str(sess.get("backend") or DEFAULT_BACKEND) == BACKEND_CODEX
+        and codex_goal_time_budget_remaining(sess) == 0
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This Codex goal reached its AgentsDock time limit. "
+                "Increase or clear the goal time limit before starting another turn."
+            ),
+        )
     req.file_ids = validate_session_file_ids(session_id, req.file_ids)
     if display_file_ids is not None:
         display_file_ids = validate_session_file_ids(session_id, display_file_ids)
     normalized_lineage = normalize_steering_lineage(steering_lineage)
+    interactive_app_server = (
+        CODEX_INTERACTIVE_CLIENT_CAPABILITY in req.client_capabilities
+    )
     for item in normalized_lineage:
         item["file_ids"] = validate_session_file_ids(
             session_id,
@@ -13848,6 +15240,8 @@ async def start_turn(
                 "purpose": req.purpose,
                 "queued_id": queued_id,
                 "steering_lineage": normalized_lineage,
+                "client_capabilities": list(req.client_capabilities),
+                "interactive_app_server": interactive_app_server,
             }
             reserved = True
     if should_queue:
@@ -13927,6 +15321,7 @@ async def start_turn(
                 prompt,
                 dict(sess),
                 manifest_path,
+                interactive_app_server=interactive_app_server,
             )
             if backend == BACKEND_CODEX
             else run_claude(
@@ -14126,6 +15521,34 @@ async def health() -> dict[str, Any]:
                 "max_text_file_bytes": MAX_WORKSPACE_TEXT_BYTES,
                 "max_preview_file_bytes": MAX_WORKSPACE_PREVIEW_BYTES,
                 "preview_media_types": sorted(set(WORKSPACE_PREVIEW_MEDIA_TYPES.values())),
+            },
+            "codex_controls": {
+                "available": CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC,
+                "required": False,
+                "message": (
+                    "Interactive Codex app-server controls are available to opted-in clients."
+                    if CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC
+                    else "Codex controls require the app-server transport."
+                ),
+                "action": (
+                    None
+                    if CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC
+                    else "Set AGENTSDOCK_CODEX_TRANSPORT=app-server or auto."
+                ),
+                "version": 1,
+                "interactive_client_capability": CODEX_INTERACTIVE_CLIENT_CAPABILITY,
+                "features": {
+                    "approvals": True,
+                    "questions": True,
+                    "permission_profiles": True,
+                    "goals": True,
+                    "compaction": True,
+                    "rollback": True,
+                    "review": True,
+                    "thread_status": True,
+                    "shell_command": True,
+                    "background_terminals": "experimental",
+                },
             },
         },
         "websocket_runtime": True,
@@ -14568,6 +15991,505 @@ async def update_session(session_id: str, req: UpdateSessionRequest) -> dict[str
     return {"session": public_session(sess)}
 
 
+@app.get("/api/sessions/{session_id}/codex/runtime")
+async def get_codex_runtime(session_id: str) -> dict[str, Any]:
+    session = STORE.sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="session not found")
+    is_codex = str(session.get("backend") or DEFAULT_BACKEND) == BACKEND_CODEX
+    available = is_codex and CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC
+    thread_id = str(session_provider_id(session) or "")
+    manager = CODEX_APP_SERVER_MANAGER
+    thread_loaded = bool(
+        thread_id and manager is not None and manager.is_thread_loaded(thread_id)
+    )
+    async with CODEX_PENDING_INTERACTIONS_LOCK:
+        pending = [
+            public_codex_interaction(item)
+            for item in CODEX_PENDING_INTERACTIONS.values()
+            if item.get("session_id") == session_id
+            and not item.get("responded")
+        ]
+    cached_status = session.get("codex_thread_status")
+    async with ACTIVE_LOCK:
+        active = session_id in BUSY_SESSIONS
+    if active:
+        status = (
+            cached_status
+            if isinstance(cached_status, dict)
+            and cached_status.get("type") == "active"
+            else {"type": "active", "activeFlags": []}
+        )
+    elif thread_loaded:
+        status = (
+            cached_status
+            if isinstance(cached_status, dict)
+            and cached_status.get("type") == "systemError"
+            else {"type": "idle"}
+        )
+    else:
+        status = {"type": "notLoaded"}
+    permission_cache_key = existing_cwd(
+        str(session.get("cwd") or DEFAULT_CWD)
+    )
+    permission_cache = CODEX_PERMISSION_PROFILES_CACHE.get(
+        permission_cache_key
+    )
+    return {
+        "available": available,
+        "transport": CODEX_TRANSPORT,
+        "interactive_capability": CODEX_INTERACTIVE_CLIENT_CAPABILITY,
+        "thread_loaded": thread_loaded,
+        "status": status,
+        "goal": session.get("codex_goal"),
+        "time_budget_seconds": session.get("codex_goal_time_budget_seconds"),
+        "token_usage": session.get("codex_token_usage"),
+        "pending_interactions": pending,
+        "permission_profiles": list(
+            permission_cache[1] if permission_cache is not None else []
+        ),
+        "background_terminals_supported": CODEX_BACKGROUND_TERMINALS_SUPPORTED,
+        "policy": {
+            "approval_policy": session.get("codex_approval_policy") or "never",
+            "sandbox_mode": session.get("codex_sandbox_mode")
+            or "danger-full-access",
+            "permission_profile": session.get("codex_permission_profile"),
+            "approvals_reviewer": session.get("codex_approvals_reviewer")
+            or "user",
+        },
+    }
+
+
+@app.post(
+    "/api/sessions/{session_id}/codex/interactions/{interaction_id}/resolve"
+)
+async def post_codex_interaction_response(
+    session_id: str,
+    interaction_id: str,
+    req: CodexInteractionResponseRequest,
+) -> dict[str, Any]:
+    interaction = await resolve_codex_interaction(
+        session_id,
+        interaction_id,
+        req.response,
+    )
+    return {"interaction": interaction}
+
+
+@app.get("/api/sessions/{session_id}/codex/permission-profiles")
+async def get_codex_permission_profiles(session_id: str) -> dict[str, Any]:
+    session = STORE.sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="session not found")
+    if str(session.get("backend") or DEFAULT_BACKEND) != BACKEND_CODEX:
+        raise HTTPException(status_code=409, detail="Codex controls require a Codex chat")
+    if CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC:
+        raise HTTPException(
+            status_code=503,
+            detail="Codex controls require the app-server transport",
+        )
+    cwd = existing_cwd(str(session.get("cwd") or DEFAULT_CWD))
+    cached = CODEX_PERMISSION_PROFILES_CACHE.get(cwd)
+    if (
+        cached is not None
+        and time.monotonic() - cached[0]
+        < CODEX_PERMISSION_PROFILES_CACHE_SECONDS
+    ):
+        return {"profiles": list(cached[1])}
+    try:
+        manager = await codex_app_server_manager()
+        await manager.start()
+        profiles = await manager.list_permission_profiles(cwd=cwd)
+    except Exception as exc:
+        if isinstance(exc, HTTPException):
+            raise
+        raise codex_control_http_error(exc) from exc
+    CODEX_PERMISSION_PROFILES_CACHE[cwd] = (
+        time.monotonic(),
+        list(profiles),
+    )
+    return {"profiles": profiles}
+
+
+@app.get("/api/sessions/{session_id}/codex/goal")
+async def get_codex_goal(session_id: str) -> dict[str, Any]:
+    session = STORE.sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="session not found")
+    return {
+        "goal": session.get("codex_goal"),
+        "time_budget_seconds": session.get("codex_goal_time_budget_seconds"),
+    }
+
+
+@app.put("/api/sessions/{session_id}/codex/goal")
+async def put_codex_goal(
+    session_id: str,
+    req: CodexGoalRequest,
+) -> dict[str, Any]:
+    fields_set = getattr(
+        req,
+        "model_fields_set",
+        getattr(req, "__fields_set__", set()),
+    )
+    if not fields_set:
+        raise HTTPException(status_code=400, detail="provide at least one goal field")
+    manager, thread_id, _session = await acquire_codex_control_thread(session_id)
+    try:
+        native_fields = fields_set & {"objective", "status", "token_budget"}
+        goal = STORE.sessions.get(session_id, {}).get("codex_goal")
+        if native_fields:
+            kwargs: dict[str, Any] = {}
+            if "objective" in fields_set:
+                kwargs["objective"] = (
+                    str(req.objective).strip() if req.objective is not None else None
+                )
+            if "status" in fields_set:
+                kwargs["status"] = req.status
+            if "token_budget" in fields_set:
+                kwargs["token_budget"] = req.token_budget
+            goal = await manager.set_thread_goal(thread_id, **kwargs)
+        if not isinstance(goal, dict):
+            raise HTTPException(
+                status_code=409,
+                detail="set an objective before configuring a time limit",
+            )
+        time_budget_seconds = (
+            req.time_budget_seconds
+            if "time_budget_seconds" in fields_set
+            else STORE.sessions.get(session_id, {}).get(
+                "codex_goal_time_budget_seconds"
+            )
+        )
+        async with STORE._lock:
+            current = STORE.sessions.get(session_id)
+            if current:
+                current["codex_goal"] = goal
+                current["codex_goal_time_budget_seconds"] = time_budget_seconds
+                current["updated_at"] = now_iso()
+                await STORE.save()
+        if fields_set == {"time_budget_seconds"}:
+            await append_event(
+                session_id,
+                "codex_goal_updated",
+                {
+                    "goal": goal,
+                    "time_budget_seconds": time_budget_seconds,
+                    "time_budget_owner": "AgentsDock",
+                },
+            )
+        return {
+            "goal": goal,
+            "time_budget_seconds": time_budget_seconds,
+        }
+    except Exception as exc:
+        if isinstance(exc, HTTPException):
+            raise
+        raise codex_control_http_error(exc) from exc
+    finally:
+        await release_codex_control_thread(session_id, manager, thread_id)
+
+
+@app.delete("/api/sessions/{session_id}/codex/goal")
+async def delete_codex_goal(session_id: str) -> dict[str, Any]:
+    manager, thread_id, _session = await acquire_codex_control_thread(session_id)
+    try:
+        await manager.clear_thread_goal(thread_id)
+        async with STORE._lock:
+            current = STORE.sessions.get(session_id)
+            if current:
+                current["codex_goal"] = None
+                current["codex_goal_time_budget_seconds"] = None
+                current["updated_at"] = now_iso()
+                await STORE.save()
+        return {"goal": None, "time_budget_seconds": None}
+    except Exception as exc:
+        if isinstance(exc, HTTPException):
+            raise
+        raise codex_control_http_error(exc) from exc
+    finally:
+        await release_codex_control_thread(session_id, manager, thread_id)
+
+
+@app.post("/api/sessions/{session_id}/codex/compact")
+async def post_codex_compact(session_id: str) -> dict[str, Any]:
+    manager, thread_id, _session = await acquire_codex_control_thread(
+        session_id,
+        reserve_session=True,
+    )
+    operation_id = f"codexop_{uuid.uuid4().hex[:16]}"
+    subscription = manager.subscribe_thread(thread_id)
+    try:
+        async with ACTIVE_LOCK:
+            active = ACTIVE.get(session_id)
+            if active:
+                active["run_id"] = operation_id
+                active["codex_native_operation_kind"] = "compaction"
+                active["provider_turn_id"] = None
+                active["provider_turn_ready"] = False
+        await manager.compact_thread(thread_id)
+        await append_event(
+            session_id,
+            "codex_compaction_started",
+            {"operation_id": operation_id},
+        )
+        task = asyncio.create_task(
+            consume_codex_native_turn(
+                session_id,
+                operation_id,
+                "compaction",
+                manager,
+                thread_id,
+                subscription,
+            )
+        )
+        register_codex_native_action(session_id, operation_id, task)
+        return {"accepted": True, "operation_id": operation_id}
+    except Exception as exc:
+        subscription.close()
+        await release_codex_control_thread(
+            session_id,
+            manager,
+            thread_id,
+            reserved_session=True,
+        )
+        raise codex_control_http_error(exc) from exc
+
+
+@app.post("/api/sessions/{session_id}/codex/rollback")
+async def post_codex_rollback(
+    session_id: str,
+    req: CodexRollbackRequest,
+) -> dict[str, Any]:
+    if not req.confirmed:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "thread/rollback permanently removes provider context and "
+                "requires explicit confirmed=true"
+            ),
+        )
+    manager, thread_id, _session = await acquire_codex_control_thread(
+        session_id,
+        reserve_session=True,
+    )
+    try:
+        thread = await manager.rollback_thread(thread_id, num_turns=req.num_turns)
+        await append_event(
+            session_id,
+            "codex_rollback",
+            {
+                "num_turns": req.num_turns,
+                "message": (
+                    f"Codex provider context rolled back {req.num_turns} turn(s). "
+                    "AgentsDock history and workspace files were not changed."
+                ),
+            },
+        )
+        return {"accepted": True, "thread": thread}
+    except Exception as exc:
+        raise codex_control_http_error(exc) from exc
+    finally:
+        await release_codex_control_thread(
+            session_id,
+            manager,
+            thread_id,
+            reserved_session=True,
+        )
+
+
+@app.post("/api/sessions/{session_id}/codex/review")
+async def post_codex_review(
+    session_id: str,
+    req: CodexReviewRequest,
+) -> dict[str, Any]:
+    if req.delivery != "inline":
+        raise HTTPException(
+            status_code=501,
+            detail="Detached review requires a mapped child chat; use inline review for now",
+        )
+    manager, thread_id, _session = await acquire_codex_control_thread(
+        session_id,
+        reserve_session=True,
+    )
+    operation_id = f"codexop_{uuid.uuid4().hex[:16]}"
+    subscription = manager.subscribe_thread(thread_id)
+    try:
+        result = await manager.start_review(
+            thread_id,
+            req.target,
+            delivery=req.delivery,
+        )
+        turn = result.get("turn") if isinstance(result.get("turn"), dict) else {}
+        turn_id = str(turn.get("id") or "")
+        async with ACTIVE_LOCK:
+            active = ACTIVE.get(session_id)
+            if active:
+                active["run_id"] = operation_id
+                active["codex_native_operation_kind"] = "review"
+                active["provider_turn_id"] = turn_id or None
+                active["provider_turn_ready"] = bool(turn_id)
+        await append_event(
+            session_id,
+            "codex_review_started",
+            {
+                "operation_id": operation_id,
+                "turn_id": turn_id or None,
+                "target": bounded_codex_interaction_value(req.target),
+                "delivery": req.delivery,
+            },
+        )
+        task = asyncio.create_task(
+            consume_codex_native_turn(
+                session_id,
+                operation_id,
+                "review",
+                manager,
+                thread_id,
+                subscription,
+                turn_id=turn_id or None,
+            )
+        )
+        register_codex_native_action(session_id, operation_id, task)
+        return {
+            "accepted": True,
+            "operation_id": operation_id,
+            "turn_id": turn_id or None,
+        }
+    except Exception as exc:
+        subscription.close()
+        await release_codex_control_thread(
+            session_id,
+            manager,
+            thread_id,
+            reserved_session=True,
+        )
+        raise codex_control_http_error(exc) from exc
+
+
+@app.post("/api/sessions/{session_id}/codex/shell")
+async def post_codex_shell_command(
+    session_id: str,
+    req: CodexShellCommandRequest,
+) -> dict[str, Any]:
+    if not req.confirmed:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "thread/shellCommand is unsandboxed and requires explicit "
+                "confirmed=true"
+            ),
+        )
+    manager, thread_id, _session = await acquire_codex_control_thread(
+        session_id,
+        reserve_session=True,
+    )
+    operation_id = f"codexop_{uuid.uuid4().hex[:16]}"
+    subscription = manager.subscribe_thread(thread_id)
+    try:
+        async with ACTIVE_LOCK:
+            active = ACTIVE.get(session_id)
+            if active:
+                active["run_id"] = operation_id
+                active["codex_native_operation_kind"] = "shell"
+                active["provider_turn_id"] = None
+                active["provider_turn_ready"] = False
+        await manager.run_thread_shell_command(thread_id, req.command)
+        await append_event(
+            session_id,
+            "codex_shell_started",
+            {
+                "operation_id": operation_id,
+                "command": req.command,
+                "unsandboxed": True,
+            },
+        )
+        task = asyncio.create_task(
+            consume_codex_native_turn(
+                session_id,
+                operation_id,
+                "shell",
+                manager,
+                thread_id,
+                subscription,
+            )
+        )
+        register_codex_native_action(session_id, operation_id, task)
+        return {"accepted": True, "operation_id": operation_id}
+    except Exception as exc:
+        subscription.close()
+        await release_codex_control_thread(
+            session_id,
+            manager,
+            thread_id,
+            reserved_session=True,
+        )
+        raise codex_control_http_error(exc) from exc
+
+
+@app.get("/api/sessions/{session_id}/codex/background-terminals")
+async def get_codex_background_terminals(session_id: str) -> dict[str, Any]:
+    global CODEX_BACKGROUND_TERMINALS_SUPPORTED
+    manager, thread_id, _session = await acquire_codex_control_thread(session_id)
+    try:
+        terminals = await manager.list_background_terminals(thread_id)
+        CODEX_BACKGROUND_TERMINALS_SUPPORTED = True
+        return {"supported": True, "terminals": terminals}
+    except Exception as exc:
+        if isinstance(exc, CodexAppServerRequestError) and exc.code in {
+            -32600,
+            -32601,
+        }:
+            CODEX_BACKGROUND_TERMINALS_SUPPORTED = False
+            return {"supported": False, "terminals": []}
+        raise codex_control_http_error(exc) from exc
+    finally:
+        await release_codex_control_thread(session_id, manager, thread_id)
+
+
+@app.post(
+    "/api/sessions/{session_id}/codex/background-terminals/terminate"
+)
+async def post_codex_background_terminal_terminate(
+    session_id: str,
+    req: CodexBackgroundTerminalRequest,
+) -> dict[str, Any]:
+    manager, thread_id, _session = await acquire_codex_control_thread(session_id)
+    try:
+        terminated = await manager.terminate_background_terminal(
+            thread_id,
+            req.process_id,
+        )
+        return {"terminated": terminated}
+    except Exception as exc:
+        raise codex_control_http_error(exc) from exc
+    finally:
+        await release_codex_control_thread(session_id, manager, thread_id)
+
+
+@app.post("/api/sessions/{session_id}/codex/background-terminals/clean")
+async def post_codex_background_terminals_clean(
+    session_id: str,
+    req: CodexBackgroundTerminalsCleanRequest,
+) -> dict[str, Any]:
+    if not req.confirmed:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "thread/backgroundTerminals/clean stops every running "
+                "background terminal and requires explicit confirmed=true"
+            ),
+        )
+    manager, thread_id, _session = await acquire_codex_control_thread(session_id)
+    try:
+        await manager.clean_background_terminals(thread_id)
+        return {"cleaned": True}
+    except Exception as exc:
+        raise codex_control_http_error(exc) from exc
+    finally:
+        await release_codex_control_thread(session_id, manager, thread_id)
+
+
 @app.post("/api/sessions/{session_id}/order")
 async def reorder_session(session_id: str, req: ReorderSessionRequest) -> dict[str, Any]:
     sessions = await STORE.reorder(session_id, req.direction, req.target_id, req.placement)
@@ -14590,15 +16512,17 @@ async def mark_session_unread(session_id: str) -> dict[str, Any]:
 async def delete_session(session_id: str) -> dict[str, Any]:
     session = STORE.sessions.get(session_id) or {}
     provider_thread_id = str(session_provider_id(session) or "")
+    await cancel_codex_interactions(session_id, resolution="session_deleted")
+    async with QUEUE_LOCK:
+        QUEUED_TURNS.pop(session_id, None)
+        RUN_NOW_TURNS.pop(session_id, None)
+        STEERING_SESSIONS.discard(session_id)
+    await cancel_codex_native_actions(session_id)
     async with ACTIVE_LOCK:
         active = ACTIVE.pop(session_id, None)
         BUSY_SESSIONS.discard(session_id)
         CURRENT_TURNS.pop(session_id, None)
         STOP_REQUESTS.discard(session_id)
-    async with QUEUE_LOCK:
-        QUEUED_TURNS.pop(session_id, None)
-        RUN_NOW_TURNS.pop(session_id, None)
-        STEERING_SESSIONS.discard(session_id)
     if active:
         native_turn = active.get("codex_app_server_turn")
         proc = active.get("proc")
@@ -14621,6 +16545,12 @@ async def delete_session(session_id: str) -> dict[str, Any]:
         async with CODEX_APP_SERVER_THREAD_LRU_LOCK:
             CODEX_APP_SERVER_THREAD_LRU.pop(provider_thread_id, None)
             CODEX_APP_SERVER_PINNED_THREADS.discard(provider_thread_id)
+    if provider_thread_id:
+        if CODEX_THREAD_SESSION_INDEX.get(provider_thread_id) == session_id:
+            CODEX_THREAD_SESSION_INDEX.pop(provider_thread_id, None)
+        for key in tuple(CODEX_APPROVAL_ITEM_CACHE):
+            if key[0] == provider_thread_id:
+                CODEX_APPROVAL_ITEM_CACHE.pop(key, None)
     with suppress(Exception):
         await asyncio.to_thread(kill_terminal_session, session_id)
     deleted = await STORE.delete(session_id)
@@ -14667,6 +16597,10 @@ async def fork_session(session_id: str, req: ForkSessionRequest) -> dict[str, An
             model=parent.get("model"),
             effort=parent.get("effort"),
             system_prompt=parent.get("system_prompt"),
+            codex_approval_policy=parent.get("codex_approval_policy"),
+            codex_sandbox_mode=parent.get("codex_sandbox_mode"),
+            codex_permission_profile=parent.get("codex_permission_profile"),
+            codex_approvals_reviewer=parent.get("codex_approvals_reviewer"),
             pinned=bool(parent.get("pinned")),
             archived=bool(parent.get("archived")),
             # Bind a native Codex fork only after the child session ID exists,
@@ -14775,8 +16709,10 @@ async def stop_turn(
     schedule_queue: bool = True,
     require_provider_turn_ready: bool = False,
 ) -> dict[str, Any]:
+    await cancel_codex_interactions(session_id, resolution="turn_stopped")
     deferred = False
     native_interrupt_reserved = False
+    native_control_interrupt_reserved = False
     transition_ready: asyncio.Event | None = None
     async with ACTIVE_LOCK:
         active = ACTIVE.get(session_id)
@@ -14803,6 +16739,15 @@ async def stop_turn(
                 ):
                     active["native_interrupt_sent"] = True
                     native_interrupt_reserved = True
+                elif (
+                    active.get("transport") == CODEX_TRANSPORT_APP_SERVER
+                    and active.get("codex_native_operation")
+                    and active.get("provider_thread_id")
+                    and active.get("provider_turn_id")
+                    and not active.get("native_interrupt_sent")
+                ):
+                    active["native_interrupt_sent"] = True
+                    native_control_interrupt_reserved = True
         elif busy:
             if require_provider_turn_ready:
                 deferred = True
@@ -14840,6 +16785,26 @@ async def stop_turn(
                     current["native_interrupt_sent"] = False
             logger.warning(
                 "Codex app-server interrupt failed session=%s error=%s",
+                session_id,
+                exc,
+            )
+    elif native_control_interrupt_reserved and CODEX_APP_SERVER_MANAGER is not None:
+        try:
+            await CODEX_APP_SERVER_MANAGER.request(
+                "turn/interrupt",
+                {
+                    "threadId": str(active.get("provider_thread_id") or ""),
+                    "turnId": str(active.get("provider_turn_id") or ""),
+                },
+            )
+            native_interrupt = True
+        except Exception as exc:
+            async with ACTIVE_LOCK:
+                current = ACTIVE.get(session_id)
+                if current is active:
+                    current["native_interrupt_sent"] = False
+            logger.warning(
+                "Codex native control interrupt failed session=%s error=%s",
                 session_id,
                 exc,
             )

@@ -56,6 +56,13 @@ from pydantic import BaseModel, Field
 import uvicorn
 import websockets
 
+from codex_app_server import (
+    CodexAppServerDisconnected,
+    CodexAppServerError,
+    CodexAppServerManager,
+    CodexAppServerRequestError,
+    CodexAppServerSubscriptionClosed,
+)
 from update_runner import atomic_json as atomic_update_json
 from update_runner import ReleaseUnavailableError, check_release, utc_now as update_utc_now, version_key
 
@@ -171,6 +178,29 @@ CODEX_FALLBACK_SERVICE_TIERS = {
 
 REQUEST_TIMEOUT_SECONDS = int(agentsdock_setting("REQUEST_TIMEOUT_SECONDS", "86400"))
 CODEX_APP_SERVER_TIMEOUT_SECONDS = int(agentsdock_setting("CODEX_APP_SERVER_TIMEOUT_SECONDS", "30"))
+CODEX_APP_SERVER_LIFECYCLE_TIMEOUT_SECONDS = max(
+    CODEX_APP_SERVER_TIMEOUT_SECONDS,
+    int(
+        agentsdock_setting(
+            "CODEX_APP_SERVER_LIFECYCLE_TIMEOUT_SECONDS",
+            "300",
+        )
+    ),
+)
+CODEX_APP_SERVER_AMBIGUOUS_ACCEPT_SECONDS = max(
+    5,
+    int(agentsdock_setting("CODEX_APP_SERVER_AMBIGUOUS_ACCEPT_SECONDS", "20")),
+)
+CODEX_TRANSPORT_AUTO = "auto"
+CODEX_TRANSPORT_APP_SERVER = "app-server"
+CODEX_TRANSPORT_EXEC = "exec"
+CODEX_TRANSPORT = agentsdock_setting("CODEX_TRANSPORT", CODEX_TRANSPORT_AUTO).strip().lower()
+if CODEX_TRANSPORT not in {CODEX_TRANSPORT_AUTO, CODEX_TRANSPORT_APP_SERVER, CODEX_TRANSPORT_EXEC}:
+    CODEX_TRANSPORT = CODEX_TRANSPORT_AUTO
+CODEX_APP_SERVER_MAX_LOADED_THREADS = max(
+    1,
+    int(agentsdock_setting("CODEX_APP_SERVER_MAX_LOADED_THREADS", "12")),
+)
 CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS = int(agentsdock_setting("CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS", "120"))
 RUNTIME_CATALOG_TIMEOUT_SECONDS = float(agentsdock_setting("RUNTIME_CATALOG_TIMEOUT_SECONDS", "6"))
 RUNTIME_DIAGNOSTIC_TTL_SECONDS = float(agentsdock_setting("RUNTIME_DIAGNOSTIC_TTL_SECONDS", "60"))
@@ -189,6 +219,37 @@ IDLE_WARN_SECONDS = int(agentsdock_setting("IDLE_WARN_SECONDS", "1800"))
 IDLE_KILL_SECONDS = int(agentsdock_setting("IDLE_KILL_SECONDS", "21600"))
 STOP_GRACE_SECONDS = float(agentsdock_setting("STOP_GRACE_SECONDS", "2.0"))
 PROCESS_STREAM_LIMIT = int(agentsdock_setting("PROCESS_STREAM_LIMIT", str(16 * 1024 * 1024)))
+CODEX_APP_SERVER_JSONL_LIMIT_BYTES = max(
+    PROCESS_STREAM_LIMIT,
+    int(
+        agentsdock_setting(
+            "CODEX_APP_SERVER_JSONL_LIMIT_BYTES",
+            str(256 * 1024 * 1024),
+        )
+    ),
+)
+CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS = max(
+    64 * 1024,
+    int(
+        agentsdock_setting(
+            "CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS",
+            str(1024 * 1024),
+        )
+    ),
+)
+CODEX_APP_SERVER_NOTIFICATION_QUEUE_LIMIT = max(
+    128,
+    int(
+        agentsdock_setting(
+            "CODEX_APP_SERVER_NOTIFICATION_QUEUE_LIMIT",
+            "8192",
+        )
+    ),
+)
+WEBSOCKET_SEND_TIMEOUT_SECONDS = max(
+    0.1,
+    float(agentsdock_setting("WEBSOCKET_SEND_TIMEOUT_SECONDS", "2")),
+)
 MAX_UPLOAD_BYTES = int(agentsdock_setting("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024 * 1024)))
 MAX_IMPORT_MESSAGES = int(agentsdock_setting("HISTORY_IMPORT_LIMIT", "400"))
 MAX_IMPORTED_TEXT_CHARS = int(agentsdock_setting("HISTORY_IMPORT_TEXT_CHARS", "12000"))
@@ -385,83 +446,19 @@ Persistent chat terminal:
   unless the user explicitly asks you to operate on it.
 """
 
+CODEX_THREAD_POLICY_VERSION = "1"
 CODEX_PROMPT_PRELUDE = """\
-[AgentsDock context]
-You are responding through AgentsDock, backed by AgentsServer.
-
-Use concise Markdown. The UI renders tool calls, command output, reasoning
-summaries, and artifacts separately, so keep the final answer focused.
-Do not use emoji, Slack-style emoji aliases, or decorative status prefixes
-such as :mag:, :gear:, :rocket:, or :white_check_mark:.
-
-Math and scientific notation:
-- Write inline LaTeX as `$...$` and display equations as `$$...$$`.
-- Keep prose outside the math delimiters and use fenced code blocks only when
-  showing literal TeX source that should not be rendered.
-- Prefer the dollar delimiters above instead of `\\(...\\)` or `\\[...\\]` so
-  equations render consistently in the chat timeline.
-
-Tool and inspection errors:
-- Failed commands, malformed JSON reads, missing files, missing Python aliases,
-  and other inspection mistakes are normal debugging signals, not stopping
-  conditions.
-- Do not end your turn just because a tool command failed. Read stderr/stdout,
-  correct the command, and try a safer alternative such as `python3`, `jq`,
-  `python3 -m json.tool`, `rg`, `sed`, `head`, `tail`, or a small script.
-- If the likely fix is non-intrusive, do it yourself and continue. Examples:
-  command typos, wrong JSON/file-reading command, missing `python` alias, small
-  parser adjustments, read-only inspection changes, or narrow code edits the
-  user already asked for.
-- Continue until you can answer the user's request, complete the requested
-  change, or identify a real blocker. Stop only if retrying would be
-  destructive, removes/overwrites unrelated work, requires missing
-  credentials/approval, or the user explicitly asked only for diagnosis.
-
-Skills and environment playbooks:
-- Before saying cluster paths such as `/mnt/amlfs-07` are unavailable, check the
-  available local skills, memories, and playbooks for matching instructions.
-  Look first under `~/.codex/skills`, `~/.claude/skills`, `~/.claude/agents`,
-  project `AGENTS.md`/`CLAUDE.md`, and relevant `~/.claude/projects/.../memory`
-  notes.
-- For AMLFS/OSMO access, prefer the installed OSMO/SONIC skills and memories
-  such as `osmo`, `osmo-exec`, `sonic`, `ssh-portforward`, and
-  `reference-osmo-amlfs-ssh`. Follow those instructions before substituting
-  local data or claiming the mount cannot be reached.
-- If the needed skill/playbook is missing, blocked, or fails, say exactly what
-  you checked and what blocked you.
-
-This is AgentsDock, not Slack. Do not call Slack upload APIs or Slack file
-helpers. Create files locally on the agent host and publish them through the manifest.
-
-To open an existing file in AgentsDock's editor, link to a relative path under
-this chat's working directory, optionally with `#L42`. Absolute paths are
-allowed only when they remain under that working directory. Do not use
-`file://`.
-
-If you create files the user should receive, write a JSON manifest at exactly:
-{manifest_path}
-
-Manifest format:
-{{"files": ["/absolute/path/to/file.ext", {{"path": "/absolute/path/video.mp4", "title": "Demo", "text": "Optional note"}}]}}
-
-Use absolute file paths. Videos should be normal playable files such as mp4 or
-mov. If `python` is not installed, use `python3` or shell tools to write files
-and the manifest.
-
-Persistent chat terminal:
-- This chat's AgentsDock terminal is the tmux session named
-  `{terminal_session}` on this same host.
-- The terminal is a separate interactive shell. Its screen and user input are
-  not automatically included in your context.
-- When terminal state is relevant, inspect it read-only with
-  `tmux capture-pane -p -J -t "$AGENTSDOCK_TMUX_SESSION" -S -200` and inspect
-  windows with `tmux list-windows -t "$AGENTSDOCK_TMUX_SESSION"`.
-- Do not send keys, resize panes, close windows, or kill the terminal session
-  unless the user explicitly asks you to operate on it.
-
-User prompt follows.
-]
-
+You are operating through AgentsDock, backed by AgentsServer.
+- Keep the final answer concise; the UI renders tool calls, command output, reasoning, and artifacts separately.
+- Render inline math as `$...$` and display math as `$$...$$`.
+- Continue through ordinary inspection errors when a safe retry or narrow fix is available.
+- This is AgentsDock, not Slack; create files locally and never call Slack file helpers.
+- Link editor-readable files with Markdown paths relative to the chat working directory, optionally with `#L42`; do not use `file://`.
+- Publish user-deliverable artifacts by writing `{{"files":[...]}}` to `{manifest_path}` with absolute file paths.
+- Manage scheduled jobs only when explicitly asked, using `"$AGENTSDOCK_JOBS_CLI" --chat-id {chat_id} <command>`; query it instead of relying on a prompt snapshot.
+- The persistent terminal is tmux session `{terminal_session}`; inspect it read-only unless the user explicitly asks you to operate it.
+- Check installed skills and project playbooks before claiming a specialized environment or remote path is unavailable.
+- Preserve user work, avoid destructive actions without clear authorization, and continue until the request is complete or genuinely blocked.
 """
 
 AGENTSDOCK_CONTEXT_END_MARKER = "[End AgentsDock context]"
@@ -852,6 +849,11 @@ def uploads_dir(session_id: str) -> Path:
 
 def manifests_dir(session_id: str) -> Path:
     return session_dir(session_id) / "manifests"
+
+
+def codex_manifest_path(session_id: str) -> Path:
+    """Stable per-chat artifact handoff path used by persistent Codex threads."""
+    return manifests_dir(session_id) / "current.json"
 
 
 def code_diffs_dir(session_id: str) -> Path:
@@ -3095,7 +3097,15 @@ class SessionStore:
             HISTORY_SEARCH_DIRTY.add(sid)
         return existed is not None
 
-    async def save_provider_session(self, sid: str, provider_id: str, backend: str, *, cwd: str | None = None) -> None:
+    async def save_provider_session(
+        self,
+        sid: str,
+        provider_id: str,
+        backend: str,
+        *,
+        cwd: str | None = None,
+        codex_instruction_hash: str | None = None,
+    ) -> None:
         async with self._lock:
             sess = self.sessions.get(sid)
             if not sess:
@@ -3105,6 +3115,9 @@ class SessionStore:
             sess["claude_session_id" if backend == BACKEND_CLAUDE else "codex_thread_id"] = provider_id
             if backend == BACKEND_CLAUDE and cwd:
                 sess["claude_session_cwd"] = cwd
+            if backend == BACKEND_CODEX and codex_instruction_hash is not None:
+                sess["codex_instruction_hash"] = codex_instruction_hash
+                sess["codex_instruction_version"] = CODEX_THREAD_POLICY_VERSION
             if backend == BACKEND_CLAUDE and sess.get("fork_from") and provider_id != sess.get("fork_from"):
                 sess["fork_from"] = None
             sess["updated_at"] = now_iso()
@@ -3651,12 +3664,22 @@ class SubscriberHub:
     async def broadcast(self, sid: str, event: dict[str, Any]) -> None:
         async with self._lock:
             subs = list(self._subscribers.get(sid, set()))
-        stale: list[WebSocket] = []
-        for ws in subs:
+
+        async def send(ws: WebSocket) -> WebSocket | None:
             try:
-                await ws.send_json(event)
+                await asyncio.wait_for(
+                    ws.send_json(event),
+                    timeout=WEBSOCKET_SEND_TIMEOUT_SECONDS,
+                )
+                return None
             except Exception:
-                stale.append(ws)
+                return ws
+
+        stale = [
+            ws
+            for ws in await asyncio.gather(*(send(ws) for ws in subs))
+            if ws is not None
+        ]
         if stale:
             async with self._lock:
                 current = self._subscribers.get(sid, set())
@@ -3676,6 +3699,12 @@ RUN_NOW_TURNS: dict[str, dict[str, Any]] = {}
 STEERING_SESSIONS: set[str] = set()
 QUEUE_LOCK = asyncio.Lock()
 RUN_METADATA: dict[str, dict[str, Any]] = {}
+CODEX_APP_SERVER_MANAGER: CodexAppServerManager | None = None
+CODEX_APP_SERVER_MANAGER_LOCK = asyncio.Lock()
+CODEX_APP_SERVER_THREAD_LRU: OrderedDict[str, float] = OrderedDict()
+CODEX_APP_SERVER_PINNED_THREADS: set[str] = set()
+CODEX_APP_SERVER_EVICTING_THREADS: dict[str, asyncio.Event] = {}
+CODEX_APP_SERVER_THREAD_LRU_LOCK = asyncio.Lock()
 HANDOFF_DIGEST_JOBS: dict[str, dict[str, Any]] = {}
 HANDOFF_DIGEST_JOBS_LOCK = asyncio.Lock()
 HANDOFF_DIGEST_FINALIZING: set[str] = set()
@@ -4143,7 +4172,7 @@ def prepare_steered_turn(selected: dict[str, Any], interrupted: dict[str, Any] |
     turn["display_file_ids"] = selected_file_ids
     turn["file_ids"] = selected_file_ids
     turn["steer_interrupted_run_id"] = (interrupted or {}).get("run_id")
-    turn["replays_interrupted_message"] = True
+    turn["replays_interrupted_message"] = False
     return turn
 
 
@@ -4263,15 +4292,36 @@ async def move_queued_turn(session_id: str, queued_id: str, req: MoveQueuedTurnR
     return {"ok": True, "queued_id": queued_id, "positions": positions}
 
 
+def queued_codex_runtime_matches_active(
+    session_id: str,
+    selected: dict[str, Any],
+    active: dict[str, Any],
+) -> bool:
+    sess = dict(STORE.sessions.get(session_id) or {})
+    if selected.get("model") is not None:
+        sess["model"] = selected.get("model")
+    if selected.get("effort") is not None:
+        sess["effort"] = selected.get("effort")
+    model, effort, service_tier = codex_runtime_settings(sess)
+    return (
+        model == str(active.get("provider_model") or "")
+        and effort == str(active.get("provider_effort") or "")
+        and service_tier == str(active.get("provider_service_tier") or "")
+    )
+
+
 async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]:
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
 
     async with ACTIVE_LOCK:
+        active_turn = dict(ACTIVE.get(session_id) or {})
         interrupted_turn = dict(CURRENT_TURNS.get(session_id) or {})
 
     selected: dict[str, Any] | None = None
     selected_index: int | None = None
+    native_steer = False
+    native_steer_queue = active_turn.get("native_steer_queue")
     remaining: int
     async with QUEUE_LOCK:
         if session_id in STEERING_SESSIONS or RUN_NOW_TURNS.get(session_id) is not None:
@@ -4285,6 +4335,22 @@ async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]
             )
             if selected_index is not None:
                 selected = items[selected_index]
+                selected_backend = (
+                    selected.get("backend")
+                    or STORE.sessions[session_id].get("backend")
+                    or DEFAULT_BACKEND
+                )
+                native_steer = bool(
+                    active_turn.get("transport") == CODEX_TRANSPORT_APP_SERVER
+                    and active_turn.get("provider_turn_ready")
+                    and native_steer_queue is not None
+                    and selected_backend == BACKEND_CODEX
+                    and queued_codex_runtime_matches_active(
+                        session_id,
+                        selected,
+                        active_turn,
+                    )
+                )
                 kept = deque(
                     item
                     for idx, item in enumerate(items)
@@ -4301,11 +4367,42 @@ async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]
         else:
             remaining = 0
         if selected is not None:
-            RUN_NOW_TURNS[session_id] = selected
             STEERING_SESSIONS.add(session_id)
+            if not native_steer:
+                RUN_NOW_TURNS[session_id] = selected
 
     if selected is None:
         raise HTTPException(status_code=404, detail="queued turn not found")
+
+    if native_steer:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[dict[str, Any]] = loop.create_future()
+        try:
+            await native_steer_queue.put({
+                "selected": selected,
+                "remaining": remaining,
+                "future": future,
+            })
+            result = await future
+            result["remaining"] = remaining
+            return result
+        except Exception as exc:
+            if (
+                selected_index is not None
+                and bool(getattr(exc, "safe_to_requeue", False))
+            ):
+                async with QUEUE_LOCK:
+                    items = list(QUEUED_TURNS.get(session_id) or [])
+                    items.insert(min(selected_index, len(items)), selected)
+                    QUEUED_TURNS[session_id] = deque(items)
+            raise
+        finally:
+            async with QUEUE_LOCK:
+                STEERING_SESSIONS.discard(session_id)
+            async with ACTIVE_LOCK:
+                still_busy = session_id in BUSY_SESSIONS
+            if not still_busy:
+                schedule_next_queued_turn(session_id)
 
     try:
         stop_result = await stop_turn(
@@ -5693,6 +5790,30 @@ def active_process_snapshot(session_id: str, active: dict[str, Any]) -> dict[str
     if pid and not pgid:
         pgid = process_group_for_pid(pid)
     if not pid:
+        if active.get("transport") == CODEX_TRANSPORT_APP_SERVER:
+            return {
+                "session_id": session_id,
+                "active": True,
+                "run_id": active.get("run_id"),
+                "backend": active.get("backend"),
+                "transport": CODEX_TRANSPORT_APP_SERVER,
+                "pid": None,
+                "pgid": None,
+                "cwd": active.get("cwd"),
+                "argv": active.get("argv") or [],
+                "started_at": active.get("started_at_iso"),
+                "elapsed_seconds": int(
+                    max(
+                        0,
+                        time.time()
+                        - float(active.get("started_at") or time.time()),
+                    )
+                ),
+                "stop_requested": bool(active.get("stop_requested")),
+                "processes": [],
+                "stdout_tail": live_output_tail(active),
+                "generated_at": now_iso(),
+            }
         return {
             "session_id": session_id,
             "active": False,
@@ -5736,6 +5857,7 @@ def active_process_snapshot(session_id: str, active: dict[str, Any]) -> dict[str
         "active": bool(processes),
         "run_id": active.get("run_id"),
         "backend": active.get("backend"),
+        "transport": active.get("transport"),
         "pid": pid,
         "pgid": pgid,
         "cwd": active.get("cwd"),
@@ -5771,6 +5893,7 @@ def jsonable_active_run(session_id: str, active: dict[str, Any]) -> dict[str, An
         "session_id": session_id,
         "run_id": active.get("run_id"),
         "backend": active.get("backend"),
+        "transport": active.get("transport"),
         "pid": active.get("pid"),
         "pgid": active.get("pgid"),
         "cwd": active.get("cwd"),
@@ -6119,7 +6242,12 @@ async def mark_provider_turn_ready(
 def active_snapshot_input(active: dict[str, Any]) -> dict[str, Any]:
     snapshot_input = {
         key: value for key, value in active.items()
-        if key not in {"proc", "stdout_tail"}
+        if key not in {
+            "proc",
+            "stdout_tail",
+            "codex_app_server_turn",
+            "native_steer_queue",
+        }
     }
     snapshot_input["proc"] = active.get("proc")
     snapshot_input["stdout_lines"] = list(active.get("stdout_tail") or [])
@@ -9744,6 +9872,7 @@ async def rollover_codex_provider_session(
     reason: str,
     *,
     message: str,
+    memory_seed_used: bool = True,
 ) -> tuple[dict[str, Any], str] | None:
     current = STORE.sessions.get(session_id)
     if not current:
@@ -9756,8 +9885,10 @@ async def rollover_codex_provider_session(
             return None
         current["session_id"] = None
         current["codex_thread_id"] = None
+        current.pop("codex_instruction_hash", None)
+        current.pop("codex_instruction_version", None)
         current["memory_seed"] = memory
-        current["memory_seed_used"] = True
+        current["memory_seed_used"] = memory_seed_used
         current["memory_forked"] = True
         current["memory_fork_reason"] = compact_memory_text(reason, 2000)
         current["updated_at"] = now_iso()
@@ -9951,6 +10082,175 @@ def agent_runner_env(session_id: str) -> dict[str, str]:
     env["AGENTSDOCK_JOBS_CLI"] = str(SERVER_ROOT / "agentsdock_jobs.py")
     env["AGENTSDOCK_AGENT_TOKEN"] = AGENT_TOKEN
     return env
+
+
+def codex_app_server_env() -> dict[str, str]:
+    """Process-wide environment; chat scope is supplied explicitly per thread."""
+    env = runner_env()
+    codex_dir = os.path.dirname(os.path.abspath(CODEX_BIN))
+    if codex_dir and codex_dir not in env.get("PATH", "").split(os.pathsep):
+        env["PATH"] = codex_dir + os.pathsep + env.get("PATH", "")
+    env["AGENTSDOCK_SERVER_URL"] = f"http://127.0.0.1:{SERVER_PORT}"
+    env["AGENTSDOCK_JOBS_CLI"] = str(SERVER_ROOT / "agentsdock_jobs.py")
+    env["AGENTSDOCK_AGENT_TOKEN"] = AGENT_TOKEN
+    return env
+
+
+async def codex_app_server_manager() -> CodexAppServerManager:
+    """Return the one lazy, multiplexed Codex app-server for this server."""
+    global CODEX_APP_SERVER_MANAGER
+    manager = CODEX_APP_SERVER_MANAGER
+    if manager is not None:
+        return manager
+    async with CODEX_APP_SERVER_MANAGER_LOCK:
+        manager = CODEX_APP_SERVER_MANAGER
+        if manager is None:
+            manager = CodexAppServerManager(
+                CODEX_BIN,
+                cwd=existing_cwd(DEFAULT_CWD),
+                env_factory=codex_app_server_env,
+                request_timeout=CODEX_APP_SERVER_TIMEOUT_SECONDS,
+                lifecycle_timeout=CODEX_APP_SERVER_LIFECYCLE_TIMEOUT_SECONDS,
+                process_stream_limit=CODEX_APP_SERVER_JSONL_LIMIT_BYTES,
+                notification_queue_limit=(
+                    CODEX_APP_SERVER_NOTIFICATION_QUEUE_LIMIT
+                ),
+            )
+            CODEX_APP_SERVER_MANAGER = manager
+        return manager
+
+
+async def close_codex_app_server_manager() -> None:
+    global CODEX_APP_SERVER_MANAGER
+    async with CODEX_APP_SERVER_MANAGER_LOCK:
+        manager = CODEX_APP_SERVER_MANAGER
+        CODEX_APP_SERVER_MANAGER = None
+    async with CODEX_APP_SERVER_THREAD_LRU_LOCK:
+        for event in CODEX_APP_SERVER_EVICTING_THREADS.values():
+            event.set()
+        CODEX_APP_SERVER_EVICTING_THREADS.clear()
+        CODEX_APP_SERVER_THREAD_LRU.clear()
+        CODEX_APP_SERVER_PINNED_THREADS.clear()
+    if manager is not None:
+        await manager.close()
+
+
+async def pin_codex_app_server_thread(thread_id: str) -> None:
+    if not thread_id:
+        return
+    while True:
+        async with CODEX_APP_SERVER_THREAD_LRU_LOCK:
+            eviction = CODEX_APP_SERVER_EVICTING_THREADS.get(thread_id)
+            if eviction is None:
+                CODEX_APP_SERVER_PINNED_THREADS.add(thread_id)
+                return
+        await eviction.wait()
+
+
+async def evict_codex_app_server_thread(
+    manager: CodexAppServerManager,
+    thread_id: str,
+    *,
+    reinsert_on_failure: bool,
+) -> bool:
+    """Reserve then unsubscribe a thread without holding the global LRU lock."""
+    if not thread_id:
+        return False
+    while True:
+        async with CODEX_APP_SERVER_THREAD_LRU_LOCK:
+            existing = CODEX_APP_SERVER_EVICTING_THREADS.get(thread_id)
+            if existing is not None:
+                wait_for_existing = existing
+            else:
+                wait_for_existing = None
+                if (
+                    thread_id in CODEX_APP_SERVER_PINNED_THREADS
+                    or manager.active_turn(thread_id) is not None
+                    or not manager.is_thread_loaded(thread_id)
+                ):
+                    return False
+                eviction = asyncio.Event()
+                CODEX_APP_SERVER_EVICTING_THREADS[thread_id] = eviction
+                CODEX_APP_SERVER_THREAD_LRU.pop(thread_id, None)
+                break
+        if wait_for_existing is not None:
+            await wait_for_existing.wait()
+            return not manager.is_thread_loaded(thread_id)
+
+    succeeded = False
+    try:
+        await manager.unsubscribe_thread(thread_id)
+        succeeded = True
+        return True
+    except CodexAppServerError:
+        return False
+    finally:
+        async with CODEX_APP_SERVER_THREAD_LRU_LOCK:
+            CODEX_APP_SERVER_EVICTING_THREADS.pop(thread_id, None)
+            if (
+                not succeeded
+                and reinsert_on_failure
+                and manager.is_thread_loaded(thread_id)
+            ):
+                CODEX_APP_SERVER_THREAD_LRU[thread_id] = time.monotonic()
+            eviction.set()
+
+
+async def unpin_codex_app_server_thread(
+    manager: CodexAppServerManager,
+    thread_id: str,
+) -> None:
+    if not thread_id:
+        return
+    async with CODEX_APP_SERVER_THREAD_LRU_LOCK:
+        CODEX_APP_SERVER_PINNED_THREADS.discard(thread_id)
+    retained = any(
+        str(session_provider_id(session) or "") == thread_id
+        for session in STORE.sessions.values()
+    )
+    if retained:
+        await touch_codex_app_server_thread(manager, thread_id)
+        return
+    async with CODEX_APP_SERVER_THREAD_LRU_LOCK:
+        CODEX_APP_SERVER_THREAD_LRU.pop(thread_id, None)
+    await evict_codex_app_server_thread(
+        manager,
+        thread_id,
+        reinsert_on_failure=False,
+    )
+
+
+async def touch_codex_app_server_thread(
+    manager: CodexAppServerManager,
+    thread_id: str,
+) -> None:
+    """Keep only a bounded set of idle thread subscriptions in the shared process."""
+    if not thread_id:
+        return
+    async with CODEX_APP_SERVER_THREAD_LRU_LOCK:
+        CODEX_APP_SERVER_THREAD_LRU.pop(thread_id, None)
+        CODEX_APP_SERVER_THREAD_LRU[thread_id] = time.monotonic()
+        candidates = [
+            candidate
+            for candidate in CODEX_APP_SERVER_THREAD_LRU
+            if (
+                candidate not in CODEX_APP_SERVER_PINNED_THREADS
+                and candidate not in CODEX_APP_SERVER_EVICTING_THREADS
+                and manager.active_turn(candidate) is None
+            )
+        ]
+        overflow = max(
+            0,
+            len(CODEX_APP_SERVER_THREAD_LRU)
+            - CODEX_APP_SERVER_MAX_LOADED_THREADS,
+        )
+        candidates = candidates[:overflow]
+    for candidate in candidates:
+        await evict_codex_app_server_thread(
+            manager,
+            candidate,
+            reinsert_on_failure=True,
+        )
 
 
 def runtime_option(value: str, label: str | None = None, **extra: Any) -> dict[str, Any]:
@@ -10548,6 +10848,189 @@ def session_prompt_addendum(sess: dict[str, Any]) -> str:
     )
 
 
+def codex_thread_instructions(session_id: str, sess: dict[str, Any]) -> str:
+    """Return stable thread-level Codex instructions, never turn/user content."""
+    provider_context = CODEX_PROMPT_PRELUDE.format(
+        manifest_path=str(codex_manifest_path(session_id)),
+        terminal_session=terminal_session_name(session_id),
+        chat_id=session_id,
+    )
+    user_developer_instructions = codex_user_developer_instructions()
+    return "\n\n".join(
+        value
+        for value in (
+            user_developer_instructions,
+            provider_context.rstrip(),
+            session_prompt_addendum(sess).strip(),
+        )
+        if value
+    )
+
+
+def codex_thread_instruction_hash(session_id: str, sess: dict[str, Any]) -> str:
+    payload = (
+        f"agentsdock-policy-v{CODEX_THREAD_POLICY_VERSION}\0"
+        f"{codex_thread_instructions(session_id, sess)}"
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def codex_runtime_settings(sess: dict[str, Any]) -> tuple[str, str, str]:
+    configured_model, configured_effort, configured_service_tier = codex_user_config_defaults()
+    model = str(sess.get("model") or configured_model or CODEX_DEFAULT_MODEL).strip()
+    effort = normalize_runtime_effort(
+        BACKEND_CODEX,
+        sess.get("effort") or configured_effort or CODEX_DEFAULT_EFFORT,
+    )
+    service_tier = configured_service_tier or codex_default_service_tier(model)
+    return model, effort, service_tier
+
+
+def codex_thread_params(
+    sess: dict[str, Any],
+    cwd: str,
+    *,
+    developer_instructions: str | None = None,
+) -> dict[str, Any]:
+    model, _effort, service_tier = codex_runtime_settings(sess)
+    params: dict[str, Any] = {
+        "cwd": cwd,
+        "approvalPolicy": "never",
+        "sandbox": "danger-full-access",
+    }
+    if developer_instructions is not None:
+        params["developerInstructions"] = developer_instructions
+    if model:
+        params["model"] = model
+    if service_tier:
+        params["serviceTier"] = service_tier
+    return params
+
+
+def codex_raw_developer_message(text: str) -> dict[str, Any]:
+    return {
+        "type": "message",
+        "role": "developer",
+        "content": [{"type": "input_text", "text": text}],
+    }
+
+
+async def ensure_codex_app_server_thread(
+    manager: CodexAppServerManager,
+    session_id: str,
+    sess: dict[str, Any],
+    cwd: str,
+) -> tuple[str, str]:
+    """Load/create and lease a provider thread, applying changed policy once."""
+    provider_id = str(session_provider_id(sess) or "")
+    had_provider_id = bool(provider_id)
+    instructions = codex_thread_instructions(session_id, sess)
+    instruction_hash = codex_thread_instruction_hash(session_id, sess)
+    stored_hash = str(sess.get("codex_instruction_hash") or "")
+    policy_changed = stored_hash != instruction_hash
+    pinned = False
+    try:
+        if provider_id:
+            await pin_codex_app_server_thread(provider_id)
+            pinned = True
+        already_loaded = bool(
+            provider_id and manager.is_thread_loaded(provider_id)
+        )
+
+        if not provider_id:
+            provider_id = await manager.start_thread(
+                {
+                    **codex_thread_params(
+                        sess,
+                        cwd,
+                        developer_instructions=instructions,
+                    ),
+                    "ephemeral": False,
+                    "serviceName": "AgentsDock",
+                }
+            )
+            await pin_codex_app_server_thread(provider_id)
+            pinned = True
+        elif already_loaded and policy_changed:
+            # A loaded thread keeps its native thread settings. Reload it with
+            # the new policy before accepting another user turn so chat-scoped
+            # manifest, jobs, and terminal routing cannot remain stale.
+            await manager.unsubscribe_thread(provider_id)
+            provider_id = await manager.resume_thread(
+                provider_id,
+                {
+                    **codex_thread_params(
+                        sess,
+                        cwd,
+                        developer_instructions=instructions,
+                    ),
+                    "excludeTurns": True,
+                },
+            )
+        elif not already_loaded:
+            resume_params = {
+                **codex_thread_params(
+                    sess,
+                    cwd,
+                    developer_instructions=(
+                        instructions if policy_changed else None
+                    ),
+                ),
+                "excludeTurns": True,
+            }
+            provider_id = await manager.resume_thread(provider_id, resume_params)
+
+        # Current Codex releases can defer changed resume instructions until a
+        # later turn. Inject the one-time migration as a developer item so the
+        # first post-upgrade turn is correct without ever wrapping user content.
+        if had_provider_id and policy_changed:
+            await manager.inject_items(
+                provider_id,
+                [codex_raw_developer_message(instructions)],
+            )
+
+        memory_seed = str(sess.get("memory_seed") or "").strip()
+        if memory_seed and (
+            not sess.get("memory_seed_used")
+            or not session_provider_id(sess)
+        ):
+            await manager.inject_items(
+                provider_id,
+                [
+                    codex_raw_developer_message(
+                        "Fork memory context follows. Treat it as bounded background "
+                        "for the next user request; do not repeat it verbatim.\n\n"
+                        f"{memory_seed}"
+                    )
+                ],
+            )
+            async with STORE._lock:
+                current = STORE.sessions.get(session_id)
+                if current:
+                    current["memory_seed_used"] = True
+                    current["updated_at"] = now_iso()
+                    await STORE.save()
+
+        provider_state_changed = (
+            str(sess.get("session_id") or "") != provider_id
+            or str(sess.get("codex_thread_id") or "") != provider_id
+            or not str(sess.get("backend") or "").strip()
+        )
+        if provider_state_changed or policy_changed:
+            await STORE.save_provider_session(
+                session_id,
+                provider_id,
+                BACKEND_CODEX,
+                codex_instruction_hash=instruction_hash,
+            )
+        await touch_codex_app_server_thread(manager, provider_id)
+        return provider_id, instruction_hash
+    except Exception:
+        if pinned and provider_id:
+            await unpin_codex_app_server_thread(manager, provider_id)
+        raise
+
+
 def session_system_prompt(session_id: str, sess: dict[str, Any], manifest_path: Path) -> str:
     return SYSTEM_PROMPT.format(
         manifest_path=str(manifest_path),
@@ -10617,14 +11100,7 @@ def build_codex_cmd(
         sess.get("session_id") if sess.get("backend") == BACKEND_CODEX else None
     )
     configured_model, configured_effort, configured_service_tier = codex_user_config_defaults()
-    provider_context = CODEX_PROMPT_PRELUDE.format(
-        manifest_path=str(manifest_path),
-        terminal_session=terminal_session_name(session_id),
-    ) + scheduled_jobs_prompt_context(session_id) + session_prompt_addendum(sess)
-    user_developer_instructions = codex_user_developer_instructions()
-    combined_developer_instructions = "\n\n".join(
-        value for value in (user_developer_instructions, provider_context.rstrip()) if value
-    )
+    combined_developer_instructions = codex_thread_instructions(session_id, sess)
     model = str(sess.get("model") or configured_model or CODEX_DEFAULT_MODEL).strip()
     normalized_effort = normalize_runtime_effort(
         BACKEND_CODEX,
@@ -10784,6 +11260,16 @@ def codex_output_text(value: Any) -> str:
     return str(value)
 
 
+def bounded_codex_output_text(value: Any) -> str:
+    text = codex_output_text(value)
+    if len(text) <= CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS:
+        return text
+    return (
+        "[Earlier tool output truncated by AgentsServer]\n"
+        + text[-CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS:]
+    )
+
+
 def codex_output_exit_code(text: str) -> int | None:
     for pattern in (r"Process exited with code (-?\d+)", r"Exit code:\s*(-?\d+)"):
         match = re.search(pattern, text)
@@ -10811,99 +11297,87 @@ def codex_reasoning_text(payload: dict[str, Any]) -> str:
     return ""
 
 
-async def codex_app_server_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
-    env = runner_env()
-    codex_dir = os.path.dirname(os.path.abspath(CODEX_BIN))
-    if codex_dir and codex_dir not in env.get("PATH", "").split(os.pathsep):
-        env["PATH"] = codex_dir + os.pathsep + env.get("PATH", "")
-    proc = await asyncio.create_subprocess_exec(
-        CODEX_BIN,
-        "app-server",
-        "--listen",
-        "stdio://",
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=DEFAULT_CWD,
-        env=env,
-        limit=PROCESS_STREAM_LIMIT,
-        start_new_session=True,
+def codex_turn_matches_client_user_message(
+    turn: dict[str, Any],
+    client_user_message_id: str,
+) -> bool:
+    """Identify an app-server turn by the id assigned to its user item."""
+    expected = str(client_user_message_id or "")
+    if not expected:
+        return False
+    if str(turn.get("clientUserMessageId") or "") == expected:
+        return True
+    items = turn.get("items")
+    if not isinstance(items, list):
+        return False
+    return any(
+        isinstance(item, dict)
+        and str(item.get("type") or "") == "userMessage"
+        and (
+            str(item.get("clientId") or "") == expected
+            or str(item.get("id") or "") == expected
+            or str(item.get("clientUserMessageId") or "") == expected
+        )
+        for item in items
     )
-    stderr_lines: list[str] = []
-
-    async def read_stderr() -> None:
-        if not proc.stderr:
-            return
-        while True:
-            line = await proc.stderr.readline()
-            if not line:
-                break
-            stderr_lines.append(line.decode("utf-8", "replace").strip())
-
-    async def send(request_id: int, request_method: str, request_params: dict[str, Any]) -> None:
-        if not proc.stdin:
-            raise RuntimeError("codex app-server stdin unavailable")
-        payload = {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": request_method,
-            "params": request_params,
-        }
-        proc.stdin.write((json.dumps(payload, separators=(",", ":")) + "\n").encode())
-        await proc.stdin.drain()
-
-    async def read_response(request_id: int) -> dict[str, Any]:
-        if not proc.stdout:
-            raise RuntimeError("codex app-server stdout unavailable")
-        while True:
-            line = await asyncio.wait_for(proc.stdout.readline(), timeout=CODEX_APP_SERVER_TIMEOUT_SECONDS)
-            if not line:
-                raise RuntimeError("codex app-server exited before response")
-            try:
-                message = json.loads(line.decode("utf-8", "replace"))
-            except Exception:
-                continue
-            if message.get("id") != request_id:
-                continue
-            if "error" in message:
-                raise RuntimeError(json.dumps(message["error"], separators=(",", ":")))
-            return message.get("result", {})
-
-    stderr_task = asyncio.create_task(read_stderr())
-    try:
-        await send(1, "initialize", {
-            "clientInfo": {"name": "agents-server", "version": "0"},
-            "capabilities": {"experimentalApi": True},
-        })
-        await read_response(1)
-        await send(2, method, params)
-        return await read_response(2)
-    finally:
-        await terminate_process_tree(proc, grace=3)
-        stderr_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await stderr_task
-        if stderr_lines:
-            logger.debug("codex app-server stderr: %s", "\n".join(stderr_lines[-20:]))
 
 
 async def fork_codex_thread(source_thread_id: str, sess: dict[str, Any]) -> str:
     cwd = existing_cwd(str(sess.get("cwd") or DEFAULT_CWD))
-    params: dict[str, Any] = {
-        "threadId": source_thread_id,
-        "cwd": cwd,
-        "sandbox": "danger-full-access",
-        "approvalPolicy": "never",
+    manager = await codex_app_server_manager()
+    params = {
+        **codex_thread_params(sess, cwd),
         "ephemeral": False,
+        "excludeTurns": True,
     }
-    if sess.get("model"):
-        params["model"] = sess["model"]
-    result = await codex_app_server_request("thread/fork", params)
-    thread = result.get("thread") if isinstance(result, dict) else None
-    forked_id = thread.get("id") if isinstance(thread, dict) else None
-    if not forked_id:
-        raise RuntimeError("codex app-server did not return a forked thread id")
-    return str(forked_id)
+    forked_id = await manager.fork_thread(source_thread_id, params)
+    await touch_codex_app_server_thread(manager, forked_id)
+    return forked_id
+
+
+async def bind_forked_codex_thread(
+    session_id: str,
+    thread_id: str,
+    sess: dict[str, Any],
+) -> tuple[str, str]:
+    """Bind a native fork to its child chat's policy before exposing it."""
+    cwd = existing_cwd(str(sess.get("cwd") or DEFAULT_CWD))
+    manager = await codex_app_server_manager()
+    instructions = codex_thread_instructions(session_id, sess)
+    instruction_hash = codex_thread_instruction_hash(session_id, sess)
+    await pin_codex_app_server_thread(thread_id)
+    bound_thread_id = thread_id
+    try:
+        if manager.is_thread_loaded(thread_id):
+            await manager.unsubscribe_thread(thread_id)
+        bound_thread_id = await manager.resume_thread(
+            thread_id,
+            {
+                **codex_thread_params(
+                    sess,
+                    cwd,
+                    developer_instructions=instructions,
+                ),
+                "excludeTurns": True,
+            },
+        )
+        # Current Codex releases can defer changed resume instructions until a
+        # later turn. Persist the child-scoped policy as a developer item too,
+        # before the fork is returned to any client.
+        await manager.inject_items(
+            bound_thread_id,
+            [codex_raw_developer_message(instructions)],
+        )
+        await STORE.save_provider_session(
+            session_id,
+            bound_thread_id,
+            BACKEND_CODEX,
+            codex_instruction_hash=instruction_hash,
+        )
+        await touch_codex_app_server_thread(manager, bound_thread_id)
+        return bound_thread_id, instruction_hash
+    finally:
+        await unpin_codex_app_server_thread(manager, bound_thread_id)
 
 
 def artifact_record(session_id: str, entry: str | dict[str, Any]) -> dict[str, Any] | None:
@@ -11346,7 +11820,103 @@ async def run_claude(
         schedule_next_queued_turn(session_id)
 
 
-async def run_codex(
+def codex_app_server_tool(item: dict[str, Any]) -> dict[str, Any] | None:
+    item_type = str(item.get("type") or "")
+    item_id = str(item.get("id") or f"tool_{uuid.uuid4().hex[:8]}")
+    if item_type == "commandExecution":
+        tool_input: dict[str, Any] = {"command": str(item.get("command") or "")}
+        if item.get("cwd"):
+            tool_input["workdir"] = item.get("cwd")
+        return {"id": item_id, "name": "Bash", "input": tool_input}
+    if item_type == "fileChange":
+        return {
+            "id": item_id,
+            "name": "apply_patch",
+            "input": {"changes": item.get("changes") or []},
+        }
+    if item_type == "mcpToolCall":
+        server = str(item.get("server") or "mcp")
+        name = str(item.get("tool") or "tool")
+        return {
+            "id": item_id,
+            "name": f"{server}/{name}",
+            "input": item.get("arguments") or {},
+        }
+    if item_type == "dynamicToolCall":
+        namespace = str(item.get("namespace") or "dynamic")
+        name = str(item.get("tool") or "tool")
+        return {
+            "id": item_id,
+            "name": f"{namespace}/{name}",
+            "input": item.get("arguments") or {},
+        }
+    if item_type == "collabAgentToolCall":
+        return {
+            "id": item_id,
+            "name": "Agent",
+            "input": {
+                "description": str(item.get("tool") or "Codex subagent"),
+                "model": item.get("model"),
+                "reasoning_effort": item.get("reasoningEffort"),
+            },
+        }
+    if item_type == "webSearch":
+        return {
+            "id": item_id,
+            "name": "WebSearch",
+            "input": {"query": item.get("query") or ""},
+        }
+    if item_type == "imageView":
+        return {
+            "id": item_id,
+            "name": "ViewImage",
+            "input": {"path": item.get("path") or ""},
+        }
+    if item_type == "imageGeneration":
+        return {"id": item_id, "name": "ImageGeneration", "input": {}}
+    return None
+
+
+def codex_app_server_tool_output(
+    item: dict[str, Any],
+    delta_text: str = "",
+) -> tuple[Any, int | None, bool]:
+    item_type = str(item.get("type") or "")
+    status = str(item.get("status") or "").lower()
+    is_error = status in {"failed", "declined", "cancelled", "canceled", "errored"}
+    if item_type == "commandExecution":
+        output = item.get("aggregatedOutput") or delta_text
+        exit_code = item.get("exitCode")
+        return output, int(exit_code) if isinstance(exit_code, int) else None, is_error
+    if item_type == "fileChange":
+        return item.get("changes") or delta_text, None, is_error
+    if item_type in {"mcpToolCall", "dynamicToolCall"}:
+        output = item.get("result") or item.get("contentItems") or item.get("error") or delta_text
+        return output, None, is_error or bool(item.get("error")) or item.get("success") is False
+    if item_type == "collabAgentToolCall":
+        return item.get("agentsStates") or status or delta_text, None, is_error
+    if item_type == "webSearch":
+        return item.get("action") or item.get("query") or delta_text, None, is_error
+    if item_type == "imageView":
+        return item.get("path") or delta_text, None, is_error
+    if item_type == "imageGeneration":
+        return item.get("result") or item.get("savedPath") or delta_text, None, is_error
+    return delta_text, None, is_error
+
+
+def codex_app_server_changed_paths(item: dict[str, Any]) -> set[str]:
+    paths: set[str] = set()
+    if str(item.get("type") or "") != "fileChange":
+        return paths
+    for change in item.get("changes") or []:
+        if isinstance(change, dict):
+            path = str(change.get("path") or change.get("filePath") or "").strip()
+            if path:
+                paths.add(path)
+    return paths
+
+
+async def run_codex_exec(
     session_id: str,
     run_id: str,
     prompt: str,
@@ -11357,6 +11927,25 @@ async def run_codex(
     diff_baseline: dict[str, str] | None = None,
 ) -> None:
     resumed_provider_id = session_provider_id(sess)
+    memory_seed = str(sess.get("memory_seed") or "").strip()
+    if memory_seed and (not sess.get("memory_seed_used") or not resumed_provider_id):
+        prompt = build_memory_augmented_prompt(
+            "Fork memory context",
+            memory_seed,
+            prompt,
+        )
+        async with STORE._lock:
+            current = STORE.sessions.get(session_id)
+            if current:
+                current["memory_seed_used"] = True
+                current["updated_at"] = now_iso()
+                sess = dict(current)
+                await STORE.save()
+        await append_event(session_id, "history_imported", {
+            "run_id": run_id,
+            "backend": BACKEND_CODEX,
+            "message": "Applied memory fork context to this first Codex exec turn.",
+        })
     cmd = build_codex_cmd(
         session_id,
         sess,
@@ -11727,7 +12316,7 @@ async def run_codex(
                 memory,
                 prompt,
             )
-            await run_codex(
+            await run_codex_exec(
                 session_id,
                 run_id,
                 retry_prompt,
@@ -11787,6 +12376,1170 @@ async def run_codex(
     STOPPED_RUNS.discard(run_id)
     if drain_queue:
         schedule_next_queued_turn(session_id)
+
+
+def queued_turn_run_metadata(item: dict[str, Any]) -> dict[str, Any]:
+    metadata = {
+        "purpose": item.get("purpose"),
+        "job_id": item.get("job_id"),
+        "job_title": item.get("job_title"),
+        "digest_job_id": item.get("digest_job_id"),
+        "digest_detail": item.get("digest_detail"),
+        "source_session_id": item.get("source_session_id"),
+        "target_session_id": item.get("target_session_id"),
+        "steer_interrupted_run_id": item.get("steer_interrupted_run_id"),
+    }
+    return {key: value for key, value in metadata.items() if value is not None}
+
+
+class NativeSteerHandoffError(CodexAppServerError):
+    """A Force Send handoff failure with an explicit queue-retry boundary."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        safe_to_requeue: bool,
+        delivery_uncertain: bool = False,
+    ) -> None:
+        super().__init__(
+            message,
+            request_sent=not safe_to_requeue,
+            safe_to_retry=safe_to_requeue,
+        )
+        self.safe_to_requeue = safe_to_requeue
+        self.delivery_uncertain = delivery_uncertain
+
+
+async def run_codex_app_server(
+    session_id: str,
+    run_id: str,
+    prompt: str,
+    sess: dict[str, Any],
+    manifest_path: Path,
+    *,
+    allow_exec_fallback: bool,
+    allow_resume_rollover: bool = True,
+    diff_baseline: dict[str, Any] | None = None,
+) -> None:
+    requested_cwd = str(sess.get("cwd") or DEFAULT_CWD)
+    cwd = existing_cwd(requested_cwd)
+    if diff_baseline is None:
+        diff_baseline = await capture_git_baseline(session_id, run_id, cwd)
+    if str(Path(requested_cwd).expanduser()) != cwd:
+        await append_event(session_id, "cwd_fallback", {
+            "run_id": run_id,
+            "requested_cwd": requested_cwd,
+            "cwd": cwd,
+        })
+
+    public_cmd = [CODEX_BIN, "app-server", "--listen", "stdio://"]
+    await append_event(session_id, "process_started", {
+        "run_id": run_id,
+        "backend": BACKEND_CODEX,
+        "transport": CODEX_TRANSPORT_APP_SERVER,
+        "argv": public_cmd,
+        "cwd": cwd,
+    })
+
+    manager = await codex_app_server_manager()
+    provider_id = str(session_provider_id(sess) or "")
+    resumed_provider_id = provider_id or None
+    model, effort, service_tier = codex_runtime_settings(sess)
+    thread_pinned = False
+    turn = None
+    turn_start_attempted = False
+    ambiguous_turn_start = False
+    ambiguous_accept_deadline = 0.0
+    ambiguous_reconcile_at = 0.0
+    ambiguous_reconcile_attempted = False
+    turn_start_epoch = 0.0
+    terminal_status = "failed"
+    terminal_error: str | None = None
+    error_emitted = False
+    delivery_unknown = False
+    turn_completed = False
+    current_run_id = run_id
+    current_diff_baseline = diff_baseline
+    manifest_watch_task: asyncio.Task[None] | None = None
+    logical_state_lock = asyncio.Lock()
+    steer_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    text_parts: list[str] = []
+    seen_text: set[str] = set()
+    seen_reasoning: set[str] = set()
+    assistant_deltas: dict[str, list[str]] = {}
+    reasoning_deltas: dict[str, list[str]] = {}
+    tool_output_deltas: dict[str, deque[str]] = {}
+    tool_output_lengths: dict[str, int] = {}
+    tool_output_truncated: set[str] = set()
+    tool_calls: dict[str, dict[str, Any]] = {}
+    started_tools: set[str] = set()
+    finished_tools: set[str] = set()
+    changed_paths: set[str] = set()
+    seen_artifacts: set[str] = set()
+    pending_unknown_message = ""
+
+    def append_tool_output_delta(item_id: str, value: Any) -> None:
+        delta = str(value or "")
+        if not delta:
+            return
+        chunks = tool_output_deltas.setdefault(item_id, deque())
+        chunks.append(delta)
+        total = tool_output_lengths.get(item_id, 0) + len(delta)
+        while total > CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS and chunks:
+            excess = total - CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS
+            first = chunks[0]
+            if len(first) <= excess:
+                total -= len(chunks.popleft())
+            else:
+                chunks[0] = first[excess:]
+                total -= excess
+            tool_output_truncated.add(item_id)
+        tool_output_lengths[item_id] = total
+
+    def consume_tool_output_delta(item_id: str) -> str:
+        chunks = tool_output_deltas.pop(item_id, deque())
+        tool_output_lengths.pop(item_id, None)
+        text = "".join(chunks)
+        if item_id in tool_output_truncated:
+            tool_output_truncated.discard(item_id)
+            return "[Earlier tool output truncated by AgentsServer]\n" + text
+        return text
+
+    def current_metadata() -> dict[str, Any]:
+        return run_event_metadata(current_run_id)
+
+    async def emit_final_text(value: Any) -> None:
+        text = clean_assistant_text(str(value or ""))
+        if not text or text in seen_text:
+            return
+        seen_text.add(text)
+        text_parts.append(text)
+        await append_event(session_id, "assistant_text", {
+            "run_id": current_run_id,
+            "text": text,
+            **current_metadata(),
+        })
+
+    async def emit_reasoning(value: Any) -> None:
+        text = str(value or "").strip()
+        if not text or text in seen_reasoning:
+            return
+        seen_reasoning.add(text)
+        await append_event(session_id, "reasoning_summary", {
+            "run_id": current_run_id,
+            "text": text,
+        })
+
+    async def flush_pending_unknown(*, final: bool) -> None:
+        nonlocal pending_unknown_message
+        text = pending_unknown_message
+        pending_unknown_message = ""
+        if not text:
+            return
+        if final:
+            await emit_final_text(text)
+        else:
+            await emit_reasoning(text)
+
+    async def emit_tool_started(tool: dict[str, Any]) -> None:
+        tool_id = str(tool.get("id") or "")
+        if not tool_id or tool_id in started_tools:
+            return
+        await flush_pending_unknown(final=False)
+        started_tools.add(tool_id)
+        tool_calls[tool_id] = tool
+        await append_event(session_id, "tool_started", {
+            "run_id": current_run_id,
+            "tool": tool,
+        })
+
+    async def emit_tool_finished(item: dict[str, Any]) -> None:
+        tool = codex_app_server_tool(item)
+        if not tool:
+            return
+        tool_id = str(tool["id"])
+        if tool_id in finished_tools:
+            return
+        await emit_tool_started(tool)
+        finished_tools.add(tool_id)
+        output, exit_code, is_error = codex_app_server_tool_output(
+            item,
+            consume_tool_output_delta(tool_id),
+        )
+        await append_event(session_id, "tool_finished", {
+            "run_id": current_run_id,
+            "tool_id": tool_id,
+            "tool": tool_calls.get(tool_id) or tool,
+            "output": bounded_codex_output_text(output),
+            "exit_code": exit_code,
+            "is_error": is_error,
+        })
+
+    async def stop_manifest_watcher() -> None:
+        nonlocal manifest_watch_task
+        task = manifest_watch_task
+        manifest_watch_task = None
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    async def finish_logical_outputs(
+        logical_run_id: str,
+        baseline: dict[str, Any],
+        paths: set[str],
+        artifacts: set[str],
+        logical_manifest_path: Path,
+    ) -> None:
+        await collect_manifest(
+            session_id,
+            logical_run_id,
+            logical_manifest_path,
+            seen_artifacts=artifacts,
+            final=True,
+        )
+        await publish_turn_code_diff(
+            session_id,
+            logical_run_id,
+            BACKEND_CODEX,
+            cwd,
+            baseline,
+            paths,
+        )
+
+    def clear_logical_buffers() -> None:
+        nonlocal pending_unknown_message
+        text_parts.clear()
+        seen_text.clear()
+        seen_reasoning.clear()
+        assistant_deltas.clear()
+        reasoning_deltas.clear()
+        tool_output_deltas.clear()
+        tool_output_lengths.clear()
+        tool_output_truncated.clear()
+        tool_calls.clear()
+        started_tools.clear()
+        finished_tools.clear()
+        changed_paths.clear()
+        seen_artifacts.clear()
+        pending_unknown_message = ""
+
+    async def switch_logical_run(
+        selected: dict[str, Any],
+        remaining: int,
+    ) -> dict[str, Any]:
+        nonlocal current_run_id, current_diff_baseline, manifest_watch_task
+        if turn is None or turn_completed:
+            raise NativeSteerHandoffError(
+                "the active Codex turn has already completed",
+                safe_to_requeue=True,
+            )
+
+        candidate_run_id = f"run_{uuid.uuid4().hex[:16]}"
+        try:
+            request_prompt = build_user_provider_prompt(
+                session_id,
+                str(selected.get("prompt") or ""),
+                list(selected.get("file_ids") or []),
+            )
+            candidate_diff_baseline = await capture_git_baseline(
+                session_id,
+                candidate_run_id,
+                cwd,
+            )
+        except Exception as exc:
+            raise NativeSteerHandoffError(
+                concise_error_message(exc),
+                safe_to_requeue=True,
+            ) from exc
+
+        try:
+            await turn.steer(
+                [{"type": "text", "text": request_prompt, "text_elements": []}],
+                client_user_message_id=candidate_run_id,
+            )
+        except CodexAppServerRequestError as exc:
+            raise NativeSteerHandoffError(
+                concise_error_message(exc),
+                safe_to_requeue=True,
+            ) from exc
+        except Exception as exc:
+            # Delivery may have succeeded. Never put this message back in the
+            # queue, and interrupt the provider turn so uncertain output cannot
+            # be attributed to the preceding logical request.
+            with suppress(CodexAppServerError):
+                await turn.interrupt()
+            with suppress(Exception):
+                await append_event(session_id, "error", {
+                    "run_id": current_run_id,
+                    "backend": BACKEND_CODEX,
+                    "transport": CODEX_TRANSPORT_APP_SERVER,
+                    "message": (
+                        "Force Send delivery could not be confirmed. The message "
+                        "was not replayed; retry it manually if it does not appear."
+                    ),
+                    "delivery_unknown": True,
+                })
+            raise NativeSteerHandoffError(
+                concise_error_message(exc),
+                safe_to_requeue=False,
+                delivery_uncertain=True,
+            ) from exc
+
+        previous_run_id = current_run_id
+        previous_metadata = run_event_metadata(previous_run_id)
+        with suppress(Exception):
+            await flush_pending_unknown(final=False)
+        previous_watcher = manifest_watch_task
+        manifest_watch_task = None
+        if previous_watcher is not None:
+            previous_watcher.cancel()
+            await asyncio.gather(previous_watcher, return_exceptions=True)
+        previous_manifest_path = manifest_path.with_name(
+            f".{previous_run_id}.json"
+        )
+        with suppress(OSError):
+            previous_manifest_path.unlink()
+        with suppress(OSError):
+            manifest_path.replace(previous_manifest_path)
+        previous_diff_baseline = current_diff_baseline
+        previous_changed_paths = set(changed_paths)
+        previous_seen_artifacts = set(seen_artifacts)
+
+        metadata = queued_turn_run_metadata(selected)
+        metadata["steer_interrupted_run_id"] = previous_run_id
+        display_prompt = str(
+            selected.get("display_prompt")
+            if selected.get("display_prompt") is not None
+            else selected.get("prompt") or ""
+        )
+        display_file_ids = list(
+            selected.get("display_file_ids")
+            if selected.get("display_file_ids") is not None
+            else selected.get("file_ids") or []
+        )
+        lineage = turn_steering_lineage(CURRENT_TURNS.get(session_id))
+        steering_message = {
+            "prompt": str(selected.get("prompt") or ""),
+            "file_ids": list(selected.get("file_ids") or []),
+        }
+        if not lineage or steering_message != lineage[-1]:
+            lineage.append(steering_message)
+
+        transition_ready = asyncio.Event()
+        stopped_during_handoff = False
+        async with ACTIVE_LOCK:
+            active = ACTIVE.get(session_id)
+            if not active or active.get("stop_requested"):
+                stopped_during_handoff = True
+            else:
+                current_run_id = candidate_run_id
+                current_diff_baseline = candidate_diff_baseline
+                RUN_METADATA[candidate_run_id] = metadata
+                clear_logical_buffers()
+                active["run_id"] = candidate_run_id
+                active["started_at"] = time.time()
+                active["started_at_iso"] = now_iso()
+                active["logical_transition_ready"] = transition_ready
+                current = CURRENT_TURNS.get(session_id)
+                if current is not None:
+                    current.update({
+                        "run_id": candidate_run_id,
+                        "prompt": str(selected.get("prompt") or ""),
+                        "display_prompt": display_prompt,
+                        "file_ids": list(selected.get("file_ids") or []),
+                        "queued_id": selected.get("queued_id"),
+                        "steering_lineage": lineage,
+                    })
+
+        if stopped_during_handoff:
+            raise NativeSteerHandoffError(
+                "the Codex turn was stopped while Force Send was being accepted",
+                safe_to_requeue=False,
+            )
+
+        try:
+            with suppress(OSError):
+                manifest_path.unlink()
+            manifest_watch_task = asyncio.create_task(
+                watch_manifest_artifacts(
+                    session_id,
+                    candidate_run_id,
+                    manifest_path,
+                    seen_artifacts,
+                )
+            )
+            for event_type, payload in (
+                (
+                    "turn_stopped",
+                    {
+                        "run_id": previous_run_id,
+                        "backend": BACKEND_CODEX,
+                        "transport": CODEX_TRANSPORT_APP_SERVER,
+                        "native_steer": True,
+                        "superseded_by_run_id": candidate_run_id,
+                        **previous_metadata,
+                    },
+                ),
+                (
+                    "turn_queue_run_now",
+                    {
+                        "queued_id": selected.get("queued_id"),
+                        "backend": BACKEND_CODEX,
+                        "prompt": display_prompt,
+                        "request_prompt": str(selected.get("prompt") or ""),
+                        "display_prompt": display_prompt,
+                        "file_ids": list(selected.get("file_ids") or []),
+                        "display_file_ids": display_file_ids,
+                        "interrupted_run_id": previous_run_id,
+                        "replays_interrupted_message": False,
+                        "native_steer": True,
+                        "message": "Steering message sent to the active Codex turn.",
+                        "remaining": remaining,
+                        "superseded_queued_ids": [],
+                    },
+                ),
+                (
+                    "turn_started",
+                    {
+                        "run_id": candidate_run_id,
+                        "backend": BACKEND_CODEX,
+                        "prompt": display_prompt,
+                        "file_ids": display_file_ids,
+                        "queued_id": selected.get("queued_id"),
+                        "native_steer": True,
+                        **metadata,
+                    },
+                ),
+            ):
+                try:
+                    await append_event(session_id, event_type, payload)
+                except Exception:
+                    logger.exception(
+                        "could not persist native steer event session=%s type=%s",
+                        session_id,
+                        event_type,
+                    )
+        except Exception:
+            logger.exception(
+                "could not finish native steer bookkeeping session=%s run=%s",
+                session_id,
+                candidate_run_id,
+            )
+        finally:
+            transition_ready.set()
+            async with ACTIVE_LOCK:
+                active = ACTIVE.get(session_id)
+                if (
+                    active
+                    and active.get("logical_transition_ready") is transition_ready
+                ):
+                    active.pop("logical_transition_ready", None)
+
+        RUN_METADATA.pop(previous_run_id, None)
+        STOPPED_RUNS.discard(previous_run_id)
+        try:
+            await finish_logical_outputs(
+                previous_run_id,
+                previous_diff_baseline,
+                previous_changed_paths,
+                previous_seen_artifacts,
+                previous_manifest_path,
+            )
+        except Exception:
+            logger.exception(
+                "could not finalize superseded Codex run session=%s run=%s",
+                session_id,
+                previous_run_id,
+            )
+        return {
+            "ok": True,
+            "queued_id": selected.get("queued_id"),
+            "run_id": candidate_run_id,
+            "interrupted": True,
+            "native_steer": True,
+            "replays_interrupted_message": False,
+            "superseded_queued_ids": [],
+        }
+
+    async def bind_active_turn_and_reconcile_stop() -> None:
+        if turn is None or not turn.turn_id:
+            return
+        should_interrupt = False
+        async with ACTIVE_LOCK:
+            active = ACTIVE.get(session_id)
+            if active:
+                active["provider_turn_ready"] = True
+                active["provider_turn_id"] = turn.turn_id
+                if (
+                    active.get("stop_requested")
+                    and not active.get("native_interrupt_sent")
+                ):
+                    active["native_interrupt_sent"] = True
+                    should_interrupt = True
+        if should_interrupt:
+            try:
+                await turn.interrupt()
+            except Exception:
+                async with ACTIVE_LOCK:
+                    active = ACTIVE.get(session_id)
+                    if active and active.get("provider_turn_id") == turn.turn_id:
+                        active["native_interrupt_sent"] = False
+                logger.warning(
+                    "Codex app-server late interrupt failed session=%s turn=%s",
+                    session_id,
+                    turn.turn_id,
+                )
+
+    def output_is_suppressed() -> bool:
+        if current_run_id in STOPPED_RUNS:
+            return True
+        active = ACTIVE.get(session_id)
+        return bool(active and active.get("stop_requested"))
+
+    async def handle_notification(notification: dict[str, Any]) -> bool:
+        nonlocal terminal_status, terminal_error, turn_completed
+        nonlocal pending_unknown_message, ambiguous_turn_start, error_emitted
+        method = str(notification.get("method") or "")
+        params = (
+            notification.get("params")
+            if isinstance(notification.get("params"), dict)
+            else {}
+        )
+        item = params.get("item") if isinstance(params.get("item"), dict) else {}
+        item_id = str(params.get("itemId") or item.get("id") or "")
+
+        if turn is not None and turn.turn_id:
+            ambiguous_turn_start = False
+            await bind_active_turn_and_reconcile_stop()
+
+        if method != "turn/completed" and output_is_suppressed():
+            return False
+
+        if method == "item/agentMessage/delta" and item_id:
+            assistant_deltas.setdefault(item_id, []).append(
+                str(params.get("delta") or "")
+            )
+            return False
+        if method in {
+            "item/reasoning/summaryTextDelta",
+            "item/reasoning/textDelta",
+            "item/plan/delta",
+        } and item_id:
+            reasoning_deltas.setdefault(item_id, []).append(
+                str(params.get("delta") or "")
+            )
+            return False
+        if method in {
+            "item/commandExecution/outputDelta",
+            "item/fileChange/outputDelta",
+        } and item_id:
+            append_tool_output_delta(item_id, params.get("delta"))
+            return False
+        if method == "item/started" and item:
+            tool = codex_app_server_tool(item)
+            if tool:
+                await emit_tool_started(tool)
+            changed_paths.update(codex_app_server_changed_paths(item))
+            return False
+        if method == "item/completed" and item:
+            item_type = str(item.get("type") or "")
+            if item_type == "agentMessage":
+                buffered = assistant_deltas.pop(
+                    str(item.get("id") or ""),
+                    [],
+                )
+                text = clean_assistant_text(
+                    str(
+                        item.get("text")
+                        or "".join(buffered)
+                    )
+                )
+                phase = str(item.get("phase") or "")
+                if phase == "commentary":
+                    await flush_pending_unknown(final=False)
+                    await emit_reasoning(text)
+                elif phase == "final_answer":
+                    await flush_pending_unknown(final=False)
+                    await emit_final_text(text)
+                elif text:
+                    await flush_pending_unknown(final=False)
+                    pending_unknown_message = text
+            elif item_type in {"reasoning", "plan"}:
+                await flush_pending_unknown(final=False)
+                buffered = reasoning_deltas.pop(
+                    str(item.get("id") or ""),
+                    [],
+                )
+                reasoning = (
+                    codex_reasoning_text(item)
+                    or "".join(buffered)
+                )
+                await emit_reasoning(reasoning)
+            else:
+                changed_paths.update(codex_app_server_changed_paths(item))
+                await emit_tool_finished(item)
+            return False
+        if method == "error":
+            error_value = params.get("error") or params.get("message") or params
+            terminal_error = concise_error_message(error_value)
+            # Delay terminal error publication until turn/completed. A stale
+            # resumed thread may be recovered transparently onto a fresh
+            # bounded-memory thread.
+            return False
+        if method == "turn/completed":
+            completed_turn = (
+                params.get("turn")
+                if isinstance(params.get("turn"), dict)
+                else {}
+            )
+            terminal_status = str(completed_turn.get("status") or "failed")
+            if completed_turn.get("error"):
+                terminal_error = concise_error_message(completed_turn.get("error"))
+            turn_completed = True
+            return True
+        return False
+
+    async def reconcile_ambiguous_start() -> bool:
+        """Resolve a lost turn/start acknowledgement without replaying input."""
+        nonlocal ambiguous_turn_start, ambiguous_reconcile_at
+        nonlocal ambiguous_reconcile_attempted
+        nonlocal terminal_status, terminal_error, turn_completed, error_emitted
+        nonlocal delivery_unknown
+        if not ambiguous_turn_start or turn is None or turn.turn_id:
+            ambiguous_turn_start = False if turn is not None and turn.turn_id else ambiguous_turn_start
+            return False
+
+        now = time.monotonic()
+        deadline_reached = now >= ambiguous_accept_deadline
+        if now < ambiguous_reconcile_at and not deadline_reached:
+            return False
+        should_read = not ambiguous_reconcile_attempted
+        ambiguous_reconcile_attempted = True
+        ambiguous_reconcile_at = ambiguous_accept_deadline
+        recovered_turn: dict[str, Any] | None = None
+        if should_read:
+            try:
+                reconcile_timeout = max(
+                    0.01,
+                    min(
+                        5.0,
+                        float(CODEX_APP_SERVER_TIMEOUT_SECONDS),
+                        max(0.0, ambiguous_accept_deadline - now),
+                    ),
+                )
+                turns = await asyncio.wait_for(
+                    manager.list_turns(
+                        provider_id,
+                        limit=4,
+                        items_view="full",
+                        sort_direction="desc",
+                    ),
+                    timeout=reconcile_timeout,
+                )
+                if isinstance(turns, list):
+                    for candidate in reversed(turns):
+                        if not isinstance(candidate, dict):
+                            continue
+                        if not codex_turn_matches_client_user_message(
+                            candidate,
+                            current_run_id,
+                        ):
+                            continue
+                        started_at = candidate.get("startedAt")
+                        if not isinstance(started_at, (int, float)):
+                            continue
+                        if started_at + 2 < turn_start_epoch:
+                            break
+                        candidate_id = str(candidate.get("id") or "")
+                        candidate_status = str(candidate.get("status") or "")
+                        if candidate_id and candidate_status in {
+                            "inProgress",
+                            "completed",
+                            "interrupted",
+                            "failed",
+                        }:
+                            recovered_turn = candidate
+                            break
+            except Exception as exc:
+                logger.debug(
+                    "ambiguous Codex turn reconciliation pending session=%s: %s",
+                    session_id,
+                    exc,
+                )
+        now = time.monotonic()
+
+        if recovered_turn is not None:
+            turn.adopt_turn_id(str(recovered_turn.get("id") or ""))
+            ambiguous_turn_start = False
+            await bind_active_turn_and_reconcile_stop()
+            status = str(recovered_turn.get("status") or "")
+            if status != "inProgress":
+                for recovered_item in recovered_turn.get("items") or []:
+                    if isinstance(recovered_item, dict):
+                        await handle_notification({
+                            "method": "item/completed",
+                            "params": {
+                                "threadId": provider_id,
+                                "turnId": turn.turn_id,
+                                "item": recovered_item,
+                            },
+                        })
+                terminal_status = status or "failed"
+                error_value = recovered_turn.get("error")
+                if error_value:
+                    terminal_error = concise_error_message(error_value)
+                turn_completed = True
+                return True
+            return False
+
+        if now < ambiguous_accept_deadline:
+            return False
+        terminal_status = "failed"
+        terminal_error = (
+            "Codex app-server did not confirm whether the turn was accepted. "
+            "The message was not replayed; retry it manually."
+        )
+        delivery_unknown = True
+        await append_event(session_id, "error", {
+            "run_id": current_run_id,
+            "backend": BACKEND_CODEX,
+            "transport": CODEX_TRANSPORT_APP_SERVER,
+            "message": terminal_error,
+            "delivery_unknown": True,
+            **current_metadata(),
+        })
+        error_emitted = True
+        return True
+
+    try:
+        await manager.start()
+        async with ACTIVE_LOCK:
+            stop_requested = session_id in STOP_REQUESTS
+            if stop_requested:
+                STOP_REQUESTS.discard(session_id)
+                STOPPED_RUNS.add(current_run_id)
+            ACTIVE[session_id] = {
+                "proc": None,
+                "run_id": current_run_id,
+                "backend": BACKEND_CODEX,
+                "transport": CODEX_TRANSPORT_APP_SERVER,
+                "pid": None,
+                "pgid": None,
+                "cwd": cwd,
+                "argv": public_cmd,
+                "started_at": time.time(),
+                "started_at_iso": now_iso(),
+                "stop_requested": stop_requested,
+                "provider_turn_ready": False,
+                "provider_thread_id": provider_id or None,
+                "provider_turn_id": None,
+                "provider_model": model,
+                "provider_effort": effort,
+                "provider_service_tier": service_tier,
+                "native_interrupt_sent": False,
+                "codex_app_server_turn": None,
+                "native_steer_queue": steer_queue,
+                "stdout_tail": deque(maxlen=LIVE_STDOUT_MAX_LINES),
+                "stdout_total_lines": 0,
+                "stdout_updated_at": None,
+            }
+        if stop_requested:
+            terminal_status = "interrupted"
+        else:
+            provider_id, _instruction_hash = await ensure_codex_app_server_thread(
+                manager,
+                session_id,
+                sess,
+                cwd,
+            )
+            thread_pinned = True
+            await append_event(session_id, "provider_session", {
+                "run_id": current_run_id,
+                "backend": BACKEND_CODEX,
+                "provider_session_id": provider_id,
+                "transport": CODEX_TRANSPORT_APP_SERVER,
+            })
+            async with ACTIVE_LOCK:
+                active = ACTIVE.get(session_id)
+                stop_requested = bool(active and active.get("stop_requested"))
+                if active:
+                    active["provider_thread_id"] = provider_id
+                    active["provider_session_id"] = provider_id
+
+            if stop_requested:
+                STOPPED_RUNS.add(current_run_id)
+                terminal_status = "interrupted"
+            else:
+                overrides: dict[str, Any] = {
+                    "cwd": cwd,
+                    "approvalPolicy": "never",
+                    "sandboxPolicy": {"type": "dangerFullAccess"},
+                    "summary": "detailed",
+                    "clientUserMessageId": current_run_id,
+                }
+                if model:
+                    overrides["model"] = model
+                if effort:
+                    overrides["effort"] = effort
+                if service_tier:
+                    overrides["serviceTier"] = service_tier
+
+                turn_start_attempted = True
+                turn_start_epoch = time.time()
+                try:
+                    turn = await manager.start_turn(
+                        provider_id,
+                        [{"type": "text", "text": prompt, "text_elements": []}],
+                        overrides=overrides,
+                    )
+                except CodexAppServerError as exc:
+                    pending_turn = getattr(exc, "pending_turn", None)
+                    if pending_turn is None:
+                        raise
+                    # Delivery is ambiguous. Observe the routed provisional
+                    # handle and never replay the user input through exec.
+                    turn = pending_turn
+                    terminal_error = concise_error_message(exc)
+                    ambiguous_turn_start = True
+                    ambiguous_accept_deadline = (
+                        time.monotonic()
+                        + CODEX_APP_SERVER_AMBIGUOUS_ACCEPT_SECONDS
+                    )
+                    ambiguous_reconcile_at = time.monotonic()
+
+                async with ACTIVE_LOCK:
+                    active = ACTIVE.get(session_id)
+                    if active:
+                        active["codex_app_server_turn"] = turn
+                        active["provider_thread_id"] = provider_id
+                        active["provider_session_id"] = provider_id
+                        active["provider_turn_id"] = turn.turn_id or None
+                        active["provider_turn_ready"] = bool(turn.turn_id)
+                        stop_requested = bool(active.get("stop_requested"))
+                await bind_active_turn_and_reconcile_stop()
+
+                manifest_watch_task = asyncio.create_task(
+                    watch_manifest_artifacts(
+                        session_id,
+                        current_run_id,
+                        manifest_path,
+                        seen_artifacts,
+                    )
+                )
+                last_activity = time.monotonic()
+                notification_task = asyncio.create_task(turn.next_notification())
+                steer_task = asyncio.create_task(steer_queue.get())
+                try:
+                    while not turn_completed:
+                        if await reconcile_ambiguous_start():
+                            break
+                        wait_timeout = 5.0
+                        if (
+                            ambiguous_turn_start
+                            and turn is not None
+                            and not turn.turn_id
+                        ):
+                            now = time.monotonic()
+                            wait_timeout = max(
+                                0.01,
+                                min(
+                                    wait_timeout,
+                                    max(0.0, ambiguous_accept_deadline - now),
+                                    max(0.0, ambiguous_reconcile_at - now),
+                                ),
+                            )
+                        done, _pending = await asyncio.wait(
+                            {notification_task, steer_task},
+                            timeout=wait_timeout,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if not done:
+                            idle = time.monotonic() - last_activity
+                            if idle >= IDLE_WARN_SECONDS:
+                                await append_event(session_id, "idle_warning", {
+                                    "run_id": current_run_id,
+                                    "idle_seconds": int(idle),
+                                })
+                            if idle >= IDLE_KILL_SECONDS:
+                                terminal_error = "Codex app-server turn exceeded the idle timeout."
+                                if turn.turn_id:
+                                    with suppress(CodexAppServerError):
+                                        await turn.interrupt()
+                                terminal_status = "failed"
+                                break
+                            continue
+
+                        # Drain provider output before a queued steering command
+                        # when both became ready together.
+                        if notification_task in done:
+                            notification = notification_task.result()
+                            last_activity = time.monotonic()
+                            async with logical_state_lock:
+                                completed = await handle_notification(notification)
+                            if completed:
+                                break
+                            notification_task = asyncio.create_task(
+                                turn.next_notification()
+                            )
+                            continue
+
+                        if steer_task in done:
+                            command = steer_task.result()
+                            future = command.get("future")
+                            try:
+                                async with logical_state_lock:
+                                    result = await switch_logical_run(
+                                        dict(command.get("selected") or {}),
+                                        int(command.get("remaining") or 0),
+                                    )
+                                if future is not None and not future.done():
+                                    future.set_result(result)
+                            except Exception as exc:
+                                if future is not None and not future.done():
+                                    future.set_exception(exc)
+                            steer_task = asyncio.create_task(steer_queue.get())
+                finally:
+                    if steer_task.done() and not steer_task.cancelled():
+                        with suppress(Exception):
+                            command = steer_task.result()
+                            future = command.get("future")
+                            if future is not None and not future.done():
+                                future.set_exception(
+                                    NativeSteerHandoffError(
+                                        "the Codex turn completed before steering was applied",
+                                        safe_to_requeue=True,
+                                    )
+                                )
+                    for task in (notification_task, steer_task):
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(
+                        notification_task,
+                        steer_task,
+                        return_exceptions=True,
+                    )
+                    while not steer_queue.empty():
+                        command = steer_queue.get_nowait()
+                        future = command.get("future")
+                        if future is not None and not future.done():
+                            future.set_exception(
+                                NativeSteerHandoffError(
+                                    "the Codex turn completed before steering was applied",
+                                    safe_to_requeue=True,
+                                )
+                            )
+
+        stopped = (
+            terminal_status in {"interrupted", "cancelled", "canceled"}
+            or current_run_id in STOPPED_RUNS
+        )
+    except Exception as exc:
+        stop_requested = current_run_id in STOPPED_RUNS
+        safe_rejection = isinstance(exc, CodexAppServerRequestError)
+        can_fallback = (
+            allow_exec_fallback
+            and not stop_requested
+            and (not turn_start_attempted or safe_rejection)
+        )
+        if can_fallback:
+            if turn is not None:
+                await turn.close()
+            if thread_pinned and provider_id:
+                await unpin_codex_app_server_thread(manager, provider_id)
+                thread_pinned = False
+            await clear_active_process(session_id)
+            await append_event(session_id, "codex_transport_fallback", {
+                "run_id": current_run_id,
+                "from": CODEX_TRANSPORT_APP_SERVER,
+                "to": CODEX_TRANSPORT_EXEC,
+                "message": (
+                    "Codex app-server was unavailable before the turn was "
+                    f"accepted; using codex exec. {concise_error_message(exc)}"
+                ),
+            })
+            await run_codex_exec(
+                session_id,
+                current_run_id,
+                prompt,
+                dict(STORE.sessions.get(session_id) or sess),
+                manifest_path,
+                diff_baseline=current_diff_baseline,
+            )
+            return
+        if turn is not None and turn.turn_id and not turn_completed:
+            with suppress(CodexAppServerError):
+                await turn.interrupt()
+        terminal_error = terminal_error or concise_error_message(exc)
+        stopped = stop_requested
+        terminal_status = "interrupted" if stopped else "failed"
+        if not stopped:
+            await append_event(session_id, "error", {
+                "run_id": current_run_id,
+                "backend": BACKEND_CODEX,
+                "message": terminal_error,
+                "transport": CODEX_TRANSPORT_APP_SERVER,
+                **current_metadata(),
+            })
+            error_emitted = True
+    finally:
+        await stop_manifest_watcher()
+        if turn is not None:
+            await turn.close()
+
+    produced_activity = bool(
+        text_parts
+        or seen_reasoning
+        or started_tools
+        or finished_tools
+        or seen_artifacts
+    )
+    recover_resume = (
+        not delivery_unknown
+        and should_recover_codex_resume(
+            allow_rollover=allow_resume_rollover,
+            resumed_provider_id=resumed_provider_id,
+            stopped=stopped,
+            stream_error=None,
+            idle_killed=False,
+            resume_stalled=False,
+            returncode=0 if terminal_status == "completed" else 1,
+            produced_activity=produced_activity,
+            terminal_error=terminal_error or "",
+        )
+    )
+    if recover_resume and resumed_provider_id:
+        recovery_reason = (
+            terminal_error
+            or "Codex app-server resumed the thread but completed without a reply."
+        )
+        rollover = await rollover_codex_provider_session(
+            session_id,
+            current_run_id,
+            resumed_provider_id,
+            recovery_reason,
+            message=(
+                "Codex could not continue the provider thread. Retrying this "
+                "turn once on a fresh app-server thread with bounded memory."
+            ),
+            memory_seed_used=False,
+        )
+        if rollover:
+            fresh_session, _memory = rollover
+            if thread_pinned and provider_id:
+                await unpin_codex_app_server_thread(manager, provider_id)
+                thread_pinned = False
+            with suppress(OSError):
+                manifest_path.unlink()
+            await run_codex_app_server(
+                session_id,
+                current_run_id,
+                prompt,
+                fresh_session,
+                manifest_path,
+                allow_exec_fallback=allow_exec_fallback,
+                allow_resume_rollover=False,
+                diff_baseline=current_diff_baseline,
+            )
+            return
+
+    drain_queue = False
+    try:
+        if terminal_status == "failed":
+            terminal_error = terminal_error or "Codex app-server turn failed."
+            record_runtime_failure(BACKEND_CODEX, terminal_error)
+            if not error_emitted:
+                await append_event(session_id, "error", {
+                    "run_id": current_run_id,
+                    "backend": BACKEND_CODEX,
+                    "message": terminal_error,
+                    "transport": CODEX_TRANSPORT_APP_SERVER,
+                    **current_metadata(),
+                })
+        elif not stopped:
+            record_runtime_success(BACKEND_CODEX)
+
+        await flush_pending_unknown(
+            final=not stopped and terminal_status == "completed"
+        )
+        await collect_manifest(
+            session_id,
+            current_run_id,
+            manifest_path,
+            seen_artifacts=seen_artifacts,
+            final=True,
+        )
+        await collect_recent_leftover_manifests(
+            session_id,
+            current_run_id,
+            manifest_path,
+            seen_artifacts=seen_artifacts,
+        )
+        await publish_turn_code_diff(
+            session_id,
+            current_run_id,
+            BACKEND_CODEX,
+            cwd,
+            current_diff_baseline,
+            changed_paths,
+        )
+        exit_code = (
+            0
+            if terminal_status == "completed"
+            else None
+            if stopped
+            else 1
+        )
+        await append_turn_finished_event(session_id, {
+            "run_id": current_run_id,
+            "backend": BACKEND_CODEX,
+            "transport": CODEX_TRANSPORT_APP_SERVER,
+            "provider_thread_id": provider_id or None,
+            "provider_turn_id": turn.turn_id if turn is not None else None,
+            "exit_code": exit_code,
+            "result_text": clean_assistant_text("\n\n".join(text_parts).strip()),
+            "stopped": stopped,
+            **current_metadata(),
+        })
+    finally:
+        RUN_METADATA.pop(current_run_id, None)
+        try:
+            await release_turn_slot(session_id)
+        finally:
+            if thread_pinned and provider_id:
+                await unpin_codex_app_server_thread(manager, provider_id)
+            drain_queue = should_schedule_queue_after_finish(session_id, stopped)
+            STOPPED_RUNS.discard(current_run_id)
+            if drain_queue:
+                schedule_next_queued_turn(session_id)
+
+
+async def run_codex(
+    session_id: str,
+    run_id: str,
+    prompt: str,
+    sess: dict[str, Any],
+    manifest_path: Path,
+) -> None:
+    if CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC:
+        await run_codex_exec(
+            session_id,
+            run_id,
+            prompt,
+            sess,
+            manifest_path,
+        )
+        return
+    await run_codex_app_server(
+        session_id,
+        run_id,
+        prompt,
+        sess,
+        manifest_path,
+        allow_exec_fallback=CODEX_TRANSPORT == CODEX_TRANSPORT_AUTO,
+    )
 
 
 async def start_turn(
@@ -11862,37 +13615,20 @@ async def start_turn(
             if current_turn is not None:
                 current_turn["run_id"] = run_id
                 current_turn["backend"] = backend
-        manifest_path = manifests_dir(session_id) / f"{run_id}.json"
+        manifest_path = (
+            codex_manifest_path(session_id)
+            if backend == BACKEND_CODEX
+            else manifests_dir(session_id) / f"{run_id}.json"
+        )
+        if backend == BACKEND_CODEX:
+            with suppress(OSError):
+                manifest_path.unlink()
         prompt = build_turn_provider_prompt(
             session_id,
             req.prompt,
             req.file_ids,
             normalized_lineage,
         )
-
-        memory_seed = str(sess.get("memory_seed") or "").strip()
-        if (
-            backend == BACKEND_CODEX
-            and memory_seed
-            and (not sess.get("memory_seed_used") or not session_provider_id(sess))
-        ):
-            prompt = build_memory_augmented_prompt(
-                "Fork memory context",
-                memory_seed,
-                prompt,
-            )
-            async with STORE._lock:
-                current = STORE.sessions.get(session_id)
-                if current:
-                    current["memory_seed_used"] = True
-                    current["updated_at"] = now_iso()
-                    sess = current
-                    await STORE.save()
-            await append_event(session_id, "history_imported", {
-                "run_id": run_id,
-                "backend": BACKEND_CODEX,
-                "message": "Applied memory fork context to this first Codex turn.",
-            })
 
         display_prompt = req.display_prompt if req.display_prompt is not None else req.prompt
         started_payload = {
@@ -12047,6 +13783,8 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        with suppress(Exception):
+            await close_codex_app_server_manager()
         digest_recovery_task.cancel()
         queue_recovery_task.cancel()
         host_monitor_task.cancel()
@@ -12584,15 +14322,39 @@ async def mark_session_unread(session_id: str) -> dict[str, Any]:
 
 @app.delete("/api/sessions/{session_id}")
 async def delete_session(session_id: str) -> dict[str, Any]:
+    session = STORE.sessions.get(session_id) or {}
+    provider_thread_id = str(session_provider_id(session) or "")
     async with ACTIVE_LOCK:
         active = ACTIVE.pop(session_id, None)
         BUSY_SESSIONS.discard(session_id)
+        CURRENT_TURNS.pop(session_id, None)
+        STOP_REQUESTS.discard(session_id)
     async with QUEUE_LOCK:
         QUEUED_TURNS.pop(session_id, None)
+        RUN_NOW_TURNS.pop(session_id, None)
+        STEERING_SESSIONS.discard(session_id)
     if active:
+        native_turn = active.get("codex_app_server_turn")
         proc = active.get("proc")
-        if proc:
+        if active.get("run_id"):
+            STOPPED_RUNS.add(str(active["run_id"]))
+        if (
+            active.get("transport") == CODEX_TRANSPORT_APP_SERVER
+            and native_turn is not None
+            and getattr(native_turn, "turn_id", "")
+        ):
+            with suppress(Exception):
+                await native_turn.interrupt()
+        elif proc:
             await terminate_process_tree(proc)
+    if provider_thread_id and CODEX_APP_SERVER_MANAGER is not None:
+        manager = CODEX_APP_SERVER_MANAGER
+        if manager.is_thread_loaded(provider_thread_id):
+            with suppress(CodexAppServerError):
+                await manager.unsubscribe_thread(provider_thread_id)
+        async with CODEX_APP_SERVER_THREAD_LRU_LOCK:
+            CODEX_APP_SERVER_THREAD_LRU.pop(provider_thread_id, None)
+            CODEX_APP_SERVER_PINNED_THREADS.discard(provider_thread_id)
     with suppress(Exception):
         await asyncio.to_thread(kill_terminal_session, session_id)
     deleted = await STORE.delete(session_id)
@@ -12641,11 +14403,34 @@ async def fork_session(session_id: str, req: ForkSessionRequest) -> dict[str, An
             system_prompt=parent.get("system_prompt"),
             pinned=bool(parent.get("pinned")),
             archived=bool(parent.get("archived")),
-            provider_session_id=forked_codex_thread_id if parent_backend == BACKEND_CODEX else None,
-            codex_thread_id=forked_codex_thread_id if parent_backend == BACKEND_CODEX else None,
+            # Bind a native Codex fork only after the child session ID exists,
+            # because its manifest/jobs/terminal policy is chat-scoped.
+            provider_session_id=None,
+            codex_thread_id=None,
         ),
         parent_id=session_id,
     )
+    if forked_codex_thread_id:
+        try:
+            forked_codex_thread_id, _instruction_hash = (
+                await bind_forked_codex_thread(
+                    child["id"],
+                    forked_codex_thread_id,
+                    child,
+                )
+            )
+            child = STORE.sessions[child["id"]]
+        except Exception as exc:
+            logger.warning(
+                "codex fork policy bind failed parent_session=%s child_session=%s "
+                "forked_thread=%s: %s",
+                session_id,
+                child["id"],
+                forked_codex_thread_id,
+                exc,
+            )
+            codex_fork_error = str(exc)
+            forked_codex_thread_id = None
     ordered_sessions = await STORE.reorder(child["id"], target_id=session_id, placement="after")
     child = STORE.sessions[child["id"]]
     if parent_backend == BACKEND_CODEX and codex_fork_error:
@@ -12725,6 +14510,8 @@ async def stop_turn(
     require_provider_turn_ready: bool = False,
 ) -> dict[str, Any]:
     deferred = False
+    native_interrupt_reserved = False
+    transition_ready: asyncio.Event | None = None
     async with ACTIVE_LOCK:
         active = ACTIVE.get(session_id)
         busy = session_id in BUSY_SESSIONS
@@ -12738,6 +14525,18 @@ async def stop_turn(
                 active["stop_requested"] = True
                 if active.get("run_id"):
                     STOPPED_RUNS.add(str(active["run_id"]))
+                transition_value = active.get("logical_transition_ready")
+                if isinstance(transition_value, asyncio.Event):
+                    transition_ready = transition_value
+                native_turn = active.get("codex_app_server_turn")
+                if (
+                    active.get("transport") == CODEX_TRANSPORT_APP_SERVER
+                    and native_turn is not None
+                    and getattr(native_turn, "turn_id", "")
+                    and not active.get("native_interrupt_sent")
+                ):
+                    active["native_interrupt_sent"] = True
+                    native_interrupt_reserved = True
         elif busy:
             if require_provider_turn_ready:
                 deferred = True
@@ -12762,14 +14561,39 @@ async def stop_turn(
             schedule_next_queued_turn(session_id)
         return {"ok": True, "stopped": False}
     proc = active.get("proc") if active else None
-    if proc:
+    native_turn = active.get("codex_app_server_turn") if active else None
+    native_interrupt = False
+    if native_interrupt_reserved and native_turn is not None:
+        try:
+            await native_turn.interrupt()
+            native_interrupt = True
+        except Exception as exc:
+            async with ACTIVE_LOCK:
+                current = ACTIVE.get(session_id)
+                if current is active:
+                    current["native_interrupt_sent"] = False
+            logger.warning(
+                "Codex app-server interrupt failed session=%s error=%s",
+                session_id,
+                exc,
+            )
+    # The app-server process is shared by every Codex chat and must never be
+    # terminated as a per-chat Stop action.
+    if proc and active.get("transport") != CODEX_TRANSPORT_APP_SERVER:
         await terminate_process_tree(proc)
+    if transition_ready is not None:
+        await transition_ready.wait()
     if emit_event:
         await append_event(session_id, "turn_stopped", {
             "run_id": active.get("run_id") if active else None,
             "backend": active.get("backend") if active else None,
+            "native_interrupt": native_interrupt,
         })
-    return {"ok": True, "stopped": True}
+    return {
+        "ok": True,
+        "stopped": True,
+        "native_interrupt": native_interrupt,
+    }
 
 
 @app.get("/api/jobs")

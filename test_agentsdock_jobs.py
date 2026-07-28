@@ -1,6 +1,8 @@
 import argparse
+import io
 import os
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 import agentsdock_jobs
@@ -26,6 +28,68 @@ class AgentsDockJobsCLITests(unittest.TestCase):
 
         self.assertEqual(calls, [("GET", "/api/sessions/sess%2Fchat/jobs", None)])
         self.assertEqual(result["jobs"][0]["id"], "job_1")
+
+    def test_main_without_chat_id_preserves_environment_fallback(self) -> None:
+        calls: list[tuple[str, str, object]] = []
+
+        def request(method: str, path: str, payload=None):
+            calls.append((method, path, payload))
+            return {"jobs": [{"id": "job_1", "session_id": "sess/chat"}]}
+
+        with (
+            patch.dict(os.environ, self.environment(), clear=True),
+            patch.object(agentsdock_jobs, "api_request", request),
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            result = agentsdock_jobs.main(["list"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, [("GET", "/api/sessions/sess%2Fchat/jobs", None)])
+        self.assertIn('"job_1"', output.getvalue())
+
+    def test_global_chat_id_overrides_environment_for_one_invocation(self) -> None:
+        calls: list[tuple[str, str, object]] = []
+        environment = self.environment()
+
+        def request(method: str, path: str, payload=None):
+            calls.append((method, path, payload))
+            return {"jobs": [{"id": "job_2", "session_id": "other/chat"}]}
+
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(agentsdock_jobs, "api_request", request),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = agentsdock_jobs.main(["--chat-id", " other/chat ", "list"])
+            self.assertEqual(os.environ["AGENTSDOCK_CHAT_ID"], "sess/chat")
+
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, [("GET", "/api/sessions/other%2Fchat/jobs", None)])
+
+    def test_global_chat_id_supplies_missing_environment_scope(self) -> None:
+        calls: list[tuple[str, str, object]] = []
+        environment = self.environment()
+        del environment["AGENTSDOCK_CHAT_ID"]
+
+        def request(method: str, path: str, payload=None):
+            calls.append((method, path, payload))
+            return {"jobs": [{"id": "job_2", "session_id": "other/chat"}]}
+
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(agentsdock_jobs, "api_request", request),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = agentsdock_jobs.main(["--chat-id", "other/chat", "list"])
+            self.assertNotIn("AGENTSDOCK_CHAT_ID", os.environ)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, [("GET", "/api/sessions/other%2Fchat/jobs", None)])
+
+    def test_global_chat_id_rejects_empty_values(self) -> None:
+        parser = agentsdock_jobs.build_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--chat-id", "  ", "list"])
 
     def test_create_cron_sends_expression_and_timezone_without_session_body(self) -> None:
         parser = agentsdock_jobs.build_parser()

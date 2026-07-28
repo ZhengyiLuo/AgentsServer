@@ -1,7 +1,9 @@
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+import tarfile
 import time
 import unittest
 import re
@@ -12,6 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 INSTALLER = ROOT / "install.sh"
 DEPLOYER = ROOT / "deploy.sh"
+PACKAGER = ROOT / "scripts" / "package_release.py"
 
 
 class InstallerContractTests(unittest.TestCase):
@@ -39,8 +42,38 @@ class InstallerContractTests(unittest.TestCase):
     def test_direct_deploy_includes_scheduler_runtime(self):
         source = DEPLOYER.read_text()
         self.assertIn('"$SCRIPT_DIR/agentsdock_jobs.py"', source)
+        self.assertIn('"$SCRIPT_DIR/codex_app_server.py"', source)
         self.assertIn("import croniter, cryptography, dateutil, tzdata", source)
         self.assertIn("python-dateutil>=2.9,<3", source)
+        self.assertIn("'$REMOTE_SERVER_DIR/codex_app_server.py'", source)
+
+    def test_installer_and_release_archive_include_app_server_runtime(self):
+        installer_source = INSTALLER.read_text()
+        packager_source = PACKAGER.read_text()
+        self.assertIn(
+            "RELEASE_FILES=(agent_server.py agentsdock_jobs.py codex_app_server.py",
+            installer_source,
+        )
+        self.assertIn('"$STAGE_DIR/codex_app_server.py"', installer_source)
+        self.assertIn('"codex_app_server.py"', packager_source)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            result = subprocess.run(
+                [sys.executable, str(PACKAGER), "--output", temporary],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            version = (ROOT / "VERSION").read_text().strip()
+            archive_path = Path(temporary) / f"agents-server-{version}.tar.gz"
+            with tarfile.open(archive_path, "r:gz") as archive:
+                members = set(archive.getnames())
+            self.assertIn(
+                f"agents-server-{version}/codex_app_server.py",
+                members,
+            )
 
     def test_installer_preserves_state_and_emits_private_result(self):
         source = INSTALLER.read_text()

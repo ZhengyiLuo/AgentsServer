@@ -12,11 +12,12 @@ class AgentPromptFormatTests(unittest.TestCase):
         codex_prompt = agent_server.CODEX_PROMPT_PRELUDE.format(
             manifest_path="/tmp/manifest.json",
             terminal_session="zd_sess_123",
+            chat_id="sess_123",
         )
 
         for prompt in (claude_prompt, codex_prompt):
-            self.assertIn("inline LaTeX as `$...$`", prompt)
-            self.assertIn("display equations as `$$...$$`", prompt)
+            self.assertIn("`$...$`", prompt)
+            self.assertIn("`$$...$$`", prompt)
 
 
 if __name__ == "__main__":

@@ -45,7 +45,8 @@ class AgentTerminalContextTests(unittest.TestCase):
         developer_prompt = codex_developer_instructions(command)
 
         self.assertIn("`zd_sess_123`", developer_prompt)
-        self.assertIn("AGENTSDOCK_TMUX_SESSION", developer_prompt)
+        self.assertIn("--chat-id sess-123", developer_prompt)
+        self.assertIn("manifests/current.json", developer_prompt)
         self.assertEqual(command[-1], "Inspect the terminal state.")
         self.assertNotIn("[AgentsDock context]", command[-1])
 
@@ -57,10 +58,10 @@ class AgentTerminalContextTests(unittest.TestCase):
             "- none\n\n"
         )
         legacy_message = (
-            agent_server.CODEX_PROMPT_PRELUDE.format(
-                manifest_path="/tmp/manifest.json",
-                terminal_session="zd_sess_123",
-            )
+            "[AgentsDock context]\n"
+            "Legacy launch instructions.\n"
+            "User prompt follows.\n"
+            "]\n\n"
             + jobs_context
             + agent_server.session_prompt_addendum({
                 "system_prompt": "Use the staging cluster.",
@@ -290,7 +291,8 @@ class AgentTerminalContextTests(unittest.TestCase):
 
         developer_prompt = codex_developer_instructions(command)
         self.assertTrue(developer_prompt.startswith("Existing user instruction."))
-        self.assertIn("[AgentsDock context]", developer_prompt)
+        self.assertIn("You are operating through AgentsDock", developer_prompt)
+        self.assertNotIn("[AgentsDock context]", developer_prompt)
         self.assertEqual(command[-1], "Raw prompt.")
 
     def test_public_session_exposes_per_chat_system_prompt(self) -> None:
@@ -310,11 +312,13 @@ class AgentTerminalContextTests(unittest.TestCase):
         codex_prompt = agent_server.CODEX_PROMPT_PRELUDE.format(
             manifest_path="/tmp/manifest.json",
             terminal_session="zd_sess_123",
+            chat_id="sess-123",
         )
 
-        for prompt in (claude_prompt, codex_prompt):
-            self.assertIn("inline LaTeX as `$...$`", prompt)
-            self.assertIn("display equations as `$$...$$`", prompt)
+        self.assertIn("inline LaTeX as `$...$`", claude_prompt)
+        self.assertIn("display equations as `$$...$$`", claude_prompt)
+        self.assertIn("inline math as `$...$`", codex_prompt)
+        self.assertIn("display math as `$$...$$`", codex_prompt)
 
     def test_both_agent_prompts_explain_clickable_workspace_file_links(self) -> None:
         claude_prompt = agent_server.SYSTEM_PROMPT.format(
@@ -324,13 +328,14 @@ class AgentTerminalContextTests(unittest.TestCase):
         codex_prompt = agent_server.CODEX_PROMPT_PRELUDE.format(
             manifest_path="/tmp/manifest.json",
             terminal_session="zd_sess_123",
+            chat_id="sess-123",
         )
 
-        for prompt in (claude_prompt, codex_prompt):
-            compact = " ".join(prompt.split())
-            self.assertIn("relative path under", compact)
+        claude_compact = " ".join(claude_prompt.split())
+        self.assertIn("relative path under", claude_compact)
+        codex_compact = " ".join(codex_prompt.split())
+        for compact in (claude_compact, codex_compact):
             self.assertIn("`#L42`", compact)
-            self.assertIn("Do not use", compact)
             self.assertIn("`file://`", compact)
             self.assertIn("/tmp/manifest.json", compact)
 

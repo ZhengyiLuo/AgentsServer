@@ -75,7 +75,7 @@ class PrepareSteeredTurnTests(unittest.TestCase):
         self.assertEqual(turn["file_ids"], ["new", "shared"])
         self.assertEqual(turn["display_file_ids"], ["new", "shared"])
         self.assertEqual(turn["steer_interrupted_run_id"], "run-original")
-        self.assertTrue(turn["replays_interrupted_message"])
+        self.assertFalse(turn["replays_interrupted_message"])
 
     def test_text_only_steer_keeps_the_interrupted_image_scoped_to_old_message(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -257,7 +257,7 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         agent_server.STEERING_SESSIONS = self.previous_steering
         agent_server.CURRENT_TURNS = self.previous_current
 
-    async def test_interrupted_turn_is_replayed_with_exact_steering_message(self) -> None:
+    async def test_interrupted_turn_promotes_only_the_exact_steering_message(self) -> None:
         append_event = AsyncMock(return_value={})
 
         async def completed_wait(_session_id: str) -> None:
@@ -276,7 +276,7 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(stop_turn.await_args.kwargs["require_provider_turn_ready"])
         promoted = agent_server.RUN_NOW_TURNS["chat-1"]
-        self.assertTrue(result["replays_interrupted_message"])
+        self.assertFalse(result["replays_interrupted_message"])
         self.assertEqual(promoted["prompt"], "Change course now.")
         self.assertEqual(
             [item["prompt"] for item in promoted["steering_lineage"]],
@@ -292,7 +292,7 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event_payload["steering_lineage"], promoted["steering_lineage"])
         self.assertEqual(event_payload["file_ids"], ["new-file"])
         self.assertEqual(event_payload["display_file_ids"], ["new-file"])
-        self.assertTrue(event_payload["replays_interrupted_message"])
+        self.assertFalse(event_payload["replays_interrupted_message"])
 
     async def test_background_recovery_preserves_messages_queued_after_startup(self) -> None:
         agent_server.QUEUED_TURNS["chat-1"] = deque([{

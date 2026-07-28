@@ -622,7 +622,7 @@ tool-result output, commands, or output-file paths.
 Before publishing:
 
 ```bash
-python3 -m py_compile agent_server.py
+python3 -m py_compile agent_server.py agentsdock_jobs.py codex_app_server.py update_runner.py
 rg -n 'private-host|/home/<name>|/Users/<name>|token-value' .
 ```
 

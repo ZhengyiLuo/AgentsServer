@@ -143,7 +143,7 @@ append_server_path "/usr/local/bin"
 append_server_path "/usr/bin"
 append_server_path "/bin"
 export PATH="$SERVER_PATH"
-RELEASE_FILES=(agent_server.py agentsdock_jobs.py install.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem)
+RELEASE_FILES=(agent_server.py agentsdock_jobs.py codex_app_server.py install.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem)
 
 for name in "${RELEASE_FILES[@]}"; do
   if [[ ! -f "$SOURCE_DIR/$name" ]]; then
@@ -472,6 +472,11 @@ else
 fi
 "$STAGE_DIR/.venv/bin/python" -c 'import websockets' >/dev/null
 "$STAGE_DIR/.venv/bin/python" -c 'import croniter, dateutil; from zoneinfo import ZoneInfo; ZoneInfo("America/Los_Angeles")' >/dev/null
+"$STAGE_DIR/.venv/bin/python" -m py_compile \
+  "$STAGE_DIR/agent_server.py" \
+  "$STAGE_DIR/agentsdock_jobs.py" \
+  "$STAGE_DIR/codex_app_server.py" \
+  "$STAGE_DIR/update_runner.py"
 
 TOKEN=""
 for candidate in "$ENV_FILE" "$LEGACY_ENV_FILE"; do

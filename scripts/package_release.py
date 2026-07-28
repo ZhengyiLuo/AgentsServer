@@ -16,6 +16,7 @@ from pathlib import Path
 FILES = (
     "agent_server.py",
     "agentsdock_jobs.py",
+    "codex_app_server.py",
     "install.sh",
     "update_runner.py",
     "pyproject.toml",

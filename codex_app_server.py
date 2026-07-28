@@ -1,0 +1,1253 @@
+"""Persistent, multiplexed JSON-RPC client for ``codex app-server``.
+
+The app-server protocol is bidirectional JSONL over stdio.  One client owns
+one lazily started process and can carry multiple Codex threads concurrently.
+Transport failures are deliberately surfaced to callers; this module never
+replays a request whose delivery may have succeeded.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import json
+from collections import deque
+from contextlib import suppress
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable
+
+
+class CodexAppServerError(RuntimeError):
+    """Base error raised by the app-server transport."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_sent: bool = False,
+        safe_to_retry: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.request_sent = request_sent
+        self.safe_to_retry = safe_to_retry
+        # ``start_turn`` attaches its provisional routed handle here when the
+        # request outcome is ambiguous.  Callers can keep observing the thread
+        # instead of replaying the user message.
+        self.pending_turn: CodexAppServerTurn | None = None
+
+
+class CodexAppServerDisconnected(CodexAppServerError):
+    """The shared app-server transport closed unexpectedly."""
+
+
+class CodexAppServerTimeout(CodexAppServerError):
+    """A request timed out after it may have reached app-server."""
+
+    def __init__(self, method: str, timeout: float) -> None:
+        self.method = method
+        self.timeout = timeout
+        super().__init__(
+            f"{method} timed out after {timeout:g}s",
+            request_sent=True,
+            safe_to_retry=False,
+        )
+
+
+class CodexAppServerRequestError(CodexAppServerError):
+    """A JSON-RPC request was explicitly rejected by app-server."""
+
+    def __init__(self, method: str, error: Any) -> None:
+        self.method = method
+        self.error = error
+        self.code = error.get("code") if isinstance(error, dict) else None
+        self.data = error.get("data") if isinstance(error, dict) else None
+        if isinstance(error, dict):
+            message = str(error.get("message") or error)
+        else:
+            message = str(error)
+        super().__init__(
+            f"{method} failed: {message}",
+            request_sent=True,
+            safe_to_retry=True,
+        )
+
+
+class CodexAppServerProtocolError(CodexAppServerError):
+    """App-server returned a response that violated the expected contract."""
+
+
+class CodexAppServerSubscriptionClosed(CodexAppServerError):
+    """A local notification subscription is no longer active."""
+
+
+ProcessFactory = Callable[..., Awaitable[asyncio.subprocess.Process]]
+NotificationHandler = Callable[[dict[str, Any]], Awaitable[None] | None]
+ServerRequestHandler = Callable[
+    [Any, str, dict[str, Any]],
+    Awaitable[dict[str, Any]] | dict[str, Any],
+]
+
+
+def _notification_scope(notification: dict[str, Any]) -> tuple[str, str]:
+    params = notification.get("params")
+    if not isinstance(params, dict):
+        return "", ""
+
+    thread_id = str(params.get("threadId") or "")
+    turn_id = str(params.get("turnId") or "")
+
+    thread = params.get("thread")
+    if not thread_id and isinstance(thread, dict):
+        thread_id = str(thread.get("id") or "")
+
+    turn = params.get("turn")
+    if not turn_id and isinstance(turn, dict):
+        turn_id = str(turn.get("id") or "")
+
+    return thread_id, turn_id
+
+
+@dataclass(eq=False, slots=True)
+class CodexAppServerSubscription:
+    """A local filtered view of app-server notifications."""
+
+    client: "CodexAppServerClient"
+    thread_id: str | None
+    turn_id: str | None
+    _queue: asyncio.Queue[Any]
+    _closed: bool = False
+
+    def _matches(self, notification: dict[str, Any]) -> bool:
+        notification_thread_id, notification_turn_id = _notification_scope(notification)
+        if self.thread_id is not None and notification_thread_id != self.thread_id:
+            return False
+        if self.turn_id is not None and notification_turn_id != self.turn_id:
+            return False
+        return True
+
+    def _put(self, value: Any) -> None:
+        if self._closed:
+            return
+        try:
+            self._queue.put_nowait(value)
+        except asyncio.QueueFull:
+            self._finish(
+                CodexAppServerDisconnected(
+                    "app-server notification backlog exceeded its safety limit",
+                    request_sent=True,
+                    safe_to_retry=False,
+                )
+            )
+
+    def _finish(self, error: BaseException | None = None) -> None:
+        if self._closed:
+            return
+        if error is not None:
+            while not self._queue.empty():
+                with suppress(asyncio.QueueEmpty):
+                    self._queue.get_nowait()
+            self._queue.put_nowait(error)
+        self._closed = True
+        self.client._release_subscription(self)
+
+    async def next_notification(self, timeout: float | None = None) -> dict[str, Any]:
+        if self._closed and self._queue.empty():
+            raise CodexAppServerSubscriptionClosed("app-server notification subscription closed")
+        waiter = self._queue.get()
+        value = await (asyncio.wait_for(waiter, timeout) if timeout is not None else waiter)
+        if isinstance(value, BaseException):
+            raise value
+        if not isinstance(value, dict):
+            raise CodexAppServerProtocolError("app-server notification was not an object")
+        return value
+
+    def close(self) -> None:
+        self._finish()
+
+
+@dataclass(eq=False, slots=True)
+class CodexAppServerTurn:
+    """An accepted app-server turn and its routed notification stream."""
+
+    client: "CodexAppServerClient"
+    thread_id: str
+    turn_id: str
+    _subscription: CodexAppServerSubscription
+    _closed: bool = False
+    _completed: bool = False
+
+    async def next_notification(self, timeout: float | None = None) -> dict[str, Any]:
+        return await self._subscription.next_notification(timeout)
+
+    async def steer(
+        self,
+        input_items: list[dict[str, Any]],
+        *,
+        client_user_message_id: str | None = None,
+    ) -> str:
+        return await self.client.steer_turn(
+            self.thread_id,
+            self.turn_id,
+            input_items,
+            client_user_message_id=client_user_message_id,
+        )
+
+    async def interrupt(self) -> None:
+        await self.client.interrupt_turn(self.thread_id, self.turn_id)
+
+    def adopt_turn_id(self, turn_id: str) -> None:
+        """Bind a provisional turn after an ambiguous ``turn/start`` response."""
+        resolved = str(turn_id or "")
+        if not resolved:
+            raise CodexAppServerProtocolError("cannot bind an empty app-server turn id")
+        if self.turn_id and self.turn_id != resolved:
+            raise CodexAppServerProtocolError(
+                f"provisional turn already bound to {self.turn_id}, not {resolved}"
+            )
+        self.turn_id = resolved
+        self._subscription.turn_id = resolved
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.client.release_turn(self)
+
+
+async def decline_server_request(
+    _request_id: Any,
+    method: str,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the least-privileged valid response for interactive requests.
+
+    AgentsServer launches Codex with non-interactive approval settings.  If a
+    request nevertheless reaches this connection, silently approving it would
+    be unsafe and waiting forever would wedge the turn.
+    """
+
+    if method in {
+        "item/commandExecution/requestApproval",
+        "item/fileChange/requestApproval",
+    }:
+        return {"decision": "decline"}
+    if method in {"applyPatchApproval", "execCommandApproval"}:
+        return {"decision": "denied"}
+    if method == "item/tool/requestUserInput":
+        return {"answers": {}}
+    if method == "mcpServer/elicitation/request":
+        return {"action": "decline"}
+    if method == "item/permissions/requestApproval":
+        return {"permissions": {}, "scope": "turn", "strictAutoReview": False}
+    raise CodexAppServerRequestError(
+        method,
+        {
+            "code": -32601,
+            "message": f"AgentsServer does not handle server request {method}",
+        },
+    )
+
+
+class CodexAppServerClient:
+    """Supervise one local app-server process and multiplex active threads."""
+
+    def __init__(
+        self,
+        codex_bin: str,
+        *,
+        cwd: str,
+        env_factory: Callable[[], dict[str, str]],
+        request_timeout: float = 30.0,
+        lifecycle_timeout: float = 300.0,
+        process_stream_limit: int = 16 * 1024 * 1024,
+        notification_queue_limit: int = 8192,
+        json_parse_thread_threshold: int = 1024 * 1024,
+        process_factory: ProcessFactory | None = None,
+        server_request_handler: ServerRequestHandler | None = None,
+        initialize_params: dict[str, Any] | None = None,
+    ) -> None:
+        self.codex_bin = codex_bin
+        self.cwd = cwd
+        self.env_factory = env_factory
+        self.request_timeout = request_timeout
+        self.lifecycle_timeout = lifecycle_timeout
+        self.process_stream_limit = process_stream_limit
+        self.notification_queue_limit = max(1, int(notification_queue_limit))
+        self.json_parse_thread_threshold = max(
+            0,
+            int(json_parse_thread_threshold),
+        )
+        self._process_factory = process_factory or asyncio.create_subprocess_exec
+        self._server_request_handler = server_request_handler or decline_server_request
+        self._initialize_params = initialize_params or {
+            "clientInfo": {
+                "name": "agents_server",
+                "title": "AgentsServer",
+                "version": "1",
+            },
+            "capabilities": {"experimentalApi": True},
+        }
+        self._proc: asyncio.subprocess.Process | None = None
+        self._reader_task: asyncio.Task[None] | None = None
+        self._stderr_task: asyncio.Task[None] | None = None
+        self._start_lock = asyncio.Lock()
+        self._write_lock = asyncio.Lock()
+        self._next_id = 0
+        self._pending: dict[int, tuple[str, asyncio.Future[Any]]] = {}
+        self._turns_by_thread: dict[str, CodexAppServerTurn] = {}
+        self._loaded_threads: set[str] = set()
+        self._subscriptions: set[CodexAppServerSubscription] = set()
+        self._notification_handlers: set[NotificationHandler] = set()
+        self._callback_tasks: set[asyncio.Task[Any]] = set()
+        self._server_request_tasks: dict[Any, asyncio.Task[None]] = {}
+        self._stderr_tail: deque[str] = deque(maxlen=40)
+        self._closing = False
+        self._initialized = False
+        self._initialize_result: dict[str, Any] | None = None
+        self._generation = 0
+
+    @property
+    def ready(self) -> bool:
+        return bool(
+            self._initialized
+            and self._proc is not None
+            and self._proc.returncode is None
+            and self._reader_task is not None
+            and not self._reader_task.done()
+        )
+
+    @property
+    def stderr_tail(self) -> list[str]:
+        return list(self._stderr_tail)
+
+    @property
+    def process(self) -> asyncio.subprocess.Process | None:
+        """The supervised process, exposed read-only for diagnostics."""
+
+        return self._proc
+
+    @property
+    def generation(self) -> int:
+        """Incremented after every successful initialize handshake."""
+
+        return self._generation
+
+    @property
+    def initialize_result(self) -> dict[str, Any] | None:
+        return dict(self._initialize_result) if self._initialize_result is not None else None
+
+    def is_thread_loaded(self, thread_id: str) -> bool:
+        return thread_id in self._loaded_threads
+
+    async def start(self) -> None:
+        """Start and initialize the process once, or reuse the live process."""
+
+        if self.ready:
+            return
+        async with self._start_lock:
+            if self.ready:
+                return
+            # A caller may subscribe before the first lazy start.  Preserve
+            # those local subscriptions when there is no old transport to
+            # discard.
+            if (
+                self._proc is not None
+                or self._reader_task is not None
+                or self._stderr_task is not None
+                or self._pending
+            ):
+                await self._discard_process()
+            self._closing = False
+            try:
+                proc = await self._process_factory(
+                    self.codex_bin,
+                    "app-server",
+                    "--listen",
+                    "stdio://",
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=self.cwd,
+                    env=self.env_factory(),
+                    limit=self.process_stream_limit,
+                    start_new_session=True,
+                )
+            except Exception as exc:
+                raise CodexAppServerDisconnected(
+                    f"failed to start codex app-server: {exc}",
+                    request_sent=False,
+                    safe_to_retry=True,
+                ) from exc
+
+            self._proc = proc
+            self._reader_task = asyncio.create_task(
+                self._reader_loop(proc),
+                name="codex-app-server-reader",
+            )
+            self._stderr_task = asyncio.create_task(
+                self._stderr_loop(proc),
+                name="codex-app-server-stderr",
+            )
+            try:
+                result = await self._request_connected("initialize", dict(self._initialize_params))
+                self._initialize_result = result if isinstance(result, dict) else {}
+                await self.notify("initialized")
+                self._initialized = True
+                self._generation += 1
+            except Exception:
+                await self._discard_process()
+                raise
+
+    async def close(self) -> None:
+        self._closing = True
+        await self._discard_process()
+
+    async def __aenter__(self) -> "CodexAppServerClient":
+        await self.start()
+        return self
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        await self.close()
+
+    def subscribe(
+        self,
+        *,
+        thread_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> CodexAppServerSubscription:
+        if turn_id is not None and thread_id is None:
+            raise ValueError("turn subscriptions require a thread_id")
+        subscription = CodexAppServerSubscription(
+            self,
+            thread_id,
+            turn_id,
+            asyncio.Queue(maxsize=self.notification_queue_limit),
+        )
+        self._subscriptions.add(subscription)
+        return subscription
+
+    def subscribe_thread(self, thread_id: str) -> CodexAppServerSubscription:
+        return self.subscribe(thread_id=thread_id)
+
+    def subscribe_turn(self, thread_id: str, turn_id: str) -> CodexAppServerSubscription:
+        return self.subscribe(thread_id=thread_id, turn_id=turn_id)
+
+    def _release_subscription(self, subscription: CodexAppServerSubscription) -> None:
+        self._subscriptions.discard(subscription)
+
+    def _finish_scoped_subscriptions(
+        self,
+        thread_id: str,
+        *,
+        turn_id: str | None = None,
+        include_thread_subscription: bool = False,
+    ) -> None:
+        for subscription in tuple(self._subscriptions):
+            if subscription.thread_id != thread_id:
+                continue
+            if include_thread_subscription or subscription.turn_id == turn_id:
+                subscription._finish()
+
+    def add_notification_handler(self, handler: NotificationHandler) -> None:
+        self._notification_handlers.add(handler)
+
+    def remove_notification_handler(self, handler: NotificationHandler) -> None:
+        self._notification_handlers.discard(handler)
+
+    async def _discard_process(self) -> None:
+        self._initialized = False
+        self._initialize_result = None
+        proc = self._proc
+        self._proc = None
+        current = asyncio.current_task()
+        reader_task = self._reader_task
+        stderr_task = self._stderr_task
+        had_transport_state = bool(
+            proc
+            or reader_task
+            or stderr_task
+            or self._pending
+            or self._turns_by_thread
+            or self._subscriptions
+            or self._server_request_tasks
+        )
+        self._reader_task = None
+        self._stderr_task = None
+
+        if proc and proc.returncode is None:
+            with suppress(ProcessLookupError):
+                proc.terminate()
+            with suppress(Exception):
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            if proc.returncode is None:
+                with suppress(ProcessLookupError):
+                    proc.kill()
+                with suppress(Exception):
+                    await proc.wait()
+
+        for task in (reader_task, stderr_task):
+            if task and task is not current:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+        background_tasks = [
+            *self._server_request_tasks.values(),
+            *self._callback_tasks,
+        ]
+        for task in background_tasks:
+            task.cancel()
+        self._server_request_tasks.clear()
+        self._callback_tasks.clear()
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
+
+        if had_transport_state:
+            self._fail_all(
+                CodexAppServerDisconnected(
+                    "codex app-server transport closed",
+                    request_sent=bool(self._pending),
+                    safe_to_retry=not bool(self._pending),
+                )
+            )
+
+    def _fail_all(self, error: BaseException) -> None:
+        for _, future in list(self._pending.values()):
+            if not future.done():
+                future.set_exception(error)
+        self._pending.clear()
+
+        self._turns_by_thread.clear()
+        self._loaded_threads.clear()
+        for subscription in tuple(self._subscriptions):
+            subscription._finish(error)
+
+    async def request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        timeout: float | None = None,
+    ) -> Any:
+        await self.start()
+        return await self._request_connected(method, params, timeout=timeout)
+
+    async def _request_connected(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        timeout: float | None = None,
+    ) -> Any:
+        proc = self._proc
+        if not proc or proc.returncode is not None or not proc.stdin:
+            raise CodexAppServerDisconnected(
+                "codex app-server is not connected",
+                request_sent=False,
+                safe_to_retry=True,
+            )
+
+        loop = asyncio.get_running_loop()
+        self._next_id += 1
+        request_id = self._next_id
+        future: asyncio.Future[Any] = loop.create_future()
+        self._pending[request_id] = (method, future)
+        try:
+            await self._send({"id": request_id, "method": method, "params": params})
+            try:
+                effective_timeout = (
+                    self.request_timeout if timeout is None else timeout
+                )
+                return await asyncio.wait_for(
+                    asyncio.shield(future),
+                    timeout=effective_timeout,
+                )
+            except asyncio.TimeoutError as exc:
+                raise CodexAppServerTimeout(method, effective_timeout) from exc
+        finally:
+            self._pending.pop(request_id, None)
+            if not future.done():
+                future.cancel()
+
+    async def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
+        payload: dict[str, Any] = {"method": method}
+        if params is not None:
+            payload["params"] = params
+        await self._send(payload)
+
+    async def _send(self, payload: dict[str, Any]) -> None:
+        proc = self._proc
+        if not proc or proc.returncode is not None or not proc.stdin:
+            raise CodexAppServerDisconnected(
+                "codex app-server stdin is unavailable",
+                request_sent=False,
+                safe_to_retry=True,
+            )
+
+        encoded = (json.dumps(payload, separators=(",", ":")) + "\n").encode()
+        async with self._write_lock:
+            try:
+                proc.stdin.write(encoded)
+                await proc.stdin.drain()
+            except Exception as exc:
+                raise CodexAppServerDisconnected(
+                    f"codex app-server write failed: {exc}",
+                    request_sent=True,
+                    safe_to_retry=False,
+                ) from exc
+
+    async def _reader_loop(self, proc: asyncio.subprocess.Process) -> None:
+        error: BaseException | None = None
+        try:
+            if not proc.stdout:
+                raise CodexAppServerDisconnected(
+                    "codex app-server stdout is unavailable",
+                    request_sent=False,
+                    safe_to_retry=True,
+                )
+            while True:
+                raw = await proc.stdout.readline()
+                if not raw:
+                    break
+                try:
+                    if (
+                        self.json_parse_thread_threshold
+                        and len(raw) >= self.json_parse_thread_threshold
+                    ):
+                        message = await asyncio.to_thread(json.loads, raw)
+                    else:
+                        message = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(message, dict):
+                    continue
+
+                request_id = message.get("id")
+                if request_id is not None and ("result" in message or "error" in message):
+                    pending = self._pending.get(request_id)
+                    if pending:
+                        request_method, future = pending
+                        if not future.done():
+                            if "error" in message:
+                                future.set_exception(
+                                    CodexAppServerRequestError(
+                                        request_method,
+                                        message.get("error"),
+                                    )
+                                )
+                            else:
+                                future.set_result(message.get("result"))
+                    continue
+
+                if request_id is not None and message.get("method"):
+                    params = message.get("params")
+                    self._start_server_request(
+                        request_id,
+                        str(message.get("method") or ""),
+                        params if isinstance(params, dict) else {},
+                    )
+                    continue
+
+                method = str(message.get("method") or "")
+                params = message.get("params")
+                if method and isinstance(params, dict):
+                    self._route_notification({"method": method, "params": params})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error = exc
+        finally:
+            if not self._closing and proc is self._proc:
+                self._initialized = False
+                error = error or CodexAppServerDisconnected(
+                    f"codex app-server exited with code {proc.returncode}",
+                    request_sent=bool(self._pending),
+                    safe_to_retry=not bool(self._pending),
+                )
+                self._fail_all(error)
+                self._cancel_server_request_tasks()
+
+    async def _stderr_loop(self, proc: asyncio.subprocess.Process) -> None:
+        if not proc.stderr:
+            return
+        while True:
+            line = await proc.stderr.readline()
+            if not line:
+                return
+            text = line.decode("utf-8", "replace").strip()
+            if text:
+                self._stderr_tail.append(text)
+
+    def _route_notification(self, notification: dict[str, Any]) -> None:
+        method = str(notification.get("method") or "")
+        params = notification.get("params")
+        if not isinstance(params, dict):
+            return
+
+        if method == "serverRequest/resolved":
+            request_id = params.get("requestId")
+            task = self._server_request_tasks.pop(request_id, None)
+            if task:
+                task.cancel()
+
+        thread_id, turn_id = _notification_scope(notification)
+        if method == "thread/started" and thread_id:
+            self._loaded_threads.add(thread_id)
+        elif method == "thread/closed" and thread_id:
+            self._loaded_threads.discard(thread_id)
+
+        active_turn = self._turns_by_thread.get(thread_id)
+        if active_turn and turn_id and not active_turn.turn_id:
+            active_turn.turn_id = turn_id
+            active_turn._subscription.turn_id = turn_id
+
+        for subscription in tuple(self._subscriptions):
+            if subscription._matches(notification):
+                subscription._put(notification)
+
+        for handler in tuple(self._notification_handlers):
+            try:
+                result = handler(notification)
+            except Exception:
+                continue
+            if inspect.isawaitable(result):
+                task = asyncio.ensure_future(result)
+                self._callback_tasks.add(task)
+                task.add_done_callback(self._finish_callback_task)
+
+        if method == "turn/completed" and active_turn:
+            if not turn_id or not active_turn.turn_id or turn_id == active_turn.turn_id:
+                active_turn._completed = True
+                if self._turns_by_thread.get(thread_id) is active_turn:
+                    self._turns_by_thread.pop(thread_id, None)
+                active_turn._subscription._finish()
+        if method == "turn/completed" and thread_id and turn_id:
+            self._finish_scoped_subscriptions(thread_id, turn_id=turn_id)
+        elif method == "thread/closed" and thread_id:
+            self._finish_scoped_subscriptions(
+                thread_id,
+                include_thread_subscription=True,
+            )
+
+    def _finish_callback_task(self, task: asyncio.Task[Any]) -> None:
+        self._callback_tasks.discard(task)
+        if not task.cancelled():
+            with suppress(Exception):
+                task.result()
+
+    def _cancel_server_request_tasks(self) -> None:
+        tasks = list(self._server_request_tasks.values())
+        self._server_request_tasks.clear()
+        for task in tasks:
+            task.cancel()
+
+    def _start_server_request(
+        self,
+        request_id: Any,
+        method: str,
+        params: dict[str, Any],
+    ) -> None:
+        previous = self._server_request_tasks.pop(request_id, None)
+        if previous:
+            previous.cancel()
+        task = asyncio.create_task(
+            self._handle_server_request(request_id, method, params),
+            name=f"codex-app-server-request-{request_id}",
+        )
+        self._server_request_tasks[request_id] = task
+        task.add_done_callback(
+            lambda done, rid=request_id: self._finish_server_request(rid, done)
+        )
+
+    def _finish_server_request(self, request_id: Any, task: asyncio.Task[None]) -> None:
+        if self._server_request_tasks.get(request_id) is task:
+            self._server_request_tasks.pop(request_id, None)
+        if not task.cancelled():
+            with suppress(Exception):
+                task.result()
+
+    async def _handle_server_request(
+        self,
+        request_id: Any,
+        method: str,
+        params: dict[str, Any],
+    ) -> None:
+        try:
+            result = self._server_request_handler(request_id, method, params)
+            if inspect.isawaitable(result):
+                result = await result
+            if not isinstance(result, dict):
+                raise CodexAppServerProtocolError(
+                    f"server request handler returned non-object for {method}"
+                )
+            await self._send({"id": request_id, "result": result})
+        except asyncio.CancelledError:
+            # Another app-server client or a turn transition resolved it.
+            return
+        except CodexAppServerRequestError as exc:
+            with suppress(CodexAppServerError):
+                await self._send(
+                    {
+                        "id": request_id,
+                        "error": (
+                            exc.error
+                            if isinstance(exc.error, dict)
+                            else {"code": -32000, "message": str(exc)}
+                        ),
+                    }
+                )
+        except Exception as exc:
+            with suppress(CodexAppServerError):
+                await self._send(
+                    {
+                        "id": request_id,
+                        "error": {"code": -32000, "message": str(exc)},
+                    }
+                )
+
+    async def start_thread(self, params: dict[str, Any]) -> str:
+        result = await self.request(
+            "thread/start",
+            dict(params),
+            timeout=self.lifecycle_timeout,
+        )
+        thread_id = self._thread_id_from_result("thread/start", result)
+        self._loaded_threads.add(thread_id)
+        return thread_id
+
+    async def resume_thread(
+        self,
+        thread_id: str,
+        params: dict[str, Any] | None = None,
+    ) -> str:
+        payload = dict(params or {})
+        payload["threadId"] = thread_id
+        payload.setdefault("excludeTurns", True)
+        result = await self.request(
+            "thread/resume",
+            payload,
+            timeout=self.lifecycle_timeout,
+        )
+        resolved = self._thread_id_from_result("thread/resume", result)
+        if resolved != thread_id:
+            raise CodexAppServerProtocolError(
+                "thread/resume returned a different thread id",
+                request_sent=True,
+                safe_to_retry=False,
+            )
+        self._loaded_threads.add(resolved)
+        return resolved
+
+    async def fork_thread(
+        self,
+        thread_id: str,
+        params: dict[str, Any] | None = None,
+        *,
+        last_turn_id: str | None = None,
+    ) -> str:
+        payload = dict(params or {})
+        payload["threadId"] = thread_id
+        payload.setdefault("excludeTurns", True)
+        if last_turn_id is not None:
+            payload["lastTurnId"] = last_turn_id
+        result = await self.request(
+            "thread/fork",
+            payload,
+            timeout=self.lifecycle_timeout,
+        )
+        resolved = self._thread_id_from_result("thread/fork", result)
+        self._loaded_threads.add(resolved)
+        return resolved
+
+    @staticmethod
+    def _thread_id_from_result(method: str, result: Any) -> str:
+        thread = result.get("thread") if isinstance(result, dict) else None
+        resolved = str(thread.get("id") or "") if isinstance(thread, dict) else ""
+        if not resolved:
+            raise CodexAppServerProtocolError(
+                f"{method} did not return a thread id",
+                request_sent=True,
+                safe_to_retry=False,
+            )
+        return resolved
+
+    async def start_or_resume_thread(
+        self,
+        thread_id: str | None,
+        start_params: dict[str, Any],
+        resume_params: dict[str, Any] | None = None,
+    ) -> str:
+        if thread_id:
+            return await self.resume_thread(
+                thread_id,
+                resume_params if resume_params is not None else start_params,
+            )
+        return await self.start_thread(start_params)
+
+    async def inject_items(
+        self,
+        thread_id: str,
+        items: list[dict[str, Any]],
+    ) -> None:
+        await self.request(
+            "thread/inject_items",
+            {"threadId": thread_id, "items": items},
+        )
+
+    async def read_thread(
+        self,
+        thread_id: str,
+        *,
+        include_turns: bool = False,
+    ) -> dict[str, Any]:
+        result = await self.request(
+            "thread/read",
+            {"threadId": thread_id, "includeTurns": include_turns},
+        )
+        thread = result.get("thread") if isinstance(result, dict) else None
+        if not isinstance(thread, dict) or str(thread.get("id") or "") != thread_id:
+            raise CodexAppServerProtocolError(
+                "thread/read did not return the requested thread",
+                request_sent=True,
+                safe_to_retry=False,
+            )
+        return thread
+
+    async def list_turns(
+        self,
+        thread_id: str,
+        *,
+        limit: int = 4,
+        items_view: str = "full",
+        sort_direction: str = "desc",
+    ) -> list[dict[str, Any]]:
+        result = await self.request(
+            "thread/turns/list",
+            {
+                "threadId": thread_id,
+                "limit": max(1, int(limit)),
+                "itemsView": items_view,
+                "sortDirection": sort_direction,
+            },
+        )
+        data = result.get("data") if isinstance(result, dict) else None
+        if not isinstance(data, list):
+            raise CodexAppServerProtocolError(
+                "thread/turns/list did not return a turn list",
+                request_sent=True,
+                safe_to_retry=False,
+            )
+        return [turn for turn in data if isinstance(turn, dict)]
+
+    async def unsubscribe_thread(self, thread_id: str) -> str:
+        result = await self.request("thread/unsubscribe", {"threadId": thread_id})
+        status = str(result.get("status") or "") if isinstance(result, dict) else ""
+        if status not in {"notLoaded", "notSubscribed", "unsubscribed"}:
+            raise CodexAppServerProtocolError(
+                "thread/unsubscribe returned an invalid status",
+                request_sent=True,
+                safe_to_retry=False,
+            )
+        self._loaded_threads.discard(thread_id)
+        self._finish_scoped_subscriptions(
+            thread_id,
+            include_thread_subscription=True,
+        )
+        return status
+
+    async def steer_turn(
+        self,
+        thread_id: str,
+        turn_id: str,
+        input_items: list[dict[str, Any]],
+        *,
+        client_user_message_id: str | None = None,
+    ) -> str:
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "expectedTurnId": turn_id,
+            "input": input_items,
+        }
+        if client_user_message_id:
+            params["clientUserMessageId"] = client_user_message_id
+        result = await self.request("turn/steer", params)
+        resolved = str(result.get("turnId") or "") if isinstance(result, dict) else ""
+        if resolved != turn_id:
+            raise CodexAppServerProtocolError(
+                f"turn/steer returned unexpected turn id {resolved or '<missing>'}",
+                request_sent=True,
+                safe_to_retry=False,
+            )
+        return resolved
+
+    async def interrupt_turn(self, thread_id: str, turn_id: str) -> None:
+        await self.request(
+            "turn/interrupt",
+            {"threadId": thread_id, "turnId": turn_id},
+        )
+
+    async def start_turn(
+        self,
+        thread_id: str,
+        input_items: list[dict[str, Any]],
+        *,
+        overrides: dict[str, Any] | None = None,
+    ) -> CodexAppServerTurn:
+        # Initialize before installing the provisional turn subscription.
+        # Otherwise the first lazy start would correctly discard it as stale
+        # transport state.
+        await self.start()
+        if thread_id in self._turns_by_thread:
+            raise CodexAppServerError(
+                f"thread {thread_id} already has an active app-server turn"
+            )
+
+        subscription = self.subscribe(thread_id=thread_id)
+        provisional = CodexAppServerTurn(self, thread_id, "", subscription)
+        self._turns_by_thread[thread_id] = provisional
+
+        params = dict(overrides or {})
+        params["threadId"] = thread_id
+        params["input"] = input_items
+        try:
+            result = await self._request_connected("turn/start", params)
+            turn = result.get("turn") if isinstance(result, dict) else None
+            turn_id = str(turn.get("id") or "") if isinstance(turn, dict) else ""
+            if not turn_id:
+                raise CodexAppServerProtocolError(
+                    "turn/start did not return a turn id",
+                    request_sent=True,
+                    safe_to_retry=False,
+                )
+            if provisional.turn_id and provisional.turn_id != turn_id:
+                raise CodexAppServerProtocolError(
+                    "turn/start response did not match its early notifications",
+                    request_sent=True,
+                    safe_to_retry=False,
+                )
+            provisional.turn_id = turn_id
+            provisional._subscription.turn_id = turn_id
+            return provisional
+        except CodexAppServerError as exc:
+            if not exc.safe_to_retry:
+                exc.pending_turn = provisional
+                # A timeout can race the acceptance response.  Keep the
+                # provisional subscription alive so later notifications can
+                # bind the real turn id and prove acceptance.
+                if self._turns_by_thread.get(thread_id) is provisional:
+                    raise
+            if self._turns_by_thread.get(thread_id) is provisional:
+                self._turns_by_thread.pop(thread_id, None)
+            provisional._subscription._finish()
+            raise
+        except Exception:
+            if self._turns_by_thread.get(thread_id) is provisional:
+                self._turns_by_thread.pop(thread_id, None)
+            provisional._subscription._finish()
+            raise
+
+    def release_turn(self, turn: CodexAppServerTurn) -> None:
+        if self._turns_by_thread.get(turn.thread_id) is turn:
+            self._turns_by_thread.pop(turn.thread_id, None)
+        turn._subscription._finish()
+
+    def active_turn(self, thread_id: str) -> CodexAppServerTurn | None:
+        return self._turns_by_thread.get(thread_id)
+
+
+class CodexAppServerManager:
+    """Lifecycle façade owning exactly one lazy shared app-server client."""
+
+    def __init__(
+        self,
+        codex_bin: str,
+        *,
+        cwd: str,
+        env_factory: Callable[[], dict[str, str]],
+        request_timeout: float = 30.0,
+        lifecycle_timeout: float = 300.0,
+        process_stream_limit: int = 16 * 1024 * 1024,
+        notification_queue_limit: int = 8192,
+        json_parse_thread_threshold: int = 1024 * 1024,
+        process_factory: ProcessFactory | None = None,
+        server_request_handler: ServerRequestHandler | None = None,
+        initialize_params: dict[str, Any] | None = None,
+    ) -> None:
+        self.client = CodexAppServerClient(
+            codex_bin,
+            cwd=cwd,
+            env_factory=env_factory,
+            request_timeout=request_timeout,
+            lifecycle_timeout=lifecycle_timeout,
+            process_stream_limit=process_stream_limit,
+            notification_queue_limit=notification_queue_limit,
+            json_parse_thread_threshold=json_parse_thread_threshold,
+            process_factory=process_factory,
+            server_request_handler=server_request_handler,
+            initialize_params=initialize_params,
+        )
+
+    @property
+    def ready(self) -> bool:
+        return self.client.ready
+
+    @property
+    def process(self) -> asyncio.subprocess.Process | None:
+        return self.client.process
+
+    @property
+    def generation(self) -> int:
+        return self.client.generation
+
+    def is_thread_loaded(self, thread_id: str) -> bool:
+        return self.client.is_thread_loaded(thread_id)
+
+    async def start(self) -> None:
+        await self.client.start()
+
+    async def close(self) -> None:
+        await self.client.close()
+
+    async def __aenter__(self) -> "CodexAppServerManager":
+        await self.start()
+        return self
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        await self.close()
+
+    def subscribe_thread(self, thread_id: str) -> CodexAppServerSubscription:
+        return self.client.subscribe_thread(thread_id)
+
+    def subscribe_turn(
+        self,
+        thread_id: str,
+        turn_id: str,
+    ) -> CodexAppServerSubscription:
+        return self.client.subscribe_turn(thread_id, turn_id)
+
+    def add_notification_handler(self, handler: NotificationHandler) -> None:
+        self.client.add_notification_handler(handler)
+
+    def remove_notification_handler(self, handler: NotificationHandler) -> None:
+        self.client.remove_notification_handler(handler)
+
+    async def request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        timeout: float | None = None,
+    ) -> Any:
+        return await self.client.request(method, params, timeout=timeout)
+
+    async def notify(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+    ) -> None:
+        await self.client.notify(method, params)
+
+    async def start_thread(self, params: dict[str, Any]) -> str:
+        return await self.client.start_thread(params)
+
+    async def resume_thread(
+        self,
+        thread_id: str,
+        params: dict[str, Any] | None = None,
+    ) -> str:
+        return await self.client.resume_thread(thread_id, params)
+
+    async def start_or_resume_thread(
+        self,
+        thread_id: str | None,
+        start_params: dict[str, Any],
+        resume_params: dict[str, Any] | None = None,
+    ) -> str:
+        return await self.client.start_or_resume_thread(
+            thread_id,
+            start_params,
+            resume_params,
+        )
+
+    async def fork_thread(
+        self,
+        thread_id: str,
+        params: dict[str, Any] | None = None,
+        *,
+        last_turn_id: str | None = None,
+    ) -> str:
+        return await self.client.fork_thread(
+            thread_id,
+            params,
+            last_turn_id=last_turn_id,
+        )
+
+    async def inject_items(
+        self,
+        thread_id: str,
+        items: list[dict[str, Any]],
+    ) -> None:
+        await self.client.inject_items(thread_id, items)
+
+    async def read_thread(
+        self,
+        thread_id: str,
+        *,
+        include_turns: bool = False,
+    ) -> dict[str, Any]:
+        return await self.client.read_thread(
+            thread_id,
+            include_turns=include_turns,
+        )
+
+    async def list_turns(
+        self,
+        thread_id: str,
+        *,
+        limit: int = 4,
+        items_view: str = "full",
+        sort_direction: str = "desc",
+    ) -> list[dict[str, Any]]:
+        return await self.client.list_turns(
+            thread_id,
+            limit=limit,
+            items_view=items_view,
+            sort_direction=sort_direction,
+        )
+
+    async def unsubscribe_thread(self, thread_id: str) -> str:
+        return await self.client.unsubscribe_thread(thread_id)
+
+    async def start_turn(
+        self,
+        thread_id: str,
+        input_items: list[dict[str, Any]],
+        *,
+        overrides: dict[str, Any] | None = None,
+    ) -> CodexAppServerTurn:
+        return await self.client.start_turn(
+            thread_id,
+            input_items,
+            overrides=overrides,
+        )
+
+    async def steer_turn(
+        self,
+        thread_id: str,
+        turn_id: str,
+        input_items: list[dict[str, Any]],
+        *,
+        client_user_message_id: str | None = None,
+    ) -> str:
+        return await self.client.steer_turn(
+            thread_id,
+            turn_id,
+            input_items,
+            client_user_message_id=client_user_message_id,
+        )
+
+    async def interrupt_turn(self, thread_id: str, turn_id: str) -> None:
+        await self.client.interrupt_turn(thread_id, turn_id)
+
+    def active_turn(self, thread_id: str) -> CodexAppServerTurn | None:
+        return self.client.active_turn(thread_id)

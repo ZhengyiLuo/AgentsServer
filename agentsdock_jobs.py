@@ -17,6 +17,13 @@ class JobsCLIError(RuntimeError):
     """A safe, user-facing CLI failure."""
 
 
+def nonempty_chat_id(value: str) -> str:
+    chat_id = value.strip()
+    if not chat_id:
+        raise argparse.ArgumentTypeError("--chat-id must not be empty")
+    return chat_id
+
+
 def required_environment() -> tuple[str, str, str]:
     server_url = os.environ.get("AGENTSDOCK_SERVER_URL", "").strip().rstrip("/")
     chat_id = os.environ.get("AGENTSDOCK_CHAT_ID", "").strip()
@@ -186,6 +193,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Manage scheduled jobs for the current AgentsDock chat.",
     )
+    parser.add_argument(
+        "--chat-id",
+        type=nonempty_chat_id,
+        help="explicit chat scope (defaults to AGENTSDOCK_CHAT_ID)",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     list_parser = subparsers.add_parser("list", help="list jobs in the active chat")
@@ -237,11 +249,21 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    previous_chat_id = os.environ.get("AGENTSDOCK_CHAT_ID")
+    if args.chat_id is not None:
+        os.environ["AGENTSDOCK_CHAT_ID"] = args.chat_id
     try:
-        result = args.handler(args)
-    except JobsCLIError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+        try:
+            result = args.handler(args)
+        except JobsCLIError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        if args.chat_id is not None:
+            if previous_chat_id is None:
+                os.environ.pop("AGENTSDOCK_CHAT_ID", None)
+            else:
+                os.environ["AGENTSDOCK_CHAT_ID"] = previous_chat_id
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 

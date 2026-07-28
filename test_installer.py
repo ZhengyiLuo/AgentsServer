@@ -150,6 +150,81 @@ chmod 755 "$project/.venv/bin/python"
             self.assertFalse((current / "old-runtime-marker").exists())
             self.assertNotEqual(previous.resolve(), current.resolve())
 
+    def test_dependency_sync_ignores_an_inherited_external_uv_environment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            fake_bin = root / "bin"
+            install_root = root / "install"
+            external_environment = root / "unrelated-project-venv"
+            sync_target_log = root / "uv-sync-target"
+            fake_bin.mkdir()
+            home.mkdir()
+            external_environment.mkdir()
+            sentinel = external_environment / "do-not-touch"
+            sentinel.write_text("unrelated workspace\n")
+            self.write_executable(fake_bin / "uname", "#!/bin/sh\necho Linux\n")
+            self.write_executable(fake_bin / "systemctl", "#!/bin/sh\nexit 0\n")
+            self.write_executable(fake_bin / "curl", "#!/bin/sh\nexit 0\n")
+            self.write_executable(fake_bin / "tmux", "#!/bin/sh\nexit 0\n")
+            self.write_executable(fake_bin / "uv", """#!/bin/sh
+project=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--project" ]; then project="$2"; shift 2; else shift; fi
+done
+target="${UV_PROJECT_ENVIRONMENT:-$project/.venv}"
+printf '%s\n' "$target" > "$FAKE_UV_SYNC_TARGET_LOG"
+mkdir -p "$target/bin"
+printf '#!/bin/sh\nexit 0\n' > "$target/bin/python"
+chmod 755 "$target/bin/python"
+""")
+            environment = {
+                **os.environ,
+                "HOME": str(home),
+                "PATH": f"{fake_bin}:/usr/bin:/bin",
+                "AGENTS_SERVER_INSTALL_DIR": str(install_root),
+                "AGENTS_SERVER_CONFIG_DIR": str(root / "config"),
+                "AGENTSDOCK_STATE_DIR": str(root / "state"),
+                "FAKE_UV_SYNC_TARGET_LOG": str(sync_target_log),
+                "UV_PROJECT_ENVIRONMENT": str(external_environment),
+                "VIRTUAL_ENV": str(external_environment),
+            }
+
+            result = subprocess.run(
+                ["bash", str(INSTALLER), "--port", "17850", "--non-interactive"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(sentinel.read_text(), "unrelated workspace\n")
+            self.assertEqual(list(external_environment.iterdir()), [sentinel])
+            sync_target = Path(sync_target_log.read_text().strip())
+            self.assertEqual(sync_target.name, ".venv")
+            self.assertEqual(sync_target.parent.parent, install_root / "releases")
+            self.assertTrue((install_root / "current" / ".venv" / "bin" / "python").is_file())
+
+    def test_dependency_sync_rejects_a_missing_staged_runtime(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_executable(fake_bin / "curl", "#!/bin/sh\nexit 0\n")
+            self.write_executable(fake_bin / "uv", "#!/bin/sh\nexit 0\n")
+
+            result = subprocess.run(
+                ["/bin/bash", str(INSTALLER), "--non-interactive"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("did not create the isolated release runtime", result.stderr)
+            self.assertTrue((install_root / "current" / "runtime-marker").is_file())
+
     def test_default_legacy_state_is_moved_and_linked(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

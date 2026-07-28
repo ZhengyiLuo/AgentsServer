@@ -408,6 +408,25 @@ download_uv_installer() {
   return 1
 }
 
+sync_release_dependencies() (
+  # Managed updates may be launched from a long-lived tmux server. Never let
+  # project/virtual-environment selectors inherited by that server redirect
+  # this release sync into an unrelated workspace.
+  unset \
+    CONDA_PREFIX \
+    PYTHONHOME \
+    PYTHONPATH \
+    UV_CONFIG_FILE \
+    UV_NO_PROJECT \
+    UV_PROJECT \
+    UV_PROJECT_ENVIRONMENT \
+    UV_PYTHON \
+    UV_WORKING_DIR \
+    VIRTUAL_ENV
+  export UV_PROJECT_ENVIRONMENT="$STAGE_DIR/.venv"
+  uv sync --project "$STAGE_DIR" --python '>=3.10' --no-dev --frozen
+)
+
 migrate_legacy_state() {
   [[ "$STATE_ROOT" == "$HOME/.agentsdock" ]] || return 0
   if [[ -L "$LEGACY_STATE_ROOT" ]]; then
@@ -464,11 +483,16 @@ if run_timed_stage \
   "dependency resolution" \
   "$DEPENDENCY_SYNC_TIMEOUT_SECONDS" \
   "Review the uv output above. Verify disk space and outbound HTTPS access, then run install.sh again; the active release was not changed." \
-  uv sync --project "$STAGE_DIR" --python '>=3.10' --no-dev --frozen; then
+  sync_release_dependencies; then
   :
 else
   stage_status=$?
   exit "$stage_status"
+fi
+if [[ ! -d "$STAGE_DIR/.venv" || -L "$STAGE_DIR/.venv" || ! -x "$STAGE_DIR/.venv/bin/python" ]]; then
+  echo "Dependency resolution did not create the isolated release runtime at $STAGE_DIR/.venv." >&2
+  echo "  The active release was not changed. Review the uv output above, then run install.sh again." >&2
+  exit 1
 fi
 "$STAGE_DIR/.venv/bin/python" -c 'import websockets' >/dev/null
 "$STAGE_DIR/.venv/bin/python" -c 'import croniter, dateutil; from zoneinfo import ZoneInfo; ZoneInfo("America/Los_Angeles")' >/dev/null

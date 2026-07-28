@@ -39,6 +39,18 @@ INSTALLER_TERMINATION_GRACE_SECONDS = 10.0
 INSTALLER_LOG_TAIL_BYTES = 64 * 1024
 INSTALLER_LOG_TAIL_LINES = 12
 INSTALLER_ERROR_MAX_CHARS = 4_000
+INSTALLER_ENVIRONMENT_SELECTORS = (
+    "CONDA_PREFIX",
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "UV_CONFIG_FILE",
+    "UV_NO_PROJECT",
+    "UV_PROJECT",
+    "UV_PROJECT_ENVIRONMENT",
+    "UV_PYTHON",
+    "UV_WORKING_DIR",
+    "VIRTUAL_ENV",
+)
 
 
 class ReleaseUnavailableError(RuntimeError):
@@ -108,6 +120,14 @@ def terminate_installer(process: subprocess.Popen[Any]) -> None:
     process.wait()
 
 
+def installer_environment() -> dict[str, str]:
+    """Return an installer environment detached from the caller's workspace."""
+    environment = os.environ.copy()
+    for name in INSTALLER_ENVIRONMENT_SELECTORS:
+        environment.pop(name, None)
+    return environment
+
+
 def run_installer(
     command: list[str],
     *,
@@ -130,6 +150,7 @@ def run_installer(
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            env=installer_environment(),
         )
         while True:
             remaining = deadline - time.monotonic()

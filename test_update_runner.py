@@ -207,6 +207,38 @@ class UpdateRunnerTests(unittest.TestCase):
                     heartbeat_seconds=0.02,
                 )
 
+    def test_installer_drops_inherited_workspace_environment_selectors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            captured_path = root / "installer-environment.json"
+            hostile = {
+                name: f"/unrelated/{name.lower()}"
+                for name in update_runner.INSTALLER_ENVIRONMENT_SELECTORS
+            }
+            with patch.dict(os.environ, hostile):
+                update_runner.run_installer(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import json, os, pathlib; "
+                            f"pathlib.Path({str(captured_path)!r}).write_text("
+                            "json.dumps(dict(os.environ)))"
+                        ),
+                    ],
+                    cwd=root,
+                    status_path=root / "server-update.json",
+                    log_path=root / "server-update.log",
+                    version="1.2.3",
+                    timeout_seconds=2,
+                    heartbeat_seconds=0.02,
+                )
+
+            captured = json.loads(captured_path.read_text())
+            for name in update_runner.INSTALLER_ENVIRONMENT_SELECTORS:
+                self.assertNotIn(name, captured)
+            self.assertEqual(captured.get("PATH"), os.environ.get("PATH"))
+
     def test_detached_runner_rejects_downgrades_before_download(self):
         args = argparse.Namespace(
             status_file="unused-status.json",

@@ -51,6 +51,7 @@ INSTALLER_ENVIRONMENT_SELECTORS = (
     "UV_WORKING_DIR",
     "VIRTUAL_ENV",
 )
+RELEASE_TRACKS = {"stable", "beta"}
 
 
 class ReleaseUnavailableError(RuntimeError):
@@ -199,6 +200,17 @@ def version_is_prerelease(version: str) -> bool:
     return "-" in version.split("+", 1)[0]
 
 
+def release_track(version: str) -> str:
+    return "beta" if version_is_prerelease(version) else "stable"
+
+
+def normalized_release_track(track: str | None) -> str:
+    value = str(track or "stable").strip().lower()
+    if value not in RELEASE_TRACKS:
+        raise ValueError(f"invalid release track: {track}")
+    return value
+
+
 def version_key(version: str) -> tuple[Any, ...]:
     """Return a SemVer-compatible key for a trusted release version."""
     if not VERSION_PATTERN.fullmatch(version):
@@ -223,7 +235,8 @@ def release_signature_url(version: str) -> str:
     return f"{RELEASE_BASE}/download/v{version}/agents-server-manifest.sig"
 
 
-def stable_release_candidates(releases: Any) -> list[str]:
+def release_candidates(releases: Any, track: str = "stable") -> list[str]:
+    track = normalized_release_track(track)
     if not isinstance(releases, list):
         raise RuntimeError("GitHub releases response must be a JSON array")
     candidates: set[str] = set()
@@ -234,34 +247,47 @@ def stable_release_candidates(releases: Any) -> list[str]:
         if not tag.startswith("v"):
             continue
         version = tag[1:]
-        if not VERSION_PATTERN.fullmatch(version) or version_is_prerelease(version):
+        if not VERSION_PATTERN.fullmatch(version) or release_track(version) != track:
             continue
-        if release.get("prerelease") is True:
+        declared_prerelease = release.get("prerelease")
+        if declared_prerelease is not None and bool(declared_prerelease) != version_is_prerelease(version):
             continue
         candidates.add(version)
     return sorted(candidates, key=version_key, reverse=True)
 
 
-def release_versions_from_html(content: bytes) -> set[str]:
+def stable_release_candidates(releases: Any) -> list[str]:
+    """Backward-compatible stable release discovery."""
+    return release_candidates(releases, "stable")
+
+
+def release_versions_from_html(content: bytes, track: str = "stable") -> set[str]:
+    track = normalized_release_track(track)
     text = content.decode("utf-8", "replace")
     prefix = f"/{RELEASE_REPOSITORY}/releases/tag/v"
     return {
         match.group(1)
         for match in re.finditer(re.escape(prefix) + r"([^\"'<>/?#]+)", text)
-        if VERSION_PATTERN.fullmatch(match.group(1)) and not version_is_prerelease(match.group(1))
+        if VERSION_PATTERN.fullmatch(match.group(1)) and release_track(match.group(1)) == track
     }
 
 
-def stable_release_candidates_from_public_pages(max_pages: int = 20) -> list[str]:
+def release_candidates_from_public_pages(track: str = "stable", max_pages: int = 20) -> list[str]:
+    track = normalized_release_track(track)
     versions: set[str] = set()
     for page in range(1, max_pages + 1):
         url = RELEASES_PAGE_URL if page == 1 else f"{RELEASES_PAGE_URL}?page={page}"
         content = download_bytes(url, MAX_METADATA_BYTES)
-        versions.update(release_versions_from_html(content))
+        versions.update(release_versions_from_html(content, track))
         next_page = f"{RELEASES_PAGE_URL.removeprefix('https://github.com')}?page={page + 1}"
         if next_page not in content.decode("utf-8", "replace"):
             break
     return sorted(versions, key=version_key, reverse=True)
+
+
+def stable_release_candidates_from_public_pages(max_pages: int = 20) -> list[str]:
+    """Backward-compatible stable release discovery."""
+    return release_candidates_from_public_pages("stable", max_pages)
 
 
 def verify_manifest(
@@ -270,7 +296,9 @@ def verify_manifest(
     public_key_path: Path,
     *,
     expected_version: str | None = None,
+    track: str = "stable",
 ) -> dict[str, Any]:
+    track = normalized_release_track(track)
     key = serialization.load_pem_public_key(public_key_path.read_bytes())
     if not isinstance(key, Ed25519PublicKey):
         raise RuntimeError("release public key is not an Ed25519 key")
@@ -281,13 +309,15 @@ def verify_manifest(
     version = str(manifest.get("version") or "")
     if not VERSION_PATTERN.fullmatch(version):
         raise RuntimeError("release manifest contains an invalid version")
-    if version_is_prerelease(version):
-        raise RuntimeError("managed updates accept stable releases only")
+    actual_track = release_track(version)
+    if actual_track != track:
+        raise RuntimeError(f"release manifest is not on the requested {track} track")
     if expected_version is not None and version != expected_version:
         raise RuntimeError("release manifest version does not match its immutable release tag")
-    if manifest.get("prerelease") not in {None, False}:
+    expected_prerelease = actual_track == "beta"
+    if manifest.get("prerelease") not in {None, expected_prerelease}:
         raise RuntimeError("release manifest prerelease metadata is inconsistent")
-    if manifest.get("track") not in {None, "stable"}:
+    if manifest.get("track") not in {None, actual_track}:
         raise RuntimeError("release manifest track metadata is inconsistent")
     archive = manifest.get("archive")
     if not isinstance(archive, dict):
@@ -304,7 +334,8 @@ def verify_manifest(
     return manifest
 
 
-def check_release(public_key_path: Path) -> dict[str, Any]:
+def check_release(public_key_path: Path, track: str = "stable") -> dict[str, Any]:
+    track = normalized_release_track(track)
     try:
         releases_bytes = download_bytes(RELEASES_API_URL, MAX_METADATA_BYTES)
     except HTTPError as exc:
@@ -312,15 +343,15 @@ def check_release(public_key_path: Path) -> dict[str, Any]:
             raise ReleaseUnavailableError("No signed AgentsServer release has been published yet.") from exc
         if exc.code not in {403, 429}:
             raise
-        candidates = stable_release_candidates_from_public_pages()
+        candidates = release_candidates_from_public_pages(track)
     else:
         try:
             releases = json.loads(releases_bytes)
         except json.JSONDecodeError as exc:
             raise RuntimeError("GitHub releases response is invalid JSON") from exc
-        candidates = stable_release_candidates(releases)
+        candidates = release_candidates(releases, track)
     if not candidates:
-        raise ReleaseUnavailableError("No signed stable AgentsServer release is available.")
+        raise ReleaseUnavailableError(f"No signed {track} AgentsServer release is available.")
 
     for version in candidates:
         try:
@@ -335,8 +366,24 @@ def check_release(public_key_path: Path) -> dict[str, Any]:
             signature,
             public_key_path,
             expected_version=version,
+            track=track,
         )
-    raise ReleaseUnavailableError("No signed stable AgentsServer release is available.")
+    raise ReleaseUnavailableError(f"No signed {track} AgentsServer release is available.")
+
+
+def release_transition_allowed(current: str, target: str, track: str = "stable") -> bool:
+    """Allow forward updates and an explicit prerelease-to-stable channel exit."""
+    track = normalized_release_track(track)
+    if release_track(target) != track:
+        return False
+    if version_key(target) > version_key(current):
+        return True
+    return (
+        version_key(target) < version_key(current)
+        and track == "stable"
+        and version_is_prerelease(current)
+        and not version_is_prerelease(target)
+    )
 
 
 def safe_extract(archive_path: Path, destination: Path) -> Path:
@@ -359,21 +406,33 @@ def safe_extract(archive_path: Path, destination: Path) -> Path:
 def run_update(args: argparse.Namespace) -> None:
     status_path = Path(args.status_file).expanduser().resolve()
     public_key = Path(args.public_key).expanduser().resolve()
-    update_status(status_path, phase="checking", message="Checking the signed release manifest.")
-    manifest = check_release(public_key)
+    track = normalized_release_track(getattr(args, "track", "stable"))
+    update_status(
+        status_path,
+        phase="checking",
+        track=track,
+        message=f"Checking the signed {track} release manifest.",
+    )
+    manifest = check_release(public_key, track)
     version = str(manifest["version"])
     if args.expected_version and version != args.expected_version:
         raise RuntimeError(f"latest signed release is {version}, not {args.expected_version}")
-    if args.current_version and version_key(version) <= version_key(args.current_version):
+    if args.current_version and not release_transition_allowed(args.current_version, version, track):
         raise RuntimeError(
             f"resolved release {version} is not newer than installed version {args.current_version}; "
-            "managed updates do not perform downgrades or reinstalls"
+            "managed updates only permit forward updates or an explicit beta-to-stable channel switch"
         )
 
     with tempfile.TemporaryDirectory(prefix="agents-server-update-") as temporary:
         root = Path(temporary)
         archive_path = root / str(manifest["archive"]["name"])
-        update_status(status_path, phase="downloading", target_version=version, message=f"Downloading AgentsServer {version}.")
+        update_status(
+            status_path,
+            phase="downloading",
+            track=track,
+            target_version=version,
+            message=f"Downloading AgentsServer {version}.",
+        )
         archive_bytes = download_bytes(str(manifest["archive"]["url"]), MAX_ARCHIVE_BYTES, timeout=120.0)
         digest = hashlib.sha256(archive_bytes).hexdigest()
         if digest != manifest["archive"]["sha256"]:
@@ -405,6 +464,7 @@ def run_update(args: argparse.Namespace) -> None:
         status_path,
         phase="complete",
         message=f"AgentsServer {version} is installed and healthy.",
+        track=track,
         installed_version=version,
         finished_at=utc_now(),
     )
@@ -418,6 +478,7 @@ def main() -> int:
     parser.add_argument("--bind", required=True)
     parser.add_argument("--expected-version")
     parser.add_argument("--current-version")
+    parser.add_argument("--track", choices=sorted(RELEASE_TRACKS), default="stable")
     args = parser.parse_args()
     try:
         run_update(args)

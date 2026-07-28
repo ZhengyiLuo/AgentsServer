@@ -18,7 +18,13 @@ import update_runner
 
 
 class UpdateRunnerTests(unittest.TestCase):
-    def signed_manifest(self, version: str = "1.2.3"):
+    def signed_manifest(
+        self,
+        version: str = "1.2.3",
+        *,
+        track: str | None = None,
+        prerelease: bool | None = None,
+    ):
         private = Ed25519PrivateKey.generate()
         manifest = {
             "schema": 1,
@@ -30,6 +36,10 @@ class UpdateRunnerTests(unittest.TestCase):
                 "sha256": "a" * 64,
             },
         }
+        if track is not None:
+            manifest["track"] = track
+        if prerelease is not None:
+            manifest["prerelease"] = prerelease
         payload = (json.dumps(manifest, sort_keys=True) + "\n").encode()
         return private, payload, private.sign(payload)
 
@@ -79,6 +89,44 @@ class UpdateRunnerTests(unittest.TestCase):
                     expected_version="1.2.4",
                 )
 
+    def test_legacy_beta_manifest_is_accepted_only_on_beta_track(self):
+        private, payload, signature = self.signed_manifest("1.3.0-beta.2")
+        with tempfile.TemporaryDirectory() as temporary:
+            public_path = Path(temporary) / "public.pem"
+            public_path.write_bytes(private.public_key().public_bytes(
+                serialization.Encoding.PEM,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            ))
+            manifest = update_runner.verify_manifest(
+                payload,
+                signature,
+                public_path,
+                track="beta",
+            )
+            with self.assertRaisesRegex(RuntimeError, "requested stable track"):
+                update_runner.verify_manifest(payload, signature, public_path)
+        self.assertEqual(manifest["version"], "1.3.0-beta.2")
+
+    def test_manifest_track_metadata_must_match_version(self):
+        private, payload, signature = self.signed_manifest(
+            "1.3.0-beta.2",
+            track="stable",
+            prerelease=True,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            public_path = Path(temporary) / "public.pem"
+            public_path.write_bytes(private.public_key().public_bytes(
+                serialization.Encoding.PEM,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            ))
+            with self.assertRaisesRegex(RuntimeError, "track metadata"):
+                update_runner.verify_manifest(
+                    payload,
+                    signature,
+                    public_path,
+                    track="beta",
+                )
+
     def test_stable_release_candidates_exclude_prereleases_and_drafts(self):
         releases = [
             self.release("1.2.4-beta.2"),
@@ -88,6 +136,30 @@ class UpdateRunnerTests(unittest.TestCase):
             self.release("8.0.0", prerelease=True),
         ]
         self.assertEqual(update_runner.stable_release_candidates(releases), ["1.2.3", "1.2.2"])
+
+    def test_beta_release_candidates_exclude_stable_mislabeled_and_drafts(self):
+        releases = [
+            self.release("1.3.0-beta.2"),
+            self.release("1.3.0-beta.1"),
+            self.release("1.2.3"),
+            self.release("9.0.0-beta.1", draft=True),
+            self.release("8.0.0-beta.1", prerelease=False),
+        ]
+        self.assertEqual(
+            update_runner.release_candidates(releases, "beta"),
+            ["1.3.0-beta.2", "1.3.0-beta.1"],
+        )
+
+    def test_html_release_discovery_filters_by_track(self):
+        content = b"""
+        <a href="/ZhengyiLuo/AgentsServer/releases/tag/v1.2.3">stable</a>
+        <a href="/ZhengyiLuo/AgentsServer/releases/tag/v1.3.0-beta.2">beta</a>
+        """
+        self.assertEqual(update_runner.release_versions_from_html(content), {"1.2.3"})
+        self.assertEqual(
+            update_runner.release_versions_from_html(content, "beta"),
+            {"1.3.0-beta.2"},
+        )
 
     def test_signed_stable_release_uses_only_versioned_asset_urls(self):
         private, payload, signature = self.signed_manifest("1.2.3")
@@ -118,6 +190,36 @@ class UpdateRunnerTests(unittest.TestCase):
 
         self.assertEqual(manifest["version"], "1.2.3")
         self.assertFalse(any("2.0.0-beta.1" in url for url in seen))
+
+    def test_signed_beta_release_uses_only_versioned_asset_urls(self):
+        private, payload, signature = self.signed_manifest("1.3.0-beta.2")
+        releases = json.dumps([
+            self.release("1.3.0-beta.2"),
+            self.release("1.2.3"),
+        ]).encode()
+        assets = {
+            update_runner.RELEASES_API_URL: releases,
+            update_runner.release_manifest_url("1.3.0-beta.2"): payload,
+            update_runner.release_signature_url("1.3.0-beta.2"): signature,
+        }
+        seen: list[str] = []
+
+        def download(url, _limit, timeout=30.0):
+            seen.append(url)
+            self.assertNotIn("/latest/", url)
+            return assets[url]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            public_path = Path(temporary) / "public.pem"
+            public_path.write_bytes(private.public_key().public_bytes(
+                serialization.Encoding.PEM,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            ))
+            with patch.object(update_runner, "download_bytes", side_effect=download):
+                manifest = update_runner.check_release(public_path, "beta")
+
+        self.assertEqual(manifest["version"], "1.3.0-beta.2")
+        self.assertFalse(any("/v1.2.3/" in url for url in seen))
 
     def test_safe_extract_rejects_path_traversal(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -251,11 +353,19 @@ class UpdateRunnerTests(unittest.TestCase):
         with patch.object(update_runner, "update_status"), \
              patch.object(update_runner, "check_release", return_value={"version": "1.2.3"}), \
              patch.object(update_runner, "download_bytes") as download:
-            with self.assertRaisesRegex(RuntimeError, "do not perform downgrades"):
+            with self.assertRaisesRegex(RuntimeError, "only permit forward updates"):
                 update_runner.run_update(args)
         download.assert_not_called()
 
-    def test_successful_update_completes_without_track_state(self):
+    def test_transition_allows_only_forward_or_beta_to_stable(self):
+        self.assertTrue(update_runner.release_transition_allowed("1.2.3", "1.2.4", "stable"))
+        self.assertTrue(update_runner.release_transition_allowed("1.3.0-beta.2", "1.2.4", "stable"))
+        self.assertFalse(update_runner.release_transition_allowed("1.2.4", "1.2.3", "stable"))
+        self.assertFalse(update_runner.release_transition_allowed("1.3.0-beta.2", "1.3.0-beta.1", "beta"))
+        self.assertFalse(update_runner.release_transition_allowed("1.3.0", "1.4.0-beta.1", "stable"))
+        self.assertFalse(update_runner.release_transition_allowed("1.2.3", "1.2.3", "stable"))
+
+    def test_successful_update_records_default_stable_track(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             archive_buffer = io.BytesIO()
@@ -296,8 +406,50 @@ class UpdateRunnerTests(unittest.TestCase):
 
         self.assertEqual(statuses[-1]["phase"], "complete")
         self.assertEqual(statuses[-1]["installed_version"], "1.2.4")
-        self.assertNotIn("track", statuses[-1])
+        self.assertEqual(statuses[-1]["track"], "stable")
         install.assert_called_once()
+
+    def test_detached_runner_allows_explicit_beta_to_latest_stable_switch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive_buffer = io.BytesIO()
+            with tarfile.open(fileobj=archive_buffer, mode="w:gz") as archive:
+                installer = b"#!/bin/sh\nexit 0\n"
+                entry = tarfile.TarInfo("agents-server-1.2.4/install.sh")
+                entry.mode = 0o755
+                entry.size = len(installer)
+                archive.addfile(entry, io.BytesIO(installer))
+            archive_bytes = archive_buffer.getvalue()
+            manifest = {
+                "version": "1.2.4",
+                "archive": {
+                    "name": "agents-server-1.2.4.tar.gz",
+                    "url": "https://example.invalid/agents-server-1.2.4.tar.gz",
+                    "sha256": hashlib.sha256(archive_bytes).hexdigest(),
+                },
+            }
+            args = argparse.Namespace(
+                status_file=str(root / "server-update.json"),
+                public_key=str(root / "release-public-key.pem"),
+                port=7850,
+                bind="127.0.0.1",
+                expected_version="1.2.4",
+                current_version="1.3.0-beta.2",
+                track="stable",
+            )
+            statuses: list[dict] = []
+
+            with patch.object(update_runner, "check_release", return_value=manifest) as check, \
+                 patch.object(update_runner, "download_bytes", return_value=archive_bytes), \
+                 patch.object(update_runner, "update_status", side_effect=lambda _path, **changes: statuses.append(changes) or changes), \
+                 patch.object(update_runner, "run_installer") as install:
+                update_runner.run_update(args)
+
+        check.assert_called_once_with(Path(args.public_key).resolve(), "stable")
+        install.assert_called_once()
+        self.assertEqual(statuses[-1]["phase"], "complete")
+        self.assertEqual(statuses[-1]["installed_version"], "1.2.4")
+        self.assertEqual(statuses[-1]["track"], "stable")
 
 
 if __name__ == "__main__":

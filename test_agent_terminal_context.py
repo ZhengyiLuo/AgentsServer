@@ -22,8 +22,13 @@ class AgentTerminalContextTests(unittest.TestCase):
 
         self.assertEqual(env["AGENTSDOCK_CHAT_ID"], "sess-ab/cd")
         self.assertEqual(env["AGENTSDOCK_TMUX_SESSION"], "zd_sess_ab_cd")
+        self.assertEqual(
+            env["AGENTSDOCK_MANIFEST_PATH"],
+            str(agent_server.codex_manifest_path("sess-ab/cd")),
+        )
+        self.assertTrue(env["AGENTSDOCK_MANIFEST_PATH"].endswith("/manifests/current.json"))
 
-    def test_claude_prompt_names_terminal_and_keeps_it_read_only(self) -> None:
+    def test_claude_prompt_uses_stable_terminal_indirection(self) -> None:
         command = agent_server.build_claude_cmd(
             "sess-123",
             {"id": "sess-123", "backend": "claude"},
@@ -31,9 +36,37 @@ class AgentTerminalContextTests(unittest.TestCase):
         )
         prompt = command[command.index("--append-system-prompt") + 1]
 
-        self.assertIn("`zd_sess_123`", prompt)
         self.assertIn("AGENTSDOCK_TMUX_SESSION", prompt)
-        self.assertIn("Do not send keys", prompt)
+        self.assertIn("read-only", prompt)
+        self.assertNotIn("sess-123", prompt)
+        self.assertNotIn("/tmp/manifest.json", prompt)
+
+    def test_claude_prompt_is_stable_across_sessions_and_runs(self) -> None:
+        first = agent_server.build_claude_cmd(
+            "sess-123",
+            {"id": "sess-123", "backend": "claude"},
+            Path("/tmp/run-a.json"),
+        )
+        second = agent_server.build_claude_cmd(
+            "sess-456",
+            {"id": "sess-456", "backend": "claude"},
+            Path("/tmp/run-b.json"),
+        )
+
+        first_prompt = first[first.index("--append-system-prompt") + 1]
+        second_prompt = second[second.index("--append-system-prompt") + 1]
+        self.assertEqual(first_prompt, second_prompt)
+        self.assertNotIn("Current jobs for this chat", first_prompt)
+        self.assertNotIn("turn-start snapshot", first_prompt)
+        self.assertLess(len(first_prompt), 2_000)
+
+    def test_legacy_system_prompt_format_contract_remains_usable(self) -> None:
+        legacy = agent_server.SYSTEM_PROMPT.format(
+            manifest_path="/tmp/legacy-run.json",
+            terminal_session="zd_legacy",
+        )
+
+        self.assertEqual(legacy, agent_server.CLAUDE_PROMPT_PRELUDE.format())
 
     def test_codex_prompt_names_terminal_and_preserves_user_prompt(self) -> None:
         command = agent_server.build_codex_cmd(
@@ -305,26 +338,20 @@ class AgentTerminalContextTests(unittest.TestCase):
         self.assertEqual(public["system_prompt"], "Use the staging cluster.")
 
     def test_both_agent_prompts_explain_renderable_latex_delimiters(self) -> None:
-        claude_prompt = agent_server.SYSTEM_PROMPT.format(
-            manifest_path="/tmp/manifest.json",
-            terminal_session="zd_sess_123",
-        )
+        claude_prompt = agent_server.CLAUDE_PROMPT_PRELUDE.format()
         codex_prompt = agent_server.CODEX_PROMPT_PRELUDE.format(
             manifest_path="/tmp/manifest.json",
             terminal_session="zd_sess_123",
             chat_id="sess-123",
         )
 
-        self.assertIn("inline LaTeX as `$...$`", claude_prompt)
-        self.assertIn("display equations as `$$...$$`", claude_prompt)
+        self.assertIn("inline math as `$...$`", claude_prompt)
+        self.assertIn("display math as `$$...$$`", claude_prompt)
         self.assertIn("inline math as `$...$`", codex_prompt)
         self.assertIn("display math as `$$...$$`", codex_prompt)
 
     def test_both_agent_prompts_explain_clickable_workspace_file_links(self) -> None:
-        claude_prompt = agent_server.SYSTEM_PROMPT.format(
-            manifest_path="/tmp/manifest.json",
-            terminal_session="zd_sess_123",
-        )
+        claude_prompt = agent_server.CLAUDE_PROMPT_PRELUDE.format()
         codex_prompt = agent_server.CODEX_PROMPT_PRELUDE.format(
             manifest_path="/tmp/manifest.json",
             terminal_session="zd_sess_123",
@@ -332,12 +359,13 @@ class AgentTerminalContextTests(unittest.TestCase):
         )
 
         claude_compact = " ".join(claude_prompt.split())
-        self.assertIn("relative path under", claude_compact)
+        self.assertIn("relative to the chat working directory", claude_compact)
         codex_compact = " ".join(codex_prompt.split())
         for compact in (claude_compact, codex_compact):
             self.assertIn("`#L42`", compact)
             self.assertIn("`file://`", compact)
-            self.assertIn("/tmp/manifest.json", compact)
+        self.assertIn("$AGENTSDOCK_MANIFEST_PATH", claude_compact)
+        self.assertIn("/tmp/manifest.json", codex_compact)
 
 
 class SessionSystemPromptPersistenceTests(unittest.IsolatedAsyncioTestCase):

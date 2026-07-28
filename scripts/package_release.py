@@ -59,6 +59,8 @@ def main() -> int:
     manifest = {
         "schema": 1,
         "version": version,
+        "track": "beta" if "-" in version.split("+", 1)[0] else "stable",
+        "prerelease": "-" in version.split("+", 1)[0],
         "api_contract_version": 9,
         "commit": commit,
         "archive": {

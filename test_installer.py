@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -68,12 +69,20 @@ class InstallerContractTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             version = (ROOT / "VERSION").read_text().strip()
             archive_path = Path(temporary) / f"agents-server-{version}.tar.gz"
+            manifest = json.loads(
+                (Path(temporary) / "agents-server-manifest.json").read_text()
+            )
             with tarfile.open(archive_path, "r:gz") as archive:
                 members = set(archive.getnames())
             self.assertIn(
                 f"agents-server-{version}/codex_app_server.py",
                 members,
             )
+            self.assertEqual(
+                manifest["track"],
+                "beta" if "-" in version.split("+", 1)[0] else "stable",
+            )
+            self.assertEqual(manifest["prerelease"], manifest["track"] == "beta")
 
     def test_installer_preserves_state_and_emits_private_result(self):
         source = INSTALLER.read_text()

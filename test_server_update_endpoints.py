@@ -47,6 +47,10 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
             "action": None,
         })
         self.assertTrue(response["managed_updates"])
+        self.assertEqual(
+            response["capabilities"]["server_updates"]["tracks"],
+            ["stable", "beta"],
+        )
 
     async def test_check_reports_a_signed_newer_release(self):
         with tempfile.TemporaryDirectory() as temporary, \
@@ -59,6 +63,55 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["phase"], "available")
         self.assertEqual(status["latest_version"], "1.1.0")
         self.assertTrue(status["update_available"])
+        self.assertEqual(status["track"], "stable")
+
+    async def test_check_beta_track_discovers_and_persists_beta_release(self):
+        manifest = AsyncMock(return_value={"version": "1.1.0-beta.3"})
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+             patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", Path(temporary) / "status.json"), \
+             patch.object(agent_server, "server_update_is_active", return_value=False), \
+             patch.object(agent_server, "signed_release_manifest", new=manifest):
+            status = await agent_server.check_server_update(
+                agent_server.ServerUpdateCheckRequest(track="beta"),
+            )
+            persisted = agent_server.read_server_update_status()
+
+        manifest.assert_awaited_once_with("beta")
+        self.assertEqual(status["phase"], "available")
+        self.assertEqual(status["track"], "beta")
+        self.assertEqual(status["current_track"], "stable")
+        self.assertTrue(status["channel_switch"])
+        self.assertEqual(persisted["track"], "beta")
+
+    async def test_check_without_body_infers_beta_for_legacy_status(self):
+        manifest = AsyncMock(return_value={"version": "1.1.0-beta.4"})
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(agent_server, "SERVER_VERSION", "1.1.0-beta.3"), \
+             patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", Path(temporary) / "status.json"), \
+             patch.object(agent_server, "server_update_is_active", return_value=False), \
+             patch.object(agent_server, "signed_release_manifest", new=manifest):
+            status = await agent_server.check_server_update()
+
+        manifest.assert_awaited_once_with("beta")
+        self.assertEqual(status["track"], "beta")
+        self.assertFalse(status["channel_switch"])
+
+    async def test_check_stable_track_allows_beta_to_latest_stable_switch(self):
+        manifest = AsyncMock(return_value={"version": "1.0.0"})
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(agent_server, "SERVER_VERSION", "1.1.0-beta.3"), \
+             patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", Path(temporary) / "status.json"), \
+             patch.object(agent_server, "server_update_is_active", return_value=False), \
+             patch.object(agent_server, "signed_release_manifest", new=manifest):
+            status = await agent_server.check_server_update(
+                agent_server.ServerUpdateCheckRequest(track="stable"),
+            )
+
+        self.assertEqual(status["phase"], "available")
+        self.assertTrue(status["update_available"])
+        self.assertTrue(status["channel_switch"])
+        self.assertIn("Switch to stable", status["message"])
 
     async def test_check_does_not_offer_a_signed_older_release(self):
         with tempfile.TemporaryDirectory() as temporary, \
@@ -178,6 +231,125 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(command[:3], ["new-session", "-d", "-s"])
         self.assertIn("--expected-version 1.1.0", command[-1])
         self.assertIn("--current-version 1.0.0", command[-1])
+        self.assertIn("--track stable", command[-1])
+
+    async def test_start_beta_release_passes_beta_track_to_runner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "update_runner.py"
+            key = root / "release-public-key.pem"
+            runner.write_text("# runner\n")
+            key.write_text("public key\n")
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", root / "status.json"), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server.shutil, "which", return_value="/usr/bin/tmux"), \
+                 patch.object(agent_server, "run_tmux", return_value=None) as run_tmux:
+                status = await agent_server.start_server_update(
+                    agent_server.ServerUpdateRequest(
+                        version="1.1.0-beta.3",
+                        track="beta",
+                    )
+                )
+
+        self.assertEqual(status["track"], "beta")
+        self.assertTrue(status["channel_switch"])
+        self.assertIn("--track beta", run_tmux.call_args.args[0][-1])
+
+    async def test_legacy_start_without_track_infers_installed_beta_track(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "update_runner.py"
+            key = root / "release-public-key.pem"
+            runner.write_text("# runner\n")
+            key.write_text("public key\n")
+            with patch.object(agent_server, "SERVER_VERSION", "1.1.0-beta.2"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", root / "status.json"), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server.shutil, "which", return_value="/usr/bin/tmux"), \
+                 patch.object(agent_server, "run_tmux", return_value=None) as run_tmux:
+                status = await agent_server.start_server_update(
+                    agent_server.ServerUpdateRequest(version="1.1.0-beta.3")
+                )
+
+        self.assertEqual(status["track"], "beta")
+        self.assertIn("--track beta", run_tmux.call_args.args[0][-1])
+
+    async def test_start_allows_explicit_beta_to_stable_switch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "update_runner.py"
+            key = root / "release-public-key.pem"
+            runner.write_text("# runner\n")
+            key.write_text("public key\n")
+            with patch.object(agent_server, "SERVER_VERSION", "1.1.0-beta.3"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", root / "status.json"), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server.shutil, "which", return_value="/usr/bin/tmux"), \
+                 patch.object(agent_server, "run_tmux", return_value=None) as run_tmux:
+                status = await agent_server.start_server_update(
+                    agent_server.ServerUpdateRequest(
+                        version="1.0.0",
+                        track="stable",
+                    )
+                )
+
+        self.assertEqual(status["phase"], "starting")
+        self.assertTrue(status["channel_switch"])
+        self.assertIn("--track stable", run_tmux.call_args.args[0][-1])
+
+    async def test_start_rejects_version_that_does_not_match_track(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+             patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", Path(temporary) / "status.json"), \
+             patch.object(agent_server, "server_update_is_active", return_value=False):
+            with self.assertRaises(HTTPException) as raised:
+                await agent_server.start_server_update(
+                    agent_server.ServerUpdateRequest(
+                        version="1.1.0-beta.3",
+                        track="stable",
+                    )
+                )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("stable track", str(raised.exception.detail))
+
+    async def test_start_refuses_stable_to_older_stable_downgrade(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(agent_server, "SERVER_VERSION", "1.2.0"), \
+             patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", Path(temporary) / "status.json"), \
+             patch.object(agent_server, "server_update_is_active", return_value=False), \
+             patch.object(agent_server, "run_tmux") as run_tmux:
+            status = await agent_server.start_server_update(
+                agent_server.ServerUpdateRequest(version="1.1.0", track="stable")
+            )
+
+        self.assertEqual(status["phase"], "current")
+        self.assertFalse(status["update_available"])
+        run_tmux.assert_not_called()
+
+    async def test_start_refuses_beta_to_older_beta_downgrade(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(agent_server, "SERVER_VERSION", "1.2.0-beta.4"), \
+             patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", Path(temporary) / "status.json"), \
+             patch.object(agent_server, "server_update_is_active", return_value=False), \
+             patch.object(agent_server, "run_tmux") as run_tmux:
+            status = await agent_server.start_server_update(
+                agent_server.ServerUpdateRequest(
+                    version="1.2.0-beta.3",
+                    track="beta",
+                )
+            )
+
+        self.assertEqual(status["phase"], "current")
+        self.assertFalse(status["update_available"])
+        run_tmux.assert_not_called()
 
 
 if __name__ == "__main__":

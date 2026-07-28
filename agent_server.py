@@ -373,115 +373,23 @@ SUBAGENT_SNAPSHOT_STATE_LIMIT = 256
 SUBAGENT_SNAPSHOT_LOG_LIMIT = 80
 SUBAGENT_SNAPSHOT_TEXT_LIMIT = 600
 
-SYSTEM_PROMPT = """\
-You are responding through AgentsDock, backed by AgentsServer.
-
-Use concise Markdown. Prefer clear sections, bullets, code fences, and direct
-answers. The UI renders rich traces separately, so do not narrate every tool
-call unless it matters to the user.
-Avoid Markdown heading markers like `#`, `##`, or `###` in ordinary answers.
-Use short bold labels such as `**What changed**` when a section label helps.
-Do not use emoji, Slack-style emoji aliases, or decorative status prefixes
-such as :mag:, :gear:, :rocket:, or :white_check_mark:.
-
-Math and scientific notation:
-- Write inline LaTeX as `$...$` and display equations as `$$...$$`.
-- Keep prose outside the math delimiters and use fenced code blocks only when
-  showing literal TeX source that should not be rendered.
-- Prefer the dollar delimiters above instead of `\\(...\\)` or `\\[...\\]` so
-  equations render consistently in the chat timeline.
-
-Tool and inspection errors:
-- Failed commands, malformed JSON reads, missing files, missing Python aliases,
-  and other inspection mistakes are normal debugging signals, not stopping
-  conditions.
-- Do not end your turn just because a tool command failed. Read stderr/stdout,
-  correct the command, and try a safer alternative such as `python3`, `jq`,
-  `python3 -m json.tool`, `rg`, `sed`, `head`, `tail`, or a small script.
-- If the likely fix is non-intrusive, do it yourself and continue. Examples:
-  command typos, wrong JSON/file-reading command, missing `python` alias, small
-  parser adjustments, read-only inspection changes, or narrow code edits the
-  user already asked for.
-- Continue until you can answer the user's request, complete the requested
-  change, or identify a real blocker. Stop only if retrying would be
-  destructive, removes/overwrites unrelated work, requires missing
-  credentials/approval, or the user explicitly asked only for diagnosis.
-
-Skills and environment playbooks:
-- Before saying cluster paths such as `/mnt/amlfs-07` are unavailable, check the
-  available local skills, memories, and playbooks for matching instructions.
-  Look first under `~/.codex/skills`, `~/.claude/skills`, `~/.claude/agents`,
-  project `AGENTS.md`/`CLAUDE.md`, and relevant `~/.claude/projects/.../memory`
-  notes.
-- For AMLFS/OSMO access, prefer the installed OSMO/SONIC skills and memories
-  such as `osmo`, `osmo-exec`, `sonic`, `ssh-portforward`, and
-  `reference-osmo-amlfs-ssh`. Follow those instructions before substituting
-  local data or claiming the mount cannot be reached.
-- If the needed skill/playbook is missing, blocked, or fails, say exactly what
-  you checked and what blocked you.
-
-Turn lifecycle and background work:
-- This is not a persistent live chat process. Your Claude process ends when the
-  current turn finishes.
-- Claude Code's native Agent tool is available for bounded parallel work. A
-  subagent may monitor a render or process while you do other work, but it is
-  still owned by this parent turn.
-- If you launch a subagent with `run_in_background: true`, keep its task ID and
-  join it with `TaskOutput` using a blocking wait before you finish. Never leave
-  a child task unjoined and never imply it will report after this process exits.
-- If the user requested the output of a render, sweep, conversion, or other
-  launched process, stay alive in this turn until it completes, inspect the
-  result, publish the artifacts through the manifest, and then answer. Use a
-  foreground subagent, a background subagent plus blocking `TaskOutput`, or
-  bounded polling/waits in the parent.
-- Do not say "monitor armed", "when the watcher fires I'll send it", "I'll
-  check back", or similar future-tense promises and then end the turn.
-- A tmux process or shell watcher can keep computation alive, but it cannot
-  resume this Claude turn or make AgentsDock ingest a manifest after the turn
-  has ended.
-- If background monitoring is needed, create a real durable mechanism: a
-  AgentsDock scheduled job that launches a later agent turn, a system service,
-  or a script the user can inspect and run. State exactly what you created and
-  how to inspect or stop it.
-- If you did not create a durable mechanism, say that the user should ask again
-  later instead of implying you will keep running.
-
-Code changes and diffs:
-- Validate code changes normally, but do not print a full repository diff just
-  for AgentsDock. The server captures the complete per-turn Git diff directly.
-- A short `git diff --stat` is useful when it helps explain validation. Keep the
-  final answer focused unless the user explicitly asks to see the patch inline.
-
-Files and artifacts:
-- User uploads are available as local paths in the prompt.
-- This is not Slack. Do not call Slack upload APIs or Slack file helpers.
-- To open an existing file in AgentsDock's editor, link to a relative path
-  under this chat's working directory, optionally with `#L42`. Absolute paths
-  are allowed only when they remain under that working directory. Do not use
-  `file://`.
-- If your response creates files the user should receive, write a JSON manifest
-  at exactly this path:
-  {manifest_path}
-- Manifest format:
-  {{"files": ["/absolute/path/to/file.ext", {{"path": "/absolute/path/video.mp4", "title": "Demo", "text": "Optional note"}}]}}
-- Include images, videos, PDFs, CSVs, notebooks, archives, logs, and documents
-  that the user would reasonably want to preview or save.
-- Do not include source files unless the user explicitly asks for them.
-- Use absolute file paths. Videos should be normal playable files such as mp4
-  or mov. If `python` is not installed, use `python3` or shell tools to write
-  files and the manifest.
-
-Persistent chat terminal:
-- This chat's AgentsDock terminal is the tmux session named
-  `{terminal_session}` on this same host.
-- The terminal is a separate interactive shell. Its screen and user input are
-  not automatically included in your context.
-- When terminal state is relevant, inspect it read-only with
-  `tmux capture-pane -p -J -t "$AGENTSDOCK_TMUX_SESSION" -S -200` and inspect
-  windows with `tmux list-windows -t "$AGENTSDOCK_TMUX_SESSION"`.
-- Do not send keys, resize panes, close windows, or kill the terminal session
-  unless the user explicitly asks you to operate on it.
+CLAUDE_PROMPT_PRELUDE = """\
+You are operating through AgentsDock, backed by AgentsServer.
+- Keep the final answer concise; the UI renders tool calls, command output, reasoning, and artifacts separately.
+- Render inline math as `$...$` and display math as `$$...$$`.
+- Continue through ordinary inspection errors when a safe retry or narrow fix is available.
+- Your Claude process ends with this turn; join child tasks before finishing and create durable automation only when explicitly asked.
+- This is AgentsDock, not Slack; create files locally and never call Slack file helpers.
+- Link editor-readable files with Markdown paths relative to the chat working directory, optionally with `#L42`; do not use `file://`.
+- Publish artifacts by resolving `$AGENTSDOCK_MANIFEST_PATH` and writing `{{"files":[...]}}` with absolute file paths to that exact location; never pass the literal `$...` path to Write.
+- Manage scheduled jobs only when explicitly asked; use `"$AGENTSDOCK_JOBS_CLI"` (start with list/help), not the API or prompt snapshots.
+- Inspect the persistent terminal named by `$AGENTSDOCK_TMUX_SESSION` read-only unless the user explicitly asks you to operate it.
+- Check installed skills and project playbooks before claiming a specialized environment or remote path is unavailable.
+- Preserve user work, avoid destructive actions without clear authorization, and continue until the request is complete or genuinely blocked.
 """
+
+# Compatibility alias for integrations which imported the historical name.
+SYSTEM_PROMPT = CLAUDE_PROMPT_PRELUDE
 
 CODEX_THREAD_POLICY_VERSION = "1"
 CODEX_PROMPT_PRELUDE = """\
@@ -889,7 +797,7 @@ def manifests_dir(session_id: str) -> Path:
 
 
 def codex_manifest_path(session_id: str) -> Path:
-    """Stable per-chat artifact handoff path used by persistent Codex threads."""
+    """Stable per-chat artifact handoff path used by provider turns."""
     return manifests_dir(session_id) / "current.json"
 
 
@@ -2823,6 +2731,11 @@ class UpdateJobRequest(BaseModel):
 
 class ServerUpdateRequest(BaseModel):
     version: str | None = None
+    track: Literal["stable", "beta"] | None = None
+
+
+class ServerUpdateCheckRequest(BaseModel):
+    track: Literal["stable", "beta"] | None = None
 
 
 class CodexInteractionResponseRequest(BaseModel):
@@ -10739,6 +10652,7 @@ def agent_runner_env(session_id: str) -> dict[str, str]:
     env = runner_env()
     env["AGENTSDOCK_CHAT_ID"] = session_id
     env["AGENTSDOCK_TMUX_SESSION"] = terminal_session_name(session_id)
+    env["AGENTSDOCK_MANIFEST_PATH"] = str(codex_manifest_path(session_id))
     env["AGENTSDOCK_SERVER_URL"] = f"http://127.0.0.1:{SERVER_PORT}"
     env["AGENTSDOCK_JOBS_CLI"] = str(SERVER_ROOT / "agentsdock_jobs.py")
     env["AGENTSDOCK_AGENT_TOKEN"] = AGENT_TOKEN
@@ -12983,10 +12897,8 @@ async def ensure_codex_app_server_thread(
 
 
 def session_system_prompt(session_id: str, sess: dict[str, Any], manifest_path: Path) -> str:
-    return SYSTEM_PROMPT.format(
-        manifest_path=str(manifest_path),
-        terminal_session=terminal_session_name(session_id),
-    ) + scheduled_jobs_prompt_context(session_id) + session_prompt_addendum(sess)
+    del session_id, manifest_path
+    return CLAUDE_PROMPT_PRELUDE.format() + session_prompt_addendum(sess)
 
 
 def build_claude_cmd(
@@ -15881,14 +15793,9 @@ async def _start_turn_locked(
             if current_turn is not None:
                 current_turn["run_id"] = run_id
                 current_turn["backend"] = backend
-        manifest_path = (
-            codex_manifest_path(session_id)
-            if backend == BACKEND_CODEX
-            else manifests_dir(session_id) / f"{run_id}.json"
-        )
-        if backend == BACKEND_CODEX:
-            with suppress(OSError):
-                manifest_path.unlink()
+        manifest_path = codex_manifest_path(session_id)
+        with suppress(OSError):
+            manifest_path.unlink()
         prompt = build_turn_provider_prompt(
             session_id,
             req.prompt,
@@ -15967,6 +15874,25 @@ def server_release_is_newer(latest: str, current: str) -> bool:
         return latest != current
 
 
+def server_release_track(version: str) -> Literal["stable", "beta"]:
+    return "beta" if "-" in str(version).split("+", 1)[0] else "stable"
+
+
+def server_release_transition_allowed(
+    target: str,
+    current: str,
+    track: Literal["stable", "beta"],
+) -> bool:
+    if target == current or server_release_track(target) != track:
+        return False
+    try:
+        if version_key(target) > version_key(current):
+            return True
+        return track == "stable" and server_release_track(current) == "beta"
+    except ValueError:
+        return target != current
+
+
 def read_server_update_status() -> dict[str, Any]:
     try:
         value = json.loads(SERVER_UPDATE_STATUS_FILE.read_text())
@@ -15975,6 +15901,8 @@ def read_server_update_status() -> dict[str, Any]:
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         value = {}
     value.setdefault("phase", "idle")
+    if value.get("track") not in {"stable", "beta"}:
+        value["track"] = server_release_track(SERVER_VERSION)
     value["current_version"] = SERVER_VERSION
     value["api_contract_version"] = API_CONTRACT_VERSION
     return value
@@ -16012,11 +15940,13 @@ def server_update_status_age_seconds(status: dict[str, Any]) -> float:
     return max(0.0, (datetime.now(timezone.utc) - updated_at).total_seconds())
 
 
-async def signed_release_manifest() -> dict[str, Any]:
+async def signed_release_manifest(
+    track: Literal["stable", "beta"] = "stable",
+) -> dict[str, Any]:
     if not SERVER_UPDATE_PUBLIC_KEY.is_file():
         raise HTTPException(status_code=503, detail="release verification key is missing from this server installation")
     try:
-        return await asyncio.to_thread(check_release, SERVER_UPDATE_PUBLIC_KEY)
+        return await asyncio.to_thread(check_release, SERVER_UPDATE_PUBLIC_KEY, track)
     except ReleaseUnavailableError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
@@ -16112,6 +16042,18 @@ async def health() -> dict[str, Any]:
             and bool(tmux["available"])
         ),
         "capabilities": {
+            "server_updates": {
+                "available": (
+                    SERVER_UPDATE_RUNNER.is_file()
+                    and SERVER_UPDATE_PUBLIC_KEY.is_file()
+                    and bool(tmux["available"])
+                ),
+                "required": False,
+                "message": "Signed Stable and Beta AgentsServer channels are available.",
+                "action": None,
+                "version": 2,
+                "tracks": ["stable", "beta"],
+            },
             "tmux": tmux,
             "workspace_files": {
                 "available": WORKSPACE_SECURE_OPEN_AVAILABLE,
@@ -16197,29 +16139,54 @@ async def server_update_status() -> dict[str, Any]:
 
 
 @app.post("/api/admin/update/check")
-async def check_server_update() -> dict[str, Any]:
+async def check_server_update(
+    body: ServerUpdateCheckRequest | None = None,
+) -> dict[str, Any]:
     async with SERVER_UPDATE_OPERATION_LOCK:
         status = read_server_update_status()
         if await asyncio.to_thread(server_update_is_active, status):
             raise HTTPException(status_code=409, detail="a server update is already running")
+        track: Literal["stable", "beta"] = (
+            body.track
+            if body is not None and body.track is not None
+            else status["track"]
+        )
         try:
-            manifest = await signed_release_manifest()
+            manifest = await signed_release_manifest(track)
         except HTTPException as exc:
             if exc.status_code != 404:
                 raise
             return write_server_update_status(
                 phase="unavailable",
+                track=track,
                 update_available=False,
                 message=str(exc.detail),
                 checked_at=update_utc_now(),
             )
         latest = str(manifest["version"])
-        update_available = server_release_is_newer(latest, SERVER_VERSION)
+        current_track = server_release_track(SERVER_VERSION)
+        channel_switch = track != current_track
+        update_available = server_release_transition_allowed(
+            latest,
+            SERVER_VERSION,
+            track,
+        )
+        if update_available and channel_switch:
+            message = (
+                f"Switch to {track} AgentsServer {latest}."
+            )
+        elif update_available:
+            message = f"AgentsServer {latest} is available."
+        else:
+            message = f"AgentsServer {SERVER_VERSION} is current on {track}."
         return write_server_update_status(
             phase="available" if update_available else "current",
+            track=track,
+            current_track=current_track,
             latest_version=latest,
             update_available=update_available,
-            message=(f"AgentsServer {latest} is available." if update_available else f"AgentsServer {SERVER_VERSION} is current."),
+            channel_switch=channel_switch,
+            message=message,
             checked_at=update_utc_now(),
         )
 
@@ -16230,6 +16197,7 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
         status = read_server_update_status()
         if await asyncio.to_thread(server_update_is_active, status):
             raise HTTPException(status_code=409, detail="a server update is already running")
+        track: Literal["stable", "beta"] = body.track or status["track"]
         requested = str(body.version or status.get("latest_version") or "").strip()
         if not requested:
             raise HTTPException(status_code=409, detail="check for a signed server update before installing")
@@ -16237,14 +16205,21 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
             version_key(requested)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="the requested server version is invalid") from exc
-        if "-" in requested.split("+", 1)[0]:
-            raise HTTPException(status_code=400, detail="managed server updates accept stable releases only")
-        if not server_release_is_newer(requested, SERVER_VERSION):
+        if server_release_track(requested) != track:
+            raise HTTPException(
+                status_code=400,
+                detail=f"the requested server version is not on the {track} track",
+            )
+        if not server_release_transition_allowed(requested, SERVER_VERSION, track):
             return write_server_update_status(
                 phase="current",
+                track=track,
                 latest_version=requested,
                 update_available=False,
-                message=f"AgentsServer {SERVER_VERSION} is current; managed updates do not downgrade or reinstall.",
+                message=(
+                    f"AgentsServer {SERVER_VERSION} is current; managed updates "
+                    "only move forward or switch from beta to the latest stable release."
+                ),
                 checked_at=update_utc_now(),
             )
         tmux = tmux_capability()
@@ -16264,14 +16239,23 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
             "--bind", SERVER_BIND_ADDRESS,
             "--expected-version", requested,
             "--current-version", SERVER_VERSION,
+            "--track", track,
         ]
+        channel_switch = track != server_release_track(SERVER_VERSION)
         status = write_server_update_status(
             update_id=update_id,
             phase="starting",
+            track=track,
+            current_track=server_release_track(SERVER_VERSION),
+            channel_switch=channel_switch,
             target_version=requested,
             latest_version=requested,
             update_available=True,
-            message=f"Starting detached update to AgentsServer {requested}.",
+            message=(
+                f"Starting switch to {track} AgentsServer {requested}."
+                if channel_switch
+                else f"Starting detached update to AgentsServer {requested}."
+            ),
             started_at=update_utc_now(),
             finished_at=None,
         )

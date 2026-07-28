@@ -774,16 +774,18 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             else:
                 self.fail("native provider turn never became ready")
 
-            with self.assertRaises(agent_server.NativeSteerHandoffError) as raised:
-                await asyncio.wait_for(
-                    agent_server.run_queued_turn_now(
-                        "chat-native",
-                        "queued-uncertain",
-                    ),
-                    timeout=2,
+            force_send = asyncio.create_task(
+                agent_server.run_queued_turn_now(
+                    "chat-native",
+                    "queued-uncertain",
                 )
+            )
+            done, _pending = await asyncio.wait({force_send}, timeout=2)
+            self.assertIn(force_send, done)
             turn.feed(completed_notification("interrupted"))
             await asyncio.wait_for(runner, timeout=2)
+            with self.assertRaises(agent_server.NativeSteerHandoffError) as raised:
+                await force_send
 
         self.assertTrue(raised.exception.delivery_uncertain)
         self.assertFalse(raised.exception.safe_to_requeue)
@@ -834,16 +836,18 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             else:
                 self.fail("native provider turn never became ready")
 
-            with self.assertRaises(agent_server.NativeSteerHandoffError) as raised:
-                await asyncio.wait_for(
-                    agent_server.run_queued_turn_now(
-                        "chat-native",
-                        "queued-rejected",
-                    ),
-                    timeout=2,
+            force_send = asyncio.create_task(
+                agent_server.run_queued_turn_now(
+                    "chat-native",
+                    "queued-rejected",
                 )
+            )
+            done, _pending = await asyncio.wait({force_send}, timeout=2)
+            self.assertIn(force_send, done)
             turn.feed(completed_notification())
             await asyncio.wait_for(runner, timeout=2)
+            with self.assertRaises(agent_server.NativeSteerHandoffError) as raised:
+                await force_send
 
         self.assertTrue(raised.exception.safe_to_requeue)
         self.assertEqual(

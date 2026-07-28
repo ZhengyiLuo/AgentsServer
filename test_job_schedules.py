@@ -1,3 +1,4 @@
+import asyncio
 import json
 import tempfile
 import unittest
@@ -188,6 +189,77 @@ class JobOccurrenceTests(unittest.TestCase):
 
 
 class JobStoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_delete_for_session_restores_jobs_when_persistence_fails(
+        self,
+    ) -> None:
+        store = agent_server.JobStore()
+        store.jobs["job_retry"] = {
+            "id": "job_retry",
+            "session_id": "missing-chat",
+            "title": "Retry cleanup",
+        }
+        with patch.object(
+            store,
+            "save",
+            AsyncMock(side_effect=[OSError("disk full"), None]),
+        ) as save:
+            with self.assertRaisesRegex(OSError, "disk full"):
+                await store.delete_for_session("missing-chat")
+            self.assertIn("job_retry", store.jobs)
+
+            self.assertEqual(
+                await store.delete_for_session("missing-chat"),
+                1,
+            )
+
+        self.assertNotIn("job_retry", store.jobs)
+        self.assertEqual(save.await_count, 2)
+
+    async def test_scheduler_cleanup_failure_does_not_resurrect_missing_session(
+        self,
+    ) -> None:
+        store = agent_server.JobStore()
+        store.jobs["job_orphan"] = {
+            "id": "job_orphan",
+            "session_id": "missing-chat",
+            "title": "Orphan",
+            "prompt": "Do not run",
+            "enabled": True,
+            "next_run_at": 1.0,
+        }
+        sleep_count = 0
+
+        async def one_scheduler_iteration(_delay: float) -> None:
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count > 1:
+                raise asyncio.CancelledError
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with (
+                patch.object(agent_server, "STATE_DIR", root),
+                patch.object(agent_server, "JOBS_FILE", root / "jobs.json"),
+                patch.object(agent_server.STORE, "sessions", {}),
+                patch.object(agent_server.time, "time", return_value=2.0),
+                patch.object(
+                    agent_server.asyncio,
+                    "sleep",
+                    side_effect=one_scheduler_iteration,
+                ),
+                patch.object(
+                    store,
+                    "save",
+                    AsyncMock(side_effect=OSError("disk full")),
+                ),
+            ):
+                with self.assertRaises(asyncio.CancelledError):
+                    await store.scheduler_loop()
+
+            self.assertFalse((root / "sessions" / "missing-chat").exists())
+
+        self.assertIn("job_orphan", store.jobs)
+
     async def test_load_migrates_legacy_interval_without_rescheduling(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

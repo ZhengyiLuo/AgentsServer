@@ -409,6 +409,86 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
             ["queued-steer"],
         )
 
+    async def test_terminal_session_queue_items_are_never_requeued(self) -> None:
+        cases = ("tombstoned", "deleting", "deleting_race", "not_found")
+        for case in cases:
+            with self.subTest(case=case):
+                agent_server.QUEUED_TURNS["chat-1"] = deque(
+                    [
+                        {
+                            "queued_id": "queued-terminal",
+                            "prompt": "Do not retry this.",
+                            "file_ids": [],
+                            "backend": "codex",
+                        }
+                    ]
+                )
+                agent_server.STORE.sessions["chat-1"] = {
+                    "id": "chat-1",
+                    "backend": "codex",
+                }
+                if case == "tombstoned":
+                    agent_server.STORE.sessions.pop("chat-1", None)
+                    agent_server.DELETED_SESSION_TOMBSTONES.add("chat-1")
+                elif case == "deleting":
+                    agent_server.DELETING_SESSIONS.add("chat-1")
+
+                async def start_turn(
+                    *_args: object,
+                    **_kwargs: object,
+                ) -> dict[str, object]:
+                    if case == "not_found":
+                        agent_server.STORE.sessions.pop("chat-1", None)
+                        raise agent_server.HTTPException(
+                            status_code=404,
+                            detail="session not found",
+                        )
+                    if case == "deleting_race":
+                        agent_server.DELETING_SESSIONS.add("chat-1")
+                        raise agent_server.HTTPException(
+                            status_code=409,
+                            detail="session is being deleted",
+                        )
+                    raise AssertionError("terminal state must be checked first")
+
+                try:
+                    with (
+                        patch.object(
+                            agent_server,
+                            "start_turn",
+                            side_effect=start_turn,
+                        ) as launch,
+                        patch.object(
+                            agent_server,
+                            "requeue_turn_front",
+                            new_callable=AsyncMock,
+                        ) as requeue,
+                        patch.object(
+                            agent_server,
+                            "retry_next_queued_turn_later",
+                            new_callable=AsyncMock,
+                        ) as retry,
+                        patch.object(
+                            agent_server,
+                            "append_event",
+                            new_callable=AsyncMock,
+                        ) as append_event,
+                    ):
+                        await start_next_queued_turn("chat-1")
+                        await asyncio.sleep(0)
+
+                    self.assertNotIn("chat-1", agent_server.QUEUED_TURNS)
+                    requeue.assert_not_awaited()
+                    retry.assert_not_awaited()
+                    append_event.assert_not_awaited()
+                    if case in {"not_found", "deleting_race"}:
+                        launch.assert_awaited_once()
+                    else:
+                        launch.assert_not_awaited()
+                finally:
+                    agent_server.DELETING_SESSIONS.discard("chat-1")
+                    agent_server.DELETED_SESSION_TOMBSTONES.discard("chat-1")
+
     async def test_later_steer_runs_first_then_keeps_other_messages_in_original_order(self) -> None:
         agent_server.QUEUED_TURNS["chat-1"] = deque([
             {

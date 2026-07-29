@@ -12470,8 +12470,9 @@ async def acquire_codex_control_thread(
     session_id: str,
     *,
     reserve_session: bool = False,
+    allow_active_goal_mutation: bool = False,
 ) -> tuple[CodexAppServerManager, str, dict[str, Any]]:
-    """Load and pin an idle Codex thread for an explicit desktop control."""
+    """Load and pin a Codex thread for an explicit desktop control."""
     ensure_session_not_deleting(session_id)
     session = STORE.sessions.get(session_id)
     if not session:
@@ -12485,13 +12486,25 @@ async def acquire_codex_control_thread(
         )
 
     reserved = False
+    active_thread_id = ""
     async with ACTIVE_LOCK:
         if session_id in BUSY_SESSIONS:
-            raise HTTPException(
-                status_code=409,
-                detail="wait for the active Codex turn to finish",
-            )
-        if reserve_session:
+            active = ACTIVE.get(session_id)
+            if (
+                not allow_active_goal_mutation
+                or not active
+                or active.get("backend") != BACKEND_CODEX
+                or active.get("transport") != CODEX_TRANSPORT_APP_SERVER
+                or active.get("interactive_app_server") is not True
+                or active.get("codex_native_operation") is True
+                or not str(active.get("provider_thread_id") or "").strip()
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="wait for the active Codex turn to finish",
+                )
+            active_thread_id = str(active["provider_thread_id"]).strip()
+        elif reserve_session:
             BUSY_SESSIONS.add(session_id)
             CURRENT_TURNS[session_id] = {
                 "run_id": None,
@@ -12503,7 +12516,49 @@ async def acquire_codex_control_thread(
 
     manager: CodexAppServerManager | None = None
     thread_id = ""
+    thread_pinned = False
+    control_lease_acquired = False
     try:
+        if active_thread_id:
+            manager = CODEX_APP_SERVER_MANAGER
+            stored_thread_id = str(session_provider_id(session) or "").strip()
+            if (
+                manager is None
+                or not manager.is_thread_loaded(active_thread_id)
+                or (
+                    stored_thread_id
+                    and stored_thread_id != active_thread_id
+                )
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="wait for the active Codex thread to finish loading",
+                )
+            thread_id = active_thread_id
+            await pin_codex_app_server_thread(thread_id)
+            thread_pinned = True
+            acquire_codex_interactive_control_lease(thread_id)
+            control_lease_acquired = True
+            async with ACTIVE_LOCK:
+                active = ACTIVE.get(session_id)
+                active_changed = (
+                    session_id not in BUSY_SESSIONS
+                    or not active
+                    or active.get("backend") != BACKEND_CODEX
+                    or active.get("transport") != CODEX_TRANSPORT_APP_SERVER
+                    or active.get("interactive_app_server") is not True
+                    or active.get("codex_native_operation") is True
+                    or str(active.get("provider_thread_id") or "").strip()
+                    != thread_id
+                )
+            if active_changed:
+                raise HTTPException(
+                    status_code=409,
+                    detail="the active Codex turn changed; retry the control",
+                )
+            return manager, thread_id, dict(
+                STORE.sessions.get(session_id) or session
+            )
         manager = await codex_app_server_manager()
         await manager.start()
         cwd = existing_cwd(str(session.get("cwd") or DEFAULT_CWD))
@@ -12513,7 +12568,9 @@ async def acquire_codex_control_thread(
             session,
             cwd,
         )
+        thread_pinned = True
         acquire_codex_interactive_control_lease(thread_id)
+        control_lease_acquired = True
         if reserved:
             async with ACTIVE_LOCK:
                 ACTIVE[session_id] = {
@@ -12534,8 +12591,9 @@ async def acquire_codex_control_thread(
                 }
         return manager, thread_id, dict(STORE.sessions.get(session_id) or session)
     except Exception as exc:
-        if thread_id and manager is not None:
+        if control_lease_acquired:
             release_codex_interactive_control_lease(thread_id)
+        if thread_pinned and thread_id and manager is not None:
             with suppress(Exception):
                 await unpin_codex_app_server_thread(manager, thread_id)
         if reserved:
@@ -15728,18 +15786,51 @@ async def run_codex_app_server(
             )
             remaining = float(limit) - projected_used
             if remaining <= 0:
-                break
+                # Goal controls use the same lifecycle lock. Revalidate after
+                # acquiring it so a concurrent clear, pause, objective edit,
+                # or raised limit can never be overwritten by this watcher.
+                async with session_lifecycle_lock(session_id):
+                    current = STORE.sessions.get(session_id) or {}
+                    current_goal = current.get("codex_goal")
+                    current_limit = current.get(
+                        "codex_goal_time_budget_seconds"
+                    )
+                    if (
+                        not isinstance(current_goal, dict)
+                        or isinstance(current_limit, bool)
+                        or not isinstance(current_limit, (int, float))
+                        or current_limit <= 0
+                        or str(current_goal.get("status") or "") != "active"
+                        or current.get("codex_goal_time_budget_exhausted")
+                        is True
+                    ):
+                        return
+                    current_identity = str(
+                        current_goal.get("id")
+                        or current_goal.get("objective")
+                        or ""
+                    )
+                    if (
+                        current_identity != goal_identity
+                        or float(current_limit) != float(limit)
+                    ):
+                        goal_identity = current_identity
+                        base_used = native_time_used(current_goal)
+                        base_started_at = time.monotonic()
+                        paused = False
+                        continue
+                    await apply_codex_goal_time_budget_limit(
+                        session_id,
+                        current_run_id,
+                        manager,
+                        provider_id,
+                        turn,
+                        current_limit,
+                    )
+                    return
             # Re-evaluate at least twice per second so edits to the time limit,
             # goal pause/resume, and native elapsed-time updates take effect.
             await asyncio.sleep(min(0.5, max(0.01, remaining)))
-        await apply_codex_goal_time_budget_limit(
-            session_id,
-            current_run_id,
-            manager,
-            provider_id,
-            turn,
-            latest.get("codex_goal_time_budget_seconds"),
-        )
 
     async def finish_logical_outputs(
         logical_run_id: str,
@@ -18016,7 +18107,10 @@ async def _put_codex_goal_locked(
     )
     if not fields_set:
         raise HTTPException(status_code=400, detail="provide at least one goal field")
-    manager, thread_id, _session = await acquire_codex_control_thread(session_id)
+    manager, thread_id, _session = await acquire_codex_control_thread(
+        session_id,
+        allow_active_goal_mutation=True,
+    )
     try:
         native_fields = fields_set & {"objective", "status", "token_budget"}
         stored_session = STORE.sessions.get(session_id, {})
@@ -18115,7 +18209,10 @@ async def delete_codex_goal(session_id: str) -> dict[str, Any]:
 
 
 async def _delete_codex_goal_locked(session_id: str) -> dict[str, Any]:
-    manager, thread_id, _session = await acquire_codex_control_thread(session_id)
+    manager, thread_id, _session = await acquire_codex_control_thread(
+        session_id,
+        allow_active_goal_mutation=True,
+    )
     try:
         await manager.clear_thread_goal(thread_id)
         async with STORE._lock:

@@ -3,7 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException
 
@@ -1404,6 +1404,170 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             agent_server.CODEX_INTERACTIVE_CONTROL_THREAD_COUNTS["thread"],
             1,
+        )
+
+    async def test_active_turn_allows_goal_clear_on_its_loaded_thread(
+        self,
+    ) -> None:
+        agent_server.STORE.sessions["chat"]["codex_goal"] = {
+            "objective": "Finish the active task",
+            "status": "active",
+        }
+        agent_server.ACTIVE["chat"].update({
+            "backend": agent_server.BACKEND_CODEX,
+            "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
+            "provider_thread_id": "thread",
+            "interactive_app_server": True,
+            "codex_native_operation": False,
+        })
+        agent_server.CODEX_APP_SERVER_PINNED_THREADS.add("thread")
+        agent_server.CODEX_APP_SERVER_THREAD_PIN_COUNTS["thread"] = 1
+        manager = AsyncMock()
+        manager.is_thread_loaded = Mock(return_value=True)
+        manager.clear_thread_goal.return_value = True
+
+        with (
+            patch.object(
+                agent_server,
+                "CODEX_APP_SERVER_MANAGER",
+                manager,
+            ),
+            patch.object(agent_server.STORE, "save", AsyncMock()),
+            patch.object(
+                agent_server,
+                "touch_codex_app_server_thread",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "ensure_codex_app_server_thread",
+                AsyncMock(),
+            ) as ensure_thread,
+        ):
+            result = await agent_server._delete_codex_goal_locked("chat")
+
+        self.assertEqual(
+            result,
+            {
+                "goal": None,
+                "time_budget_seconds": None,
+                "time_budget_exhausted": False,
+            },
+        )
+        manager.clear_thread_goal.assert_awaited_once_with("thread")
+        ensure_thread.assert_not_awaited()
+        self.assertIsNone(
+            agent_server.STORE.sessions["chat"]["codex_goal"],
+        )
+        self.assertIn("chat", agent_server.BUSY_SESSIONS)
+        self.assertIn("chat", agent_server.ACTIVE)
+        self.assertIn(
+            "thread",
+            agent_server.CODEX_APP_SERVER_PINNED_THREADS,
+        )
+        self.assertEqual(
+            agent_server.CODEX_APP_SERVER_THREAD_PIN_COUNTS["thread"],
+            1,
+        )
+        self.assertNotIn(
+            "thread",
+            agent_server.CODEX_INTERACTIVE_CONTROL_THREADS,
+        )
+
+    async def test_active_native_operation_rejects_goal_mutation(
+        self,
+    ) -> None:
+        agent_server.ACTIVE["chat"].update({
+            "backend": agent_server.BACKEND_CODEX,
+            "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
+            "provider_thread_id": "thread",
+            "interactive_app_server": True,
+            "codex_native_operation": True,
+        })
+
+        with self.assertRaises(HTTPException) as raised:
+            await agent_server._delete_codex_goal_locked("chat")
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(
+            raised.exception.detail,
+            "wait for the active Codex turn to finish",
+        )
+        self.assertNotIn(
+            "thread",
+            agent_server.CODEX_APP_SERVER_PINNED_THREADS,
+        )
+        self.assertNotIn(
+            "thread",
+            agent_server.CODEX_INTERACTIVE_CONTROL_THREADS,
+        )
+
+    async def test_active_turn_allows_goal_status_update_on_its_loaded_thread(
+        self,
+    ) -> None:
+        agent_server.STORE.sessions["chat"]["codex_goal"] = {
+            "objective": "Finish the active task",
+            "status": "active",
+            "timeUsedSeconds": 31,
+        }
+        agent_server.ACTIVE["chat"].update({
+            "backend": agent_server.BACKEND_CODEX,
+            "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
+            "provider_thread_id": "thread",
+            "interactive_app_server": True,
+            "codex_native_operation": False,
+        })
+        agent_server.CODEX_APP_SERVER_PINNED_THREADS.add("thread")
+        agent_server.CODEX_APP_SERVER_THREAD_PIN_COUNTS["thread"] = 1
+        manager = AsyncMock()
+        manager.is_thread_loaded = Mock(return_value=True)
+        manager.set_thread_goal.return_value = {
+            "objective": "Finish the active task",
+            "status": "paused",
+            "timeUsedSeconds": 31,
+        }
+
+        with (
+            patch.object(
+                agent_server,
+                "CODEX_APP_SERVER_MANAGER",
+                manager,
+            ),
+            patch.object(agent_server.STORE, "save", AsyncMock()),
+            patch.object(
+                agent_server,
+                "touch_codex_app_server_thread",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "ensure_codex_app_server_thread",
+                AsyncMock(),
+            ) as ensure_thread,
+        ):
+            result = await agent_server._put_codex_goal_locked(
+                "chat",
+                agent_server.CodexGoalRequest(status="paused"),
+            )
+
+        self.assertEqual(result["goal"]["status"], "paused")
+        manager.set_thread_goal.assert_awaited_once_with(
+            "thread",
+            status="paused",
+        )
+        ensure_thread.assert_not_awaited()
+        self.assertIn("chat", agent_server.BUSY_SESSIONS)
+        self.assertIn(
+            "thread",
+            agent_server.CODEX_APP_SERVER_PINNED_THREADS,
+        )
+        self.assertEqual(
+            agent_server.CODEX_APP_SERVER_THREAD_PIN_COUNTS["thread"],
+            1,
+        )
+        self.assertNotIn(
+            "thread",
+            agent_server.CODEX_INTERACTIVE_CONTROL_THREADS,
         )
 
     async def test_manager_shutdown_clears_lru_touched_by_turn_finalizer(

@@ -17315,6 +17315,26 @@ def server_update_status_age_seconds(status: dict[str, Any]) -> float:
     return max(0.0, (datetime.now(timezone.utc) - updated_at).total_seconds())
 
 
+def server_update_runner_environment() -> dict[str, str]:
+    """Preserve Linux's user-service bus when the detached tmux server is stale."""
+    if not sys.platform.startswith("linux"):
+        return {}
+    runtime_dir = str(os.environ.get("XDG_RUNTIME_DIR") or "").strip()
+    if not runtime_dir:
+        candidate = Path("/run/user") / str(os.getuid())
+        if candidate.is_dir():
+            runtime_dir = str(candidate)
+    if not runtime_dir:
+        return {}
+    result = {"XDG_RUNTIME_DIR": runtime_dir}
+    bus_address = str(os.environ.get("DBUS_SESSION_BUS_ADDRESS") or "").strip()
+    if not bus_address and (Path(runtime_dir) / "bus").exists():
+        bus_address = f"unix:path={Path(runtime_dir) / 'bus'}"
+    if bus_address:
+        result["DBUS_SESSION_BUS_ADDRESS"] = bus_address
+    return result
+
+
 async def signed_release_manifest(
     track: Literal["stable", "beta"] = "stable",
 ) -> dict[str, Any]:
@@ -17616,6 +17636,13 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
             "--current-version", SERVER_VERSION,
             "--track", track,
         ]
+        runner_environment = server_update_runner_environment()
+        if runner_environment:
+            command = [
+                "env",
+                *(f"{key}={value}" for key, value in runner_environment.items()),
+                *command,
+            ]
         channel_switch = track != server_release_track(SERVER_VERSION)
         status = write_server_update_status(
             update_id=update_id,

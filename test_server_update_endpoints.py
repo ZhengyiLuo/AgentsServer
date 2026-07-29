@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +9,19 @@ from fastapi import HTTPException
 
 
 class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
+    def test_linux_runner_environment_restores_the_user_service_bus(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary)
+            (runtime / "bus").touch()
+            with patch.object(agent_server.sys, "platform", "linux"), \
+                 patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(runtime)}, clear=True):
+                environment = agent_server.server_update_runner_environment()
+
+        self.assertEqual(environment, {
+            "XDG_RUNTIME_DIR": str(runtime),
+            "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime / 'bus'}",
+        })
+
     async def test_health_reports_missing_tmux_and_disables_managed_updates(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -232,6 +246,36 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("--expected-version 1.1.0", command[-1])
         self.assertIn("--current-version 1.0.0", command[-1])
         self.assertIn("--track stable", command[-1])
+
+    async def test_start_passes_user_service_environment_into_detached_tmux(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "update_runner.py"
+            key = root / "release-public-key.pem"
+            runner.write_text("# runner\n")
+            key.write_text("public key\n")
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", root / "status.json"), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server.shutil, "which", return_value="/usr/bin/tmux"), \
+                 patch.object(agent_server, "server_update_runner_environment", return_value={
+                     "XDG_RUNTIME_DIR": "/run/user/123",
+                     "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/123/bus",
+                 }), \
+                 patch.object(agent_server, "run_tmux", return_value=None) as run_tmux:
+                await agent_server.start_server_update(
+                    agent_server.ServerUpdateRequest(version="1.1.0"),
+                )
+
+        command = run_tmux.call_args.args[0][-1]
+        self.assertIn("env XDG_RUNTIME_DIR=/run/user/123", command)
+        self.assertIn(
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/123/bus",
+            command,
+        )
+        self.assertIn("--expected-version 1.1.0", command)
 
     async def test_start_beta_release_passes_beta_track_to_runner(self):
         with tempfile.TemporaryDirectory() as temporary:

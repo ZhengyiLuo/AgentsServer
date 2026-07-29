@@ -265,6 +265,188 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({event.get("run_id") for event in older["events"]}, {"human-old"})
         self.assertFalse(any(event["type"] == "job_summary" for event in older["events"]))
 
+    def test_semantic_page_preserves_all_turn_artifacts_before_optional_trace_details(self) -> None:
+        run_id = "artifact-heavy-run"
+        events = [
+            self.event(1, "turn_started", run_id=run_id, prompt="Render every example"),
+        ]
+        for seq in range(2, 7):
+            events.append(self.event(
+                seq,
+                "artifact_created",
+                run_id=run_id,
+                artifact={
+                    "id": f"video-{seq}",
+                    "filename": f"example-{seq}.mp4",
+                    "content_type": "video/mp4",
+                },
+            ))
+        events.extend([
+            self.event(7, "file_uploaded", run_id=run_id, file={
+                "id": "uploaded-source",
+                "filename": "source.json",
+                "content_type": "application/json",
+            }),
+            self.event(8, "code_diff", run_id=run_id, diff_files=[{
+                "path": "render.py",
+                "additions": 2,
+                "deletions": 1,
+            }]),
+            self.event(9, "tool_started", run_id=run_id),
+            self.event(10, "reasoning_summary", run_id=run_id, text="Finalizing media"),
+            self.event(11, "assistant_text", run_id=run_id, text="All videos are ready."),
+            self.event(12, "turn_finished", run_id=run_id, result_text="All videos are ready."),
+        ])
+        self.write_events(events)
+
+        page = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            limit=1,
+            tail=True,
+        )
+
+        artifact_events = [
+            event for event in page["events"]
+            if event["type"] == "artifact_created"
+        ]
+        self.assertEqual(
+            [(event["artifact"]["id"], event["seq"]) for event in artifact_events],
+            [(f"video-{seq}", seq) for seq in range(2, 7)],
+        )
+        self.assertIn("file_uploaded", [event["type"] for event in page["events"]])
+        self.assertIn("code_diff", [event["type"] for event in page["events"]])
+        self.assertIn("turn_started", [event["type"] for event in page["events"]])
+        self.assertIn("turn_finished", [event["type"] for event in page["events"]])
+        self.assertGreater(
+            len(page["events"]),
+            agent_server.SEMANTIC_TIMELINE_EVENT_BUDGET_PER_ITEM,
+        )
+        self.assertNotIn("tool_started", [event["type"] for event in page["events"]])
+        self.assertNotIn("reasoning_summary", [event["type"] for event in page["events"]])
+
+    def test_semantic_media_overflow_is_bounded_but_preserves_thirteen_videos(self) -> None:
+        for artifact_count in (13, 80):
+            with self.subTest(artifact_count=artifact_count):
+                run_id = f"media-run-{artifact_count}"
+                events = [
+                    self.event(
+                        1,
+                        "turn_started",
+                        run_id=run_id,
+                        prompt="Render examples",
+                    ),
+                ]
+                for seq in range(2, artifact_count + 2):
+                    events.append(self.event(
+                        seq,
+                        "artifact_created",
+                        run_id=run_id,
+                        artifact={
+                            "id": f"video-{seq}",
+                            "filename": f"example-{seq}.mp4",
+                            "content_type": "video/mp4",
+                        },
+                    ))
+                events.append(self.event(
+                    artifact_count + 2,
+                    "turn_finished",
+                    run_id=run_id,
+                    result_text="Done",
+                ))
+                self.write_events(events)
+
+                page = agent_server.read_semantic_timeline_page(
+                    self.session_id,
+                    limit=1,
+                    tail=True,
+                )
+                artifacts = [
+                    event
+                    for event in page["events"]
+                    if event["type"] == "artifact_created"
+                ]
+
+                self.assertEqual(
+                    len(artifacts),
+                    min(
+                        artifact_count,
+                        agent_server.SEMANTIC_TIMELINE_ESSENTIAL_LIMIT_PER_ITEM,
+                    ),
+                )
+                if artifact_count == 13:
+                    self.assertEqual(
+                        {event["artifact"]["id"] for event in artifacts},
+                        {f"video-{seq}" for seq in range(2, 15)},
+                    )
+                self.assertLessEqual(
+                    len(page["events"]),
+                    agent_server.SEMANTIC_TIMELINE_EVENT_BUDGET_PER_ITEM
+                    + agent_server.SEMANTIC_TIMELINE_ESSENTIAL_LIMIT_PER_ITEM,
+                )
+
+    def test_semantic_media_page_cap_is_fair_across_multiple_turns(self) -> None:
+        events: list[dict[str, object]] = []
+        seq = 0
+        run_ids = [f"media-run-{index}" for index in range(5)]
+        for run_id in run_ids:
+            seq += 1
+            events.append(self.event(
+                seq,
+                "turn_started",
+                run_id=run_id,
+                prompt="Render examples",
+            ))
+            for artifact_index in range(40):
+                seq += 1
+                events.append(self.event(
+                    seq,
+                    "artifact_created",
+                    run_id=run_id,
+                    artifact={
+                        "id": f"{run_id}-video-{artifact_index}",
+                        "filename": f"{artifact_index}.mp4",
+                        "content_type": "video/mp4",
+                    },
+                ))
+            seq += 1
+            events.append(self.event(
+                seq,
+                "turn_finished",
+                run_id=run_id,
+                result_text="Done",
+            ))
+        self.write_events(events)
+
+        page = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            limit=5,
+            tail=True,
+        )
+        counts = {
+            run_id: sum(
+                event["type"] == "artifact_created"
+                and event.get("run_id") == run_id
+                for event in page["events"]
+            )
+            for run_id in run_ids
+        }
+        base_budget = (
+            len(run_ids)
+            * agent_server.SEMANTIC_TIMELINE_EVENT_BUDGET_PER_ITEM
+        )
+
+        self.assertTrue(all(count > 0 for count in counts.values()))
+        self.assertLessEqual(max(counts.values()) - min(counts.values()), 1)
+        self.assertTrue(all(
+            count <= agent_server.SEMANTIC_TIMELINE_ESSENTIAL_LIMIT_PER_ITEM
+            for count in counts.values()
+        ))
+        self.assertLessEqual(
+            len(page["events"]),
+            base_budget
+            + agent_server.SEMANTIC_TIMELINE_ESSENTIAL_PAGE_OVERFLOW_LIMIT,
+        )
+
     def test_semantic_cursor_keeps_each_job_global_and_does_not_repeat_old_runs(self) -> None:
         events: list[dict[str, object]] = []
         seq = 0
@@ -323,6 +505,96 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(summary["is_error"])
         self.assertNotIn("result_text", summary)
         self.assertIn("job_error", [event["type"] for event in page["events"]])
+
+    def test_semantic_job_summary_preserves_partial_output_and_explicit_status(self) -> None:
+        for terminal_type, expected_status in (
+            ("turn_stopped", "stopped"),
+            ("job_error", "failed"),
+        ):
+            with self.subTest(terminal_type=terminal_type):
+                common = {
+                    "run_id": f"{expected_status}-run",
+                    "purpose": "scheduled_job",
+                    "job_id": "job-1",
+                    "job_title": "Capacity monitor",
+                }
+                terminal_fields = (
+                    {"message": "Provider failed"}
+                    if terminal_type == "job_error"
+                    else {}
+                )
+                self.write_events([
+                    self.event(1, "turn_started", prompt="Check", **common),
+                    self.event(
+                        2,
+                        "assistant_text",
+                        text="Useful partial output",
+                        **common,
+                    ),
+                    self.event(3, terminal_type, **terminal_fields, **common),
+                ])
+
+                page = agent_server.read_semantic_timeline_page(
+                    self.session_id,
+                    limit=1,
+                    tail=True,
+                )
+                summary = next(
+                    event
+                    for event in page["events"]
+                    if event["type"] == "job_summary"
+                )
+
+                self.assertEqual(summary["text"], "Useful partial output")
+                self.assertEqual(summary["job_latest_run_id"], common["run_id"])
+                self.assertEqual(summary["job_latest_status_run_id"], common["run_id"])
+                self.assertEqual(summary["job_latest_status"], expected_status)
+                self.assertEqual(summary["job_latest_status_type"], terminal_type)
+                self.assertEqual(summary["job_latest_status_seq"], 3)
+                self.assertEqual(summary["job_status"], expected_status)
+                self.assertEqual(summary["job_status_run_id"], common["run_id"])
+                self.assertEqual(summary["job_status_type"], terminal_type)
+                self.assertEqual(summary["job_status_seq"], 3)
+                if expected_status == "stopped":
+                    self.assertTrue(summary["stopped"])
+                else:
+                    self.assertTrue(summary["is_error"])
+                    self.assertEqual(summary["message"], "Provider failed")
+
+    def test_semantic_job_summary_uses_partial_output_from_the_latest_run(self) -> None:
+        first = {
+            "run_id": "completed-run",
+            "purpose": "scheduled_job",
+            "job_id": "job-1",
+            "job_title": "Capacity monitor",
+        }
+        latest = {
+            "run_id": "stopped-run",
+            "purpose": "scheduled_job",
+            "job_id": "job-1",
+            "job_title": "Capacity monitor",
+        }
+        self.write_events([
+            self.event(1, "turn_started", prompt="Check", **first),
+            self.event(2, "turn_finished", result_text="Old completed output", **first),
+            self.event(3, "turn_started", prompt="Check", **latest),
+            self.event(4, "assistant_text", text="Latest partial output", **latest),
+            self.event(5, "turn_stopped", **latest),
+        ])
+
+        page = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            limit=1,
+            tail=True,
+        )
+        summary = next(
+            event for event in page["events"] if event["type"] == "job_summary"
+        )
+
+        self.assertEqual(summary["text"], "Latest partial output")
+        self.assertNotIn("result_text", summary)
+        self.assertEqual(summary["job_latest_run_id"], "stopped-run")
+        self.assertEqual(summary["job_latest_status"], "stopped")
 
     def test_semantic_job_summary_uses_a_newer_runless_defer_as_latest_status(self) -> None:
         common = {

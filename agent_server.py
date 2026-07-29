@@ -2429,7 +2429,15 @@ EVENT_SEQ_LOCK = asyncio.Lock()
 EVENT_DELIVERY_LOCKS: dict[str, asyncio.Lock] = {}
 TIMELINE_INDEX_CACHE_MAX = int(agentsdock_setting("TIMELINE_INDEX_CACHE_MAX", "24"))
 TIMELINE_INDEX_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
+# Retained as a compatibility/testing surface; synchronization uses the fixed
+# stripe pool below so deleted-session churn cannot leak one lock per chat.
 TIMELINE_INDEX_LOCKS: dict[str, threading.Lock] = {}
+# Cache membership and the per-session lock registry are shared across every
+# request worker.  Protect them independently from the per-session scan locks:
+# an LRU eviction for chat A must never remove or recreate chat B's lock while
+# chat B is building/reading its index.
+TIMELINE_INDEX_CACHE_LOCK = threading.RLock()
+TIMELINE_INDEX_LOCK_STRIPES = tuple(threading.Lock() for _ in range(64))
 FORK_INTERNAL_RUN_CACHE_MAX = int(agentsdock_setting("FORK_INTERNAL_RUN_CACHE_MAX", "128"))
 FORK_INTERNAL_RUN_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 FORK_INTERNAL_RUN_LOCKS: dict[str, threading.Lock] = {}
@@ -2501,8 +2509,10 @@ async def forget_event_seq(session_id: str) -> None:
     async with EVENT_SEQ_LOCK:
         EVENT_SEQ_CACHE.pop(session_id, None)
     EVENT_DELIVERY_LOCKS.pop(session_id, None)
-    TIMELINE_INDEX_CACHE.pop(session_id, None)
-    TIMELINE_INDEX_LOCKS.pop(session_id, None)
+    timeline_lock = timeline_index_session_lock(session_id)
+    with timeline_lock:
+        with TIMELINE_INDEX_CACHE_LOCK:
+            TIMELINE_INDEX_CACHE.pop(session_id, None)
     FORK_INTERNAL_RUN_CACHE.pop(session_id, None)
     FORK_INTERNAL_RUN_LOCKS.pop(session_id, None)
 
@@ -7402,6 +7412,18 @@ TIMELINE_INDEX_TRACE_TYPES = {
 SEMANTIC_TIMELINE_JOB_RUN_LIMIT = 7
 SEMANTIC_TIMELINE_JOB_EXTRA_LIMIT = 64
 SEMANTIC_TIMELINE_EVENT_BUDGET_PER_ITEM = 4
+# Media and diffs are first-class output, but a corrupt/noisy run must not turn
+# a one-item semantic page into a thousand-event response. Thirty-two keeps
+# the known 13-video review workflow intact, while the page cap prevents many
+# selected media-heavy turns from multiplying that allowance without bound.
+SEMANTIC_TIMELINE_ESSENTIAL_LIMIT_PER_ITEM = 32
+SEMANTIC_TIMELINE_ESSENTIAL_PAGE_OVERFLOW_LIMIT = 128
+JOB_RUN_HISTORY_TEXT_LIMIT = 64 * 1024
+SEMANTIC_TIMELINE_ESSENTIAL_DETAIL_TYPES = {
+    "artifact_created",
+    "file_uploaded",
+    "code_diff",
+}
 
 
 def timeline_index_is_native_steer_transition_stop(
@@ -7547,15 +7569,222 @@ def timeline_index_is_error(event: dict[str, Any]) -> bool:
     return event_type == "error" or event_type.endswith("_error") or event.get("is_error") is True or bool(event.get("error"))
 
 
+def timeline_index_session_lock(session_id: str) -> threading.Lock:
+    return TIMELINE_INDEX_LOCK_STRIPES[
+        hash(session_id) % len(TIMELINE_INDEX_LOCK_STRIPES)
+    ]
+
+
+def timeline_index_cached_entry(
+    session_id: str,
+    *,
+    touch: bool = False,
+) -> dict[str, Any] | None:
+    with TIMELINE_INDEX_CACHE_LOCK:
+        cached = TIMELINE_INDEX_CACHE.get(session_id)
+        if cached is not None and touch:
+            TIMELINE_INDEX_CACHE.move_to_end(session_id)
+        return cached
+
+
+def evict_timeline_index_cache_locked() -> None:
+    """Evict inactive LRU entries while preserving in-flight session scans."""
+    target = max(1, TIMELINE_INDEX_CACHE_MAX)
+    if len(TIMELINE_INDEX_CACHE) <= target:
+        return
+    for cache_session_id in list(TIMELINE_INDEX_CACHE):
+        if len(TIMELINE_INDEX_CACHE) <= target:
+            break
+        session_lock = timeline_index_session_lock(cache_session_id)
+        if session_lock.locked():
+            continue
+        TIMELINE_INDEX_CACHE.pop(cache_session_id, None)
+
+
+def bounded_job_history_text(value: Any, limit: int) -> Any:
+    if not isinstance(value, str) or len(value) <= limit:
+        return value
+    return value[: limit - 1].rstrip() + "…"
+
+
+def job_run_history_event_snapshot(
+    event: dict[str, Any],
+    *,
+    include_output: bool = True,
+    text_limit: int = JOB_RUN_HISTORY_TEXT_LIMIT,
+) -> dict[str, Any]:
+    """Keep the useful/status fields for one run without retaining full events."""
+    fields = [
+        "id",
+        "session_id",
+        "seq",
+        "type",
+        "ts",
+        "run_id",
+        "purpose",
+        "job_id",
+        "job_title",
+        "backend",
+        "message",
+        "error",
+        "exit_code",
+        "is_error",
+        "stopped",
+        "native_interrupt",
+    ]
+    if include_output:
+        fields.extend(("result_text", "text", "output"))
+    snapshot = {
+        field: bounded_job_history_text(event[field], text_limit)
+        for field in fields
+        if event.get(field) is not None
+    }
+    return snapshot
+
+
+def scheduled_job_run_status(event: dict[str, Any]) -> str | None:
+    event_type = str(event.get("type") or "")
+    if timeline_index_is_error(event):
+        return "failed"
+    if event_type == "turn_stopped":
+        return "stopped"
+    if event_type == "job_deferred":
+        return "deferred"
+    if event_type in {"turn_finished", "job_finished"}:
+        return "completed"
+    if event_type in {"turn_started", "job_started", "job_ran"}:
+        return "running"
+    return None
+
+
+def scheduled_job_status_should_replace(
+    current_event: dict[str, Any] | None,
+    current_status: str | None,
+    event: dict[str, Any],
+    status: str,
+) -> bool:
+    if not isinstance(current_event, dict):
+        return True
+    current_run_id = str(current_event.get("run_id") or "").strip()
+    run_id = str(event.get("run_id") or "").strip()
+    if (
+        current_run_id
+        and current_run_id == run_id
+        and current_status in {"completed", "failed", "stopped"}
+        and status == "running"
+        and str(event.get("type") or "") == "job_ran"
+    ):
+        # job_ran is emitted by the scheduler just after turn launch. A very
+        # fast run can finish before that marker reaches disk; do not regress
+        # the already terminal run back to "running".
+        return False
+    return int(event.get("seq") or 0) >= int(current_event.get("seq") or 0)
+
+
+def scheduled_job_output_rank(event: dict[str, Any]) -> tuple[int, int, int]:
+    event_type = str(event.get("type") or "")
+    if timeline_index_is_error(event) and any(
+        str(event.get(field) or "").strip()
+        for field in ("result_text", "text", "output")
+    ):
+        return 1, int(event.get("seq") or 0), 4
+    if event_type == "turn_finished" and str(event.get("result_text") or "").strip():
+        return 1, int(event.get("seq") or 0), 3
+    if event_type == "assistant_text" and str(event.get("text") or "").strip():
+        return 1, int(event.get("seq") or 0), 2
+    if event_type == "job_finished" and any(
+        str(event.get(field) or "").strip()
+        for field in ("result_text", "text", "message")
+    ):
+        return 1, int(event.get("seq") or 0), 1
+    return 0, int(event.get("seq") or 0), 0
+
+
+def scheduled_job_history_response_event(
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    """Combine one run's useful output with its authoritative latest status."""
+    output = (
+        dict(record["output_event"])
+        if isinstance(record.get("output_event"), dict)
+        else {}
+    )
+    status_event = (
+        dict(record["status_event"])
+        if isinstance(record.get("status_event"), dict)
+        else {}
+    )
+    response = {
+        **(output or status_event),
+        "id": f"job_run:{record['key']}",
+        "session_id": str(record.get("session_id") or ""),
+        # Run history is ordered/cursored by the final event associated with
+        # the attempt, while the authoritative lifecycle seq remains explicit.
+        "seq": int(record.get("end_seq") or status_event.get("seq") or 0),
+        "type": str(
+            status_event.get("type")
+            or output.get("type")
+            or "job_finished"
+        ),
+        "ts": (
+            status_event.get("ts")
+            or output.get("ts")
+            or record.get("timestamp")
+        ),
+        "purpose": "scheduled_job",
+        "job_id": str(record.get("job_id") or ""),
+        "job_title": str(record.get("job_title") or "Scheduled job"),
+        "job_run_status": str(record.get("status") or "unknown"),
+        "job_run_status_seq": int(
+            status_event.get("seq") or record.get("end_seq") or 0
+        ),
+        "job_run_status_type": str(status_event.get("type") or ""),
+    }
+    run_id = str(record.get("run_id") or "").strip()
+    if run_id:
+        response["run_id"] = run_id
+    response["job_status"] = response["job_run_status"]
+    response["job_status_seq"] = response["job_run_status_seq"]
+    response["job_status_type"] = response["job_run_status_type"]
+    response["job_status_run_id"] = run_id or None
+    # Status fields come from the latest lifecycle event; output text stays
+    # sourced from the best assistant/final event for this same run.
+    for field in (
+        "message",
+        "error",
+        "exit_code",
+        "is_error",
+        "stopped",
+        "native_interrupt",
+    ):
+        if status_event.get(field) is not None:
+            response[field] = status_event[field]
+    if record.get("status") == "failed":
+        response["is_error"] = True
+        if not str(response.get("error") or "").strip():
+            response["error"] = (
+                status_event.get("message")
+                or "Scheduled job failed."
+            )
+    elif record.get("status") == "stopped":
+        response["stopped"] = True
+    return client_safe_event(response)
+
+
 def build_timeline_index(session_id: str) -> dict[str, Any]:
-    lock = TIMELINE_INDEX_LOCKS.setdefault(session_id, threading.Lock())
+    lock = timeline_index_session_lock(session_id)
     with lock:
-        return _build_timeline_index_locked(session_id)
+        payload = _build_timeline_index_locked(session_id)
+    with TIMELINE_INDEX_CACHE_LOCK:
+        evict_timeline_index_cache_locked()
+    return payload
 
 
 def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
     path = events_path(session_id)
     if not path.exists():
+        with TIMELINE_INDEX_CACHE_LOCK:
+            TIMELINE_INDEX_CACHE.pop(session_id, None)
         return {
             "session_id": session_id,
             "landmarks": [],
@@ -7565,9 +7794,12 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
         }
     stat = path.stat()
     signature = (stat.st_size, stat.st_mtime_ns)
-    cached = TIMELINE_INDEX_CACHE.get(session_id)
-    if cached and cached.get("signature") == signature:
-        TIMELINE_INDEX_CACHE.move_to_end(session_id)
+    cached = timeline_index_cached_entry(session_id, touch=True)
+    if (
+        cached
+        and cached.get("signature") == signature
+        and int(cached.get("offset") or 0) >= stat.st_size
+    ):
         return cached["payload"]
 
     can_append = bool(
@@ -7575,15 +7807,204 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
         0 <= int(cached.get("offset") or 0) < stat.st_size
     )
     records: list[dict[str, Any]] = cached["records"] if can_append else []
-    by_key: dict[str, dict[str, Any]] = {record["key"]: record for record in records}
+    by_key: dict[str, dict[str, Any]] = (
+        cached.get("by_key") or {record["key"]: record for record in records}
+        if can_append
+        else {}
+    )
+    landmarks_by_key: dict[str, dict[str, Any]] = (
+        cached.get("landmarks_by_key") or {}
+        if can_append
+        else {}
+    )
+    landmark_order: list[str] = (
+        cached.get("landmark_order") or []
+        if can_append
+        else []
+    )
+    dirty_record_keys: set[str] = set()
     active_turn_key: str | None = cached.get("active_turn_key") if can_append else None
-    current_turn_by_run: dict[str, str] = dict(cached.get("current_turn_by_run") or {}) if can_append else {}
-    job_by_run: dict[str, str] = dict(cached.get("job_by_run") or {}) if can_append else {}
-    fork_internal_run_ids: set[str] = set(cached.get("fork_internal_run_ids") or ()) if can_append else set()
+    current_turn_by_run: dict[str, str] = (
+        cached.get("current_turn_by_run") or {}
+        if can_append
+        else {}
+    )
+    job_by_run: dict[str, str] = (
+        cached.get("job_by_run") or {}
+        if can_append
+        else {}
+    )
+    fork_internal_run_ids: set[str] = (
+        cached.get("fork_internal_run_ids") or set()
+        if can_append
+        else set()
+    )
     visible_count = int(cached.get("visible_count") or 0) if can_append else 0
     latest_seq = int(cached.get("latest_seq") or 0) if can_append else 0
+    run_history_records: dict[str, dict[str, Any]] = (
+        cached.get("run_history_records") or {}
+        if can_append
+        else {}
+    )
+    job_run_keys: dict[str, list[str]] = (
+        cached.get("job_run_keys") or {}
+        if can_append
+        else {}
+    )
+    job_run_key_sets: dict[str, set[str]] = (
+        cached.get("job_run_key_sets")
+        or {
+            job_id: set(keys)
+            for job_id, keys in job_run_keys.items()
+        }
+        if can_append
+        else {}
+    )
+    run_history_keys_by_run_id: dict[str, list[str]] = (
+        cached.get("run_history_keys_by_run_id") or {}
+        if can_append
+        else {}
+    )
+    current_run_history_key: dict[str, str] = (
+        cached.get("current_run_history_key") or {}
+        if can_append
+        else {}
+    )
     scan_offset = int(cached.get("offset") or 0) if can_append else 0
     event_offset = scan_offset
+
+    def attach_run_to_job(
+        history_key: str,
+        record: dict[str, Any],
+        job_id: str,
+        *,
+        job_title: str = "",
+    ) -> None:
+        clean_job_id = str(job_id or "").strip()
+        if not clean_job_id:
+            return
+        prior_job_id = str(record.get("job_id") or "").strip()
+        if prior_job_id and prior_job_id != clean_job_id:
+            prior_keys = job_run_keys.get(prior_job_id)
+            if prior_keys and history_key in prior_keys:
+                prior_keys.remove(history_key)
+                job_run_key_sets.get(prior_job_id, set()).discard(history_key)
+        record["job_id"] = clean_job_id
+        if job_title:
+            record["job_title"] = job_title
+        keys = job_run_keys.setdefault(clean_job_id, [])
+        key_set = job_run_key_sets.setdefault(clean_job_id, set(keys))
+        if history_key not in key_set:
+            keys.append(history_key)
+            key_set.add(history_key)
+
+    def index_run_event(
+        event: dict[str, Any],
+        *,
+        line_end_offset: int,
+        resolved_job_id: str = "",
+        resolved_job_title: str = "",
+    ) -> None:
+        seq = int(event.get("seq") or 0)
+        run_id = str(event.get("run_id") or "").strip()
+        event_type = str(event.get("type") or "")
+        status = scheduled_job_run_status(event)
+        # Runless deferrals/failures are real scheduled attempts and belong in
+        # lazy history, but job creation/deletion markers are not run history.
+        if not run_id:
+            if not resolved_job_id or (
+                event_type != "job_deferred"
+                and not timeline_index_is_error(event)
+            ):
+                return
+            history_key = f"status:{resolved_job_id}:{seq}"
+        else:
+            keys = run_history_keys_by_run_id.setdefault(run_id, [])
+            if event_type == "turn_started":
+                base_key = f"run:{run_id}"
+                history_key = (
+                    base_key
+                    if not keys
+                    else f"{base_key}:start-{seq}"
+                )
+                keys.append(history_key)
+                current_run_history_key[run_id] = history_key
+            else:
+                history_key = (
+                    current_run_history_key.get(run_id)
+                    or (keys[-1] if keys else f"run:{run_id}")
+                )
+                if not keys:
+                    keys.append(history_key)
+        record = run_history_records.get(history_key)
+        if record is None:
+            record = {
+                "key": history_key,
+                "session_id": session_id,
+                "run_id": run_id,
+                "job_id": "",
+                "job_title": resolved_job_title or "Scheduled job",
+                "start_seq": seq,
+                "end_seq": seq,
+                "start_offset": max(0, event_offset),
+                "end_offset": max(0, line_end_offset),
+                "timestamp": event.get("ts"),
+                "output_event": None,
+                "status_event": None,
+                "status": None,
+            }
+            run_history_records[history_key] = record
+        record["start_seq"] = min(int(record.get("start_seq", seq)), seq)
+        record["end_seq"] = max(int(record.get("end_seq") or seq), seq)
+        record["start_offset"] = min(
+            int(record.get("start_offset", event_offset)),
+            max(0, event_offset),
+        )
+        record["end_offset"] = max(
+            int(record.get("end_offset") or line_end_offset),
+            max(0, line_end_offset),
+        )
+        record["timestamp"] = event.get("ts") or record.get("timestamp")
+        output_rank = scheduled_job_output_rank(event)
+        current_output = record.get("output_event")
+        is_known_scheduled_run = bool(
+            resolved_job_id
+            or str(record.get("job_id") or "").strip()
+            or event.get("purpose") == "scheduled_job"
+        )
+        if is_known_scheduled_run and output_rank[0] > 0 and (
+            not isinstance(current_output, dict)
+            or output_rank > scheduled_job_output_rank(current_output)
+        ):
+            record["output_event"] = job_run_history_event_snapshot(
+                event,
+                text_limit=JOB_RUN_HISTORY_TEXT_LIMIT,
+            )
+        if status is not None:
+            current_status = record.get("status_event")
+            if scheduled_job_status_should_replace(
+                current_status if isinstance(current_status, dict) else None,
+                str(record.get("status") or "") or None,
+                event,
+                status,
+            ):
+                record["status_event"] = job_run_history_event_snapshot(
+                    event,
+                    include_output=False,
+                )
+                record["status"] = status
+        if resolved_job_id:
+            attach_run_to_job(
+                history_key,
+                record,
+                resolved_job_id,
+                job_title=resolved_job_title,
+            )
+        if run_id and (
+            event_type in {"turn_finished", "turn_stopped"}
+            or timeline_index_is_error(event)
+        ):
+            current_run_history_key.pop(run_id, None)
 
     def ensure_record(
         key: str,
@@ -7624,6 +8045,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
             record_start_offset,
         )
         record["event_count"] += 1
+        dirty_record_keys.add(key)
         return record
 
     final_offset = scan_offset
@@ -7631,6 +8053,12 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
         source.seek(scan_offset)
         for raw_line in source:
             event_offset = final_offset
+            # append_event() writes one complete newline-terminated JSON
+            # record. Never advance the cached cursor past an incomplete tail
+            # left by a concurrent writer or interrupted write.
+            if raw_line and not raw_line.endswith(b"\n"):
+                final_offset = event_offset
+                break
             final_offset += len(raw_line)
             if not raw_line.strip():
                 continue
@@ -7662,6 +8090,30 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
             if timeline_index_event_is_hidden(event):
                 continue
             visible_count += 1
+            indexed_job = (
+                event.get("job")
+                if isinstance(event.get("job"), dict)
+                else {}
+            )
+            explicit_job_id = str(
+                event.get("job_id") or indexed_job.get("id") or ""
+            ).strip()
+            indexed_job_title = str(
+                event.get("job_title") or indexed_job.get("title") or ""
+            ).strip()
+            if run_id and explicit_job_id:
+                job_by_run[run_id] = explicit_job_id
+            resolved_job_id = explicit_job_id or (
+                str(job_by_run.get(run_id) or "").strip()
+                if run_id
+                else ""
+            )
+            index_run_event(
+                event,
+                line_end_offset=final_offset,
+                resolved_job_id=resolved_job_id,
+                resolved_job_title=indexed_job_title,
+            )
 
             digest_id = str(event.get("digest_job_id") or "").strip()
             is_digest_lifecycle = event_type.startswith("handoff_digest_")
@@ -7727,6 +8179,54 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                 if prior_key and prior_key != record["key"]:
                     prior = by_key.pop(prior_key, None)
                     if prior is not None:
+                        landmarks_by_key.pop(prior_key, None)
+                        dirty_record_keys.discard(prior_key)
+                        if run_id:
+                            history_keys = run_history_keys_by_run_id.get(run_id) or []
+                            history_record = (
+                                run_history_records.get(history_keys[-1])
+                                if history_keys
+                                else None
+                            )
+                            prior_preview = str(prior.get("preview") or "").strip()
+                            if (
+                                isinstance(history_record, dict)
+                                and prior_preview
+                                and not isinstance(
+                                    history_record.get("output_event"),
+                                    dict,
+                                )
+                            ):
+                                status_event = history_record.get("status_event")
+                                status_type = (
+                                    str(status_event.get("type") or "")
+                                    if isinstance(status_event, dict)
+                                    else ""
+                                )
+                                history_record["output_event"] = {
+                                    "id": f"legacy_job_output:{run_id}",
+                                    "session_id": session_id,
+                                    "seq": int(prior.get("end_seq") or seq),
+                                    "type": (
+                                        "turn_finished"
+                                        if status_type == "turn_finished"
+                                        else "assistant_text"
+                                    ),
+                                    "ts": prior.get("timestamp"),
+                                    "run_id": run_id,
+                                    "purpose": "scheduled_job",
+                                    "job_id": str(job_id),
+                                    "job_title": str(
+                                        job.get("title")
+                                        or event.get("job_title")
+                                        or "Scheduled job"
+                                    ),
+                                    (
+                                        "result_text"
+                                        if status_type == "turn_finished"
+                                        else "text"
+                                    ): prior_preview,
+                                }
                         record["start_seq"] = min(int(record["start_seq"]), int(prior["start_seq"]))
                         record["end_seq"] = max(int(record["end_seq"]), int(prior["end_seq"]))
                         record["start_offset"] = min(
@@ -7843,8 +8343,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
             record["title"] = compact_timeline_index_text(event_type.replace("_", " ").title() or "System", 72)
             record["preview"] = text or record["title"]
 
-    landmarks: list[dict[str, Any]] = []
-    for stored in records:
+    def landmark_from_record(stored: dict[str, Any]) -> dict[str, Any]:
         file_names = list(stored.get("file_names") or [])
         tool_count = int(stored.get("tool_count") or 0)
         thought_count = int(stored.get("thought_count") or 0)
@@ -7875,7 +8374,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
             if kind in {"job", "codex_lifecycle"}
             else stored["start_seq"]
         )
-        landmarks.append({
+        return {
             "key": stored["key"],
             "kind": kind,
             "start_seq": landmark_seq,
@@ -7884,9 +8383,61 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
             "preview": preview,
             "meta": " · ".join(meta_parts),
             "timestamp": stored.get("timestamp"),
-        })
+        }
 
-    landmarks.sort(key=lambda item: (int(item["start_seq"]), int(item["end_seq"]), str(item["key"])))
+    if not can_append or not landmarks_by_key:
+        dirty_record_keys = set(by_key)
+        landmarks_by_key.clear()
+        landmark_order = []
+    for key in dirty_record_keys:
+        stored = by_key.get(key)
+        if stored is not None:
+            landmarks_by_key[key] = landmark_from_record(stored)
+
+    def landmark_key(key: str) -> tuple[int, int, str]:
+        item = landmarks_by_key[key]
+        return (
+            int(item["start_seq"]),
+            int(item["end_seq"]),
+            str(item["key"]),
+        )
+
+    unchanged_order = [
+        key
+        for key in landmark_order
+        if key in landmarks_by_key and key not in dirty_record_keys
+    ]
+    dirty_order = sorted(
+        (
+            key
+            for key in dirty_record_keys
+            if key in landmarks_by_key
+        ),
+        key=landmark_key,
+    )
+    merged_order: list[str] = []
+    unchanged_index = 0
+    dirty_index = 0
+    while (
+        unchanged_index < len(unchanged_order)
+        or dirty_index < len(dirty_order)
+    ):
+        if dirty_index >= len(dirty_order):
+            merged_order.extend(unchanged_order[unchanged_index:])
+            break
+        if unchanged_index >= len(unchanged_order):
+            merged_order.extend(dirty_order[dirty_index:])
+            break
+        unchanged_key = unchanged_order[unchanged_index]
+        dirty_key = dirty_order[dirty_index]
+        if landmark_key(unchanged_key) <= landmark_key(dirty_key):
+            merged_order.append(unchanged_key)
+            unchanged_index += 1
+        else:
+            merged_order.append(dirty_key)
+            dirty_index += 1
+    landmark_order = merged_order
+    landmarks = [landmarks_by_key[key] for key in landmark_order]
 
     payload = {
         "session_id": session_id,
@@ -7895,22 +8446,33 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
         "event_count": visible_count,
         "generated_at": now_iso(),
     }
-    TIMELINE_INDEX_CACHE[session_id] = {
-        "signature": signature,
+    final_stat = path.stat()
+    final_signature = (final_stat.st_size, final_stat.st_mtime_ns)
+    cache_entry = {
+        "signature": final_signature,
         "payload": payload,
         "records": records,
+        "by_key": by_key,
+        "landmarks_by_key": landmarks_by_key,
+        "landmark_order": landmark_order,
         "active_turn_key": active_turn_key,
         "current_turn_by_run": current_turn_by_run,
         "job_by_run": job_by_run,
+        "run_history_records": run_history_records,
+        "job_run_keys": job_run_keys,
+        "job_run_key_sets": job_run_key_sets,
+        "run_history_keys_by_run_id": run_history_keys_by_run_id,
+        "current_run_history_key": current_run_history_key,
         "fork_internal_run_ids": fork_internal_run_ids,
         "visible_count": visible_count,
         "latest_seq": latest_seq,
         "offset": final_offset,
-        "inode": stat.st_ino,
+        "inode": final_stat.st_ino,
     }
-    TIMELINE_INDEX_CACHE.move_to_end(session_id)
-    while len(TIMELINE_INDEX_CACHE) > max(1, TIMELINE_INDEX_CACHE_MAX):
-        TIMELINE_INDEX_CACHE.popitem(last=False)
+    with TIMELINE_INDEX_CACHE_LOCK:
+        TIMELINE_INDEX_CACHE[session_id] = cache_entry
+        TIMELINE_INDEX_CACHE.move_to_end(session_id)
+        evict_timeline_index_cache_locked()
     return payload
 
 
@@ -7957,6 +8519,220 @@ def semantic_job_event_is_result(event: dict[str, Any]) -> bool:
     return False
 
 
+def semantic_job_representative_rank(event: dict[str, Any]) -> tuple[int, int, int]:
+    """Rank one scheduled-run event for lazy history display."""
+    return (
+        1 if semantic_job_event_is_result(event) else 0,
+        semantic_job_event_priority(event),
+        int(event.get("seq") or 0),
+    )
+
+
+def read_scheduled_job_runs(
+    session_id: str,
+    job_id: str,
+    *,
+    before_seq: int | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Return one useful representative per scheduled run, newest first.
+
+    The normal timeline-index scan builds one bounded record per run, including
+    useful output, authoritative status, and byte/seq bounds. History paging
+    therefore performs no second JSONL scan, even for very large chats.
+    """
+    clean_job_id = str(job_id or "").strip()
+    if not clean_job_id:
+        raise KeyError("scheduled job not found")
+    bounded_limit = max(1, min(int(limit or 20), 100))
+    normalized_before = (
+        max(1, int(before_seq))
+        if before_seq is not None
+        else None
+    )
+    lock = timeline_index_session_lock(session_id)
+    with lock:
+        _build_timeline_index_locked(session_id)
+        timeline_cache = timeline_index_cached_entry(session_id, touch=True) or {}
+        job_landmark_exists = any(
+            candidate.get("kind") == "job"
+            and str(candidate.get("key") or "") == f"job:{clean_job_id}"
+            for candidate in timeline_cache.get("records") or []
+        )
+        if not job_landmark_exists:
+            raise KeyError("scheduled job not found")
+        run_records = timeline_cache.get("run_history_records") or {}
+        run_keys = (
+            (timeline_cache.get("job_run_keys") or {}).get(clean_job_id) or []
+        )
+        total = len(run_keys)
+        # A run key is registered when the run first becomes associated with
+        # the job, while its end_seq can advance later. For example, a run can
+        # start, a subsequent tick can be deferred, and then the original run
+        # can finish. Sort only the lightweight cached record references by
+        # their final event sequence so cursor paging cannot skip that finish.
+        ordered_records = sorted(
+            (
+                record
+                for key in run_keys
+                if isinstance(
+                    (record := run_records.get(key)),
+                    dict,
+                )
+            ),
+            key=lambda record: (
+                int(record.get("end_seq") or 0),
+                int(record.get("start_seq") or 0),
+                str(record.get("key") or ""),
+            ),
+            reverse=True,
+        )
+        selected: list[dict[str, Any]] = []
+        has_more = False
+        for record in ordered_records:
+            record_seq = int(record.get("end_seq") or 0)
+            if (
+                normalized_before is not None
+                and record_seq >= normalized_before
+            ):
+                continue
+            if len(selected) >= bounded_limit:
+                has_more = True
+                break
+            selected.append(scheduled_job_history_response_event(record))
+    with TIMELINE_INDEX_CACHE_LOCK:
+        evict_timeline_index_cache_locked()
+    next_before = (
+        min(int(event.get("seq") or 0) for event in selected)
+        if has_more and selected
+        else None
+    )
+    return {
+        "session_id": session_id,
+        "job_id": clean_job_id,
+        "runs": selected,
+        "total": total,
+        "has_more": has_more,
+        "next_before": next_before,
+    }
+
+
+RUN_TRACE_EVENT_TYPES = {
+    "reasoning_summary",
+    "tool_started",
+    "tool_finished",
+    "code_diff",
+}
+
+
+def read_indexed_run_trace(
+    session_id: str,
+    run_id: str,
+    *,
+    anchor_seq: int | None = None,
+    after_seq: int = 0,
+    limit: int = 160,
+) -> dict[str, Any]:
+    """Read trace detail only within byte bounds recorded by the main index."""
+    clean_run_id = str(run_id or "").strip()
+    if not clean_run_id:
+        raise KeyError("run trace not found")
+    normalized_after = max(0, int(after_seq or 0))
+    bounded_limit = max(1, min(int(limit or 160), 1_000))
+    lock = timeline_index_session_lock(session_id)
+    with lock:
+        _build_timeline_index_locked(session_id)
+        timeline_cache = timeline_index_cached_entry(session_id, touch=True) or {}
+        run_records = timeline_cache.get("run_history_records") or {}
+        candidate_keys = list(
+            (timeline_cache.get("run_history_keys_by_run_id") or {}).get(
+                clean_run_id
+            )
+            or [f"run:{clean_run_id}"]
+        )
+        candidates = [
+            run_records[key]
+            for key in candidate_keys
+            if isinstance(run_records.get(key), dict)
+        ]
+        normalized_anchor = max(0, int(anchor_seq or 0))
+        if normalized_anchor > 0:
+            record = next(
+                (
+                    candidate
+                    for candidate in sorted(
+                        candidates,
+                        key=lambda item: (
+                            int(item.get("start_seq") or 0),
+                            int(item.get("end_seq") or 0),
+                        ),
+                        reverse=True,
+                    )
+                    if int(candidate.get("start_seq") or 0)
+                    <= normalized_anchor
+                    <= int(candidate.get("end_seq") or 0)
+                ),
+                None,
+            )
+        else:
+            record = candidates[-1] if candidates else None
+        if not isinstance(record, dict):
+            raise KeyError("run trace not found")
+        bounds = {
+            "start_offset": max(0, int(record.get("start_offset") or 0)),
+            "end_offset": max(0, int(record.get("end_offset") or 0)),
+            "end_seq": max(0, int(record.get("end_seq") or 0)),
+        }
+        fork_internal_run_ids = set(
+            timeline_cache.get("fork_internal_run_ids") or ()
+        )
+    with TIMELINE_INDEX_CACHE_LOCK:
+        evict_timeline_index_cache_locked()
+
+    path = events_path(session_id)
+    if not path.exists():
+        raise KeyError("run trace not found")
+    selected: list[dict[str, Any]] = []
+    has_more = False
+    with path.open("rb") as source:
+        source.seek(bounds["start_offset"])
+        while source.tell() < bounds["end_offset"]:
+            line_start = source.tell()
+            raw_line = source.readline()
+            if not raw_line or line_start >= bounds["end_offset"]:
+                break
+            if not raw_line.endswith(b"\n"):
+                break
+            try:
+                event = json.loads(raw_line.decode("utf-8", "replace"))
+            except Exception:
+                continue
+            seq = int(event.get("seq") or 0)
+            if (
+                seq <= normalized_after
+                or str(event.get("run_id") or "").strip() != clean_run_id
+                or str(event.get("type") or "") not in RUN_TRACE_EVENT_TYPES
+                or is_fork_internal_event(event, fork_internal_run_ids)
+                or not event_files_belong_to_session(event, session_id)
+            ):
+                continue
+            if len(selected) >= bounded_limit:
+                has_more = True
+                break
+            selected.append(client_safe_event(event))
+
+    next_after = (
+        int(selected[-1].get("seq") or normalized_after)
+        if has_more and selected
+        else max(normalized_after, bounds["end_seq"])
+    )
+    return {
+        "events": selected,
+        "has_more": has_more,
+        "next_after": next_after,
+    }
+
+
 def new_semantic_job_state(landmark: dict[str, Any]) -> dict[str, Any]:
     return {
         "landmark": landmark,
@@ -7967,6 +8743,9 @@ def new_semantic_job_state(landmark: dict[str, Any]) -> dict[str, Any]:
         "standalone": deque(maxlen=SEMANTIC_TIMELINE_JOB_EXTRA_LIMIT),
         "latest_event": None,
         "latest_result_event": None,
+        "latest_output_event": None,
+        "latest_status_event": None,
+        "latest_status": None,
         "latest_run_id": None,
         "latest_run_seq": 0,
         "latest_run_extras": deque(maxlen=SEMANTIC_TIMELINE_JOB_EXTRA_LIMIT),
@@ -7990,6 +8769,23 @@ def add_semantic_job_event(state: dict[str, Any], event: dict[str, Any]) -> None
         # collections. A later marker-only or stopped run must not erase the
         # last useful output merely because optional page detail was exhausted.
         state["latest_result_event"] = event
+    latest_output = state.get("latest_output_event")
+    output_rank = scheduled_job_output_rank(event)
+    if output_rank[0] > 0 and (
+        not isinstance(latest_output, dict)
+        or output_rank > scheduled_job_output_rank(latest_output)
+    ):
+        state["latest_output_event"] = event
+    status = scheduled_job_run_status(event)
+    latest_status = state.get("latest_status_event")
+    if status is not None and scheduled_job_status_should_replace(
+        latest_status if isinstance(latest_status, dict) else None,
+        str(state.get("latest_status") or "") or None,
+        event,
+        status,
+    ):
+        state["latest_status_event"] = event
+        state["latest_status"] = status
 
     title = str(event.get("job_title") or "").strip()
     job = event.get("job") if isinstance(event.get("job"), dict) else None
@@ -8051,8 +8847,17 @@ def semantic_job_summary_event(
         default=state.get("latest_event") if isinstance(state.get("latest_event"), dict) else {},
     )
     latest_result = (
-        state.get("latest_result_event")
-        if isinstance(state.get("latest_result_event"), dict)
+        state.get("latest_output_event")
+        if isinstance(state.get("latest_output_event"), dict)
+        else (
+            state.get("latest_result_event")
+            if isinstance(state.get("latest_result_event"), dict)
+            else None
+        )
+    )
+    latest_status_event = (
+        state.get("latest_status_event")
+        if isinstance(state.get("latest_status_event"), dict)
         else None
     )
     standalone_status_candidates = [
@@ -8101,7 +8906,26 @@ def semantic_job_summary_event(
         ),
         "job_end_seq": anchor_seq,
         "job_history_truncated": run_count > len(representatives),
+        "job_latest_run_id": (
+            str(state.get("latest_run_id") or "").strip() or None
+        ),
+        "job_latest_status": str(state.get("latest_status") or "unknown"),
+        "job_latest_status_seq": int(
+            latest_status_event.get("seq") or 0
+        ) if latest_status_event else 0,
+        "job_latest_status_type": str(
+            latest_status_event.get("type") or ""
+        ) if latest_status_event else "",
+        "job_latest_status_run_id": (
+            str(latest_status_event.get("run_id") or "").strip() or None
+        ) if latest_status_event else None,
     }
+    # Compact aliases are consumed by current desktop clients. Keep the
+    # explicit ``job_latest_*`` names as the durable, self-describing contract.
+    summary["job_status"] = summary["job_latest_status"]
+    summary["job_status_seq"] = summary["job_latest_status_seq"]
+    summary["job_status_type"] = summary["job_latest_status_type"]
+    summary["job_status_run_id"] = summary["job_latest_status_run_id"]
     job = dict(state["job"]) if isinstance(state.get("job"), dict) else {
         "id": summary["job_id"],
         "title": title,
@@ -8112,6 +8936,7 @@ def semantic_job_summary_event(
         "backend",
         "result_text",
         "text",
+        "output",
         "message",
         "error",
         "exit_code",
@@ -8120,6 +8945,26 @@ def semantic_job_summary_event(
     ):
         if latest_display.get(field) is not None:
             summary[field] = latest_display[field]
+    if latest_status_event is not None:
+        for field in (
+            "message",
+            "error",
+            "exit_code",
+            "is_error",
+            "stopped",
+            "native_interrupt",
+        ):
+            if latest_status_event.get(field) is not None:
+                summary[field] = latest_status_event[field]
+    if summary["job_latest_status"] == "failed":
+        summary["is_error"] = True
+        if not str(summary.get("error") or "").strip():
+            summary["error"] = (
+                (latest_status_event or {}).get("message")
+                or "Scheduled job failed."
+            )
+    elif summary["job_latest_status"] == "stopped":
+        summary["stopped"] = True
     if str(latest_display.get("type") or "") == "job_error":
         summary["is_error"] = True
         summary["error"] = (
@@ -8153,10 +8998,15 @@ def semantic_timeline_event_is_display(event: dict[str, Any]) -> bool:
 
 def semantic_timeline_ordinary_candidates(
     events: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
     ordered = sorted(events, key=lambda event: int(event.get("seq") or 0))
     if not ordered:
-        return [], [], []
+        return [], [], [], []
     first_turn = next(
         (event for event in ordered if str(event.get("type") or "") == "turn_started"),
         None,
@@ -8179,12 +9029,22 @@ def semantic_timeline_ordinary_candidates(
         semantic_timeline_event_identity(event)
         for event in [*primary, *secondary]
     }
-    optional = [
+    remaining = [
         event
         for event in reversed(ordered)
         if semantic_timeline_event_identity(event) not in core_ids
     ]
-    return primary, secondary, optional
+    essential = [
+        event
+        for event in remaining
+        if str(event.get("type") or "") in SEMANTIC_TIMELINE_ESSENTIAL_DETAIL_TYPES
+    ]
+    optional = [
+        event
+        for event in remaining
+        if str(event.get("type") or "") not in SEMANTIC_TIMELINE_ESSENTIAL_DETAIL_TYPES
+    ]
+    return primary, secondary, essential, optional
 
 
 def collect_semantic_timeline_events(
@@ -8336,6 +9196,7 @@ def collect_semantic_timeline_events(
         list[dict[str, Any]],
         list[dict[str, Any]],
         list[dict[str, Any]],
+        list[dict[str, Any]],
     ]] = []
     for landmark in selected:
         key = str(landmark.get("key") or "")
@@ -8348,14 +9209,24 @@ def collect_semantic_timeline_events(
                 semantic_timeline_event_identity(event): event
                 for event in [*standalone, *representatives, *extras]
             }
+            optional = sorted(
+                optional_by_id.values(),
+                key=lambda event: int(event.get("seq") or 0),
+                reverse=True,
+            )
             bundles.append((
                 [semantic_job_summary_event(session_id, state)],
                 [],
-                sorted(
-                    optional_by_id.values(),
-                    key=lambda event: int(event.get("seq") or 0),
-                    reverse=True,
-                ),
+                [
+                    event
+                    for event in optional
+                    if str(event.get("type") or "") in SEMANTIC_TIMELINE_ESSENTIAL_DETAIL_TYPES
+                ],
+                [
+                    event
+                    for event in optional
+                    if str(event.get("type") or "") not in SEMANTIC_TIMELINE_ESSENTIAL_DETAIL_TYPES
+                ],
             ))
         elif str(landmark.get("kind") or "") == "codex_lifecycle":
             lifecycle_events = events_by_key.get(key, [])
@@ -8364,17 +9235,17 @@ def collect_semantic_timeline_events(
                 key=lambda event: int(event.get("seq") or 0),
                 default=None,
             )
-            bundles.append(([latest] if latest is not None else [], [], []))
+            bundles.append(([latest] if latest is not None else [], [], [], []))
         else:
             bundles.append(semantic_timeline_ordinary_candidates(events_by_key.get(key, [])))
 
     deduplicated: dict[str, dict[str, Any]] = {}
 
-    def append_with_budget(event: dict[str, Any]) -> bool:
+    def append_with_limit(event: dict[str, Any], limit: int) -> bool:
         identity = semantic_timeline_event_identity(event)
         if identity in deduplicated:
             return False
-        if len(deduplicated) >= event_limit:
+        if len(deduplicated) >= limit:
             return False
         deduplicated[identity] = event
         return True
@@ -8382,26 +9253,57 @@ def collect_semantic_timeline_events(
     # Every selected semantic item gets one representative before any item
     # receives detail. The page-size clamp in read_semantic_timeline_page()
     # guarantees that this baseline always fits.
-    for primary, _secondary, _optional in bundles:
+    for primary, _secondary, _essential, _optional in bundles:
         if primary:
-            append_with_budget(primary[0])
+            append_with_limit(primary[0], event_limit)
 
     # Preserve both sides of ordinary chat turns whenever the response budget
     # permits it. Newer units win only when a caller requests more semantic
     # items than can fit with two events apiece.
-    for _primary, secondary, _optional in reversed(bundles):
+    for _primary, secondary, _essential, _optional in reversed(bundles):
         for event in secondary:
-            append_with_budget(event)
+            append_with_limit(event, event_limit)
+
+    # Files and reviewable diffs are semantic output, not optional trace
+    # detail. Give each selected item a generous but bounded overflow and also
+    # cap total page overflow. This preserves normal multi-video workflows
+    # without allowing one pathological turn to return 1,000 media records.
+    essential_queues = [
+        deque(essential[:SEMANTIC_TIMELINE_ESSENTIAL_LIMIT_PER_ITEM])
+        for _primary, _secondary, essential, _optional in bundles
+    ]
+    essential_response_limit = min(
+        MAX_EVENT_RESPONSE_LIMIT,
+        event_limit + min(
+            SEMANTIC_TIMELINE_ESSENTIAL_PAGE_OVERFLOW_LIMIT,
+            len(bundles) * SEMANTIC_TIMELINE_ESSENTIAL_LIMIT_PER_ITEM,
+        ),
+    )
+    while len(deduplicated) < essential_response_limit:
+        made_progress = False
+        for queue in reversed(essential_queues):
+            while queue:
+                event = queue.popleft()
+                if append_with_limit(event, essential_response_limit):
+                    made_progress = True
+                    break
+            if len(deduplicated) >= essential_response_limit:
+                break
+        if not made_progress:
+            break
 
     # Fill remaining space round-robin so one trace-heavy turn cannot crowd
     # every other selected item out of the response.
-    optional_queues = [deque(optional) for _primary, _secondary, optional in bundles]
+    optional_queues = [
+        deque(optional)
+        for _primary, _secondary, _essential, optional in bundles
+    ]
     while len(deduplicated) < event_limit:
         made_progress = False
         for queue in reversed(optional_queues):
             while queue:
                 event = queue.popleft()
-                if append_with_budget(event):
+                if append_with_limit(event, event_limit):
                     made_progress = True
                     break
             if len(deduplicated) >= event_limit:
@@ -8435,56 +9337,57 @@ def read_semantic_timeline_page(
     tail: bool = True,
 ) -> dict[str, Any]:
     limit = max(1, min(int(limit or 500), MAX_EVENT_RESPONSE_LIMIT))
-    index = build_timeline_index(session_id)
-    cached = TIMELINE_INDEX_CACHE.get(session_id) or {}
-    job_by_run = dict(cached.get("job_by_run") or {})
-    fork_internal_run_ids = set(cached.get("fork_internal_run_ids") or ())
-    original_start_by_key = {
-        str(record.get("key") or ""): int(record.get("start_seq") or 0)
-        for record in cached.get("records") or []
-    }
-    start_offset_by_key = {
-        str(record.get("key") or ""): max(0, int(record.get("start_offset") or 0))
-        for record in cached.get("records") or []
-    }
-    landmarks = sorted(
-        (
-            {
-                **dict(landmark),
-                "_semantic_original_start_seq": original_start_by_key.get(
-                    str(landmark.get("key") or ""),
-                    int(landmark.get("start_seq") or 0),
-                ),
-                "_semantic_start_offset": start_offset_by_key.get(
-                    str(landmark.get("key") or ""),
-                    0,
-                ),
-            }
-            for landmark in index.get("landmarks") or []
-        ),
-        key=lambda landmark: (
-            semantic_timeline_landmark_anchor(landmark),
-            str(landmark.get("key") or ""),
-        ),
-    )
-    total = len(landmarks)
-    boundary = int(semantic_before) if semantic_before is not None else None
-    eligible = [
-        landmark for landmark in landmarks
-        if semantic_timeline_landmark_anchor(landmark) > after
-        and (
-            boundary is None
-            or semantic_timeline_landmark_anchor(landmark) < boundary
+    lock = timeline_index_session_lock(session_id)
+    with lock:
+        index = _build_timeline_index_locked(session_id)
+        cached = timeline_index_cached_entry(session_id, touch=True) or {}
+        job_by_run = dict(cached.get("job_by_run") or {})
+        fork_internal_run_ids = set(cached.get("fork_internal_run_ids") or ())
+        records_by_key = cached.get("by_key") or {}
+        landmarks = index.get("landmarks") or []
+        total = len(landmarks)
+        boundary = (
+            int(semantic_before)
+            if semantic_before is not None
+            else None
         )
-    ]
-    if tail:
-        selected = eligible[-limit:]
-        omitted_before = max(0, len(eligible) - len(selected))
-        omitted_after = 0
-    else:
-        selected = eligible[:limit]
-        omitted_before = 0
-        omitted_after = max(0, len(eligible) - len(selected))
+        eligible_count = 0
+        selected_landmarks: deque[dict[str, Any]] = deque(
+            maxlen=limit if tail else None
+        )
+        for landmark in landmarks:
+            anchor = semantic_timeline_landmark_anchor(landmark)
+            if anchor <= after or (
+                boundary is not None and anchor >= boundary
+            ):
+                continue
+            eligible_count += 1
+            if tail or len(selected_landmarks) < limit:
+                selected_landmarks.append(landmark)
+        selected = []
+        for landmark in selected_landmarks:
+            key = str(landmark.get("key") or "")
+            record = records_by_key.get(key) or {}
+            selected.append({
+                **dict(landmark),
+                "_semantic_original_start_seq": int(
+                    record.get("start_seq")
+                    or landmark.get("start_seq")
+                    or 0
+                ),
+                "_semantic_start_offset": max(
+                    0,
+                    int(record.get("start_offset") or 0),
+                ),
+            })
+        if tail:
+            omitted_before = max(0, eligible_count - len(selected))
+            omitted_after = 0
+        else:
+            omitted_before = 0
+            omitted_after = max(0, eligible_count - len(selected))
+    with TIMELINE_INDEX_CACHE_LOCK:
+        evict_timeline_index_cache_locked()
     events = collect_semantic_timeline_events(
         session_id,
         selected,
@@ -17697,6 +18600,50 @@ async def list_session_jobs(session_id: str) -> dict[str, Any]:
         reverse=True,
     )
     return {"jobs": jobs}
+
+
+@app.get("/api/sessions/{session_id}/jobs/{job_id}/runs")
+async def get_session_job_runs(
+    session_id: str,
+    job_id: str,
+    before_seq: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=20, ge=1, le=100),
+) -> dict[str, Any]:
+    if session_id not in STORE.sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+    try:
+        return await asyncio.to_thread(
+            read_scheduled_job_runs,
+            session_id,
+            job_id,
+            before_seq=before_seq,
+            limit=limit,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
+
+
+@app.get("/api/sessions/{session_id}/runs/{run_id}/trace")
+async def get_session_run_trace(
+    session_id: str,
+    run_id: str,
+    anchor_seq: int | None = Query(default=None, ge=1),
+    after_seq: int = Query(default=0, ge=0),
+    limit: int = Query(default=160, ge=1, le=1_000),
+) -> dict[str, Any]:
+    if session_id not in STORE.sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+    try:
+        return await asyncio.to_thread(
+            read_indexed_run_trace,
+            session_id,
+            run_id,
+            anchor_seq=anchor_seq,
+            after_seq=after_seq,
+            limit=limit,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
 
 
 @app.post("/api/jobs")

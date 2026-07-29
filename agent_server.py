@@ -3814,6 +3814,20 @@ QUEUED_TURNS: dict[str, deque[dict[str, Any]]] = {}
 RUN_NOW_TURNS: dict[str, dict[str, Any]] = {}
 STEERING_SESSIONS: set[str] = set()
 QUEUE_LOCK = asyncio.Lock()
+RUN_NOW_REQUESTS: dict[str, tuple[str, asyncio.Task[dict[str, Any]]]] = {}
+RUN_NOW_REQUEST_LOCK = asyncio.Lock()
+RUN_NOW_COMPLETED_TTL_SECONDS = max(
+    1.0,
+    float(agentsdock_setting("RUN_NOW_COMPLETED_TTL_SECONDS", "120")),
+)
+RUN_NOW_COMPLETED_MAX = max(
+    16,
+    int(agentsdock_setting("RUN_NOW_COMPLETED_MAX", "512")),
+)
+RUN_NOW_COMPLETED_RESULTS: OrderedDict[
+    tuple[str, str],
+    dict[str, Any],
+] = OrderedDict()
 RUN_METADATA: dict[str, dict[str, Any]] = {}
 CODEX_APP_SERVER_MANAGER: CodexAppServerManager | None = None
 CODEX_APP_SERVER_MANAGER_LOCK = asyncio.Lock()
@@ -4605,6 +4619,105 @@ def queued_codex_runtime_matches_active(
 
 
 async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]:
+    """Coalesce duplicate Force Send requests without replaying a steer."""
+    cached: dict[str, Any] | None = None
+    async with RUN_NOW_REQUEST_LOCK:
+        now = time.monotonic()
+        for key, outcome in list(RUN_NOW_COMPLETED_RESULTS.items()):
+            if float(outcome.get("expires_at") or 0) <= now:
+                RUN_NOW_COMPLETED_RESULTS.pop(key, None)
+        cache_key = (session_id, queued_id)
+        cached = RUN_NOW_COMPLETED_RESULTS.get(cache_key)
+        if cached is not None:
+            RUN_NOW_COMPLETED_RESULTS.move_to_end(cache_key)
+        existing = RUN_NOW_REQUESTS.get(session_id)
+        if cached is not None:
+            task = None
+        elif existing is not None:
+            existing_queued_id, existing_task = existing
+            if existing_queued_id != queued_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Another Force Send is already being applied. "
+                        "Wait for it to finish before steering a different message."
+                    ),
+                )
+            task = existing_task
+        else:
+            task = asyncio.create_task(
+                _run_queued_turn_now_and_release(session_id, queued_id)
+            )
+            RUN_NOW_REQUESTS[session_id] = (queued_id, task)
+
+    if cached is not None:
+        error = cached.get("error")
+        if isinstance(error, dict):
+            raise NativeSteerHandoffError(
+                str(error.get("message") or "Force Send delivery is uncertain"),
+                safe_to_requeue=False,
+                delivery_uncertain=True,
+            )
+        result = cached.get("result")
+        if isinstance(result, dict):
+            return dict(result)
+        raise HTTPException(status_code=409, detail="Force Send result is unavailable")
+
+    # A dropped HTTP connection must not cancel a steer that may already have
+    # reached the provider. Later duplicate requests join this task.
+    assert task is not None
+    return await asyncio.shield(task)
+
+
+async def _run_queued_turn_now_and_release(
+    session_id: str,
+    queued_id: str,
+) -> dict[str, Any]:
+    result: dict[str, Any] | None = None
+    uncertain_error: dict[str, Any] | None = None
+    try:
+        result = await _run_queued_turn_now_once(session_id, queued_id)
+        return result
+    except NativeSteerHandoffError as exc:
+        if exc.delivery_uncertain or not exc.safe_to_requeue:
+            uncertain_error = {"message": str(exc)}
+        raise
+    finally:
+        async with RUN_NOW_REQUEST_LOCK:
+            cacheable_result = (
+                result
+                if result is not None
+                and result.get("ok") is True
+                and not result.get("deferred")
+                else None
+            )
+            if cacheable_result is not None or uncertain_error is not None:
+                cache_key = (session_id, queued_id)
+                RUN_NOW_COMPLETED_RESULTS[cache_key] = {
+                    "expires_at": (
+                        time.monotonic() + RUN_NOW_COMPLETED_TTL_SECONDS
+                    ),
+                    **(
+                        {"result": dict(cacheable_result)}
+                        if cacheable_result is not None
+                        else {"error": uncertain_error}
+                    ),
+                }
+                RUN_NOW_COMPLETED_RESULTS.move_to_end(cache_key)
+                while len(RUN_NOW_COMPLETED_RESULTS) > RUN_NOW_COMPLETED_MAX:
+                    RUN_NOW_COMPLETED_RESULTS.popitem(last=False)
+            current = RUN_NOW_REQUESTS.get(session_id)
+            if (
+                current is not None
+                and current[1] is asyncio.current_task()
+            ):
+                RUN_NOW_REQUESTS.pop(session_id, None)
+
+
+async def _run_queued_turn_now_once(
+    session_id: str,
+    queued_id: str,
+) -> dict[str, Any]:
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
 
@@ -4619,7 +4732,13 @@ async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]
     remaining: int
     async with QUEUE_LOCK:
         if session_id in STEERING_SESSIONS or RUN_NOW_TURNS.get(session_id) is not None:
-            raise HTTPException(status_code=409, detail="another steering handoff is already in progress")
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Force Send is already being applied. "
+                    "Wait for it to finish before steering another message."
+                ),
+            )
         queue = QUEUED_TURNS.get(session_id)
         if queue:
             items = list(queue)
@@ -14075,6 +14194,26 @@ def codex_reasoning_text(payload: dict[str, Any]) -> str:
     return ""
 
 
+def codex_app_server_reasoning_summary(payload: dict[str, Any]) -> str:
+    """Extract only app-server's user-visible completed reasoning summary.
+
+    ``reasoning.text`` and ``item/reasoning/textDelta`` can contain raw model
+    reasoning. They are never a persistence fallback for AgentsDock.
+    """
+    summary = payload.get("summary")
+    if not isinstance(summary, list):
+        return ""
+    parts: list[str] = []
+    for item in summary:
+        if isinstance(item, dict):
+            part = str(item.get("text") or item.get("summary_text") or "").strip()
+            if part:
+                parts.append(part)
+        elif isinstance(item, str) and item.strip():
+            parts.append(item.strip())
+    return "\n".join(parts).strip()
+
+
 def codex_exec_agent_message(event: dict[str, Any]) -> tuple[str, str] | None:
     """Return text and phase from every Codex exec agent-message shape."""
     event_type = str(event.get("type") or "")
@@ -15372,17 +15511,25 @@ async def run_codex_app_server(
     delivery_unknown = False
     turn_completed = False
     current_run_id = run_id
+    current_provider_prompt = prompt
     current_diff_baseline = diff_baseline
     manifest_watch_task: asyncio.Task[None] | None = None
     goal_time_budget_task: asyncio.Task[None] | None = None
     logical_state_lock = asyncio.Lock()
     steer_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    notification_task: asyncio.Task[tuple[int, dict[str, Any]]] | None = None
+    synthetic_notification_sequence = 0
+    handled_notification_sequence = 0
+    last_activity = time.monotonic()
 
     text_parts: list[str] = []
     seen_text: set[str] = set()
     seen_reasoning: set[str] = set()
+    emitted_final_item_ids: set[str] = set()
+    emitted_reasoning_item_ids: set[str] = set()
     assistant_deltas: dict[str, list[str]] = {}
-    reasoning_deltas: dict[str, list[str]] = {}
+    reasoning_summary_deltas: dict[str, list[str]] = {}
+    plan_deltas: dict[str, list[str]] = {}
     tool_output_deltas: dict[str, deque[str]] = {}
     tool_output_lengths: dict[str, int] = {}
     tool_output_truncated: set[str] = set()
@@ -15392,6 +15539,7 @@ async def run_codex_app_server(
     changed_paths: set[str] = set()
     seen_artifacts: set[str] = set()
     pending_unknown_message = ""
+    pending_unknown_item_id = ""
 
     def append_tool_output_delta(item_id: str, value: Any) -> None:
         delta = str(value or "")
@@ -15423,21 +15571,39 @@ async def run_codex_app_server(
     def current_metadata() -> dict[str, Any]:
         return run_event_metadata(current_run_id)
 
-    async def emit_final_text(value: Any) -> None:
+    async def emit_final_text(value: Any, *, item_id: str = "") -> None:
         text = clean_assistant_text(str(value or ""))
-        if not text or text in seen_text:
+        if not text:
+            return
+        if (
+            item_id
+            and item_id in emitted_final_item_ids
+        ) or text in seen_text:
             return
         seen_text.add(text)
         text_parts.append(text)
         await append_event(session_id, "assistant_text", {
             "run_id": current_run_id,
             "text": text,
+            **({"item_id": item_id} if item_id else {}),
             **current_metadata(),
         })
+        if item_id:
+            emitted_final_item_ids.add(item_id)
 
-    async def emit_reasoning(value: Any, *, phase: str = "") -> None:
+    async def emit_reasoning(
+        value: Any,
+        *,
+        phase: str = "",
+        item_id: str = "",
+    ) -> None:
         text = str(value or "").strip()
-        if not text or text in seen_reasoning:
+        if not text:
+            return
+        if item_id:
+            if item_id in emitted_reasoning_item_ids:
+                return
+        elif text in seen_reasoning:
             return
         seen_reasoning.add(text)
         payload = {
@@ -15446,18 +15612,28 @@ async def run_codex_app_server(
         }
         if phase:
             payload["phase"] = phase
+        if item_id:
+            payload["item_id"] = item_id
         await append_event(session_id, "reasoning_summary", payload)
+        if item_id:
+            emitted_reasoning_item_ids.add(item_id)
 
     async def flush_pending_unknown(*, final: bool) -> None:
-        nonlocal pending_unknown_message
+        nonlocal pending_unknown_message, pending_unknown_item_id
         text = pending_unknown_message
+        item_id = pending_unknown_item_id
         pending_unknown_message = ""
+        pending_unknown_item_id = ""
         if not text:
             return
         if final:
-            await emit_final_text(text)
+            await emit_final_text(text, item_id=item_id)
         else:
-            await emit_reasoning(text, phase="commentary")
+            await emit_reasoning(
+                text,
+                phase="commentary",
+                item_id=item_id,
+            )
 
     async def emit_tool_started(tool: dict[str, Any]) -> None:
         tool_id = str(tool.get("id") or "")
@@ -15589,12 +15765,18 @@ async def run_codex_app_server(
         )
 
     def clear_logical_buffers() -> None:
-        nonlocal pending_unknown_message
+        nonlocal pending_unknown_message, pending_unknown_item_id
+        nonlocal terminal_error, terminal_status, error_emitted
+        # Native turn/steer keeps one provider turn. Clear only unfinished
+        # delta state at the logical UI boundary; turn-wide completed item IDs
+        # deliberately survive so a repeated notification cannot duplicate a
+        # pre-steer reasoning/commentary item under the new logical run.
         text_parts.clear()
         seen_text.clear()
         seen_reasoning.clear()
         assistant_deltas.clear()
-        reasoning_deltas.clear()
+        reasoning_summary_deltas.clear()
+        plan_deltas.clear()
         tool_output_deltas.clear()
         tool_output_lengths.clear()
         tool_output_truncated.clear()
@@ -15604,12 +15786,59 @@ async def run_codex_app_server(
         changed_paths.clear()
         seen_artifacts.clear()
         pending_unknown_message = ""
+        pending_unknown_item_id = ""
+        terminal_error = None
+        terminal_status = "failed"
+        error_emitted = False
+
+    async def next_sequenced_notification() -> tuple[int, dict[str, Any]]:
+        nonlocal synthetic_notification_sequence
+        if turn is None:
+            raise CodexAppServerError("Codex app-server turn is unavailable")
+        sequenced_reader = getattr(
+            turn,
+            "next_notification_with_sequence",
+            None,
+        )
+        if callable(sequenced_reader):
+            sequence, notification = await sequenced_reader()
+            return int(sequence), dict(notification)
+        # Compatibility for tests or third-party manager wrappers created
+        # before receive-order watermarks were added.
+        notification = await turn.next_notification()
+        synthetic_notification_sequence += 1
+        return synthetic_notification_sequence, dict(notification)
+
+    async def drain_notifications_through(watermark: int) -> None:
+        """Persist exactly the provider notifications preceding steer ack."""
+        nonlocal notification_task, handled_notification_sequence
+        nonlocal last_activity
+        while handled_notification_sequence < watermark:
+            if notification_task is None:
+                notification_task = asyncio.create_task(
+                    next_sequenced_notification()
+                )
+            sequence, notification = await notification_task
+            notification_task = None
+            if sequence <= handled_notification_sequence:
+                continue
+            if sequence > watermark:
+                raise CodexAppServerProtocolError(
+                    "turn/steer notification watermark skipped routed output",
+                    request_sent=True,
+                    safe_to_retry=False,
+                )
+            handled_notification_sequence = sequence
+            last_activity = time.monotonic()
+            await handle_notification(notification)
 
     async def switch_logical_run(
         selected: dict[str, Any],
         remaining: int,
     ) -> dict[str, Any]:
-        nonlocal current_run_id, current_diff_baseline, manifest_watch_task
+        nonlocal current_run_id, current_provider_prompt
+        nonlocal current_diff_baseline, manifest_watch_task, last_activity
+        nonlocal delivery_unknown
         if turn is None or turn_completed:
             raise NativeSteerHandoffError(
                 "the active Codex turn has already completed",
@@ -15634,12 +15863,62 @@ async def run_codex_app_server(
                 safe_to_requeue=True,
             ) from exc
 
+        transition_ready = asyncio.Event()
+        transition_reserved = False
+
+        async def release_transition_boundary() -> None:
+            nonlocal transition_reserved
+            if not transition_reserved:
+                return
+            transition_reserved = False
+            transition_ready.set()
+            async with ACTIVE_LOCK:
+                active = ACTIVE.get(session_id)
+                if (
+                    active
+                    and active.get("logical_transition_ready") is transition_ready
+                ):
+                    active.pop("logical_transition_ready", None)
+                    active.pop("logical_transition_candidate_run_id", None)
+
+        async with ACTIVE_LOCK:
+            active = ACTIVE.get(session_id)
+            if not active or active.get("stop_requested"):
+                raise NativeSteerHandoffError(
+                    "the active Codex turn is already stopping",
+                    safe_to_requeue=True,
+                )
+            active["logical_transition_ready"] = transition_ready
+            active["logical_transition_candidate_run_id"] = candidate_run_id
+            transition_reserved = True
+
         try:
-            await turn.steer(
-                [{"type": "text", "text": request_prompt, "text_elements": []}],
-                client_user_message_id=candidate_run_id,
+            steer_with_watermark = getattr(
+                turn,
+                "steer_with_notification_watermark",
+                None,
             )
+            if callable(steer_with_watermark):
+                _turn_id, notification_watermark = await steer_with_watermark(
+                    [{
+                        "type": "text",
+                        "text": request_prompt,
+                        "text_elements": [],
+                    }],
+                    client_user_message_id=candidate_run_id,
+                )
+            else:
+                await turn.steer(
+                    [{
+                        "type": "text",
+                        "text": request_prompt,
+                        "text_elements": [],
+                    }],
+                    client_user_message_id=candidate_run_id,
+                )
+                notification_watermark = handled_notification_sequence
         except CodexAppServerRequestError as exc:
+            await release_transition_boundary()
             raise NativeSteerHandoffError(
                 concise_error_message(exc),
                 safe_to_requeue=True,
@@ -15648,6 +15927,7 @@ async def run_codex_app_server(
             # Delivery may have succeeded. Never put this message back in the
             # queue, and interrupt the provider turn so uncertain output cannot
             # be attributed to the preceding logical request.
+            delivery_unknown = True
             with suppress(CodexAppServerError):
                 await turn.interrupt()
             with suppress(Exception):
@@ -15661,11 +15941,56 @@ async def run_codex_app_server(
                     ),
                     "delivery_unknown": True,
                 })
+            await release_transition_boundary()
             raise NativeSteerHandoffError(
                 concise_error_message(exc),
                 safe_to_requeue=False,
                 delivery_uncertain=True,
             ) from exc
+
+        try:
+            await drain_notifications_through(int(notification_watermark))
+        except Exception as exc:
+            delivery_unknown = True
+            with suppress(CodexAppServerError):
+                await turn.interrupt()
+            with suppress(Exception):
+                await append_event(session_id, "error", {
+                    "run_id": current_run_id,
+                    "backend": BACKEND_CODEX,
+                    "transport": CODEX_TRANSPORT_APP_SERVER,
+                    "message": (
+                        "Force Send was accepted, but the provider output boundary "
+                        "could not be reconciled. The message was not replayed."
+                    ),
+                    "delivery_unknown": True,
+                })
+            await release_transition_boundary()
+            raise NativeSteerHandoffError(
+                concise_error_message(exc),
+                safe_to_requeue=False,
+                delivery_uncertain=True,
+            ) from exc
+
+        if turn_completed:
+            delivery_unknown = True
+            with suppress(Exception):
+                await append_event(session_id, "error", {
+                    "run_id": current_run_id,
+                    "backend": BACKEND_CODEX,
+                    "transport": CODEX_TRANSPORT_APP_SERVER,
+                    "message": (
+                        "Force Send was acknowledged as the provider turn "
+                        "completed. Delivery is uncertain, so it was not replayed."
+                    ),
+                    "delivery_unknown": True,
+                })
+            await release_transition_boundary()
+            raise NativeSteerHandoffError(
+                "the provider turn completed at the Force Send boundary",
+                safe_to_requeue=False,
+                delivery_uncertain=True,
+            )
 
         previous_run_id = current_run_id
         previous_metadata = run_event_metadata(previous_run_id)
@@ -15707,21 +16032,21 @@ async def run_codex_app_server(
         if not lineage or steering_message != lineage[-1]:
             lineage.append(steering_message)
 
-        transition_ready = asyncio.Event()
-        stopped_during_handoff = False
+        active_missing_after_accept = False
         async with ACTIVE_LOCK:
             active = ACTIVE.get(session_id)
-            if not active or active.get("stop_requested"):
-                stopped_during_handoff = True
-            else:
+            if active:
+                stopped_during_handoff = bool(active.get("stop_requested"))
                 current_run_id = candidate_run_id
+                current_provider_prompt = request_prompt
                 current_diff_baseline = candidate_diff_baseline
-                RUN_METADATA[candidate_run_id] = metadata
                 clear_logical_buffers()
+                RUN_METADATA[candidate_run_id] = metadata
                 active["run_id"] = candidate_run_id
                 active["started_at"] = time.time()
                 active["started_at_iso"] = now_iso()
-                active["logical_transition_ready"] = transition_ready
+                if stopped_during_handoff:
+                    STOPPED_RUNS.add(candidate_run_id)
                 current = CURRENT_TURNS.get(session_id)
                 if current is not None:
                     current.update({
@@ -15732,12 +16057,30 @@ async def run_codex_app_server(
                         "queued_id": selected.get("queued_id"),
                         "steering_lineage": lineage,
                     })
-
-        if stopped_during_handoff:
+            else:
+                active_missing_after_accept = True
+        if active_missing_after_accept:
+            delivery_unknown = True
+            # The provider accepted the steer, so the selected message must
+            # never be replayed even if local active bookkeeping vanished.
+            with suppress(Exception):
+                await append_event(session_id, "error", {
+                    "run_id": previous_run_id,
+                    "backend": BACKEND_CODEX,
+                    "transport": CODEX_TRANSPORT_APP_SERVER,
+                    "message": (
+                        "Force Send was accepted, but its local turn state "
+                        "disappeared. The message was not replayed."
+                    ),
+                    "delivery_unknown": True,
+                })
+            await release_transition_boundary()
             raise NativeSteerHandoffError(
-                "the Codex turn was stopped while Force Send was being accepted",
+                "the active turn disappeared after Force Send was accepted",
                 safe_to_requeue=False,
+                delivery_uncertain=True,
             )
+        last_activity = time.monotonic()
 
         try:
             with suppress(OSError):
@@ -15808,14 +16151,7 @@ async def run_codex_app_server(
                 candidate_run_id,
             )
         finally:
-            transition_ready.set()
-            async with ACTIVE_LOCK:
-                active = ACTIVE.get(session_id)
-                if (
-                    active
-                    and active.get("logical_transition_ready") is transition_ready
-                ):
-                    active.pop("logical_transition_ready", None)
+            await release_transition_boundary()
 
         RUN_METADATA.pop(previous_run_id, None)
         STOPPED_RUNS.discard(previous_run_id)
@@ -15833,6 +16169,10 @@ async def run_codex_app_server(
                 session_id,
                 previous_run_id,
             )
+        # Bookkeeping and artifact finalization can be slow on remote disks.
+        # The steered request gets its full idle window after the handoff is
+        # actually ready to resume provider notification processing.
+        last_activity = time.monotonic()
         return {
             "ok": True,
             "queued_id": selected.get("queued_id"),
@@ -15873,6 +16213,8 @@ async def run_codex_app_server(
                 )
 
     def output_is_suppressed() -> bool:
+        if delivery_unknown:
+            return True
         if current_run_id in STOPPED_RUNS:
             return True
         active = ACTIVE.get(session_id)
@@ -15880,7 +16222,8 @@ async def run_codex_app_server(
 
     async def handle_notification(notification: dict[str, Any]) -> bool:
         nonlocal terminal_status, terminal_error, turn_completed
-        nonlocal pending_unknown_message, ambiguous_turn_start, error_emitted
+        nonlocal pending_unknown_message, pending_unknown_item_id
+        nonlocal ambiguous_turn_start, error_emitted
         method = str(notification.get("method") or "")
         params = (
             notification.get("params")
@@ -15902,12 +16245,17 @@ async def run_codex_app_server(
                 str(params.get("delta") or "")
             )
             return False
-        if method in {
-            "item/reasoning/summaryTextDelta",
-            "item/reasoning/textDelta",
-            "item/plan/delta",
-        } and item_id:
-            reasoning_deltas.setdefault(item_id, []).append(
+        if method == "item/reasoning/summaryTextDelta" and item_id:
+            reasoning_summary_deltas.setdefault(item_id, []).append(
+                str(params.get("delta") or "")
+            )
+            return False
+        if method == "item/reasoning/textDelta":
+            # Raw model reasoning is transient provider data and must never be
+            # persisted into the AgentsDock timeline.
+            return False
+        if method == "item/plan/delta" and item_id:
+            plan_deltas.setdefault(item_id, []).append(
                 str(params.get("delta") or "")
             )
             return False
@@ -15939,24 +16287,37 @@ async def run_codex_app_server(
                 phase = str(item.get("phase") or "")
                 if phase == "commentary":
                     await flush_pending_unknown(final=False)
-                    await emit_reasoning(text, phase="commentary")
+                    await emit_reasoning(
+                        text,
+                        phase="commentary",
+                        item_id=item_id,
+                    )
                 elif phase == "final_answer":
                     await flush_pending_unknown(final=False)
-                    await emit_final_text(text)
+                    await emit_final_text(text, item_id=item_id)
                 elif text:
                     await flush_pending_unknown(final=False)
                     pending_unknown_message = text
-            elif item_type in {"reasoning", "plan"}:
+                    pending_unknown_item_id = item_id
+            elif item_type == "reasoning":
                 await flush_pending_unknown(final=False)
-                buffered = reasoning_deltas.pop(
+                buffered = reasoning_summary_deltas.pop(
                     str(item.get("id") or ""),
                     [],
                 )
                 reasoning = (
-                    codex_reasoning_text(item)
+                    codex_app_server_reasoning_summary(item)
                     or "".join(buffered)
                 )
-                await emit_reasoning(reasoning)
+                await emit_reasoning(reasoning, item_id=item_id)
+            elif item_type == "plan":
+                await flush_pending_unknown(final=False)
+                buffered = plan_deltas.pop(
+                    str(item.get("id") or ""),
+                    [],
+                )
+                plan = codex_reasoning_text(item) or "".join(buffered)
+                await emit_reasoning(plan, phase="plan", item_id=item_id)
             else:
                 changed_paths.update(codex_app_server_changed_paths(item))
                 await emit_tool_finished(item)
@@ -16261,7 +16622,9 @@ async def run_codex_app_server(
                     )
                 )
                 last_activity = time.monotonic()
-                notification_task = asyncio.create_task(turn.next_notification())
+                notification_task = asyncio.create_task(
+                    next_sequenced_notification()
+                )
                 steer_task = asyncio.create_task(steer_queue.get())
                 try:
                     while not turn_completed:
@@ -16306,16 +16669,21 @@ async def run_codex_app_server(
                         # Drain provider output before a queued steering command
                         # when both became ready together.
                         if notification_task in done:
-                            notification = notification_task.result()
+                            sequence, notification = notification_task.result()
+                            handled_notification_sequence = max(
+                                handled_notification_sequence,
+                                sequence,
+                            )
                             last_activity = time.monotonic()
                             async with logical_state_lock:
                                 completed = await handle_notification(notification)
                             if completed:
                                 break
                             notification_task = asyncio.create_task(
-                                turn.next_notification()
+                                next_sequenced_notification()
                             )
-                            continue
+                            if steer_task not in done:
+                                continue
 
                         if steer_task in done:
                             command = steer_task.result()
@@ -16330,7 +16698,16 @@ async def run_codex_app_server(
                                     future.set_result(result)
                             except Exception as exc:
                                 if future is not None and not future.done():
-                                    future.set_exception(exc)
+                                    # Do not transfer a traceback that still
+                                    # owns this live runner frame into another
+                                    # task. Consumers such as unittest may
+                                    # clear received traceback frames, which
+                                    # can close this coroutine on Python 3.12.
+                                    future.set_exception(exc.with_traceback(None))
+                            if notification_task is None and not turn_completed:
+                                notification_task = asyncio.create_task(
+                                    next_sequenced_notification()
+                                )
                             steer_task = asyncio.create_task(steer_queue.get())
                 finally:
                     if steer_task.done() and not steer_task.cancelled():
@@ -16344,12 +16721,16 @@ async def run_codex_app_server(
                                         safe_to_requeue=True,
                                     )
                                 )
-                    for task in (notification_task, steer_task):
+                    cleanup_tasks = [
+                        task
+                        for task in (notification_task, steer_task)
+                        if task is not None
+                    ]
+                    for task in cleanup_tasks:
                         if not task.done():
                             task.cancel()
                     await asyncio.gather(
-                        notification_task,
-                        steer_task,
+                        *cleanup_tasks,
                         return_exceptions=True,
                     )
                     while not steer_queue.empty():
@@ -16394,7 +16775,7 @@ async def run_codex_app_server(
             await run_codex_exec(
                 session_id,
                 current_run_id,
-                prompt,
+                current_provider_prompt,
                 dict(STORE.sessions.get(session_id) or sess),
                 manifest_path,
                 diff_baseline=current_diff_baseline,
@@ -16471,7 +16852,7 @@ async def run_codex_app_server(
             await run_codex_app_server(
                 session_id,
                 current_run_id,
-                prompt,
+                current_provider_prompt,
                 fresh_session,
                 manifest_path,
                 allow_exec_fallback=allow_exec_fallback,

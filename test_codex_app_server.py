@@ -611,12 +611,27 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
                 )
             return {"turn": {"id": turn_id, "status": "inProgress", "items": []}}
 
+        steer_boundary_event = {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread_a",
+                "turnId": "turn_a",
+                "item": {
+                    "id": "reason-before-steer-ack",
+                    "type": "reasoning",
+                    "summary": [{"text": "Before ack"}],
+                },
+            },
+        }
+
+        def steer_turn(message: dict[str, Any]) -> dict[str, Any]:
+            process.feed(steer_boundary_event)
+            return {"turnId": message["params"]["expectedTurnId"]}
+
         process.responders.update(
             {
                 "turn/start": start_turn,
-                "turn/steer": lambda message: {
-                    "turnId": message["params"]["expectedTurnId"]
-                },
+                "turn/steer": steer_turn,
                 "turn/interrupt": lambda _: {},
             }
         )
@@ -669,13 +684,18 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
         process.feed(turn_b_event)
         self.assertEqual(await turn_b.next_notification(timeout=1), turn_b_event)
 
-        self.assertEqual(
-            await turn_a.steer(
+        steered_turn_id, notification_watermark = (
+            await turn_a.steer_with_notification_watermark(
                 [{"type": "text", "text": "steer A"}],
                 client_user_message_id="message-a",
-            ),
-            "turn_a",
+            )
         )
+        self.assertEqual(steered_turn_id, "turn_a")
+        boundary_sequence, boundary_notification = (
+            await turn_a.next_notification_with_sequence(timeout=1)
+        )
+        self.assertEqual(boundary_notification, steer_boundary_event)
+        self.assertEqual(boundary_sequence, notification_watermark)
         await turn_a.interrupt()
 
         completed = {

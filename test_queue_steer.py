@@ -2,7 +2,7 @@ import asyncio
 import json
 import tempfile
 import unittest
-from collections import deque
+from collections import OrderedDict, deque
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -227,6 +227,8 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         self.previous_queued = agent_server.QUEUED_TURNS
         self.previous_run_now = agent_server.RUN_NOW_TURNS
         self.previous_steering = agent_server.STEERING_SESSIONS
+        self.previous_run_now_requests = agent_server.RUN_NOW_REQUESTS
+        self.previous_run_now_completed = agent_server.RUN_NOW_COMPLETED_RESULTS
         self.previous_current = agent_server.CURRENT_TURNS
         agent_server.STORE.sessions = {
             "chat-1": {"id": "chat-1", "title": "Chat", "backend": "codex"},
@@ -241,6 +243,8 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         }
         agent_server.RUN_NOW_TURNS = {}
         agent_server.STEERING_SESSIONS = set()
+        agent_server.RUN_NOW_REQUESTS = {}
+        agent_server.RUN_NOW_COMPLETED_RESULTS = OrderedDict()
         agent_server.CURRENT_TURNS = {
             "chat-1": {
                 "run_id": "run-original",
@@ -255,7 +259,139 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         agent_server.QUEUED_TURNS = self.previous_queued
         agent_server.RUN_NOW_TURNS = self.previous_run_now
         agent_server.STEERING_SESSIONS = self.previous_steering
+        agent_server.RUN_NOW_REQUESTS = self.previous_run_now_requests
+        agent_server.RUN_NOW_COMPLETED_RESULTS = self.previous_run_now_completed
         agent_server.CURRENT_TURNS = self.previous_current
+
+    async def test_duplicate_force_send_requests_join_one_handoff(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def gated_handoff(
+            _session_id: str,
+            _queued_id: str,
+        ) -> dict[str, object]:
+            started.set()
+            await release.wait()
+            return {"ok": True, "queued_id": "queued-steer"}
+
+        with patch.object(
+            agent_server,
+            "_run_queued_turn_now_once",
+            side_effect=gated_handoff,
+        ) as handoff:
+            first = asyncio.create_task(
+                run_queued_turn_now("chat-1", "queued-steer")
+            )
+            await started.wait()
+            second = asyncio.create_task(
+                run_queued_turn_now("chat-1", "queued-steer")
+            )
+            await asyncio.sleep(0)
+            self.assertEqual(handoff.call_count, 1)
+            release.set()
+            first_result, second_result = await asyncio.gather(first, second)
+
+        self.assertEqual(first_result, second_result)
+        self.assertNotIn("chat-1", agent_server.RUN_NOW_REQUESTS)
+
+    async def test_retry_after_dropped_completed_response_reuses_result(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        completed = asyncio.Event()
+
+        async def gated_handoff(
+            _session_id: str,
+            _queued_id: str,
+        ) -> dict[str, object]:
+            started.set()
+            await release.wait()
+            completed.set()
+            return {
+                "ok": True,
+                "queued_id": "queued-steer",
+                "run_id": "run-steered",
+            }
+
+        with patch.object(
+            agent_server,
+            "_run_queued_turn_now_once",
+            side_effect=gated_handoff,
+        ) as handoff:
+            dropped_waiter = asyncio.create_task(
+                run_queued_turn_now("chat-1", "queued-steer")
+            )
+            await started.wait()
+            dropped_waiter.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await dropped_waiter
+            release.set()
+            await completed.wait()
+            for _ in range(100):
+                if "chat-1" not in agent_server.RUN_NOW_REQUESTS:
+                    break
+                await asyncio.sleep(0)
+            retried = await run_queued_turn_now("chat-1", "queued-steer")
+
+        self.assertEqual(retried["run_id"], "run-steered")
+        self.assertEqual(handoff.call_count, 1)
+
+    async def test_deferred_force_send_is_not_cached(self) -> None:
+        outcomes = [
+            {
+                "ok": False,
+                "queued_id": "queued-steer",
+                "deferred": True,
+            },
+            {
+                "ok": True,
+                "queued_id": "queued-steer",
+                "run_id": "run-steered",
+            },
+        ]
+
+        with patch.object(
+            agent_server,
+            "_run_queued_turn_now_once",
+            side_effect=outcomes,
+        ) as handoff:
+            first = await run_queued_turn_now("chat-1", "queued-steer")
+            second = await run_queued_turn_now("chat-1", "queued-steer")
+
+        self.assertTrue(first["deferred"])
+        self.assertEqual(second["run_id"], "run-steered")
+        self.assertEqual(handoff.call_count, 2)
+
+    async def test_different_force_send_is_rejected_with_friendly_state(
+        self,
+    ) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def gated_handoff(
+            _session_id: str,
+            _queued_id: str,
+        ) -> dict[str, object]:
+            started.set()
+            await release.wait()
+            return {"ok": True, "queued_id": "queued-steer"}
+
+        with patch.object(
+            agent_server,
+            "_run_queued_turn_now_once",
+            side_effect=gated_handoff,
+        ):
+            first = asyncio.create_task(
+                run_queued_turn_now("chat-1", "queued-steer")
+            )
+            await started.wait()
+            with self.assertRaisesRegex(
+                agent_server.HTTPException,
+                "Another Force Send is already being applied",
+            ):
+                await run_queued_turn_now("chat-1", "queued-other")
+            release.set()
+            await first
 
     async def test_interrupted_turn_promotes_only_the_exact_steering_message(self) -> None:
         append_event = AsyncMock(return_value={})
@@ -586,7 +722,7 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
             "queued_id": "already-steering",
             "prompt": "First steer",
         }
-        with self.assertRaisesRegex(agent_server.HTTPException, "already in progress"):
+        with self.assertRaisesRegex(agent_server.HTTPException, "already being applied"):
             await run_queued_turn_now("chat-1", "queued-steer")
         self.assertEqual(agent_server.RUN_NOW_TURNS["chat-1"]["queued_id"], "already-steering")
         self.assertEqual(len(agent_server.QUEUED_TURNS["chat-1"]), 1)

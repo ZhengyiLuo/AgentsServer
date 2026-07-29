@@ -244,6 +244,7 @@ class CodexAppServerSubscription:
     turn_id: str | None
     _queue: asyncio.Queue[Any]
     _closed: bool = False
+    _last_enqueued_sequence: int = 0
 
     def _matches(self, notification: dict[str, Any]) -> bool:
         notification_thread_id, notification_turn_id = _notification_scope(notification)
@@ -257,7 +258,9 @@ class CodexAppServerSubscription:
         if self._closed:
             return
         try:
-            self._queue.put_nowait(value)
+            self._last_enqueued_sequence += 1
+            sequence = self._last_enqueued_sequence
+            self._queue.put_nowait((sequence, value))
         except asyncio.QueueFull:
             self._finish(
                 CodexAppServerDisconnected(
@@ -278,16 +281,28 @@ class CodexAppServerSubscription:
         self._closed = True
         self.client._release_subscription(self)
 
-    async def next_notification(self, timeout: float | None = None) -> dict[str, Any]:
+    async def next_notification_with_sequence(
+        self,
+        timeout: float | None = None,
+    ) -> tuple[int, dict[str, Any]]:
         if self._closed and self._queue.empty():
             raise CodexAppServerSubscriptionClosed("app-server notification subscription closed")
         waiter = self._queue.get()
         value = await (asyncio.wait_for(waiter, timeout) if timeout is not None else waiter)
         if isinstance(value, BaseException):
             raise value
-        if not isinstance(value, dict):
+        if (
+            not isinstance(value, tuple)
+            or len(value) != 2
+            or not isinstance(value[0], int)
+            or not isinstance(value[1], dict)
+        ):
             raise CodexAppServerProtocolError("app-server notification was not an object")
         return value
+
+    async def next_notification(self, timeout: float | None = None) -> dict[str, Any]:
+        _sequence, notification = await self.next_notification_with_sequence(timeout)
+        return notification
 
     def close(self) -> None:
         self._finish()
@@ -307,6 +322,12 @@ class CodexAppServerTurn:
     async def next_notification(self, timeout: float | None = None) -> dict[str, Any]:
         return await self._subscription.next_notification(timeout)
 
+    async def next_notification_with_sequence(
+        self,
+        timeout: float | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        return await self._subscription.next_notification_with_sequence(timeout)
+
     async def steer(
         self,
         input_items: list[dict[str, Any]],
@@ -318,6 +339,20 @@ class CodexAppServerTurn:
             self.turn_id,
             input_items,
             client_user_message_id=client_user_message_id,
+        )
+
+    async def steer_with_notification_watermark(
+        self,
+        input_items: list[dict[str, Any]],
+        *,
+        client_user_message_id: str | None = None,
+    ) -> tuple[str, int]:
+        return await self.client.steer_turn_with_notification_watermark(
+            self.thread_id,
+            self.turn_id,
+            input_items,
+            client_user_message_id=client_user_message_id,
+            notification_subscription=self._subscription,
         )
 
     async def interrupt(self) -> None:
@@ -421,7 +456,14 @@ class CodexAppServerClient:
         self._start_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         self._next_id = 0
-        self._pending: dict[int, tuple[str, asyncio.Future[Any]]] = {}
+        self._pending: dict[
+            int,
+            tuple[
+                str,
+                asyncio.Future[Any],
+                CodexAppServerSubscription | None,
+            ],
+        ] = {}
         self._turns_by_thread: dict[str, CodexAppServerTurn] = {}
         self._loaded_threads: set[str] = set()
         self._subscriptions: set[CodexAppServerSubscription] = set()
@@ -640,7 +682,9 @@ class CodexAppServerClient:
             )
 
     def _fail_all(self, error: BaseException) -> None:
-        for _, future in list(self._pending.values()):
+        for _, future, _notification_boundary_subscription in list(
+            self._pending.values()
+        ):
             if not future.done():
                 future.set_exception(error)
         self._pending.clear()
@@ -666,6 +710,7 @@ class CodexAppServerClient:
         params: dict[str, Any],
         *,
         timeout: float | None = None,
+        notification_boundary_subscription: CodexAppServerSubscription | None = None,
     ) -> Any:
         proc = self._proc
         if not proc or proc.returncode is not None or not proc.stdin:
@@ -679,7 +724,11 @@ class CodexAppServerClient:
         self._next_id += 1
         request_id = self._next_id
         future: asyncio.Future[Any] = loop.create_future()
-        self._pending[request_id] = (method, future)
+        self._pending[request_id] = (
+            method,
+            future,
+            notification_boundary_subscription,
+        )
         try:
             await self._send({"id": request_id, "method": method, "params": params})
             try:
@@ -754,7 +803,11 @@ class CodexAppServerClient:
                 if request_id is not None and ("result" in message or "error" in message):
                     pending = self._pending.get(request_id)
                     if pending:
-                        request_method, future = pending
+                        (
+                            request_method,
+                            future,
+                            notification_boundary_subscription,
+                        ) = pending
                         if not future.done():
                             if "error" in message:
                                 future.set_exception(
@@ -764,7 +817,15 @@ class CodexAppServerClient:
                                     )
                                 )
                             else:
-                                future.set_result(message.get("result"))
+                                result = message.get("result")
+                                future.set_result(
+                                    (
+                                        result,
+                                        notification_boundary_subscription._last_enqueued_sequence,
+                                    )
+                                    if notification_boundary_subscription is not None
+                                    else result
+                                )
                     continue
 
                 if request_id is not None and message.get("method"):
@@ -1471,6 +1532,64 @@ class CodexAppServerClient:
                 safe_to_retry=False,
             )
         return resolved
+
+    async def steer_turn_with_notification_watermark(
+        self,
+        thread_id: str,
+        turn_id: str,
+        input_items: list[dict[str, Any]],
+        *,
+        client_user_message_id: str | None = None,
+        notification_subscription: CodexAppServerSubscription | None = None,
+    ) -> tuple[str, int]:
+        """Return the exact receive-order boundary of the steer response.
+
+        Notifications at or below the watermark were read before app-server's
+        steer acknowledgement and therefore belong to the preceding logical
+        AgentsDock run. Later notifications belong to the steered run.
+        """
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "expectedTurnId": turn_id,
+            "input": input_items,
+        }
+        if client_user_message_id:
+            params["clientUserMessageId"] = client_user_message_id
+        if notification_subscription is None:
+            active_turn = self._turns_by_thread.get(thread_id)
+            if active_turn is not None and active_turn.turn_id == turn_id:
+                notification_subscription = active_turn._subscription
+        if notification_subscription is None:
+            raise CodexAppServerProtocolError(
+                "turn/steer notification stream is unavailable",
+                request_sent=False,
+                safe_to_retry=True,
+            )
+        await self.start()
+        response = await self._request_connected(
+            "turn/steer",
+            params,
+            notification_boundary_subscription=notification_subscription,
+        )
+        if (
+            not isinstance(response, tuple)
+            or len(response) != 2
+            or not isinstance(response[1], int)
+        ):
+            raise CodexAppServerProtocolError(
+                "turn/steer did not return a notification watermark",
+                request_sent=True,
+                safe_to_retry=False,
+            )
+        result, watermark = response
+        resolved = str(result.get("turnId") or "") if isinstance(result, dict) else ""
+        if resolved != turn_id:
+            raise CodexAppServerProtocolError(
+                f"turn/steer returned unexpected turn id {resolved or '<missing>'}",
+                request_sent=True,
+                safe_to_retry=False,
+            )
+        return resolved, watermark
 
     async def interrupt_turn(self, thread_id: str, turn_id: str) -> None:
         await self.request(

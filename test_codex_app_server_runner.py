@@ -1,7 +1,7 @@
 import asyncio
 import time
 import unittest
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -23,9 +23,12 @@ class FakeTurn:
     ) -> None:
         self.turn_id = turn_id
         self.steer_error = steer_error
-        self.notifications: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        self.notifications: asyncio.Queue[
+            tuple[int, dict[str, object] | BaseException]
+        ] = asyncio.Queue()
+        self.notification_sequence = 0
         for notification in notifications or []:
-            self.notifications.put_nowait(notification)
+            self.feed(notification)
         self.steer_calls: list[tuple[list[dict[str, object]], str | None]] = []
         self.interrupt_calls = 0
         self.close_calls = 0
@@ -34,15 +37,22 @@ class FakeTurn:
         self,
         timeout: float | None = None,
     ) -> dict[str, object]:
+        _sequence, value = await self.next_notification_with_sequence(timeout)
+        return value
+
+    async def next_notification_with_sequence(
+        self,
+        timeout: float | None = None,
+    ) -> tuple[int, dict[str, object]]:
         waiter = self.notifications.get()
-        value = (
+        sequence, value = (
             await waiter
             if timeout is None
             else await asyncio.wait_for(waiter, timeout)
         )
         if isinstance(value, BaseException):
             raise value
-        return value
+        return sequence, value
 
     async def steer(
         self,
@@ -55,6 +65,18 @@ class FakeTurn:
             raise self.steer_error
         return self.turn_id
 
+    async def steer_with_notification_watermark(
+        self,
+        input_items: list[dict[str, object]],
+        *,
+        client_user_message_id: str | None = None,
+    ) -> tuple[str, int]:
+        turn_id = await self.steer(
+            input_items,
+            client_user_message_id=client_user_message_id,
+        )
+        return turn_id, self.notification_sequence
+
     async def interrupt(self) -> None:
         self.interrupt_calls += 1
 
@@ -64,8 +86,49 @@ class FakeTurn:
     def adopt_turn_id(self, turn_id: str) -> None:
         self.turn_id = turn_id
 
-    def feed(self, notification: dict[str, object]) -> None:
-        self.notifications.put_nowait(notification)
+    def feed(self, notification: dict[str, object] | BaseException) -> None:
+        self.notification_sequence += 1
+        self.notifications.put_nowait(
+            (self.notification_sequence, notification)
+        )
+
+
+class GatedSteerTurn(FakeTurn):
+    def __init__(
+        self,
+        notifications: list[dict[str, object]] | None = None,
+    ) -> None:
+        super().__init__(notifications)
+        self.steer_started = asyncio.Event()
+        self.steer_acknowledged = asyncio.Event()
+        self.ack_watermark = 0
+
+    async def steer(
+        self,
+        input_items: list[dict[str, object]],
+        *,
+        client_user_message_id: str | None = None,
+    ) -> str:
+        self.steer_calls.append((input_items, client_user_message_id))
+        self.steer_started.set()
+        await self.steer_acknowledged.wait()
+        return self.turn_id
+
+    async def steer_with_notification_watermark(
+        self,
+        input_items: list[dict[str, object]],
+        *,
+        client_user_message_id: str | None = None,
+    ) -> tuple[str, int]:
+        turn_id = await self.steer(
+            input_items,
+            client_user_message_id=client_user_message_id,
+        )
+        return turn_id, self.ack_watermark
+
+    def acknowledge_steer(self) -> None:
+        self.ack_watermark = self.notification_sequence
+        self.steer_acknowledged.set()
 
 
 class FakeManager:
@@ -168,6 +231,24 @@ def agent_message(
     }
 
 
+def reasoning_item(
+    item_id: str,
+    text: str,
+) -> dict[str, object]:
+    return {
+        "method": "item/completed",
+        "params": {
+            "threadId": "thread-native",
+            "turnId": "turn-native",
+            "item": {
+                "id": item_id,
+                "type": "reasoning",
+                "summary": [{"text": text}],
+            },
+        },
+    }
+
+
 class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.previous_sessions = agent_server.STORE.sessions
@@ -179,6 +260,8 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.previous_queued = agent_server.QUEUED_TURNS
         self.previous_run_now = agent_server.RUN_NOW_TURNS
         self.previous_steering = agent_server.STEERING_SESSIONS
+        self.previous_run_now_requests = agent_server.RUN_NOW_REQUESTS
+        self.previous_run_now_completed = agent_server.RUN_NOW_COMPLETED_RESULTS
         self.previous_run_metadata = agent_server.RUN_METADATA
 
         self.cwd = str(Path(__file__).resolve().parent.parent)
@@ -205,6 +288,8 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         agent_server.QUEUED_TURNS = {}
         agent_server.RUN_NOW_TURNS = {}
         agent_server.STEERING_SESSIONS = set()
+        agent_server.RUN_NOW_REQUESTS = {}
+        agent_server.RUN_NOW_COMPLETED_RESULTS = OrderedDict()
         agent_server.RUN_METADATA = {}
 
     async def asyncTearDown(self) -> None:
@@ -217,6 +302,8 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         agent_server.QUEUED_TURNS = self.previous_queued
         agent_server.RUN_NOW_TURNS = self.previous_run_now
         agent_server.STEERING_SESSIONS = self.previous_steering
+        agent_server.RUN_NOW_REQUESTS = self.previous_run_now_requests
+        agent_server.RUN_NOW_COMPLETED_RESULTS = self.previous_run_now_completed
         agent_server.RUN_METADATA = self.previous_run_metadata
 
     def runner_patches(
@@ -729,6 +816,441 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             run_now["run_id"],
         )
 
+    async def test_native_steer_preserves_completed_trace_items_by_item_id(
+        self,
+    ) -> None:
+        turn = FakeTurn([
+            reasoning_item("reason-a", "Same completed reasoning."),
+            reasoning_item("reason-b", "Same completed reasoning."),
+            agent_message(
+                "commentary-before",
+                "Completed commentary before steering.",
+                "commentary",
+            ),
+            {
+                "method": "item/reasoning/summaryTextDelta",
+                "params": {
+                    "threadId": "thread-native",
+                    "turnId": "turn-native",
+                    "itemId": "unfinished-reasoning",
+                    "delta": "This unfinished reasoning must stay transient.",
+                },
+            },
+            {
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "thread-native",
+                    "turnId": "turn-native",
+                    "itemId": "unfinished-commentary",
+                    "delta": "This unfinished commentary must stay transient.",
+                },
+            },
+        ])
+        manager = FakeManager(turn)
+        agent_server.QUEUED_TURNS["chat-native"] = deque([{
+            "queued_id": "queued-steer",
+            "prompt": "Steer without dropping completed trace items.",
+            "file_ids": [],
+            "backend": agent_server.BACKEND_CODEX,
+        }])
+        stack, events, _finished, _exec_fallback = self.runner_patches(manager)
+        with stack:
+            runner = asyncio.create_task(
+                agent_server.run_codex_app_server(
+                    "chat-native",
+                    "run-original",
+                    "Original request",
+                    dict(self.session),
+                    Path(self.cwd) / ".runner-test-manifest.json",
+                    allow_exec_fallback=True,
+                )
+            )
+            for _ in range(100):
+                completed_trace = [
+                    call
+                    for call in events.await_args_list
+                    if call.args[1] == "reasoning_summary"
+                ]
+                if len(completed_trace) == 3:
+                    break
+                await asyncio.sleep(0)
+            else:
+                self.fail("pre-steer trace items were not published")
+
+            run_now = await asyncio.wait_for(
+                agent_server.run_queued_turn_now(
+                    "chat-native",
+                    "queued-steer",
+                ),
+                timeout=2,
+            )
+            # Re-delivery of one authoritative item must not duplicate it,
+            # while a distinct item with identical text remains visible.
+            turn.feed(reasoning_item("reason-a", "Same completed reasoning."))
+            turn.feed(reasoning_item("reason-after", "Same completed reasoning."))
+            turn.feed(agent_message(
+                "commentary-after",
+                "Completed commentary after steering.",
+                "commentary",
+            ))
+            turn.feed(agent_message(
+                "final-after",
+                "One final answer.",
+                "final_answer",
+            ))
+            turn.feed(completed_notification())
+            await asyncio.wait_for(runner, timeout=2)
+
+        trace_payloads = [
+            call.args[2]
+            for call in events.await_args_list
+            if call.args[1] == "reasoning_summary"
+        ]
+        self.assertEqual(
+            [payload.get("item_id") for payload in trace_payloads],
+            [
+                "reason-a",
+                "reason-b",
+                "commentary-before",
+                "reason-after",
+                "commentary-after",
+            ],
+        )
+        self.assertEqual(
+            [payload["run_id"] for payload in trace_payloads[:3]],
+            ["run-original", "run-original", "run-original"],
+        )
+        self.assertEqual(
+            [payload["run_id"] for payload in trace_payloads[3:]],
+            [run_now["run_id"], run_now["run_id"]],
+        )
+        self.assertFalse(any(
+            "unfinished" in str(payload.get("text") or "").lower()
+            for payload in trace_payloads
+        ))
+        final_payloads = [
+            call.args[2]
+            for call in events.await_args_list
+            if call.args[1] == "assistant_text"
+        ]
+        self.assertEqual(len(final_payloads), 1)
+        self.assertEqual(final_payloads[0]["item_id"], "final-after")
+        self.assertEqual(final_payloads[0]["text"], "One final answer.")
+
+    async def test_app_server_never_persists_raw_reasoning_text(self) -> None:
+        turn = FakeTurn([
+            {
+                "method": "item/reasoning/textDelta",
+                "params": {
+                    "threadId": "thread-native",
+                    "turnId": "turn-native",
+                    "itemId": "raw-only",
+                    "delta": "SECRET RAW CHAIN",
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-native",
+                    "turnId": "turn-native",
+                    "item": {
+                        "id": "raw-only",
+                        "type": "reasoning",
+                        "text": "SECRET RAW CHAIN",
+                    },
+                },
+            },
+            {
+                "method": "item/reasoning/summaryTextDelta",
+                "params": {
+                    "threadId": "thread-native",
+                    "turnId": "turn-native",
+                    "itemId": "safe-summary-delta",
+                    "delta": "Safe delta summary.",
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-native",
+                    "turnId": "turn-native",
+                    "item": {
+                        "id": "safe-summary-delta",
+                        "type": "reasoning",
+                    },
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-native",
+                    "turnId": "turn-native",
+                    "item": {
+                        "id": "safe-summary",
+                        "type": "reasoning",
+                        "text": "RAW ITEM TEXT",
+                        "summary": [{"text": "Safe completed summary."}],
+                    },
+                },
+            },
+            agent_message(
+                "commentary",
+                "Completed commentary remains visible.",
+                "commentary",
+            ),
+            agent_message("final", "Done.", "final_answer"),
+            completed_notification(),
+        ])
+        manager = FakeManager(turn)
+        stack, events, _finished, _exec_fallback = self.runner_patches(manager)
+        with stack:
+            await agent_server.run_codex_app_server(
+                "chat-native",
+                "run-original",
+                "Do not leak raw reasoning",
+                dict(self.session),
+                Path(self.cwd) / ".runner-test-manifest.json",
+                allow_exec_fallback=True,
+                allow_resume_rollover=False,
+            )
+
+        traces = [
+            call.args[2]
+            for call in events.await_args_list
+            if call.args[1] == "reasoning_summary"
+        ]
+        self.assertEqual(
+            [trace["text"] for trace in traces],
+            [
+                "Safe delta summary.",
+                "Safe completed summary.",
+                "Completed commentary remains visible.",
+            ],
+        )
+        serialized = str(traces)
+        self.assertNotIn("SECRET RAW CHAIN", serialized)
+        self.assertNotIn("RAW ITEM TEXT", serialized)
+
+    async def test_native_steer_uses_ack_watermark_without_backlog_starvation(
+        self,
+    ) -> None:
+        turn = GatedSteerTurn()
+        manager = FakeManager(turn)
+        agent_server.QUEUED_TURNS["chat-native"] = deque([{
+            "queued_id": "queued-steer",
+            "prompt": "Switch to the new request.",
+            "file_ids": [],
+            "backend": agent_server.BACKEND_CODEX,
+        }])
+        stack, events, _finished, _exec_fallback = self.runner_patches(manager)
+        with stack:
+            runner = asyncio.create_task(
+                agent_server.run_codex_app_server(
+                    "chat-native",
+                    "run-original",
+                    "Original request",
+                    dict(self.session),
+                    Path(self.cwd) / ".runner-test-manifest.json",
+                    allow_exec_fallback=True,
+                    allow_resume_rollover=False,
+                )
+            )
+            for _ in range(100):
+                if (
+                    agent_server.ACTIVE.get("chat-native") or {}
+                ).get("provider_turn_ready"):
+                    break
+                await asyncio.sleep(0)
+            force_send = asyncio.create_task(
+                agent_server.run_queued_turn_now(
+                    "chat-native",
+                    "queued-steer",
+                )
+            )
+            await asyncio.wait_for(turn.steer_started.wait(), timeout=1)
+
+            turn.feed(reasoning_item("reason-before", "Reasoning before ack."))
+            turn.feed(agent_message(
+                "commentary-before",
+                "Commentary before ack.",
+                "commentary",
+            ))
+            turn.acknowledge_steer()
+            for index in range(40):
+                turn.feed(reasoning_item(
+                    f"reason-after-{index}",
+                    f"Reasoning after ack {index}.",
+                ))
+
+            run_now = await asyncio.wait_for(force_send, timeout=2)
+            turn.feed(agent_message("final-after", "Done.", "final_answer"))
+            turn.feed(completed_notification())
+            await asyncio.wait_for(runner, timeout=2)
+
+        traces = [
+            call.args[2]
+            for call in events.await_args_list
+            if call.args[1] == "reasoning_summary"
+        ]
+        by_id = {
+            str(payload.get("item_id") or ""): payload
+            for payload in traces
+        }
+        self.assertEqual(by_id["reason-before"]["run_id"], "run-original")
+        self.assertEqual(
+            by_id["commentary-before"]["run_id"],
+            "run-original",
+        )
+        self.assertTrue(all(
+            by_id[f"reason-after-{index}"]["run_id"] == run_now["run_id"]
+            for index in range(40)
+        ))
+        self.assertNotIn("chat-native", agent_server.STEERING_SESSIONS)
+
+    async def test_native_steer_resets_preceding_terminal_error(self) -> None:
+        turn = FakeTurn([
+            {
+                "method": "error",
+                "params": {
+                    "threadId": "thread-native",
+                    "turnId": "turn-native",
+                    "error": "old logical run error",
+                },
+            },
+            reasoning_item("old-error-boundary", "Old run continued."),
+        ])
+        manager = FakeManager(turn)
+        agent_server.QUEUED_TURNS["chat-native"] = deque([{
+            "queued_id": "queued-after-error",
+            "prompt": "Start clean after the old error.",
+            "file_ids": [],
+            "backend": agent_server.BACKEND_CODEX,
+        }])
+        stack, events, finished, _exec_fallback = self.runner_patches(manager)
+        with stack:
+            runner = asyncio.create_task(
+                agent_server.run_codex_app_server(
+                    "chat-native",
+                    "run-original",
+                    "Original request",
+                    dict(self.session),
+                    Path(self.cwd) / ".runner-test-manifest.json",
+                    allow_exec_fallback=True,
+                    allow_resume_rollover=False,
+                )
+            )
+            for _ in range(100):
+                if any(
+                    call.args[1] == "reasoning_summary"
+                    and call.args[2].get("item_id") == "old-error-boundary"
+                    for call in events.await_args_list
+                ):
+                    break
+                await asyncio.sleep(0)
+            run_now = await agent_server.run_queued_turn_now(
+                "chat-native",
+                "queued-after-error",
+            )
+            turn.feed(completed_notification("failed"))
+            await asyncio.wait_for(runner, timeout=2)
+
+        candidate_errors = [
+            call.args[2]
+            for call in events.await_args_list
+            if call.args[1] == "error"
+            and call.args[2].get("run_id") == run_now["run_id"]
+        ]
+        self.assertTrue(candidate_errors)
+        self.assertFalse(any(
+            "old logical run error" in str(payload.get("message") or "")
+            for payload in candidate_errors
+        ))
+        self.assertNotIn(
+            "old logical run error",
+            str(finished.await_args.args[1].get("result_text") or ""),
+        )
+
+    async def test_native_steer_resets_idle_timeout_window(self) -> None:
+        turn = FakeTurn()
+        manager = FakeManager(turn)
+        agent_server.QUEUED_TURNS["chat-native"] = deque([{
+            "queued_id": "queued-fresh-idle",
+            "prompt": "Give this request a fresh idle window.",
+            "file_ids": [],
+            "backend": agent_server.BACKEND_CODEX,
+        }])
+        real_wait = asyncio.wait
+
+        async def fast_poll(
+            futures: set[asyncio.Future[object] | asyncio.Task[object]],
+            *,
+            timeout: float | None = None,
+            return_when: str = asyncio.ALL_COMPLETED,
+        ) -> tuple[
+            set[asyncio.Future[object] | asyncio.Task[object]],
+            set[asyncio.Future[object] | asyncio.Task[object]],
+        ]:
+            return await real_wait(
+                futures,
+                timeout=min(0.01, timeout) if timeout is not None else 0.01,
+                return_when=return_when,
+            )
+
+        stack, events, _finished, _exec_fallback = self.runner_patches(manager)
+        with stack, patch.object(
+            agent_server.asyncio,
+            "wait",
+            fast_poll,
+        ), patch.object(
+            agent_server,
+            "IDLE_WARN_SECONDS",
+            0.15,
+        ), patch.object(
+            agent_server,
+            "IDLE_KILL_SECONDS",
+            0.2,
+        ):
+            runner = asyncio.create_task(
+                agent_server.run_codex_app_server(
+                    "chat-native",
+                    "run-original",
+                    "Original request",
+                    dict(self.session),
+                    Path(self.cwd) / ".runner-test-manifest.json",
+                    allow_exec_fallback=True,
+                    allow_resume_rollover=False,
+                )
+            )
+            for _ in range(100):
+                if (
+                    agent_server.ACTIVE.get("chat-native") or {}
+                ).get("provider_turn_ready"):
+                    break
+                await asyncio.sleep(0)
+            await asyncio.sleep(0.1)
+            run_now = await agent_server.run_queued_turn_now(
+                "chat-native",
+                "queued-fresh-idle",
+            )
+            await asyncio.sleep(0.12)
+            turn.feed(agent_message(
+                "final-fresh-idle",
+                "The steered run kept its full idle window.",
+                "final_answer",
+            ))
+            turn.feed(completed_notification())
+            await asyncio.wait_for(runner, timeout=2)
+
+        self.assertEqual(turn.interrupt_calls, 0)
+        finals = [
+            call.args[2]
+            for call in events.await_args_list
+            if call.args[1] == "assistant_text"
+            and call.args[2].get("item_id") == "final-fresh-idle"
+        ]
+        self.assertEqual(len(finals), 1)
+        self.assertEqual(finals[0]["run_id"], run_now["run_id"])
+
     async def test_simultaneous_completion_and_steer_settles_force_send(self) -> None:
         turn = FakeTurn([completed_notification()])
 
@@ -802,6 +1324,130 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(force_send.done())
 
+    async def test_completion_during_steer_ack_is_terminally_uncertain(self) -> None:
+        turn = GatedSteerTurn()
+        manager = FakeManager(turn)
+        agent_server.QUEUED_TURNS["chat-native"] = deque([{
+            "queued_id": "queued-at-boundary",
+            "prompt": "Steer at completion",
+            "file_ids": [],
+            "backend": agent_server.BACKEND_CODEX,
+        }])
+        stack, events, _finished, exec_fallback = self.runner_patches(manager)
+        with stack:
+            runner = asyncio.create_task(
+                agent_server.run_codex_app_server(
+                    "chat-native",
+                    "run-original",
+                    "Original request",
+                    dict(self.session),
+                    Path(self.cwd) / ".runner-test-manifest.json",
+                    allow_exec_fallback=True,
+                    allow_resume_rollover=True,
+                )
+            )
+            for _ in range(100):
+                if (
+                    agent_server.ACTIVE.get("chat-native") or {}
+                ).get("provider_turn_ready"):
+                    break
+                await asyncio.sleep(0)
+            force_send = asyncio.create_task(
+                agent_server.run_queued_turn_now(
+                    "chat-native",
+                    "queued-at-boundary",
+                )
+            )
+            await asyncio.wait_for(turn.steer_started.wait(), timeout=1)
+            turn.feed(completed_notification())
+            turn.acknowledge_steer()
+            with self.assertRaises(
+                agent_server.NativeSteerHandoffError
+            ) as raised:
+                await asyncio.wait_for(force_send, timeout=2)
+            await asyncio.wait_for(runner, timeout=2)
+
+        self.assertTrue(raised.exception.delivery_uncertain)
+        self.assertFalse(raised.exception.safe_to_requeue)
+        self.assertNotIn("chat-native", agent_server.QUEUED_TURNS)
+        self.assertNotIn("chat-native", agent_server.STEERING_SESSIONS)
+        self.assertEqual(len(turn.steer_calls), 1)
+        exec_fallback.assert_not_awaited()
+        delivery_errors = [
+            call.args[2]
+            for call in events.await_args_list
+            if call.args[1] == "error"
+            and call.args[2].get("delivery_unknown")
+        ]
+        self.assertEqual(len(delivery_errors), 1)
+
+    async def test_stop_during_steer_rpc_keeps_accepted_candidate_visible(
+        self,
+    ) -> None:
+        turn = GatedSteerTurn()
+        manager = FakeManager(turn)
+        agent_server.QUEUED_TURNS["chat-native"] = deque([{
+            "queued_id": "queued-stop-race",
+            "prompt": "Accepted while stopping",
+            "file_ids": [],
+            "backend": agent_server.BACKEND_CODEX,
+        }])
+        stack, events, _finished, _exec_fallback = self.runner_patches(manager)
+        with stack:
+            runner = asyncio.create_task(
+                agent_server.run_codex_app_server(
+                    "chat-native",
+                    "run-original",
+                    "Original request",
+                    dict(self.session),
+                    Path(self.cwd) / ".runner-test-manifest.json",
+                    allow_exec_fallback=True,
+                    allow_resume_rollover=False,
+                )
+            )
+            for _ in range(100):
+                if (
+                    agent_server.ACTIVE.get("chat-native") or {}
+                ).get("provider_turn_ready"):
+                    break
+                await asyncio.sleep(0)
+            force_send = asyncio.create_task(
+                agent_server.run_queued_turn_now(
+                    "chat-native",
+                    "queued-stop-race",
+                )
+            )
+            await asyncio.wait_for(turn.steer_started.wait(), timeout=1)
+            stop = asyncio.create_task(agent_server.stop_turn("chat-native"))
+            for _ in range(100):
+                if turn.interrupt_calls == 1:
+                    break
+                await asyncio.sleep(0)
+            turn.acknowledge_steer()
+            run_now, stop_result = await asyncio.gather(force_send, stop)
+            turn.feed(completed_notification("interrupted"))
+            await asyncio.wait_for(runner, timeout=2)
+
+        self.assertTrue(stop_result["stopped"])
+        self.assertEqual(turn.interrupt_calls, 1)
+        candidate_run_id = run_now["run_id"]
+        started = [
+            call.args[2]
+            for call in events.await_args_list
+            if call.args[1] == "turn_started"
+            and call.args[2].get("run_id") == candidate_run_id
+        ]
+        stopped = [
+            call.args[2]
+            for call in events.await_args_list
+            if call.args[1] == "turn_stopped"
+            and call.args[2].get("run_id") == candidate_run_id
+        ]
+        self.assertEqual(len(started), 1)
+        self.assertEqual(len(stopped), 1)
+        self.assertNotIn("chat-native", agent_server.QUEUED_TURNS)
+        self.assertNotIn("chat-native", agent_server.STEERING_SESSIONS)
+
     async def test_ambiguous_steer_error_is_not_requeued(self) -> None:
         uncertain = CodexAppServerDisconnected(
             "connection closed after steering write",
@@ -821,7 +1467,12 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
         stack, events, _finished, exec_fallback = self.runner_patches(manager)
-        with stack:
+        rollover = AsyncMock()
+        with stack, patch.object(
+            agent_server,
+            "rollover_codex_provider_session",
+            rollover,
+        ):
             runner = asyncio.create_task(
                 agent_server.run_codex_app_server(
                     "chat-native",
@@ -830,7 +1481,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                     dict(self.session),
                     Path(self.cwd) / ".runner-test-manifest.json",
                     allow_exec_fallback=True,
-                    allow_resume_rollover=False,
+                    allow_resume_rollover=True,
                 )
             )
             for _ in range(100):
@@ -850,16 +1501,44 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             )
             done, _pending = await asyncio.wait({force_send}, timeout=2)
             self.assertIn(force_send, done)
-            turn.feed(completed_notification("interrupted"))
+            turn.feed(agent_message(
+                "commentary-after-uncertain",
+                "Must not be attributed to the old run.",
+                "commentary",
+            ))
+            turn.feed(agent_message(
+                "final-after-uncertain",
+                "Must not become an old-run answer.",
+                "final_answer",
+            ))
+            turn.feed(completed_notification("failed"))
             await asyncio.wait_for(runner, timeout=2)
             with self.assertRaises(agent_server.NativeSteerHandoffError) as raised:
                 await force_send
+            with self.assertRaises(
+                agent_server.NativeSteerHandoffError
+            ) as retried:
+                await agent_server.run_queued_turn_now(
+                    "chat-native",
+                    "queued-uncertain",
+                )
 
         self.assertTrue(raised.exception.delivery_uncertain)
+        self.assertTrue(retried.exception.delivery_uncertain)
         self.assertFalse(raised.exception.safe_to_requeue)
         self.assertNotIn("chat-native", agent_server.QUEUED_TURNS)
         self.assertEqual(turn.interrupt_calls, 1)
+        self.assertEqual(len(turn.steer_calls), 1)
         exec_fallback.assert_not_awaited()
+        rollover.assert_not_awaited()
+        self.assertFalse(any(
+            call.args[1] in {"assistant_text", "reasoning_summary"}
+            and call.args[2].get("item_id") in {
+                "commentary-after-uncertain",
+                "final-after-uncertain",
+            }
+            for call in events.await_args_list
+        ))
         uncertain_errors = [
             call.args[2]
             for call in events.await_args_list
@@ -1469,6 +2148,95 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             finished.await_args.args[1]["result_text"],
             "Fresh app-server thread completed.",
+        )
+
+    async def test_post_steer_rollover_retries_only_the_accepted_prompt(
+        self,
+    ) -> None:
+        first_turn = FakeTurn()
+        second_turn = FakeTurn([
+            agent_message(
+                "msg-after-steer-rollover",
+                "Recovered the steering request.",
+                "final_answer",
+            ),
+            completed_notification(),
+        ])
+        manager = FakeManager(turns=[first_turn, second_turn])
+        agent_server.QUEUED_TURNS["chat-native"] = deque([{
+            "queued_id": "queued-steer-rollover",
+            "prompt": "Only retry this steering text.",
+            "file_ids": [],
+            "backend": agent_server.BACKEND_CODEX,
+        }])
+        fresh_session = {
+            "id": "chat-native",
+            "backend": agent_server.BACKEND_CODEX,
+            "cwd": self.cwd,
+            "memory_seed": "bounded context",
+            "memory_seed_used": False,
+        }
+        rollover = AsyncMock(return_value=(fresh_session, "bounded context"))
+        ensure = AsyncMock(
+            side_effect=[
+                ("thread-native", "old-policy"),
+                ("thread-fresh", "fresh-policy"),
+            ]
+        )
+        stack, _events, finished, exec_fallback = self.runner_patches(manager)
+        with stack, patch.object(
+            agent_server,
+            "ensure_codex_app_server_thread",
+            ensure,
+        ), patch.object(
+            agent_server,
+            "rollover_codex_provider_session",
+            rollover,
+        ):
+            runner = asyncio.create_task(
+                agent_server.run_codex_app_server(
+                    "chat-native",
+                    "run-original",
+                    "Never replay this original text.",
+                    dict(self.session),
+                    Path(self.cwd) / ".runner-test-manifest.json",
+                    allow_exec_fallback=True,
+                    allow_resume_rollover=True,
+                )
+            )
+            for _ in range(100):
+                if (
+                    agent_server.ACTIVE.get("chat-native") or {}
+                ).get("provider_turn_ready"):
+                    break
+                await asyncio.sleep(0)
+            run_now = await agent_server.run_queued_turn_now(
+                "chat-native",
+                "queued-steer-rollover",
+            )
+            first_turn.feed(completed_notification())
+            await asyncio.wait_for(runner, timeout=2)
+
+        self.assertTrue(run_now["native_steer"])
+        self.assertEqual(len(manager.turn_calls), 2)
+        self.assertEqual(
+            manager.turn_calls[1][1],
+            [{
+                "type": "text",
+                "text": "Only retry this steering text.",
+                "text_elements": [],
+            }],
+        )
+        self.assertNotIn(
+            "Never replay this original text.",
+            str(manager.turn_calls[1][1]),
+        )
+        self.assertEqual(len(first_turn.steer_calls), 1)
+        rollover.assert_awaited_once()
+        exec_fallback.assert_not_awaited()
+        self.assertEqual(
+            finished.await_args.args[1]["result_text"],
+            "Recovered the steering request.",
         )
 
 

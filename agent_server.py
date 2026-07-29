@@ -9115,8 +9115,21 @@ def semantic_timeline_event_is_display(event: dict[str, Any]) -> bool:
     return event_type not in TIMELINE_INDEX_TRACE_TYPES and event_type != "turn_started"
 
 
+def semantic_timeline_event_is_steer_commentary(
+    event: dict[str, Any],
+) -> bool:
+    """Return whether an event is completed agent commentary promoted on steer."""
+    return (
+        str(event.get("type") or "") == "reasoning_summary"
+        and str(event.get("phase") or "") == "commentary"
+        and bool(str(event.get("text") or "").strip())
+    )
+
+
 def semantic_timeline_ordinary_candidates(
     events: list[dict[str, Any]],
+    *,
+    preserve_steer_commentary: bool = False,
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -9153,15 +9166,26 @@ def semantic_timeline_ordinary_candidates(
         for event in reversed(ordered)
         if semantic_timeline_event_identity(event) not in core_ids
     ]
-    essential = [
+    detail_essential = [
         event
         for event in remaining
         if str(event.get("type") or "") in SEMANTIC_TIMELINE_ESSENTIAL_DETAIL_TYPES
     ]
+    commentary_essential = [
+        event
+        for event in remaining
+        if preserve_steer_commentary
+        and semantic_timeline_event_is_steer_commentary(event)
+    ]
+    essential = [*detail_essential, *commentary_essential]
+    essential_ids = {
+        semantic_timeline_event_identity(event)
+        for event in essential
+    }
     optional = [
         event
         for event in remaining
-        if str(event.get("type") or "") not in SEMANTIC_TIMELINE_ESSENTIAL_DETAIL_TYPES
+        if semantic_timeline_event_identity(event) not in essential_ids
     ]
     return primary, secondary, essential, optional
 
@@ -9189,6 +9213,7 @@ def collect_semantic_timeline_events(
     events_by_key: dict[str, list[dict[str, Any]]] = {
         key: [] for key in selected_by_key if key not in selected_jobs
     }
+    native_steer_retired_keys: set[str] = set()
     current_turn_by_run: dict[str, str] = {}
     active_turn_key: str | None = None
     seen_user_turn_keys: set[str] = set()
@@ -9218,6 +9243,13 @@ def collect_semantic_timeline_events(
             event_type = str(event.get("type") or "")
             run_id = str(event.get("run_id") or "").strip()
             if timeline_index_is_native_steer_transition_stop(event):
+                retired_key = (
+                    current_turn_by_run.get(run_id)
+                    if run_id
+                    else active_turn_key
+                )
+                if retired_key:
+                    native_steer_retired_keys.add(retired_key)
                 active_turn_key = timeline_index_retire_native_steer_turn(
                     event,
                     current_turn_by_run,
@@ -9356,7 +9388,10 @@ def collect_semantic_timeline_events(
             )
             bundles.append(([latest] if latest is not None else [], [], [], []))
         else:
-            bundles.append(semantic_timeline_ordinary_candidates(events_by_key.get(key, [])))
+            bundles.append(semantic_timeline_ordinary_candidates(
+                events_by_key.get(key, []),
+                preserve_steer_commentary=key in native_steer_retired_keys,
+            ))
 
     deduplicated: dict[str, dict[str, Any]] = {}
 

@@ -9115,10 +9115,10 @@ def semantic_timeline_event_is_display(event: dict[str, Any]) -> bool:
     return event_type not in TIMELINE_INDEX_TRACE_TYPES and event_type != "turn_started"
 
 
-def semantic_timeline_event_is_steer_commentary(
+def semantic_timeline_event_is_completed_commentary(
     event: dict[str, Any],
 ) -> bool:
-    """Return whether an event is completed agent commentary promoted on steer."""
+    """Return whether an event is durable completed agent commentary."""
     return (
         str(event.get("type") or "") == "reasoning_summary"
         and str(event.get("phase") or "") == "commentary"
@@ -9129,7 +9129,7 @@ def semantic_timeline_event_is_steer_commentary(
 def semantic_timeline_ordinary_candidates(
     events: list[dict[str, Any]],
     *,
-    preserve_steer_commentary: bool = False,
+    preserve_completed_commentary: bool = False,
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -9174,8 +9174,8 @@ def semantic_timeline_ordinary_candidates(
     commentary_essential = [
         event
         for event in remaining
-        if preserve_steer_commentary
-        and semantic_timeline_event_is_steer_commentary(event)
+        if preserve_completed_commentary
+        and semantic_timeline_event_is_completed_commentary(event)
     ]
     essential = [*detail_essential, *commentary_essential]
     essential_ids = {
@@ -9214,6 +9214,7 @@ def collect_semantic_timeline_events(
         key: [] for key in selected_by_key if key not in selected_jobs
     }
     native_steer_retired_keys: set[str] = set()
+    stopped_turn_keys: set[str] = set()
     current_turn_by_run: dict[str, str] = {}
     active_turn_key: str | None = None
     seen_user_turn_keys: set[str] = set()
@@ -9326,6 +9327,8 @@ def collect_semantic_timeline_events(
 
             if not key or key not in selected_by_key:
                 continue
+            if event_type == "turn_stopped":
+                stopped_turn_keys.add(key)
             if not event_files_belong_to_session(event, session_id):
                 continue
             event = client_safe_event(event)
@@ -9390,7 +9393,10 @@ def collect_semantic_timeline_events(
         else:
             bundles.append(semantic_timeline_ordinary_candidates(
                 events_by_key.get(key, []),
-                preserve_steer_commentary=key in native_steer_retired_keys,
+                preserve_completed_commentary=(
+                    key in native_steer_retired_keys
+                    or key in stopped_turn_keys
+                ),
             ))
 
     deduplicated: dict[str, dict[str, Any]] = {}
@@ -16338,9 +16344,7 @@ async def run_codex_app_server(
                     turn.turn_id,
                 )
 
-    def output_is_suppressed() -> bool:
-        if delivery_unknown:
-            return True
+    def stop_requested_for_current_run() -> bool:
         if current_run_id in STOPPED_RUNS:
             return True
         active = ACTIVE.get(session_id)
@@ -16363,7 +16367,37 @@ async def run_codex_app_server(
             ambiguous_turn_start = False
             await bind_active_turn_and_reconcile_stop()
 
-        if method != "turn/completed" and output_is_suppressed():
+        stopped_output = stop_requested_for_current_run()
+        if stopped_output:
+            # Phase-less agent messages can be final output. Once the user
+            # stops a run, never promote one of these buffered messages into
+            # durable commentary merely because a later trace item completes.
+            pending_unknown_message = ""
+            pending_unknown_item_id = ""
+
+        if method == "item/reasoning/textDelta":
+            # Raw model reasoning is transient provider data and must never be
+            # persisted into the AgentsDock timeline.
+            return False
+
+        if method != "turn/completed" and delivery_unknown:
+            return False
+
+        if stopped_output and method not in {
+            # These deltas are not persisted by themselves. They only provide
+            # bounded fallback text if the corresponding completed,
+            # user-visible trace item omits its aggregate payload.
+            "item/agentMessage/delta",
+            "item/reasoning/summaryTextDelta",
+            "item/plan/delta",
+            "item/commandExecution/outputDelta",
+            "item/fileChange/outputDelta",
+            # Preserve the durable lifecycle of tools and completed trace
+            # items emitted while app-server is acknowledging interruption.
+            "item/started",
+            "item/completed",
+            "turn/completed",
+        }:
             return False
 
         if method == "item/agentMessage/delta" and item_id:
@@ -16375,10 +16409,6 @@ async def run_codex_app_server(
             reasoning_summary_deltas.setdefault(item_id, []).append(
                 str(params.get("delta") or "")
             )
-            return False
-        if method == "item/reasoning/textDelta":
-            # Raw model reasoning is transient provider data and must never be
-            # persisted into the AgentsDock timeline.
             return False
         if method == "item/plan/delta" and item_id:
             plan_deltas.setdefault(item_id, []).append(
@@ -16419,9 +16449,10 @@ async def run_codex_app_server(
                         item_id=item_id,
                     )
                 elif phase == "final_answer":
-                    await flush_pending_unknown(final=False)
-                    await emit_final_text(text, item_id=item_id)
-                elif text:
+                    if not stopped_output:
+                        await flush_pending_unknown(final=False)
+                        await emit_final_text(text, item_id=item_id)
+                elif text and not stopped_output:
                     await flush_pending_unknown(final=False)
                     pending_unknown_message = text
                     pending_unknown_item_id = item_id

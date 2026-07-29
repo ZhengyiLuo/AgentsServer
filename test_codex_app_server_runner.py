@@ -725,6 +725,204 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(turn.interrupt_calls, 1)
         terminate.assert_not_awaited()
 
+    async def test_stop_retains_completed_trace_notifications_until_turn_completion(
+        self,
+    ) -> None:
+        turn = FakeTurn()
+        manager = FakeManager(turn)
+        stack, events, finished, exec_fallback = self.runner_patches(manager)
+        with stack:
+            runner = asyncio.create_task(
+                agent_server.run_codex_app_server(
+                    "chat-native",
+                    "run-original",
+                    "Original request",
+                    dict(self.session),
+                    Path(self.cwd) / ".runner-test-manifest.json",
+                    allow_exec_fallback=True,
+                    allow_resume_rollover=False,
+                )
+            )
+            for _ in range(100):
+                active = agent_server.ACTIVE.get("chat-native") or {}
+                if active.get("provider_turn_ready"):
+                    break
+                await asyncio.sleep(0)
+            else:
+                self.fail("Codex app-server turn never became ready")
+
+            stop_result = await agent_server.stop_turn("chat-native")
+            turn.feed({
+                "method": "item/reasoning/summaryTextDelta",
+                "params": {
+                    "threadId": "thread-native",
+                    "turnId": "turn-native",
+                    "itemId": "reasoning-after-stop",
+                    "delta": "Completed reasoning after Stop.",
+                },
+            })
+            turn.feed({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-native",
+                    "turnId": "turn-native",
+                    "item": {
+                        "id": "reasoning-after-stop",
+                        "type": "reasoning",
+                    },
+                },
+            })
+            turn.feed({
+                "method": "item/reasoning/textDelta",
+                "params": {
+                    "threadId": "thread-native",
+                    "turnId": "turn-native",
+                    "itemId": "raw-after-stop",
+                    "delta": "SECRET RAW REASONING",
+                },
+            })
+            turn.feed({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-native",
+                    "turnId": "turn-native",
+                    "item": {
+                        "id": "raw-after-stop",
+                        "type": "reasoning",
+                        "text": "SECRET RAW REASONING",
+                    },
+                },
+            })
+            turn.feed({
+                "method": "item/plan/delta",
+                "params": {
+                    "threadId": "thread-native",
+                    "turnId": "turn-native",
+                    "itemId": "plan-after-stop",
+                    "delta": "Completed plan after Stop.",
+                },
+            })
+            turn.feed({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-native",
+                    "turnId": "turn-native",
+                    "item": {
+                        "id": "plan-after-stop",
+                        "type": "plan",
+                    },
+                },
+            })
+            turn.feed({
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "thread-native",
+                    "turnId": "turn-native",
+                    "itemId": "commentary-after-stop",
+                    "delta": "Completed commentary after Stop.",
+                },
+            })
+            turn.feed(agent_message(
+                "commentary-after-stop",
+                "",
+                "commentary",
+            ))
+            turn.feed(agent_message(
+                "final-after-stop",
+                "This final answer must stay suppressed.",
+                "final_answer",
+            ))
+            turn.feed(agent_message(
+                "unknown-after-stop",
+                "This phase-less answer must stay suppressed.",
+                "",
+            ))
+            turn.feed({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-native",
+                    "turnId": "turn-native",
+                    "item": {
+                        "id": "tool-after-stop",
+                        "type": "commandExecution",
+                        "command": "echo retained",
+                        "status": "inProgress",
+                    },
+                },
+            })
+            turn.feed({
+                "method": "item/commandExecution/outputDelta",
+                "params": {
+                    "threadId": "thread-native",
+                    "turnId": "turn-native",
+                    "itemId": "tool-after-stop",
+                    "delta": "retained tool output",
+                },
+            })
+            turn.feed({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-native",
+                    "turnId": "turn-native",
+                    "item": {
+                        "id": "tool-after-stop",
+                        "type": "commandExecution",
+                        "command": "echo retained",
+                        "status": "cancelled",
+                    },
+                },
+            })
+            turn.feed(completed_notification("interrupted"))
+            await asyncio.wait_for(runner, timeout=2)
+
+        self.assertTrue(stop_result["native_interrupt"])
+        self.assertEqual(turn.interrupt_calls, 1)
+        exec_fallback.assert_not_awaited()
+        event_pairs = [
+            (call.args[1], call.args[2])
+            for call in events.await_args_list
+            if len(call.args) >= 3
+        ]
+        reasoning = [
+            payload
+            for event_type, payload in event_pairs
+            if event_type == "reasoning_summary"
+        ]
+        self.assertEqual(
+            [payload["text"] for payload in reasoning],
+            [
+                "Completed reasoning after Stop.",
+                "Completed plan after Stop.",
+                "Completed commentary after Stop.",
+            ],
+        )
+        self.assertEqual(
+            [payload.get("phase") for payload in reasoning],
+            [None, "plan", "commentary"],
+        )
+        self.assertNotIn("SECRET RAW REASONING", str(event_pairs))
+        self.assertFalse(
+            any(event_type == "assistant_text" for event_type, _ in event_pairs)
+        )
+        self.assertEqual(
+            [
+                event_type
+                for event_type, _ in event_pairs
+                if event_type in {"tool_started", "tool_finished"}
+            ],
+            ["tool_started", "tool_finished"],
+        )
+        tool_finished = next(
+            payload
+            for event_type, payload in event_pairs
+            if event_type == "tool_finished"
+        )
+        self.assertEqual(tool_finished["output"], "retained tool output")
+        self.assertTrue(tool_finished["is_error"])
+        self.assertTrue(finished.await_args.args[1]["stopped"])
+        self.assertIsNone(finished.await_args.args[1]["exit_code"])
+        self.assertEqual(finished.await_args.args[1]["result_text"], "")
+
     async def test_native_run_now_steers_runner_and_emits_queued_id(self) -> None:
         turn = FakeTurn()
         manager = FakeManager(turn)

@@ -1223,6 +1223,94 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
             "run-a",
         )
 
+    def test_genuine_stop_preserves_completed_commentary_in_semantic_page(
+        self,
+    ) -> None:
+        self.write_events([
+            self.event(
+                1,
+                "turn_started",
+                run_id="stopped-run",
+                prompt="Initial request",
+            ),
+            self.event(
+                2,
+                "reasoning_summary",
+                run_id="stopped-run",
+                text="Private reasoning remains lazy trace detail.",
+            ),
+            self.event(
+                3,
+                "reasoning_summary",
+                run_id="stopped-run",
+                item_id="commentary-before-stop",
+                phase="commentary",
+                text="Completed commentary before Stop.",
+            ),
+            self.event(
+                4,
+                "tool_started",
+                run_id="stopped-run",
+                tool={"name": "exec"},
+            ),
+            self.event(
+                5,
+                "turn_stopped",
+                run_id="stopped-run",
+                message="Stopped by user.",
+            ),
+            # App-server can flush completed trace items after acknowledging
+            # interruption. They remain part of the same retired logical turn.
+            self.event(
+                6,
+                "reasoning_summary",
+                run_id="stopped-run",
+                item_id="commentary-after-stop-a",
+                phase="commentary",
+                text="First completed commentary during Stop.",
+            ),
+            self.event(
+                7,
+                "reasoning_summary",
+                run_id="stopped-run",
+                item_id="commentary-after-stop-b",
+                phase="commentary",
+                text="Second completed commentary during Stop.",
+            ),
+            self.event(
+                8,
+                "turn_finished",
+                run_id="stopped-run",
+                result_text="",
+                stopped=True,
+            ),
+        ])
+
+        page = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            limit=1,
+            tail=True,
+        )
+
+        commentary = [
+            event
+            for event in page["events"]
+            if event["type"] == "reasoning_summary"
+            and event.get("phase") == "commentary"
+        ]
+        self.assertEqual(
+            [event["item_id"] for event in commentary],
+            [
+                "commentary-before-stop",
+                "commentary-after-stop-a",
+                "commentary-after-stop-b",
+            ],
+        )
+        self.assertTrue(
+            any(event["type"] == "turn_stopped" for event in page["events"])
+        )
+        self.assertEqual(page["semantic_item_count"], 1)
+
     async def test_endpoint_keeps_default_payload_and_offloads_visible_scans(self) -> None:
         session = {
             "id": self.session_id,

@@ -1611,7 +1611,7 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
-    async def test_active_turn_allows_goal_clear_on_its_loaded_thread(
+    async def test_noninteractive_active_turn_allows_goal_clear_on_loaded_thread(
         self,
     ) -> None:
         agent_server.STORE.sessions["chat"]["codex_goal"] = {
@@ -1622,14 +1622,23 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "backend": agent_server.BACKEND_CODEX,
             "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
             "provider_thread_id": "thread",
-            "interactive_app_server": True,
+            "interactive_app_server": False,
             "codex_native_operation": False,
         })
         agent_server.CODEX_APP_SERVER_PINNED_THREADS.add("thread")
         agent_server.CODEX_APP_SERVER_THREAD_PIN_COUNTS["thread"] = 1
         manager = AsyncMock()
         manager.is_thread_loaded = Mock(return_value=True)
-        manager.clear_thread_goal.return_value = True
+
+        async def clear_thread_goal(thread_id: str) -> bool:
+            self.assertEqual(thread_id, "thread")
+            self.assertIn(
+                "chat",
+                agent_server.SERVER_MAINTENANCE_SESSIONS,
+            )
+            return True
+
+        manager.clear_thread_goal.side_effect = clear_thread_goal
 
         with (
             patch.object(
@@ -1678,6 +1687,10 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "thread",
             agent_server.CODEX_INTERACTIVE_CONTROL_THREADS,
         )
+        self.assertNotIn(
+            "chat",
+            agent_server.SERVER_MAINTENANCE_SESSIONS,
+        )
 
     async def test_active_native_operation_rejects_goal_mutation(
         self,
@@ -1707,7 +1720,7 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
             agent_server.CODEX_INTERACTIVE_CONTROL_THREADS,
         )
 
-    async def test_active_turn_allows_goal_status_update_on_its_loaded_thread(
+    async def test_noninteractive_active_turn_allows_goal_update_on_loaded_thread(
         self,
     ) -> None:
         agent_server.STORE.sessions["chat"]["codex_goal"] = {
@@ -1719,7 +1732,7 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "backend": agent_server.BACKEND_CODEX,
             "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
             "provider_thread_id": "thread",
-            "interactive_app_server": True,
+            "interactive_app_server": False,
             "codex_native_operation": False,
         })
         agent_server.CODEX_APP_SERVER_PINNED_THREADS.add("thread")

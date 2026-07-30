@@ -12550,12 +12550,14 @@ async def acquire_codex_control_thread(
             )
         if session_id in BUSY_SESSIONS:
             active = ACTIVE.get(session_id)
+            # interactive_app_server describes the initiating client's ability
+            # to render approvals, not whether this loaded thread can accept a
+            # goal mutation from another compatible client.
             if (
                 not allow_active_goal_mutation
                 or not active
                 or active.get("backend") != BACKEND_CODEX
                 or active.get("transport") != CODEX_TRANSPORT_APP_SERVER
-                or active.get("interactive_app_server") is not True
                 or active.get("codex_native_operation") is True
                 or not str(active.get("provider_thread_id") or "").strip()
             ):
@@ -12609,7 +12611,6 @@ async def acquire_codex_control_thread(
                     or not active
                     or active.get("backend") != BACKEND_CODEX
                     or active.get("transport") != CODEX_TRANSPORT_APP_SERVER
-                    or active.get("interactive_app_server") is not True
                     or active.get("codex_native_operation") is True
                     or str(active.get("provider_thread_id") or "").strip()
                     != thread_id

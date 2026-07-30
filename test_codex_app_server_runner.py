@@ -718,12 +718,315 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             agent_server,
             "append_event",
             AsyncMock(return_value={}),
+        ), patch.object(
+            agent_server,
+            "STOP_CONFIRM_TIMEOUT_SECONDS",
+            0.01,
         ):
             result = await agent_server.stop_turn("chat-native")
 
         self.assertTrue(result["native_interrupt"])
         self.assertEqual(turn.interrupt_calls, 1)
         terminate.assert_not_awaited()
+
+    async def test_stop_keeps_an_owned_unbound_runner_pending(self) -> None:
+        blocker = asyncio.Event()
+        startup_task = asyncio.create_task(blocker.wait())
+        events = AsyncMock(return_value={})
+        try:
+            with (
+                patch.object(
+                    agent_server,
+                    "SESSION_TURN_TASKS",
+                    {"chat-native": {startup_task}},
+                ),
+                patch.object(
+                    agent_server,
+                    "STOP_CONFIRM_TIMEOUT_SECONDS",
+                    0.01,
+                ),
+                patch.object(agent_server, "append_event", events),
+            ):
+                result = await agent_server.stop_turn("chat-native")
+        finally:
+            startup_task.cancel()
+            await asyncio.gather(startup_task, return_exceptions=True)
+
+        self.assertFalse(result["stopped"])
+        self.assertTrue(result["pending"])
+        self.assertIn("chat-native", agent_server.BUSY_SESSIONS)
+        self.assertIn("chat-native", agent_server.STOP_REQUESTS)
+        events.assert_not_awaited()
+
+    async def test_stop_cancels_a_turn_request_before_runner_registration(self) -> None:
+        agent_server.ACTIVE = {}
+        agent_server.BUSY_SESSIONS = set()
+        agent_server.CURRENT_TURNS = {}
+        runtime_started = asyncio.Event()
+
+        async def stalled_runtime(_backend: str) -> None:
+            runtime_started.set()
+            await asyncio.Event().wait()
+
+        events = AsyncMock(return_value={})
+        with (
+            patch.object(agent_server, "SESSION_TURN_TASKS", {}),
+            patch.object(
+                agent_server,
+                "turn_start_blocker",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(
+                agent_server,
+                "ensure_runtime_available",
+                stalled_runtime,
+            ),
+            patch.object(
+                agent_server,
+                "STOP_CONFIRM_TIMEOUT_SECONDS",
+                0.01,
+            ),
+            patch.object(agent_server, "append_event", events),
+        ):
+            request_task = asyncio.create_task(
+                agent_server.start_turn(
+                    "chat-native",
+                    agent_server.TurnRequest(prompt="Start slowly"),
+                )
+            )
+            await asyncio.wait_for(runtime_started.wait(), timeout=1)
+            result = await agent_server.stop_turn("chat-native")
+
+        self.assertFalse(result["stopped"])
+        self.assertTrue(result["pending"])
+        self.assertFalse(request_task.done())
+        self.assertIn("chat-native", agent_server.BUSY_SESSIONS)
+        self.assertIn("chat-native", agent_server.STOP_REQUESTS)
+        events.assert_not_awaited()
+        request_task.cancel()
+        await asyncio.gather(request_task, return_exceptions=True)
+        await agent_server.release_turn_slot("chat-native")
+
+    async def test_stop_cancels_a_native_control_before_active_binding(self) -> None:
+        agent_server.ACTIVE = {}
+        agent_server.BUSY_SESSIONS = set()
+        agent_server.CURRENT_TURNS = {}
+        manager_started = asyncio.Event()
+
+        async def stalled_manager_start() -> None:
+            manager_started.set()
+            await asyncio.Event().wait()
+
+        manager = Mock()
+        manager.start = stalled_manager_start
+        events = AsyncMock(return_value={})
+        with (
+            patch.object(agent_server, "SESSION_TURN_TASKS", {}),
+            patch.object(
+                agent_server,
+                "codex_app_server_manager",
+                AsyncMock(return_value=manager),
+            ),
+            patch.object(
+                agent_server,
+                "STOP_CONFIRM_TIMEOUT_SECONDS",
+                0.01,
+            ),
+            patch.object(agent_server, "append_event", events),
+        ):
+            request_task = asyncio.create_task(
+                agent_server.acquire_codex_control_thread(
+                    "chat-native",
+                    reserve_session=True,
+                )
+            )
+            await asyncio.wait_for(manager_started.wait(), timeout=1)
+            result = await agent_server.stop_turn("chat-native")
+
+        self.assertFalse(result["stopped"])
+        self.assertTrue(result["pending"])
+        self.assertFalse(request_task.done())
+        self.assertIn("chat-native", agent_server.BUSY_SESSIONS)
+        self.assertIn("chat-native", agent_server.STOP_REQUESTS)
+        events.assert_not_awaited()
+        request_task.cancel()
+        await asyncio.gather(request_task, return_exceptions=True)
+        await agent_server.release_turn_slot("chat-native")
+
+    async def test_stop_releases_a_busy_orphan_with_no_owner(self) -> None:
+        events = AsyncMock(return_value={})
+        with (
+            patch.object(agent_server, "SESSION_TURN_TASKS", {}),
+            patch.object(
+                agent_server,
+                "STOP_CONFIRM_TIMEOUT_SECONDS",
+                0.01,
+            ),
+            patch.object(agent_server, "append_event", events),
+        ):
+            result = await agent_server.stop_turn("chat-native")
+
+        self.assertTrue(result["stopped"])
+        self.assertFalse(result["pending"])
+        self.assertNotIn("chat-native", agent_server.BUSY_SESSIONS)
+        self.assertNotIn("chat-native", agent_server.CURRENT_TURNS)
+        events.assert_awaited_once()
+
+    async def test_native_control_honors_a_stop_requested_before_binding(self) -> None:
+        agent_server.ACTIVE = {}
+        agent_server.BUSY_SESSIONS = set()
+        agent_server.CURRENT_TURNS = {}
+        agent_server.STOP_REQUESTS = {"chat-native"}
+        manager = Mock()
+        manager.start = AsyncMock()
+        unpin = AsyncMock()
+        acquire_lease = Mock()
+        release_lease = Mock()
+        events = AsyncMock(return_value={})
+        with (
+            patch.object(agent_server, "SESSION_TURN_TASKS", {}),
+            patch.object(
+                agent_server,
+                "codex_app_server_manager",
+                AsyncMock(return_value=manager),
+            ),
+            patch.object(
+                agent_server,
+                "ensure_codex_app_server_thread",
+                AsyncMock(return_value=("thread-native", "policy-hash")),
+            ),
+            patch.object(agent_server, "unpin_codex_app_server_thread", unpin),
+            patch.object(
+                agent_server,
+                "acquire_codex_interactive_control_lease",
+                acquire_lease,
+            ),
+            patch.object(
+                agent_server,
+                "release_codex_interactive_control_lease",
+                release_lease,
+            ),
+            patch.object(agent_server, "append_event", events),
+        ):
+            with self.assertRaises(agent_server.HTTPException) as raised:
+                await agent_server.acquire_codex_control_thread(
+                    "chat-native",
+                    reserve_session=True,
+                )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertNotIn("chat-native", agent_server.BUSY_SESSIONS)
+        self.assertNotIn("chat-native", agent_server.ACTIVE)
+        acquire_lease.assert_called_once_with("thread-native")
+        release_lease.assert_called_once_with("thread-native")
+        unpin.assert_awaited_once_with(manager, "thread-native")
+        events.assert_awaited_once()
+
+    async def test_stop_treats_an_already_idle_chat_as_terminal(self) -> None:
+        agent_server.ACTIVE = {}
+        agent_server.BUSY_SESSIONS = set()
+        events = AsyncMock(return_value={})
+        with patch.object(agent_server, "append_event", events):
+            result = await agent_server.stop_turn("chat-native")
+
+        self.assertTrue(result["stopped"])
+        self.assertFalse(result["pending"])
+        events.assert_not_awaited()
+
+    async def test_stop_keeps_an_accepted_turn_active_until_provider_terminalizes(self) -> None:
+        turn = FakeTurn()
+        runner_task = asyncio.create_task(asyncio.Event().wait())
+        agent_server.ACTIVE["chat-native"] = {
+            "run_id": "run-original",
+            "backend": agent_server.BACKEND_CODEX,
+            "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
+            "provider_turn_ready": True,
+            "provider_session_id": "thread-native",
+            "codex_app_server_turn": turn,
+        }
+        events = AsyncMock(return_value={})
+        try:
+            with (
+                patch.object(
+                    agent_server,
+                    "SESSION_TURN_TASKS",
+                    {"chat-native": {runner_task}},
+                ),
+                patch.object(
+                    agent_server,
+                    "STOP_CONFIRM_TIMEOUT_SECONDS",
+                    0.01,
+                ),
+                patch.object(agent_server, "append_event", events),
+            ):
+                result = await agent_server.stop_turn("chat-native")
+        finally:
+            runner_task.cancel()
+            await asyncio.gather(runner_task, return_exceptions=True)
+
+        self.assertFalse(result["stopped"])
+        self.assertTrue(result["pending"])
+        self.assertEqual(turn.interrupt_calls, 1)
+        self.assertFalse(
+            agent_server.ACTIVE["chat-native"]["native_interrupt_sent"]
+        )
+        events.assert_not_awaited()
+
+    async def test_stop_keeps_a_native_control_owner_active_during_provider_start(self) -> None:
+        owner_task = asyncio.create_task(asyncio.Event().wait())
+        agent_server.ACTIVE["chat-native"] = {
+            "run_id": None,
+            "backend": agent_server.BACKEND_CODEX,
+            "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
+            "provider_thread_id": "thread-native",
+            "provider_turn_id": None,
+            "codex_native_operation": True,
+            "owner_task": owner_task,
+        }
+        events = AsyncMock(return_value={})
+        try:
+            with (
+                patch.object(agent_server, "SESSION_TURN_TASKS", {}),
+                patch.object(
+                    agent_server,
+                    "STOP_CONFIRM_TIMEOUT_SECONDS",
+                    0.01,
+                ),
+                patch.object(agent_server, "append_event", events),
+            ):
+                result = await agent_server.stop_turn("chat-native")
+        finally:
+            owner_task.cancel()
+            await asyncio.gather(owner_task, return_exceptions=True)
+
+        self.assertFalse(result["stopped"])
+        self.assertTrue(result["pending"])
+        self.assertIn("chat-native", agent_server.ACTIVE)
+        events.assert_not_awaited()
+
+    def test_collaboration_wait_is_not_projected_as_a_subagent(self) -> None:
+        tool = agent_server.codex_app_server_tool({
+            "id": "wait-1",
+            "type": "collabAgentToolCall",
+            "tool": "wait",
+            "receiverThreadIds": ["thread-child"],
+        })
+
+        self.assertEqual(tool["name"], "Collaboration/wait")
+        self.assertEqual(tool["input"]["operation"], "wait")
+
+    def test_collaboration_spawn_projects_an_explicit_codex_subagent(self) -> None:
+        tool = agent_server.codex_app_server_tool({
+            "id": "spawn-1",
+            "type": "collabAgentToolCall",
+            "tool": "spawnAgent",
+            "receiverThreadIds": ["thread-child"],
+            "prompt": "Audit the scheduler",
+        })
+
+        self.assertEqual(tool["name"], "spawn_agent")
+        self.assertEqual(tool["input"]["task_name"], "thread-child")
+        self.assertEqual(tool["input"]["message"], "Audit the scheduler")
 
     async def test_stop_retains_completed_trace_notifications_until_turn_completion(
         self,
@@ -751,7 +1054,20 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             else:
                 self.fail("Codex app-server turn never became ready")
 
-            stop_result = await agent_server.stop_turn("chat-native")
+            agent_server.register_session_task(
+                agent_server.SESSION_TURN_TASKS,
+                "chat-native",
+                runner,
+            )
+            stop_task = asyncio.create_task(
+                agent_server.stop_turn("chat-native")
+            )
+            for _ in range(100):
+                if turn.interrupt_calls:
+                    break
+                await asyncio.sleep(0)
+            else:
+                self.fail("Stop did not interrupt the native turn")
             turn.feed({
                 "method": "item/reasoning/summaryTextDelta",
                 "params": {
@@ -874,6 +1190,9 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             })
             turn.feed(completed_notification("interrupted"))
             await asyncio.wait_for(runner, timeout=2)
+            agent_server.ACTIVE.pop("chat-native", None)
+            agent_server.BUSY_SESSIONS.discard("chat-native")
+            stop_result = await asyncio.wait_for(stop_task, timeout=2)
 
         self.assertTrue(stop_result["native_interrupt"])
         self.assertEqual(turn.interrupt_calls, 1)
@@ -1836,8 +2155,21 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             else:
                 self.fail("provisional native turn was never installed")
 
-            stop_result = await agent_server.stop_turn("chat-native")
-            self.assertFalse(stop_result["native_interrupt"])
+            agent_server.register_session_task(
+                agent_server.SESSION_TURN_TASKS,
+                "chat-native",
+                runner,
+            )
+            stop_task = asyncio.create_task(
+                agent_server.stop_turn("chat-native")
+            )
+            for _ in range(100):
+                active = agent_server.ACTIVE.get("chat-native") or {}
+                if active.get("stop_requested"):
+                    break
+                await asyncio.sleep(0)
+            else:
+                self.fail("Stop was not registered on the provisional turn")
             pending_turn.adopt_turn_id("turn-native")
             pending_turn.feed(
                 agent_message(
@@ -1848,6 +2180,10 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             )
             pending_turn.feed(completed_notification("interrupted"))
             await asyncio.wait_for(runner, timeout=2)
+            agent_server.ACTIVE.pop("chat-native", None)
+            agent_server.BUSY_SESSIONS.discard("chat-native")
+            stop_result = await asyncio.wait_for(stop_task, timeout=2)
+            self.assertFalse(stop_result["native_interrupt"])
 
         self.assertEqual(pending_turn.interrupt_calls, 1)
         self.assertFalse(

@@ -1692,9 +1692,13 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
             agent_server.SERVER_MAINTENANCE_SESSIONS,
         )
 
-    async def test_active_native_operation_rejects_goal_mutation(
+    async def test_active_native_operation_allows_goal_clear_on_loaded_thread(
         self,
     ) -> None:
+        agent_server.STORE.sessions["chat"]["codex_goal"] = {
+            "objective": "Stop this goal",
+            "status": "active",
+        }
         agent_server.ACTIVE["chat"].update({
             "backend": agent_server.BACKEND_CODEX,
             "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
@@ -1702,15 +1706,29 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "interactive_app_server": True,
             "codex_native_operation": True,
         })
+        manager = AsyncMock()
+        manager.is_thread_loaded = Mock(return_value=True)
+        manager.active_turn = Mock(return_value=None)
 
-        with self.assertRaises(HTTPException) as raised:
-            await agent_server._delete_codex_goal_locked("chat")
+        with (
+            patch.object(
+                agent_server,
+                "CODEX_APP_SERVER_MANAGER",
+                manager,
+            ),
+            patch.object(agent_server.STORE, "save", AsyncMock()),
+        ):
+            result = await agent_server._delete_codex_goal_locked("chat")
 
-        self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(
-            raised.exception.detail,
-            "wait for the active Codex turn to finish",
+            result,
+            {
+                "goal": None,
+                "time_budget_seconds": None,
+                "time_budget_exhausted": False,
+            },
         )
+        manager.clear_thread_goal.assert_awaited_once_with("thread")
         self.assertNotIn(
             "thread",
             agent_server.CODEX_APP_SERVER_PINNED_THREADS,

@@ -294,6 +294,7 @@ MAX_CODEX_PENDING_INTERACTIONS = 128
 MAX_CODEX_APPROVAL_ITEM_CACHE = 256
 CODEX_PERMISSION_PROFILES_CACHE_SECONDS = 60.0
 CODEX_SESSION_CLEANUP_TIMEOUT_SECONDS = 15.0
+STOP_CONFIRM_TIMEOUT_SECONDS = 5.0
 HANDOFF_DIGEST_TIMEOUT_SECONDS = int(agentsdock_setting("HANDOFF_DIGEST_TIMEOUT_SECONDS", "180"))
 HANDOFF_DIGEST_BACKEND = agentsdock_setting("HANDOFF_DIGEST_BACKEND", BACKEND_CLAUDE).lower()
 if HANDOFF_DIGEST_BACKEND not in VALID_BACKENDS:
@@ -6729,6 +6730,7 @@ def active_snapshot_input(active: dict[str, Any]) -> dict[str, Any]:
             "stdout_tail",
             "codex_app_server_turn",
             "native_steer_queue",
+            "owner_task",
         }
     }
     snapshot_input["proc"] = active.get("proc")
@@ -12524,6 +12526,13 @@ async def acquire_codex_control_thread(
     allow_active_goal_mutation: bool = False,
 ) -> tuple[CodexAppServerManager, str, dict[str, Any]]:
     """Load and pin a Codex thread for an explicit desktop control."""
+    reservation_task = asyncio.current_task() if reserve_session else None
+    if reservation_task is not None:
+        register_session_task(
+            SESSION_TURN_TASKS,
+            session_id,
+            reservation_task,
+        )
     ensure_session_not_deleting(session_id)
     session = STORE.sessions.get(session_id)
     if not session:
@@ -12558,7 +12567,6 @@ async def acquire_codex_control_thread(
                 or not active
                 or active.get("backend") != BACKEND_CODEX
                 or active.get("transport") != CODEX_TRANSPORT_APP_SERVER
-                or active.get("codex_native_operation") is True
                 or not str(active.get("provider_thread_id") or "").strip()
             ):
                 raise HTTPException(
@@ -12611,7 +12619,6 @@ async def acquire_codex_control_thread(
                     or not active
                     or active.get("backend") != BACKEND_CODEX
                     or active.get("transport") != CODEX_TRANSPORT_APP_SERVER
-                    or active.get("codex_native_operation") is True
                     or str(active.get("provider_thread_id") or "").strip()
                     != thread_id
                 )
@@ -12636,25 +12643,40 @@ async def acquire_codex_control_thread(
         acquire_codex_interactive_control_lease(thread_id)
         control_lease_acquired = True
         if reserved:
+            stop_before_bind = False
             async with ACTIVE_LOCK:
-                ACTIVE[session_id] = {
-                    "proc": None,
-                    "run_id": None,
-                    "backend": BACKEND_CODEX,
-                    "transport": CODEX_TRANSPORT_APP_SERVER,
-                    "provider_thread_id": thread_id,
-                    "provider_session_id": thread_id,
-                    "provider_turn_id": None,
-                    "provider_turn_ready": False,
-                    "interactive_app_server": True,
-                    "codex_native_operation": True,
-                    "codex_native_operation_kind": None,
-                    "started_at": time.time(),
-                    "started_at_iso": now_iso(),
-                    "stop_requested": False,
-                }
+                stop_before_bind = session_id in STOP_REQUESTS
+                if not stop_before_bind:
+                    ACTIVE[session_id] = {
+                        "proc": None,
+                        "run_id": None,
+                        "backend": BACKEND_CODEX,
+                        "transport": CODEX_TRANSPORT_APP_SERVER,
+                        "provider_thread_id": thread_id,
+                        "provider_session_id": thread_id,
+                        "provider_turn_id": None,
+                        "provider_turn_ready": False,
+                        "interactive_app_server": True,
+                        "codex_native_operation": True,
+                        "codex_native_operation_kind": None,
+                        "owner_task": reservation_task,
+                        "started_at": time.time(),
+                        "started_at_iso": now_iso(),
+                        "stop_requested": False,
+                    }
+            if stop_before_bind:
+                with suppress(Exception):
+                    await append_event(session_id, "turn_stopped", {
+                        "run_id": None,
+                        "backend": BACKEND_CODEX,
+                        "message": "Codex control stopped before it started.",
+                    })
+                raise HTTPException(
+                    status_code=409,
+                    detail="Codex control stopped before it started",
+                )
         return manager, thread_id, dict(STORE.sessions.get(session_id) or session)
-    except Exception as exc:
+    except BaseException as exc:
         if control_lease_acquired:
             release_codex_interactive_control_lease(thread_id)
         if thread_pinned and thread_id and manager is not None:
@@ -12665,9 +12687,20 @@ async def acquire_codex_control_thread(
         if maintenance_reserved:
             async with ACTIVE_LOCK:
                 SERVER_MAINTENANCE_SESSIONS.discard(session_id)
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         if isinstance(exc, HTTPException):
             raise
+        if not isinstance(exc, Exception):
+            raise
         raise codex_control_http_error(exc) from exc
+    finally:
+        if reservation_task is not None:
+            tasks = SESSION_TURN_TASKS.get(session_id)
+            if tasks is not None:
+                tasks.discard(reservation_task)
+                if not tasks:
+                    SESSION_TURN_TASKS.pop(session_id, None)
 
 
 async def release_codex_control_thread(
@@ -14043,9 +14076,10 @@ async def ensure_codex_app_server_thread(
         CODEX_THREAD_SESSION_INDEX[provider_id] = session_id
         await touch_codex_app_server_thread(manager, provider_id)
         return provider_id, instruction_hash
-    except Exception:
+    except BaseException:
         if pinned and provider_id:
-            await unpin_codex_app_server_thread(manager, provider_id)
+            with suppress(Exception):
+                await unpin_codex_app_server_thread(manager, provider_id)
         raise
 
 
@@ -14989,13 +15023,32 @@ def codex_app_server_tool(item: dict[str, Any]) -> dict[str, Any] | None:
             "input": item.get("arguments") or {},
         }
     if item_type == "collabAgentToolCall":
+        operation = str(item.get("tool") or "collaboration")
+        normalized_operation = re.sub(r"[^a-z0-9]", "", operation.lower())
+        receiver_thread_ids = [
+            str(value)
+            for value in (item.get("receiverThreadIds") or [])
+            if str(value or "").strip()
+        ]
+        if normalized_operation == "spawnagent":
+            return {
+                "id": item_id,
+                "name": "spawn_agent",
+                "input": {
+                    "task_name": receiver_thread_ids[0]
+                    if receiver_thread_ids
+                    else "Codex subagent",
+                    "message": str(item.get("prompt") or ""),
+                    "model": item.get("model"),
+                    "reasoning_effort": item.get("reasoningEffort"),
+                },
+            }
         return {
             "id": item_id,
-            "name": "Agent",
+            "name": f"Collaboration/{operation}",
             "input": {
-                "description": str(item.get("tool") or "Codex subagent"),
-                "model": item.get("model"),
-                "reasoning_effort": item.get("reasoningEffort"),
+                "operation": operation,
+                "receiver_thread_ids": receiver_thread_ids,
             },
         }
     if item_type == "webSearch":
@@ -17176,16 +17229,30 @@ async def start_turn(
     display_file_ids: list[str] | None = None,
     steering_lineage: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    async with session_lifecycle_lock(session_id):
-        ensure_session_not_deleting(session_id)
-        return await _start_turn_locked(
-            session_id,
-            req,
-            queue_if_busy=queue_if_busy,
-            queued_id=queued_id,
-            display_file_ids=display_file_ids,
-            steering_lineage=steering_lineage,
-        )
+    # Register the request task before BUSY_SESSIONS is reserved. Stop can then
+    # distinguish a legitimate slow launch from an orphaned reservation and
+    # leave a deferred stop marker for the runner to reconcile when it binds.
+    request_task = asyncio.current_task()
+    if request_task is not None:
+        register_session_task(SESSION_TURN_TASKS, session_id, request_task)
+    try:
+        async with session_lifecycle_lock(session_id):
+            ensure_session_not_deleting(session_id)
+            return await _start_turn_locked(
+                session_id,
+                req,
+                queue_if_busy=queue_if_busy,
+                queued_id=queued_id,
+                display_file_ids=display_file_ids,
+                steering_lineage=steering_lineage,
+            )
+    finally:
+        if request_task is not None:
+            tasks = SESSION_TURN_TASKS.get(session_id)
+            if tasks is not None:
+                tasks.discard(request_task)
+                if not tasks:
+                    SESSION_TURN_TASKS.pop(session_id, None)
 
 
 async def _start_turn_locked(
@@ -19315,6 +19382,7 @@ async def stop_turn(
     native_interrupt_reserved = False
     native_control_interrupt_reserved = False
     transition_ready: asyncio.Event | None = None
+    owned_tasks: list[asyncio.Task[Any]] = []
     async with ACTIVE_LOCK:
         active = ACTIVE.get(session_id)
         busy = session_id in BUSY_SESSIONS
@@ -19354,6 +19422,25 @@ async def stop_turn(
                 deferred = True
             else:
                 STOP_REQUESTS.add(session_id)
+        current_task = asyncio.current_task()
+        owned_tasks = [
+            task
+            for task in (
+                *tuple(SESSION_TURN_TASKS.get(session_id) or ()),
+                *tuple(
+                    task
+                    for (task_session_id, _operation_id), task in
+                    CODEX_NATIVE_ACTION_TASKS.items()
+                    if task_session_id == session_id
+                ),
+                active.get("owner_task") if active else None,
+            )
+            if (
+                isinstance(task, asyncio.Task)
+                and task is not current_task
+                and not task.done()
+            )
+        ]
     if deferred:
         return {
             "ok": True,
@@ -19363,15 +19450,86 @@ async def stop_turn(
         }
     if not active:
         if busy:
+            deadline = (
+                asyncio.get_running_loop().time()
+                + STOP_CONFIRM_TIMEOUT_SECONDS
+            )
+            current_turn: dict[str, Any] = {}
+            pending = set(owned_tasks)
+            while True:
+                current_task = asyncio.current_task()
+                async with ACTIVE_LOCK:
+                    bound_active = ACTIVE.get(session_id)
+                    still_busy = session_id in BUSY_SESSIONS
+                    current_turn = dict(CURRENT_TURNS.get(session_id) or {})
+                    pending = {
+                        task
+                        for task in SESSION_TURN_TASKS.get(session_id) or ()
+                        if task is not current_task and not task.done()
+                    } | {
+                        task
+                        for (task_session_id, _operation_id), task in
+                        CODEX_NATIVE_ACTION_TASKS.items()
+                        if (
+                            task_session_id == session_id
+                            and task is not current_task
+                            and not task.done()
+                        )
+                    }
+                if bound_active:
+                    # The runner bound while Stop was waiting. Re-enter through
+                    # the normal provider-interrupt path instead of recording a
+                    # false terminal event.
+                    return await stop_turn(
+                        session_id,
+                        emit_event=emit_event,
+                        schedule_queue=schedule_queue,
+                        require_provider_turn_ready=require_provider_turn_ready,
+                    )
+                if not still_busy:
+                    return {"ok": True, "stopped": True, "pending": False}
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                if pending:
+                    await asyncio.wait(
+                        pending,
+                        timeout=remaining,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                else:
+                    await asyncio.sleep(min(0.01, remaining))
+
+            if pending:
+                # Keep the deferred STOP_REQUESTS marker. A legitimate slow
+                # launch owns this reservation and will reconcile the stop as
+                # soon as it binds; do not cancel it mid-pin or mid-handshake.
+                return {
+                    "ok": True,
+                    "stopped": False,
+                    "pending": True,
+                    "message": (
+                        "Stop is waiting for the agent process to finish "
+                        "starting."
+                    ),
+                }
+            # No request or runner owns this BUSY reservation after the grace
+            # period, so it is an orphan and can be safely released.
+            run_id = str(current_turn.get("run_id") or "") or None
+            await release_turn_slot(session_id)
+            if run_id:
+                RUN_METADATA.pop(run_id, None)
             if emit_event:
                 await append_event(session_id, "turn_stopped", {
-                    "run_id": None,
-                    "message": "Stop requested before the agent process was ready.",
+                    "run_id": run_id,
+                    "message": "Stopped before the agent process was ready.",
                 })
-            return {"ok": True, "stopped": True, "pending": True}
+            return {"ok": True, "stopped": True, "pending": False}
         if schedule_queue:
             schedule_next_queued_turn(session_id)
-        return {"ok": True, "stopped": False}
+        # The requested terminal state is already satisfied. Returning
+        # stopped=True also lets clients clear a stale local running marker.
+        return {"ok": True, "stopped": True, "pending": False}
     proc = active.get("proc") if active else None
     native_turn = active.get("codex_app_server_turn") if active else None
     native_interrupt = False
@@ -19414,17 +19572,111 @@ async def stop_turn(
     if proc and active.get("transport") != CODEX_TRANSPORT_APP_SERVER:
         await terminate_process_tree(proc)
     if transition_ready is not None:
-        await transition_ready.wait()
-    if emit_event:
-        await append_event(session_id, "turn_stopped", {
-            "run_id": active.get("run_id") if active else None,
-            "backend": active.get("backend") if active else None,
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(transition_ready.wait()),
+                timeout=STOP_CONFIRM_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            async with ACTIVE_LOCK:
+                current = ACTIVE.get(session_id)
+                if current is active:
+                    current["native_interrupt_sent"] = False
+            return {
+                "ok": True,
+                "stopped": False,
+                "pending": True,
+                "native_interrupt": native_interrupt,
+                "message": "Stop was sent; waiting for the steering transition to settle.",
+            }
+    deadline = (
+        asyncio.get_running_loop().time()
+        + STOP_CONFIRM_TIMEOUT_SECONDS
+    )
+    dynamic_tasks = set(owned_tasks)
+    while True:
+        current_task = asyncio.current_task()
+        async with ACTIVE_LOCK:
+            current = ACTIVE.get(session_id)
+            still_busy = session_id in BUSY_SESSIONS
+            dynamic_tasks = {
+                task
+                for task in SESSION_TURN_TASKS.get(session_id) or ()
+                if task is not current_task and not task.done()
+            } | {
+                task
+                for (task_session_id, _operation_id), task in
+                CODEX_NATIVE_ACTION_TASKS.items()
+                if (
+                    task_session_id == session_id
+                    and task is not current_task
+                    and not task.done()
+                )
+            }
+            owner_task = active.get("owner_task")
+            if (
+                isinstance(owner_task, asyncio.Task)
+                and owner_task is not current_task
+                and not owner_task.done()
+            ):
+                dynamic_tasks.add(owner_task)
+        if current is not active:
+            return {
+                "ok": True,
+                "stopped": True,
+                "pending": False,
+                "native_interrupt": native_interrupt,
+            }
+        if not still_busy:
+            await release_turn_slot(session_id)
+            return {
+                "ok": True,
+                "stopped": True,
+                "pending": False,
+                "native_interrupt": native_interrupt,
+            }
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            break
+        if dynamic_tasks:
+            await asyncio.wait(
+                dynamic_tasks,
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        else:
+            await asyncio.sleep(min(0.01, remaining))
+
+    if not dynamic_tasks:
+        # No request or runner still owns this ACTIVE record. It is stale and
+        # safe to clear after the bounded confirmation window.
+        await release_turn_slot(session_id)
+        if emit_event:
+            await append_event(session_id, "turn_stopped", {
+                "run_id": active.get("run_id"),
+                "backend": active.get("backend"),
+                "native_interrupt": native_interrupt,
+            })
+        return {
+            "ok": True,
+            "stopped": True,
+            "pending": False,
             "native_interrupt": native_interrupt,
-        })
+        }
+
+    # A provider interrupt is an acknowledgement, not terminal state. Leave
+    # the chat active and permit a later Stop click to retry the interrupt
+    # instead of rendering a false "Turn Stopped" row.
+    async with ACTIVE_LOCK:
+        current = ACTIVE.get(session_id)
+        if current is active:
+            current["native_interrupt_sent"] = False
     return {
         "ok": True,
-        "stopped": True,
+        "stopped": False,
+        "pending": True,
         "native_interrupt": native_interrupt,
+        "message": "Stop was sent; waiting for Codex to finish stopping.",
     }
 
 

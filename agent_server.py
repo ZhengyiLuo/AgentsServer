@@ -2598,6 +2598,7 @@ class ReorderSessionRequest(BaseModel):
     direction: str | None = None
     target_id: str | None = None
     placement: str | None = None
+    target_folder: str | None = None
 
 
 class ReadSessionRequest(BaseModel):
@@ -3074,6 +3075,7 @@ class SessionStore:
         direction: str | None = None,
         target_id: str | None = None,
         placement: str | None = None,
+        target_folder: str | None = None,
     ) -> list[dict[str, Any]]:
         async with self._lock:
             sess = self.sessions.get(sid)
@@ -3088,19 +3090,38 @@ class SessionStore:
                 target = self.sessions.get(target_id)
                 if not target:
                     raise HTTPException(status_code=404, detail="target session not found")
-                if session_section_key(target) != section:
+                target_section = session_section_key(target)
+                if target_folder is not None:
+                    requested_folder = str(target_folder or "General").strip() or "General"
+                    if target_section[0] != "folder":
+                        raise HTTPException(
+                            status_code=400,
+                            detail="cross-section moves require a folder target",
+                        )
+                    if requested_folder != target_section[1]:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="target session moved to another folder",
+                        )
+                if target_section != section and target_folder is None:
                     raise HTTPException(status_code=400, detail="sessions must be in the same section")
                 if target_id == sid:
                     return sorted_sessions(list(self.sessions.values()))
 
                 peers = [
                     peer for peer in sorted_sessions(list(self.sessions.values()))
-                    if session_section_key(peer) == section
+                    if session_section_key(peer) == target_section
                     and peer.get("id") != sid
                 ]
                 target_index = next((idx for idx, peer in enumerate(peers) if peer.get("id") == target_id), None)
                 if target_index is None:
                     raise HTTPException(status_code=404, detail="target session not found")
+                if target_section != section:
+                    sess["folder"] = target_section[1]
+                    sess["pinned"] = False
+                    sess["pinned_at"] = None
+                    sess["archived"] = False
+                    sess["archived_at"] = None
                 insert_index = target_index + 1 if normalized_placement == "after" else target_index
                 reordered = peers[:insert_index] + [sess] + peers[insert_index:]
                 for index, peer in enumerate(reordered):
@@ -19066,7 +19087,13 @@ async def _post_codex_background_terminals_clean_locked(
 
 @app.post("/api/sessions/{session_id}/order")
 async def reorder_session(session_id: str, req: ReorderSessionRequest) -> dict[str, Any]:
-    sessions = await STORE.reorder(session_id, req.direction, req.target_id, req.placement)
+    sessions = await STORE.reorder(
+        session_id,
+        req.direction,
+        req.target_id,
+        req.placement,
+        req.target_folder,
+    )
     return {"sessions": [public_session(sess) for sess in sessions]}
 
 

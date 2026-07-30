@@ -39,6 +39,21 @@ class CodexAppServerError(RuntimeError):
 class CodexAppServerDisconnected(CodexAppServerError):
     """The shared app-server transport closed unexpectedly."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_sent: bool = False,
+        safe_to_retry: bool = False,
+        planned: bool = False,
+    ) -> None:
+        super().__init__(
+            message,
+            request_sent=request_sent,
+            safe_to_retry=safe_to_retry,
+        )
+        self.planned = planned
+
 
 class CodexAppServerTimeout(CodexAppServerError):
     """A request timed out after it may have reached app-server."""
@@ -422,6 +437,7 @@ class CodexAppServerClient:
         env_factory: Callable[[], dict[str, str]],
         request_timeout: float = 30.0,
         lifecycle_timeout: float = 300.0,
+        process_exit_timeout: float = 1.0,
         process_stream_limit: int = 16 * 1024 * 1024,
         notification_queue_limit: int = 8192,
         json_parse_thread_threshold: int = 1024 * 1024,
@@ -434,6 +450,7 @@ class CodexAppServerClient:
         self.env_factory = env_factory
         self.request_timeout = request_timeout
         self.lifecycle_timeout = lifecycle_timeout
+        self.process_exit_timeout = max(0.0, float(process_exit_timeout))
         self.process_stream_limit = process_stream_limit
         self.notification_queue_limit = max(1, int(notification_queue_limit))
         self.json_parse_thread_threshold = max(
@@ -675,9 +692,14 @@ class CodexAppServerClient:
         if had_transport_state:
             self._fail_all(
                 CodexAppServerDisconnected(
-                    "codex app-server transport closed",
+                    (
+                        "codex app-server stopped with AgentsServer"
+                        if self._closing
+                        else "codex app-server transport closed"
+                    ),
                     request_sent=bool(self._pending),
                     safe_to_retry=not bool(self._pending),
+                    planned=self._closing,
                 )
             )
 
@@ -847,14 +869,36 @@ class CodexAppServerClient:
             error = exc
         finally:
             if not self._closing and proc is self._proc:
-                self._initialized = False
-                error = error or CodexAppServerDisconnected(
-                    f"codex app-server exited with code {proc.returncode}",
-                    request_sent=bool(self._pending),
-                    safe_to_retry=not bool(self._pending),
-                )
-                self._fail_all(error)
-                self._cancel_server_request_tasks()
+                returncode = proc.returncode
+                if returncode is None:
+                    try:
+                        returncode = await asyncio.wait_for(
+                            proc.wait(),
+                            timeout=self.process_exit_timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        returncode = proc.returncode
+                    except Exception as exc:
+                        error = error or exc
+                # ``close()`` may have started while the reader was waiting
+                # for the child status.  Let the planned shutdown path own
+                # subscription cleanup instead of reporting a false crash.
+                if not self._closing and proc is self._proc:
+                    self._initialized = False
+                    error = error or CodexAppServerDisconnected(
+                        (
+                            f"codex app-server exited with code {returncode}"
+                            if returncode is not None
+                            else (
+                                "codex app-server closed stdout before its "
+                                "process exit status became available"
+                            )
+                        ),
+                        request_sent=bool(self._pending),
+                        safe_to_retry=not bool(self._pending),
+                    )
+                    self._fail_all(error)
+                    self._cancel_server_request_tasks()
 
     async def _stderr_loop(self, proc: asyncio.subprocess.Process) -> None:
         if not proc.stderr:

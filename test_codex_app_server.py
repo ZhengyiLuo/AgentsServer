@@ -1044,6 +1044,79 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.generation, 2)
         self.assertTrue(client.is_thread_loaded("thr_1"))
 
+    async def test_reader_waits_for_numeric_exit_status_after_stdout_eof(
+        self,
+    ) -> None:
+        factory = FakeProcessFactory()
+        process = factory.process
+        client = self.make_client(factory, process_exit_timeout=0.5)
+        self.addAsyncCleanup(client.close)
+        await client.start()
+
+        pending = asyncio.create_task(client.request("test/hang", {}))
+        await wait_until(
+            lambda: process.messages[-1].get("method") == "test/hang"
+        )
+        process.stdout.feed_eof()
+
+        async def publish_exit_status() -> None:
+            await asyncio.sleep(0.01)
+            process.returncode = 37
+            process.stderr.feed_eof()
+            process._exited.set()
+
+        exit_task = asyncio.create_task(publish_exit_status())
+        with self.assertRaises(CodexAppServerDisconnected) as raised:
+            await pending
+        await exit_task
+
+        self.assertEqual(
+            str(raised.exception),
+            "codex app-server exited with code 37",
+        )
+        self.assertNotIn("None", str(raised.exception))
+
+    async def test_reader_never_formats_missing_exit_status_as_none(self) -> None:
+        factory = FakeProcessFactory()
+        process = factory.process
+        client = self.make_client(factory, process_exit_timeout=0.01)
+        self.addAsyncCleanup(client.close)
+        await client.start()
+
+        pending = asyncio.create_task(client.request("test/hang", {}))
+        await wait_until(
+            lambda: process.messages[-1].get("method") == "test/hang"
+        )
+        process.stdout.feed_eof()
+
+        with self.assertRaises(CodexAppServerDisconnected) as raised:
+            await pending
+
+        self.assertIn(
+            "exit status became available",
+            str(raised.exception),
+        )
+        self.assertNotIn("code None", str(raised.exception))
+
+    async def test_planned_close_marks_transport_disconnect_as_planned(
+        self,
+    ) -> None:
+        factory = FakeProcessFactory()
+        process = factory.process
+        client = self.make_client(factory)
+        await client.start()
+
+        pending = asyncio.create_task(client.request("test/hang", {}))
+        await wait_until(
+            lambda: process.messages[-1].get("method") == "test/hang"
+        )
+        await client.close()
+
+        with self.assertRaises(CodexAppServerDisconnected) as raised:
+            await pending
+        self.assertTrue(raised.exception.planned)
+        self.assertIn("stopped with AgentsServer", str(raised.exception))
+
     async def test_manager_is_a_policy_agnostic_single_client_facade(self) -> None:
         factory = FakeProcessFactory()
         factory.process.responders["thread/start"] = lambda _: {

@@ -3806,6 +3806,10 @@ class SubscriberHub:
 HUB = SubscriberHub()
 ACTIVE: dict[str, dict[str, Any]] = {}
 BUSY_SESSIONS: set[str] = set()
+# Short provider-maintenance requests (for example, loading a selected Codex
+# thread) participate in update admission without impersonating a user turn in
+# runtime/status responses.
+SERVER_MAINTENANCE_SESSIONS: set[str] = set()
 CURRENT_TURNS: dict[str, dict[str, Any]] = {}
 STOP_REQUESTS: set[str] = set()
 STOPPED_RUNS: set[str] = set()
@@ -11655,6 +11659,9 @@ def host_pressure_snapshot() -> dict[str, Any]:
 
 async def scheduled_job_blocker(session_id: str) -> str | None:
     async with ACTIVE_LOCK:
+        update_blocker = managed_server_update_blocker()
+        if update_blocker:
+            return update_blocker
         if session_id in BUSY_SESSIONS:
             return "chat already has a running turn"
         active_count = len(BUSY_SESSIONS)
@@ -11676,6 +11683,9 @@ async def scheduled_job_blocker(session_id: str) -> str | None:
 
 async def turn_start_blocker(*, ignore_session_id: str | None = None) -> str | None:
     async with ACTIVE_LOCK:
+        update_blocker = managed_server_update_blocker()
+        if update_blocker:
+            return update_blocker
         active_count = len(BUSY_SESSIONS - ({ignore_session_id} if ignore_session_id else set()))
 
     if MAX_ACTIVE_AGENT_RUNS > 0 and active_count >= MAX_ACTIVE_AGENT_RUNS:
@@ -12527,8 +12537,17 @@ async def acquire_codex_control_thread(
         )
 
     reserved = False
+    maintenance_reserved = False
     active_thread_id = ""
     async with ACTIVE_LOCK:
+        update_blocker = managed_server_update_blocker()
+        if update_blocker:
+            raise HTTPException(status_code=503, detail=update_blocker)
+        if session_id in SERVER_MAINTENANCE_SESSIONS:
+            raise HTTPException(
+                status_code=409,
+                detail="wait for Codex session maintenance to finish",
+            )
         if session_id in BUSY_SESSIONS:
             active = ACTIVE.get(session_id)
             if (
@@ -12554,6 +12573,9 @@ async def acquire_codex_control_thread(
                 "interactive_app_server": True,
             }
             reserved = True
+        if not reserve_session:
+            SERVER_MAINTENANCE_SESSIONS.add(session_id)
+            maintenance_reserved = True
 
     manager: CodexAppServerManager | None = None
     thread_id = ""
@@ -12639,6 +12661,9 @@ async def acquire_codex_control_thread(
                 await unpin_codex_app_server_thread(manager, thread_id)
         if reserved:
             await release_turn_slot(session_id)
+        if maintenance_reserved:
+            async with ACTIVE_LOCK:
+                SERVER_MAINTENANCE_SESSIONS.discard(session_id)
         if isinstance(exc, HTTPException):
             raise
         raise codex_control_http_error(exc) from exc
@@ -12658,6 +12683,12 @@ async def release_codex_control_thread(
     if reserved_session:
         await release_turn_slot(session_id)
         if schedule_queue:
+            schedule_next_queued_turn(session_id)
+    else:
+        async with ACTIVE_LOCK:
+            SERVER_MAINTENANCE_SESSIONS.discard(session_id)
+            session_idle = session_id not in BUSY_SESSIONS
+        if schedule_queue and session_idle:
             schedule_next_queued_turn(session_id)
 
 
@@ -16906,7 +16937,17 @@ async def run_codex_app_server(
             or current_run_id in STOPPED_RUNS
         )
     except Exception as exc:
-        stop_requested = current_run_id in STOPPED_RUNS
+        planned_transport_shutdown = (
+            isinstance(exc, CodexAppServerDisconnected)
+            and (
+                bool(getattr(exc, "planned", False))
+                or managed_server_restart_is_planned()
+            )
+        )
+        stop_requested = (
+            current_run_id in STOPPED_RUNS
+            or planned_transport_shutdown
+        )
         safe_rejection = isinstance(exc, CodexAppServerRequestError)
         can_fallback = (
             allow_exec_fallback
@@ -16941,7 +16982,8 @@ async def run_codex_app_server(
         if turn is not None and turn.turn_id and not turn_completed:
             with suppress(CodexAppServerError):
                 await turn.interrupt()
-        terminal_error = terminal_error or concise_error_message(exc)
+        if not planned_transport_shutdown:
+            terminal_error = terminal_error or concise_error_message(exc)
         stopped = stop_requested
         terminal_status = "interrupted" if stopped else "failed"
         if not stopped:
@@ -17183,6 +17225,14 @@ async def _start_turn_locked(
     reserved = False
     should_queue = False
     async with ACTIVE_LOCK:
+        update_blocker = managed_server_update_blocker()
+        if update_blocker:
+            raise HTTPException(status_code=503, detail=update_blocker)
+        if session_id in SERVER_MAINTENANCE_SESSIONS:
+            raise HTTPException(
+                status_code=409,
+                detail="wait for Codex session maintenance to finish",
+            )
         if session_id in BUSY_SESSIONS:
             if queue_if_busy:
                 should_queue = True
@@ -17306,6 +17356,45 @@ SERVER_UPDATE_OPERATION_LOCK = asyncio.Lock()
 SERVER_UPDATE_START_GRACE_SECONDS = 45.0
 
 
+def managed_server_update_blocks_work(
+    status: dict[str, Any] | None = None,
+) -> bool:
+    """Return whether this process is draining for a managed replacement."""
+
+    current = status if status is not None else read_server_update_status()
+    return str(current.get("phase") or "") in SERVER_UPDATE_ACTIVE_PHASES
+
+
+def managed_server_update_blocker() -> str | None:
+    if not managed_server_update_blocks_work():
+        return None
+    return "AgentsServer is preparing a managed update"
+
+
+def managed_server_restart_is_planned() -> bool:
+    status = read_server_update_status()
+    return str(status.get("phase") or "") in {"installing", "restarting"}
+
+
+def server_update_work_message(
+    active_session_ids: list[str],
+    queued_turn_count: int,
+) -> str:
+    parts: list[str] = []
+    if active_session_ids:
+        count = len(active_session_ids)
+        parts.append(f"{count} active agent run{'s' if count != 1 else ''}")
+    if queued_turn_count:
+        parts.append(
+            f"{queued_turn_count} queued turn{'s' if queued_turn_count != 1 else ''}"
+        )
+    detail = " and ".join(parts) or "agent work"
+    return (
+        f"server update deferred: {detail} must finish or be removed before "
+        "AgentsServer can restart"
+    )
+
+
 def server_release_is_newer(latest: str, current: str) -> bool:
     try:
         return version_key(latest) > version_key(current)
@@ -17381,6 +17470,39 @@ def server_update_status_age_seconds(status: dict[str, Any]) -> float:
     return max(0.0, (datetime.now(timezone.utc) - updated_at).total_seconds())
 
 
+def finalize_abandoned_server_update(status: dict[str, Any]) -> dict[str, Any]:
+    """Release a stale update drain after its detached runner disappeared."""
+
+    target_version = str(status.get("target_version") or "")
+    if target_version == SERVER_VERSION:
+        return write_server_update_status(
+            phase="complete",
+            update_available=False,
+            installed_version=SERVER_VERSION,
+            message=f"AgentsServer {SERVER_VERSION} is installed and healthy.",
+            finished_at=status.get("finished_at") or update_utc_now(),
+        )
+    return write_server_update_status(
+        phase="failed",
+        message=(
+            "The detached updater exited before reporting completion. "
+            "See server-update.log."
+        ),
+        finished_at=update_utc_now(),
+    )
+
+
+async def reconcile_server_update_status_after_startup() -> dict[str, Any]:
+    """Resolve an update phase orphaned by a crash or power loss."""
+
+    status = read_server_update_status()
+    if str(status.get("phase") or "") not in SERVER_UPDATE_ACTIVE_PHASES:
+        return status
+    if await asyncio.to_thread(server_update_is_active, status):
+        return status
+    return finalize_abandoned_server_update(status)
+
+
 def server_update_runner_environment() -> dict[str, str]:
     """Preserve Linux's user-service bus when the detached tmux server is stale."""
     if not sys.platform.startswith("linux"):
@@ -17419,6 +17541,7 @@ async def lifespan(app: FastAPI):
     await STORE.load()
     await JOBS.load()
     ensure_dirs()
+    await reconcile_server_update_status_after_startup()
     digest_job_count = await load_handoff_digest_jobs()
     JOBS.start_scheduler()
     queue_recovery_task = asyncio.create_task(recover_queued_turns_after_start())
@@ -17577,25 +17700,15 @@ async def health() -> dict[str, Any]:
 async def server_update_status() -> dict[str, Any]:
     status = read_server_update_status()
     phase = str(status.get("phase") or "")
-    target_version = str(status.get("target_version") or "")
-    if phase in SERVER_UPDATE_ACTIVE_PHASES and target_version == SERVER_VERSION:
-        status = write_server_update_status(
-            phase="complete",
-            update_available=False,
-            installed_version=SERVER_VERSION,
-            message=f"AgentsServer {SERVER_VERSION} is installed and healthy.",
-            finished_at=status.get("finished_at") or update_utc_now(),
+    if phase in SERVER_UPDATE_ACTIVE_PHASES:
+        updater_active = await asyncio.to_thread(server_update_is_active, status)
+        updater_stale = (
+            not updater_active
+            and server_update_status_age_seconds(status)
+            >= SERVER_UPDATE_START_GRACE_SECONDS
         )
-    elif (
-        phase in SERVER_UPDATE_ACTIVE_PHASES
-        and not await asyncio.to_thread(server_update_is_active, status)
-        and server_update_status_age_seconds(status) >= SERVER_UPDATE_START_GRACE_SECONDS
-    ):
-        status = write_server_update_status(
-            phase="failed",
-            message="The detached updater exited before reporting completion. See server-update.log.",
-            finished_at=update_utc_now(),
-        )
+        if updater_stale:
+            status = finalize_abandoned_server_update(status)
     return status
 
 
@@ -17702,6 +17815,12 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
             "--current-version", SERVER_VERSION,
             "--track", track,
         ]
+        auth_token_file: Path | None = None
+        if AGENT_TOKEN:
+            auth_token_file = SERVER_UPDATE_STATUS_FILE.with_name(
+                f".server-update-{update_id}.auth.json"
+            )
+            command.extend(["--auth-token-file", str(auth_token_file)])
         runner_environment = server_update_runner_environment()
         if runner_environment:
             command = [
@@ -17710,26 +17829,55 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                 *command,
             ]
         channel_switch = track != server_release_track(SERVER_VERSION)
-        status = write_server_update_status(
-            update_id=update_id,
-            phase="starting",
-            track=track,
-            current_track=server_release_track(SERVER_VERSION),
-            channel_switch=channel_switch,
-            target_version=requested,
-            latest_version=requested,
-            update_available=True,
-            message=(
-                f"Starting switch to {track} AgentsServer {requested}."
-                if channel_switch
-                else f"Starting detached update to AgentsServer {requested}."
-            ),
-            started_at=update_utc_now(),
-            finished_at=None,
-        )
+        # Close admission and establish the durable update phase while holding
+        # the same lock used to reserve turns.  This removes the race where a
+        # turn could start after an idle check but before the detached updater
+        # was launched.
+        async with ACTIVE_LOCK:
+            async with QUEUE_LOCK:
+                active_session_ids = sorted(
+                    BUSY_SESSIONS | SERVER_MAINTENANCE_SESSIONS
+                )
+                queued_turn_count = sum(
+                    len(queue)
+                    for queue in QUEUED_TURNS.values()
+                ) + len(RUN_NOW_TURNS)
+                if active_session_ids or queued_turn_count:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=server_update_work_message(
+                            active_session_ids,
+                            queued_turn_count,
+                        ),
+                    )
+                status = write_server_update_status(
+                    update_id=update_id,
+                    phase="starting",
+                    track=track,
+                    current_track=server_release_track(SERVER_VERSION),
+                    channel_switch=channel_switch,
+                    target_version=requested,
+                    latest_version=requested,
+                    update_available=True,
+                    message=(
+                        f"Starting switch to {track} AgentsServer {requested}."
+                        if channel_switch
+                        else (
+                            f"Starting detached update to AgentsServer "
+                            f"{requested}."
+                        )
+                    ),
+                    started_at=update_utc_now(),
+                    finished_at=None,
+                )
         try:
+            if auth_token_file is not None:
+                atomic_update_json(auth_token_file, {"token": AGENT_TOKEN})
             await asyncio.to_thread(run_tmux, ["new-session", "-d", "-s", tmux_name, shlex.join(command)])
         except Exception as exc:
+            if auth_token_file is not None:
+                with suppress(FileNotFoundError):
+                    auth_token_file.unlink()
             write_server_update_status(phase="failed", message=f"Could not start detached updater: {exc}", finished_at=update_utc_now())
             raise HTTPException(status_code=500, detail="could not start detached updater") from exc
         return status
@@ -18050,8 +18198,7 @@ async def update_session(session_id: str, req: UpdateSessionRequest) -> dict[str
     return {"session": public_session(sess)}
 
 
-@app.get("/api/sessions/{session_id}/codex/runtime")
-async def get_codex_runtime(session_id: str) -> dict[str, Any]:
+async def codex_runtime_snapshot(session_id: str) -> dict[str, Any]:
     session = STORE.sessions.get(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="session not found")
@@ -18099,6 +18246,7 @@ async def get_codex_runtime(session_id: str) -> dict[str, Any]:
         "available": available,
         "transport": CODEX_TRANSPORT,
         "interactive_capability": CODEX_INTERACTIVE_CLIENT_CAPABILITY,
+        "persisted_thread": bool(thread_id),
         "thread_loaded": thread_loaded,
         "status": status,
         "goal": session.get("codex_goal"),
@@ -18119,6 +18267,106 @@ async def get_codex_runtime(session_id: str) -> dict[str, Any]:
     }
 
 
+@app.get("/api/sessions/{session_id}/codex/runtime")
+async def get_codex_runtime(session_id: str) -> dict[str, Any]:
+    return await codex_runtime_snapshot(session_id)
+
+
+@app.post("/api/sessions/{session_id}/codex/load")
+async def load_codex_runtime(session_id: str) -> dict[str, Any]:
+    """Resume a persisted Codex thread without creating provider state."""
+
+    async with session_lifecycle_lock(session_id):
+        ensure_session_not_deleting(session_id)
+        session = STORE.sessions.get(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="session not found")
+        if str(session.get("backend") or DEFAULT_BACKEND) != BACKEND_CODEX:
+            raise HTTPException(
+                status_code=409,
+                detail="Codex thread loading requires a Codex chat",
+            )
+        if CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC:
+            raise HTTPException(
+                status_code=503,
+                detail="Codex thread loading requires the app-server transport",
+            )
+
+        provider_id = str(session_provider_id(session) or "").strip()
+        async with ACTIVE_LOCK:
+            if (
+                session_id in BUSY_SESSIONS
+                or session_id in SERVER_MAINTENANCE_SESSIONS
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="wait for the active Codex turn to finish",
+                )
+            update_blocker = managed_server_update_blocker()
+            if update_blocker:
+                raise HTTPException(status_code=503, detail=update_blocker)
+
+        # A new chat has no persisted provider thread to resume.  Returning the
+        # normal snapshot keeps the endpoint idempotent and, importantly, does
+        # not turn merely selecting a chat into thread/start.
+        if not provider_id:
+            return await codex_runtime_snapshot(session_id)
+
+        manager: CodexAppServerManager | None = None
+        maintenance_reserved = False
+        loaded_thread_id = ""
+        runtime: dict[str, Any] | None = None
+        try:
+            # Reserve only for the duration of thread/resume. This participates
+            # in update admission without making the chat look like it has an
+            # active user turn.
+            async with ACTIVE_LOCK:
+                if (
+                    session_id in BUSY_SESSIONS
+                    or session_id in SERVER_MAINTENANCE_SESSIONS
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="wait for the active Codex turn to finish",
+                    )
+                update_blocker = managed_server_update_blocker()
+                if update_blocker:
+                    raise HTTPException(status_code=503, detail=update_blocker)
+                SERVER_MAINTENANCE_SESSIONS.add(session_id)
+                maintenance_reserved = True
+
+            manager = await codex_app_server_manager()
+            cwd = existing_cwd(str(session.get("cwd") or DEFAULT_CWD))
+            loaded_thread_id, _instruction_hash = (
+                await ensure_codex_app_server_thread(
+                    manager,
+                    session_id,
+                    session,
+                    cwd,
+                )
+            )
+            # Snapshot while ensure's pin is still held. An LRU eviction cannot
+            # turn a successful load into a stale ``thread_loaded`` response.
+            runtime = await codex_runtime_snapshot(session_id)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise codex_control_http_error(exc) from exc
+        finally:
+            if loaded_thread_id and manager is not None:
+                with suppress(Exception):
+                    await unpin_codex_app_server_thread(
+                        manager,
+                        loaded_thread_id,
+                    )
+            if maintenance_reserved:
+                async with ACTIVE_LOCK:
+                    SERVER_MAINTENANCE_SESSIONS.discard(session_id)
+
+        assert runtime is not None
+        return runtime
+
+
 @app.post(
     "/api/sessions/{session_id}/codex/interactions/{interaction_id}/resolve"
 )
@@ -18137,18 +18385,46 @@ async def post_codex_interaction_response(
 
 @app.get("/api/sessions/{session_id}/codex/permission-profiles")
 async def get_codex_permission_profiles(session_id: str) -> dict[str, Any]:
+    async with session_lifecycle_lock(session_id):
+        ensure_session_not_deleting(session_id)
+        return await _get_codex_permission_profiles_locked(session_id)
+
+
+async def _get_codex_permission_profiles_locked(
+    session_id: str,
+) -> dict[str, Any]:
     session = STORE.sessions.get(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="session not found")
     if str(session.get("backend") or DEFAULT_BACKEND) != BACKEND_CODEX:
-        raise HTTPException(status_code=409, detail="Codex controls require a Codex chat")
+        raise HTTPException(
+            status_code=409,
+            detail="Codex controls require a Codex chat",
+        )
     if CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC:
         raise HTTPException(
             status_code=503,
             detail="Codex controls require the app-server transport",
         )
-    cwd = existing_cwd(str(session.get("cwd") or DEFAULT_CWD))
+
+    maintenance_reserved = False
     try:
+        async with ACTIVE_LOCK:
+            update_blocker = managed_server_update_blocker()
+            if update_blocker:
+                raise HTTPException(status_code=503, detail=update_blocker)
+            if (
+                session_id in BUSY_SESSIONS
+                or session_id in SERVER_MAINTENANCE_SESSIONS
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="wait for the active Codex turn to finish",
+                )
+            SERVER_MAINTENANCE_SESSIONS.add(session_id)
+            maintenance_reserved = True
+
+        cwd = existing_cwd(str(session.get("cwd") or DEFAULT_CWD))
         manager = await codex_app_server_manager()
         await manager.start()
         cached = cached_codex_permission_profiles(cwd, manager)
@@ -18159,6 +18435,10 @@ async def get_codex_permission_profiles(session_id: str) -> dict[str, Any]:
         if isinstance(exc, HTTPException):
             raise
         raise codex_control_http_error(exc) from exc
+    finally:
+        if maintenance_reserved:
+            async with ACTIVE_LOCK:
+                SERVER_MAINTENANCE_SESSIONS.discard(session_id)
     CODEX_PERMISSION_PROFILES_CACHE[cwd] = (
         manager.generation,
         time.monotonic(),

@@ -868,6 +868,211 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
             agent_server.CODEX_APP_SERVER_MANAGER = previous_manager
         self.assertEqual(runtime["status"], {"type": "notLoaded"})
 
+    async def test_load_runtime_resumes_only_a_persisted_idle_thread(self) -> None:
+        manager = AsyncMock()
+        manager.is_thread_loaded = Mock(return_value=True)
+        ensure_thread = AsyncMock(return_value=("thread", "instruction-hash"))
+        previous_manager = agent_server.CODEX_APP_SERVER_MANAGER
+        previous_busy = agent_server.BUSY_SESSIONS
+        previous_current = agent_server.CURRENT_TURNS
+        previous_maintenance = agent_server.SERVER_MAINTENANCE_SESSIONS
+        agent_server.CODEX_APP_SERVER_MANAGER = manager
+        agent_server.BUSY_SESSIONS = set()
+        agent_server.CURRENT_TURNS = {}
+        agent_server.SERVER_MAINTENANCE_SESSIONS = set()
+        unpin_thread = AsyncMock()
+        try:
+            with patch.object(
+                agent_server,
+                "ensure_codex_app_server_thread",
+                ensure_thread,
+            ), patch.object(
+                agent_server,
+                "unpin_codex_app_server_thread",
+                unpin_thread,
+            ), patch.object(
+                agent_server,
+                "managed_server_update_blocker",
+                return_value=None,
+            ):
+                runtime = await agent_server.load_codex_runtime("chat")
+                released = "chat" not in agent_server.BUSY_SESSIONS
+                maintenance_released = (
+                    "chat" not in agent_server.SERVER_MAINTENANCE_SESSIONS
+                )
+        finally:
+            agent_server.CODEX_APP_SERVER_MANAGER = previous_manager
+            agent_server.BUSY_SESSIONS = previous_busy
+            agent_server.CURRENT_TURNS = previous_current
+            agent_server.SERVER_MAINTENANCE_SESSIONS = previous_maintenance
+
+        self.assertTrue(runtime["persisted_thread"])
+        self.assertTrue(runtime["thread_loaded"])
+        self.assertEqual(runtime["status"], {"type": "idle"})
+        ensure_thread.assert_awaited_once()
+        unpin_thread.assert_awaited_once_with(manager, "thread")
+        self.assertTrue(released)
+        self.assertTrue(maintenance_released)
+
+    async def test_load_runtime_does_not_create_a_thread_for_a_new_chat(
+        self,
+    ) -> None:
+        agent_server.STORE.sessions["chat"].pop("codex_thread_id", None)
+        agent_server.STORE.sessions["chat"].pop("session_id", None)
+        manager_factory = AsyncMock(
+            side_effect=AssertionError("new chats must not start app-server")
+        )
+        previous_manager = agent_server.CODEX_APP_SERVER_MANAGER
+        previous_busy = agent_server.BUSY_SESSIONS
+        agent_server.CODEX_APP_SERVER_MANAGER = None
+        agent_server.BUSY_SESSIONS = set()
+        try:
+            with patch.object(
+                agent_server,
+                "codex_app_server_manager",
+                manager_factory,
+            ), patch.object(
+                agent_server,
+                "managed_server_update_blocker",
+                return_value=None,
+            ):
+                runtime = await agent_server.load_codex_runtime("chat")
+        finally:
+            agent_server.CODEX_APP_SERVER_MANAGER = previous_manager
+            agent_server.BUSY_SESSIONS = previous_busy
+
+        self.assertFalse(runtime["thread_loaded"])
+        self.assertFalse(runtime["persisted_thread"])
+        self.assertEqual(runtime["status"], {"type": "notLoaded"})
+        manager_factory.assert_not_awaited()
+
+    async def test_load_runtime_rejects_while_chat_is_busy(self) -> None:
+        previous_busy = agent_server.BUSY_SESSIONS
+        agent_server.BUSY_SESSIONS = {"chat"}
+        try:
+            with patch.object(
+                agent_server,
+                "managed_server_update_blocker",
+                return_value=None,
+            ):
+                with self.assertRaises(HTTPException) as raised:
+                    await agent_server.load_codex_runtime("chat")
+        finally:
+            agent_server.BUSY_SESSIONS = previous_busy
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("active Codex turn", str(raised.exception.detail))
+
+    async def test_all_codex_control_acquisition_is_blocked_during_update(
+        self,
+    ) -> None:
+        manager_factory = AsyncMock(
+            side_effect=AssertionError("app-server must not start during update")
+        )
+        with patch.object(
+            agent_server,
+            "managed_server_update_blocker",
+            return_value="AgentsServer is preparing a managed update",
+        ), patch.object(
+            agent_server,
+            "codex_app_server_manager",
+            manager_factory,
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await agent_server.acquire_codex_control_thread(
+                    "chat",
+                    reserve_session=False,
+                )
+            with self.assertRaises(HTTPException) as profiles_raised:
+                await agent_server.get_codex_permission_profiles("chat")
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertIn("managed update", str(raised.exception.detail))
+        self.assertEqual(profiles_raised.exception.status_code, 503)
+        manager_factory.assert_not_awaited()
+
+    async def test_permission_profile_discovery_uses_maintenance_not_turn_state(
+        self,
+    ) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_list_permission_profiles(*, cwd: str):
+            self.assertEqual(cwd, "/work")
+            started.set()
+            await release.wait()
+            return [{"name": "default"}]
+
+        manager = Mock()
+        manager.generation = 7
+        manager.start = AsyncMock()
+        manager.list_permission_profiles = AsyncMock(
+            side_effect=slow_list_permission_profiles
+        )
+        busy: set[str] = set()
+        maintenance: set[str] = set()
+        current: dict[str, object] = {}
+        queued: dict[str, object] = {}
+        with (
+            patch.object(agent_server, "BUSY_SESSIONS", busy),
+            patch.object(
+                agent_server,
+                "SERVER_MAINTENANCE_SESSIONS",
+                maintenance,
+            ),
+            patch.object(agent_server, "CURRENT_TURNS", current),
+            patch.object(agent_server, "QUEUED_TURNS", queued),
+            patch.object(
+                agent_server,
+                "CODEX_PERMISSION_PROFILES_CACHE",
+                {},
+            ),
+            patch.object(
+                agent_server,
+                "managed_server_update_blocker",
+                return_value=None,
+            ),
+            patch.object(
+                agent_server,
+                "existing_cwd",
+                return_value="/work",
+            ),
+            patch.object(
+                agent_server,
+                "codex_app_server_manager",
+                AsyncMock(return_value=manager),
+            ),
+            patch.object(
+                agent_server,
+                "cached_codex_permission_profiles",
+                return_value=None,
+            ),
+        ):
+            profile_task = asyncio.create_task(
+                agent_server._get_codex_permission_profiles_locked("chat")
+            )
+            await asyncio.wait_for(started.wait(), timeout=1)
+            try:
+                self.assertEqual(maintenance, {"chat"})
+                self.assertEqual(busy, set())
+                self.assertEqual(current, {})
+                with self.assertRaises(HTTPException) as raised:
+                    await agent_server._start_turn_locked(
+                        "chat",
+                        agent_server.TurnRequest(prompt="do not queue me"),
+                    )
+                self.assertEqual(raised.exception.status_code, 409)
+                self.assertIn("maintenance", str(raised.exception.detail))
+                self.assertEqual(queued, {})
+            finally:
+                release.set()
+            result = await profile_task
+
+        self.assertEqual(result, {"profiles": [{"name": "default"}]})
+        self.assertEqual(maintenance, set())
+        self.assertEqual(busy, set())
+        self.assertEqual(current, {})
+
 
 class GatedNativeSubscription:
     def __init__(self, notifications: list[dict[str, object]], gate_at: int) -> None:

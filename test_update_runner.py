@@ -401,12 +401,14 @@ class UpdateRunnerTests(unittest.TestCase):
             with patch.object(update_runner, "check_release", return_value=manifest), \
                  patch.object(update_runner, "download_bytes", return_value=archive_bytes), \
                  patch.object(update_runner, "update_status", side_effect=record_status), \
+                 patch.object(update_runner, "assert_server_idle") as idle_check, \
                  patch.object(update_runner, "run_installer") as install:
                 update_runner.run_update(args)
 
         self.assertEqual(statuses[-1]["phase"], "complete")
         self.assertEqual(statuses[-1]["installed_version"], "1.2.4")
         self.assertEqual(statuses[-1]["track"], "stable")
+        idle_check.assert_called_once_with(7850, token="")
         install.assert_called_once()
 
     def test_detached_runner_allows_explicit_beta_to_latest_stable_switch(self):
@@ -442,14 +444,37 @@ class UpdateRunnerTests(unittest.TestCase):
             with patch.object(update_runner, "check_release", return_value=manifest) as check, \
                  patch.object(update_runner, "download_bytes", return_value=archive_bytes), \
                  patch.object(update_runner, "update_status", side_effect=lambda _path, **changes: statuses.append(changes) or changes), \
+                 patch.object(update_runner, "assert_server_idle") as idle_check, \
                  patch.object(update_runner, "run_installer") as install:
                 update_runner.run_update(args)
 
         check.assert_called_once_with(Path(args.public_key).resolve(), "stable")
+        idle_check.assert_called_once_with(7850, token="")
         install.assert_called_once()
         self.assertEqual(statuses[-1]["phase"], "complete")
         self.assertEqual(statuses[-1]["installed_version"], "1.2.4")
         self.assertEqual(statuses[-1]["track"], "stable")
+
+    def test_pre_restart_idle_check_rejects_late_work(self):
+        with patch.object(
+            update_runner,
+            "server_work_snapshot",
+            return_value=(2, 3),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "2 active agent runs and 3 queued turns",
+            ):
+                update_runner.assert_server_idle(7850, token="one-time-token")
+
+    def test_one_time_health_credential_is_consumed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "update-auth.json"
+            update_runner.atomic_json(path, {"token": "secret"})
+            token = update_runner.consume_auth_token_file(str(path))
+
+        self.assertEqual(token, "secret")
+        self.assertFalse(path.exists())
 
 
 if __name__ == "__main__":

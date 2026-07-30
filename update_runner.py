@@ -29,6 +29,7 @@ RELEASES_API_URL = f"https://api.github.com/repos/{RELEASE_REPOSITORY}/releases?
 RELEASES_PAGE_URL = f"https://github.com/{RELEASE_REPOSITORY}/releases"
 MAX_METADATA_BYTES = 1_000_000
 MAX_ARCHIVE_BYTES = 200 * 1024 * 1024
+SERVER_IDLE_CHECK_TIMEOUT_SECONDS = 10.0
 VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$")
 # The standalone installer allows dependency synchronization to run for up to
 # 1,200 seconds. Keep this enclosing budget comfortably above that so the
@@ -194,6 +195,104 @@ def download_bytes(url: str, limit: int, timeout: float = 30.0) -> bytes:
     if len(content) > limit:
         raise RuntimeError(f"download exceeds the {limit}-byte safety limit")
     return content
+
+
+def server_work_snapshot(
+    port: int,
+    *,
+    token: str | None = None,
+    timeout: float = SERVER_IDLE_CHECK_TIMEOUT_SECONDS,
+) -> tuple[int, int]:
+    """Read the live workload immediately before invoking the installer."""
+
+    headers = {"User-Agent": "AgentsServer-Updater/1"}
+    clean_token = str(token or "").strip()
+    if clean_token:
+        headers["Authorization"] = f"Bearer {clean_token}"
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{int(port)}/api/health",
+        headers=headers,
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        content = response.read(MAX_METADATA_BYTES + 1)
+    if len(content) > MAX_METADATA_BYTES:
+        raise RuntimeError("server health response exceeds its safety limit")
+    try:
+        health = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("server health response is invalid JSON") from exc
+    if not isinstance(health, dict) or health.get("ok") is not True:
+        raise RuntimeError("server health response is not healthy")
+
+    active = health.get("active")
+    raw_active_count = health.get("active_count")
+    if isinstance(raw_active_count, bool):
+        raise RuntimeError("server health response has an invalid active count")
+    if isinstance(raw_active_count, int):
+        active_count = max(0, raw_active_count)
+    elif isinstance(active, list):
+        active_count = len(active)
+    else:
+        raise RuntimeError("server health response is missing its active count")
+
+    queued = health.get("queued")
+    if not isinstance(queued, dict):
+        raise RuntimeError("server health response is missing its queued turns")
+    queued_count = 0
+    for value in queued.values():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError("server health response has an invalid queued count")
+        queued_count += value
+    return active_count, queued_count
+
+
+def assert_server_idle(port: int, *, token: str | None = None) -> None:
+    """Fail closed if work appeared after the update was accepted."""
+
+    try:
+        active_count, queued_count = server_work_snapshot(
+            port,
+            token=token,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"could not verify that AgentsServer is idle before restart: {exc}"
+        ) from exc
+    if active_count or queued_count:
+        parts: list[str] = []
+        if active_count:
+            parts.append(
+                f"{active_count} active agent run{'s' if active_count != 1 else ''}"
+            )
+        if queued_count:
+            parts.append(
+                f"{queued_count} queued turn{'s' if queued_count != 1 else ''}"
+            )
+        raise RuntimeError(
+            "server became busy before restart: "
+            + " and ".join(parts)
+            + "; retry the update after work finishes"
+        )
+
+
+def consume_auth_token_file(path: str | None) -> str:
+    """Read and immediately remove the updater's one-time health credential."""
+
+    clean_path = str(path or "").strip()
+    if not clean_path:
+        return ""
+    token_path = Path(clean_path).expanduser().resolve()
+    try:
+        value = json.loads(token_path.read_text())
+        token = str(value.get("token") or "") if isinstance(value, dict) else ""
+    finally:
+        try:
+            token_path.unlink()
+        except FileNotFoundError:
+            pass
+    if not token:
+        raise RuntimeError("server update health credential is empty")
+    return token
 
 
 def version_is_prerelease(version: str) -> bool:
@@ -407,6 +506,7 @@ def run_update(args: argparse.Namespace) -> None:
     status_path = Path(args.status_file).expanduser().resolve()
     public_key = Path(args.public_key).expanduser().resolve()
     track = normalized_release_track(getattr(args, "track", "stable"))
+    auth_token = consume_auth_token_file(getattr(args, "auth_token_file", None))
     update_status(
         status_path,
         phase="checking",
@@ -450,6 +550,7 @@ def run_update(args: argparse.Namespace) -> None:
             "--port", str(args.port),
             "--bind", args.bind,
         ]
+        assert_server_idle(args.port, token=auth_token)
         update_status(status_path, phase="installing", message=f"Installing AgentsServer {version} with rollback protection.")
         log_path = status_path.with_name("server-update.log")
         run_installer(
@@ -479,6 +580,7 @@ def main() -> int:
     parser.add_argument("--expected-version")
     parser.add_argument("--current-version")
     parser.add_argument("--track", choices=sorted(RELEASE_TRACKS), default="stable")
+    parser.add_argument("--auth-token-file")
     args = parser.parse_args()
     try:
         run_update(args)

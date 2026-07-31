@@ -705,6 +705,60 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertEqual(oversized.exception.detail["code"], "workspace_preview_too_large")
         self.assertEqual(outside_data, b"outside")
 
+    def test_download_streams_arbitrary_workspace_files_as_attachments(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data = b"\x00\xffbinary-workspace-data"
+            (root / "模型.weights").write_bytes(data)
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
+                response = asyncio.run(agent_server.get_session_workspace_download(
+                    self.request(),
+                    "session-1",
+                    "模型.weights",
+                ))
+                body = self.response_body(response)
+                head_response = asyncio.run(agent_server.get_session_workspace_download(
+                    self.request("HEAD"),
+                    "session-1",
+                    "模型.weights",
+                ))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "application/octet-stream")
+        self.assertEqual(response.headers["content-length"], str(len(data)))
+        self.assertEqual(
+            response.headers["content-disposition"],
+            "attachment; filename*=UTF-8''%E6%A8%A1%E5%9E%8B.weights",
+        )
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+        self.assertEqual(body, data)
+        self.assertEqual(head_response.status_code, 200)
+        self.assertEqual(head_response.headers["content-length"], str(len(data)))
+        self.assertEqual(head_response.body, b"")
+
+    def test_download_rejects_directories_symlinks_and_escaping_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "workspace"
+            root.mkdir()
+            outside = Path(temporary) / "outside.bin"
+            outside.write_bytes(b"outside")
+            (root / "escape.bin").symlink_to(outside)
+            (root / "directory.bin").mkdir()
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
+                for path, status, code in (
+                    ("escape.bin", 403, "workspace_symlink_blocked"),
+                    ("directory.bin", 400, "workspace_not_regular_file"),
+                    ("../outside.bin", 400, "invalid_workspace_path"),
+                ):
+                    with self.subTest(path=path), self.assertRaises(HTTPException) as raised:
+                        agent_server.open_workspace_download_sync("session-1", path)
+                    self.assertEqual(raised.exception.status_code, status)
+                    self.assertEqual(raised.exception.detail["code"], code)
+                outside_data = outside.read_bytes()
+
+        self.assertEqual(outside_data, b"outside")
+
     def test_preview_parses_only_one_satisfiable_byte_range(self) -> None:
         self.assertIsNone(agent_server.parse_workspace_preview_range(None, 10))
         self.assertEqual(agent_server.parse_workspace_preview_range("bytes=2-", 10), (2, 9))

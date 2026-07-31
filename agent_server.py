@@ -43,7 +43,7 @@ from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Literal
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from croniter import CroniterBadDateError, CroniterError, croniter
@@ -1157,6 +1157,41 @@ def open_workspace_preview_sync(session_id: str, relative_path: str) -> dict[str
             "path": normalized,
             "name": name,
             "media_type": media_type,
+            "revision": workspace_entry_revision(item_stat),
+            "size": int(item_stat.st_size),
+            "mtime_ns": int(item_stat.st_mtime_ns),
+        }
+        file_fd = -1
+        return result
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        os.close(parent_fd)
+
+
+def open_workspace_download_sync(session_id: str, relative_path: str) -> dict[str, Any]:
+    """Securely open one workspace file for an explicit user download."""
+    _, root = session_workspace_root(session_id)
+    normalized = normalize_workspace_path(relative_path)
+    parent_fd, name = open_workspace_parent_fd(root, normalized)
+    file_fd = -1
+    try:
+        try:
+            file_fd = os.open(name, workspace_open_flags(), dir_fd=parent_fd)
+        except OSError as exc:
+            raise translate_workspace_os_error(exc, normalized) from exc
+        item_stat = os.fstat(file_fd)
+        if not stat.S_ISREG(item_stat.st_mode):
+            raise workspace_http_error(
+                400,
+                "workspace_not_regular_file",
+                f"Not a regular workspace file: {normalized}",
+            )
+        result = {
+            "file_fd": file_fd,
+            "root": str(root),
+            "path": normalized,
+            "name": name,
             "revision": workspace_entry_revision(item_stat),
             "size": int(item_stat.st_size),
             "mtime_ns": int(item_stat.st_mtime_ns),
@@ -20086,6 +20121,46 @@ async def get_session_workspace_preview(
             status_code=status_code,
             headers=headers,
             media_type=str(preview["media_type"]),
+        )
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+
+
+@app.api_route("/api/sessions/{session_id}/workspace/download", methods=["GET", "HEAD"])
+async def get_session_workspace_download(
+    request: Request,
+    session_id: str,
+    path: str = Query(min_length=1, max_length=MAX_WORKSPACE_PATH_CHARS),
+) -> Response:
+    download = await asyncio.to_thread(open_workspace_download_sync, session_id, path)
+    file_fd = int(download["file_fd"])
+    try:
+        size = int(download["size"])
+        revision = str(download["revision"])
+        filename = quote(str(download["name"]), safe="")
+        headers = {
+            "Cache-Control": "no-store",
+            "Content-Length": str(size),
+            "Content-Disposition": f"attachment; filename*=UTF-8''{filename}",
+            "ETag": f'"{revision}"',
+            "X-AgentsDock-Revision": revision,
+            "X-Content-Type-Options": "nosniff",
+        }
+        if request.method.upper() == "HEAD":
+            os.close(file_fd)
+            file_fd = -1
+            return Response(
+                content=b"",
+                headers=headers,
+                media_type="application/octet-stream",
+            )
+        body = stream_workspace_preview(file_fd, 0, size)
+        file_fd = -1
+        return StreamingResponse(
+            body,
+            headers=headers,
+            media_type="application/octet-stream",
         )
     finally:
         if file_fd >= 0:

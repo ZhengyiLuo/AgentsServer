@@ -9458,6 +9458,11 @@ def collect_semantic_timeline_events(
                 preserve_completed_commentary=(
                     key in native_steer_retired_keys
                     or key in stopped_turn_keys
+                    # A semantic full-tail refresh replaces the mobile
+                    # snapshot. Completed commentary from the unfinished
+                    # active turn is therefore durable display content, not
+                    # optional trace sampling.
+                    or key == active_turn_key
                 ),
             ))
 

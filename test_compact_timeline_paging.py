@@ -1223,6 +1223,95 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
             "run-a",
         )
 
+    def test_active_turn_preserves_completed_commentary_after_compaction(
+        self,
+    ) -> None:
+        events = [
+            self.event(
+                1,
+                "turn_started",
+                run_id="active-run",
+                prompt="Keep reporting progress",
+            ),
+            self.event(
+                2,
+                "reasoning_summary",
+                run_id="active-run",
+                item_id="commentary-1",
+                phase="commentary",
+                text="First completed commentary.",
+            ),
+            self.event(
+                3,
+                "tool_started",
+                run_id="active-run",
+                tool={"name": "exec"},
+            ),
+            self.event(
+                4,
+                "reasoning_summary",
+                run_id="active-run",
+                item_id="commentary-2",
+                phase="commentary",
+                text="Second completed commentary.",
+            ),
+            self.event(
+                5,
+                "codex_compaction_completed",
+                turn_id="active-compaction",
+                item_id="automatic-compaction",
+                status="completed",
+                message="Codex completed automatic context compaction.",
+            ),
+        ]
+        seq = len(events)
+        for commentary_index in range(3, 9):
+            seq += 1
+            events.append(self.event(
+                seq,
+                "reasoning_summary",
+                run_id="active-run",
+                item_id=f"commentary-{commentary_index}",
+                phase="commentary",
+                text=f"Completed commentary {commentary_index}.",
+            ))
+            seq += 1
+            events.append(self.event(
+                seq,
+                "tool_finished",
+                run_id="active-run",
+                tool={"name": "exec"},
+            ))
+        self.write_events(events)
+
+        page = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            limit=2,
+            tail=True,
+        )
+
+        commentary = [
+            event
+            for event in page["events"]
+            if event["type"] == "reasoning_summary"
+            and event.get("phase") == "commentary"
+        ]
+        self.assertEqual(
+            [event["item_id"] for event in commentary],
+            [f"commentary-{index}" for index in range(1, 9)],
+        )
+        self.assertIn(
+            "codex_compaction_completed",
+            [event["type"] for event in page["events"]],
+        )
+        self.assertFalse(
+            any(
+                event["type"].startswith("turn_")
+                and event["type"] != "turn_started"
+                for event in page["events"]
+            )
+        )
+
     def test_genuine_stop_preserves_completed_commentary_in_semantic_page(
         self,
     ) -> None:

@@ -7599,6 +7599,7 @@ SEMANTIC_TIMELINE_EVENT_BUDGET_PER_ITEM = 4
 # selected media-heavy turns from multiplying that allowance without bound.
 SEMANTIC_TIMELINE_ESSENTIAL_LIMIT_PER_ITEM = 32
 SEMANTIC_TIMELINE_ESSENTIAL_PAGE_OVERFLOW_LIMIT = 128
+SEMANTIC_TIMELINE_TRACE_ANCHOR_PAGE_OVERFLOW_LIMIT = 128
 JOB_RUN_HISTORY_TEXT_LIMIT = 64 * 1024
 SEMANTIC_TIMELINE_ESSENTIAL_DETAIL_TYPES = {
     "artifact_created",
@@ -9188,6 +9189,18 @@ def semantic_timeline_event_is_completed_commentary(
     )
 
 
+def semantic_timeline_event_is_trace_anchor(event: dict[str, Any]) -> bool:
+    """Keep one lightweight handle so completed trace detail stays discoverable."""
+    event_type = str(event.get("type") or "")
+    if event_type not in RUN_TRACE_EVENT_TYPES:
+        return False
+    if not str(event.get("run_id") or "").strip():
+        return False
+    if event_type == "reasoning_summary":
+        return bool(str(event.get("text") or "").strip())
+    return True
+
+
 def semantic_timeline_ordinary_candidates(
     events: list[dict[str, Any]],
     *,
@@ -9213,12 +9226,18 @@ def semantic_timeline_ordinary_candidates(
     secondary_event = first_turn
     if secondary_event is None and ordered[0] is not latest_display:
         secondary_event = ordered[0]
-    secondary = (
-        [secondary_event]
-        if secondary_event is not None
-        and semantic_timeline_event_identity(secondary_event) != semantic_timeline_event_identity(latest_display)
-        else []
+    secondary_candidates = [secondary_event] if secondary_event is not None else []
+    trace_anchor = next(
+        (event for event in reversed(ordered) if semantic_timeline_event_is_trace_anchor(event)),
+        None,
     )
+    primary_id = semantic_timeline_event_identity(latest_display)
+    secondary_by_id = {
+        semantic_timeline_event_identity(event): event
+        for event in secondary_candidates
+        if semantic_timeline_event_identity(event) != primary_id
+    }
+    secondary = list(secondary_by_id.values())
     core_ids = {
         semantic_timeline_event_identity(event)
         for event in [*primary, *secondary]
@@ -9249,6 +9268,12 @@ def semantic_timeline_ordinary_candidates(
         for event in remaining
         if semantic_timeline_event_identity(event) not in essential_ids
     ]
+    if trace_anchor is not None:
+        trace_anchor_id = semantic_timeline_event_identity(trace_anchor)
+        optional = [
+            trace_anchor,
+            *(event for event in optional if semantic_timeline_event_identity(event) != trace_anchor_id),
+        ]
     return primary, secondary, essential, optional
 
 
@@ -9515,6 +9540,46 @@ def collect_semantic_timeline_events(
                     made_progress = True
                     break
             if len(deduplicated) >= essential_response_limit:
+                break
+        if not made_progress:
+            break
+
+    # Essential media and reviewable diffs always win their pass above. Give
+    # each ordinary turn one separately bounded trace handle afterward, even
+    # when essentials consumed the base event budget, so lazy reasoning detail
+    # remains discoverable without displacing first-class output.
+    anchor_queues = [
+        deque(
+            [anchor]
+            if (anchor := next(
+                (
+                    event
+                    for event in optional
+                    if semantic_timeline_event_is_trace_anchor(event)
+                ),
+                None,
+            )) is not None
+            else []
+        )
+        for _primary, _secondary, _essential, optional in bundles
+    ]
+    anchor_response_limit = min(
+        MAX_EVENT_RESPONSE_LIMIT,
+        max(event_limit, len(deduplicated))
+        + min(
+            SEMANTIC_TIMELINE_TRACE_ANCHOR_PAGE_OVERFLOW_LIMIT,
+            sum(bool(queue) for queue in anchor_queues),
+        ),
+    )
+    while len(deduplicated) < anchor_response_limit:
+        made_progress = False
+        for queue in reversed(anchor_queues):
+            while queue:
+                event = queue.popleft()
+                if append_with_limit(event, anchor_response_limit):
+                    made_progress = True
+                    break
+            if len(deduplicated) >= anchor_response_limit:
                 break
         if not made_progress:
             break

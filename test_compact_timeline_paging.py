@@ -322,7 +322,14 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
             agent_server.SEMANTIC_TIMELINE_EVENT_BUDGET_PER_ITEM,
         )
         self.assertNotIn("tool_started", [event["type"] for event in page["events"]])
-        self.assertNotIn("reasoning_summary", [event["type"] for event in page["events"]])
+        self.assertEqual(
+            [
+                (event["seq"], event["type"])
+                for event in page["events"]
+                if event["type"] in {"reasoning_summary", "tool_started", "tool_finished"}
+            ],
+            [(10, "reasoning_summary")],
+        )
 
     def test_semantic_media_overflow_is_bounded_but_preserves_thirteen_videos(self) -> None:
         for artifact_count in (13, 80):
@@ -1137,6 +1144,115 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(
             any(event["type"] == "turn_stopped" for event in page["events"])
+        )
+
+    def test_completed_turn_keeps_one_trace_anchor_in_semantic_page(self) -> None:
+        self.write_events([
+            self.event(1, "turn_started", run_id="completed-run", prompt="Question"),
+            self.event(
+                2,
+                "reasoning_summary",
+                run_id="completed-run",
+                phase="commentary",
+                text="Checking the implementation.",
+            ),
+            self.event(3, "tool_started", run_id="completed-run", tool={"name": "exec"}),
+            self.event(4, "tool_finished", run_id="completed-run", tool={"name": "exec"}),
+            self.event(5, "turn_finished", run_id="completed-run", result_text="Answer"),
+        ])
+
+        page = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            limit=1,
+            tail=True,
+        )
+
+        self.assertIn("turn_started", [event["type"] for event in page["events"]])
+        self.assertIn("turn_finished", [event["type"] for event in page["events"]])
+        anchors = [
+            event
+            for event in page["events"]
+            if event["type"] in {"reasoning_summary", "tool_started", "tool_finished"}
+            and event.get("run_id") == "completed-run"
+        ]
+        self.assertTrue(anchors)
+        self.assertEqual(anchors[-1]["type"], "tool_finished")
+
+    def test_trace_anchor_ignores_later_provider_session(self) -> None:
+        self.write_events([
+            self.event(1, "turn_started", run_id="provider-run", prompt="Question"),
+            self.event(2, "reasoning_summary", run_id="provider-run", text="Thinking"),
+            self.event(3, "tool_finished", run_id="provider-run", tool={"name": "exec"}),
+            self.event(
+                4,
+                "provider_session",
+                run_id="provider-run",
+                provider_session_id="provider-thread",
+            ),
+            self.event(5, "turn_finished", run_id="provider-run", result_text="Answer"),
+        ])
+
+        page = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            limit=1,
+            tail=True,
+        )
+
+        provider = next(event for event in page["events"] if event["type"] == "provider_session")
+        self.assertFalse(agent_server.semantic_timeline_event_is_trace_anchor(provider))
+        anchors = [
+            event
+            for event in page["events"]
+            if agent_server.semantic_timeline_event_is_trace_anchor(event)
+        ]
+        self.assertEqual(
+            [(event["seq"], event["type"]) for event in anchors],
+            [(3, "tool_finished")],
+        )
+
+    def test_media_heavy_turns_each_keep_a_trace_anchor_after_essentials(self) -> None:
+        events: list[dict[str, object]] = []
+        seq = 0
+        run_ids = [f"trace-media-run-{index}" for index in range(3)]
+        for run_id in run_ids:
+            seq += 1
+            events.append(self.event(seq, "turn_started", run_id=run_id, prompt="Render"))
+            seq += 1
+            events.append(self.event(seq, "reasoning_summary", run_id=run_id, text="Planning"))
+            for artifact_index in range(2):
+                seq += 1
+                events.append(self.event(
+                    seq,
+                    "artifact_created",
+                    run_id=run_id,
+                    artifact={
+                        "id": f"{run_id}-video-{artifact_index}",
+                        "filename": f"{artifact_index}.mp4",
+                        "content_type": "video/mp4",
+                    },
+                ))
+            seq += 1
+            events.append(self.event(seq, "turn_finished", run_id=run_id, result_text="Done"))
+        self.write_events(events)
+
+        page = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            limit=len(run_ids),
+            tail=True,
+        )
+
+        for run_id in run_ids:
+            self.assertEqual(sum(
+                event["type"] == "artifact_created" and event.get("run_id") == run_id
+                for event in page["events"]
+            ), 2)
+            self.assertTrue(any(
+                event["type"] == "reasoning_summary" and event.get("run_id") == run_id
+                for event in page["events"]
+            ))
+        self.assertLessEqual(
+            len(page["events"]),
+            len(run_ids) * (agent_server.SEMANTIC_TIMELINE_EVENT_BUDGET_PER_ITEM + 1),
         )
 
     def test_native_steer_preserves_completed_commentary_in_semantic_page(self) -> None:

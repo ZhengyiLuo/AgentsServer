@@ -513,12 +513,14 @@ def job_context_mode(job: dict[str, Any]) -> Literal["chat", "standalone"]:
     return "standalone" if mode == "standalone" else "chat"
 
 
-def validate_job_context_backend(
+def resolve_job_context_contract(
     parent_session: dict[str, Any],
     context_mode: Any,
     backend: Any,
-) -> str | None:
-    """Validate a job backend against its provider-context contract."""
+    *,
+    context_mode_explicit: bool,
+) -> tuple[Literal["chat", "standalone"], str | None]:
+    """Resolve legacy omission and validate a job's provider context."""
 
     normalized_backend = str(backend or "").strip().lower() or None
     if normalized_backend is not None and normalized_backend not in VALID_BACKENDS:
@@ -526,12 +528,25 @@ def validate_job_context_backend(
             status_code=400,
             detail=f"backend must be one of {sorted(VALID_BACKENDS)}",
         )
-    mode = "standalone" if str(context_mode or "").strip().lower() == "standalone" else "chat"
+    mode: Literal["chat", "standalone"] = (
+        "standalone"
+        if str(context_mode or "").strip().lower() == "standalone"
+        else "chat"
+    )
     parent_backend = str(
         parent_session.get("backend") or DEFAULT_BACKEND
     ).strip().lower()
     if parent_backend not in VALID_BACKENDS:
         parent_backend = DEFAULT_BACKEND
+    if (
+        not context_mode_explicit
+        and normalized_backend is not None
+        and normalized_backend != parent_backend
+    ):
+        # Contract-v8 and mobile clients predate context_mode. Their explicit
+        # alternate backend meant an independent provider run; preserve that
+        # intent instead of turning a formerly accepted request into a 400.
+        mode = "standalone"
     if (
         mode == "chat"
         and normalized_backend is not None
@@ -548,7 +563,7 @@ def validate_job_context_backend(
     # None intentionally means "inherit the parent chat backend". Preserve it
     # for older clients and legacy job payloads instead of expanding it into a
     # new required field value.
-    return normalized_backend
+    return mode, normalized_backend
 
 
 def normalize_cron_expression(value: Any, job_id: str) -> str:
@@ -2778,6 +2793,15 @@ class CreateScopedJobRequest(JobCreateFields):
     pass
 
 
+def request_fields_set(request_model: BaseModel) -> set[str]:
+    """Read explicit Pydantic fields without eagerly touching v1 aliases."""
+
+    fields = getattr(request_model, "model_fields_set", None)
+    if fields is None:
+        fields = getattr(request_model, "__fields_set__", set())
+    return set(fields)
+
+
 def normalize_runtime_effort(backend: str, effort: Any, *, strict: bool = False) -> str | None:
     clean = str(effort or "").strip().lower()
     if not clean:
@@ -3579,10 +3603,31 @@ class JobStore:
             if "scheduled_run_at" not in job:
                 job["scheduled_run_at"] = job.get("next_run_at") if job.get("enabled") else None
                 changed = True
+            context_mode_was_explicit = "context_mode" in job
             normalized_context_mode = job_context_mode(job)
+            if not context_mode_was_explicit:
+                parent_session = STORE.sessions.get(
+                    str(job.get("session_id") or "")
+                )
+                if parent_session:
+                    try:
+                        normalized_context_mode, _backend = (
+                            resolve_job_context_contract(
+                                parent_session,
+                                normalized_context_mode,
+                                job.get("backend"),
+                                context_mode_explicit=False,
+                            )
+                        )
+                    except HTTPException:
+                        # Do not make server startup fail on a corrupt legacy
+                        # backend. Existing runtime validation will surface it
+                        # if that job is run or edited.
+                        normalized_context_mode = "chat"
             if job.get("context_mode") != normalized_context_mode:
-                # Jobs created before context modes existed always continued
-                # in their parent chat. Preserve that behavior during load.
+                # Preserve the legacy contract: an omitted/same-provider job
+                # continued its parent chat, while an explicitly different
+                # provider ran independently.
                 job["context_mode"] = normalized_context_mode
                 changed = True
         if changed:
@@ -3598,10 +3643,11 @@ class JobStore:
         parent_session = STORE.sessions.get(req.session_id)
         if not parent_session:
             raise HTTPException(status_code=404, detail="session not found")
-        backend = validate_job_context_backend(
+        context_mode, backend = resolve_job_context_contract(
             parent_session,
             req.context_mode,
             req.backend,
+            context_mode_explicit="context_mode" in request_fields_set(req),
         )
         jid = f"job_{uuid.uuid4().hex[:16]}"
         now = now_iso()
@@ -3651,7 +3697,7 @@ class JobStore:
             "max_runs": max_runs,
             "enabled": req.enabled,
             "backend": backend,
-            "context_mode": req.context_mode,
+            "context_mode": context_mode,
             "created_at": now,
             "updated_at": now,
             "last_run_at": None,
@@ -3721,6 +3767,10 @@ class JobStore:
                 )
                 if not parent_session:
                     raise HTTPException(status_code=404, detail="session not found")
+                context_mode_explicit = (
+                    "context_mode" in patch
+                    and patch["context_mode"] is not None
+                )
                 next_context_mode = (
                     patch["context_mode"]
                     if patch.get("context_mode") is not None
@@ -3731,13 +3781,17 @@ class JobStore:
                     if patch.get("backend") is not None
                     else job.get("backend")
                 )
-                normalized_backend = validate_job_context_backend(
-                    parent_session,
-                    next_context_mode,
-                    next_backend,
+                resolved_context_mode, normalized_backend = (
+                    resolve_job_context_contract(
+                        parent_session,
+                        next_context_mode,
+                        next_backend,
+                        context_mode_explicit=context_mode_explicit,
+                    )
                 )
+                patch = dict(patch)
+                patch["context_mode"] = resolved_context_mode
                 if "backend" in patch and patch["backend"] is not None:
-                    patch = dict(patch)
                     patch["backend"] = normalized_backend
             current_kind = job_schedule_kind(job)
             requested_kind = str(patch.get("schedule_kind") or "").strip().lower()
@@ -17943,9 +17997,7 @@ async def _start_turn_locked(
         raise HTTPException(status_code=503, detail=f"agent launch deferred: {blocker}")
 
     try:
-        fields_set = getattr(req, "model_fields_set", None)
-        if fields_set is None:
-            fields_set = getattr(req, "__fields_set__", set())
+        fields_set = request_fields_set(req)
         runtime_patch: dict[str, Any] = {}
         if req.backend:
             runtime_patch["backend"] = req.backend
@@ -18921,15 +18973,10 @@ async def update_session(session_id: str, req: UpdateSessionRequest) -> dict[str
             current = STORE.sessions.get(session_id)
             if not current:
                 raise HTTPException(status_code=404, detail="session not found")
-            # Validate and synchronize the loaded provider before committing
-            # the preference. If a real app-server error occurs, the PATCH
-            # fails with the stored session unchanged, so clients can safely
-            # keep their previous selection.
-            runtime_preview = preview_session_runtime_update(current, patch)
-            await sync_loaded_codex_runtime_settings(
-                session_id,
-                runtime_preview,
-            )
+            # Validate the complete model/effort pair atomically. App-server
+            # applies the saved selection through the next turn/start; it does
+            # not currently expose a client RPC for mutating a loaded thread.
+            preview_session_runtime_update(current, patch)
             sess = await STORE.update(session_id, patch)
     else:
         # Title, folder, pin, and archive edits must remain lightweight. They
@@ -18944,63 +18991,6 @@ async def update_session(session_id: str, req: UpdateSessionRequest) -> dict[str
             # best-effort and must not turn a successful archive into a 500.
             logger.warning("could not clean up terminal for archived session %s: %s", session_id, exc)
     return {"session": public_session(sess)}
-
-
-async def sync_loaded_codex_runtime_settings(
-    session_id: str,
-    sess: dict[str, Any],
-) -> bool:
-    """Apply saved model/effort to subsequent turns on a loaded Codex thread.
-
-    Native persistent goals can start their own continuation turns, so relying
-    only on AgentsDock's next ``turn/start`` would leave those continuations on
-    stale settings. This update is deliberately non-interrupting and does not
-    replace or clear the thread goal.
-    """
-
-    if str(sess.get("backend") or DEFAULT_BACKEND) != BACKEND_CODEX:
-        return False
-    if CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC:
-        return False
-    thread_id = str(session_provider_id(sess) or "").strip()
-    manager = CODEX_APP_SERVER_MANAGER
-    if (
-        not thread_id
-        or manager is None
-        or not manager.is_thread_loaded(thread_id)
-    ):
-        # An unloaded thread has no live native continuation. The next explicit
-        # turn/resume already carries these saved settings in turn/start.
-        return False
-
-    model, effort, service_tier = codex_runtime_settings(sess)
-    await pin_codex_app_server_thread(thread_id)
-    try:
-        await manager.update_thread_settings(
-            thread_id,
-            model=model,
-            effort=effort,
-            service_tier=service_tier,
-        )
-    except Exception as exc:
-        if isinstance(exc, CodexAppServerRequestError) and exc.code == -32601:
-            # Older app-server builds do not expose thread/settings/update.
-            # Persist the preference and let the normal turn/start overrides
-            # apply it on the next explicit turn instead of blocking users
-            # from changing models or effort.
-            logger.info(
-                "Codex app-server lacks thread/settings/update; deferring "
-                "runtime settings until next turn session=%s thread=%s",
-                session_id,
-                thread_id,
-            )
-            return False
-        # Do not commit a preference while a loaded native goal would continue
-        # with stale settings. Repeating the same PATCH retries synchronization.
-        raise codex_control_http_error(exc) from exc
-    finally:
-        await unpin_codex_app_server_thread(manager, thread_id)
-    return True
 
 
 async def codex_runtime_snapshot(session_id: str) -> dict[str, Any]:
@@ -19278,11 +19268,7 @@ async def _put_codex_goal_locked(
     session_id: str,
     req: CodexGoalRequest,
 ) -> dict[str, Any]:
-    fields_set = getattr(
-        req,
-        "model_fields_set",
-        getattr(req, "__fields_set__", set()),
-    )
+    fields_set = request_fields_set(req)
     if not fields_set:
         raise HTTPException(status_code=400, detail="provide at least one goal field")
     manager, thread_id, _session = await acquire_codex_control_thread(
@@ -20501,7 +20487,12 @@ async def create_job(req: CreateJobRequest) -> dict[str, Any]:
 
 @app.post("/api/sessions/{session_id}/jobs")
 async def create_session_job(session_id: str, req: CreateScopedJobRequest) -> dict[str, Any]:
-    job = await JOBS.create(CreateJobRequest(session_id=session_id, **req.model_dump()))
+    # Keep omission metadata intact so legacy scoped clients that select an
+    # alternate backend (but predate context_mode) retain standalone behavior.
+    job = await JOBS.create(CreateJobRequest(
+        session_id=session_id,
+        **req.model_dump(exclude_unset=True),
+    ))
     return {"job": public_job(job)}
 
 

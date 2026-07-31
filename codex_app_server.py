@@ -1071,27 +1071,6 @@ class CodexAppServerClient:
         self._loaded_threads.add(resolved)
         return resolved
 
-    async def update_thread_settings(
-        self,
-        thread_id: str,
-        *,
-        model: str,
-        effort: str,
-        service_tier: str | None,
-    ) -> None:
-        """Update the runtime settings used by subsequent native turns."""
-
-        params = {
-            "threadId": _require_nonempty_string(thread_id, "thread_id"),
-            "model": _require_nonempty_string(model, "model"),
-            "effort": _require_nonempty_string(effort, "effort"),
-            # Null explicitly clears a tier inherited from the previous model;
-            # omission would leave that stale sticky setting in place.
-            "serviceTier": str(service_tier or "").strip() or None,
-        }
-        method = "thread/settings/update"
-        _protocol_empty_object(method, await self.request(method, params))
-
     async def fork_thread(
         self,
         thread_id: str,
@@ -1832,21 +1811,6 @@ class CodexAppServerManager:
         params: dict[str, Any] | None = None,
     ) -> str:
         return await self.client.resume_thread(thread_id, params)
-
-    async def update_thread_settings(
-        self,
-        thread_id: str,
-        *,
-        model: str,
-        effort: str,
-        service_tier: str | None,
-    ) -> None:
-        await self.client.update_thread_settings(
-            thread_id,
-            model=model,
-            effort=effort,
-            service_tier=service_tier,
-        )
 
     async def start_or_resume_thread(
         self,

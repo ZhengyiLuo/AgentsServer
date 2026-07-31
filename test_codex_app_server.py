@@ -189,6 +189,7 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
                 "thread/resume": lambda message: {
                     "thread": {"id": message["params"]["threadId"]}
                 },
+                "thread/settings/update": lambda _: {},
                 "thread/fork": lambda _: {"thread": {"id": "thr_fork"}},
                 "thread/inject_items": lambda _: {},
                 "thread/read": lambda message: {
@@ -226,6 +227,13 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
             "thr_existing",
         )
         self.assertTrue(client.is_thread_loaded("thr_existing"))
+
+        await client.update_thread_settings(
+            "thr_existing",
+            model="gpt-5.6-sol",
+            effort="ultra",
+            service_tier=None,
+        )
 
         self.assertEqual(
             await client.fork_thread(
@@ -271,6 +279,15 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
                 "developerInstructions": "resume instructions",
                 "threadId": "thr_existing",
                 "excludeTurns": True,
+            },
+        )
+        self.assertEqual(
+            by_method["thread/settings/update"]["params"],
+            {
+                "threadId": "thr_existing",
+                "model": "gpt-5.6-sol",
+                "effort": "ultra",
+                "serviceTier": None,
             },
         )
         self.assertEqual(

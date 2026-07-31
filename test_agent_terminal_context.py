@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import agent_server
 
@@ -59,6 +59,55 @@ class AgentTerminalContextTests(unittest.TestCase):
         self.assertNotIn("Current jobs for this chat", first_prompt)
         self.assertNotIn("turn-start snapshot", first_prompt)
         self.assertLess(len(first_prompt), 2_000)
+
+    def test_claude_transcript_suppression_flag_only_affects_fresh_command(self) -> None:
+        standalone = agent_server.build_claude_cmd(
+            "sess-123",
+            {"id": "sess-123", "backend": "claude"},
+            Path("/tmp/manifest.json"),
+            no_session_persistence=True,
+        )
+        ordinary = agent_server.build_claude_cmd(
+            "sess-123",
+            {"id": "sess-123", "backend": "claude"},
+            Path("/tmp/manifest.json"),
+        )
+        resumed = agent_server.build_claude_cmd(
+            "sess-123",
+            {"id": "sess-123", "backend": "claude"},
+            Path("/tmp/manifest.json"),
+            provider_id="claude-parent",
+            no_session_persistence=True,
+        )
+
+        self.assertIn("--no-session-persistence", standalone)
+        self.assertNotIn("--no-session-persistence", ordinary)
+        self.assertNotIn("--no-session-persistence", resumed)
+
+        legacy = agent_server.build_claude_cmd(
+            "sess-123",
+            {"id": "sess-123", "backend": "claude"},
+            Path("/tmp/manifest.json"),
+            no_session_persistence=False,
+        )
+        self.assertNotIn("--no-session-persistence", legacy)
+
+    def test_claude_transcript_suppression_probe_is_cached(self) -> None:
+        probe = Mock(
+            return_value="--print --no-session-persistence --help"
+        )
+        with (
+            patch.object(
+                agent_server,
+                "CLAUDE_NO_SESSION_PERSISTENCE_SUPPORTED",
+                None,
+            ),
+            patch.object(agent_server, "run_catalog_command", probe),
+        ):
+            self.assertTrue(agent_server.claude_supports_no_session_persistence())
+            self.assertTrue(agent_server.claude_supports_no_session_persistence())
+
+        probe.assert_called_once_with([agent_server.CLAUDE_BIN, "--help"])
 
     def test_legacy_system_prompt_format_contract_remains_usable(self) -> None:
         legacy = agent_server.SYSTEM_PROMPT.format(

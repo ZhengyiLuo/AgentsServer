@@ -69,6 +69,21 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
             response["capabilities"]["server_updates"]["tracks"],
             ["stable", "beta"],
         )
+        self.assertEqual(
+            response["capabilities"]["scheduled_jobs"],
+            {
+                "available": True,
+                "required": False,
+                "message": (
+                    "Scheduled jobs support parent-chat and standalone "
+                    "provider contexts."
+                ),
+                "action": None,
+                "version": 2,
+                "context_modes": ["chat", "standalone"],
+                "default_context_mode": "chat",
+            },
+        )
 
     async def test_check_reports_a_signed_newer_release(self):
         with tempfile.TemporaryDirectory() as temporary, \

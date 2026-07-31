@@ -559,6 +559,36 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             "Completed result.",
         )
 
+    async def test_ultra_effort_is_forwarded_to_native_turn_start(self) -> None:
+        turn = FakeTurn(
+            [
+                agent_message("ultra-final", "Completed deeply.", "final_answer"),
+                completed_notification(),
+            ]
+        )
+        manager = FakeManager(turn)
+        session = {
+            **self.session,
+            "model": "gpt-5.6-sol",
+            "effort": "ultra",
+        }
+        stack, _events, _finished, exec_fallback = self.runner_patches(manager)
+        with stack:
+            await agent_server.run_codex_app_server(
+                "chat-native",
+                "run-original",
+                "Use Ultra",
+                session,
+                Path(self.cwd) / ".runner-test-manifest.json",
+                allow_exec_fallback=True,
+            )
+
+        overrides = manager.turn_calls[0][2]
+        self.assertEqual(overrides["model"], "gpt-5.6-sol")
+        self.assertEqual(overrides["effort"], "ultra")
+        self.assertEqual(overrides["summary"], "detailed")
+        exec_fallback.assert_not_awaited()
+
     async def test_interactive_turn_applies_saved_security_controls(self) -> None:
         turn = FakeTurn(
             [

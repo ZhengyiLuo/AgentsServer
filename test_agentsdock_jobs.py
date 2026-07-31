@@ -116,7 +116,44 @@ class AgentsDockJobsCLITests(unittest.TestCase):
         self.assertEqual(payload["schedule_kind"], "cron")
         self.assertEqual(payload["cron_expression"], "0 9 * * MON-FRI")
         self.assertEqual(payload["timezone"], "America/Los_Angeles")
+        self.assertEqual(payload["context_mode"], "chat")
         self.assertEqual(result["job"]["id"], "job_1")
+
+    def test_create_and_update_support_standalone_context(self) -> None:
+        parser = agentsdock_jobs.build_parser()
+        calls: list[tuple[str, str, object]] = []
+
+        def request(method: str, path: str, payload=None):
+            calls.append((method, path, payload))
+            if method == "GET":
+                return {
+                    "jobs": [{
+                        "id": "job_1",
+                        "session_id": "sess/chat",
+                        "schedule_kind": "interval",
+                    }]
+                }
+            return {"job": {"id": "job_1", "session_id": "sess/chat"}}
+
+        with (
+            patch.dict(os.environ, self.environment(), clear=True),
+            patch.object(agentsdock_jobs, "api_request", request),
+        ):
+            agentsdock_jobs.command_create(parser.parse_args([
+                "create",
+                "--title", "Fresh report",
+                "--prompt", "Report",
+                "--interval-seconds", "3600",
+                "--context-mode", "standalone",
+            ]))
+            self.assertEqual(calls[-1][2]["context_mode"], "standalone")
+
+            agentsdock_jobs.command_update(parser.parse_args([
+                "update",
+                "job_1",
+                "--context-mode", "chat",
+            ]))
+            self.assertEqual(calls[-1][2], {"context_mode": "chat"})
 
     def test_update_rrule_uses_scoped_endpoint_and_sets_kind(self) -> None:
         parser = agentsdock_jobs.build_parser()

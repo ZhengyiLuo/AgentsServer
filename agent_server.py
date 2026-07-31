@@ -163,6 +163,7 @@ CODEX_FALLBACK_MODELS = (
     ("gpt-5.4-mini", "GPT-5.4-Mini"),
 )
 CODEX_FALLBACK_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
+CODEX_EFFORT_ORDER = ("none", "minimal", *CODEX_FALLBACK_EFFORTS)
 CODEX_FALLBACK_MODEL_EFFORTS = {
     "gpt-5.6-sol": ("low", "medium", "high", "xhigh", "max", "ultra"),
     "gpt-5.6-terra": ("low", "medium", "high", "xhigh", "max", "ultra"),
@@ -432,6 +433,7 @@ def now_iso() -> str:
 
 
 VALID_JOB_SCHEDULE_KINDS = {"interval", "cron", "rrule"}
+VALID_JOB_CONTEXT_MODES = {"chat", "standalone"}
 CRON_RANDOM_TOKEN_RE = re.compile(r"(?i)\bR\b")
 CRON_HASH_TOKEN_RE = re.compile(r"(?i)\bH\b")
 RRULE_FREQUENCIES = {"SECONDLY", "MINUTELY", "HOURLY", "DAILY", "WEEKLY", "MONTHLY", "YEARLY"}
@@ -504,6 +506,49 @@ def job_schedule_kind(job: dict[str, Any]) -> str:
     if str(job.get("rrule") or "").strip():
         return "rrule"
     return "interval"
+
+
+def job_context_mode(job: dict[str, Any]) -> Literal["chat", "standalone"]:
+    mode = str(job.get("context_mode") or "").strip().lower()
+    return "standalone" if mode == "standalone" else "chat"
+
+
+def validate_job_context_backend(
+    parent_session: dict[str, Any],
+    context_mode: Any,
+    backend: Any,
+) -> str | None:
+    """Validate a job backend against its provider-context contract."""
+
+    normalized_backend = str(backend or "").strip().lower() or None
+    if normalized_backend is not None and normalized_backend not in VALID_BACKENDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"backend must be one of {sorted(VALID_BACKENDS)}",
+        )
+    mode = "standalone" if str(context_mode or "").strip().lower() == "standalone" else "chat"
+    parent_backend = str(
+        parent_session.get("backend") or DEFAULT_BACKEND
+    ).strip().lower()
+    if parent_backend not in VALID_BACKENDS:
+        parent_backend = DEFAULT_BACKEND
+    if (
+        mode == "chat"
+        and normalized_backend is not None
+        and normalized_backend != parent_backend
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "A job that continues in this chat must use the parent chat "
+                f"backend ({parent_backend}); choose standalone context to use "
+                f"{normalized_backend}."
+            ),
+        )
+    # None intentionally means "inherit the parent chat backend". Preserve it
+    # for older clients and legacy job payloads instead of expanding it into a
+    # new required field value.
+    return normalized_backend
 
 
 def normalize_cron_expression(value: Any, job_id: str) -> str:
@@ -2722,6 +2767,7 @@ class JobCreateFields(BaseModel):
     max_runs: int | None = None
     enabled: bool = True
     backend: str | None = None
+    context_mode: Literal["chat", "standalone"] = "chat"
 
 
 class CreateJobRequest(JobCreateFields):
@@ -2749,6 +2795,157 @@ def normalize_runtime_effort(backend: str, effort: Any, *, strict: bool = False)
     return None
 
 
+def normalize_runtime_effort_for_model(
+    backend: str,
+    model: Any,
+    effort: Any,
+    *,
+    strict: bool = False,
+) -> str | None:
+    """Normalize an effort and reject known-incompatible Codex model pairs.
+
+    Unknown/custom model ids remain provider-owned. For picker-visible Codex
+    models, fail before launch rather than advertising a saved effort that the
+    provider will ignore or reject later.
+    """
+    normalized = normalize_runtime_effort(backend, effort, strict=strict)
+    if normalized is None or str(backend or "").strip().lower() != BACKEND_CODEX:
+        return normalized
+
+    clean_model = str(model or "").strip()
+    if not clean_model:
+        configured_model, _configured_effort, _configured_service_tier = (
+            codex_user_config_defaults()
+        )
+        clean_model = configured_model or CODEX_DEFAULT_MODEL
+    supported = CODEX_FALLBACK_MODEL_EFFORTS.get(clean_model)
+    if supported is None or normalized in supported:
+        return normalized
+    if strict:
+        choices = ", ".join(supported)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Codex model {clean_model} does not support effort {normalized}; "
+                f"choose one of: {choices}"
+            ),
+        )
+    logger.warning(
+        "dropping unsupported Codex model/effort pair model=%s effort=%s",
+        clean_model,
+        normalized,
+    )
+    return None
+
+
+def clamp_codex_runtime_effort(model: str, effort: Any) -> str:
+    """Return a launch-safe effort without rewriting the saved preference.
+
+    The Codex config file can outlive a model or can contain an effort copied
+    from another model.  Known fallback models are clamped to their nearest
+    supported level at launch. Unknown/discovered model ids remain owned by
+    Codex because a static server table must not reject newer capabilities.
+    """
+
+    normalized = normalize_runtime_effort(BACKEND_CODEX, effort)
+    supported = CODEX_FALLBACK_MODEL_EFFORTS.get(str(model or "").strip())
+    if supported is None:
+        return normalized or CODEX_DEFAULT_EFFORT
+    if normalized in supported:
+        return normalized
+
+    if normalized in CODEX_EFFORT_ORDER:
+        requested_index = CODEX_EFFORT_ORDER.index(normalized)
+        ranked_supported = [
+            (CODEX_EFFORT_ORDER.index(candidate), candidate)
+            for candidate in supported
+            if candidate in CODEX_EFFORT_ORDER
+        ]
+        lower_or_equal = [
+            item for item in ranked_supported if item[0] <= requested_index
+        ]
+        if lower_or_equal:
+            clamped = max(lower_or_equal)[1]
+        elif ranked_supported:
+            clamped = min(ranked_supported)[1]
+        else:
+            clamped = supported[0]
+    else:
+        default_effort = normalize_runtime_effort(
+            BACKEND_CODEX,
+            CODEX_DEFAULT_EFFORT,
+        )
+        clamped = (
+            default_effort
+            if default_effort in supported
+            else supported[-1]
+        )
+    logger.warning(
+        "clamping unsupported Codex runtime effort model=%s requested=%r effective=%s",
+        model,
+        effort,
+        clamped,
+    )
+    return clamped
+
+
+def preview_session_runtime_update(
+    sess: dict[str, Any],
+    patch: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate and preview provider runtime fields without mutating state."""
+
+    current_backend = str(sess.get("backend") or DEFAULT_BACKEND).lower()
+    prospective_backend = (
+        str(patch["backend"]).lower()
+        if patch.get("backend") is not None
+        else current_backend
+    )
+    if prospective_backend not in VALID_BACKENDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"backend must be one of {sorted(VALID_BACKENDS)}",
+        )
+    backend_changed = prospective_backend != current_backend
+    if backend_changed and session_backend_locked(sess):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "backend is locked after the chat starts; fork or create "
+                "a new chat to use another backend"
+            ),
+        )
+
+    prospective_model = (
+        str(patch.get("model") or "").strip() or None
+        if "model" in patch
+        else None if backend_changed else sess.get("model")
+    )
+    prospective_effort = (
+        patch.get("effort")
+        if "effort" in patch
+        else None if backend_changed else sess.get("effort")
+    )
+    normalized_effort = normalize_runtime_effort_for_model(
+        prospective_backend,
+        prospective_model,
+        prospective_effort,
+        strict="effort" in patch,
+    )
+
+    preview = dict(sess)
+    preview["backend"] = prospective_backend
+    preview["model"] = prospective_model
+    preview["effort"] = normalized_effort
+    if backend_changed:
+        preview["session_id"] = sess.get(
+            "claude_session_id"
+            if prospective_backend == BACKEND_CLAUDE
+            else "codex_thread_id"
+        )
+    return preview
+
+
 def clean_session_system_prompt(value: Any) -> str | None:
     clean = str(value or "").strip()
     if not clean:
@@ -2774,6 +2971,7 @@ class UpdateJobRequest(BaseModel):
     max_runs: int | None = None
     enabled: bool | None = None
     backend: str | None = None
+    context_mode: Literal["chat", "standalone"] | None = None
 
 
 class ServerUpdateRequest(BaseModel):
@@ -2907,7 +3105,14 @@ class SessionStore:
         for sess in self.sessions.values():
             backend = str(sess.get("backend") or DEFAULT_BACKEND).strip().lower()
             previous_effort = sess.get("effort")
-            normalized_effort = normalize_runtime_effort(backend, previous_effort)
+            # Normalize aliases and truly invalid values, but do not erase a
+            # saved preference from a static model-capability table. Codex's
+            # discovered model catalog can evolve ahead of AgentsServer; any
+            # known-incompatible pair is clamped only when launching a turn.
+            normalized_effort = normalize_runtime_effort(
+                backend,
+                previous_effort,
+            )
             if normalized_effort != previous_effort:
                 sess["effort"] = normalized_effort
                 runtime_changed = True
@@ -2968,6 +3173,13 @@ class SessionStore:
         backend = (req.backend or DEFAULT_BACKEND).lower()
         if backend not in VALID_BACKENDS:
             raise HTTPException(status_code=400, detail=f"backend must be one of {sorted(VALID_BACKENDS)}")
+        model = str(req.model or "").strip() or None
+        effort = normalize_runtime_effort_for_model(
+            backend,
+            model,
+            req.effort,
+            strict=True,
+        )
         sid = f"sess_{uuid.uuid4().hex[:16]}"
         ensure_dirs(sid)
         now = now_iso()
@@ -2986,8 +3198,8 @@ class SessionStore:
             "folder": req.folder or "General",
             "cwd": req.cwd or DEFAULT_CWD,
             "backend": backend,
-            "model": req.model,
-            "effort": normalize_runtime_effort(backend, req.effort, strict=True),
+            "model": model,
+            "effort": effort,
             "system_prompt": clean_session_system_prompt(req.system_prompt),
             "session_id": active_provider_id,
             "claude_session_id": claude_session_id,
@@ -3019,6 +3231,24 @@ class SessionStore:
             sess = self.sessions.get(sid)
             if not sess:
                 raise HTTPException(status_code=404, detail="session not found")
+            runtime_preview = preview_session_runtime_update(sess, patch)
+            current_backend = str(sess.get("backend") or DEFAULT_BACKEND).lower()
+            prospective_backend = str(
+                runtime_preview.get("backend") or DEFAULT_BACKEND
+            ).lower()
+            backend_changed = prospective_backend != current_backend
+            prospective_effort = (
+                patch.get("effort")
+                if "effort" in patch
+                else None if backend_changed else sess.get("effort")
+            )
+            effort_is_explicit = "effort" in patch
+            normalized_prospective_effort = runtime_preview.get("effort")
+            reset_implicit_incompatible_effort = (
+                "model" in patch
+                and not effort_is_explicit
+                and normalized_prospective_effort != prospective_effort
+            )
             old_section = session_section_key(sess)
             if "backend" in patch and patch["backend"] is not None:
                 backend = str(patch["backend"]).lower()
@@ -3071,14 +3301,17 @@ class SessionStore:
                 if key in patch:
                     value = patch[key]
                     if key == "effort":
-                        sess[key] = normalize_runtime_effort(
-                            str(sess.get("backend") or DEFAULT_BACKEND),
-                            value,
-                            strict=True,
-                        )
+                        sess[key] = normalized_prospective_effort
                     else:
                         clean = str(value).strip() if value is not None else ""
                         sess[key] = clean or None
+            if reset_implicit_incompatible_effort:
+                # Older clients update the model and effort in separate
+                # requests. Let that model change succeed while clearing a
+                # now-invalid inherited effort; the response tells the client
+                # which value was retained, and a following effort PATCH can
+                # choose any supported value.
+                sess["effort"] = normalized_prospective_effort
             if "pinned" in patch and patch["pinned"] is not None:
                 pinned = bool(patch["pinned"])
                 if pinned and not sess.get("pinned"):
@@ -3346,6 +3579,12 @@ class JobStore:
             if "scheduled_run_at" not in job:
                 job["scheduled_run_at"] = job.get("next_run_at") if job.get("enabled") else None
                 changed = True
+            normalized_context_mode = job_context_mode(job)
+            if job.get("context_mode") != normalized_context_mode:
+                # Jobs created before context modes existed always continued
+                # in their parent chat. Preserve that behavior during load.
+                job["context_mode"] = normalized_context_mode
+                changed = True
         if changed:
             await self.save()
 
@@ -3356,10 +3595,14 @@ class JobStore:
         tmp.replace(JOBS_FILE)
 
     async def create(self, req: CreateJobRequest) -> dict[str, Any]:
-        if req.session_id not in STORE.sessions:
+        parent_session = STORE.sessions.get(req.session_id)
+        if not parent_session:
             raise HTTPException(status_code=404, detail="session not found")
-        if req.backend and req.backend not in VALID_BACKENDS:
-            raise HTTPException(status_code=400, detail=f"backend must be one of {sorted(VALID_BACKENDS)}")
+        backend = validate_job_context_backend(
+            parent_session,
+            req.context_mode,
+            req.backend,
+        )
         jid = f"job_{uuid.uuid4().hex[:16]}"
         now = now_iso()
         now_timestamp = time.time()
@@ -3407,7 +3650,8 @@ class JobStore:
             "loop": loop,
             "max_runs": max_runs,
             "enabled": req.enabled,
-            "backend": req.backend,
+            "backend": backend,
+            "context_mode": req.context_mode,
             "created_at": now,
             "updated_at": now,
             "last_run_at": None,
@@ -3452,6 +3696,49 @@ class JobStore:
             was_enabled = bool(job.get("enabled"))
             if "backend" in patch and patch["backend"] is not None and patch["backend"] not in VALID_BACKENDS:
                 raise HTTPException(status_code=400, detail=f"backend must be one of {sorted(VALID_BACKENDS)}")
+            if (
+                "context_mode" in patch
+                and patch["context_mode"] is not None
+                and patch["context_mode"] not in VALID_JOB_CONTEXT_MODES
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "context_mode must be one of "
+                        f"{sorted(VALID_JOB_CONTEXT_MODES)}"
+                    ),
+                )
+            runtime_contract_changed = (
+                ("backend" in patch and patch["backend"] is not None)
+                or (
+                    "context_mode" in patch
+                    and patch["context_mode"] is not None
+                )
+            )
+            if runtime_contract_changed:
+                parent_session = STORE.sessions.get(
+                    str(job.get("session_id") or "")
+                )
+                if not parent_session:
+                    raise HTTPException(status_code=404, detail="session not found")
+                next_context_mode = (
+                    patch["context_mode"]
+                    if patch.get("context_mode") is not None
+                    else job_context_mode(job)
+                )
+                next_backend = (
+                    patch["backend"]
+                    if patch.get("backend") is not None
+                    else job.get("backend")
+                )
+                normalized_backend = validate_job_context_backend(
+                    parent_session,
+                    next_context_mode,
+                    next_backend,
+                )
+                if "backend" in patch and patch["backend"] is not None:
+                    patch = dict(patch)
+                    patch["backend"] = normalized_backend
             current_kind = job_schedule_kind(job)
             requested_kind = str(patch.get("schedule_kind") or "").strip().lower()
             legacy_interval_patch = (
@@ -3502,7 +3789,7 @@ class JobStore:
                     patch["rrule"], timezone_name, comparison_anchor
                 ) != job.get("rrule")
             next_run_at = parse_job_timestamp(patch.get("next_run_at"), timezone_name) if has_next_run_patch else None
-            for key in ("title", "prompt", "enabled", "backend"):
+            for key in ("title", "prompt", "enabled", "backend", "context_mode"):
                 if key in patch and patch[key] is not None:
                     job[key] = patch[key]
             job["schedule_kind"] = next_kind
@@ -3715,13 +4002,20 @@ class JobStore:
             job_id=jid,
             job_title=str(job.get("title") or jid),
         )
-        result = await start_turn(job["session_id"], req, queue_if_busy=False)
+        context_mode = job_context_mode(job)
+        result = await start_turn(
+            job["session_id"],
+            req,
+            queue_if_busy=False,
+            provider_context_mode=context_mode,
+        )
         await self.mark_ran(jid)
         ran_job = public_job(self.jobs[jid])
         await append_event(job["session_id"], "job_ran", {
             "job": ran_job,
             "job_id": jid,
             "run_id": result["run_id"],
+            "context_mode": context_mode,
             "message": f"Scheduled job ran: {ran_job.get('title') or jid}",
         })
         return result
@@ -3913,6 +4207,7 @@ SESSION_LIFECYCLE_LOCKS: dict[str, asyncio.Lock] = {}
 DELETING_SESSIONS: set[str] = set()
 DELETED_SESSION_TOMBSTONES: set[str] = set()
 CODEX_BACKGROUND_TERMINALS_SUPPORTED: bool | None = None
+CLAUDE_NO_SESSION_PERSISTENCE_SUPPORTED: bool | None = None
 CODEX_PERMISSION_PROFILES_CACHE: dict[
     str,
     tuple[int, float, list[dict[str, Any]]],
@@ -11367,6 +11662,40 @@ def session_provider_id(sess: dict[str, Any]) -> str | None:
     return sess.get("session_id")
 
 
+def standalone_provider_session(sess: dict[str, Any]) -> dict[str, Any]:
+    """Clone chat settings without any provider-thread continuity.
+
+    Standalone scheduled runs inherit the parent chat's backend, model, cwd,
+    permissions, and developer instructions. They intentionally do not inherit
+    its provider thread, fork memory, or persistent Codex goal.
+    """
+
+    isolated = dict(sess)
+    isolated["session_id"] = None
+    isolated["claude_session_id"] = None
+    isolated["codex_thread_id"] = None
+    isolated["fork_from"] = None
+    isolated["memory_seed"] = None
+    isolated["memory_seed_used"] = False
+    isolated["codex_goal"] = None
+    isolated["codex_goal_time_budget_seconds"] = None
+    isolated["codex_goal_time_budget_exhausted"] = False
+    return isolated
+
+
+def provider_context_goal_is_exhausted(
+    sess: dict[str, Any],
+    provider_context_mode: Literal["chat", "standalone"],
+) -> bool:
+    """Apply a parent chat's goal budget only when continuing that chat."""
+
+    return (
+        provider_context_mode == "chat"
+        and str(sess.get("backend") or DEFAULT_BACKEND) == BACKEND_CODEX
+        and codex_goal_time_budget_remaining(sess) == 0
+    )
+
+
 def provider_history(sess: dict[str, Any], limit: int | None) -> tuple[Path | None, list[dict[str, str]]]:
     backend = (sess.get("backend") or DEFAULT_BACKEND).lower()
     provider_id = session_provider_id(sess)
@@ -11694,6 +12023,7 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
 def public_job(job: dict[str, Any]) -> dict[str, Any]:
     out = {k: v for k, v in job.items() if not str(k).startswith("_")}
     out["schedule_kind"] = job_schedule_kind(out)
+    out["context_mode"] = job_context_mode(out)
     out["timezone"] = str(out.get("timezone") or "UTC")
     for key in ("next_run_at", "scheduled_run_at", "schedule_start_at", "last_scheduled_run_at"):
         if out.get(key) is not None:
@@ -13428,6 +13758,22 @@ def claude_supports_effort(effort: str) -> bool:
     return result.returncode == 0 and "unknown --effort value" not in output
 
 
+def claude_supports_no_session_persistence() -> bool:
+    """Probe once before using Claude's standalone transcript suppression."""
+
+    global CLAUDE_NO_SESSION_PERSISTENCE_SUPPORTED
+    if CLAUDE_NO_SESSION_PERSISTENCE_SUPPORTED is not None:
+        return CLAUDE_NO_SESSION_PERSISTENCE_SUPPORTED
+    try:
+        help_text = run_catalog_command([CLAUDE_BIN, "--help"])
+        supported = "--no-session-persistence" in help_text
+    except Exception as exc:
+        logger.debug("Claude session-persistence probe failed: %s", exc)
+        supported = False
+    CLAUDE_NO_SESSION_PERSISTENCE_SUPPORTED = supported
+    return supported
+
+
 def runtime_executable(backend: str) -> str:
     return CLAUDE_BIN if backend == BACKEND_CLAUDE else CODEX_BIN
 
@@ -13751,7 +14097,14 @@ def discover_codex_catalog() -> dict[str, Any]:
         if str(model.get("visibility") or "list") == "list" and model.get("supported_in_api", True) is not False
     ]
     visible_models.sort(key=runtime_priority)
-    default_entry = discovered_codex_default_model(visible_models, configured_model)
+    # The selectable "Server default" must describe the model that
+    # codex_runtime_settings() will actually launch when a chat has no
+    # explicit model. Otherwise the picker can advertise Sol/Ultra while the
+    # turn is launched with the legacy gpt-5.5 fallback.
+    default_entry = discovered_codex_default_model(
+        visible_models,
+        configured_model or CODEX_DEFAULT_MODEL,
+    )
     if default_entry:
         default_model = configured_model or str(default_entry.get("slug") or default_entry.get("id") or "").strip()
         default_model_label = str(default_entry.get("display_name") or title_model_label(default_model)).strip()
@@ -13964,8 +14317,8 @@ def codex_thread_instruction_hash(session_id: str, sess: dict[str, Any]) -> str:
 def codex_runtime_settings(sess: dict[str, Any]) -> tuple[str, str, str]:
     configured_model, configured_effort, configured_service_tier = codex_user_config_defaults()
     model = str(sess.get("model") or configured_model or CODEX_DEFAULT_MODEL).strip()
-    effort = normalize_runtime_effort(
-        BACKEND_CODEX,
+    effort = clamp_codex_runtime_effort(
+        model,
         sess.get("effort") or configured_effort or CODEX_DEFAULT_EFFORT,
     )
     service_tier = configured_service_tier or codex_default_service_tier(model)
@@ -14209,6 +14562,58 @@ async def ensure_codex_app_server_thread(
         raise
 
 
+async def start_standalone_codex_app_server_thread(
+    manager: CodexAppServerManager,
+    session_id: str,
+    sess: dict[str, Any],
+    cwd: str,
+) -> str:
+    """Start one non-persistent Codex thread for a standalone job run."""
+
+    return await manager.start_thread({
+        **codex_thread_params(
+            sess,
+            cwd,
+            developer_instructions=codex_thread_instructions(
+                session_id,
+                sess,
+            ),
+        ),
+        # Output is persisted in the parent AgentsDock job run. Avoid creating
+        # a second durable Codex chat that the user cannot navigate directly.
+        "ephemeral": True,
+        "serviceName": "AgentsDock Scheduled Job",
+    })
+
+
+async def acquire_codex_run_thread(
+    manager: CodexAppServerManager,
+    session_id: str,
+    sess: dict[str, Any],
+    cwd: str,
+    *,
+    standalone_provider_context: bool,
+) -> str:
+    """Acquire a pinned thread without binding standalone runs to the chat."""
+
+    if standalone_provider_context:
+        provider_id = await start_standalone_codex_app_server_thread(
+            manager,
+            session_id,
+            sess,
+            cwd,
+        )
+        await pin_codex_app_server_thread(provider_id)
+        return provider_id
+    provider_id, _instruction_hash = await ensure_codex_app_server_thread(
+        manager,
+        session_id,
+        sess,
+        cwd,
+    )
+    return provider_id
+
+
 def session_system_prompt(session_id: str, sess: dict[str, Any], manifest_path: Path) -> str:
     del session_id, manifest_path
     return CLAUDE_PROMPT_PRELUDE.format() + session_prompt_addendum(sess)
@@ -14220,6 +14625,7 @@ def build_claude_cmd(
     manifest_path: Path,
     *,
     provider_id: str | None = None,
+    no_session_persistence: bool = False,
 ) -> list[str]:
     system_prompt = session_system_prompt(
         session_id,
@@ -14238,6 +14644,8 @@ def build_claude_cmd(
         cmd.extend(["--model", str(sess["model"])])
     if sess.get("effort"):
         cmd.extend(["--effort", str(sess["effort"])])
+    if no_session_persistence and not provider_id:
+        cmd.append("--no-session-persistence")
     if provider_id:
         cmd.extend(["--resume", provider_id])
         if sess.get("fork_from"):
@@ -14275,14 +14683,10 @@ def build_codex_cmd(
     provider_id = sess.get("codex_thread_id") or (
         sess.get("session_id") if sess.get("backend") == BACKEND_CODEX else None
     )
-    configured_model, configured_effort, configured_service_tier = codex_user_config_defaults()
     combined_developer_instructions = codex_thread_instructions(session_id, sess)
-    model = str(sess.get("model") or configured_model or CODEX_DEFAULT_MODEL).strip()
-    normalized_effort = normalize_runtime_effort(
-        BACKEND_CODEX,
-        sess.get("effort") or configured_effort or CODEX_DEFAULT_EFFORT,
+    model, normalized_effort, effective_service_tier = codex_runtime_settings(
+        sess
     )
-    effective_service_tier = configured_service_tier or codex_default_service_tier(model)
     cmd = [CODEX_BIN, "exec"]
     if provider_id:
         cmd.append("resume")
@@ -14901,22 +15305,62 @@ async def collect_recent_leftover_manifests(
         await collect_manifest(session_id, run_id, candidate, seen_artifacts=seen_artifacts, final=True)
 
 
+async def persist_run_provider_session(
+    session_id: str,
+    run_id: str,
+    backend: str,
+    provider_id: str,
+    *,
+    cwd: str | None = None,
+    standalone_provider_context: bool = False,
+) -> bool:
+    """Bind a provider thread only for chat-context runs.
+
+    Standalone scheduled runs project their output into the parent timeline,
+    but their provider identity must never replace the parent's resumable chat.
+    """
+
+    if standalone_provider_context or not provider_id:
+        return False
+    await STORE.save_provider_session(
+        session_id,
+        provider_id,
+        backend,
+        **({"cwd": cwd} if cwd is not None else {}),
+    )
+    await append_event(session_id, "provider_session", {
+        "run_id": run_id,
+        "backend": backend,
+        "provider_session_id": provider_id,
+    })
+    return True
+
+
 async def run_claude(
     session_id: str,
     run_id: str,
     prompt: str,
     sess: dict[str, Any],
     manifest_path: Path,
+    *,
+    standalone_provider_context: bool = False,
 ) -> None:
+    if standalone_provider_context:
+        sess = standalone_provider_session(sess)
     requested_cwd = str(sess.get("cwd") or DEFAULT_CWD)
     cwd = existing_cwd(requested_cwd)
     diff_baseline = await capture_git_baseline(session_id, run_id, cwd)
     resume_provider_id, resume_skip_message = resolve_claude_resume_provider(sess, cwd)
+    no_session_persistence = (
+        standalone_provider_context
+        and await asyncio.to_thread(claude_supports_no_session_persistence)
+    )
     cmd = build_claude_cmd(
         session_id,
         sess,
         manifest_path,
         provider_id=resume_provider_id,
+        no_session_persistence=no_session_persistence,
     )
     if str(Path(requested_cwd).expanduser()) != cwd:
         await append_event(session_id, "cwd_fallback", {"run_id": run_id, "requested_cwd": requested_cwd, "cwd": cwd})
@@ -15096,8 +15540,14 @@ async def run_claude(
     elif not stopped:
         record_runtime_success(BACKEND_CLAUDE)
     if provider_id and not result_error:
-        await STORE.save_provider_session(session_id, provider_id, BACKEND_CLAUDE, cwd=cwd)
-        await append_event(session_id, "provider_session", {"run_id": run_id, "backend": BACKEND_CLAUDE, "provider_session_id": provider_id})
+        await persist_run_provider_session(
+            session_id,
+            run_id,
+            BACKEND_CLAUDE,
+            provider_id,
+            cwd=cwd,
+            standalone_provider_context=standalone_provider_context,
+        )
     result_text = clean_assistant_text(final_text or "\n\n".join(text_parts).strip())
     await collect_manifest(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts, final=True)
     await collect_recent_leftover_manifests(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts)
@@ -15242,7 +15692,10 @@ async def run_codex_exec(
     *,
     allow_compaction_rollover: bool = True,
     diff_baseline: dict[str, str] | None = None,
+    standalone_provider_context: bool = False,
 ) -> None:
+    if standalone_provider_context:
+        sess = standalone_provider_session(sess)
     resumed_provider_id = session_provider_id(sess)
     memory_seed = str(sess.get("memory_seed") or "").strip()
     if memory_seed and (not sess.get("memory_seed_used") or not resumed_provider_id):
@@ -15359,8 +15812,13 @@ async def run_codex_exec(
         if not new_provider_id:
             return
         provider_id = new_provider_id
-        await STORE.save_provider_session(session_id, provider_id, BACKEND_CODEX)
-        await append_event(session_id, "provider_session", {"run_id": run_id, "backend": BACKEND_CODEX, "provider_session_id": provider_id})
+        await persist_run_provider_session(
+            session_id,
+            run_id,
+            BACKEND_CODEX,
+            provider_id,
+            standalone_provider_context=standalone_provider_context,
+        )
         if not codex_history_path:
             codex_history_path = find_codex_history(provider_id)
             codex_history_pos = codex_history_path.stat().st_size if codex_history_path and codex_history_path.exists() else 0
@@ -15684,6 +16142,7 @@ async def run_codex_exec(
                 manifest_path,
                 allow_compaction_rollover=False,
                 diff_baseline=diff_baseline,
+                standalone_provider_context=standalone_provider_context,
             )
             return
     if stream_error and not stopped:
@@ -15717,7 +16176,7 @@ async def run_codex_exec(
         record_runtime_failure(BACKEND_CODEX, terminal_error or stream_error or f"exit {proc.returncode}")
     elif not stopped:
         record_runtime_success(BACKEND_CODEX)
-    if provider_id:
+    if provider_id and not standalone_provider_context:
         await STORE.save_provider_session(session_id, provider_id, BACKEND_CODEX)
     await collect_manifest(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts, final=True)
     await collect_recent_leftover_manifests(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts)
@@ -15782,7 +16241,10 @@ async def run_codex_app_server(
     interactive_app_server: bool = False,
     allow_resume_rollover: bool = True,
     diff_baseline: dict[str, Any] | None = None,
+    standalone_provider_context: bool = False,
 ) -> None:
+    if standalone_provider_context:
+        sess = standalone_provider_session(sess)
     requested_cwd = str(sess.get("cwd") or DEFAULT_CWD)
     cwd = existing_cwd(requested_cwd)
     if diff_baseline is None:
@@ -16858,19 +17320,21 @@ async def run_codex_app_server(
         if stop_requested:
             terminal_status = "interrupted"
         else:
-            provider_id, _instruction_hash = await ensure_codex_app_server_thread(
+            provider_id = await acquire_codex_run_thread(
                 manager,
                 session_id,
                 sess,
                 cwd,
+                standalone_provider_context=standalone_provider_context,
             )
             thread_pinned = True
-            await append_event(session_id, "provider_session", {
-                "run_id": current_run_id,
-                "backend": BACKEND_CODEX,
-                "provider_session_id": provider_id,
-                "transport": CODEX_TRANSPORT_APP_SERVER,
-            })
+            if not standalone_provider_context:
+                await append_event(session_id, "provider_session", {
+                    "run_id": current_run_id,
+                    "backend": BACKEND_CODEX,
+                    "provider_session_id": provider_id,
+                    "transport": CODEX_TRANSPORT_APP_SERVER,
+                })
             async with ACTIVE_LOCK:
                 active = ACTIVE.get(session_id)
                 stop_requested = bool(active and active.get("stop_requested"))
@@ -17157,6 +17621,7 @@ async def run_codex_app_server(
                 dict(STORE.sessions.get(session_id) or sess),
                 manifest_path,
                 diff_baseline=current_diff_baseline,
+                standalone_provider_context=standalone_provider_context,
             )
             return
         if turn is not None and turn.turn_id and not turn_completed:
@@ -17238,6 +17703,7 @@ async def run_codex_app_server(
                 interactive_app_server=interactive_app_server,
                 allow_resume_rollover=False,
                 diff_baseline=current_diff_baseline,
+                standalone_provider_context=standalone_provider_context,
             )
             return
 
@@ -17320,6 +17786,7 @@ async def run_codex(
     manifest_path: Path,
     *,
     interactive_app_server: bool = False,
+    standalone_provider_context: bool = False,
 ) -> None:
     if CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC:
         await run_codex_exec(
@@ -17328,6 +17795,11 @@ async def run_codex(
             prompt,
             sess,
             manifest_path,
+            **(
+                {"standalone_provider_context": True}
+                if standalone_provider_context
+                else {}
+            ),
         )
         return
     await run_codex_app_server(
@@ -17343,6 +17815,11 @@ async def run_codex(
             and not interactive_app_server
         ),
         interactive_app_server=interactive_app_server,
+        **(
+            {"standalone_provider_context": True}
+            if standalone_provider_context
+            else {}
+        ),
     )
 
 
@@ -17354,6 +17831,7 @@ async def start_turn(
     queued_id: str | None = None,
     display_file_ids: list[str] | None = None,
     steering_lineage: list[dict[str, Any]] | None = None,
+    provider_context_mode: Literal["chat", "standalone"] = "chat",
 ) -> dict[str, Any]:
     # Register the request task before BUSY_SESSIONS is reserved. Stop can then
     # distinguish a legitimate slow launch from an orphaned reservation and
@@ -17371,6 +17849,7 @@ async def start_turn(
                 queued_id=queued_id,
                 display_file_ids=display_file_ids,
                 steering_lineage=steering_lineage,
+                provider_context_mode=provider_context_mode,
             )
     finally:
         if request_task is not None:
@@ -17389,14 +17868,20 @@ async def _start_turn_locked(
     queued_id: str | None = None,
     display_file_ids: list[str] | None = None,
     steering_lineage: list[dict[str, Any]] | None = None,
+    provider_context_mode: Literal["chat", "standalone"] = "chat",
 ) -> dict[str, Any]:
     sess = STORE.sessions.get(session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="session not found")
-    if (
-        str(sess.get("backend") or DEFAULT_BACKEND) == BACKEND_CODEX
-        and codex_goal_time_budget_remaining(sess) == 0
-    ):
+    if provider_context_mode not in VALID_JOB_CONTEXT_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "provider_context_mode must be one of "
+                f"{sorted(VALID_JOB_CONTEXT_MODES)}"
+            ),
+        )
+    if provider_context_goal_is_exhausted(sess, provider_context_mode):
         raise HTTPException(
             status_code=409,
             detail=(
@@ -17458,16 +17943,34 @@ async def _start_turn_locked(
         raise HTTPException(status_code=503, detail=f"agent launch deferred: {blocker}")
 
     try:
-        if req.backend:
-            sess = await STORE.update(session_id, {"backend": req.backend})
-        fields_set = getattr(req, "model_fields_set", getattr(req, "__fields_set__", set()))
+        fields_set = getattr(req, "model_fields_set", None)
+        if fields_set is None:
+            fields_set = getattr(req, "__fields_set__", set())
         runtime_patch: dict[str, Any] = {}
+        if req.backend:
+            runtime_patch["backend"] = req.backend
         if "model" in fields_set and req.model is not None:
             runtime_patch["model"] = req.model
         if "effort" in fields_set and req.effort is not None:
             runtime_patch["effort"] = req.effort
-        if runtime_patch:
-            sess = await STORE.update(session_id, runtime_patch)
+        if provider_context_mode == "standalone":
+            # Scheduled standalone runs inherit chat settings but never mutate
+            # the parent runtime or provider binding. Clearing continuity first
+            # also permits a locked parent chat to run a one-off alternate
+            # backend. The normal preview semantics clear inherited model and
+            # effort whenever that backend changes unless explicitly supplied.
+            sess = preview_session_runtime_update(
+                standalone_provider_session(sess),
+                runtime_patch,
+            )
+        else:
+            # Preserve ordinary chat behavior: per-turn runtime overrides are
+            # durable chat selections and backend locking still applies.
+            if req.backend:
+                sess = await STORE.update(session_id, {"backend": req.backend})
+                runtime_patch.pop("backend", None)
+            if runtime_patch:
+                sess = await STORE.update(session_id, runtime_patch)
 
         backend = sess.get("backend") or DEFAULT_BACKEND
         await ensure_runtime_available(backend)
@@ -17495,6 +17998,13 @@ async def _start_turn_locked(
             "prompt": display_prompt,
             "file_ids": display_file_ids if display_file_ids is not None else req.file_ids,
         }
+        if backend == BACKEND_CODEX:
+            effective_model, effective_effort, _service_tier = codex_runtime_settings(sess)
+            started_payload["model"] = effective_model
+            started_payload["effort"] = effective_effort
+        else:
+            started_payload["model"] = sess.get("model")
+            started_payload["effort"] = sess.get("effort")
         if queued_id:
             started_payload["queued_id"] = queued_id
         run_metadata = {
@@ -17507,6 +18017,8 @@ async def _start_turn_locked(
             "target_session_id": req.target_session_id,
             "steer_interrupted_run_id": req.steer_interrupted_run_id,
         }
+        if req.purpose == "scheduled_job":
+            run_metadata["job_context_mode"] = provider_context_mode
         run_metadata = {key: value for key, value in run_metadata.items() if value is not None}
         if run_metadata:
             RUN_METADATA[run_id] = run_metadata
@@ -17520,6 +18032,11 @@ async def _start_turn_locked(
                 dict(sess),
                 manifest_path,
                 interactive_app_server=interactive_app_server,
+                **(
+                    {"standalone_provider_context": True}
+                    if provider_context_mode == "standalone"
+                    else {}
+                ),
             )
             if backend == BACKEND_CODEX
             else run_claude(
@@ -17528,6 +18045,11 @@ async def _start_turn_locked(
                 prompt,
                 dict(sess),
                 manifest_path,
+                **(
+                    {"standalone_provider_context": True}
+                    if provider_context_mode == "standalone"
+                    else {}
+                ),
             )
         )
         turn_task = asyncio.create_task(task)
@@ -17848,6 +18370,18 @@ async def health() -> dict[str, Any]:
                 "max_text_file_bytes": MAX_WORKSPACE_TEXT_BYTES,
                 "max_preview_file_bytes": MAX_WORKSPACE_PREVIEW_BYTES,
                 "preview_media_types": sorted(set(WORKSPACE_PREVIEW_MEDIA_TYPES.values())),
+            },
+            "scheduled_jobs": {
+                "available": True,
+                "required": False,
+                "message": (
+                    "Scheduled jobs support parent-chat and standalone "
+                    "provider contexts."
+                ),
+                "action": None,
+                "version": 2,
+                "context_modes": ["chat", "standalone"],
+                "default_context_mode": "chat",
             },
             "codex_controls": {
                 "available": CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC,
@@ -18381,7 +18915,27 @@ async def send_handoff_digest_background(session_id: str, req: HandoffDigestSend
 
 @app.patch("/api/sessions/{session_id}")
 async def update_session(session_id: str, req: UpdateSessionRequest) -> dict[str, Any]:
-    sess = await STORE.update(session_id, req.model_dump(exclude_unset=True))
+    patch = req.model_dump(exclude_unset=True)
+    if {"backend", "model", "effort"}.intersection(patch):
+        async with session_lifecycle_lock(session_id):
+            current = STORE.sessions.get(session_id)
+            if not current:
+                raise HTTPException(status_code=404, detail="session not found")
+            # Validate and synchronize the loaded provider before committing
+            # the preference. If a real app-server error occurs, the PATCH
+            # fails with the stored session unchanged, so clients can safely
+            # keep their previous selection.
+            runtime_preview = preview_session_runtime_update(current, patch)
+            await sync_loaded_codex_runtime_settings(
+                session_id,
+                runtime_preview,
+            )
+            sess = await STORE.update(session_id, patch)
+    else:
+        # Title, folder, pin, and archive edits must remain lightweight. They
+        # do not interact with provider runtime state and should not queue
+        # behind a long Codex lifecycle operation.
+        sess = await STORE.update(session_id, patch)
     if req.archived is True:
         try:
             await asyncio.to_thread(kill_terminal_session, session_id)
@@ -18390,6 +18944,63 @@ async def update_session(session_id: str, req: UpdateSessionRequest) -> dict[str
             # best-effort and must not turn a successful archive into a 500.
             logger.warning("could not clean up terminal for archived session %s: %s", session_id, exc)
     return {"session": public_session(sess)}
+
+
+async def sync_loaded_codex_runtime_settings(
+    session_id: str,
+    sess: dict[str, Any],
+) -> bool:
+    """Apply saved model/effort to subsequent turns on a loaded Codex thread.
+
+    Native persistent goals can start their own continuation turns, so relying
+    only on AgentsDock's next ``turn/start`` would leave those continuations on
+    stale settings. This update is deliberately non-interrupting and does not
+    replace or clear the thread goal.
+    """
+
+    if str(sess.get("backend") or DEFAULT_BACKEND) != BACKEND_CODEX:
+        return False
+    if CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC:
+        return False
+    thread_id = str(session_provider_id(sess) or "").strip()
+    manager = CODEX_APP_SERVER_MANAGER
+    if (
+        not thread_id
+        or manager is None
+        or not manager.is_thread_loaded(thread_id)
+    ):
+        # An unloaded thread has no live native continuation. The next explicit
+        # turn/resume already carries these saved settings in turn/start.
+        return False
+
+    model, effort, service_tier = codex_runtime_settings(sess)
+    await pin_codex_app_server_thread(thread_id)
+    try:
+        await manager.update_thread_settings(
+            thread_id,
+            model=model,
+            effort=effort,
+            service_tier=service_tier,
+        )
+    except Exception as exc:
+        if isinstance(exc, CodexAppServerRequestError) and exc.code == -32601:
+            # Older app-server builds do not expose thread/settings/update.
+            # Persist the preference and let the normal turn/start overrides
+            # apply it on the next explicit turn instead of blocking users
+            # from changing models or effort.
+            logger.info(
+                "Codex app-server lacks thread/settings/update; deferring "
+                "runtime settings until next turn session=%s thread=%s",
+                session_id,
+                thread_id,
+            )
+            return False
+        # Do not commit a preference while a loaded native goal would continue
+        # with stale settings. Repeating the same PATCH retries synchronization.
+        raise codex_control_http_error(exc) from exc
+    finally:
+        await unpin_codex_app_server_thread(manager, thread_id)
+    return True
 
 
 async def codex_runtime_snapshot(session_id: str) -> dict[str, Any]:

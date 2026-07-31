@@ -128,6 +128,7 @@ def command_create(args: argparse.Namespace) -> Any:
         "max_runs": args.max_runs,
         "enabled": not args.disabled,
         "backend": args.backend,
+        "context_mode": args.context_mode,
     }
     encoded_chat_id = urllib.parse.quote(chat_id, safe="")
     return {"job": checked_job(api_request("POST", f"/api/sessions/{encoded_chat_id}/jobs", payload))}
@@ -137,7 +138,16 @@ def command_update(args: argparse.Namespace) -> Any:
     _server_url, chat_id, _token = required_environment()
     current_job = owned_job(args.job_id)
     patch: dict[str, Any] = {}
-    for key in ("title", "prompt", "interval_seconds", "rrule", "timezone", "next_run_at", "backend"):
+    for key in (
+        "title",
+        "prompt",
+        "interval_seconds",
+        "rrule",
+        "timezone",
+        "next_run_at",
+        "backend",
+        "context_mode",
+    ):
         value = getattr(args, key)
         if value is not None:
             patch[key] = value
@@ -216,6 +226,12 @@ def build_parser() -> argparse.ArgumentParser:
     create_parser.add_argument("--max-runs", type=int)
     create_parser.add_argument("--disabled", action="store_true")
     create_parser.add_argument("--backend", choices=("codex", "claude"))
+    create_parser.add_argument(
+        "--context-mode",
+        choices=("chat", "standalone"),
+        default="chat",
+        help="continue in the parent chat (default) or use a fresh provider context",
+    )
     create_parser.set_defaults(handler=command_create)
 
     update_parser = subparsers.add_parser("update", help="update a job owned by the active chat")
@@ -232,6 +248,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_limit_group.add_argument("--max-runs", type=int)
     run_limit_group.add_argument("--unlimited", action="store_true", help="clear a finite run limit")
     update_parser.add_argument("--backend", choices=("codex", "claude"))
+    update_parser.add_argument(
+        "--context-mode",
+        choices=("chat", "standalone"),
+    )
     loop_group = update_parser.add_mutually_exclusive_group()
     loop_group.add_argument("--loop", dest="loop", action="store_true")
     loop_group.add_argument("--no-loop", dest="loop", action="store_false")

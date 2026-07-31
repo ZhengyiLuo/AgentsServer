@@ -532,6 +532,200 @@ class JobStoreTests(unittest.IsolatedAsyncioTestCase):
         finally:
             agent_server.STORE.sessions.pop("sess_count", None)
 
+    async def test_load_defaults_legacy_jobs_to_chat_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs_file = root / "jobs.json"
+            jobs_file.write_text(json.dumps({
+                "job_old": {
+                    "id": "job_old",
+                    "session_id": "sess_1",
+                    "title": "Legacy",
+                    "prompt": "Check",
+                    "schedule_kind": "interval",
+                    "interval_seconds": 60,
+                    "timezone": "UTC",
+                    "enabled": False,
+                    "run_count": 0,
+                }
+            }))
+            store = agent_server.JobStore()
+            with (
+                patch.object(agent_server, "STATE_DIR", root),
+                patch.object(agent_server, "JOBS_FILE", jobs_file),
+            ):
+                await store.load()
+
+            self.assertEqual(store.jobs["job_old"]["context_mode"], "chat")
+            persisted = json.loads(jobs_file.read_text())
+            self.assertEqual(persisted["job_old"]["context_mode"], "chat")
+
+    async def test_create_and_update_job_context_mode(self) -> None:
+        store = agent_server.JobStore()
+        agent_server.STORE.sessions["sess_context"] = {"id": "sess_context"}
+        try:
+            with (
+                patch.object(store, "save", new_callable=AsyncMock),
+                patch.object(agent_server, "append_event", new_callable=AsyncMock),
+            ):
+                default_job = await store.create(agent_server.CreateJobRequest(
+                    session_id="sess_context",
+                    title="Default",
+                    prompt="Check",
+                ))
+                standalone_job = await store.create(agent_server.CreateJobRequest(
+                    session_id="sess_context",
+                    title="Standalone",
+                    prompt="Check",
+                    context_mode="standalone",
+                ))
+                updated = await store.update(
+                    standalone_job["id"],
+                    {"context_mode": "chat"},
+                )
+
+            self.assertEqual(default_job["context_mode"], "chat")
+            self.assertEqual(standalone_job["context_mode"], "standalone")
+            self.assertEqual(updated["context_mode"], "chat")
+        finally:
+            agent_server.STORE.sessions.pop("sess_context", None)
+
+    async def test_chat_context_job_rejects_backend_different_from_parent(self) -> None:
+        store = agent_server.JobStore()
+        agent_server.STORE.sessions["sess_backend_contract"] = {
+            "id": "sess_backend_contract",
+            "backend": agent_server.BACKEND_CODEX,
+        }
+        try:
+            with (
+                patch.object(store, "save", new_callable=AsyncMock),
+                patch.object(agent_server, "append_event", new_callable=AsyncMock),
+            ):
+                inherited = await store.create(agent_server.CreateJobRequest(
+                    session_id="sess_backend_contract",
+                    title="Inherited",
+                    prompt="Check",
+                ))
+                matching = await store.create(agent_server.CreateJobRequest(
+                    session_id="sess_backend_contract",
+                    title="Matching",
+                    prompt="Check",
+                    backend=agent_server.BACKEND_CODEX,
+                ))
+                standalone = await store.create(agent_server.CreateJobRequest(
+                    session_id="sess_backend_contract",
+                    title="Independent Claude",
+                    prompt="Check",
+                    backend=agent_server.BACKEND_CLAUDE,
+                    context_mode="standalone",
+                ))
+                with self.assertRaisesRegex(
+                    HTTPException,
+                    "must use the parent chat backend",
+                ):
+                    await store.create(agent_server.CreateJobRequest(
+                        session_id="sess_backend_contract",
+                        title="Invalid same-chat backend",
+                        prompt="Check",
+                        backend=agent_server.BACKEND_CLAUDE,
+                    ))
+
+            self.assertIsNone(inherited["backend"])
+            self.assertEqual(matching["backend"], agent_server.BACKEND_CODEX)
+            self.assertEqual(standalone["backend"], agent_server.BACKEND_CLAUDE)
+            self.assertEqual(standalone["context_mode"], "standalone")
+            self.assertEqual(len(store.jobs), 3)
+        finally:
+            agent_server.STORE.sessions.pop("sess_backend_contract", None)
+
+    async def test_context_mode_update_validates_resulting_backend_atomically(self) -> None:
+        store = agent_server.JobStore()
+        agent_server.STORE.sessions["sess_backend_update"] = {
+            "id": "sess_backend_update",
+            "backend": agent_server.BACKEND_CODEX,
+        }
+        try:
+            with (
+                patch.object(store, "save", new_callable=AsyncMock),
+                patch.object(agent_server, "append_event", new_callable=AsyncMock),
+            ):
+                job = await store.create(agent_server.CreateJobRequest(
+                    session_id="sess_backend_update",
+                    title="Independent Claude",
+                    prompt="Check",
+                    backend=agent_server.BACKEND_CLAUDE,
+                    context_mode="standalone",
+                ))
+                before = dict(store.jobs[job["id"]])
+                with self.assertRaisesRegex(
+                    HTTPException,
+                    "must use the parent chat backend",
+                ):
+                    await store.update(job["id"], {"context_mode": "chat"})
+                self.assertEqual(store.jobs[job["id"]], before)
+
+                same_chat = await store.update(job["id"], {
+                    "context_mode": "chat",
+                    "backend": agent_server.BACKEND_CODEX,
+                })
+                self.assertEqual(same_chat["context_mode"], "chat")
+                self.assertEqual(same_chat["backend"], agent_server.BACKEND_CODEX)
+
+                with self.assertRaisesRegex(
+                    HTTPException,
+                    "must use the parent chat backend",
+                ):
+                    await store.update(
+                        job["id"],
+                        {"backend": agent_server.BACKEND_CLAUDE},
+                    )
+                self.assertEqual(
+                    store.jobs[job["id"]]["backend"],
+                    agent_server.BACKEND_CODEX,
+                )
+        finally:
+            agent_server.STORE.sessions.pop("sess_backend_update", None)
+
+    async def test_run_job_forwards_context_mode_and_projects_run_event(self) -> None:
+        for stored_mode, expected_mode in (
+            (None, "chat"),
+            ("standalone", "standalone"),
+        ):
+            with self.subTest(stored_mode=stored_mode):
+                store = agent_server.JobStore()
+                job = {
+                    "id": "job_context",
+                    "session_id": "sess_context",
+                    "title": "Context check",
+                    "prompt": "Check now",
+                    "schedule_kind": "interval",
+                    "timezone": "UTC",
+                    "enabled": False,
+                    "run_count": 0,
+                }
+                if stored_mode is not None:
+                    job["context_mode"] = stored_mode
+                store.jobs[job["id"]] = job
+                start_turn = AsyncMock(return_value={"run_id": "run_context"})
+                events = AsyncMock()
+                with (
+                    patch.object(agent_server, "start_turn", start_turn),
+                    patch.object(store, "mark_ran", new_callable=AsyncMock),
+                    patch.object(agent_server, "append_event", events),
+                ):
+                    result = await store.run_job(job["id"])
+
+                self.assertEqual(result["run_id"], "run_context")
+                self.assertEqual(
+                    start_turn.await_args.kwargs["provider_context_mode"],
+                    expected_mode,
+                )
+                self.assertFalse(start_turn.await_args.kwargs["queue_if_busy"])
+                self.assertEqual(
+                    events.await_args.args[2]["context_mode"],
+                    expected_mode,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

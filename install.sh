@@ -32,6 +32,23 @@ NON_INTERACTIVE="false"
 PORT_FALLBACK="true"
 PORT_FALLBACK_ATTEMPTS=5
 
+if [[ -t 1 ]] && [[ "${TERM:-}" != "dumb" ]] && [[ -z "${NO_COLOR:-}" ]]; then
+  COLOR_GREEN=$'\033[32m'
+  COLOR_RED=$'\033[31m'
+  COLOR_YELLOW=$'\033[33m'
+  COLOR_BOLD=$'\033[1m'
+  COLOR_RESET=$'\033[0m'
+else
+  COLOR_GREEN=""
+  COLOR_RED=""
+  COLOR_YELLOW=""
+  COLOR_BOLD=""
+  COLOR_RESET=""
+fi
+CHECK_MARK="${COLOR_GREEN}✓${COLOR_RESET}"
+CROSS_MARK="${COLOR_RED}✗${COLOR_RESET}"
+DOT_MARK="${COLOR_YELLOW}○${COLOR_RESET}"
+
 usage() {
   cat <<'USAGE'
 Usage: ./install.sh [--port PORT] [--bind ADDRESS] [--release-version VERSION] [--non-interactive] [--no-port-fallback]
@@ -881,13 +898,22 @@ while true; do
 done
 
 echo "[6/7] Checking optional agent runtimes"
-RUNTIMES=()
-command -v claude >/dev/null 2>&1 && RUNTIMES+=(claude)
-command -v codex >/dev/null 2>&1 && RUNTIMES+=(codex)
-if ((${#RUNTIMES[@]} == 0)); then
-  echo "      Server is ready; install and sign in to Claude Code or Codex before starting a chat."
-else
-  echo "      Found: ${RUNTIMES[*]}"
+check_runtime_cli() {
+  local name="$1"
+  local install_hint="$2"
+  if command -v "$name" >/dev/null 2>&1; then
+    echo "      $CHECK_MARK $name found"
+    return 0
+  fi
+  echo "      $CROSS_MARK $name not found - $install_hint"
+  return 1
+}
+CLAUDE_READY="false"
+CODEX_READY="false"
+check_runtime_cli claude "npm install -g @anthropic-ai/claude-code, then run: claude" && CLAUDE_READY="true"
+check_runtime_cli codex "npm install -g @openai/codex, then run: codex login" && CODEX_READY="true"
+if [[ "$CLAUDE_READY" == "false" && "$CODEX_READY" == "false" ]]; then
+  echo "      Sign in to at least one before starting a chat."
 fi
 
 TAILSCALE_IP=""
@@ -898,14 +924,27 @@ SERVER_URL="http://127.0.0.1:$PORT"
 [[ -z "$TAILSCALE_IP" ]] || SERVER_URL="http://$TAILSCALE_IP:$PORT"
 
 echo "[7/7] AgentsServer $RELEASE_VERSION is ready"
+echo
+echo "  ${COLOR_BOLD}Server URL${COLOR_RESET}    $SERVER_URL"
+echo "  ${COLOR_BOLD}Access token${COLOR_RESET}  $TOKEN"
+echo
+echo "  ${COLOR_BOLD}Next steps${COLOR_RESET}"
 if [[ "$PORT_AUTO_SELECTED" == "true" ]]; then
-  echo "      Note: port $ORIGINAL_PORT was already in use by another process, so AgentsServer was installed on port $PORT instead. Pass --port to pin a specific port next time, or --no-port-fallback to fail instead of switching."
+  echo "  $DOT_MARK port $ORIGINAL_PORT was already in use, installed on $PORT instead (--port to pin, --no-port-fallback to disable)"
+fi
+if [[ "$CLAUDE_READY" == "false" && "$CODEX_READY" == "false" ]]; then
+  echo "  $CROSS_MARK install and sign in to Claude Code or Codex (see [6/7] above) before starting a chat"
 fi
 if [[ -n "$TMUX_WARNING" ]]; then
-  echo "      Note: $TMUX_WARNING"
+  echo "  $CROSS_MARK tmux unavailable: persistent terminal, pane inspection, and in-app updates won't work - $TMUX_WARNING"
+else
+  echo "  $CHECK_MARK tmux available"
 fi
 if [[ -z "$TAILSCALE_IP" ]] && ! command -v tailscale >/dev/null 2>&1; then
-  echo "      Optional: this server is only reachable on this machine right now. To use it from another Mac, iPhone, iPad, or a different WiFi network, install Tailscale on this host and your client devices, then rerun install.sh: https://tailscale.com/download"
+  echo "  $DOT_MARK optional: install Tailscale to reach this server from another device or WiFi network: https://tailscale.com/download"
+else
+  echo "  $CHECK_MARK reachable via Tailscale at $TAILSCALE_IP"
 fi
+echo
 printf 'AGENTSDOCK_SETUP_RESULT={"server_url":"%s","access_token":"%s","service":"%s","tailscale_ip":"%s","server_version":"%s"}\n' \
   "$SERVER_URL" "$TOKEN" "$SERVICE_KIND" "$TAILSCALE_IP" "$RELEASE_VERSION"

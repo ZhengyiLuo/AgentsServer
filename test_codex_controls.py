@@ -927,6 +927,35 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final_snapshot["turn_id"], "turn-new")
         self.assertEqual(final_snapshot["run_id"], "run-new")
 
+    async def test_token_usage_cannot_repopulate_a_replaced_thread(self) -> None:
+        snapshot = agent_server.codex_token_usage_snapshot(
+            {
+                "last": {"totalTokens": 25_000},
+                "total": {"totalTokens": 25_000},
+                "modelContextWindow": 100_000,
+            },
+            thread_id="thread",
+            turn_id="turn-old",
+            run_id="run-old",
+        )
+        self.assertIsNotNone(snapshot)
+        agent_server.STORE.sessions["chat"]["codex_thread_id"] = "thread-new"
+        agent_server.STORE.sessions["chat"]["session_id"] = "thread-new"
+        save = AsyncMock()
+        with patch.object(agent_server.STORE, "save", save):
+            recorded = await agent_server.record_codex_token_usage(
+                "chat",
+                snapshot,
+                force_checkpoint=True,
+            )
+
+        self.assertFalse(recorded)
+        self.assertNotIn(
+            "codex_token_usage_snapshot",
+            agent_server.STORE.sessions["chat"],
+        )
+        self.assertEqual(save.await_count, 0)
+
     async def test_automatic_compaction_preserves_before_and_after_usage(self) -> None:
         before_usage = {
             "last": {
@@ -1027,6 +1056,75 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
             compaction["token_usage_before"]["context_tokens"],
             90_000,
         )
+        self.assertEqual(
+            compaction["token_usage_after"]["context_tokens"],
+            10_000,
+        )
+
+    async def test_automatic_compaction_does_not_invent_before_usage(self) -> None:
+        after_usage = {
+            "last": {"totalTokens": 10_000},
+            "total": {"totalTokens": 100_000},
+            "modelContextWindow": 100_000,
+        }
+        active = {
+            "chat": {
+                "run_id": "run-compact",
+                "provider_thread_id": "thread",
+                "provider_turn_id": "turn-1",
+            }
+        }
+        events: list[tuple[str, dict[str, object]]] = []
+
+        async def record_event(
+            _session_id: str,
+            event_type: str,
+            payload: dict[str, object],
+        ) -> dict[str, object]:
+            events.append((event_type, payload))
+            return {}
+
+        with (
+            patch.object(agent_server, "ACTIVE", active),
+            patch.object(
+                agent_server,
+                "codex_session_id_for_thread",
+                return_value="chat",
+            ),
+            patch.object(agent_server.STORE, "save", AsyncMock()),
+            patch.object(agent_server, "append_event", side_effect=record_event),
+        ):
+            await agent_server.project_codex_notification({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread",
+                    "turnId": "turn-1",
+                    "item": {"id": "compact-1", "type": "contextCompaction"},
+                },
+            })
+            await agent_server.project_codex_notification({
+                "method": "thread/tokenUsage/updated",
+                "params": {
+                    "threadId": "thread",
+                    "turnId": "turn-1",
+                    "tokenUsage": after_usage,
+                },
+            })
+            await agent_server.project_codex_notification({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread",
+                    "turnId": "turn-1",
+                    "item": {"id": "compact-1", "type": "contextCompaction"},
+                },
+            })
+
+        compaction = next(
+            payload
+            for event_type, payload in events
+            if event_type == "codex_compaction_completed"
+        )
+        self.assertIsNone(compaction["token_usage_before"])
         self.assertEqual(
             compaction["token_usage_after"]["context_tokens"],
             10_000,
@@ -1518,6 +1616,7 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
             events.append((event_type, payload))
             return {}
 
+        manager = AsyncMock()
         with (
             patch.object(agent_server, "append_event", side_effect=record_event),
             patch.object(
@@ -1531,7 +1630,7 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     "chat",
                     "operation",
                     "compaction",
-                    AsyncMock(),
+                    manager,
                     "thread",
                     subscription,
                 )
@@ -1568,6 +1667,10 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             events[-1][1]["message"],
             "Context compaction completed.",
+        )
+        manager.wait_for_notification_handler.assert_awaited_once_with(
+            agent_server.project_codex_notification,
+            "thread",
         )
         release_thread.assert_awaited_once()
 

@@ -150,9 +150,17 @@ class FakeManager:
         self.turn_calls: list[
             tuple[str, list[dict[str, object]], dict[str, object]]
         ] = []
+        self.notification_barriers: list[tuple[object, str]] = []
 
     async def start(self) -> None:
         self.start_calls += 1
+
+    async def wait_for_notification_handler(
+        self,
+        handler: object,
+        thread_id: str,
+    ) -> None:
+        self.notification_barriers.append((handler, thread_id))
 
     async def start_turn(
         self,
@@ -557,6 +565,10 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             finished.await_args.args[1]["result_text"],
             "Completed result.",
+        )
+        self.assertEqual(
+            manager.notification_barriers,
+            [(agent_server.project_codex_notification, "thread-native")],
         )
 
     async def test_ultra_effort_is_forwarded_to_native_turn_start(self) -> None:

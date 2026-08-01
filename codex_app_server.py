@@ -486,6 +486,10 @@ class CodexAppServerClient:
         self._subscriptions: set[CodexAppServerSubscription] = set()
         self._notification_handlers: set[NotificationHandler] = set()
         self._callback_tasks: set[asyncio.Task[Any]] = set()
+        self._callback_tails: dict[
+            tuple[NotificationHandler, str],
+            asyncio.Task[Any],
+        ] = {}
         self._server_request_tasks: dict[Any, asyncio.Task[None]] = {}
         self._stderr_tail: deque[str] = deque(maxlen=40)
         self._closing = False
@@ -641,6 +645,22 @@ class CodexAppServerClient:
     def remove_notification_handler(self, handler: NotificationHandler) -> None:
         self._notification_handlers.discard(handler)
 
+    async def wait_for_notification_handler(
+        self,
+        handler: NotificationHandler,
+        thread_id: str,
+    ) -> None:
+        """Wait through the latest callback received for one provider thread."""
+        tail = self._callback_tails.get((handler, thread_id))
+        if tail is None:
+            return
+        try:
+            await asyncio.shield(tail)
+        except Exception:
+            # Callback failures are deliberately isolated from transport and
+            # subscription consumers, matching normal callback dispatch.
+            pass
+
     async def _discard_process(self) -> None:
         self._initialized = False
         self._initialize_result = None
@@ -686,6 +706,7 @@ class CodexAppServerClient:
             task.cancel()
         self._server_request_tasks.clear()
         self._callback_tasks.clear()
+        self._callback_tails.clear()
         if background_tasks:
             await asyncio.gather(*background_tasks, return_exceptions=True)
 
@@ -939,14 +960,34 @@ class CodexAppServerClient:
                 subscription._put(notification)
 
         for handler in tuple(self._notification_handlers):
-            try:
-                result = handler(notification)
-            except Exception:
-                continue
-            if inspect.isawaitable(result):
+            owner = (handler, thread_id or "")
+            previous = self._callback_tails.get(owner)
+            if previous is None:
+                try:
+                    result = handler(notification)
+                except Exception:
+                    continue
+                if not inspect.isawaitable(result):
+                    # Preserve the original inline contract for synchronous
+                    # caches consumed by immediately following server requests.
+                    continue
                 task = asyncio.ensure_future(result)
-                self._callback_tasks.add(task)
-                task.add_done_callback(self._finish_callback_task)
+            else:
+                task = asyncio.create_task(
+                    self._invoke_notification_handler(
+                        handler,
+                        notification,
+                        previous,
+                    )
+                )
+            self._callback_tails[owner] = task
+            self._callback_tasks.add(task)
+            task.add_done_callback(
+                lambda completed, owner=owner: self._finish_callback_task(
+                    owner,
+                    completed,
+                )
+            )
 
         if method == "turn/completed" and active_turn:
             if not turn_id or not active_turn.turn_id or turn_id == active_turn.turn_id:
@@ -962,8 +1003,34 @@ class CodexAppServerClient:
                 include_thread_subscription=True,
             )
 
-    def _finish_callback_task(self, task: asyncio.Task[Any]) -> None:
+    async def _invoke_notification_handler(
+        self,
+        handler: NotificationHandler,
+        notification: dict[str, Any],
+        previous: asyncio.Task[Any] | None,
+    ) -> None:
+        if previous is not None:
+            try:
+                await previous
+            except Exception:
+                # One failed notification must not discard every later
+                # notification already received for the same handler.
+                pass
+        try:
+            result = handler(notification)
+        except Exception:
+            return
+        if inspect.isawaitable(result):
+            await result
+
+    def _finish_callback_task(
+        self,
+        owner: tuple[NotificationHandler, str],
+        task: asyncio.Task[Any],
+    ) -> None:
         self._callback_tasks.discard(task)
+        if self._callback_tails.get(owner) is task:
+            self._callback_tails.pop(owner, None)
         if not task.cancelled():
             with suppress(Exception):
                 task.result()
@@ -1785,6 +1852,13 @@ class CodexAppServerManager:
 
     def remove_notification_handler(self, handler: NotificationHandler) -> None:
         self.client.remove_notification_handler(handler)
+
+    async def wait_for_notification_handler(
+        self,
+        handler: NotificationHandler,
+        thread_id: str,
+    ) -> None:
+        await self.client.wait_for_notification_handler(handler, thread_id)
 
     async def request(
         self,

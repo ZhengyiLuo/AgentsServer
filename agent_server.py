@@ -12614,6 +12614,10 @@ async def record_codex_token_usage(
         session = STORE.sessions.get(session_id)
         if not session:
             return False
+        snapshot_thread_id = str(snapshot.get("thread_id") or "").strip()
+        current_thread_id = str(session_provider_id(session) or "").strip()
+        if not snapshot_thread_id or snapshot_thread_id != current_thread_id:
+            return False
         session["codex_token_usage"] = dict(snapshot.get("token_usage") or {})
         session["codex_token_usage_snapshot"] = dict(snapshot)
         previous = session.get("_codex_token_usage_checkpoint")
@@ -13340,12 +13344,9 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
                 ):
                     active["codex_compaction_in_progress"] = True
                     active["codex_compaction_item_id"] = item_id
-                    if before is not None and not isinstance(
-                        active.get("codex_compaction_token_usage_before"),
-                        dict,
-                    ):
-                        active["codex_compaction_token_usage_before"] = dict(
-                            before
+                    if "codex_compaction_token_usage_before" not in active:
+                        active["codex_compaction_token_usage_before"] = (
+                            dict(before) if before is not None else None
                         )
             return
         async with ACTIVE_LOCK:
@@ -13356,14 +13357,17 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
                 and active.get("codex_native_operation_kind") == "compaction"
             )
             run_id = str(active.get("run_id") or "") if active else ""
-            before = (
-                dict(active["codex_compaction_token_usage_before"])
-                if active
-                and isinstance(
-                    active.get("codex_compaction_token_usage_before"), dict
+            if active and "codex_compaction_token_usage_before" in active:
+                recorded_before = active.get(
+                    "codex_compaction_token_usage_before"
                 )
-                else current_codex_token_usage_snapshot(session_id)
-            )
+                before = (
+                    dict(recorded_before)
+                    if isinstance(recorded_before, dict)
+                    else None
+                )
+            else:
+                before = current_codex_token_usage_snapshot(session_id)
             after = (
                 dict(active["codex_compaction_token_usage_after"])
                 if active
@@ -14035,6 +14039,14 @@ async def consume_codex_native_turn(
     finally:
         subscription.close()
         try:
+            # The subscription is intentionally low-latency and can observe
+            # terminal delivery before async projection finishes. Drain the
+            # per-thread projection tail before reading usage state or
+            # releasing ACTIVE so terminal attribution cannot race.
+            await manager.wait_for_notification_handler(
+                project_codex_notification,
+                thread_id,
+            )
             if session_id in STORE.sessions and terminal_error:
                 await append_event(
                     session_id,
@@ -18223,6 +18235,14 @@ async def run_codex_app_server(
         await stop_manifest_watcher()
         if turn is not None:
             await turn.close()
+        if provider_id:
+            # The low-latency subscription can finish before its async
+            # projection callbacks. Keep ACTIVE/run attribution alive through
+            # every notification already received for this provider thread.
+            await manager.wait_for_notification_handler(
+                project_codex_notification,
+                provider_id,
+            )
 
     produced_activity = bool(
         text_parts

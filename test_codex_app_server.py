@@ -136,6 +136,82 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
             **kwargs,
         )
 
+    async def test_async_notification_handler_preserves_wire_order(self) -> None:
+        factory = FakeProcessFactory()
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+        seen: list[str] = []
+
+        async def handler(notification: dict[str, Any]) -> None:
+            method = str(notification.get("method") or "")
+            seen.append(f"start:{method}")
+            if method == "notification/first":
+                first_entered.set()
+                await release_first.wait()
+            seen.append(f"finish:{method}")
+
+        client.add_notification_handler(handler)
+        client._route_notification(
+            {
+                "method": "notification/first",
+                "params": {"threadId": "thread-a"},
+            }
+        )
+        await asyncio.wait_for(first_entered.wait(), timeout=1)
+        client._route_notification(
+            {
+                "method": "notification/other-thread",
+                "params": {"threadId": "thread-b"},
+            }
+        )
+        await wait_until(lambda: "finish:notification/other-thread" in seen)
+        client._route_notification(
+            {
+                "method": "notification/second",
+                "params": {"threadId": "thread-a"},
+            }
+        )
+        await asyncio.sleep(0)
+        self.assertEqual(
+            seen,
+            [
+                "start:notification/first",
+                "start:notification/other-thread",
+                "finish:notification/other-thread",
+            ],
+        )
+
+        release_first.set()
+        await client.wait_for_notification_handler(handler, "thread-a")
+        self.assertEqual(
+            seen,
+            [
+                "start:notification/first",
+                "start:notification/other-thread",
+                "finish:notification/other-thread",
+                "finish:notification/first",
+                "start:notification/second",
+                "finish:notification/second",
+            ],
+        )
+
+    async def test_sync_notification_handler_runs_inline(self) -> None:
+        client = self.make_client(FakeProcessFactory())
+        self.addAsyncCleanup(client.close)
+        seen: list[str] = []
+
+        def handler(notification: dict[str, Any]) -> None:
+            seen.append(str(notification.get("method") or ""))
+
+        client.add_notification_handler(handler)
+        client._route_notification({
+            "method": "item/started",
+            "params": {"threadId": "thread", "item": {"id": "approval"}},
+        })
+        self.assertEqual(seen, ["item/started"])
+
     async def test_initialize_once_and_reuse_one_process(self) -> None:
         factory = FakeProcessFactory()
         process = factory.process

@@ -387,13 +387,15 @@ You are operating through AgentsDock, backed by AgentsServer.
 - Manage scheduled jobs only when explicitly asked; use `"$AGENTSDOCK_JOBS_CLI"` (start with list/help), not the API or prompt snapshots.
 - Inspect the persistent terminal named by `$AGENTSDOCK_TMUX_SESSION` read-only unless the user explicitly asks you to operate it.
 - Check installed skills and project playbooks before claiming a specialized environment or remote path is unavailable.
+- If an incidental cleanup or optional clause makes a compound command fail, immediately retry the still-safe requested operation without that clause.
+- Keep the main chat focused; delegate bounded noisy exploration and return summaries instead of dumping large logs or tool output into the thread.
 - Preserve user work, avoid destructive actions without clear authorization, and continue until the request is complete or genuinely blocked.
 """
 
 # Compatibility alias for integrations which imported the historical name.
 SYSTEM_PROMPT = CLAUDE_PROMPT_PRELUDE
 
-CODEX_THREAD_POLICY_VERSION = "1"
+CODEX_THREAD_POLICY_VERSION = "2"
 CODEX_PROMPT_PRELUDE = """\
 You are operating through AgentsDock, backed by AgentsServer.
 - Keep the final answer concise; the UI renders tool calls, command output, reasoning, and artifacts separately.
@@ -405,6 +407,8 @@ You are operating through AgentsDock, backed by AgentsServer.
 - Manage scheduled jobs only when explicitly asked, using `"$AGENTSDOCK_JOBS_CLI" --chat-id {chat_id} <command>`; query it instead of relying on a prompt snapshot.
 - The persistent terminal is tmux session `{terminal_session}`; inspect it read-only unless the user explicitly asks you to operate it.
 - Check installed skills and project playbooks before claiming a specialized environment or remote path is unavailable.
+- If an incidental cleanup or optional clause makes a compound command fail, immediately retry the still-safe requested operation without that clause.
+- Keep the main chat focused; delegate bounded noisy exploration and return summaries instead of dumping large logs or tool output into the thread.
 - Preserve user work, avoid destructive actions without clear authorization, and continue until the request is complete or genuinely blocked.
 """
 
@@ -1069,7 +1073,7 @@ def workspace_info_sync(session_id: str) -> dict[str, Any]:
         "root": str(root),
         "name": root.name or str(root),
         "read_only": bool(sess.get("archived")),
-        "capability_version": 4 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
+        "capability_version": 5 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
         "max_text_file_bytes": MAX_WORKSPACE_TEXT_BYTES,
         "max_preview_file_bytes": MAX_WORKSPACE_PREVIEW_BYTES,
         "preview_media_types": sorted(set(WORKSPACE_PREVIEW_MEDIA_TYPES.values())),
@@ -1162,6 +1166,100 @@ def read_workspace_file_sync(session_id: str, relative_path: str) -> dict[str, A
             "size": len(data),
             "mtime_ns": int(item_stat.st_mtime_ns),
             "writable": not bool(sess.get("archived")) and bool(item_stat.st_mode & 0o222),
+        }
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        os.close(parent_fd)
+
+
+def normalize_absolute_file_path(value: str | None) -> tuple[Path, str, str]:
+    """Validate one explicit, native absolute path for read-only access.
+
+    This is deliberately separate from workspace normalization. It accepts no
+    relative, dot-segment, or lexically non-canonical paths, so callers cannot
+    smuggle traversal semantics into a direct-read request.
+    """
+    raw = str(value or "")
+    if "\x00" in raw:
+        raise workspace_http_error(400, "invalid_absolute_file_path", "Absolute file paths cannot contain NUL bytes.")
+    if len(raw) > MAX_WORKSPACE_PATH_CHARS:
+        raise workspace_http_error(400, "invalid_absolute_file_path", "Absolute file path is too long.")
+    if not os.path.isabs(raw):
+        raise workspace_http_error(400, "invalid_absolute_file_path", "An absolute file path is required.")
+    if os.name != "nt" and raw.startswith("//"):
+        raise workspace_http_error(400, "invalid_absolute_file_path", "The absolute file path must use one filesystem root.")
+    if os.path.normpath(raw) != raw:
+        raise workspace_http_error(
+            400,
+            "invalid_absolute_file_path",
+            "Absolute file paths must be canonical and cannot contain dot segments or repeated separators.",
+        )
+    absolute = Path(raw)
+    parts = absolute.parts
+    if not parts or not absolute.anchor or len(parts) < 2:
+        raise workspace_http_error(400, "invalid_absolute_file_path", "An absolute file path is required.")
+    relative = "/".join(parts[1:])
+    if not relative:
+        raise workspace_http_error(400, "invalid_absolute_file_path", "An absolute file path is required.")
+    return Path(absolute.anchor), relative, raw
+
+
+def read_absolute_file_sync(session_id: str, absolute_path: str) -> dict[str, Any]:
+    """Read one explicitly named absolute UTF-8 file without granting mutations."""
+    if not WORKSPACE_SECURE_OPEN_AVAILABLE:
+        raise workspace_http_error(
+            501,
+            "workspace_secure_open_unavailable",
+            "Secure absolute file access is unavailable on this host.",
+        )
+    if session_id not in STORE.sessions:
+        raise workspace_http_error(404, "session_not_found", "Chat not found.")
+    root, relative, normalized = normalize_absolute_file_path(absolute_path)
+    parent_fd, name = open_workspace_parent_fd(root, relative)
+    file_fd = -1
+    try:
+        try:
+            file_fd = os.open(name, workspace_open_flags(), dir_fd=parent_fd)
+        except OSError as exc:
+            raise translate_workspace_os_error(exc, normalized) from exc
+        item_stat = os.fstat(file_fd)
+        if not stat.S_ISREG(item_stat.st_mode):
+            raise workspace_http_error(400, "absolute_not_regular_file", f"Not a regular file: {normalized}")
+        if item_stat.st_size > MAX_WORKSPACE_TEXT_BYTES:
+            raise workspace_http_error(
+                413,
+                "absolute_file_too_large",
+                f"{normalized} is larger than the {MAX_WORKSPACE_TEXT_BYTES // (1024 * 1024)} MiB editor limit.",
+            )
+        chunks: list[bytes] = []
+        remaining = MAX_WORKSPACE_TEXT_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(file_fd, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        if len(data) > MAX_WORKSPACE_TEXT_BYTES:
+            raise workspace_http_error(413, "absolute_file_too_large", f"{normalized} exceeds the editor size limit.")
+        if b"\x00" in data:
+            raise workspace_http_error(415, "absolute_binary_file", f"{normalized} is binary and cannot be opened in the text editor.")
+        try:
+            content = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise workspace_http_error(415, "absolute_encoding_unsupported", f"{normalized} is not UTF-8 text.") from exc
+        return {
+            "root": str(root),
+            "path": normalized,
+            "name": name,
+            "content": content,
+            "revision": workspace_revision(data),
+            "size": len(data),
+            "mtime_ns": int(item_stat.st_mtime_ns),
+            # This endpoint has no corresponding write/rename/delete route.
+            "writable": False,
+            "scope": "absolute",
         }
     finally:
         if file_fd >= 0:
@@ -3148,8 +3246,9 @@ class SessionStore:
                     CODEX_THREAD_SESSION_INDEX[provider_id] = str(
                         sess.get("id") or ""
                     )
-                # App-server status, token usage, and approval cards describe
-                # one live process. They cannot survive a server restart.
+                # App-server status and approval cards describe one live
+                # process. Bounded token checkpoints are durable so clients
+                # can still explain prior compaction after a restart.
                 reset_values = {
                     "codex_thread_status": {"type": "notLoaded"},
                     "codex_pending_interaction_count": 0,
@@ -3159,8 +3258,10 @@ class SessionStore:
                     if sess.get(key) != value:
                         sess[key] = value
                         runtime_changed = True
-                if "codex_token_usage" in sess:
-                    sess.pop("codex_token_usage", None)
+                if "_codex_token_usage_terminal" in sess:
+                    # This marker coordinates independently dispatched live
+                    # notifications and has no meaning after process restart.
+                    sess.pop("_codex_token_usage_terminal", None)
                     runtime_changed = True
         await self.ensure_sort_orders()
         if runtime_changed:
@@ -3508,6 +3609,14 @@ class SessionStore:
             if backend == BACKEND_CODEX and codex_instruction_hash is not None:
                 sess["codex_instruction_hash"] = codex_instruction_hash
                 sess["codex_instruction_version"] = CODEX_THREAD_POLICY_VERSION
+            if backend == BACKEND_CODEX and previous_codex_thread_id != provider_id:
+                for key in (
+                    "codex_token_usage",
+                    "codex_token_usage_snapshot",
+                    "_codex_token_usage_checkpoint",
+                    "_codex_token_usage_terminal",
+                ):
+                    sess.pop(key, None)
             if backend == BACKEND_CLAUDE and sess.get("fork_from") and provider_id != sess.get("fork_from"):
                 sess["fork_from"] = None
             sess["updated_at"] = now_iso()
@@ -4375,8 +4484,8 @@ async def reset_codex_ephemeral_runtime_metadata() -> None:
                 if session.get(key) != value:
                     session[key] = value
                     changed = True
-            if "codex_token_usage" in session:
-                session.pop("codex_token_usage", None)
+            if "_codex_token_usage_terminal" in session:
+                session.pop("_codex_token_usage_terminal", None)
                 changed = True
         if changed:
             await STORE.save()
@@ -7925,6 +8034,9 @@ TIMELINE_INDEX_HIDDEN_TYPES = {
     "codex_thread_status",
     "codex_goal_updated",
     "codex_goal_cleared",
+    # Legacy beta servers briefly emitted usage as timeline events. Keep those
+    # old rows out of pagination even though current servers never emit them.
+    "codex_token_usage",
     "codex_compaction_started",
 }
 TIMELINE_INDEX_JOB_TYPES = {"job_created", "job_ran", "job_started", "job_deferred", "job_finished", "job_error"}
@@ -7992,10 +8104,11 @@ def timeline_index_codex_lifecycle_key(
 
 
 def timeline_index_event_is_hidden(event: dict[str, Any]) -> bool:
-    return (
-        str(event.get("type") or "") in TIMELINE_INDEX_HIDDEN_TYPES
-        or timeline_index_is_native_steer_transition_stop(event)
-    )
+    # Native-steer stops need routing context before they can be classified:
+    # ordinary chat transitions are hidden, while a scheduled-job transition
+    # is the terminal status for that job run. Both index builders handle that
+    # distinction using their run-to-job maps before calling this predicate.
+    return str(event.get("type") or "") in TIMELINE_INDEX_HIDDEN_TYPES
 
 
 def timeline_index_retire_native_steer_turn(
@@ -8611,7 +8724,27 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                 fork_internal_run_ids.add(run_id)
             if is_forked and (is_fork_internal or run_id in fork_internal_run_ids):
                 continue
-            if timeline_index_is_native_steer_transition_stop(event):
+            indexed_job = (
+                event.get("job")
+                if isinstance(event.get("job"), dict)
+                else {}
+            )
+            explicit_job_id = str(
+                event.get("job_id") or indexed_job.get("id") or ""
+            ).strip()
+            resolved_job_id = explicit_job_id or (
+                str(job_by_run.get(run_id) or "").strip()
+                if run_id
+                else ""
+            ) or (run_id if event.get("purpose") == "scheduled_job" else "")
+            # A native steer silently retires an ordinary logical chat turn,
+            # but interrupting a scheduled run produces the job's terminal
+            # Stopped status. Preserve and index that event so the job card no
+            # longer remains falsely active with its trace paging disabled.
+            if (
+                timeline_index_is_native_steer_transition_stop(event)
+                and not resolved_job_id
+            ):
                 active_turn_key = timeline_index_retire_native_steer_turn(
                     event,
                     current_turn_by_run,
@@ -8621,24 +8754,11 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
             if timeline_index_event_is_hidden(event):
                 continue
             visible_count += 1
-            indexed_job = (
-                event.get("job")
-                if isinstance(event.get("job"), dict)
-                else {}
-            )
-            explicit_job_id = str(
-                event.get("job_id") or indexed_job.get("id") or ""
-            ).strip()
             indexed_job_title = str(
                 event.get("job_title") or indexed_job.get("title") or ""
             ).strip()
             if run_id and explicit_job_id:
                 job_by_run[run_id] = explicit_job_id
-            resolved_job_id = explicit_job_id or (
-                str(job_by_run.get(run_id) or "").strip()
-                if run_id
-                else ""
-            )
             index_run_event(
                 event,
                 line_end_offset=final_offset,
@@ -8689,7 +8809,12 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                 record["timestamp"] = event.get("ts") or record.get("timestamp")
                 continue
 
-            if event_type in TIMELINE_INDEX_JOB_TYPES or event.get("job_id") or (run_id and run_id in job_by_run):
+            if (
+                event_type in TIMELINE_INDEX_JOB_TYPES
+                or event.get("purpose") == "scheduled_job"
+                or event.get("job_id")
+                or (run_id and run_id in job_by_run)
+            ):
                 job = event.get("job") if isinstance(event.get("job"), dict) else {}
                 job_id = event.get("job_id") or job.get("id") or job_by_run.get(run_id) or run_id or f"job-{seq}"
                 if run_id:
@@ -9280,6 +9405,12 @@ def new_semantic_job_state(landmark: dict[str, Any]) -> dict[str, Any]:
         "latest_run_id": None,
         "latest_run_seq": 0,
         "latest_run_extras": deque(maxlen=SEMANTIC_TIMELINE_JOB_EXTRA_LIMIT),
+        # Keep one lightweight reasoning and tool anchor for the latest run.
+        # The complete trace remains lazy-loaded through read_indexed_run_trace,
+        # but these anchors make an interrupted job's retained reasoning
+        # visibly discoverable immediately after a chat reload.
+        "latest_run_reasoning": None,
+        "latest_run_tool": None,
         "title": str(landmark.get("title") or "Scheduled job"),
         "job": None,
     }
@@ -9341,7 +9472,15 @@ def add_semantic_job_event(state: dict[str, Any], event: dict[str, Any]) -> None
         if run_id != state.get("latest_run_id"):
             state["latest_run_id"] = run_id
             state["latest_run_extras"] = deque(maxlen=SEMANTIC_TIMELINE_JOB_EXTRA_LIMIT)
+            state["latest_run_reasoning"] = None
+            state["latest_run_tool"] = None
         state["latest_run_seq"] = seq
+    if run_id == state.get("latest_run_id"):
+        event_type = str(event.get("type") or "")
+        if event_type == "reasoning_summary":
+            state["latest_run_reasoning"] = event
+        elif event_type in {"tool_started", "tool_finished"}:
+            state["latest_run_tool"] = event
     if run_id == state.get("latest_run_id") and (
         event.get("file")
         or event.get("artifact")
@@ -9679,7 +9818,23 @@ def collect_semantic_timeline_events(
                 continue
             event_type = str(event.get("type") or "")
             run_id = str(event.get("run_id") or "").strip()
-            if timeline_index_is_native_steer_transition_stop(event):
+            job_payload = (
+                event.get("job")
+                if isinstance(event.get("job"), dict)
+                else {}
+            )
+            explicit_job_id = str(
+                event.get("job_id") or job_payload.get("id") or ""
+            ).strip()
+            transition_job_id = explicit_job_id or (
+                str(job_by_run.get(run_id) or "").strip()
+                if run_id
+                else ""
+            ) or (run_id if event.get("purpose") == "scheduled_job" else "")
+            if (
+                timeline_index_is_native_steer_transition_stop(event)
+                and not transition_job_id
+            ):
                 retired_key = (
                     current_turn_by_run.get(run_id)
                     if run_id
@@ -9713,8 +9868,6 @@ def collect_semantic_timeline_events(
                         current_turn_by_run.pop(run_id, None)
             else:
                 codex_lifecycle_key = timeline_index_codex_lifecycle_key(event)
-                job_payload = event.get("job") if isinstance(event.get("job"), dict) else {}
-                explicit_job_id = str(event.get("job_id") or job_payload.get("id") or "").strip()
                 job_id = job_by_run.get(run_id) if run_id else None
                 if not job_id and (
                     event_type in TIMELINE_INDEX_JOB_TYPES
@@ -9794,7 +9947,24 @@ def collect_semantic_timeline_events(
             state = selected_jobs[key]
             representatives = list(state["representatives"].values())
             standalone = list(state["standalone"])
-            extras = list(state["latest_run_extras"])
+            retain_interrupted_trace_anchor = (
+                str(state.get("latest_status") or "") == "stopped"
+            )
+            extras = [
+                *list(state["latest_run_extras"]),
+                *(
+                    [state["latest_run_reasoning"]]
+                    if retain_interrupted_trace_anchor
+                    and isinstance(state.get("latest_run_reasoning"), dict)
+                    else []
+                ),
+                *(
+                    [state["latest_run_tool"]]
+                    if retain_interrupted_trace_anchor
+                    and isinstance(state.get("latest_run_tool"), dict)
+                    else []
+                ),
+            ]
             optional_by_id = {
                 semantic_timeline_event_identity(event): event
                 for event in [*standalone, *representatives, *extras]
@@ -12027,6 +12197,10 @@ async def rollover_codex_provider_session(
         current["codex_thread_id"] = None
         current.pop("codex_instruction_hash", None)
         current.pop("codex_instruction_version", None)
+        current.pop("codex_token_usage", None)
+        current.pop("codex_token_usage_snapshot", None)
+        current.pop("_codex_token_usage_checkpoint", None)
+        current.pop("_codex_token_usage_terminal", None)
         current["memory_seed"] = memory
         current["memory_seed_used"] = memory_seed_used
         current["memory_forked"] = True
@@ -12334,6 +12508,171 @@ def bounded_codex_interaction_value(
                 break
         return output_dict
     return str(value)[:remaining]
+
+
+CODEX_TOKEN_USAGE_PERSIST_INTERVAL_SECONDS = 30.0
+
+
+def codex_token_usage_snapshot(
+    token_usage: Any,
+    *,
+    thread_id: str,
+    turn_id: str | None,
+    run_id: str | None,
+    snapshot_at: str | None = None,
+) -> dict[str, Any] | None:
+    """Return one bounded, forward-compatible app-server usage snapshot.
+
+    ``total`` is cumulative thread usage and can grow into the millions.  The
+    live context occupancy reported to clients must instead use ``last``.
+    """
+    bounded = bounded_codex_interaction_value(token_usage, remaining=4_000)
+    if not isinstance(bounded, dict):
+        return None
+    last = bounded.get("last") if isinstance(bounded.get("last"), dict) else {}
+    total = (
+        bounded.get("total")
+        if isinstance(bounded.get("total"), dict)
+        else {}
+    )
+
+    def token_count(value: Any) -> int | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return max(0, int(value))
+
+    context_tokens = token_count(last.get("totalTokens"))
+    context_window = token_count(bounded.get("modelContextWindow"))
+    context_percent = (
+        round(context_tokens * 100 / context_window, 2)
+        if context_tokens is not None and context_window
+        else None
+    )
+    snapshot: dict[str, Any] = {
+        "thread_id": thread_id,
+        "turn_id": turn_id,
+        "run_id": run_id,
+        "snapshot_at": snapshot_at or now_iso(),
+        "token_usage": bounded,
+        "input_tokens": token_count(last.get("inputTokens")),
+        "cached_input_tokens": token_count(last.get("cachedInputTokens")),
+        "cache_write_input_tokens": token_count(
+            last.get("cacheWriteInputTokens")
+        ),
+        "output_tokens": token_count(last.get("outputTokens")),
+        "reasoning_output_tokens": token_count(
+            last.get("reasoningOutputTokens")
+        ),
+        "total_tokens": token_count(last.get("totalTokens")),
+        "cumulative_total_tokens": token_count(total.get("totalTokens")),
+        "context_tokens": context_tokens,
+        "context_window": context_window,
+        "context_percent": context_percent,
+    }
+    return {key: value for key, value in snapshot.items() if value is not None}
+
+
+def current_codex_token_usage_snapshot(session_id: str) -> dict[str, Any] | None:
+    session = STORE.sessions.get(session_id)
+    value = session.get("codex_token_usage_snapshot") if session else None
+    return dict(value) if isinstance(value, dict) else None
+
+
+def terminal_codex_token_usage_run_id(
+    session_id: str,
+    thread_id: str,
+    turn_id: str | None,
+) -> str | None:
+    session = STORE.sessions.get(session_id)
+    terminal = session.get("_codex_token_usage_terminal") if session else None
+    marker = terminal if isinstance(terminal, dict) else {}
+    if (
+        turn_id is not None
+        and marker.get("thread_id") == thread_id
+        and marker.get("turn_id") == turn_id
+    ):
+        return str(marker.get("run_id") or "") or None
+    return None
+
+
+async def record_codex_token_usage(
+    session_id: str,
+    snapshot: dict[str, Any],
+    *,
+    force_checkpoint: bool = False,
+) -> bool:
+    """Keep every sample in memory and durably checkpoint at a bounded rate.
+
+    Token usage is runtime/control state, never timeline content.  Emitting one
+    event per sample would leak unknown rows into older clients and make large
+    installations rewrite/broadcast far too often.  Persist the first sample
+    for a run/turn, then at most every interval, plus explicit terminal points.
+    """
+    now_epoch = time.time()
+    should_checkpoint = force_checkpoint
+    async with STORE._lock:
+        session = STORE.sessions.get(session_id)
+        if not session:
+            return False
+        session["codex_token_usage"] = dict(snapshot.get("token_usage") or {})
+        session["codex_token_usage_snapshot"] = dict(snapshot)
+        previous = session.get("_codex_token_usage_checkpoint")
+        previous_marker = previous if isinstance(previous, dict) else {}
+        terminal = session.get("_codex_token_usage_terminal")
+        terminal_marker = terminal if isinstance(terminal, dict) else {}
+        terminal_match = bool(
+            snapshot.get("turn_id")
+            and terminal_marker.get("thread_id") == snapshot.get("thread_id")
+            and terminal_marker.get("turn_id") == snapshot.get("turn_id")
+        )
+        if terminal_marker and not terminal_match:
+            # A sample for a different turn proves the prior terminal marker
+            # can no longer receive a late final usage update.
+            session.pop("_codex_token_usage_terminal", None)
+        previous_saved_at = previous_marker.get("saved_at_epoch")
+        elapsed = (
+            now_epoch - float(previous_saved_at)
+            if isinstance(previous_saved_at, (int, float))
+            and not isinstance(previous_saved_at, bool)
+            else None
+        )
+        if (
+            previous_marker.get("run_id") != snapshot.get("run_id")
+            or previous_marker.get("turn_id") != snapshot.get("turn_id")
+            or elapsed is None
+            or elapsed < 0
+            or elapsed >= CODEX_TOKEN_USAGE_PERSIST_INTERVAL_SECONDS
+            or terminal_match
+        ):
+            should_checkpoint = True
+        if should_checkpoint:
+            session["_codex_token_usage_checkpoint"] = {
+                "run_id": snapshot.get("run_id"),
+                "turn_id": snapshot.get("turn_id"),
+                "saved_at_epoch": now_epoch,
+            }
+            # The latest bounded checkpoint remains available after restart;
+            # routine telemetry never changes chat ordering.
+            await STORE.save()
+    return should_checkpoint
+
+
+async def codex_notification_run_id(
+    session_id: str,
+    thread_id: str,
+    turn_id: str | None,
+) -> str | None:
+    async with ACTIVE_LOCK:
+        active = ACTIVE.get(session_id)
+        if not active:
+            return None
+        active_thread_id = str(active.get("provider_thread_id") or "")
+        if active_thread_id and active_thread_id != thread_id:
+            return None
+        active_turn_id = str(active.get("provider_turn_id") or "")
+        if active_turn_id and turn_id and active_turn_id != turn_id:
+            return None
+        return str(active.get("run_id") or "") or None
 
 
 def public_codex_interaction(pending: dict[str, Any]) -> dict[str, Any]:
@@ -12881,21 +13220,133 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
         return
 
     if method == "thread/tokenUsage/updated":
-        usage = bounded_codex_interaction_value(
-            params.get("tokenUsage"),
-            remaining=8_000,
+        turn_id = str(params.get("turnId") or "") or None
+        run_id = await codex_notification_run_id(
+            session_id,
+            thread_id,
+            turn_id,
         )
-        if isinstance(usage, dict):
-            # High-frequency usage notifications remain runtime-only. Native
-            # goal updates are persisted separately and contain budget usage.
-            session = STORE.sessions.get(session_id)
-            if session is not None:
-                session["codex_token_usage"] = usage
+        if run_id is None:
+            previous_snapshot = current_codex_token_usage_snapshot(session_id)
+            if (
+                previous_snapshot is not None
+                and str(previous_snapshot.get("thread_id") or "") == thread_id
+                and (str(previous_snapshot.get("turn_id") or "") or None)
+                == turn_id
+            ):
+                run_id = str(previous_snapshot.get("run_id") or "") or None
+            if run_id is None:
+                run_id = terminal_codex_token_usage_run_id(
+                    session_id,
+                    thread_id,
+                    turn_id,
+                )
+        snapshot = codex_token_usage_snapshot(
+            params.get("tokenUsage"),
+            thread_id=thread_id,
+            turn_id=turn_id,
+            run_id=run_id,
+        )
+        if snapshot is None:
+            return
+        async with ACTIVE_LOCK:
+            active = ACTIVE.get(session_id)
+            if (
+                active
+                and active.get("codex_compaction_in_progress")
+                and (
+                    not active.get("provider_thread_id")
+                    or str(active.get("provider_thread_id")) == thread_id
+                )
+            ):
+                active["codex_compaction_token_usage_after"] = dict(snapshot)
+        await record_codex_token_usage(session_id, snapshot)
         return
 
-    if method == "item/completed":
-        item = params.get("item") if isinstance(params.get("item"), dict) else {}
+    if method == "turn/completed":
+        completed_turn = (
+            params.get("turn")
+            if isinstance(params.get("turn"), dict)
+            else {}
+        )
+        turn_id = str(
+            params.get("turnId") or completed_turn.get("id") or ""
+        ) or None
+        run_id = await codex_notification_run_id(
+            session_id,
+            thread_id,
+            turn_id,
+        )
+        if turn_id is not None:
+            async with STORE._lock:
+                session = STORE.sessions.get(session_id)
+                if session is not None:
+                    # App-server dispatches notification handlers
+                    # independently. Remember the terminal turn before reading
+                    # its current snapshot so a usage notification that
+                    # completes afterwards is also force-checkpointed.
+                    terminal_marker = {
+                        "thread_id": thread_id,
+                        "turn_id": turn_id,
+                    }
+                    if run_id is not None:
+                        terminal_marker["run_id"] = run_id
+                    session["_codex_token_usage_terminal"] = terminal_marker
+        snapshot = current_codex_token_usage_snapshot(session_id)
+        snapshot_turn_id = (
+            str(snapshot.get("turn_id") or "") or None
+            if snapshot is not None
+            else None
+        )
+        # Never relabel a stale prior-turn sample when Codex completes a turn
+        # without publishing fresh usage for it.
+        if snapshot is not None and (
+            turn_id is None or snapshot_turn_id == turn_id
+        ):
+            snapshot.update(
+                {
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                }
+            )
+            # ACTIVE may already have been released by the ordinary turn
+            # consumer. Preserve the sample's known attribution in that race.
+            if run_id is not None:
+                snapshot["run_id"] = run_id
+            await record_codex_token_usage(
+                session_id,
+                snapshot,
+                force_checkpoint=True,
+            )
+        return
+
+    if method in {"item/started", "item/completed"}:
+        item = (
+            params.get("item")
+            if isinstance(params.get("item"), dict)
+            else {}
+        )
         if str(item.get("type") or "") != "contextCompaction":
+            return
+        turn_id = str(params.get("turnId") or "") or None
+        item_id = str(params.get("itemId") or item.get("id") or "") or None
+        if method == "item/started":
+            before = current_codex_token_usage_snapshot(session_id)
+            async with ACTIVE_LOCK:
+                active = ACTIVE.get(session_id)
+                if active and (
+                    not active.get("provider_thread_id")
+                    or str(active.get("provider_thread_id")) == thread_id
+                ):
+                    active["codex_compaction_in_progress"] = True
+                    active["codex_compaction_item_id"] = item_id
+                    if before is not None and not isinstance(
+                        active.get("codex_compaction_token_usage_before"),
+                        dict,
+                    ):
+                        active["codex_compaction_token_usage_before"] = dict(
+                            before
+                        )
             return
         async with ACTIVE_LOCK:
             active = ACTIVE.get(session_id)
@@ -12904,17 +13355,51 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
                 and active.get("codex_native_operation")
                 and active.get("codex_native_operation_kind") == "compaction"
             )
+            run_id = str(active.get("run_id") or "") if active else ""
+            before = (
+                dict(active["codex_compaction_token_usage_before"])
+                if active
+                and isinstance(
+                    active.get("codex_compaction_token_usage_before"), dict
+                )
+                else current_codex_token_usage_snapshot(session_id)
+            )
+            after = (
+                dict(active["codex_compaction_token_usage_after"])
+                if active
+                and isinstance(
+                    active.get("codex_compaction_token_usage_after"), dict
+                )
+                else None
+            )
+            if active and not explicit_native_compaction:
+                for key in (
+                    "codex_compaction_in_progress",
+                    "codex_compaction_item_id",
+                    "codex_compaction_token_usage_before",
+                    "codex_compaction_token_usage_after",
+                ):
+                    active.pop(key, None)
         if explicit_native_compaction:
             # Its owner emits one terminal event after canonical
             # turn/completed, while the chat remains reserved.
             return
+        if after is not None:
+            await record_codex_token_usage(
+                session_id,
+                after,
+                force_checkpoint=True,
+            )
         await append_event(
             session_id,
             "codex_compaction_completed",
             {
-                "turn_id": params.get("turnId"),
-                "item_id": item.get("id"),
+                "run_id": run_id or None,
+                "turn_id": turn_id,
+                "item_id": item_id,
                 "status": "completed",
+                "token_usage_before": before,
+                "token_usage_after": after,
                 "message": "Codex completed automatic context compaction.",
             },
         )
@@ -13576,15 +14061,51 @@ async def consume_codex_native_turn(
                     if terminal_status == "completed"
                     else f"{operation_label} {terminal_status}."
                 )
+                compaction_usage: dict[str, Any] = {}
+                if operation == "compaction":
+                    async with ACTIVE_LOCK:
+                        active = ACTIVE.get(session_id)
+                        if (
+                            active
+                            and str(active.get("run_id") or "")
+                            == operation_id
+                        ):
+                            before = active.get(
+                                "codex_compaction_token_usage_before"
+                            )
+                            after = active.get(
+                                "codex_compaction_token_usage_after"
+                            )
+                            compaction_usage = {
+                                "token_usage_before": (
+                                    dict(before)
+                                    if isinstance(before, dict)
+                                    else None
+                                ),
+                                "token_usage_after": (
+                                    dict(after)
+                                    if isinstance(after, dict)
+                                    else None
+                                ),
+                            }
+                    after_snapshot = compaction_usage.get("token_usage_after")
+                    if isinstance(after_snapshot, dict):
+                        await record_codex_token_usage(
+                            session_id,
+                            after_snapshot,
+                            force_checkpoint=True,
+                        )
                 await append_event(
                     session_id,
                     terminal_event_type,
                     {
+                        "run_id": operation_id,
                         "operation_id": operation_id,
                         "turn_id": turn_id,
                         "status": terminal_status,
                         "error": terminal_error,
                         "message": terminal_message,
+                        **compaction_usage,
                     },
                 )
         finally:
@@ -18418,7 +18939,7 @@ async def health() -> dict[str, Any]:
                     else "Secure workspace file access is unavailable on this host."
                 ),
                 "action": None if WORKSPACE_SECURE_OPEN_AVAILABLE else "Use a supported macOS or Linux host.",
-                "version": 4 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
+                "version": 5 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
                 "max_text_file_bytes": MAX_WORKSPACE_TEXT_BYTES,
                 "max_preview_file_bytes": MAX_WORKSPACE_PREVIEW_BYTES,
                 "preview_media_types": sorted(set(WORKSPACE_PREVIEW_MEDIA_TYPES.values())),
@@ -19048,6 +19569,7 @@ async def codex_runtime_snapshot(session_id: str) -> dict[str, Any]:
         "time_budget_seconds": session.get("codex_goal_time_budget_seconds"),
         "time_budget_exhausted": codex_goal_time_budget_is_exhausted(session),
         "token_usage": session.get("codex_token_usage"),
+        "token_usage_snapshot": session.get("codex_token_usage_snapshot"),
         "pending_interactions": pending,
         "permission_profiles": permission_profiles,
         "background_terminals_supported": CODEX_BACKGROUND_TERMINALS_SUPPORTED,
@@ -19414,6 +19936,7 @@ async def _post_codex_compact_locked(session_id: str) -> dict[str, Any]:
     )
     operation_id = f"codexop_{uuid.uuid4().hex[:16]}"
     subscription = manager.subscribe_thread(thread_id)
+    token_usage_before = current_codex_token_usage_snapshot(session_id)
     try:
         async with ACTIVE_LOCK:
             active = ACTIVE.get(session_id)
@@ -19422,6 +19945,13 @@ async def _post_codex_compact_locked(session_id: str) -> dict[str, Any]:
                 active["codex_native_operation_kind"] = "compaction"
                 active["provider_turn_id"] = None
                 active["provider_turn_ready"] = False
+                active["codex_compaction_in_progress"] = True
+                active["codex_compaction_token_usage_before"] = (
+                    dict(token_usage_before)
+                    if token_usage_before is not None
+                    else None
+                )
+                active["codex_compaction_token_usage_after"] = None
         await manager.compact_thread(thread_id)
         task = asyncio.create_task(
             consume_codex_native_turn(
@@ -19439,7 +19969,10 @@ async def _post_codex_compact_locked(session_id: str) -> dict[str, Any]:
                 session_id,
                 "codex_compaction_started",
                 {
+                    "run_id": operation_id,
                     "operation_id": operation_id,
+                    "thread_id": thread_id,
+                    "token_usage_before": token_usage_before,
                     "message": (
                         "Codex started compacting this thread's context."
                     ),
@@ -20749,6 +21282,14 @@ async def get_session_workspace_file(
     path: str = Query(min_length=1, max_length=MAX_WORKSPACE_PATH_CHARS),
 ) -> dict[str, Any]:
     return await asyncio.to_thread(read_workspace_file_sync, session_id, path)
+
+
+@app.get("/api/sessions/{session_id}/workspace/absolute-file")
+async def get_session_absolute_file(
+    session_id: str,
+    path: str = Query(min_length=1, max_length=MAX_WORKSPACE_PATH_CHARS),
+) -> dict[str, Any]:
+    return await asyncio.to_thread(read_absolute_file_sync, session_id, path)
 
 
 @app.api_route("/api/sessions/{session_id}/workspace/preview", methods=["GET", "HEAD"])

@@ -737,6 +737,301 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
             "Codex completed automatic context compaction.",
         )
 
+    async def test_token_usage_is_run_scoped_coalesced_and_finalized(self) -> None:
+        usage = {
+            "last": {
+                "inputTokens": 23_000,
+                "cachedInputTokens": 20_000,
+                "cacheWriteInputTokens": 100,
+                "outputTokens": 1_000,
+                "reasoningOutputTokens": 500,
+                "totalTokens": 25_000,
+            },
+            "total": {
+                "inputTokens": 7_000_000,
+                "cachedInputTokens": 6_000_000,
+                "outputTokens": 200_000,
+                "reasoningOutputTokens": 100_000,
+                "totalTokens": 7_300_000,
+            },
+            "modelContextWindow": 100_000,
+        }
+        active = {
+            "chat": {
+                "run_id": "run-1",
+                "provider_thread_id": "thread",
+                "provider_turn_id": "turn-1",
+            }
+        }
+        save = AsyncMock()
+        append_event = AsyncMock()
+        with (
+            patch.object(agent_server, "ACTIVE", active),
+            patch.object(
+                agent_server,
+                "codex_session_id_for_thread",
+                return_value="chat",
+            ),
+            patch.object(agent_server.STORE, "save", save),
+            patch.object(agent_server, "append_event", append_event),
+            patch.object(
+                agent_server.time,
+                "time",
+                side_effect=[1_000, 1_001, 1_002, 1_003],
+            ),
+        ):
+            await agent_server.project_codex_notification(
+                {
+                    "method": "thread/tokenUsage/updated",
+                    "params": {
+                        "threadId": "thread",
+                        "turnId": "turn-1",
+                        "tokenUsage": usage,
+                    },
+                }
+            )
+            first_payload = agent_server.STORE.sessions["chat"][
+                "codex_token_usage_snapshot"
+            ]
+            self.assertEqual(first_payload["run_id"], "run-1")
+            self.assertEqual(first_payload["turn_id"], "turn-1")
+            self.assertEqual(first_payload["context_tokens"], 25_000)
+            self.assertEqual(first_payload["context_percent"], 25.0)
+            self.assertEqual(first_payload["cache_write_input_tokens"], 100)
+            self.assertTrue(first_payload["snapshot_at"])
+            self.assertEqual(
+                first_payload["cumulative_total_tokens"],
+                7_300_000,
+            )
+            self.assertEqual(save.await_count, 1)
+            self.assertEqual(append_event.await_count, 0)
+
+            updated_usage = json.loads(json.dumps(usage))
+            updated_usage["last"]["totalTokens"] = 25_500
+            await agent_server.project_codex_notification(
+                {
+                    "method": "thread/tokenUsage/updated",
+                    "params": {
+                        "threadId": "thread",
+                        "turnId": "turn-1",
+                        "tokenUsage": updated_usage,
+                    },
+                }
+            )
+            self.assertEqual(save.await_count, 1)
+            self.assertEqual(append_event.await_count, 0)
+
+            await agent_server.project_codex_notification(
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread",
+                        "turn": {"id": "turn-1", "status": "completed"},
+                    },
+                }
+            )
+
+            # Global notification handlers are asynchronous. A final usage
+            # sample may complete after the ordinary turn consumer has already
+            # released ACTIVE; it must still be durable and keep attribution.
+            active.clear()
+            final_usage = json.loads(json.dumps(updated_usage))
+            final_usage["last"]["totalTokens"] = 26_000
+            await agent_server.project_codex_notification(
+                {
+                    "method": "thread/tokenUsage/updated",
+                    "params": {
+                        "threadId": "thread",
+                        "turnId": "turn-1",
+                        "tokenUsage": final_usage,
+                    },
+                }
+            )
+
+        self.assertEqual(save.await_count, 3)
+        self.assertEqual(append_event.await_count, 0)
+        final_payload = agent_server.STORE.sessions["chat"][
+            "codex_token_usage_snapshot"
+        ]
+        self.assertEqual(final_payload["context_tokens"], 26_000)
+        self.assertEqual(final_payload["run_id"], "run-1")
+        self.assertEqual(
+            agent_server.STORE.sessions["chat"]["codex_token_usage"],
+            final_usage,
+        )
+
+    async def test_turn_completion_does_not_relabel_stale_usage(self) -> None:
+        stale = {
+            "thread_id": "thread",
+            "turn_id": "turn-old",
+            "run_id": "run-old",
+            "snapshot_at": agent_server.now_iso(),
+            "token_usage": {"last": {"totalTokens": 10}},
+            "context_tokens": 10,
+        }
+        agent_server.STORE.sessions["chat"]["codex_token_usage_snapshot"] = stale
+        save = AsyncMock()
+        active = {
+            "chat": {
+                "run_id": "run-new",
+                "provider_thread_id": "thread",
+                "provider_turn_id": "turn-new",
+            }
+        }
+        with (
+            patch.object(agent_server, "ACTIVE", active),
+            patch.object(
+                agent_server,
+                "codex_session_id_for_thread",
+                return_value="chat",
+            ),
+            patch.object(agent_server.STORE, "save", save),
+        ):
+            await agent_server.project_codex_notification(
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread",
+                        "turn": {"id": "turn-new", "status": "completed"},
+                    },
+                }
+            )
+
+            self.assertEqual(save.await_count, 0)
+            self.assertEqual(
+                agent_server.STORE.sessions["chat"]["codex_token_usage_snapshot"],
+                stale,
+            )
+
+            active.clear()
+            late_usage = {
+                "last": {"totalTokens": 25},
+                "total": {"totalTokens": 100},
+                "modelContextWindow": 100,
+            }
+            await agent_server.project_codex_notification(
+                {
+                    "method": "thread/tokenUsage/updated",
+                    "params": {
+                        "threadId": "thread",
+                        "turnId": "turn-new",
+                        "tokenUsage": late_usage,
+                    },
+                }
+            )
+
+        self.assertEqual(save.await_count, 1)
+        final_snapshot = agent_server.STORE.sessions["chat"][
+            "codex_token_usage_snapshot"
+        ]
+        self.assertEqual(final_snapshot["turn_id"], "turn-new")
+        self.assertEqual(final_snapshot["run_id"], "run-new")
+
+    async def test_automatic_compaction_preserves_before_and_after_usage(self) -> None:
+        before_usage = {
+            "last": {
+                "inputTokens": 85_000,
+                "cachedInputTokens": 80_000,
+                "outputTokens": 3_000,
+                "reasoningOutputTokens": 2_000,
+                "totalTokens": 90_000,
+            },
+            "total": {
+                "inputTokens": 85_000,
+                "cachedInputTokens": 80_000,
+                "outputTokens": 3_000,
+                "reasoningOutputTokens": 2_000,
+                "totalTokens": 90_000,
+            },
+            "modelContextWindow": 100_000,
+        }
+        after_usage = json.loads(json.dumps(before_usage))
+        after_usage["last"]["inputTokens"] = 8_000
+        after_usage["last"]["totalTokens"] = 10_000
+        after_usage["total"]["totalTokens"] = 100_000
+        active = {
+            "chat": {
+                "run_id": "run-compact",
+                "provider_thread_id": "thread",
+                "provider_turn_id": "turn-1",
+            }
+        }
+        events: list[tuple[str, dict[str, object]]] = []
+
+        async def record_event(
+            _session_id: str,
+            event_type: str,
+            payload: dict[str, object],
+        ) -> dict[str, object]:
+            events.append((event_type, payload))
+            return {}
+
+        with (
+            patch.object(agent_server, "ACTIVE", active),
+            patch.object(
+                agent_server,
+                "codex_session_id_for_thread",
+                return_value="chat",
+            ),
+            patch.object(agent_server.STORE, "save", AsyncMock()),
+            patch.object(agent_server, "append_event", side_effect=record_event),
+        ):
+            for usage in (before_usage,):
+                await agent_server.project_codex_notification(
+                    {
+                        "method": "thread/tokenUsage/updated",
+                        "params": {
+                            "threadId": "thread",
+                            "turnId": "turn-1",
+                            "tokenUsage": usage,
+                        },
+                    }
+                )
+            await agent_server.project_codex_notification(
+                {
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "thread",
+                        "turnId": "turn-1",
+                        "item": {"id": "compact-1", "type": "contextCompaction"},
+                    },
+                }
+            )
+            await agent_server.project_codex_notification(
+                {
+                    "method": "thread/tokenUsage/updated",
+                    "params": {
+                        "threadId": "thread",
+                        "turnId": "turn-1",
+                        "tokenUsage": after_usage,
+                    },
+                }
+            )
+            await agent_server.project_codex_notification(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread",
+                        "turnId": "turn-1",
+                        "item": {"id": "compact-1", "type": "contextCompaction"},
+                    },
+                }
+            )
+
+        compaction = next(
+            payload
+            for event_type, payload in events
+            if event_type == "codex_compaction_completed"
+        )
+        self.assertEqual(
+            compaction["token_usage_before"]["context_tokens"],
+            90_000,
+        )
+        self.assertEqual(
+            compaction["token_usage_after"]["context_tokens"],
+            10_000,
+        )
+
     def test_goal_budget_and_native_completion_events_bump_timeline(self) -> None:
         for event_type in (
             "codex_goal_budget_limited",
@@ -822,7 +1117,7 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(stored["codex_goal_time_budget_exhausted"])
         self.assertEqual(stored["updated_at"], original_updated_at)
 
-    async def test_session_load_clears_process_owned_codex_runtime_state(self) -> None:
+    async def test_session_load_keeps_durable_token_usage_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             sessions_file = Path(temp_dir) / "sessions.json"
             sessions_file.write_text(json.dumps({
@@ -847,7 +1142,7 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session["codex_thread_status"], {"type": "notLoaded"})
         self.assertEqual(session["codex_pending_interaction_count"], 0)
         self.assertFalse(session["codex_needs_user_action"])
-        self.assertNotIn("codex_token_usage", session)
+        self.assertEqual(session["codex_token_usage"], {"totalTokens": 100})
         self.assertEqual(
             agent_server.CODEX_THREAD_SESSION_INDEX["thread-stale"],
             "stale",
@@ -1166,6 +1461,20 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_compaction_captures_turn_and_waits_for_turn_completed(self) -> None:
+        agent_server.ACTIVE["chat"].update(
+            {
+                "codex_native_operation_kind": "compaction",
+                "codex_compaction_in_progress": True,
+                "codex_compaction_token_usage_before": {
+                    "context_tokens": 90_000,
+                    "context_window": 100_000,
+                },
+                "codex_compaction_token_usage_after": {
+                    "context_tokens": 10_000,
+                    "context_window": 100_000,
+                },
+            }
+        )
         subscription = GatedNativeSubscription(
             [
                 {
@@ -1247,6 +1556,15 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
         self.assertEqual(events[-1][1]["turn_id"], "turn-compact")
+        self.assertEqual(events[-1][1]["run_id"], "operation")
+        self.assertEqual(
+            events[-1][1]["token_usage_before"]["context_tokens"],
+            90_000,
+        )
+        self.assertEqual(
+            events[-1][1]["token_usage_after"]["context_tokens"],
+            10_000,
+        )
         self.assertEqual(
             events[-1][1]["message"],
             "Context compaction completed.",

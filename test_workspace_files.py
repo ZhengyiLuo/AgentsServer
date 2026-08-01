@@ -77,7 +77,7 @@ class WorkspaceFilesTests(unittest.TestCase):
         ])
         self.assertEqual(second["entries"][0]["kind"], "symlink")
 
-    def test_workspace_capability_v4_entries_have_opaque_revisions_and_preview_limits(self) -> None:
+    def test_workspace_capability_v5_entries_have_opaque_revisions_and_preview_limits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             path = root / "app.py"
@@ -89,7 +89,7 @@ class WorkspaceFilesTests(unittest.TestCase):
                 path.write_text("second, longer\n")
                 changed = agent_server.list_workspace_entries_sync("session-1", "", 0, 20)["entries"][0]
 
-        self.assertEqual(info["capability_version"], 4)
+        self.assertEqual(info["capability_version"], 5)
         self.assertEqual(info["max_preview_file_bytes"], agent_server.MAX_WORKSPACE_PREVIEW_BYTES)
         self.assertIn("application/pdf", info["preview_media_types"])
         self.assertIn("image/png", info["preview_media_types"])
@@ -607,6 +607,63 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertEqual(result["content"].encode("utf-8"), data)
         self.assertEqual(result["revision"], agent_server.workspace_revision(data))
         self.assertEqual(result["size"], len(data))
+
+    def test_explicit_absolute_read_is_canonical_nofollow_and_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            workspace = base / "workspace"
+            workspace.mkdir()
+            outside = base / "outside.md"
+            outside.write_text("# outside\n")
+            link = base / "outside-link.md"
+            link.symlink_to(outside)
+            outside_directory = base / "outside-directory"
+            outside_directory.mkdir()
+            (outside_directory / "nested.md").write_text("# nested\n")
+            parent_link = base / "outside-parent-link"
+            parent_link.symlink_to(outside_directory, target_is_directory=True)
+            session = self.session(workspace)
+            with patch.object(agent_server.STORE, "sessions", {"session-1": session}):
+                result = agent_server.read_absolute_file_sync(
+                    "session-1",
+                    str(outside),
+                )
+                with self.assertRaises(HTTPException) as relative:
+                    agent_server.read_absolute_file_sync("session-1", "outside.md")
+                with self.assertRaises(HTTPException) as traversal:
+                    agent_server.read_absolute_file_sync(
+                        "session-1",
+                        f"{workspace}/../outside.md",
+                    )
+                with self.assertRaises(HTTPException) as symlink:
+                    agent_server.read_absolute_file_sync("session-1", str(link))
+                with self.assertRaises(HTTPException) as symlink_parent:
+                    agent_server.read_absolute_file_sync(
+                        "session-1",
+                        str(parent_link / "nested.md"),
+                    )
+                with self.assertRaises(HTTPException) as mutation:
+                    agent_server.write_workspace_file_sync(
+                        "session-1",
+                        str(outside),
+                        "changed\n",
+                        result["revision"],
+                    )
+                unchanged = outside.read_text()
+
+        self.assertEqual(result["path"], str(outside))
+        self.assertEqual(result["content"], "# outside\n")
+        self.assertEqual(result["scope"], "absolute")
+        self.assertFalse(result["writable"])
+        self.assertEqual(relative.exception.detail["code"], "invalid_absolute_file_path")
+        self.assertEqual(traversal.exception.detail["code"], "invalid_absolute_file_path")
+        self.assertEqual(symlink.exception.detail["code"], "workspace_symlink_blocked")
+        self.assertIn(
+            symlink_parent.exception.detail["code"],
+            {"workspace_symlink_blocked", "invalid_workspace_path"},
+        )
+        self.assertEqual(mutation.exception.detail["code"], "invalid_workspace_path")
+        self.assertEqual(unchanged, "# outside\n")
 
     def test_rejects_binary_invalid_utf8_and_oversized_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

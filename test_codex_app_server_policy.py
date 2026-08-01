@@ -76,6 +76,14 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(str(agent_server.codex_manifest_path("chat-1")), instructions)
         self.assertIn("--chat-id chat-1", instructions)
         self.assertIn(agent_server.terminal_session_name("chat-1"), instructions)
+        self.assertIn("immediately retry the still-safe requested operation", instructions)
+        self.assertIn("delegate bounded noisy exploration", instructions)
+        self.assertLessEqual(len(instructions.splitlines()), 15)
+
+    def test_claude_policy_has_the_same_retry_and_context_hygiene_rules(self) -> None:
+        instructions = agent_server.CLAUDE_PROMPT_PRELUDE.format()
+        self.assertIn("immediately retry the still-safe requested operation", instructions)
+        self.assertIn("delegate bounded noisy exploration", instructions)
         self.assertLessEqual(len(instructions.splitlines()), 15)
 
     async def test_new_thread_receives_policy_once_at_thread_start(self) -> None:

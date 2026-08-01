@@ -568,6 +568,119 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(summary["is_error"])
                     self.assertEqual(summary["message"], "Provider failed")
 
+    def test_native_steer_preserves_interrupted_job_trace_and_stopped_status(self) -> None:
+        scheduled = {
+            "run_id": "job-run",
+            "purpose": "scheduled_job",
+            "job_id": "job-1",
+            "job_title": "Status check",
+        }
+        self.write_events([
+            self.event(1, "turn_started", prompt="Check status", **scheduled),
+            self.event(
+                2,
+                "reasoning_summary",
+                phase="commentary",
+                text="Checking the current status.",
+                **scheduled,
+            ),
+            self.event(3, "tool_started", tool={"name": "exec"}, **scheduled),
+            self.event(
+                4,
+                "turn_stopped",
+                native_steer=True,
+                superseded_by_run_id="user-run",
+                **scheduled,
+            ),
+            self.event(
+                5,
+                "turn_started",
+                run_id="user-run",
+                native_steer=True,
+                steer_interrupted_run_id="job-run",
+                prompt="New user request",
+            ),
+        ])
+
+        page = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            limit=2,
+            tail=True,
+        )
+        summary = next(
+            event for event in page["events"] if event["type"] == "job_summary"
+        )
+
+        self.assertEqual(summary["job_latest_status"], "stopped")
+        self.assertEqual(summary["job_latest_status_type"], "turn_stopped")
+        self.assertTrue(summary["stopped"])
+        self.assertTrue(any(
+            event["type"] == "turn_stopped"
+            and event.get("run_id") == "job-run"
+            for event in page["events"]
+        ))
+        self.assertTrue(any(
+            event["type"] == "reasoning_summary"
+            and event.get("run_id") == "job-run"
+            for event in page["events"]
+        ))
+        trace = agent_server.read_indexed_run_trace(
+            self.session_id,
+            "job-run",
+            anchor_seq=4,
+        )
+        self.assertEqual(
+            [event["type"] for event in trace["events"]],
+            ["reasoning_summary", "tool_started"],
+        )
+
+    def test_native_steer_stop_uses_legacy_run_to_job_mapping(self) -> None:
+        self.write_events([
+            self.event(
+                1,
+                "turn_started",
+                run_id="legacy-job-run",
+                prompt="Check status",
+            ),
+            self.event(
+                2,
+                "job_ran",
+                run_id="legacy-job-run",
+                job_id="job-1",
+                job_title="Status check",
+            ),
+            self.event(
+                3,
+                "reasoning_summary",
+                run_id="legacy-job-run",
+                text="Checking status.",
+            ),
+            self.event(
+                4,
+                "turn_stopped",
+                run_id="legacy-job-run",
+                native_steer=True,
+                superseded_by_run_id="user-run",
+            ),
+        ])
+
+        page = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            limit=1,
+            tail=True,
+        )
+        summary = next(
+            event for event in page["events"] if event["type"] == "job_summary"
+        )
+
+        self.assertEqual(summary["job_id"], "job-1")
+        self.assertEqual(summary["job_latest_status"], "stopped")
+        self.assertTrue(any(
+            event["type"] == "turn_stopped"
+            and event.get("run_id") == "legacy-job-run"
+            for event in page["events"]
+        ))
+
     def test_semantic_job_summary_uses_partial_output_from_the_latest_run(self) -> None:
         first = {
             "run_id": "completed-run",

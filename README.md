@@ -142,6 +142,16 @@ terminates the complete dependency-worker process group. Existing
 `~/.zenithbot-agent` state is migrated automatically and left behind as a
 compatibility link. The installer does not use `sudo`.
 
+If the requested port is already held by something other than the
+AgentsServer release being replaced, health checks on it will keep failing
+silently for up to 45 seconds. Rather than grind through that on every retry,
+the installer detects the still-active listener, reports what it found (with
+`lsof`, when available), and automatically retries on up to 5 higher ports
+before giving up and rolling back. A port chosen this way is called out at
+the end of the run and reflected in `AGENTSDOCK_SETUP_RESULT`. Pass `--port`
+to pin an exact port, or `--no-port-fallback` to fail immediately instead of
+switching.
+
 AgentsDock desktop can run this same installer locally or over an existing SSH
 key connection from its first-run setup window. Remote clients should use the
 Tailscale URL printed by the installer.
@@ -274,7 +284,10 @@ Leave the variable unset only for trusted local development.
 
 Remote access is expected to go through Tailscale. This keeps the server
 reachable from phones, tablets, and laptops without publishing the raw agent
-port on the internet.
+port on the internet. It's optional: everything else in this README works
+without it, so `install.sh` only prints a reminder with the download link
+at the end of a successful run when Tailscale isn't already on the host —
+it never blocks setup or is installed automatically.
 
 On the agent host:
 

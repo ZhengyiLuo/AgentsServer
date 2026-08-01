@@ -29,10 +29,12 @@ LAUNCHCTL_STOP_ATTEMPTS=50
 LAUNCHCTL_STOP_DELAY=0.1
 LAUNCHCTL_BOOTSTRAP_ATTEMPTS=3
 NON_INTERACTIVE="false"
+PORT_FALLBACK="true"
+PORT_FALLBACK_ATTEMPTS=5
 
 usage() {
   cat <<'USAGE'
-Usage: ./install.sh [--port PORT] [--bind ADDRESS] [--release-version VERSION] [--non-interactive]
+Usage: ./install.sh [--port PORT] [--bind ADDRESS] [--release-version VERSION] [--non-interactive] [--no-port-fallback]
 
 Installs or updates AgentsServer for the current user. Releases and Python
 runtimes are versioned, the previous healthy release is retained for rollback,
@@ -41,6 +43,10 @@ are required.
 
 --non-interactive skips the optional tmux install prompt on macOS instead of
 asking; use it for unattended/SSH-driven runs.
+
+--no-port-fallback disables automatically retrying on the next free port when
+the requested one is already held by another process; it fails and rolls back
+instead. By default, up to 5 higher ports are tried automatically.
 USAGE
 }
 
@@ -50,6 +56,7 @@ while (($#)); do
     --bind) BIND_ADDRESS="${2:-}"; shift 2 ;;
     --release-version) RELEASE_VERSION="${2:-}"; shift 2 ;;
     --non-interactive) NON_INTERACTIVE="true"; shift ;;
+    --no-port-fallback) PORT_FALLBACK="false"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -708,11 +715,24 @@ restore_previous_release() {
   return 1
 }
 
-echo "[4/7] Installing the user service"
-if [[ "$OS_NAME" == "Linux" ]]; then
-  USER_SERVICE_DIR="$HOME/.config/systemd/user"
-  mkdir -p "$USER_SERVICE_DIR"
-  cat > "$USER_SERVICE_DIR/$SERVICE_NAME.service" <<EOF
+port_has_listener() {
+  local port="$1"
+  (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null || return 1
+  exec 3>&- 2>/dev/null || true
+  return 0
+}
+
+describe_port_listener() {
+  local port="$1"
+  command -v lsof >/dev/null 2>&1 || return 0
+  lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print "  " $1 " (pid " $2 ")"}' | sort -u
+}
+
+write_service_files() {
+  if [[ "$OS_NAME" == "Linux" ]]; then
+    USER_SERVICE_DIR="$HOME/.config/systemd/user"
+    mkdir -p "$USER_SERVICE_DIR"
+    cat > "$USER_SERVICE_DIR/$SERVICE_NAME.service" <<EOF
 [Unit]
 Description=AgentsServer
 After=network-online.target
@@ -728,17 +748,17 @@ RestartSec=2
 [Install]
 WantedBy=default.target
 EOF
-  SERVICE_KIND="systemd-user"
-elif [[ "$OS_NAME" == "Darwin" ]]; then
-  LABEL="com.agentsdock.server"
-  LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
-  PLIST="$LAUNCH_AGENTS/$LABEL.plist"
-  mkdir -p "$LAUNCH_AGENTS" "$HOME/Library/Logs/AgentsServer"
-  if [[ -f "$PLIST" ]]; then
-    SERVICE_CONFIG_BACKUP="$(mktemp "${TMPDIR:-/tmp}/agents-server-launch-agent.XXXXXX")"
-    cp -p "$PLIST" "$SERVICE_CONFIG_BACKUP"
-  fi
-  cat > "$PLIST" <<EOF
+    SERVICE_KIND="systemd-user"
+  elif [[ "$OS_NAME" == "Darwin" ]]; then
+    LABEL="com.agentsdock.server"
+    LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
+    PLIST="$LAUNCH_AGENTS/$LABEL.plist"
+    mkdir -p "$LAUNCH_AGENTS" "$HOME/Library/Logs/AgentsServer"
+    if [[ -f "$PLIST" && -z "$SERVICE_CONFIG_BACKUP" ]]; then
+      SERVICE_CONFIG_BACKUP="$(mktemp "${TMPDIR:-/tmp}/agents-server-launch-agent.XXXXXX")"
+      cp -p "$PLIST" "$SERVICE_CONFIG_BACKUP"
+    fi
+    cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -764,19 +784,13 @@ elif [[ "$OS_NAME" == "Darwin" ]]; then
   <key>StandardErrorPath</key><string>$HOME/Library/Logs/AgentsServer/server-error.log</string>
 </dict></plist>
 EOF
-  chmod 600 "$PLIST"
-  SERVICE_KIND="launch-agent"
-else
-  echo "Unsupported host OS: $OS_NAME" >&2
-  exit 1
-fi
-if ! restart_service; then
-  echo "AgentsServer $RELEASE_VERSION could not start; restoring the previous service when possible." >&2
-  if restore_previous_release true; then
-    echo "The previous release and service were restored." >&2
+    chmod 600 "$PLIST"
+    SERVICE_KIND="launch-agent"
+  else
+    echo "Unsupported host OS: $OS_NAME" >&2
+    exit 1
   fi
-  exit 1
-fi
+}
 
 HEALTH_CHECK_ATTEMPTS=45
 HEALTH_CHECK_HEARTBEAT_ATTEMPTS=5
@@ -807,9 +821,52 @@ wait_for_health() {
   return 1
 }
 
-echo "[5/7] Waiting for authenticated health"
-if ! wait_for_health; then
+# A requested port already held by AgentsServer's own about-to-be-replaced
+# service is normal and resolves itself once restart_service stops it below.
+# A port that still has a listener after a failed health check, though, means
+# something else is squatting on it; automatically try nearby ports instead
+# of grinding through the same silent 45s timeout on every retry.
+ORIGINAL_PORT="$PORT"
+PORT_AUTO_SELECTED="false"
+port_fallback_attempt=0
+
+while true; do
+  echo "[4/7] Installing the user service (port $PORT)"
+  write_service_files
+  if ! restart_service; then
+    echo "AgentsServer $RELEASE_VERSION could not start; restoring the previous service when possible." >&2
+    if restore_previous_release true; then
+      echo "The previous release and service were restored." >&2
+    fi
+    exit 1
+  fi
+
+  echo "[5/7] Waiting for authenticated health"
+  if wait_for_health; then
+    break
+  fi
+
+  if [[ "$PORT_FALLBACK" == "true" ]] && port_has_listener "$PORT" && ((port_fallback_attempt < PORT_FALLBACK_ATTEMPTS)); then
+    echo "Port $PORT did not become healthy and is still held by another process:" >&2
+    describe_port_listener "$PORT" >&2
+    port_fallback_attempt=$((port_fallback_attempt + 1))
+    candidate=$((ORIGINAL_PORT + port_fallback_attempt))
+    while ((port_fallback_attempt <= PORT_FALLBACK_ATTEMPTS)) && ((candidate <= 65535)) && port_has_listener "$candidate"; do
+      port_fallback_attempt=$((port_fallback_attempt + 1))
+      candidate=$((ORIGINAL_PORT + port_fallback_attempt))
+    done
+    if ((port_fallback_attempt <= PORT_FALLBACK_ATTEMPTS)) && ((candidate <= 65535)); then
+      PORT="$candidate"
+      PORT_AUTO_SELECTED="true"
+      echo "Retrying on port $PORT instead (attempt $port_fallback_attempt/$PORT_FALLBACK_ATTEMPTS). Pass --port to pin a specific port, or --no-port-fallback to disable this." >&2
+      continue
+    fi
+    echo "Ran out of nearby free ports to try." >&2
+  fi
+
   echo "AgentsServer $RELEASE_VERSION did not become healthy; rolling back." >&2
+  PORT="$ORIGINAL_PORT"
+  write_service_files
   if restore_previous_release false; then
     wait_for_health || true
     echo "The previous release was restored." >&2
@@ -821,7 +878,7 @@ if ! wait_for_health; then
     systemctl --user status "$SERVICE_NAME.service" --no-pager -l >&2 || true
   fi
   exit 1
-fi
+done
 
 echo "[6/7] Checking optional agent runtimes"
 RUNTIMES=()
@@ -841,8 +898,14 @@ SERVER_URL="http://127.0.0.1:$PORT"
 [[ -z "$TAILSCALE_IP" ]] || SERVER_URL="http://$TAILSCALE_IP:$PORT"
 
 echo "[7/7] AgentsServer $RELEASE_VERSION is ready"
+if [[ "$PORT_AUTO_SELECTED" == "true" ]]; then
+  echo "      Note: port $ORIGINAL_PORT was already in use by another process, so AgentsServer was installed on port $PORT instead. Pass --port to pin a specific port next time, or --no-port-fallback to fail instead of switching."
+fi
 if [[ -n "$TMUX_WARNING" ]]; then
   echo "      Note: $TMUX_WARNING"
+fi
+if [[ -z "$TAILSCALE_IP" ]] && ! command -v tailscale >/dev/null 2>&1; then
+  echo "      Optional: this server is only reachable on this machine right now. To use it from another Mac, iPhone, iPad, or a different WiFi network, install Tailscale on this host and your client devices, then rerun install.sh: https://tailscale.com/download"
 fi
 printf 'AGENTSDOCK_SETUP_RESULT={"server_url":"%s","access_token":"%s","service":"%s","tailscale_ip":"%s","server_version":"%s"}\n' \
   "$SERVER_URL" "$TOKEN" "$SERVICE_KIND" "$TAILSCALE_IP" "$RELEASE_VERSION"

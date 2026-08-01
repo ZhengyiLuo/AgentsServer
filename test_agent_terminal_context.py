@@ -416,6 +416,25 @@ class AgentTerminalContextTests(unittest.TestCase):
         self.assertIn("$AGENTSDOCK_MANIFEST_PATH", claude_compact)
         self.assertIn("/tmp/manifest.json", codex_compact)
 
+    def test_both_agent_prompts_explain_artifact_and_video_publishing(self) -> None:
+        claude_prompt = agent_server.CLAUDE_PROMPT_PRELUDE.format()
+        codex_prompt = agent_server.CODEX_PROMPT_PRELUDE.format(
+            manifest_path="/tmp/manifests/current.json",
+            terminal_session="zd_sess_123",
+            chat_id="sess-123",
+        )
+
+        for prompt in (claude_prompt, codex_prompt):
+            compact = " ".join(prompt.split())
+            self.assertIn("create a file the user should receive", compact)
+            self.assertIn('"files":["/absolute/path.ext"', compact)
+            self.assertIn('"title":"Demo"', compact)
+            self.assertIn('"text":"Optional note"', compact)
+            self.assertIn("normal playable `.mp4`/`.mov` files", compact)
+            self.assertIn("not Slack", compact)
+        self.assertIn("stable `manifests/current.json` path", claude_prompt)
+        self.assertIn("/tmp/manifests/current.json", codex_prompt)
+
 
 class SessionSystemPromptPersistenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_session_store_updates_and_clears_system_prompt(self) -> None:

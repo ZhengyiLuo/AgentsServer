@@ -77,7 +77,7 @@ class WorkspaceFilesTests(unittest.TestCase):
         ])
         self.assertEqual(second["entries"][0]["kind"], "symlink")
 
-    def test_workspace_capability_v5_entries_have_opaque_revisions_and_preview_limits(self) -> None:
+    def test_workspace_capability_v6_entries_have_opaque_revisions_and_preview_limits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             path = root / "app.py"
@@ -89,7 +89,7 @@ class WorkspaceFilesTests(unittest.TestCase):
                 path.write_text("second, longer\n")
                 changed = agent_server.list_workspace_entries_sync("session-1", "", 0, 20)["entries"][0]
 
-        self.assertEqual(info["capability_version"], 5)
+        self.assertEqual(info["capability_version"], 6)
         self.assertEqual(info["max_preview_file_bytes"], agent_server.MAX_WORKSPACE_PREVIEW_BYTES)
         self.assertIn("application/pdf", info["preview_media_types"])
         self.assertIn("image/png", info["preview_media_types"])
@@ -608,7 +608,7 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertEqual(result["revision"], agent_server.workspace_revision(data))
         self.assertEqual(result["size"], len(data))
 
-    def test_explicit_absolute_read_is_canonical_nofollow_and_read_only(self) -> None:
+    def test_explicit_absolute_read_is_canonical_nofollow_and_does_not_expand_workspace_mutations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()
             workspace = base / "workspace"
@@ -622,11 +622,19 @@ class WorkspaceFilesTests(unittest.TestCase):
             (outside_directory / "nested.md").write_text("# nested\n")
             parent_link = base / "outside-parent-link"
             parent_link.symlink_to(outside_directory, target_is_directory=True)
+            hard_source = base / "hard-source.md"
+            hard_source.write_text("# shared inode\n")
+            hard_alias = base / "hard-alias.md"
+            os.link(hard_source, hard_alias)
             session = self.session(workspace)
             with patch.object(agent_server.STORE, "sessions", {"session-1": session}):
                 result = agent_server.read_absolute_file_sync(
                     "session-1",
                     str(outside),
+                )
+                hard_linked = agent_server.read_absolute_file_sync(
+                    "session-1",
+                    str(hard_source),
                 )
                 with self.assertRaises(HTTPException) as relative:
                     agent_server.read_absolute_file_sync("session-1", "outside.md")
@@ -654,7 +662,8 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertEqual(result["path"], str(outside))
         self.assertEqual(result["content"], "# outside\n")
         self.assertEqual(result["scope"], "absolute")
-        self.assertFalse(result["writable"])
+        self.assertTrue(result["writable"])
+        self.assertFalse(hard_linked["writable"])
         self.assertEqual(relative.exception.detail["code"], "invalid_absolute_file_path")
         self.assertEqual(traversal.exception.detail["code"], "invalid_absolute_file_path")
         self.assertEqual(symlink.exception.detail["code"], "workspace_symlink_blocked")
@@ -664,6 +673,76 @@ class WorkspaceFilesTests(unittest.TestCase):
         )
         self.assertEqual(mutation.exception.detail["code"], "invalid_workspace_path")
         self.assertEqual(unchanged, "# outside\n")
+
+    def test_explicit_absolute_write_is_revision_checked_atomic_and_nofollow(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            workspace = base / "workspace"
+            workspace.mkdir()
+            outside = base / "outside.md"
+            outside.write_text("# before\n")
+            outside.chmod(0o640)
+            link = base / "outside-link.md"
+            link.symlink_to(outside)
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(workspace)}):
+                original = agent_server.read_absolute_file_sync("session-1", str(outside))
+                updated = agent_server.write_absolute_file_sync(
+                    "session-1",
+                    str(outside),
+                    "# after\n",
+                    original["revision"],
+                )
+                with self.assertRaises(HTTPException) as stale:
+                    agent_server.write_absolute_file_sync(
+                        "session-1",
+                        str(outside),
+                        "# stale\n",
+                        original["revision"],
+                    )
+                with self.assertRaises(HTTPException) as symlink:
+                    agent_server.write_absolute_file_sync(
+                        "session-1",
+                        str(link),
+                        "# escaped\n",
+                        updated["revision"],
+                    )
+
+            self.assertEqual(outside.read_text(), "# after\n")
+            self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o640)
+            self.assertEqual(updated["path"], str(outside))
+            self.assertEqual(updated["scope"], "absolute")
+            self.assertTrue(updated["writable"])
+            self.assertEqual(stale.exception.detail["code"], "workspace_file_conflict")
+            self.assertEqual(symlink.exception.detail["code"], "workspace_symlink_blocked")
+            self.assertEqual(list(base.glob(".*.agentsdock-*.tmp")), [])
+
+    def test_explicit_absolute_write_respects_archived_and_file_read_only_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            workspace = base / "workspace"
+            workspace.mkdir()
+            outside = base / "outside.md"
+            outside.write_text("# locked\n")
+            outside.chmod(0o444)
+            session = self.session(workspace)
+            with patch.object(agent_server.STORE, "sessions", {"session-1": session}):
+                locked = agent_server.read_absolute_file_sync("session-1", str(outside))
+                with self.assertRaises(HTTPException) as read_only:
+                    agent_server.write_absolute_file_sync(
+                        "session-1", str(outside), "# changed\n", locked["revision"]
+                    )
+                outside.chmod(0o644)
+                session["archived"] = True
+                archived = agent_server.read_absolute_file_sync("session-1", str(outside))
+                with self.assertRaises(HTTPException) as archived_write:
+                    agent_server.write_absolute_file_sync(
+                        "session-1", str(outside), "# changed\n", archived["revision"]
+                    )
+
+            self.assertFalse(locked["writable"])
+            self.assertEqual(read_only.exception.detail["code"], "workspace_permission_denied")
+            self.assertFalse(archived["writable"])
+            self.assertEqual(archived_write.exception.detail["code"], "workspace_read_only")
 
     def test_rejects_binary_invalid_utf8_and_oversized_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

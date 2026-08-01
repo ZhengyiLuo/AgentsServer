@@ -200,10 +200,10 @@ CODEX_INTERACTIVE_CLIENT_CAPABILITY = "codex_interactive_v1"
 CODEX_APPROVAL_POLICIES = {"never", "on-request", "untrusted"}
 CODEX_SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
 CODEX_APPROVAL_REVIEWERS = {"user", "auto_review", "guardian_subagent"}
-CODEX_DEFAULT_APPROVAL_POLICY = "on-request"
+CODEX_DEFAULT_APPROVAL_POLICY = "never"
 CODEX_DEFAULT_SANDBOX_MODE = "danger-full-access"
 CODEX_DEFAULT_PERMISSION_PROFILE: str | None = None
-CODEX_DEFAULT_APPROVALS_REVIEWER = "auto_review"
+CODEX_DEFAULT_APPROVALS_REVIEWER = "user"
 # Turns from clients without the interactive app-server capability cannot
 # service approval requests. Keep their deliberate fail-closed policy separate
 # from the user-facing session defaults above.
@@ -396,7 +396,7 @@ You are operating through AgentsDock, backed by AgentsServer.
 - Your Claude process ends with this turn; join child tasks before finishing and create durable automation only when explicitly asked.
 - This is AgentsDock, not Slack; create files locally and never call Slack file helpers.
 - Link editor-readable files with Markdown paths relative to the chat working directory, optionally with `#L42`; do not use `file://`.
-- Publish artifacts by resolving `$AGENTSDOCK_MANIFEST_PATH` and writing `{{"files":[...]}}` with absolute file paths to that exact location; never pass the literal `$...` path to Write.
+- When you create a file the user should receive, write it locally, then publish it by resolving `$AGENTSDOCK_MANIFEST_PATH` (the stable `manifests/current.json` path) and writing `{{"files":["/absolute/path.ext",{{"path":"/absolute/video.mp4","title":"Demo","text":"Optional note"}}]}}` there; use absolute paths, make videos normal playable `.mp4`/`.mov` files, and never pass the literal `$...` path to Write.
 - Manage scheduled jobs only when explicitly asked; use `"$AGENTSDOCK_JOBS_CLI"` (start with list/help), not the API or prompt snapshots.
 - Inspect the persistent terminal named by `$AGENTSDOCK_TMUX_SESSION` read-only unless the user explicitly asks you to operate it.
 - Check installed skills and project playbooks before claiming a specialized environment or remote path is unavailable.
@@ -408,7 +408,7 @@ You are operating through AgentsDock, backed by AgentsServer.
 # Compatibility alias for integrations which imported the historical name.
 SYSTEM_PROMPT = CLAUDE_PROMPT_PRELUDE
 
-CODEX_THREAD_POLICY_VERSION = "2"
+CODEX_THREAD_POLICY_VERSION = "3"
 CODEX_PROMPT_PRELUDE = """\
 You are operating through AgentsDock, backed by AgentsServer.
 - Keep the final answer concise; the UI renders tool calls, command output, reasoning, and artifacts separately.
@@ -416,7 +416,7 @@ You are operating through AgentsDock, backed by AgentsServer.
 - Continue through ordinary inspection errors when a safe retry or narrow fix is available.
 - This is AgentsDock, not Slack; create files locally and never call Slack file helpers.
 - Link editor-readable files with Markdown paths relative to the chat working directory, optionally with `#L42`; do not use `file://`.
-- Publish user-deliverable artifacts by writing `{{"files":[...]}}` to `{manifest_path}` with absolute file paths.
+- When you create a file the user should receive, write it locally, then publish it by writing `{{"files":["/absolute/path.ext",{{"path":"/absolute/video.mp4","title":"Demo","text":"Optional note"}}]}}` to `{manifest_path}`; use absolute paths and make videos normal playable `.mp4`/`.mov` files.
 - Manage scheduled jobs only when explicitly asked, using `"$AGENTSDOCK_JOBS_CLI" --chat-id {chat_id} <command>`; query it instead of relying on a prompt snapshot.
 - The persistent terminal is tmux session `{terminal_session}`; inspect it read-only unless the user explicitly asks you to operate it.
 - Check installed skills and project playbooks before claiming a specialized environment or remote path is unavailable.
@@ -1086,7 +1086,7 @@ def workspace_info_sync(session_id: str) -> dict[str, Any]:
         "root": str(root),
         "name": root.name or str(root),
         "read_only": bool(sess.get("archived")),
-        "capability_version": 5 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
+        "capability_version": 6 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
         "max_text_file_bytes": MAX_WORKSPACE_TEXT_BYTES,
         "max_preview_file_bytes": MAX_WORKSPACE_PREVIEW_BYTES,
         "preview_media_types": sorted(set(WORKSPACE_PREVIEW_MEDIA_TYPES.values())),
@@ -1187,7 +1187,7 @@ def read_workspace_file_sync(session_id: str, relative_path: str) -> dict[str, A
 
 
 def normalize_absolute_file_path(value: str | None) -> tuple[Path, str, str]:
-    """Validate one explicit, native absolute path for read-only access.
+    """Validate one explicit, native absolute path for direct file access.
 
     This is deliberately separate from workspace normalization. It accepts no
     relative, dot-segment, or lexically non-canonical paths, so callers cannot
@@ -1219,14 +1219,15 @@ def normalize_absolute_file_path(value: str | None) -> tuple[Path, str, str]:
 
 
 def read_absolute_file_sync(session_id: str, absolute_path: str) -> dict[str, Any]:
-    """Read one explicitly named absolute UTF-8 file without granting mutations."""
+    """Read one explicitly named absolute UTF-8 file without enumerating its parent."""
     if not WORKSPACE_SECURE_OPEN_AVAILABLE:
         raise workspace_http_error(
             501,
             "workspace_secure_open_unavailable",
             "Secure absolute file access is unavailable on this host.",
         )
-    if session_id not in STORE.sessions:
+    sess = STORE.sessions.get(session_id)
+    if not sess:
         raise workspace_http_error(404, "session_not_found", "Chat not found.")
     root, relative, normalized = normalize_absolute_file_path(absolute_path)
     parent_fd, name = open_workspace_parent_fd(root, relative)
@@ -1270,8 +1271,12 @@ def read_absolute_file_sync(session_id: str, absolute_path: str) -> dict[str, An
             "revision": workspace_revision(data),
             "size": len(data),
             "mtime_ns": int(item_stat.st_mtime_ns),
-            # This endpoint has no corresponding write/rename/delete route.
-            "writable": False,
+            "writable": (
+                WORKSPACE_MUTATIONS_AVAILABLE
+                and not bool(sess.get("archived"))
+                and bool(item_stat.st_mode & 0o222)
+                and item_stat.st_nlink == 1
+            ),
             "scope": "absolute",
         }
     finally:
@@ -1443,7 +1448,11 @@ def write_all(file_fd: int, data: bytes) -> None:
 
 
 def workspace_write_lock(root: Path, relative_path: str) -> threading.Lock:
-    key = hashlib.sha256(f"{root}\0{relative_path}".encode("utf-8", errors="surrogatepass")).digest()
+    # Key by the lexical destination rather than the API's root/relative
+    # representation. The same file can be addressed through the workspace
+    # route or the explicit absolute route and must share one process lock.
+    destination = os.path.normcase(os.path.normpath(str(root.joinpath(*relative_path.split("/")))))
+    key = hashlib.sha256(destination.encode("utf-8", errors="surrogatepass")).digest()
     return WORKSPACE_WRITE_LOCKS[int.from_bytes(key[:2], "big") % len(WORKSPACE_WRITE_LOCKS)]
 
 
@@ -1490,6 +1499,40 @@ def write_workspace_file_sync(
     normalized = normalize_workspace_path(relative_path)
     with workspace_write_lock(root, normalized):
         return write_workspace_file_locked(root, normalized, content, expected_revision)
+
+
+def write_absolute_file_sync(
+    session_id: str,
+    absolute_path: str,
+    content: str,
+    expected_revision: str,
+) -> dict[str, Any]:
+    """Revision-check and atomically replace one explicitly named absolute file.
+
+    This grants no directory enumeration or create/rename/delete authority. The
+    shared writer retains no-follow opens, regular-file and hard-link checks,
+    metadata preservation, a second pre-replace revision check, fsync, and an
+    atomic same-directory replace.
+    """
+    if not WORKSPACE_MUTATIONS_AVAILABLE:
+        raise workspace_http_error(
+            501,
+            "workspace_mutations_unavailable",
+            "Secure absolute file editing is unavailable on this host.",
+        )
+    sess = STORE.sessions.get(session_id)
+    if not sess:
+        raise workspace_http_error(404, "session_not_found", "Chat not found.")
+    if bool(sess.get("archived")):
+        raise workspace_http_error(409, "workspace_read_only", "Archived chats cannot edit files.")
+    root, relative, normalized = normalize_absolute_file_path(absolute_path)
+    with workspace_write_lock(root, relative):
+        result = write_workspace_file_locked(root, relative, content, expected_revision)
+    return {
+        **result,
+        "path": normalized,
+        "scope": "absolute",
+    }
 
 
 def write_workspace_file_locked(
@@ -19021,7 +19064,7 @@ async def health() -> dict[str, Any]:
                     else "Secure workspace file access is unavailable on this host."
                 ),
                 "action": None if WORKSPACE_SECURE_OPEN_AVAILABLE else "Use a supported macOS or Linux host.",
-                "version": 5 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
+                "version": 6 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
                 "max_text_file_bytes": MAX_WORKSPACE_TEXT_BYTES,
                 "max_preview_file_bytes": MAX_WORKSPACE_PREVIEW_BYTES,
                 "preview_media_types": sorted(set(WORKSPACE_PREVIEW_MEDIA_TYPES.values())),
@@ -21485,6 +21528,17 @@ async def get_session_workspace_download(
 async def put_session_workspace_file(session_id: str, req: WorkspaceWriteRequest) -> dict[str, Any]:
     return await asyncio.to_thread(
         write_workspace_file_sync,
+        session_id,
+        req.path,
+        req.content,
+        req.expected_revision,
+    )
+
+
+@app.put("/api/sessions/{session_id}/workspace/absolute-file")
+async def put_session_absolute_file(session_id: str, req: WorkspaceWriteRequest) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        write_absolute_file_sync,
         session_id,
         req.path,
         req.content,

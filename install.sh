@@ -778,8 +778,12 @@ if ! restart_service; then
   exit 1
 fi
 
+HEALTH_CHECK_ATTEMPTS=45
+HEALTH_CHECK_HEARTBEAT_ATTEMPTS=5
+
 wait_for_health() {
-  for _attempt in $(seq 1 45); do
+  local attempt
+  for ((attempt = 1; attempt <= HEALTH_CHECK_ATTEMPTS; attempt++)); do
     if command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1; then
       if curl --fail --silent --show-error --connect-timeout 1 --max-time 2 \
         -H "Authorization: Bearer $TOKEN" \
@@ -794,6 +798,9 @@ wait_for_health() {
       --output-document=/dev/null \
       "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1; then
       return 0
+    fi
+    if ((attempt < HEALTH_CHECK_ATTEMPTS)) && ((attempt % HEALTH_CHECK_HEARTBEAT_ATTEMPTS == 0)); then
+      echo "      Still waiting for health (${attempt}s elapsed, timeout ${HEALTH_CHECK_ATTEMPTS}s)"
     fi
     sleep 1
   done

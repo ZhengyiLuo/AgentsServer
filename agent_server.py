@@ -200,6 +200,19 @@ CODEX_INTERACTIVE_CLIENT_CAPABILITY = "codex_interactive_v1"
 CODEX_APPROVAL_POLICIES = {"never", "on-request", "untrusted"}
 CODEX_SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
 CODEX_APPROVAL_REVIEWERS = {"user", "auto_review", "guardian_subagent"}
+CODEX_DEFAULT_APPROVAL_POLICY = "on-request"
+CODEX_DEFAULT_SANDBOX_MODE = "danger-full-access"
+CODEX_DEFAULT_PERMISSION_PROFILE: str | None = None
+CODEX_DEFAULT_APPROVALS_REVIEWER = "auto_review"
+# Turns from clients without the interactive app-server capability cannot
+# service approval requests. Keep their deliberate fail-closed policy separate
+# from the user-facing session defaults above.
+CODEX_NONINTERACTIVE_APPROVAL_POLICY = "never"
+CODEX_SANDBOX_POLICY_TYPES = {
+    "read-only": "readOnly",
+    "workspace-write": "workspaceWrite",
+    "danger-full-access": "dangerFullAccess",
+}
 CODEX_GOAL_STATUSES = {
     "active",
     "paused",
@@ -3226,6 +3239,19 @@ class SessionStore:
                 self.sessions = {}
         for sess in self.sessions.values():
             backend = str(sess.get("backend") or DEFAULT_BACKEND).strip().lower()
+            for key, default in (
+                ("codex_approval_policy", CODEX_DEFAULT_APPROVAL_POLICY),
+                ("codex_sandbox_mode", CODEX_DEFAULT_SANDBOX_MODE),
+                ("codex_approvals_reviewer", CODEX_DEFAULT_APPROVALS_REVIEWER),
+            ):
+                if sess.get(key) is None:
+                    sess[key] = default
+                    runtime_changed = True
+            if "codex_permission_profile" not in sess:
+                sess["codex_permission_profile"] = (
+                    CODEX_DEFAULT_PERMISSION_PROFILE
+                )
+                runtime_changed = True
             previous_effort = sess.get("effort")
             # Normalize aliases and truly invalid values, but do not erase a
             # saved preference from a static model-capability table. Codex's
@@ -3329,12 +3355,24 @@ class SessionStore:
             "session_id": active_provider_id,
             "claude_session_id": claude_session_id,
             "codex_thread_id": codex_thread_id,
-            "codex_approval_policy": req.codex_approval_policy or "never",
-            "codex_sandbox_mode": req.codex_sandbox_mode or "danger-full-access",
-            "codex_permission_profile": (
-                str(req.codex_permission_profile or "").strip() or None
+            "codex_approval_policy": (
+                req.codex_approval_policy or CODEX_DEFAULT_APPROVAL_POLICY
             ),
-            "codex_approvals_reviewer": req.codex_approvals_reviewer or "user",
+            "codex_sandbox_mode": (
+                req.codex_sandbox_mode or CODEX_DEFAULT_SANDBOX_MODE
+            ),
+            "codex_permission_profile": (
+                str(
+                    req.codex_permission_profile
+                    or CODEX_DEFAULT_PERMISSION_PROFILE
+                    or ""
+                ).strip()
+                or CODEX_DEFAULT_PERMISSION_PROFILE
+            ),
+            "codex_approvals_reviewer": (
+                req.codex_approvals_reviewer
+                or CODEX_DEFAULT_APPROVALS_REVIEWER
+            ),
             "parent_id": parent_id,
             "fork_from": None,
             "pinned": pinned,
@@ -3399,9 +3437,21 @@ class SessionStore:
                 if key in patch and patch[key] is not None:
                     sess[key] = patch[key]
             for key, default, allowed in (
-                ("codex_approval_policy", "never", CODEX_APPROVAL_POLICIES),
-                ("codex_sandbox_mode", "danger-full-access", CODEX_SANDBOX_MODES),
-                ("codex_approvals_reviewer", "user", CODEX_APPROVAL_REVIEWERS),
+                (
+                    "codex_approval_policy",
+                    CODEX_DEFAULT_APPROVAL_POLICY,
+                    CODEX_APPROVAL_POLICIES,
+                ),
+                (
+                    "codex_sandbox_mode",
+                    CODEX_DEFAULT_SANDBOX_MODE,
+                    CODEX_SANDBOX_MODES,
+                ),
+                (
+                    "codex_approvals_reviewer",
+                    CODEX_DEFAULT_APPROVALS_REVIEWER,
+                    CODEX_APPROVAL_REVIEWERS,
+                ),
             ):
                 if key not in patch:
                     continue
@@ -15007,8 +15057,8 @@ def codex_thread_params(
     model, _effort, service_tier = codex_runtime_settings(sess)
     params: dict[str, Any] = {
         "cwd": cwd,
-        "approvalPolicy": "never",
-        "sandbox": "danger-full-access",
+        "approvalPolicy": CODEX_NONINTERACTIVE_APPROVAL_POLICY,
+        "sandbox": CODEX_DEFAULT_SANDBOX_MODE,
     }
     if developer_instructions is not None:
         params["developerInstructions"] = developer_instructions
@@ -17942,19 +17992,30 @@ async def run_codex_app_server(
                     "clientUserMessageId": current_run_id,
                 }
                 permission_profile = (
-                    str(sess.get("codex_permission_profile") or "").strip()
+                    str(
+                        sess.get("codex_permission_profile")
+                        or CODEX_DEFAULT_PERMISSION_PROFILE
+                        or ""
+                    ).strip()
                     if interactive_app_server
                     else ""
                 )
                 approval_policy = (
-                    str(sess.get("codex_approval_policy") or "never")
+                    str(
+                        sess.get("codex_approval_policy")
+                        or CODEX_DEFAULT_APPROVAL_POLICY
+                    )
                     if interactive_app_server
-                    else "never"
+                    else CODEX_NONINTERACTIVE_APPROVAL_POLICY
                 )
                 overrides["approvalPolicy"] = (
                     approval_policy
                     if approval_policy in CODEX_APPROVAL_POLICIES
-                    else "never"
+                    else (
+                        CODEX_DEFAULT_APPROVAL_POLICY
+                        if interactive_app_server
+                        else CODEX_NONINTERACTIVE_APPROVAL_POLICY
+                    )
                 )
                 if permission_profile:
                     # Permission profiles are an experimental app-server
@@ -17965,30 +18026,28 @@ async def run_codex_app_server(
                     sandbox_mode = (
                         str(
                             sess.get("codex_sandbox_mode")
-                            or "danger-full-access"
+                            or CODEX_DEFAULT_SANDBOX_MODE
                         )
                         if interactive_app_server
-                        else "danger-full-access"
+                        else CODEX_DEFAULT_SANDBOX_MODE
                     )
-                    sandbox_policy_types = {
-                        "read-only": "readOnly",
-                        "workspace-write": "workspaceWrite",
-                        "danger-full-access": "dangerFullAccess",
-                    }
                     overrides["sandboxPolicy"] = {
-                        "type": sandbox_policy_types.get(
+                        "type": CODEX_SANDBOX_POLICY_TYPES.get(
                             sandbox_mode,
-                            "dangerFullAccess",
+                            CODEX_SANDBOX_POLICY_TYPES[
+                                CODEX_DEFAULT_SANDBOX_MODE
+                            ],
                         )
                     }
                 if interactive_app_server:
                     approvals_reviewer = str(
-                        sess.get("codex_approvals_reviewer") or "user"
+                        sess.get("codex_approvals_reviewer")
+                        or CODEX_DEFAULT_APPROVALS_REVIEWER
                     )
                     overrides["approvalsReviewer"] = (
                         approvals_reviewer
                         if approvals_reviewer in CODEX_APPROVAL_REVIEWERS
-                        else "user"
+                        else CODEX_DEFAULT_APPROVALS_REVIEWER
                     )
                 if model:
                     overrides["model"] = model
@@ -19597,12 +19656,31 @@ async def codex_runtime_snapshot(session_id: str) -> dict[str, Any]:
         "permission_profiles": permission_profiles,
         "background_terminals_supported": CODEX_BACKGROUND_TERMINALS_SUPPORTED,
         "policy": {
-            "approval_policy": session.get("codex_approval_policy") or "never",
-            "sandbox_mode": session.get("codex_sandbox_mode")
-            or "danger-full-access",
-            "permission_profile": session.get("codex_permission_profile"),
-            "approvals_reviewer": session.get("codex_approvals_reviewer")
-            or "user",
+            "approval_policy": (
+                session.get("codex_approval_policy")
+                if session.get("codex_approval_policy")
+                in CODEX_APPROVAL_POLICIES
+                else CODEX_DEFAULT_APPROVAL_POLICY
+            ),
+            "sandbox_mode": (
+                session.get("codex_sandbox_mode")
+                if session.get("codex_sandbox_mode") in CODEX_SANDBOX_MODES
+                else CODEX_DEFAULT_SANDBOX_MODE
+            ),
+            "permission_profile": (
+                str(
+                    session.get("codex_permission_profile")
+                    or CODEX_DEFAULT_PERMISSION_PROFILE
+                    or ""
+                ).strip()
+                or CODEX_DEFAULT_PERMISSION_PROFILE
+            ),
+            "approvals_reviewer": (
+                session.get("codex_approvals_reviewer")
+                if session.get("codex_approvals_reviewer")
+                in CODEX_APPROVAL_REVIEWERS
+                else CODEX_DEFAULT_APPROVALS_REVIEWER
+            ),
         },
     }
 

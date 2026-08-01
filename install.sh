@@ -28,15 +28,19 @@ LEGACY_SERVICE_NAME="zenithbot-agent"
 LAUNCHCTL_STOP_ATTEMPTS=50
 LAUNCHCTL_STOP_DELAY=0.1
 LAUNCHCTL_BOOTSTRAP_ATTEMPTS=3
+NON_INTERACTIVE="false"
 
 usage() {
   cat <<'USAGE'
-Usage: ./install.sh [--port PORT] [--bind ADDRESS] [--release-version VERSION]
+Usage: ./install.sh [--port PORT] [--bind ADDRESS] [--release-version VERSION] [--non-interactive]
 
 Installs or updates AgentsServer for the current user. Releases and Python
 runtimes are versioned, the previous healthy release is retained for rollback,
 and existing chat state and generated tokens are preserved. No sudo privileges
 are required.
+
+--non-interactive skips the optional tmux install prompt on macOS instead of
+asking; use it for unattended/SSH-driven runs.
 USAGE
 }
 
@@ -45,7 +49,7 @@ while (($#)); do
     --port) PORT="${2:-}"; shift 2 ;;
     --bind) BIND_ADDRESS="${2:-}"; shift 2 ;;
     --release-version) RELEASE_VERSION="${2:-}"; shift 2 ;;
-    --non-interactive) shift ;;
+    --non-interactive) NON_INTERACTIVE="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -201,28 +205,64 @@ probe_service_manager() {
   fi
 }
 
+TMUX_WARNING=""
+
+tmux_working() {
+  command -v tmux >/dev/null 2>&1 && tmux -V >/dev/null 2>&1
+}
+
+offer_brew_tmux_install() {
+  # Only ever offered on macOS with Homebrew present; never attempted over a
+  # non-interactive/SSH-driven run, where there is no one to answer a prompt.
+  [[ "$NON_INTERACTIVE" != "true" && -t 0 ]] || return 1
+  command -v brew >/dev/null 2>&1 || return 1
+  local reply=""
+  read -r -p "      tmux was not found. Install it now with Homebrew (brew install tmux)? [y/N] " reply || return 1
+  case "$reply" in
+    y|Y|yes|YES) ;;
+    *) return 1 ;;
+  esac
+  echo "      Installing tmux with Homebrew"
+  brew install tmux
+}
+
+check_tmux_prerequisite() {
+  # tmux is optional: it only backs the persistent chat terminal, tmux-pane
+  # inspection, and in-app managed updates. The rest of AgentsServer (chats,
+  # turns, jobs, files) runs without it, so a missing tmux is a warning, not
+  # a preflight failure.
+  local guidance=""
+  tmux_working && return 0
+  if [[ "$OS_NAME" == "Darwin" ]]; then
+    if offer_brew_tmux_install && tmux_working; then
+      return 0
+    fi
+    guidance="Install tmux with Homebrew: brew install tmux"
+  else
+    guidance="Install tmux with your package manager, for example: sudo apt install tmux, sudo dnf install tmux, or sudo pacman -S tmux."
+  fi
+  TMUX_WARNING="tmux is unavailable, so the persistent chat terminal, tmux-pane inspection, and in-app managed updates will not work. $guidance Then rerun install.sh to enable them; everything else about AgentsServer works without it."
+  echo "Optional prerequisite unavailable: tmux" >&2
+  echo "  $TMUX_WARNING" >&2
+}
+
 preflight_prerequisites() {
   case "$OS_NAME" in
     Darwin)
-      require_command "tmux" "Install tmux with Homebrew: brew install tmux"
       require_download_client "Restore the curl included with macOS, or install curl or wget with Homebrew: brew install curl."
       require_command "launchctl" "launchctl is included with macOS; run this installer from a supported macOS user session."
-      if command -v tmux >/dev/null 2>&1 && ! tmux -V >/dev/null 2>&1; then
-        record_prerequisite_failure "tmux" "Install a working tmux with Homebrew: brew install tmux"
-      fi
       ;;
     Linux)
-      require_command "tmux" "Install tmux with your package manager, for example: sudo apt install tmux, sudo dnf install tmux, or sudo pacman -S tmux."
       require_download_client "Install curl or wget with your package manager, for example: sudo apt install curl, sudo dnf install curl, or sudo pacman -S curl."
       require_command "systemctl" "AgentsServer's Linux installer requires systemd and a working systemctl --user session."
-      if command -v tmux >/dev/null 2>&1 && ! tmux -V >/dev/null 2>&1; then
-        record_prerequisite_failure "tmux" "Install a working tmux with your package manager, for example: sudo apt install tmux, sudo dnf install tmux, or sudo pacman -S tmux."
-      fi
       ;;
     *)
       echo "Unsupported host OS: $OS_NAME" >&2
       PREFLIGHT_FAILED="true"
       ;;
+  esac
+  case "$OS_NAME" in
+    Darwin|Linux) check_tmux_prerequisite ;;
   esac
   probe_service_manager
   if [[ "$PREFLIGHT_FAILED" == "true" ]]; then
@@ -794,5 +834,8 @@ SERVER_URL="http://127.0.0.1:$PORT"
 [[ -z "$TAILSCALE_IP" ]] || SERVER_URL="http://$TAILSCALE_IP:$PORT"
 
 echo "[7/7] AgentsServer $RELEASE_VERSION is ready"
+if [[ -n "$TMUX_WARNING" ]]; then
+  echo "      Note: $TMUX_WARNING"
+fi
 printf 'AGENTSDOCK_SETUP_RESULT={"server_url":"%s","access_token":"%s","service":"%s","tailscale_ip":"%s","server_version":"%s"}\n' \
   "$SERVER_URL" "$TOKEN" "$SERVICE_KIND" "$TAILSCALE_IP" "$RELEASE_VERSION"

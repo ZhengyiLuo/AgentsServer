@@ -6070,7 +6070,7 @@ def tmux_capability() -> dict[str, Any]:
     if available:
         return {
             "available": True,
-            "required": True,
+            "required": False,
             "message": "tmux is available.",
             "action": None,
         }
@@ -6085,8 +6085,11 @@ def tmux_capability() -> dict[str, Any]:
         action = "Install tmux on the agent host, then rerun the AgentsServer installer."
     return {
         "available": False,
-        "required": True,
-        "message": "tmux is required for persistent terminals and detached managed updates but was not found on the server PATH.",
+        "required": False,
+        "message": (
+            "tmux was not found, so the persistent chat terminal, tmux-pane inspection, "
+            "and in-app managed updates are unavailable. The rest of AgentsServer works without it."
+        ),
         "action": action,
     }
 

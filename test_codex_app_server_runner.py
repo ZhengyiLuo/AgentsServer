@@ -571,6 +571,75 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             [(agent_server.project_codex_notification, "thread-native")],
         )
 
+    async def test_scheduled_run_metadata_is_attached_to_live_reasoning_and_tools(
+        self,
+    ) -> None:
+        turn = FakeTurn(
+            [
+                reasoning_item("reason-job", "Checking the scheduled run."),
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-native",
+                        "turnId": "turn-native",
+                        "item": {
+                            "id": "tool-job",
+                            "type": "commandExecution",
+                            "command": "echo scheduled",
+                            "status": "completed",
+                            "exitCode": 0,
+                            "aggregatedOutput": "scheduled\n",
+                        },
+                    },
+                },
+                completed_notification(),
+            ]
+        )
+        manager = FakeManager(turn)
+        expected_metadata = {
+            "purpose": "scheduled_job",
+            "job_id": "job-nightly",
+            "job_title": "Nightly check",
+            "source_session_id": "chat-native",
+            "target_session_id": "chat-native",
+            "job_context_mode": "chat",
+        }
+        agent_server.RUN_METADATA["run-original"] = dict(expected_metadata)
+        stack, events, _finished, exec_fallback = self.runner_patches(manager)
+        with stack:
+            await agent_server.run_codex_app_server(
+                "chat-native",
+                "run-original",
+                "Run the scheduled check",
+                dict(self.session),
+                Path(self.cwd) / ".runner-test-manifest.json",
+                allow_exec_fallback=True,
+            )
+
+        exec_fallback.assert_not_awaited()
+        live_payloads = {
+            event_type: payload
+            for event_type, payload in (
+                (call.args[1], call.args[2])
+                for call in events.await_args_list
+                if len(call.args) >= 3
+            )
+            if event_type in {
+                "reasoning_summary",
+                "tool_started",
+                "tool_finished",
+            }
+        }
+        self.assertEqual(
+            set(live_payloads),
+            {"reasoning_summary", "tool_started", "tool_finished"},
+        )
+        for event_type, payload in live_payloads.items():
+            with self.subTest(event_type=event_type):
+                self.assertEqual(payload["run_id"], "run-original")
+                for key, value in expected_metadata.items():
+                    self.assertEqual(payload[key], value)
+
     async def test_ultra_effort_is_forwarded_to_native_turn_start(self) -> None:
         turn = FakeTurn(
             [

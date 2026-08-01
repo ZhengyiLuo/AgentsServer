@@ -16968,6 +16968,7 @@ async def run_codex_app_server(
         payload = {
             "run_id": current_run_id,
             "text": text,
+            **current_metadata(),
         }
         if phase:
             payload["phase"] = phase
@@ -17004,6 +17005,7 @@ async def run_codex_app_server(
         await append_event(session_id, "tool_started", {
             "run_id": current_run_id,
             "tool": tool,
+            **current_metadata(),
         })
 
     async def emit_tool_finished(item: dict[str, Any]) -> None:
@@ -17026,6 +17028,7 @@ async def run_codex_app_server(
             "output": output,
             "exit_code": exit_code,
             "is_error": is_error,
+            **current_metadata(),
         })
 
     async def stop_manifest_watcher() -> None:

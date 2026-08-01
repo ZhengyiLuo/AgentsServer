@@ -705,6 +705,83 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(overrides["approvalsReviewer"], "user")
         exec_fallback.assert_not_awaited()
 
+    async def test_interactive_turn_uses_canonical_security_defaults(self) -> None:
+        turn = FakeTurn(
+            [
+                agent_message("default-final", "Done.", "final_answer"),
+                completed_notification(),
+            ]
+        )
+        manager = FakeManager(turn)
+        stack, _events, _finished, exec_fallback = self.runner_patches(manager)
+        with stack:
+            await agent_server.run_codex_app_server(
+                "chat-native",
+                "run-original",
+                "Default interactive request",
+                dict(self.session),
+                Path(self.cwd) / ".runner-test-manifest.json",
+                allow_exec_fallback=False,
+                interactive_app_server=True,
+            )
+
+        overrides = manager.turn_calls[0][2]
+        self.assertEqual(
+            overrides["approvalPolicy"],
+            agent_server.CODEX_DEFAULT_APPROVAL_POLICY,
+        )
+        self.assertEqual(
+            overrides["sandboxPolicy"],
+            {
+                "type": agent_server.CODEX_SANDBOX_POLICY_TYPES[
+                    agent_server.CODEX_DEFAULT_SANDBOX_MODE
+                ]
+            },
+        )
+        self.assertEqual(
+            overrides["approvalsReviewer"],
+            agent_server.CODEX_DEFAULT_APPROVALS_REVIEWER,
+        )
+        self.assertNotIn("permissions", overrides)
+        exec_fallback.assert_not_awaited()
+
+    async def test_noninteractive_turn_keeps_the_approval_hard_gate(self) -> None:
+        turn = FakeTurn(
+            [
+                agent_message("legacy-final", "Done.", "final_answer"),
+                completed_notification(),
+            ]
+        )
+        manager = FakeManager(turn)
+        stack, _events, _finished, exec_fallback = self.runner_patches(manager)
+        with stack:
+            await agent_server.run_codex_app_server(
+                "chat-native",
+                "run-original",
+                "Noninteractive request",
+                dict(self.session),
+                Path(self.cwd) / ".runner-test-manifest.json",
+                allow_exec_fallback=False,
+                interactive_app_server=False,
+            )
+
+        overrides = manager.turn_calls[0][2]
+        self.assertEqual(
+            overrides["approvalPolicy"],
+            agent_server.CODEX_NONINTERACTIVE_APPROVAL_POLICY,
+        )
+        self.assertEqual(
+            overrides["sandboxPolicy"],
+            {
+                "type": agent_server.CODEX_SANDBOX_POLICY_TYPES[
+                    agent_server.CODEX_DEFAULT_SANDBOX_MODE
+                ]
+            },
+        )
+        self.assertNotIn("approvalsReviewer", overrides)
+        self.assertNotIn("permissions", overrides)
+        exec_fallback.assert_not_awaited()
+
     async def test_permission_profile_never_combines_with_sandbox_policy(self) -> None:
         turn = FakeTurn(
             [

@@ -698,6 +698,136 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
             agent_server.cached_codex_permission_profiles("/work", manager)
         )
 
+    async def test_new_sessions_and_null_resets_use_canonical_permission_defaults(
+        self,
+    ) -> None:
+        store = agent_server.SessionStore()
+        with (
+            patch.object(agent_server, "ensure_dirs"),
+            patch.object(agent_server, "append_event", AsyncMock()),
+            patch.object(store, "save", AsyncMock()),
+        ):
+            created = await store.create(
+                agent_server.CreateSessionRequest(
+                    backend=agent_server.BACKEND_CODEX,
+                )
+            )
+            explicit = await store.create(
+                agent_server.CreateSessionRequest(
+                    backend=agent_server.BACKEND_CODEX,
+                    codex_approval_policy="never",
+                    codex_sandbox_mode="read-only",
+                    codex_permission_profile=":read-only",
+                    codex_approvals_reviewer="user",
+                )
+            )
+            reset = await store.update(
+                explicit["id"],
+                {
+                    "codex_approval_policy": None,
+                    "codex_sandbox_mode": None,
+                    "codex_permission_profile": None,
+                    "codex_approvals_reviewer": None,
+                },
+            )
+
+        self.assertEqual(
+            created["codex_approval_policy"],
+            agent_server.CODEX_DEFAULT_APPROVAL_POLICY,
+        )
+        self.assertEqual(
+            created["codex_sandbox_mode"],
+            agent_server.CODEX_DEFAULT_SANDBOX_MODE,
+        )
+        self.assertIs(
+            created["codex_permission_profile"],
+            agent_server.CODEX_DEFAULT_PERMISSION_PROFILE,
+        )
+        self.assertEqual(
+            created["codex_approvals_reviewer"],
+            agent_server.CODEX_DEFAULT_APPROVALS_REVIEWER,
+        )
+        self.assertEqual(
+            reset["codex_approval_policy"],
+            agent_server.CODEX_DEFAULT_APPROVAL_POLICY,
+        )
+        self.assertEqual(
+            reset["codex_sandbox_mode"],
+            agent_server.CODEX_DEFAULT_SANDBOX_MODE,
+        )
+        self.assertIsNone(reset["codex_permission_profile"])
+        self.assertEqual(
+            reset["codex_approvals_reviewer"],
+            agent_server.CODEX_DEFAULT_APPROVALS_REVIEWER,
+        )
+
+    async def test_session_load_defaults_missing_permissions_without_overwriting_choices(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sessions_file = Path(temp_dir) / "sessions.json"
+            sessions_file.write_text(
+                json.dumps(
+                    {
+                        "missing": {
+                            "id": "missing",
+                            "backend": agent_server.BACKEND_CODEX,
+                        },
+                        "explicit": {
+                            "id": "explicit",
+                            "backend": agent_server.BACKEND_CODEX,
+                            "codex_approval_policy": "never",
+                            "codex_sandbox_mode": "read-only",
+                            "codex_permission_profile": ":read-only",
+                            "codex_approvals_reviewer": "user",
+                        },
+                    }
+                )
+            )
+            store = agent_server.SessionStore()
+            with (
+                patch.object(agent_server, "SESSIONS_FILE", sessions_file),
+                patch.object(agent_server, "ensure_dirs"),
+                patch.object(store, "save", AsyncMock()),
+            ):
+                await store.load()
+
+        missing = store.sessions["missing"]
+        self.assertEqual(
+            missing["codex_approval_policy"],
+            agent_server.CODEX_DEFAULT_APPROVAL_POLICY,
+        )
+        self.assertEqual(
+            missing["codex_sandbox_mode"],
+            agent_server.CODEX_DEFAULT_SANDBOX_MODE,
+        )
+        self.assertIsNone(missing["codex_permission_profile"])
+        self.assertEqual(
+            missing["codex_approvals_reviewer"],
+            agent_server.CODEX_DEFAULT_APPROVALS_REVIEWER,
+        )
+        explicit = store.sessions["explicit"]
+        self.assertEqual(explicit["codex_approval_policy"], "never")
+        self.assertEqual(explicit["codex_sandbox_mode"], "read-only")
+        self.assertEqual(explicit["codex_permission_profile"], ":read-only")
+        self.assertEqual(explicit["codex_approvals_reviewer"], "user")
+
+    async def test_runtime_policy_reports_canonical_defaults_for_legacy_session(
+        self,
+    ) -> None:
+        with patch.object(agent_server, "CODEX_APP_SERVER_MANAGER", None):
+            runtime = await agent_server.codex_runtime_snapshot("chat")
+
+        self.assertEqual(
+            runtime["policy"],
+            {
+                "approval_policy": agent_server.CODEX_DEFAULT_APPROVAL_POLICY,
+                "sandbox_mode": agent_server.CODEX_DEFAULT_SANDBOX_MODE,
+                "permission_profile": agent_server.CODEX_DEFAULT_PERMISSION_PROFILE,
+                "approvals_reviewer": agent_server.CODEX_DEFAULT_APPROVALS_REVIEWER,
+            },
+        )
+
     async def test_native_status_and_automatic_compaction_events_are_readable(
         self,
     ) -> None:

@@ -339,6 +339,23 @@ terminate its own installer. Progress is written to
 sessions remain under the persistent state/configuration roots and are never
 placed inside a release directory.
 
+## Uninstalling AgentsServer
+
+```bash
+./uninstall.sh
+```
+
+This stops and removes the user service, the versioned release runtime, and
+generated configuration (including the access token). It prompts before
+making changes unless `--yes` is passed. Chat history, jobs, files, and
+terminals under the state directory (`~/.agentsdock` by default) are kept by
+default, so a later `./install.sh` picks the same history back up; pass
+`--purge-state` to permanently delete that too (prompted separately even with
+`--yes`, so a single flag can never wipe chat history by accident). Like
+`install.sh`, it never invokes a package manager or `sudo`. Persistent chat
+terminal tmux sessions (named `zd_*`) are left running; list them with
+`tmux ls` and remove them yourself if you no longer need them.
+
 ## Development Deployment Helper
 
 New installations should use `install.sh`. For a managed installation,

@@ -665,6 +665,47 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(CodexAppServerProtocolError):
             await client.list_background_terminals("thr")
 
+    async def test_lists_all_subagent_descendants_with_explicit_source_filter(self) -> None:
+        factory = FakeProcessFactory()
+        process = factory.process
+
+        def list_threads(message: dict[str, Any]) -> dict[str, Any]:
+            if message["params"].get("cursor") is None:
+                return {
+                    "data": [{"id": "child-a", "parentThreadId": "root"}],
+                    "nextCursor": "page-2",
+                }
+            return {
+                "data": [{"id": "grandchild", "parentThreadId": "child-a"}],
+                "nextCursor": None,
+            }
+
+        process.responders["thread/list"] = list_threads
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+
+        descendants = await client.list_descendant_threads("root", page_size=1)
+
+        self.assertEqual([thread["id"] for thread in descendants], ["child-a", "grandchild"])
+        requests = [
+            message for message in process.messages
+            if message.get("method") == "thread/list"
+        ]
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0]["params"]["ancestorThreadId"], "root")
+        self.assertTrue(requests[0]["params"]["useStateDbOnly"])
+        self.assertEqual(
+            requests[0]["params"]["sourceKinds"],
+            [
+                "subAgent",
+                "subAgentReview",
+                "subAgentCompact",
+                "subAgentThreadSpawn",
+                "subAgentOther",
+            ],
+        )
+        self.assertEqual(requests[1]["params"]["cursor"], "page-2")
+
     async def test_multiplexed_turns_route_by_thread_and_turn(self) -> None:
         factory = FakeProcessFactory()
         process = factory.process
@@ -819,6 +860,113 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(steer["params"]["expectedTurnId"], "turn_a")
         self.assertEqual(steer["params"]["clientUserMessageId"], "message-a")
         self.assertNotIn("additionalContext", steer["params"])
+
+    async def test_goal_continuation_retargets_active_turn_and_interrupt(self) -> None:
+        factory = FakeProcessFactory()
+        process = factory.process
+        process.responders.update(
+            {
+                "turn/start": lambda _: {
+                    "turn": {
+                        "id": "turn_initial",
+                        "status": "inProgress",
+                        "items": [],
+                    }
+                },
+                "turn/interrupt": lambda _: {},
+            }
+        )
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+        thread_events = client.subscribe_thread("thread_goal")
+        other_thread_events = client.subscribe_thread("thread_other")
+        self.addCleanup(thread_events.close)
+        self.addCleanup(other_thread_events.close)
+
+        turn = await client.start_turn(
+            "thread_goal",
+            [{"type": "text", "text": "Start goal"}],
+        )
+        self.assertEqual(turn.turn_id, "turn_initial")
+
+        # An arbitrary event carrying another turn id must not retarget the
+        # active handle or leak into its scoped subscription.
+        wrong_turn = {
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "thread_goal",
+                "turnId": "turn_wrong",
+                "delta": "must not retarget",
+            },
+        }
+        process.feed(wrong_turn)
+        self.assertEqual(await thread_events.next_notification(timeout=1), wrong_turn)
+        with self.assertRaises(asyncio.TimeoutError):
+            await turn.next_notification(timeout=0.01)
+        self.assertEqual(turn.turn_id, "turn_initial")
+
+        # A turn started on another thread is unrelated to this active turn.
+        unrelated_started = {
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread_other",
+                "turn": {
+                    "id": "turn_other",
+                    "status": "inProgress",
+                    "items": [],
+                },
+            },
+        }
+        process.feed(unrelated_started)
+        self.assertEqual(
+            await other_thread_events.next_notification(timeout=1),
+            unrelated_started,
+        )
+        self.assertEqual(turn.turn_id, "turn_initial")
+
+        # Native goals continue by starting a new turn on the same thread.
+        # The existing handle must follow it before subscriptions are routed.
+        continued_started = {
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread_goal",
+                "turn": {
+                    "id": "turn_continued",
+                    "status": "inProgress",
+                    "items": [],
+                },
+            },
+        }
+        process.feed(continued_started)
+        self.assertEqual(
+            await turn.next_notification(timeout=1),
+            continued_started,
+        )
+        self.assertEqual(turn.turn_id, "turn_continued")
+
+        continued_item = {
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "thread_goal",
+                "turnId": "turn_continued",
+                "delta": "continued output",
+            },
+        }
+        process.feed(continued_item)
+        self.assertEqual(await turn.next_notification(timeout=1), continued_item)
+
+        await turn.interrupt()
+        interrupt = next(
+            message
+            for message in reversed(process.messages)
+            if message.get("method") == "turn/interrupt"
+        )
+        self.assertEqual(
+            interrupt["params"],
+            {"threadId": "thread_goal", "turnId": "turn_continued"},
+        )
+
+        await turn.close()
 
     async def test_resume_accepts_a_jsonl_response_larger_than_16_mib(self) -> None:
         factory = FakeProcessFactory()

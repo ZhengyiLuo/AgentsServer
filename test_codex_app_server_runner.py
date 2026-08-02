@@ -271,6 +271,10 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.previous_run_now_requests = agent_server.RUN_NOW_REQUESTS
         self.previous_run_now_completed = agent_server.RUN_NOW_COMPLETED_RESULTS
         self.previous_run_metadata = agent_server.RUN_METADATA
+        self.previous_goal_sync = agent_server.CODEX_GOAL_SYNC_GENERATIONS
+        self.previous_goal_quarantine = (
+            agent_server.CODEX_QUARANTINED_GOAL_THREADS
+        )
 
         self.cwd = str(Path(__file__).resolve().parent.parent)
         self.session = {
@@ -299,6 +303,8 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         agent_server.RUN_NOW_REQUESTS = {}
         agent_server.RUN_NOW_COMPLETED_RESULTS = OrderedDict()
         agent_server.RUN_METADATA = {}
+        agent_server.CODEX_GOAL_SYNC_GENERATIONS = {}
+        agent_server.CODEX_QUARANTINED_GOAL_THREADS = {}
 
     async def asyncTearDown(self) -> None:
         agent_server.STORE.sessions = self.previous_sessions
@@ -313,6 +319,10 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         agent_server.RUN_NOW_REQUESTS = self.previous_run_now_requests
         agent_server.RUN_NOW_COMPLETED_RESULTS = self.previous_run_now_completed
         agent_server.RUN_METADATA = self.previous_run_metadata
+        agent_server.CODEX_GOAL_SYNC_GENERATIONS = self.previous_goal_sync
+        agent_server.CODEX_QUARANTINED_GOAL_THREADS = (
+            self.previous_goal_quarantine
+        )
 
     def runner_patches(
         self,
@@ -917,7 +927,222 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(turn.interrupt_calls, 1)
         terminate.assert_not_awaited()
 
-    async def test_stop_keeps_an_owned_unbound_runner_pending(self) -> None:
+    async def test_stop_pauses_active_goal_before_interrupting_native_turn(self) -> None:
+        order: list[str] = []
+        turn = FakeTurn()
+
+        async def interrupt() -> None:
+            order.append("interrupt")
+            turn.interrupt_calls += 1
+
+        turn.interrupt = interrupt  # type: ignore[method-assign]
+        paused_goal = {
+            "id": "goal-native",
+            "threadId": "thread-native",
+            "objective": "Finish the task",
+            "status": "paused",
+            "timeUsedSeconds": 12,
+        }
+        manager = Mock()
+
+        async def pause_goal(
+            thread_id: str,
+            *,
+            status: str,
+        ) -> dict[str, object]:
+            self.assertEqual(thread_id, "thread-native")
+            self.assertEqual(status, "paused")
+            order.append("pause")
+            return paused_goal
+
+        manager.set_thread_goal = AsyncMock(side_effect=pause_goal)
+        self.session["codex_goal"] = {
+            **paused_goal,
+            "status": "active",
+        }
+        agent_server.ACTIVE["chat-native"] = {
+            "run_id": "run-original",
+            "backend": agent_server.BACKEND_CODEX,
+            "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
+            "provider_thread_id": "thread-native",
+            "provider_session_id": "thread-native",
+            "provider_turn_ready": True,
+            "codex_app_server_turn": turn,
+        }
+
+        with (
+            patch.object(agent_server, "CODEX_APP_SERVER_MANAGER", manager),
+            patch.object(agent_server.STORE, "save", AsyncMock()) as save,
+            patch.object(agent_server, "append_event", AsyncMock(return_value={})),
+            patch.object(agent_server, "STOP_CONFIRM_TIMEOUT_SECONDS", 0.01),
+        ):
+            result = await agent_server.stop_turn("chat-native")
+
+        self.assertEqual(order, ["pause", "interrupt"])
+        manager.set_thread_goal.assert_awaited_once_with(
+            "thread-native",
+            status="paused",
+        )
+        self.assertEqual(self.session["codex_goal"], paused_goal)
+        save.assert_awaited_once()
+        self.assertTrue(result["stopped"])
+        self.assertTrue(result["goal_paused"])
+
+    async def test_goal_pause_failure_still_interrupts_and_fences_stale_thread(
+        self,
+    ) -> None:
+        order: list[str] = []
+        turn = FakeTurn()
+
+        async def interrupt() -> None:
+            order.append("interrupt")
+            turn.interrupt_calls += 1
+
+        turn.interrupt = interrupt  # type: ignore[method-assign]
+        manager = Mock()
+
+        async def fail_pause(
+            _thread_id: str,
+            *,
+            status: str,
+        ) -> dict[str, object]:
+            self.assertEqual(status, "paused")
+            order.append("pause")
+            raise RuntimeError("goal control unavailable")
+
+        manager.set_thread_goal = AsyncMock(side_effect=fail_pause)
+        active_goal = {
+            "id": "goal-native",
+            "threadId": "thread-native",
+            "objective": "Finish the task",
+            "status": "active",
+        }
+        self.session["codex_goal"] = active_goal
+        agent_server.ACTIVE["chat-native"] = {
+            "run_id": "run-original",
+            "backend": agent_server.BACKEND_CODEX,
+            "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
+            "provider_thread_id": "thread-native",
+            "provider_session_id": "thread-native",
+            "provider_turn_ready": True,
+            "codex_app_server_turn": turn,
+        }
+
+        with (
+            patch.object(agent_server, "CODEX_APP_SERVER_MANAGER", manager),
+            patch.object(agent_server.STORE, "save", AsyncMock()) as save,
+            patch.object(agent_server, "append_event", AsyncMock(return_value={})) as events,
+            patch.object(agent_server, "STOP_CONFIRM_TIMEOUT_SECONDS", 0.01),
+        ):
+            result = await agent_server.stop_turn("chat-native")
+
+        self.assertEqual(order, ["pause", "interrupt"])
+        self.assertEqual(self.session["codex_goal"]["status"], "paused")
+        self.assertIsNone(self.session["codex_thread_id"])
+        self.assertGreaterEqual(save.await_count, 1)
+        self.assertGreaterEqual(events.await_count, 1)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["stopped"])
+        self.assertFalse(result["pending"])
+        self.assertFalse(result["goal_paused"])
+        self.assertTrue(result["goal_fenced"])
+        self.assertTrue(result["native_interrupt"])
+        self.assertIn("fenced", result["message"])
+
+    async def test_goal_control_timeouts_release_session_maintenance(self) -> None:
+        agent_server.ACTIVE["chat-native"] = {
+            "run_id": "run-original",
+            "backend": agent_server.BACKEND_CODEX,
+            "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
+            "provider_thread_id": "thread-native",
+            "provider_session_id": "thread-native",
+            "provider_turn_ready": True,
+        }
+        self.session["codex_goal"] = {
+            "id": "goal-native",
+            "threadId": "thread-native",
+            "objective": "Finish the task",
+            "status": "active",
+        }
+
+        async def never_finishes(*_args: object, **_kwargs: object) -> object:
+            await asyncio.Event().wait()
+
+        cases = (
+            (
+                "update",
+                lambda: agent_server._put_codex_goal_locked(
+                    "chat-native",
+                    agent_server.CodexGoalRequest(status="paused"),
+                ),
+                "Codex goal update timed out",
+            ),
+            (
+                "clear",
+                lambda: agent_server._delete_codex_goal_locked("chat-native"),
+                None,
+            ),
+        )
+        for name, operation, expected_message in cases:
+            with self.subTest(operation=name):
+                manager = Mock()
+                manager.is_thread_loaded = Mock(return_value=True)
+                manager.set_thread_goal = AsyncMock(side_effect=never_finishes)
+                manager.clear_thread_goal = AsyncMock(side_effect=never_finishes)
+                maintenance: set[str] = set()
+                with (
+                    patch.object(
+                        agent_server,
+                        "CODEX_APP_SERVER_MANAGER",
+                        manager,
+                    ),
+                    patch.object(
+                        agent_server,
+                        "CODEX_GOAL_CONTROL_TIMEOUT_SECONDS",
+                        0.01,
+                    ),
+                    patch.object(
+                        agent_server,
+                        "SERVER_MAINTENANCE_SESSIONS",
+                        maintenance,
+                    ),
+                    patch.object(
+                        agent_server,
+                        "pin_codex_app_server_thread",
+                        AsyncMock(),
+                    ),
+                    patch.object(
+                        agent_server,
+                        "unpin_codex_app_server_thread",
+                        AsyncMock(),
+                    ),
+                    patch.object(
+                        agent_server,
+                        "acquire_codex_interactive_control_lease",
+                        Mock(),
+                    ),
+                    patch.object(
+                        agent_server,
+                        "release_codex_interactive_control_lease",
+                        Mock(),
+                    ),
+                ):
+                    if expected_message is None:
+                        result = await operation()
+                    else:
+                        with self.assertRaises(agent_server.HTTPException) as raised:
+                            await operation()
+
+                if expected_message is None:
+                    self.assertIsNone(result["goal"])
+                    self.assertIsNone(self.session["codex_goal"])
+                    self.assertIsNone(self.session["codex_thread_id"])
+                else:
+                    self.assertEqual(raised.exception.status_code, 504)
+                    self.assertIn(expected_message, str(raised.exception.detail))
+                self.assertEqual(maintenance, set())
+
+    async def test_stop_cancels_an_owned_unbound_runner_after_timeout(self) -> None:
         blocker = asyncio.Event()
         startup_task = asyncio.create_task(blocker.wait())
         events = AsyncMock(return_value={})
@@ -940,11 +1165,13 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             startup_task.cancel()
             await asyncio.gather(startup_task, return_exceptions=True)
 
-        self.assertFalse(result["stopped"])
-        self.assertTrue(result["pending"])
-        self.assertIn("chat-native", agent_server.BUSY_SESSIONS)
-        self.assertIn("chat-native", agent_server.STOP_REQUESTS)
-        events.assert_not_awaited()
+        self.assertTrue(result["stopped"])
+        self.assertFalse(result["pending"])
+        self.assertTrue(result["hard_stop"])
+        self.assertTrue(startup_task.cancelled())
+        self.assertNotIn("chat-native", agent_server.BUSY_SESSIONS)
+        self.assertNotIn("chat-native", agent_server.STOP_REQUESTS)
+        events.assert_awaited_once()
 
     async def test_stop_cancels_a_turn_request_before_runner_registration(self) -> None:
         agent_server.ACTIVE = {}
@@ -985,15 +1212,14 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(runtime_started.wait(), timeout=1)
             result = await agent_server.stop_turn("chat-native")
 
-        self.assertFalse(result["stopped"])
-        self.assertTrue(result["pending"])
-        self.assertFalse(request_task.done())
-        self.assertIn("chat-native", agent_server.BUSY_SESSIONS)
-        self.assertIn("chat-native", agent_server.STOP_REQUESTS)
-        events.assert_not_awaited()
-        request_task.cancel()
+        self.assertTrue(result["stopped"])
+        self.assertFalse(result["pending"])
+        self.assertTrue(result["hard_stop"])
+        self.assertTrue(request_task.cancelled())
+        self.assertNotIn("chat-native", agent_server.BUSY_SESSIONS)
+        self.assertNotIn("chat-native", agent_server.STOP_REQUESTS)
+        events.assert_awaited_once()
         await asyncio.gather(request_task, return_exceptions=True)
-        await agent_server.release_turn_slot("chat-native")
 
     async def test_stop_cancels_a_native_control_before_active_binding(self) -> None:
         agent_server.ACTIVE = {}
@@ -1031,15 +1257,14 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(manager_started.wait(), timeout=1)
             result = await agent_server.stop_turn("chat-native")
 
-        self.assertFalse(result["stopped"])
-        self.assertTrue(result["pending"])
-        self.assertFalse(request_task.done())
-        self.assertIn("chat-native", agent_server.BUSY_SESSIONS)
-        self.assertIn("chat-native", agent_server.STOP_REQUESTS)
-        events.assert_not_awaited()
-        request_task.cancel()
+        self.assertTrue(result["stopped"])
+        self.assertFalse(result["pending"])
+        self.assertTrue(result["hard_stop"])
+        self.assertTrue(request_task.cancelled())
+        self.assertNotIn("chat-native", agent_server.BUSY_SESSIONS)
+        self.assertNotIn("chat-native", agent_server.STOP_REQUESTS)
+        events.assert_awaited_once()
         await asyncio.gather(request_task, return_exceptions=True)
-        await agent_server.release_turn_slot("chat-native")
 
     async def test_stop_releases_a_busy_orphan_with_no_owner(self) -> None:
         events = AsyncMock(return_value={})
@@ -1121,7 +1346,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["pending"])
         events.assert_not_awaited()
 
-    async def test_stop_keeps_an_accepted_turn_active_until_provider_terminalizes(self) -> None:
+    async def test_stop_hard_terminalizes_a_stale_accepted_turn(self) -> None:
         turn = FakeTurn()
         runner_task = asyncio.create_task(asyncio.Event().wait())
         agent_server.ACTIVE["chat-native"] = {
@@ -1132,7 +1357,62 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             "provider_session_id": "thread-native",
             "codex_app_server_turn": turn,
         }
+        self.session["active_run"] = {"run_id": "run-original"}
         events = AsyncMock(return_value={})
+        quarantine = AsyncMock(return_value=True)
+        try:
+            with (
+                patch.object(
+                    agent_server,
+                    "SESSION_TURN_TASKS",
+                    {"chat-native": {runner_task}},
+                ),
+                patch.object(
+                    agent_server,
+                    "STOP_CONFIRM_TIMEOUT_SECONDS",
+                    0.01,
+                ),
+                    patch.object(agent_server, "append_event", events),
+                    patch.object(
+                        agent_server,
+                        "quarantine_codex_goal_thread",
+                        quarantine,
+                    ),
+                ):
+                result = await agent_server.stop_turn("chat-native")
+        finally:
+            runner_task.cancel()
+            await asyncio.gather(runner_task, return_exceptions=True)
+
+        self.assertTrue(result["stopped"])
+        self.assertFalse(result["pending"])
+        self.assertTrue(result["hard_stop"])
+        self.assertEqual(turn.interrupt_calls, 1)
+        self.assertNotIn("chat-native", agent_server.ACTIVE)
+        self.assertNotIn("chat-native", agent_server.BUSY_SESSIONS)
+        quarantine.assert_awaited_once()
+        events.assert_awaited_once_with(
+            "chat-native",
+            "turn_stopped",
+            unittest.mock.ANY,
+        )
+
+    async def test_stop_hard_terminalizes_a_stalled_steering_transition(self) -> None:
+        turn = FakeTurn()
+        runner_task = asyncio.create_task(asyncio.Event().wait())
+        transition_ready = asyncio.Event()
+        agent_server.ACTIVE["chat-native"] = {
+            "run_id": "run-original",
+            "backend": agent_server.BACKEND_CODEX,
+            "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
+            "provider_turn_ready": True,
+            "provider_session_id": "thread-native",
+            "codex_app_server_turn": turn,
+            "logical_transition_ready": transition_ready,
+        }
+        self.session["active_run"] = {"run_id": "run-original"}
+        events = AsyncMock(return_value={})
+        quarantine = AsyncMock(return_value=True)
         try:
             with (
                 patch.object(
@@ -1146,21 +1426,120 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                     0.01,
                 ),
                 patch.object(agent_server, "append_event", events),
+                patch.object(
+                    agent_server,
+                    "quarantine_codex_goal_thread",
+                    quarantine,
+                ),
             ):
                 result = await agent_server.stop_turn("chat-native")
         finally:
             runner_task.cancel()
             await asyncio.gather(runner_task, return_exceptions=True)
 
-        self.assertFalse(result["stopped"])
-        self.assertTrue(result["pending"])
-        self.assertEqual(turn.interrupt_calls, 1)
-        self.assertFalse(
-            agent_server.ACTIVE["chat-native"]["native_interrupt_sent"]
-        )
-        events.assert_not_awaited()
+        self.assertTrue(result["stopped"])
+        self.assertFalse(result["pending"])
+        self.assertTrue(result["hard_stop"])
+        self.assertTrue(runner_task.cancelled())
+        self.assertNotIn("chat-native", agent_server.ACTIVE)
+        self.assertNotIn("chat-native", agent_server.BUSY_SESSIONS)
+        quarantine.assert_awaited_once()
+        events.assert_awaited_once()
 
-    async def test_stop_keeps_a_native_control_owner_active_during_provider_start(self) -> None:
+    async def test_delayed_old_cleanup_cannot_clear_a_replacement_turn(self) -> None:
+        agent_server.ACTIVE["chat-native"] = {
+            "run_id": "run-replacement",
+            "backend": agent_server.BACKEND_CODEX,
+        }
+        agent_server.BUSY_SESSIONS = {"chat-native"}
+        agent_server.CURRENT_TURNS["chat-native"] = {
+            "run_id": "run-replacement",
+            "backend": agent_server.BACKEND_CODEX,
+        }
+
+        released = await agent_server.release_turn_slot(
+            "chat-native",
+            expected_run_id="run-original",
+        )
+
+        self.assertFalse(released)
+        self.assertEqual(
+            agent_server.ACTIVE["chat-native"]["run_id"],
+            "run-replacement",
+        )
+        self.assertIn("chat-native", agent_server.BUSY_SESSIONS)
+        self.assertEqual(
+            agent_server.CURRENT_TURNS["chat-native"]["run_id"],
+            "run-replacement",
+        )
+
+    async def test_delayed_native_control_unpin_cannot_clear_replacement(self) -> None:
+        manager = Mock()
+        unpin_started = asyncio.Event()
+        finish_unpin = asyncio.Event()
+
+        async def delayed_unpin(_manager: object, _thread_id: str) -> None:
+            unpin_started.set()
+            await finish_unpin.wait()
+
+        agent_server.ACTIVE["chat-native"] = {
+            "run_id": None,
+            "backend": agent_server.BACKEND_CODEX,
+            "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
+            "provider_thread_id": "thread-old",
+            "codex_native_operation": True,
+        }
+        agent_server.BUSY_SESSIONS = {"chat-native"}
+        agent_server.CURRENT_TURNS["chat-native"] = {
+            "run_id": None,
+            "backend": agent_server.BACKEND_CODEX,
+            "purpose": "codex_native_control",
+        }
+        with (
+            patch.object(
+                agent_server,
+                "release_codex_interactive_control_lease",
+            ),
+            patch.object(
+                agent_server,
+                "unpin_codex_app_server_thread",
+                side_effect=delayed_unpin,
+            ),
+        ):
+            cleanup = asyncio.create_task(
+                agent_server.release_codex_control_thread(
+                    "chat-native",
+                    manager,
+                    "thread-old",
+                    reserved_session=True,
+                )
+            )
+            await unpin_started.wait()
+            agent_server.ACTIVE["chat-native"] = {
+                "run_id": "run-replacement",
+                "backend": agent_server.BACKEND_CODEX,
+                "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
+                "provider_thread_id": "thread-new",
+                "codex_native_operation": False,
+            }
+            agent_server.CURRENT_TURNS["chat-native"] = {
+                "run_id": "run-replacement",
+                "backend": agent_server.BACKEND_CODEX,
+            }
+            finish_unpin.set()
+            await cleanup
+
+        self.assertEqual(
+            agent_server.ACTIVE["chat-native"]["run_id"],
+            "run-replacement",
+        )
+        self.assertIn("chat-native", agent_server.BUSY_SESSIONS)
+        self.assertEqual(
+            agent_server.CURRENT_TURNS["chat-native"]["run_id"],
+            "run-replacement",
+        )
+
+    async def test_stop_hard_terminalizes_a_stale_native_control_owner(self) -> None:
         owner_task = asyncio.create_task(asyncio.Event().wait())
         agent_server.ACTIVE["chat-native"] = {
             "run_id": None,
@@ -1172,6 +1551,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             "owner_task": owner_task,
         }
         events = AsyncMock(return_value={})
+        quarantine = AsyncMock(return_value=True)
         try:
             with (
                 patch.object(agent_server, "SESSION_TURN_TASKS", {}),
@@ -1180,17 +1560,26 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                     "STOP_CONFIRM_TIMEOUT_SECONDS",
                     0.01,
                 ),
-                patch.object(agent_server, "append_event", events),
-            ):
+                    patch.object(agent_server, "append_event", events),
+                    patch.object(
+                        agent_server,
+                        "quarantine_codex_goal_thread",
+                        quarantine,
+                    ),
+                ):
                 result = await agent_server.stop_turn("chat-native")
         finally:
             owner_task.cancel()
             await asyncio.gather(owner_task, return_exceptions=True)
 
-        self.assertFalse(result["stopped"])
-        self.assertTrue(result["pending"])
-        self.assertIn("chat-native", agent_server.ACTIVE)
-        events.assert_not_awaited()
+        self.assertTrue(result["stopped"])
+        self.assertFalse(result["pending"])
+        self.assertTrue(result["hard_stop"])
+        self.assertTrue(owner_task.cancelled())
+        self.assertNotIn("chat-native", agent_server.ACTIVE)
+        self.assertNotIn("chat-native", agent_server.BUSY_SESSIONS)
+        quarantine.assert_awaited_once()
+        events.assert_awaited_once()
 
     def test_collaboration_wait_is_not_projected_as_a_subagent(self) -> None:
         tool = agent_server.codex_app_server_tool({

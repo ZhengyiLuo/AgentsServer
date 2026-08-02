@@ -352,7 +352,7 @@ class ClaudeSubagentSnapshotTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response["subagents"], [])
         self.assertEqual(offload.await_count, 1)
-        self.assertIs(offload.await_args.args[0], agent_server.build_claude_subagent_snapshot)
+        self.assertIs(offload.await_args.args[0], agent_server.build_subagent_snapshot)
         self.assertEqual(offload.await_args.args[1:], (self.session_id, 12))
         self.assertEqual(raised.exception.status_code, 404)
 

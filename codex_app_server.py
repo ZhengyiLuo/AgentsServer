@@ -951,9 +951,16 @@ class CodexAppServerClient:
             self._loaded_threads.discard(thread_id)
 
         active_turn = self._turns_by_thread.get(thread_id)
-        if active_turn and turn_id and not active_turn.turn_id:
-            active_turn.turn_id = turn_id
-            active_turn._subscription.turn_id = turn_id
+        if active_turn and turn_id:
+            # A provisional turn may receive an item notification before the
+            # turn/start response binds its id.  Once bound, only an explicit
+            # turn/started notification may move the handle to another turn.
+            # Native goals continue a thread by starting follow-up turns, so
+            # keeping this id current is required for both event routing and
+            # turn/interrupt to target the work that is actually running.
+            if not active_turn.turn_id or method == "turn/started":
+                active_turn.turn_id = turn_id
+                active_turn._subscription.turn_id = turn_id
 
         for subscription in tuple(self._subscriptions):
             if subscription._matches(notification):
@@ -1238,6 +1245,74 @@ class CodexAppServerClient:
                 safe_to_retry=False,
             )
         return [turn for turn in data if isinstance(turn, dict)]
+
+    async def list_descendant_threads(
+        self,
+        thread_id: str,
+        *,
+        page_size: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return every persisted subagent descendant of ``thread_id``.
+
+        Relationship filters are part of app-server's experimental API. The
+        client enables that capability during initialization, so using the
+        ancestor filter is both cheaper and more accurate than reconstructing
+        the spawn tree from transcript items.
+        """
+
+        thread_id = _require_nonempty_string(thread_id, "thread_id")
+        if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size < 1:
+            raise ValueError("page_size must be a positive integer")
+
+        method = "thread/list"
+        descendants: list[dict[str, Any]] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        while True:
+            params: dict[str, Any] = {
+                "ancestorThreadId": thread_id,
+                "limit": page_size,
+                "useStateDbOnly": True,
+                # Relationship-filtered requests must opt into subagent source
+                # kinds. The ordinary omitted/default source filter is limited
+                # to interactive threads on older app-server releases.
+                "sourceKinds": [
+                    "subAgent",
+                    "subAgentReview",
+                    "subAgentCompact",
+                    "subAgentThreadSpawn",
+                    "subAgentOther",
+                ],
+            }
+            if cursor is not None:
+                params["cursor"] = cursor
+            result = _protocol_object(method, await self.request(method, params))
+            data = result.get("data")
+            if not isinstance(data, list):
+                raise CodexAppServerProtocolError(
+                    f"{method} did not return a thread list",
+                    request_sent=True,
+                    safe_to_retry=False,
+                )
+            for thread in data:
+                if not isinstance(thread, dict) or not str(thread.get("id") or "").strip():
+                    raise CodexAppServerProtocolError(
+                        f"{method} returned an invalid thread",
+                        request_sent=True,
+                        safe_to_retry=False,
+                    )
+                descendants.append(dict(thread))
+
+            cursor = _protocol_cursor(method, result)
+            if cursor is None:
+                return descendants
+            if cursor in seen_cursors:
+                raise CodexAppServerProtocolError(
+                    f"{method} repeated a pagination cursor",
+                    request_sent=True,
+                    safe_to_retry=False,
+                )
+            seen_cursors.add(cursor)
 
     async def list_permission_profiles(
         self,
@@ -1942,6 +2017,17 @@ class CodexAppServerManager:
             limit=limit,
             items_view=items_view,
             sort_direction=sort_direction,
+        )
+
+    async def list_descendant_threads(
+        self,
+        thread_id: str,
+        *,
+        page_size: int = 100,
+    ) -> list[dict[str, Any]]:
+        return await self.client.list_descendant_threads(
+            thread_id,
+            page_size=page_size,
         )
 
     async def list_permission_profiles(

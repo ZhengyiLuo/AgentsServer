@@ -411,6 +411,8 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
 
         self.assertTrue(stop_turn.await_args.kwargs["require_provider_turn_ready"])
+        self.assertFalse(stop_turn.await_args.kwargs["cascade_codex_subagents"])
+        self.assertFalse(stop_turn.await_args.kwargs["hard_terminalize_on_timeout"])
         promoted = agent_server.RUN_NOW_TURNS["chat-1"]
         self.assertFalse(result["replays_interrupted_message"])
         self.assertEqual(promoted["prompt"], "Change course now.")
@@ -489,6 +491,7 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["deferred"])
         self.assertFalse(result["interrupted"])
         self.assertTrue(stop_turn.await_args.kwargs["require_provider_turn_ready"])
+        self.assertFalse(stop_turn.await_args.kwargs["hard_terminalize_on_timeout"])
         self.assertNotIn("chat-1", agent_server.RUN_NOW_TURNS)
         self.assertNotIn("chat-1", agent_server.STEERING_SESSIONS)
         self.assertEqual(

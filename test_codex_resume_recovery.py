@@ -78,6 +78,8 @@ class CodexResumeRecoveryTests(unittest.TestCase):
 
     def test_resume_error_classifier_is_narrow(self) -> None:
         self.assertTrue(is_codex_resume_failure("thread not found"))
+        self.assertTrue(is_codex_resume_failure("unknown thread id"))
+        self.assertTrue(is_codex_resume_failure("thread is not loaded"))
         self.assertTrue(is_codex_resume_failure("Unable to resume session"))
         self.assertFalse(is_codex_resume_failure("timed out waiting for cloud requirements"))
 

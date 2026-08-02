@@ -18,6 +18,7 @@ import fcntl
 import glob
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import math
@@ -60,6 +61,7 @@ from codex_app_server import (
     CodexAppServerDisconnected,
     CodexAppServerError,
     CodexAppServerManager,
+    CodexAppServerProtocolError,
     CodexAppServerRequestError,
     CodexAppServerSubscriptionClosed,
     decline_server_request,
@@ -309,6 +311,10 @@ MAX_CODEX_APPROVAL_ITEM_CACHE = 256
 CODEX_PERMISSION_PROFILES_CACHE_SECONDS = 60.0
 CODEX_SESSION_CLEANUP_TIMEOUT_SECONDS = 15.0
 STOP_CONFIRM_TIMEOUT_SECONDS = 5.0
+CODEX_GOAL_CONTROL_TIMEOUT_SECONDS = max(
+    0.1,
+    float(agentsdock_setting("CODEX_GOAL_CONTROL_TIMEOUT_SECONDS", "5")),
+)
 HANDOFF_DIGEST_TIMEOUT_SECONDS = int(agentsdock_setting("HANDOFF_DIGEST_TIMEOUT_SECONDS", "180"))
 HANDOFF_DIGEST_BACKEND = agentsdock_setting("HANDOFF_DIGEST_BACKEND", BACKEND_CLAUDE).lower()
 if HANDOFF_DIGEST_BACKEND not in VALID_BACKENDS:
@@ -2864,6 +2870,7 @@ class TurnRequest(BaseModel):
     purpose: str | None = None
     job_id: str | None = None
     job_title: str | None = None
+    job_scheduled_run_at: float | None = None
     digest_job_id: str | None = None
     digest_detail: str | None = None
     source_session_id: str | None = None
@@ -3274,6 +3281,8 @@ class SessionStore:
         DELETING_SESSIONS.clear()
         DELETED_SESSION_TOMBSTONES.clear()
         CODEX_THREAD_SESSION_INDEX.clear()
+        CODEX_SUBAGENT_SESSION_INDEX.clear()
+        CODEX_SUBAGENT_STATE.clear()
         if SESSIONS_FILE.exists():
             try:
                 self.sessions = json.loads(SESSIONS_FILE.read_text())
@@ -3327,12 +3336,31 @@ class SessionStore:
                     if sess.get(key) != value:
                         sess[key] = value
                         runtime_changed = True
+                cached_goal = sess.get("codex_goal")
+                if (
+                    isinstance(cached_goal, dict)
+                    and str(cached_goal.get("status") or "") == "active"
+                ):
+                    # A server restart destroys the local run owner. Preserve
+                    # the objective, but never advertise it as actively
+                    # running until the provider thread has been reconciled.
+                    sess["codex_goal"] = {
+                        **cached_goal,
+                        "status": "paused",
+                    }
+                    sess["_codex_goal_reconciliation_required"] = {
+                        "thread_id": provider_id or None,
+                        "recorded_at": now_iso(),
+                        "reason": "AgentsServer restarted without a live run owner.",
+                    }
+                    runtime_changed = True
                 if "_codex_token_usage_terminal" in sess:
                     # This marker coordinates independently dispatched live
                     # notifications and has no meaning after process restart.
                     sess.pop("_codex_token_usage_terminal", None)
                     runtime_changed = True
         await self.ensure_sort_orders()
+        rebuild_codex_subagent_indexes()
         if runtime_changed:
             await self.save()
 
@@ -4250,6 +4278,11 @@ class JobStore:
         job = self.jobs.get(jid)
         if not job:
             raise HTTPException(status_code=404, detail="job not found")
+        scheduled_run_at = float(
+            job.get("scheduled_run_at")
+            or job.get("next_run_at")
+            or time.time()
+        )
         req = TurnRequest(
             prompt=job["prompt"],
             file_ids=[],
@@ -4257,6 +4290,7 @@ class JobStore:
             purpose="scheduled_job",
             job_id=jid,
             job_title=str(job.get("title") or jid),
+            job_scheduled_run_at=scheduled_run_at,
         )
         context_mode = job_context_mode(job)
         result = await start_turn(
@@ -4271,6 +4305,7 @@ class JobStore:
             "job": ran_job,
             "job_id": jid,
             "run_id": result["run_id"],
+            "job_scheduled_run_at": scheduled_run_at,
             "context_mode": context_mode,
             "message": f"Scheduled job ran: {ran_job.get('title') or jid}",
         })
@@ -4448,6 +4483,17 @@ CODEX_APP_SERVER_THREAD_PIN_COUNTS: dict[str, int] = {}
 CODEX_APP_SERVER_EVICTING_THREADS: dict[str, asyncio.Event] = {}
 CODEX_APP_SERVER_THREAD_LRU_LOCK = asyncio.Lock()
 CODEX_THREAD_SESSION_INDEX: dict[str, str] = {}
+# A persisted thread goal belongs to the provider thread, while AgentsDock's
+# session cache survives provider-process restarts. Remember which app-server
+# generation has been reconciled so a resumed thread is checked exactly once
+# per generation instead of trusting a stale local goal indefinitely.
+CODEX_GOAL_SYNC_GENERATIONS: dict[str, tuple[int, str]] = {}
+# Threads detached after a failed Stop remain fenced for the lifetime of the
+# provider process. Any late native goal continuation is interrupted instead
+# of being adopted as a new AgentsDock run.
+CODEX_QUARANTINED_GOAL_THREADS: dict[str, str] = {}
+CODEX_SUBAGENT_SESSION_INDEX: dict[str, str] = {}
+CODEX_SUBAGENT_STATE: dict[str, dict[str, Any]] = {}
 CODEX_PENDING_INTERACTIONS: dict[str, dict[str, Any]] = {}
 CODEX_PENDING_INTERACTIONS_LOCK = asyncio.Lock()
 CODEX_APPROVAL_ITEM_CACHE: OrderedDict[
@@ -4563,6 +4609,8 @@ def release_codex_interactive_control_lease(thread_id: str) -> None:
 
 async def reset_codex_ephemeral_runtime_metadata() -> None:
     """Clear process-owned Codex state after transport shutdown or restart."""
+    CODEX_GOAL_SYNC_GENERATIONS.clear()
+    CODEX_QUARANTINED_GOAL_THREADS.clear()
     changed = False
     async with STORE._lock:
         for session in STORE.sessions.values():
@@ -4577,6 +4625,21 @@ async def reset_codex_ephemeral_runtime_metadata() -> None:
                 if session.get(key) != value:
                     session[key] = value
                     changed = True
+            cached_goal = session.get("codex_goal")
+            if (
+                isinstance(cached_goal, dict)
+                and str(cached_goal.get("status") or "") == "active"
+            ):
+                session["codex_goal"] = {
+                    **cached_goal,
+                    "status": "paused",
+                }
+                session["_codex_goal_reconciliation_required"] = {
+                    "thread_id": str(session_provider_id(session) or "") or None,
+                    "recorded_at": now_iso(),
+                    "reason": "Codex app-server stopped without a live run owner.",
+                }
+                changed = True
             if "_codex_token_usage_terminal" in session:
                 session.pop("_codex_token_usage_terminal", None)
                 changed = True
@@ -5464,6 +5527,8 @@ async def _run_queued_turn_now_once(
             emit_event=False,
             schedule_queue=False,
             require_provider_turn_ready=True,
+            cascade_codex_subagents=False,
+            hard_terminalize_on_timeout=False,
         )
         interrupted = bool(stop_result.get("stopped") or stop_result.get("pending"))
         deferred = bool(stop_result.get("deferred"))
@@ -6393,9 +6458,6 @@ def working_tmux_bin(*, use_cache: bool = False) -> str | None:
 
 
 def tmux_bin() -> str:
-    # Every terminal operation already fails clearly if tmux disappears. Do
-    # not spawn an extra `tmux -V` process for every capture, resize, or key
-    # press; the cache is path-sensitive and expires quickly.
     found = working_tmux_bin(use_cache=True)
     if not found:
         raise HTTPException(status_code=503, detail="tmux is unavailable or not working on the agent server")
@@ -7547,12 +7609,41 @@ def client_safe_event(event: dict[str, Any]) -> dict[str, Any]:
     return safe
 
 
-async def release_turn_slot(session_id: str) -> None:
+async def release_turn_slot(
+    session_id: str,
+    *,
+    expected_run_id: str | None = None,
+) -> bool:
+    """Release a chat turn reservation without clearing a newer owner.
+
+    A forcibly cancelled app-server consumer can finish its cleanup after the
+    user has already started another turn.  Callers that own a concrete run
+    must provide it so that delayed cleanup from the old task cannot erase the
+    replacement turn's ACTIVE/BUSY bookkeeping.
+    """
+
     async with ACTIVE_LOCK:
+        if expected_run_id is not None:
+            active = ACTIVE.get(session_id)
+            current_turn = CURRENT_TURNS.get(session_id)
+            active_run_id = (
+                str(active.get("run_id") or "") if isinstance(active, dict) else ""
+            )
+            current_run_id = (
+                str(current_turn.get("run_id") or "")
+                if isinstance(current_turn, dict)
+                else ""
+            )
+            if (
+                (active_run_id and active_run_id != expected_run_id)
+                or (current_run_id and current_run_id != expected_run_id)
+            ):
+                return False
         ACTIVE.pop(session_id, None)
         BUSY_SESSIONS.discard(session_id)
         CURRENT_TURNS.pop(session_id, None)
         STOP_REQUESTS.discard(session_id)
+        return True
 
 
 async def clear_active_process(session_id: str) -> None:
@@ -7941,13 +8032,384 @@ def normalize_subagent_status(value: Any) -> str:
     status = str(value or "").strip().lower()
     if status in {"completed", "complete", "done"}:
         return "completed"
-    if status in {"failed", "error"}:
+    if status in {"failed", "error", "errored", "systemerror", "notfound"}:
         return "failed"
-    if status in {"stopped", "cancelled", "canceled", "killed"}:
+    if status in {
+        "stopped",
+        "cancelled",
+        "canceled",
+        "killed",
+        "interrupted",
+        "shutdown",
+        "closed",
+    }:
         return "stopped"
-    if status in {"starting", "pending", "queued"}:
+    if status in {"starting", "pending", "pendinginit", "queued"}:
         return "starting"
     return "running"
+
+
+def session_codex_subagent_states(session_id: str) -> list[dict[str, Any]]:
+    """Read the bounded child index embedded in sessions.json metadata."""
+
+    session = STORE.sessions.get(session_id) or {}
+    value = session.get("codex_subagents")
+    if isinstance(value, dict):
+        return [dict(state) for state in value.values() if isinstance(state, dict)]
+    if isinstance(value, list):
+        return [dict(state) for state in value if isinstance(state, dict)]
+    return []
+
+
+def rebuild_codex_subagent_indexes() -> None:
+    """Restore child ownership/status indexes from durable timeline records."""
+
+    CODEX_SUBAGENT_SESSION_INDEX.clear()
+    CODEX_SUBAGENT_STATE.clear()
+    for session_id in STORE.sessions:
+        for state in session_codex_subagent_states(session_id):
+            if str(state.get("backend") or "") != BACKEND_CODEX:
+                continue
+            child_thread_id = str(state.get("subagent_id") or "").strip()
+            if not child_thread_id:
+                continue
+            CODEX_SUBAGENT_SESSION_INDEX[child_thread_id] = session_id
+            CODEX_SUBAGENT_STATE[child_thread_id] = dict(state)
+
+
+async def emit_codex_subagent_state(
+    session_id: str,
+    child_thread_id: str,
+    status: Any,
+    *,
+    parent_thread_id: str | None = None,
+    run_id: str | None = None,
+    tool_id: str | None = None,
+    name: Any = None,
+    activity: Any = None,
+    summary: Any = None,
+) -> dict[str, Any] | None:
+    """Persist one authoritative Codex child lifecycle transition."""
+
+    child_thread_id = str(child_thread_id or "").strip()
+    if not child_thread_id or session_id not in STORE.sessions:
+        return None
+    previous = CODEX_SUBAGENT_STATE.get(child_thread_id) or {}
+    if previous and str(previous.get("session_id") or "") != session_id:
+        previous = {}
+    normalized = normalize_subagent_status(status or previous.get("subagent_status"))
+    clean_name = compact_subagent_text(name) or str(previous.get("subagent_name") or "")
+    clean_name = clean_name or "Codex subagent"
+    clean_activity = compact_subagent_text(activity)
+    clean_summary = compact_subagent_text(summary)
+    resolved_parent = str(
+        parent_thread_id
+        or previous.get("subagent_parent_thread_id")
+        or session_provider_id(STORE.sessions.get(session_id) or {})
+        or ""
+    ).strip()
+    resolved_run = str(run_id or previous.get("run_id") or "").strip() or None
+    started_at = str(previous.get("subagent_started_at") or previous.get("ts") or now_iso())
+    log = list(previous.get("subagent_log") or [])[-SUBAGENT_SNAPSHOT_LOG_LIMIT:]
+    if clean_activity and (not log or str(log[-1].get("text") or "") != clean_activity):
+        log.append({"ts": now_iso(), "text": clean_activity})
+        log = log[-SUBAGENT_SNAPSHOT_LOG_LIMIT:]
+
+    payload: dict[str, Any] = {
+        "run_id": resolved_run,
+        "backend": BACKEND_CODEX,
+        "subagent_id": child_thread_id,
+        "subagent_tool_id": str(
+            tool_id or previous.get("subagent_tool_id") or child_thread_id
+        ),
+        "subagent_name": clean_name,
+        "subagent_kind": "collaborator",
+        "subagent_status": normalized,
+        "subagent_activity": clean_activity or previous.get("subagent_activity"),
+        "subagent_summary": clean_summary or previous.get("subagent_summary"),
+        "subagent_started_at": started_at,
+        "subagent_provider_ref": child_thread_id,
+        "subagent_parent_thread_id": resolved_parent or None,
+        "subagent_log": log,
+    }
+    comparable_keys = (
+        "run_id",
+        "backend",
+        "subagent_id",
+        "subagent_tool_id",
+        "subagent_name",
+        "subagent_status",
+        "subagent_activity",
+        "subagent_summary",
+        "subagent_parent_thread_id",
+        "subagent_log",
+    )
+    if previous and all(previous.get(key) == payload.get(key) for key in comparable_keys):
+        CODEX_SUBAGENT_SESSION_INDEX[child_thread_id] = session_id
+        return previous
+
+    event = await append_event(session_id, "subagent_state", payload)
+    stored = {
+        "session_id": session_id,
+        "type": "subagent_state",
+        "ts": now_iso(),
+        **payload,
+        **(event if isinstance(event, dict) else {}),
+    }
+    CODEX_SUBAGENT_SESSION_INDEX[child_thread_id] = session_id
+    CODEX_SUBAGENT_STATE[child_thread_id] = stored
+    async with STORE._lock:
+        session = STORE.sessions.get(session_id)
+        if session is not None:
+            indexed = session.get("codex_subagents")
+            if not isinstance(indexed, dict):
+                indexed = {}
+            else:
+                indexed = dict(indexed)
+            indexed[child_thread_id] = stored
+            if len(indexed) > SUBAGENT_SNAPSHOT_STATE_LIMIT:
+                ordered = sorted(
+                    indexed.items(),
+                    key=lambda pair: int(pair[1].get("seq") or 0),
+                    reverse=True,
+                )[:SUBAGENT_SNAPSHOT_STATE_LIMIT]
+                indexed = dict(reversed(ordered))
+            session["codex_subagents"] = indexed
+            await STORE.save()
+    return stored
+
+
+def build_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str, Any]:
+    """Merge provider-native snapshots without relying on transcript inference."""
+
+    limit = max(1, min(int(limit or 64), SUBAGENT_SNAPSHOT_STATE_LIMIT))
+    merged: OrderedDict[str, dict[str, Any]] = OrderedDict()
+    session = STORE.sessions.get(session_id) or {}
+    if str(session.get("backend") or "") != BACKEND_CODEX:
+        claude = build_claude_subagent_snapshot(
+            session_id,
+            SUBAGENT_SNAPSHOT_STATE_LIMIT,
+        )
+        for state in claude.get("subagents") or []:
+            key = f"{str(state.get('backend') or BACKEND_CLAUDE)}:{state.get('subagent_id')}"
+            merged[key] = dict(state)
+    for state in CODEX_SUBAGENT_STATE.values():
+        if str(state.get("session_id") or "") != session_id:
+            continue
+        key = f"{str(state.get('backend') or '')}:{state.get('subagent_id')}"
+        merged[key] = dict(state)
+
+    active_statuses = {"starting", "running"}
+    retained = list(merged.values())
+    retained.sort(key=lambda state: (
+        0 if normalize_subagent_status(state.get("subagent_status")) in active_statuses else 1,
+        -int(state.get("seq") or 0),
+    ))
+    selected = retained[:limit]
+    return {
+        "session_id": session_id,
+        "subagents": selected,
+        "count": len(retained),
+        "active_count": sum(
+            normalize_subagent_status(state.get("subagent_status")) in active_statuses
+            for state in retained
+        ),
+        "latest_seq": max((int(state.get("seq") or 0) for state in retained), default=0),
+    }
+
+
+def codex_child_status_from_turn(turn: Any) -> str | None:
+    if not isinstance(turn, dict):
+        return None
+    status = str(turn.get("status") or "").strip()
+    if status == "inProgress":
+        return "running"
+    if status in {"completed", "interrupted", "failed"}:
+        return normalize_subagent_status(status)
+    return None
+
+
+async def reconcile_codex_subagents(
+    session_id: str,
+    manager: CodexAppServerManager | None = None,
+) -> dict[str, Any]:
+    """Refresh durable child states from app-server's persisted spawn tree."""
+
+    session = STORE.sessions.get(session_id) or {}
+    root_thread_id = str(session_provider_id(session) or "").strip()
+    manager = manager or CODEX_APP_SERVER_MANAGER
+    list_descendants = getattr(manager, "list_descendant_threads", None)
+    if not root_thread_id or manager is None or not callable(list_descendants):
+        return {"reconciled": 0, "descendants": 0}
+    try:
+        descendants = await list_descendants(root_thread_id)
+    except Exception as exc:
+        logger.warning(
+            "Codex subagent reconciliation failed session=%s thread=%s error=%s",
+            session_id,
+            root_thread_id,
+            concise_error_message(exc),
+        )
+        return {"reconciled": 0, "descendants": 0, "error": concise_error_message(exc)}
+    if not isinstance(descendants, list):
+        return {"reconciled": 0, "descendants": 0}
+
+    reconciled = 0
+    for thread in descendants:
+        if not isinstance(thread, dict):
+            continue
+        child_thread_id = str(thread.get("id") or "").strip()
+        if not child_thread_id:
+            continue
+        CODEX_SUBAGENT_SESSION_INDEX[child_thread_id] = session_id
+        previous = CODEX_SUBAGENT_STATE.get(child_thread_id) or {}
+        status = codex_child_status_from_thread(thread.get("status"))
+        turns = thread.get("turns") if isinstance(thread.get("turns"), list) else []
+        latest_turn = turns[0] if turns else None
+        status = codex_child_status_from_turn(latest_turn) or status
+        thread_status_type = str(
+            (thread.get("status") or {}).get("type")
+            if isinstance(thread.get("status"), dict)
+            else ""
+        )
+        if status is None and thread_status_type == "notLoaded":
+            previous_status = normalize_subagent_status(previous.get("subagent_status"))
+            status = previous_status if previous_status not in {"starting", "running"} else "completed"
+        if status is None:
+            # Unknown states must not manufacture an immortal active card.
+            status = "completed"
+        await emit_codex_subagent_state(
+            session_id,
+            child_thread_id,
+            status,
+            parent_thread_id=str(thread.get("parentThreadId") or root_thread_id),
+            name=thread.get("preview"),
+            activity=f"Subagent {status}",
+        )
+        reconciled += 1
+    return {"reconciled": reconciled, "descendants": len(descendants)}
+
+
+async def stop_codex_descendant_subagents(
+    session_id: str,
+    root_thread_id: str,
+    *,
+    manager: CodexAppServerManager | None = None,
+    target_thread_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    """Interrupt active descendant turns without touching the parent turn."""
+
+    manager = manager or CODEX_APP_SERVER_MANAGER
+    list_descendants = getattr(manager, "list_descendant_threads", None)
+    list_turns = getattr(manager, "list_turns", None)
+    interrupt_turn = getattr(manager, "interrupt_turn", None)
+    if (
+        manager is None
+        or not root_thread_id
+        or not callable(list_descendants)
+        or not callable(list_turns)
+        or not callable(interrupt_turn)
+    ):
+        return {
+            "descendants": 0,
+            "requested": [],
+            "interrupted": [],
+            "pending": [],
+            "errors": [],
+        }
+    try:
+        descendants = await list_descendants(root_thread_id)
+    except Exception as exc:
+        return {
+            "descendants": 0,
+            "requested": [],
+            "interrupted": [],
+            "pending": [],
+            "errors": [concise_error_message(exc)],
+        }
+
+    requested: list[str] = []
+    interrupted: list[str] = []
+    errors: list[str] = []
+    pending: dict[str, dict[str, Any]] = {}
+    targets = {str(value) for value in target_thread_ids} if target_thread_ids else None
+    for thread in descendants if isinstance(descendants, list) else []:
+        if not isinstance(thread, dict):
+            continue
+        child_thread_id = str(thread.get("id") or "").strip()
+        if not child_thread_id or (targets is not None and child_thread_id not in targets):
+            continue
+        CODEX_SUBAGENT_SESSION_INDEX[child_thread_id] = session_id
+        try:
+            turns = await list_turns(
+                child_thread_id,
+                limit=4,
+                items_view="summary",
+                sort_direction="desc",
+            )
+            active_turns = [
+                turn for turn in turns
+                if isinstance(turn, dict)
+                and str(turn.get("status") or "") == "inProgress"
+                and str(turn.get("id") or "").strip()
+            ]
+            for turn in active_turns:
+                await interrupt_turn(child_thread_id, str(turn["id"]))
+            if active_turns:
+                requested.append(child_thread_id)
+                pending[child_thread_id] = thread
+                previous_status = normalize_subagent_status(
+                    (CODEX_SUBAGENT_STATE.get(child_thread_id) or {}).get("subagent_status")
+                )
+                await emit_codex_subagent_state(
+                    session_id,
+                    child_thread_id,
+                    previous_status if previous_status in {"starting", "running"} else "running",
+                    parent_thread_id=str(thread.get("parentThreadId") or root_thread_id),
+                    name=thread.get("preview"),
+                    activity="Stopping subagent…",
+                )
+        except Exception as exc:
+            errors.append(f"{child_thread_id}: {concise_error_message(exc)}")
+
+    deadline = asyncio.get_running_loop().time() + STOP_CONFIRM_TIMEOUT_SECONDS
+    while pending and asyncio.get_running_loop().time() < deadline:
+        for child_thread_id, thread in list(pending.items()):
+            try:
+                turns = await list_turns(
+                    child_thread_id,
+                    limit=1,
+                    items_view="summary",
+                    sort_direction="desc",
+                )
+            except Exception as exc:
+                errors.append(f"{child_thread_id}: {concise_error_message(exc)}")
+                pending.pop(child_thread_id, None)
+                continue
+            latest_turn = turns[0] if turns else None
+            status = codex_child_status_from_turn(latest_turn)
+            if status in {None, "running"}:
+                continue
+            await emit_codex_subagent_state(
+                session_id,
+                child_thread_id,
+                status,
+                parent_thread_id=str(thread.get("parentThreadId") or root_thread_id),
+                name=thread.get("preview"),
+                activity=f"Subagent {status}",
+            )
+            if status == "stopped":
+                interrupted.append(child_thread_id)
+            pending.pop(child_thread_id, None)
+        if pending:
+            await asyncio.sleep(0.05)
+    return {
+        "descendants": len(descendants) if isinstance(descendants, list) else 0,
+        "requested": requested,
+        "interrupted": interrupted,
+        "pending": list(pending),
+        "errors": errors,
+    }
 
 
 def claude_subagent_child_activity(raw: dict[str, Any]) -> str:
@@ -8608,6 +9070,7 @@ def job_run_history_event_snapshot(
         "purpose",
         "job_id",
         "job_title",
+        "job_scheduled_run_at",
         "backend",
         "message",
         "error",
@@ -8624,6 +9087,38 @@ def job_run_history_event_snapshot(
         if event.get(field) is not None
     }
     return snapshot
+
+
+def scheduled_job_occurrence_key(event: dict[str, Any]) -> str:
+    """Return the stable scheduler occurrence represented by an event.
+
+    A busy retry moves ``next_run_at`` but deliberately leaves
+    ``scheduled_run_at`` unchanged.  That canonical timestamp therefore
+    identifies all defer/error notices for the one pending occurrence without
+    conflating later scheduled executions of the same job.
+    """
+    explicit = str(event.get("job_occurrence_id") or "").strip()
+    if explicit:
+        return f"id:{explicit[:160]}"
+    job = event.get("job") if isinstance(event.get("job"), dict) else {}
+    scheduled_at = event.get("job_scheduled_run_at")
+    if scheduled_at is None:
+        scheduled_at = job.get("scheduled_run_at")
+    if scheduled_at is not None:
+        try:
+            numeric = float(scheduled_at)
+        except (TypeError, ValueError):
+            numeric = math.nan
+        if math.isfinite(numeric):
+            return f"scheduled:{numeric:.6f}"
+    scheduled_at_iso = str(
+        event.get("job_scheduled_run_at_iso")
+        or job.get("scheduled_run_at_iso")
+        or ""
+    ).strip()
+    if scheduled_at_iso:
+        return f"scheduled-iso:{scheduled_at_iso[:160]}"
+    return ""
 
 
 def scheduled_job_run_status(event: dict[str, Any]) -> str | None:
@@ -8893,6 +9388,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
         run_id = str(event.get("run_id") or "").strip()
         event_type = str(event.get("type") or "")
         status = scheduled_job_run_status(event)
+        occurrence_key = scheduled_job_occurrence_key(event)
         # Runless deferrals/failures are real scheduled attempts and belong in
         # lazy history, but job creation/deletion markers are not run history.
         if not run_id:
@@ -8901,16 +9397,36 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                 and not timeline_index_is_error(event)
             ):
                 return
-            history_key = f"status:{resolved_job_id}:{seq}"
+            history_key = (
+                f"status:{resolved_job_id}:occurrence:{occurrence_key}"
+                if occurrence_key
+                else f"status:{resolved_job_id}:{seq}"
+            )
         else:
             keys = run_history_keys_by_run_id.setdefault(run_id, [])
             if event_type == "turn_started":
-                base_key = f"run:{run_id}"
-                history_key = (
-                    base_key
-                    if not keys
-                    else f"{base_key}:start-{seq}"
+                occurrence_history_key = (
+                    f"status:{resolved_job_id}:occurrence:{occurrence_key}"
+                    if resolved_job_id and occurrence_key
+                    else ""
                 )
+                # Busy retries and the eventual execution are one scheduler
+                # occurrence. Reuse its runless history record once the turn
+                # finally starts, instead of showing both a deferred row and
+                # a completed row for the same tick.
+                if (
+                    occurrence_history_key
+                    and occurrence_history_key in run_history_records
+                ):
+                    history_key = occurrence_history_key
+                    run_history_records[history_key]["run_id"] = run_id
+                else:
+                    base_key = f"run:{run_id}"
+                    history_key = (
+                        base_key
+                        if not keys
+                        else f"{base_key}:start-{seq}"
+                    )
                 keys.append(history_key)
                 current_run_history_key[run_id] = history_key
             else:
@@ -12464,6 +12980,9 @@ def is_codex_resume_failure(message: str) -> bool:
             "no conversation found with session id",
             "conversation not found",
             "thread not found",
+            "unknown thread",
+            "thread does not exist",
+            "thread is not loaded",
             "session not found",
             "failed to resume",
             "could not resume",
@@ -12529,10 +13048,21 @@ async def rollover_codex_provider_session(
         return None
     snapshot = dict(current)
     memory = build_fork_memory(snapshot, session_id, reason=reason, exclude_run_id=run_id)
+    quarantined_goal_thread = False
     async with STORE._lock:
         current = STORE.sessions.get(session_id)
         if not current or session_provider_id(current) != provider_id:
             return None
+        current_goal = current.get("codex_goal")
+        if (
+            isinstance(current_goal, dict)
+            and str(current_goal.get("status") or "") == "active"
+        ):
+            # A provider rollover abandons the native thread. Keep the user's
+            # objective, but never claim it is actively running without a
+            # local owner; the replacement thread will receive it paused.
+            current["codex_goal"] = {**current_goal, "status": "paused"}
+            quarantined_goal_thread = True
         current["session_id"] = None
         current["codex_thread_id"] = None
         current.pop("codex_instruction_hash", None)
@@ -12550,6 +13080,9 @@ async def rollover_codex_provider_session(
         fresh_session = dict(current)
     if CODEX_THREAD_SESSION_INDEX.get(provider_id) == session_id:
         CODEX_THREAD_SESSION_INDEX.pop(provider_id, None)
+    CODEX_GOAL_SYNC_GENERATIONS.pop(session_id, None)
+    if quarantined_goal_thread:
+        CODEX_QUARANTINED_GOAL_THREADS[provider_id] = session_id
     await append_event(session_id, "provider_rollover", {
         "run_id": run_id,
         "backend": BACKEND_CODEX,
@@ -12773,6 +13306,16 @@ def codex_app_server_env() -> dict[str, str]:
 def codex_session_id_for_thread(thread_id: str) -> str | None:
     if not thread_id:
         return None
+    child_session_id = CODEX_SUBAGENT_SESSION_INDEX.get(thread_id)
+    if child_session_id:
+        if (
+            child_session_id in STORE.sessions
+            and child_session_id not in DELETING_SESSIONS
+            and child_session_id not in DELETED_SESSION_TOMBSTONES
+        ):
+            return child_session_id
+        CODEX_SUBAGENT_SESSION_INDEX.pop(thread_id, None)
+        CODEX_SUBAGENT_STATE.pop(thread_id, None)
     indexed = CODEX_THREAD_SESSION_INDEX.get(thread_id)
     if indexed:
         session = STORE.sessions.get(indexed)
@@ -13499,6 +14042,129 @@ def codex_thread_status_message(status: dict[str, Any]) -> str:
     return "Codex thread status changed."
 
 
+def codex_collaboration_thread_ids(item: dict[str, Any]) -> list[str]:
+    """Normalize legacy/current collaboration item receiver shapes."""
+
+    values = list(item.get("receiverThreadIds") or [])
+    for key in ("receiverThreadId", "newThreadId"):
+        if item.get(key):
+            values.append(item.get(key))
+    return list(dict.fromkeys(
+        str(value).strip() for value in values if str(value or "").strip()
+    ))
+
+
+def codex_collaboration_states(item: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    states: dict[str, dict[str, Any]] = {}
+    raw_states = item.get("agentsStates")
+    if isinstance(raw_states, dict):
+        for thread_id, state in raw_states.items():
+            clean_id = str(thread_id or "").strip()
+            if not clean_id:
+                continue
+            states[clean_id] = dict(state) if isinstance(state, dict) else {"status": state}
+    singular_status = item.get("agentStatus")
+    for thread_id in codex_collaboration_thread_ids(item):
+        if thread_id not in states and singular_status is not None:
+            states[thread_id] = (
+                dict(singular_status)
+                if isinstance(singular_status, dict)
+                else {"status": singular_status}
+            )
+    return states
+
+
+async def project_codex_subagent_item(
+    session_id: str,
+    parent_thread_id: str,
+    item: dict[str, Any],
+    *,
+    run_id: str | None,
+    completed: bool,
+) -> None:
+    item_type = str(item.get("type") or "")
+    if item_type == "subAgentActivity":
+        child_thread_id = str(item.get("agentThreadId") or "").strip()
+        kind = str(item.get("kind") or "").strip().lower()
+        status = "stopped" if kind == "interrupted" else "running"
+        activity = {
+            "started": "Subagent started",
+            "interacted": "Subagent activity",
+            "interrupted": "Subagent stopped",
+        }.get(kind, "Subagent activity")
+        await emit_codex_subagent_state(
+            session_id,
+            child_thread_id,
+            status,
+            parent_thread_id=parent_thread_id,
+            run_id=run_id,
+            tool_id=str(item.get("id") or "") or None,
+            name=item.get("agentPath"),
+            activity=activity,
+        )
+        return
+    if item_type not in {"collabAgentToolCall", "collabToolCall"}:
+        return
+
+    operation = re.sub(r"[^a-z0-9]", "", str(item.get("tool") or "").lower())
+    states = codex_collaboration_states(item)
+    receiver_ids = codex_collaboration_thread_ids(item)
+    child_ids = list(dict.fromkeys([*receiver_ids, *states.keys()]))
+    item_failed = str(item.get("status") or "").lower() in {
+        "failed", "declined", "cancelled", "canceled", "errored",
+    }
+    for child_thread_id in child_ids:
+        state = states.get(child_thread_id) or {}
+        state_status = state.get("status")
+        if state_status is None:
+            if item_failed:
+                state_status = "failed"
+            elif operation == "spawnagent":
+                state_status = "running" if completed else "starting"
+            elif operation in {"interruptagent", "closeagent"} and completed:
+                state_status = "stopped"
+            else:
+                state_status = (
+                    (CODEX_SUBAGENT_STATE.get(child_thread_id) or {}).get("subagent_status")
+                    or "running"
+                )
+        activity = compact_subagent_text(state.get("message"))
+        if not activity:
+            if operation == "spawnagent":
+                activity = "Subagent attached" if completed else "Starting subagent"
+            elif operation == "interruptagent":
+                activity = "Subagent stopped" if completed else "Stopping subagent"
+            elif operation == "closeagent":
+                activity = "Subagent closed" if completed else "Closing subagent"
+            elif operation in {"sendinput", "sendmessage", "followuptask", "resumeagent"}:
+                activity = "Subagent received follow-up"
+            else:
+                activity = "Subagent status updated"
+        await emit_codex_subagent_state(
+            session_id,
+            child_thread_id,
+            state_status,
+            parent_thread_id=str(item.get("senderThreadId") or parent_thread_id),
+            run_id=run_id,
+            tool_id=str(item.get("id") or "") or None,
+            activity=activity,
+            summary=state.get("message"),
+        )
+
+
+def codex_child_status_from_thread(status: Any) -> str | None:
+    if not isinstance(status, dict):
+        return None
+    status_type = str(status.get("type") or "").strip()
+    if status_type == "active":
+        return "running"
+    if status_type == "idle":
+        return "completed"
+    if status_type == "systemError":
+        return "failed"
+    return None
+
+
 async def project_codex_notification(notification: dict[str, Any]) -> None:
     """Project durable thread control state without duplicating turn output."""
     method = str(notification.get("method") or "")
@@ -13509,8 +14175,140 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
     )
     thread_id = str(params.get("threadId") or "")
     session_id = codex_session_id_for_thread(thread_id)
+    quarantined_session_id = CODEX_QUARANTINED_GOAL_THREADS.get(thread_id)
+    is_child_thread = bool(
+        session_id
+        and CODEX_SUBAGENT_SESSION_INDEX.get(thread_id) == session_id
+    )
+    if method == "turn/started" and thread_id and not is_child_thread:
+        owner_session_id = session_id or quarantined_session_id
+        if owner_session_id and not await codex_thread_has_local_run_owner(
+            owner_session_id,
+            thread_id,
+        ):
+            turn_value = (
+                params.get("turn")
+                if isinstance(params.get("turn"), dict)
+                else {}
+            )
+            turn_id = str(params.get("turnId") or turn_value.get("id") or "")
+            manager = CODEX_APP_SERVER_MANAGER
+            interrupt_ok = False
+            pause_ok = False
+            errors: list[str] = []
+            if manager is None:
+                errors.append("Codex app-server manager is unavailable")
+            else:
+                if turn_id:
+                    try:
+                        await manager.request(
+                            "turn/interrupt",
+                            {"threadId": thread_id, "turnId": turn_id},
+                            timeout=CODEX_GOAL_CONTROL_TIMEOUT_SECONDS,
+                        )
+                        interrupt_ok = True
+                    except Exception as exc:
+                        errors.append(
+                            f"interrupt failed: {concise_error_message(exc)}"
+                        )
+                else:
+                    errors.append("turn/started omitted the turn id")
+                try:
+                    paused_goal = await asyncio.wait_for(
+                        manager.set_thread_goal(thread_id, status="paused"),
+                        timeout=CODEX_GOAL_CONTROL_TIMEOUT_SECONDS,
+                    )
+                    pause_ok = bool(
+                        isinstance(paused_goal, dict)
+                        and str(paused_goal.get("status") or "") == "paused"
+                    )
+                    if not pause_ok:
+                        errors.append("goal pause returned non-paused state")
+                    elif session_id:
+                        await persist_reconciled_codex_goal(
+                            session_id,
+                            thread_id,
+                            paused_goal,
+                        )
+                except Exception as exc:
+                    errors.append(
+                        f"goal pause failed: {concise_error_message(exc)}"
+                    )
+            if session_id and (not interrupt_ok or not pause_ok):
+                await quarantine_codex_goal_thread(
+                    session_id,
+                    thread_id,
+                    reason=(
+                        "Ownerless Codex goal continuation could not be fully "
+                        "stopped: " + "; ".join(errors)
+                    ),
+                )
+            logger.warning(
+                "rejected ownerless Codex turn session=%s thread=%s turn=%s "
+                "interrupt_ok=%s pause_ok=%s errors=%s",
+                owner_session_id,
+                thread_id,
+                turn_id,
+                interrupt_ok,
+                pause_ok,
+                "; ".join(errors),
+            )
+            # Never project an ownerless provider continuation as chat work.
+            return
     if not session_id:
         return
+
+    if method in {"item/started", "item/completed"}:
+        item = params.get("item") if isinstance(params.get("item"), dict) else {}
+        if str(item.get("type") or "") in {
+            "collabAgentToolCall",
+            "collabToolCall",
+            "subAgentActivity",
+        }:
+            turn_id = str(params.get("turnId") or "") or None
+            run_id = await codex_notification_run_id(
+                session_id,
+                thread_id,
+                turn_id,
+            )
+            await project_codex_subagent_item(
+                session_id,
+                thread_id,
+                item,
+                run_id=run_id,
+                completed=method == "item/completed",
+            )
+            return
+
+    if is_child_thread:
+        if method == "thread/status/changed":
+            status = codex_child_status_from_thread(params.get("status"))
+            if status:
+                await emit_codex_subagent_state(
+                    session_id,
+                    thread_id,
+                    status,
+                    activity=f"Subagent {status}",
+                )
+            return
+        if method == "turn/completed":
+            completed_turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+            turn_status = str(completed_turn.get("status") or "failed")
+            await emit_codex_subagent_state(
+                session_id,
+                thread_id,
+                turn_status,
+                activity=f"Subagent {normalize_subagent_status(turn_status)}",
+            )
+            return
+        if method == "thread/closed":
+            await emit_codex_subagent_state(
+                session_id,
+                thread_id,
+                "stopped",
+                activity="Subagent closed",
+            )
+            return
 
     if method == "thread/status/changed":
         status = bounded_codex_interaction_value(params.get("status"), remaining=4_000)
@@ -13833,6 +14631,7 @@ async def close_codex_app_server_manager() -> None:
     CODEX_INTERACTIVE_CONTROL_THREADS.clear()
     CODEX_INTERACTIVE_CONTROL_THREAD_COUNTS.clear()
     CODEX_PERMISSION_PROFILES_CACHE.clear()
+    CODEX_QUARANTINED_GOAL_THREADS.clear()
     await reset_codex_ephemeral_runtime_metadata()
 
 
@@ -14022,7 +14821,11 @@ async def acquire_codex_control_thread(
             with suppress(Exception):
                 await unpin_codex_app_server_thread(manager, thread_id)
         if reserved:
-            await release_turn_slot(session_id)
+            await release_codex_control_slot(
+                session_id,
+                expected_thread_id=thread_id,
+                allow_prebind=True,
+            )
         if maintenance_reserved:
             async with ACTIVE_LOCK:
                 SERVER_MAINTENANCE_SESSIONS.discard(session_id)
@@ -14054,8 +14857,12 @@ async def release_codex_control_thread(
     with suppress(Exception):
         await unpin_codex_app_server_thread(manager, thread_id)
     if reserved_session:
-        await release_turn_slot(session_id)
-        if schedule_queue:
+        released = await release_codex_control_slot(
+            session_id,
+            expected_thread_id=thread_id,
+            allow_prebind=False,
+        )
+        if schedule_queue and released:
             schedule_next_queued_turn(session_id)
     else:
         async with ACTIVE_LOCK:
@@ -14063,6 +14870,50 @@ async def release_codex_control_thread(
             session_idle = session_id not in BUSY_SESSIONS
         if schedule_queue and session_idle:
             schedule_next_queued_turn(session_id)
+
+
+async def release_codex_control_slot(
+    session_id: str,
+    *,
+    expected_thread_id: str,
+    allow_prebind: bool = False,
+) -> bool:
+    """Release only the native-control reservation owned by this thread.
+
+    Native controls do not necessarily have a run id before their provider
+    turn starts.  A cancelled control may also remain blocked while unpinning
+    its thread; if a replacement turn starts meanwhile, its late cleanup must
+    not clear the replacement's ACTIVE/BUSY state.
+    """
+
+    expected = str(expected_thread_id or "").strip()
+    async with ACTIVE_LOCK:
+        active = ACTIVE.get(session_id)
+        current = CURRENT_TURNS.get(session_id)
+        if isinstance(active, dict):
+            active_thread = str(
+                active.get("provider_thread_id")
+                or active.get("provider_session_id")
+                or ""
+            ).strip()
+            owns_slot = bool(
+                active.get("codex_native_operation")
+                and expected
+                and active_thread == expected
+            )
+        else:
+            owns_slot = bool(
+                allow_prebind
+                and isinstance(current, dict)
+                and current.get("purpose") == "codex_native_control"
+            )
+        if not owns_slot:
+            return False
+        ACTIVE.pop(session_id, None)
+        BUSY_SESSIONS.discard(session_id)
+        CURRENT_TURNS.pop(session_id, None)
+        STOP_REQUESTS.discard(session_id)
+        return True
 
 
 def register_codex_native_action(
@@ -15367,6 +16218,204 @@ def codex_raw_developer_message(text: str) -> dict[str, Any]:
     }
 
 
+def codex_goal_api_is_unsupported(exc: BaseException) -> bool:
+    return isinstance(exc, CodexAppServerRequestError) and exc.code in {
+        -32600,
+        -32601,
+    }
+
+
+async def codex_thread_has_local_run_owner(
+    session_id: str,
+    thread_id: str,
+) -> bool:
+    """Return whether AgentsDock currently owns work on this exact thread.
+
+    A native goal and a provider thread status are durable control state, not
+    run ownership. Only the local BUSY/ACTIVE bookkeeping may authorize a
+    provider continuation.
+    """
+
+    async with ACTIVE_LOCK:
+        active = ACTIVE.get(session_id)
+        return bool(
+            session_id in BUSY_SESSIONS
+            and active
+            and active.get("backend") == BACKEND_CODEX
+            and active.get("transport") == CODEX_TRANSPORT_APP_SERVER
+            and str(
+                active.get("provider_thread_id")
+                or active.get("provider_session_id")
+                or ""
+            ).strip()
+            == thread_id
+        )
+
+
+async def persist_reconciled_codex_goal(
+    session_id: str,
+    thread_id: str,
+    goal: dict[str, Any] | None,
+    *,
+    allow_unbound_thread: bool = False,
+) -> bool:
+    """Persist provider-authoritative goal state without reordering the chat."""
+
+    changed = False
+    async with STORE._lock:
+        current = STORE.sessions.get(session_id)
+        if current is None:
+            return False
+        current_thread_id = str(session_provider_id(current) or "").strip()
+        if current_thread_id != thread_id and not (
+            allow_unbound_thread and not current_thread_id
+        ):
+            return False
+        if current.get("codex_goal") != goal:
+            current["codex_goal"] = goal
+            changed = True
+        if goal is None:
+            if current.get("codex_goal_time_budget_seconds") is not None:
+                current["codex_goal_time_budget_seconds"] = None
+                changed = True
+            if current.get("codex_goal_time_budget_exhausted") is not False:
+                current["codex_goal_time_budget_exhausted"] = False
+                changed = True
+        elif codex_goal_time_budget_is_exhausted(current):
+            if current.get("codex_goal_time_budget_exhausted") is not True:
+                current["codex_goal_time_budget_exhausted"] = True
+                changed = True
+        reconciliation = current.get("_codex_goal_reconciliation_required")
+        if isinstance(reconciliation, dict) and (
+            allow_unbound_thread
+            or str(reconciliation.get("replacement_thread_id") or "")
+            == thread_id
+            or str(reconciliation.get("thread_id") or "") == thread_id
+        ):
+            current.pop("_codex_goal_reconciliation_required", None)
+            changed = True
+        if changed:
+            await STORE.save()
+    return True
+
+
+async def reconcile_codex_thread_goal(
+    manager: CodexAppServerManager,
+    session_id: str,
+    thread_id: str,
+    *,
+    new_thread: bool = False,
+    force: bool = False,
+) -> dict[str, Any] | None:
+    """Reconcile cached and native goal state once per provider generation.
+
+    Existing threads are read from Codex because the local session cache may
+    predate a daemon restart. A fresh rollover thread receives the previous
+    objective in the paused state, so migration can never create ownerless
+    background work.
+    """
+
+    generation_value = getattr(manager, "generation", 0)
+    generation = generation_value if isinstance(generation_value, int) else 0
+    sync_key = (generation, thread_id)
+    session = STORE.sessions.get(session_id) or {}
+    if not force and CODEX_GOAL_SYNC_GENERATIONS.get(session_id) == sync_key:
+        cached = session.get("codex_goal")
+        return dict(cached) if isinstance(cached, dict) else None
+
+    cached_goal = session.get("codex_goal")
+    native_goal: dict[str, Any] | None
+    try:
+        if new_thread:
+            objective = (
+                str(cached_goal.get("objective") or "").strip()
+                if isinstance(cached_goal, dict)
+                else ""
+            )
+            if objective:
+                cached_status = str(cached_goal.get("status") or "")
+                migrated_status = (
+                    "paused"
+                    if cached_status == "active"
+                    else cached_status
+                    if cached_status in CODEX_GOAL_STATUSES
+                    else "paused"
+                )
+                kwargs: dict[str, Any] = {
+                    "objective": objective,
+                    # Never resume a migrated goal before a local turn owns it.
+                    "status": migrated_status,
+                }
+                token_budget = cached_goal.get("tokenBudget")
+                if token_budget is None:
+                    token_budget = cached_goal.get("token_budget")
+                if isinstance(token_budget, int) and not isinstance(
+                    token_budget, bool
+                ):
+                    kwargs["token_budget"] = token_budget
+                native_goal = await asyncio.wait_for(
+                    manager.set_thread_goal(thread_id, **kwargs),
+                    timeout=CODEX_GOAL_CONTROL_TIMEOUT_SECONDS,
+                )
+            else:
+                native_goal = None
+        else:
+            get_goal = getattr(manager, "get_thread_goal", None)
+            if get_goal is None:
+                # Test doubles and legacy managers without native goals keep
+                # the old behavior. Production managers always expose this.
+                CODEX_GOAL_SYNC_GENERATIONS[session_id] = sync_key
+                return dict(cached_goal) if isinstance(cached_goal, dict) else None
+            get_result = get_goal(thread_id)
+            if not inspect.isawaitable(get_result):
+                # Keep lightweight protocol test doubles compatible; a real
+                # Codex manager always returns an awaitable here.
+                CODEX_GOAL_SYNC_GENERATIONS[session_id] = sync_key
+                return dict(cached_goal) if isinstance(cached_goal, dict) else None
+            native_goal = await asyncio.wait_for(
+                get_result,
+                timeout=CODEX_GOAL_CONTROL_TIMEOUT_SECONDS,
+            )
+            if (
+                isinstance(native_goal, dict)
+                and str(native_goal.get("status") or "") == "active"
+                and not await codex_thread_has_local_run_owner(
+                    session_id,
+                    thread_id,
+                )
+            ):
+                native_goal = await asyncio.wait_for(
+                    manager.set_thread_goal(thread_id, status="paused"),
+                    timeout=CODEX_GOAL_CONTROL_TIMEOUT_SECONDS,
+                )
+    except Exception as exc:
+        if not codex_goal_api_is_unsupported(exc):
+            raise
+        logger.info(
+            "Codex goal reconciliation unsupported session=%s thread=%s",
+            session_id,
+            thread_id,
+        )
+        CODEX_GOAL_SYNC_GENERATIONS[session_id] = sync_key
+        return dict(cached_goal) if isinstance(cached_goal, dict) else None
+
+    if native_goal is not None and not isinstance(native_goal, dict):
+        raise CodexAppServerProtocolError(
+            "thread goal reconciliation returned invalid state",
+            request_sent=True,
+            safe_to_retry=False,
+        )
+    persisted = await persist_reconciled_codex_goal(
+        session_id,
+        thread_id,
+        native_goal,
+        allow_unbound_thread=new_thread,
+    )
+    if persisted:
+        CODEX_GOAL_SYNC_GENERATIONS[session_id] = sync_key
+    return native_goal
+
+
 async def ensure_codex_app_server_thread(
     manager: CodexAppServerManager,
     session_id: str,
@@ -15432,6 +16481,13 @@ async def ensure_codex_app_server_thread(
                 "excludeTurns": True,
             }
             provider_id = await manager.resume_thread(provider_id, resume_params)
+
+        await reconcile_codex_thread_goal(
+            manager,
+            session_id,
+            provider_id,
+            new_thread=not had_provider_id,
+        )
 
         # Current Codex releases can defer changed resume instructions until a
         # later turn. Inject the one-time migration as a developer item so the
@@ -16323,12 +17379,14 @@ async def run_claude(
             **run_event_metadata(run_id),
         })
         RUN_METADATA.pop(run_id, None)
-        await release_turn_slot(session_id)
+        await release_turn_slot(session_id, expected_run_id=run_id)
         schedule_next_queued_turn(session_id)
         return
     async with ACTIVE_LOCK:
         BUSY_SESSIONS.add(session_id)
-        stop_requested = session_id in STOP_REQUESTS
+        stop_requested = (
+            session_id in STOP_REQUESTS or run_id in STOPPED_RUNS
+        )
         if stop_requested:
             STOP_REQUESTS.discard(session_id)
             STOPPED_RUNS.add(run_id)
@@ -16488,7 +17546,7 @@ async def run_claude(
         **run_event_metadata(run_id),
     })
     RUN_METADATA.pop(run_id, None)
-    await release_turn_slot(session_id)
+    await release_turn_slot(session_id, expected_run_id=run_id)
     drain_queue = should_schedule_queue_after_finish(session_id, stopped)
     STOPPED_RUNS.discard(run_id)
     if drain_queue:
@@ -16525,14 +17583,10 @@ def codex_app_server_tool(item: dict[str, Any]) -> dict[str, Any] | None:
             "name": f"{namespace}/{name}",
             "input": item.get("arguments") or {},
         }
-    if item_type == "collabAgentToolCall":
+    if item_type in {"collabAgentToolCall", "collabToolCall"}:
         operation = str(item.get("tool") or "collaboration")
         normalized_operation = re.sub(r"[^a-z0-9]", "", operation.lower())
-        receiver_thread_ids = [
-            str(value)
-            for value in (item.get("receiverThreadIds") or [])
-            if str(value or "").strip()
-        ]
+        receiver_thread_ids = codex_collaboration_thread_ids(item)
         if normalized_operation == "spawnagent":
             return {
                 "id": item_id,
@@ -16587,8 +17641,15 @@ def codex_app_server_tool_output(
     if item_type in {"mcpToolCall", "dynamicToolCall"}:
         output = item.get("result") or item.get("contentItems") or item.get("error") or delta_text
         return output, None, is_error or bool(item.get("error")) or item.get("success") is False
-    if item_type == "collabAgentToolCall":
-        return item.get("agentsStates") or status or delta_text, None, is_error
+    if item_type in {"collabAgentToolCall", "collabToolCall"}:
+        return (
+            item.get("agentsStates")
+            or item.get("agentStatus")
+            or status
+            or delta_text,
+            None,
+            is_error,
+        )
     if item_type == "webSearch":
         return item.get("action") or item.get("query") or delta_text, None, is_error
     if item_type == "imageView":
@@ -16682,12 +17743,14 @@ async def run_codex_exec(
             **run_event_metadata(run_id),
         })
         RUN_METADATA.pop(run_id, None)
-        await release_turn_slot(session_id)
+        await release_turn_slot(session_id, expected_run_id=run_id)
         schedule_next_queued_turn(session_id)
         return
     async with ACTIVE_LOCK:
         BUSY_SESSIONS.add(session_id)
-        stop_requested = session_id in STOP_REQUESTS
+        stop_requested = (
+            session_id in STOP_REQUESTS or run_id in STOPPED_RUNS
+        )
         if stop_requested:
             STOP_REQUESTS.discard(session_id)
             STOPPED_RUNS.add(run_id)
@@ -17117,7 +18180,7 @@ async def run_codex_exec(
         **run_event_metadata(run_id),
     })
     RUN_METADATA.pop(run_id, None)
-    await release_turn_slot(session_id)
+    await release_turn_slot(session_id, expected_run_id=run_id)
     drain_queue = should_schedule_queue_after_finish(session_id, stopped)
     STOPPED_RUNS.discard(run_id)
     if drain_queue:
@@ -18217,7 +19280,9 @@ async def run_codex_app_server(
     try:
         await manager.start()
         async with ACTIVE_LOCK:
-            stop_requested = session_id in STOP_REQUESTS
+            stop_requested = (
+                session_id in STOP_REQUESTS or current_run_id in STOPPED_RUNS
+            )
             if stop_requested:
                 STOP_REQUESTS.discard(session_id)
                 STOPPED_RUNS.add(current_run_id)
@@ -18715,7 +19780,10 @@ async def run_codex_app_server(
     finally:
         RUN_METADATA.pop(current_run_id, None)
         try:
-            await release_turn_slot(session_id)
+            await release_turn_slot(
+                session_id,
+                expected_run_id=current_run_id,
+            )
         finally:
             if thread_pinned and provider_id:
                 await unpin_codex_app_server_thread(manager, provider_id)
@@ -18956,6 +20024,7 @@ async def _start_turn_locked(
             "purpose": req.purpose,
             "job_id": req.job_id,
             "job_title": req.job_title,
+            "job_scheduled_run_at": req.job_scheduled_run_at,
             "digest_job_id": req.digest_job_id,
             "digest_detail": req.digest_detail,
             "source_session_id": req.source_session_id,
@@ -19116,8 +20185,6 @@ def server_update_is_active(status: dict[str, Any]) -> bool:
     if str(status.get("phase") or "") not in SERVER_UPDATE_ACTIVE_PHASES:
         return False
     update_id = str(status.get("update_id") or "")
-    # tmux is optional. Treat a missing or broken binary as an absent detached
-    # updater instead of letting status polling raise from ``run_tmux``.
     if not update_id or working_tmux_bin(use_cache=True) is None:
         return False
     return run_tmux(["has-session", "-t", server_update_tmux_name(update_id)], check=False).returncode == 0
@@ -19702,7 +20769,18 @@ async def get_session_subagents(
 ) -> dict[str, Any]:
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
-    return await asyncio.to_thread(build_claude_subagent_snapshot, session_id, limit)
+    session = STORE.sessions[session_id]
+    if str(session.get("backend") or "") == BACKEND_CODEX and session_provider_id(session):
+        try:
+            manager = await codex_app_server_manager()
+            await reconcile_codex_subagents(session_id, manager)
+        except Exception as exc:
+            logger.warning(
+                "Codex subagent snapshot reconciliation failed session=%s error=%s",
+                session_id,
+                concise_error_message(exc),
+            )
+    return await asyncio.to_thread(build_subagent_snapshot, session_id, limit)
 
 
 @app.get("/api/sessions/{session_id}/search")
@@ -20213,7 +21291,10 @@ async def _put_codex_goal_locked(
                 kwargs["status"] = req.status
             if "token_budget" in fields_set:
                 kwargs["token_budget"] = req.token_budget
-            goal = await manager.set_thread_goal(thread_id, **kwargs)
+            goal = await asyncio.wait_for(
+                manager.set_thread_goal(thread_id, **kwargs),
+                timeout=CODEX_GOAL_CONTROL_TIMEOUT_SECONDS,
+            )
         if not isinstance(goal, dict):
             raise HTTPException(
                 status_code=409,
@@ -20274,6 +21355,11 @@ async def _put_codex_goal_locked(
             "time_budget_seconds": time_budget_seconds,
             "time_budget_exhausted": time_budget_exhausted,
         }
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="Codex goal update timed out. Retry the change.",
+        ) from exc
     except Exception as exc:
         if isinstance(exc, HTTPException):
             raise
@@ -20290,12 +21376,43 @@ async def delete_codex_goal(session_id: str) -> dict[str, Any]:
 
 
 async def _delete_codex_goal_locked(session_id: str) -> dict[str, Any]:
-    manager, thread_id, _session = await acquire_codex_control_thread(
-        session_id,
-        allow_active_goal_mutation=True,
-    )
+    def cleared_result() -> dict[str, Any]:
+        return {
+            "goal": None,
+            "time_budget_seconds": None,
+            "time_budget_exhausted": False,
+        }
+
     try:
-        await manager.clear_thread_goal(thread_id)
+        manager, thread_id, _session = await acquire_codex_control_thread(
+            session_id,
+            allow_active_goal_mutation=True,
+        )
+    except HTTPException as exc:
+        session = STORE.sessions.get(session_id) or {}
+        stale_thread_id = str(session_provider_id(session) or "").strip()
+        if stale_thread_id and is_codex_resume_failure(str(exc.detail or "")):
+            await quarantine_codex_goal_thread(
+                session_id,
+                stale_thread_id,
+                reason=(
+                    "Clearing the goal found a stale provider thread: "
+                    f"{concise_error_message(exc.detail)}"
+                ),
+                clear_goal=True,
+            )
+            return cleared_result()
+        raise
+    try:
+        # Generation reconciliation may already have established that the
+        # provider has no goal. In that case the user's requested terminal
+        # state is satisfied and another native call is unnecessary.
+        if (STORE.sessions.get(session_id) or {}).get("codex_goal") is None:
+            return cleared_result()
+        await asyncio.wait_for(
+            manager.clear_thread_goal(thread_id),
+            timeout=CODEX_GOAL_CONTROL_TIMEOUT_SECONDS,
+        )
         async with STORE._lock:
             current = STORE.sessions.get(session_id)
             if current:
@@ -20304,12 +21421,34 @@ async def _delete_codex_goal_locked(session_id: str) -> dict[str, Any]:
                 current["codex_goal_time_budget_exhausted"] = False
                 current["updated_at"] = now_iso()
                 await STORE.save()
-        return {
-            "goal": None,
-            "time_budget_seconds": None,
-            "time_budget_exhausted": False,
-        }
+        return cleared_result()
+    except asyncio.TimeoutError:
+        # The request may have reached Codex even though its response was lost.
+        # Explicit Clear is nevertheless an unambiguous user intent: detach the
+        # uncertain provider thread and clear local state so the goal cannot
+        # keep the chat stuck behind a retry-only UI.
+        await quarantine_codex_goal_thread(
+            session_id,
+            thread_id,
+            reason=(
+                "Clearing the Codex goal timed out; the provider result is "
+                "ambiguous, so the old thread was detached."
+            ),
+            clear_goal=True,
+        )
+        return cleared_result()
     except Exception as exc:
+        if is_codex_resume_failure(concise_error_message(exc)):
+            await quarantine_codex_goal_thread(
+                session_id,
+                thread_id,
+                reason=(
+                    "Clearing the goal found a stale provider thread: "
+                    f"{concise_error_message(exc)}"
+                ),
+                clear_goal=True,
+            )
+            return cleared_result()
         if isinstance(exc, HTTPException):
             raise
         raise codex_control_http_error(exc) from exc
@@ -20784,6 +21923,21 @@ async def delete_session(session_id: str) -> dict[str, Any]:
             async with ACTIVE_LOCK:
                 active = ACTIVE.get(session_id)
                 busy = session_id in BUSY_SESSIONS
+
+            if active and not active.get("codex_native_operation"):
+                goal_pause_ok, _goal_paused, goal_pause_error = (
+                    await pause_active_codex_goal_for_stop(session_id, active)
+                )
+                if not goal_pause_ok:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=goal_pause_error
+                        or "The active Codex goal could not be paused. Retry deletion.",
+                    )
+
+            async with ACTIVE_LOCK:
+                active = ACTIVE.get(session_id)
+                busy = session_id in BUSY_SESSIONS
                 if active and not active.get("codex_native_operation"):
                     active["stop_requested"] = True
                     if active.get("run_id"):
@@ -20864,6 +22018,15 @@ async def delete_session(session_id: str) -> dict[str, Any]:
                 for key in tuple(CODEX_APPROVAL_ITEM_CACHE):
                     if key[0] == provider_thread_id:
                         CODEX_APPROVAL_ITEM_CACHE.pop(key, None)
+            CODEX_GOAL_SYNC_GENERATIONS.pop(session_id, None)
+            for provider_thread_id, owner_session_id in tuple(
+                CODEX_QUARANTINED_GOAL_THREADS.items()
+            ):
+                if owner_session_id == session_id:
+                    CODEX_QUARANTINED_GOAL_THREADS.pop(
+                        provider_thread_id,
+                        None,
+                    )
             with suppress(Exception):
                 await asyncio.to_thread(kill_terminal_session, session_id)
             async with event_delivery_lock(session_id):
@@ -21027,12 +22190,266 @@ async def stop_turn_endpoint(session_id: str) -> dict[str, Any]:
     return await stop_turn(session_id)
 
 
+async def quarantine_codex_goal_thread(
+    session_id: str,
+    thread_id: str,
+    *,
+    reason: str,
+    run_id: str | None = None,
+    clear_goal: bool = False,
+) -> bool:
+    """Fence a provider thread whose goal state cannot be controlled.
+
+    Detaching the provider identity makes the next user turn start a fresh
+    thread. The old thread stays in a process-local denylist so late goal
+    continuations are interrupted. This is a recovery boundary, not evidence
+    that a run remains live.
+    """
+
+    thread_id = str(thread_id or "").strip()
+    if not thread_id:
+        CODEX_GOAL_SYNC_GENERATIONS.pop(session_id, None)
+        changed = False
+        async with STORE._lock:
+            current = STORE.sessions.get(session_id)
+            if current is None:
+                return False
+            goal = current.get("codex_goal")
+            if clear_goal:
+                if goal is not None:
+                    current["codex_goal"] = None
+                    changed = True
+                if current.get("codex_goal_time_budget_seconds") is not None:
+                    current["codex_goal_time_budget_seconds"] = None
+                    changed = True
+                if current.get("codex_goal_time_budget_exhausted") is not False:
+                    current["codex_goal_time_budget_exhausted"] = False
+                    changed = True
+            elif (
+                isinstance(goal, dict)
+                and str(goal.get("status") or "") != "paused"
+            ):
+                current["codex_goal"] = {**goal, "status": "paused"}
+                changed = True
+            marker = {
+                "thread_id": None,
+                "recorded_at": now_iso(),
+                "reason": compact_memory_text(reason, 1000),
+            }
+            current["_codex_goal_reconciliation_required"] = marker
+            changed = True
+            if changed:
+                await STORE.save()
+        return True
+    CODEX_QUARANTINED_GOAL_THREADS[thread_id] = session_id
+    CODEX_GOAL_SYNC_GENERATIONS.pop(session_id, None)
+    should_rollover = False
+    changed = False
+    async with STORE._lock:
+        current = STORE.sessions.get(session_id)
+        if current is None:
+            return True
+        current_thread_id = str(session_provider_id(current) or "").strip()
+        # Never let a delayed failure from an old thread overwrite state that
+        # has already been rebound to a newer provider thread.
+        if current_thread_id not in {"", thread_id}:
+            return True
+        goal = current.get("codex_goal")
+        if clear_goal:
+            if goal is not None:
+                current["codex_goal"] = None
+                changed = True
+            if current.get("codex_goal_time_budget_seconds") is not None:
+                current["codex_goal_time_budget_seconds"] = None
+                changed = True
+            if current.get("codex_goal_time_budget_exhausted") is not False:
+                current["codex_goal_time_budget_exhausted"] = False
+                changed = True
+        elif isinstance(goal, dict) and str(goal.get("status") or "") != "paused":
+            current["codex_goal"] = {**goal, "status": "paused"}
+            changed = True
+        marker = {
+            "thread_id": thread_id,
+            "recorded_at": now_iso(),
+            "reason": compact_memory_text(reason, 1000),
+        }
+        if current.get("_codex_goal_reconciliation_required") != marker:
+            current["_codex_goal_reconciliation_required"] = marker
+            changed = True
+        should_rollover = current_thread_id == thread_id
+        if changed:
+            await STORE.save()
+
+    if should_rollover:
+        await rollover_codex_provider_session(
+            session_id,
+            run_id or f"goal-fence-{uuid.uuid4().hex[:12]}",
+            thread_id,
+            reason,
+            message=(
+                "Detached a Codex thread whose persistent goal could not be "
+                "safely reconciled. The next turn will use a fresh thread."
+            ),
+        )
+    logger.warning(
+        "quarantined Codex goal thread session=%s thread=%s reason=%s",
+        session_id,
+        thread_id,
+        compact_memory_text(reason, 500),
+    )
+    return True
+
+
+async def pause_active_codex_goal_for_stop(
+    session_id: str,
+    active: dict[str, Any] | None,
+) -> tuple[bool, bool, str | None]:
+    """Pause native goal continuation before interrupting its current turn.
+
+    Codex goals may start another provider turn immediately after an
+    interruption.  A Stop operation therefore is not terminal until the goal
+    is paused.  The objective remains persisted so the user can resume it.
+    """
+    if (
+        not active
+        or active.get("backend") != BACKEND_CODEX
+        or active.get("transport") != CODEX_TRANSPORT_APP_SERVER
+    ):
+        return True, False, None
+
+    session = STORE.sessions.get(session_id) or {}
+    manager = CODEX_APP_SERVER_MANAGER
+    thread_id = str(
+        active.get("provider_thread_id")
+        or active.get("provider_session_id")
+        or session_provider_id(session)
+        or ""
+    ).strip()
+    if manager is None or not thread_id:
+        cached_goal = session.get("codex_goal")
+        if not (
+            isinstance(cached_goal, dict)
+            and str(cached_goal.get("status") or "") == "active"
+        ) and not session.get("_codex_goal_reconciliation_required"):
+            return True, False, None
+        return (
+            False,
+            False,
+            "The active Codex goal could not be paused because its provider "
+            "thread is unavailable. Retry Stop.",
+        )
+
+    try:
+        goal = await reconcile_codex_thread_goal(
+            manager,
+            session_id,
+            thread_id,
+            force=True,
+        )
+        if (
+            not isinstance(goal, dict)
+            or str(goal.get("status") or "") != "active"
+        ):
+            return True, False, None
+        paused_goal = await asyncio.wait_for(
+            manager.set_thread_goal(thread_id, status="paused"),
+            timeout=CODEX_GOAL_CONTROL_TIMEOUT_SECONDS,
+        )
+        if (
+            not isinstance(paused_goal, dict)
+            or str(paused_goal.get("status") or "") != "paused"
+        ):
+            raise CodexAppServerProtocolError(
+                "thread/goal/set did not return a paused goal",
+                request_sent=True,
+                safe_to_retry=False,
+            )
+    except Exception as exc:
+        message = (
+            "Timed out while pausing the active Codex goal. Retry Stop."
+            if isinstance(exc, asyncio.TimeoutError)
+            else f"Could not pause the active Codex goal: {concise_error_message(exc)}"
+        )
+        logger.warning(
+            "Codex goal pause before stop failed session=%s thread=%s error=%s",
+            session_id,
+            thread_id,
+            concise_error_message(exc),
+        )
+        return False, False, message
+
+    # The native notification normally persists this state too, but persist
+    # the direct response before interrupt so a reconnect cannot resurrect an
+    # active goal from stale local state.
+    await persist_reconciled_codex_goal(
+        session_id,
+        thread_id,
+        paused_goal,
+    )
+    generation_value = getattr(manager, "generation", 0)
+    generation = generation_value if isinstance(generation_value, int) else 0
+    CODEX_GOAL_SYNC_GENERATIONS[session_id] = (generation, thread_id)
+    return True, True, None
+
+
+async def settle_idle_codex_goal_for_stop(
+    session_id: str,
+) -> dict[str, Any]:
+    """Pause or fence a goal when no local turn owns the chat."""
+
+    session = STORE.sessions.get(session_id) or {}
+    if str(session.get("backend") or DEFAULT_BACKEND) != BACKEND_CODEX:
+        return {}
+    thread_id = str(session_provider_id(session) or "").strip()
+    cached_goal = session.get("codex_goal")
+    manager = CODEX_APP_SERVER_MANAGER
+    should_check_native = bool(
+        thread_id
+        and manager is not None
+        and manager.is_thread_loaded(thread_id)
+    )
+    if not should_check_native and not (
+        isinstance(cached_goal, dict)
+        and str(cached_goal.get("status") or "") == "active"
+    ) and not session.get("_codex_goal_reconciliation_required"):
+        return {}
+    synthetic_active = {
+        "backend": BACKEND_CODEX,
+        "transport": CODEX_TRANSPORT_APP_SERVER,
+        "provider_thread_id": thread_id,
+        "provider_session_id": thread_id,
+    }
+    goal_pause_ok, goal_paused, goal_pause_error = (
+        await pause_active_codex_goal_for_stop(
+            session_id,
+            synthetic_active,
+        )
+    )
+    if goal_pause_ok:
+        return {"goal_paused": goal_paused}
+    fenced = await quarantine_codex_goal_thread(
+        session_id,
+        thread_id,
+        reason=goal_pause_error
+        or "Could not reconcile the idle Codex goal while stopping.",
+    )
+    return {
+        "goal_paused": False,
+        "goal_fenced": fenced,
+        "message": (
+            "No local turn was running. The stale Codex goal thread was fenced."
+        ),
+    }
+
+
 async def stop_turn(
     session_id: str,
     *,
     emit_event: bool = True,
     schedule_queue: bool = True,
     require_provider_turn_ready: bool = False,
+    cascade_codex_subagents: bool = True,
+    hard_terminalize_on_timeout: bool = True,
 ) -> dict[str, Any]:
     await cancel_codex_interactions(session_id, resolution="turn_stopped")
     deferred = False
@@ -21098,6 +22515,32 @@ async def stop_turn(
                 and not task.done()
             )
         ]
+    subagent_stop = {
+        "descendants": 0,
+        "requested": [],
+        "interrupted": [],
+        "pending": [],
+        "errors": [],
+    }
+    session = STORE.sessions.get(session_id) or {}
+    root_thread_id = str(
+        (active or {}).get("provider_thread_id")
+        or (active or {}).get("provider_session_id")
+        or session_provider_id(session)
+        or ""
+    ).strip()
+    if (
+        cascade_codex_subagents
+        and not active
+        and str(session.get("backend") or "") == BACKEND_CODEX
+        and root_thread_id
+        and CODEX_APP_SERVER_MANAGER is not None
+    ):
+        subagent_stop = await stop_codex_descendant_subagents(
+            session_id,
+            root_thread_id,
+            manager=CODEX_APP_SERVER_MANAGER,
+        )
     if deferred:
         return {
             "ok": True,
@@ -21142,9 +22585,20 @@ async def stop_turn(
                         emit_event=emit_event,
                         schedule_queue=schedule_queue,
                         require_provider_turn_ready=require_provider_turn_ready,
+                        cascade_codex_subagents=cascade_codex_subagents,
+                        hard_terminalize_on_timeout=hard_terminalize_on_timeout,
                     )
                 if not still_busy:
-                    return {"ok": True, "stopped": True, "pending": False}
+                    goal_result = await settle_idle_codex_goal_for_stop(
+                        session_id
+                    )
+                    return {
+                        "ok": True,
+                        "stopped": True,
+                        "pending": False,
+                        "subagents": subagent_stop,
+                        **goal_result,
+                    }
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     break
@@ -21158,6 +22612,48 @@ async def stop_turn(
                     await asyncio.sleep(min(0.01, remaining))
 
             if pending:
+                if (
+                    hard_terminalize_on_timeout
+                    and str(session.get("backend") or "") == BACKEND_CODEX
+                ):
+                    run_id = str(current_turn.get("run_id") or "") or None
+                    if run_id:
+                        STOPPED_RUNS.add(run_id)
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        await asyncio.wait(
+                            pending,
+                            timeout=min(1.0, STOP_CONFIRM_TIMEOUT_SECONDS),
+                        )
+                    await release_turn_slot(
+                        session_id,
+                        expected_run_id=run_id,
+                    )
+                    if emit_event:
+                        await append_event(session_id, "turn_stopped", {
+                            "run_id": run_id,
+                            "backend": BACKEND_CODEX,
+                            "message": (
+                                "Stopped while the Codex agent process was "
+                                "still starting."
+                            ),
+                            "hard_stop": True,
+                        })
+                    RUN_METADATA.pop(run_id, None) if run_id else None
+                    if run_id and all(task.done() for task in pending):
+                        STOPPED_RUNS.discard(run_id)
+                    goal_result = await settle_idle_codex_goal_for_stop(
+                        session_id
+                    )
+                    return {
+                        "ok": True,
+                        "stopped": True,
+                        "pending": False,
+                        "hard_stop": True,
+                        "subagents": subagent_stop,
+                        **goal_result,
+                    }
                 # Keep the deferred STOP_REQUESTS marker. A legitimate slow
                 # launch owns this reservation and will reconcile the stop as
                 # soon as it binds; do not cancel it mid-pin or mid-handshake.
@@ -21181,14 +22677,165 @@ async def stop_turn(
                     "run_id": run_id,
                     "message": "Stopped before the agent process was ready.",
                 })
-            return {"ok": True, "stopped": True, "pending": False}
+            goal_result = await settle_idle_codex_goal_for_stop(session_id)
+            return {
+                "ok": True,
+                "stopped": True,
+                "pending": False,
+                "subagents": subagent_stop,
+                **goal_result,
+            }
         if schedule_queue:
             schedule_next_queued_turn(session_id)
         # The requested terminal state is already satisfied. Returning
         # stopped=True also lets clients clear a stale local running marker.
-        return {"ok": True, "stopped": True, "pending": False}
+        goal_result = await settle_idle_codex_goal_for_stop(session_id)
+        return {
+            "ok": True,
+            "stopped": True,
+            "pending": False,
+            "subagents": subagent_stop,
+            **goal_result,
+        }
     proc = active.get("proc") if active else None
     native_turn = active.get("codex_app_server_turn") if active else None
+    goal_pause_ok, goal_paused, goal_pause_error = (
+        await pause_active_codex_goal_for_stop(session_id, active)
+    )
+
+    async def terminal_goal_pause_failure_result(
+        native_interrupt: bool,
+    ) -> dict[str, Any]:
+        thread_id = str(
+            active.get("provider_thread_id")
+            or active.get("provider_session_id")
+            or session_provider_id(STORE.sessions.get(session_id) or {})
+            or ""
+        ).strip()
+        fenced = await quarantine_codex_goal_thread(
+            session_id,
+            thread_id,
+            run_id=str(active.get("run_id") or "") or None,
+            reason=goal_pause_error
+            or "Codex goal reconciliation failed while stopping the turn.",
+        )
+        return {
+            "ok": True,
+            "stopped": True,
+            "pending": False,
+            "native_interrupt": native_interrupt,
+            "goal_paused": False,
+            "goal_fenced": fenced,
+            "subagents": subagent_stop,
+            "message": (
+                "Turn stopped. The stale Codex goal thread was fenced and "
+                "will not be reused."
+            ),
+        }
+
+    async def hard_terminalize_active_stop(
+        *,
+        native_interrupt: bool,
+        reason: str,
+        tasks: set[asyncio.Task[Any]],
+    ) -> dict[str, Any]:
+        """Bound explicit Stop even if a local app-server consumer is stale."""
+
+        run_id = str(active.get("run_id") or "") or None
+        if run_id:
+            STOPPED_RUNS.add(run_id)
+        current_task = asyncio.current_task()
+        owned = {
+            task
+            for task in tasks
+            if task is not current_task and not task.done()
+        }
+        for task in owned:
+            task.cancel()
+        if owned:
+            await asyncio.wait(
+                owned,
+                timeout=min(1.0, STOP_CONFIRM_TIMEOUT_SECONDS),
+            )
+
+        # A natural terminal notification may have won the race with local
+        # cancellation. In that case its runner already emitted the terminal
+        # row and released the reservation, so do not manufacture a duplicate.
+        async with ACTIVE_LOCK:
+            still_owned = (
+                ACTIVE.get(session_id) is active
+                and session_id in BUSY_SESSIONS
+            )
+        if not still_owned:
+            if run_id and all(task.done() for task in owned):
+                STOPPED_RUNS.discard(run_id)
+            return {
+                "ok": True,
+                "stopped": True,
+                "pending": False,
+                "native_interrupt": native_interrupt,
+                "goal_paused": goal_paused,
+                "subagents": subagent_stop,
+            }
+
+        thread_id = str(
+            active.get("provider_thread_id")
+            or active.get("provider_session_id")
+            or session_provider_id(STORE.sessions.get(session_id) or {})
+            or ""
+        ).strip()
+        fenced = await quarantine_codex_goal_thread(
+            session_id,
+            thread_id,
+            run_id=run_id,
+            reason=reason,
+        )
+        released = await release_turn_slot(
+            session_id,
+            expected_run_id=run_id,
+        )
+        active_run = (STORE.sessions.get(session_id) or {}).get("active_run")
+        should_emit_terminal = bool(
+            emit_event
+            and released
+            and (
+                not run_id
+                or (
+                    isinstance(active_run, dict)
+                    and str(active_run.get("run_id") or "") == run_id
+                )
+            )
+        )
+        if should_emit_terminal:
+            await append_event(session_id, "turn_stopped", {
+                "run_id": run_id,
+                "backend": active.get("backend"),
+                "native_interrupt": native_interrupt,
+                "goal_fenced": fenced,
+                "hard_stop": True,
+                "message": (
+                    "Stopped after Codex did not acknowledge interruption in time."
+                ),
+            })
+        if run_id:
+            RUN_METADATA.pop(run_id, None)
+            if all(task.done() for task in owned):
+                STOPPED_RUNS.discard(run_id)
+        return {
+            "ok": True,
+            "stopped": True,
+            "pending": False,
+            "hard_stop": True,
+            "native_interrupt": native_interrupt,
+            "goal_paused": goal_paused,
+            "goal_fenced": fenced,
+            "subagents": subagent_stop,
+            "message": (
+                "Turn stopped. The stale Codex thread was fenced and will not "
+                "be reused."
+            ),
+        }
+
     native_interrupt = False
     if native_interrupt_reserved and native_turn is not None:
         try:
@@ -21224,6 +22871,18 @@ async def stop_turn(
                 session_id,
                 exc,
             )
+    if (
+        cascade_codex_subagents
+        and str(session.get("backend") or "") == BACKEND_CODEX
+        and active.get("transport") == CODEX_TRANSPORT_APP_SERVER
+        and root_thread_id
+        and CODEX_APP_SERVER_MANAGER is not None
+    ):
+        subagent_stop = await stop_codex_descendant_subagents(
+            session_id,
+            root_thread_id,
+            manager=CODEX_APP_SERVER_MANAGER,
+        )
     # The app-server process is shared by every Codex chat and must never be
     # terminated as a per-chat Stop action.
     if proc and active.get("transport") != CODEX_TRANSPORT_APP_SERVER:
@@ -21239,12 +22898,29 @@ async def stop_turn(
                 current = ACTIVE.get(session_id)
                 if current is active:
                     current["native_interrupt_sent"] = False
+            if (
+                hard_terminalize_on_timeout
+                and active.get("transport") == CODEX_TRANSPORT_APP_SERVER
+            ):
+                return await hard_terminalize_active_stop(
+                    native_interrupt=native_interrupt,
+                    reason=(
+                        goal_pause_error
+                        or "Codex steering transition did not settle after Stop."
+                    ),
+                    tasks=set(owned_tasks),
+                )
             return {
                 "ok": True,
                 "stopped": False,
                 "pending": True,
                 "native_interrupt": native_interrupt,
-                "message": "Stop was sent; waiting for the steering transition to settle.",
+                "goal_paused": goal_paused,
+                "subagents": subagent_stop,
+                "message": (
+                    goal_pause_error
+                    or "Stop was sent; waiting for the steering transition to settle."
+                ),
             }
     deadline = (
         asyncio.get_running_loop().time()
@@ -21278,19 +22954,28 @@ async def stop_turn(
             ):
                 dynamic_tasks.add(owner_task)
         if current is not active:
+            if not goal_pause_ok:
+                return await terminal_goal_pause_failure_result(native_interrupt)
             return {
                 "ok": True,
                 "stopped": True,
                 "pending": False,
                 "native_interrupt": native_interrupt,
+                "goal_paused": goal_paused,
+                "subagents": subagent_stop,
             }
         if not still_busy:
+            if not goal_pause_ok:
+                await release_turn_slot(session_id)
+                return await terminal_goal_pause_failure_result(native_interrupt)
             await release_turn_slot(session_id)
             return {
                 "ok": True,
                 "stopped": True,
                 "pending": False,
                 "native_interrupt": native_interrupt,
+                "goal_paused": goal_paused,
+                "subagents": subagent_stop,
             }
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
@@ -21305,6 +22990,16 @@ async def stop_turn(
             await asyncio.sleep(min(0.01, remaining))
 
     if not dynamic_tasks:
+        if not goal_pause_ok:
+            await release_turn_slot(session_id)
+            if emit_event:
+                await append_event(session_id, "turn_stopped", {
+                    "run_id": active.get("run_id"),
+                    "backend": active.get("backend"),
+                    "native_interrupt": native_interrupt,
+                    "goal_fenced": True,
+                })
+            return await terminal_goal_pause_failure_result(native_interrupt)
         # No request or runner still owns this ACTIVE record. It is stale and
         # safe to clear after the bounded confirmation window.
         await release_turn_slot(session_id)
@@ -21319,6 +23014,8 @@ async def stop_turn(
             "stopped": True,
             "pending": False,
             "native_interrupt": native_interrupt,
+            "goal_paused": goal_paused,
+            "subagents": subagent_stop,
         }
 
     # A provider interrupt is an acknowledgement, not terminal state. Leave
@@ -21328,12 +23025,28 @@ async def stop_turn(
         current = ACTIVE.get(session_id)
         if current is active:
             current["native_interrupt_sent"] = False
+    if (
+        hard_terminalize_on_timeout
+        and active.get("transport") == CODEX_TRANSPORT_APP_SERVER
+    ):
+        return await hard_terminalize_active_stop(
+            native_interrupt=native_interrupt,
+            reason=(
+                goal_pause_error
+                or "Codex did not confirm the requested Stop before timeout."
+            ),
+            tasks=dynamic_tasks,
+        )
     return {
         "ok": True,
         "stopped": False,
         "pending": True,
         "native_interrupt": native_interrupt,
-        "message": "Stop was sent; waiting for Codex to finish stopping.",
+        "goal_paused": goal_paused,
+        "message": (
+            goal_pause_error
+            or "Stop was sent; waiting for Codex to finish stopping."
+        ),
     }
 
 

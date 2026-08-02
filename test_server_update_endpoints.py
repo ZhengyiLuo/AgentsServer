@@ -35,12 +35,12 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
             key.write_text("public key\n")
             with patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
                  patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
-                 patch.object(agent_server.shutil, "which", return_value=None):
+                 patch.object(agent_server, "working_tmux_bin", return_value=None):
                 response = await agent_server.health()
 
         capability = response["capabilities"]["tmux"]
         self.assertEqual(capability["available"], False)
-        self.assertEqual(capability["required"], True)
+        self.assertEqual(capability["required"], False)
         self.assertIn("not found", capability["message"])
         self.assertIn("Install tmux", capability["action"])
         self.assertFalse(response["managed_updates"])
@@ -54,13 +54,13 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
             key.write_text("public key\n")
             with patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
                  patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
-                 patch.object(agent_server.shutil, "which", return_value="/usr/bin/tmux"):
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"):
                 response = await agent_server.health()
 
         capability = response["capabilities"]["tmux"]
         self.assertEqual(capability, {
             "available": True,
-            "required": True,
+            "required": False,
             "message": "tmux is available.",
             "action": None,
         })
@@ -176,7 +176,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
              patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", Path(temporary) / "status.json"), \
              patch.object(agent_server, "SERVER_UPDATE_START_GRACE_SECONDS", 45.0), \
              patch.object(agent_server, "server_update_status_age_seconds", return_value=44.9), \
-             patch.object(agent_server.shutil, "which", return_value=None):
+             patch.object(agent_server, "working_tmux_bin", return_value=None):
             agent_server.write_server_update_status(
                 update_id="new-update",
                 phase="starting",
@@ -198,7 +198,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                  "server_update_status_age_seconds",
                  return_value=46.0,
              ), \
-             patch.object(agent_server.shutil, "which", return_value=None):
+             patch.object(agent_server, "working_tmux_bin", return_value=None):
             agent_server.write_server_update_status(
                 update_id="completed-update",
                 phase="restarting",
@@ -328,7 +328,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
              patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", Path(temporary) / "status.json"), \
              patch.object(agent_server, "server_update_is_active", return_value=False), \
              patch.object(agent_server, "signed_release_manifest", new=manifest), \
-             patch.object(agent_server.shutil, "which", return_value=None):
+             patch.object(agent_server, "working_tmux_bin", return_value=None):
             status = await agent_server.start_server_update(agent_server.ServerUpdateRequest(version="1.0.0"))
 
         self.assertEqual(status["phase"], "current")
@@ -342,7 +342,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
              patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", Path(temporary) / "status.json"), \
              patch.object(agent_server, "server_update_is_active", return_value=False), \
              patch.object(agent_server, "signed_release_manifest", new=manifest), \
-             patch.object(agent_server.shutil, "which", return_value=None):
+             patch.object(agent_server, "working_tmux_bin", return_value=None):
             with self.assertRaises(HTTPException) as raised:
                 await agent_server.start_server_update(agent_server.ServerUpdateRequest(version="1.1.0"))
 
@@ -365,7 +365,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
                  patch.object(agent_server, "server_update_is_active", return_value=False), \
                  patch.object(agent_server, "signed_release_manifest", new=manifest), \
-                 patch.object(agent_server.shutil, "which", return_value="/usr/bin/tmux"), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
                  patch.object(agent_server, "run_tmux", return_value=None) as run_tmux:
                 status = await agent_server.start_server_update(agent_server.ServerUpdateRequest(version="1.1.0"))
 
@@ -393,7 +393,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(agent_server, "QUEUED_TURNS", {}), \
                  patch.object(agent_server, "RUN_NOW_TURNS", {}), \
                  patch.object(agent_server, "server_update_is_active", return_value=False), \
-                 patch.object(agent_server.shutil, "which", return_value="/usr/bin/tmux"), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
                  patch.object(agent_server, "run_tmux") as run_tmux:
                 with self.assertRaises(HTTPException) as raised:
                     await agent_server.start_server_update(
@@ -427,7 +427,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(agent_server, "QUEUED_TURNS", queued), \
                  patch.object(agent_server, "RUN_NOW_TURNS", {}), \
                  patch.object(agent_server, "server_update_is_active", return_value=False), \
-                 patch.object(agent_server.shutil, "which", return_value="/usr/bin/tmux"), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
                  patch.object(agent_server, "run_tmux") as run_tmux:
                 with self.assertRaises(HTTPException) as raised:
                     await agent_server.start_server_update(
@@ -469,7 +469,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(agent_server, "QUEUED_TURNS", {}), \
                  patch.object(agent_server, "RUN_NOW_TURNS", {}), \
                  patch.object(agent_server, "server_update_is_active", return_value=False), \
-                 patch.object(agent_server.shutil, "which", return_value="/usr/bin/tmux"), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
                  patch.object(agent_server, "run_tmux", side_effect=blocked_tmux):
                 update_task = asyncio.create_task(
                     agent_server.start_server_update(
@@ -571,8 +571,8 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                 )
                 patches.enter_context(
                     patch.object(
-                        agent_server.shutil,
-                        "which",
+                        agent_server,
+                        "working_tmux_bin",
                         return_value="/usr/bin/tmux",
                     )
                 )
@@ -660,7 +660,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(agent_server, "QUEUED_TURNS", {}), \
                  patch.object(agent_server, "RUN_NOW_TURNS", {}), \
                  patch.object(agent_server, "server_update_is_active", return_value=False), \
-                 patch.object(agent_server.shutil, "which", return_value="/usr/bin/tmux"), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
                  patch.object(
                      agent_server,
                      "run_tmux",
@@ -720,7 +720,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
                  patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
                  patch.object(agent_server, "server_update_is_active", return_value=False), \
-                 patch.object(agent_server.shutil, "which", return_value="/usr/bin/tmux"), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
                  patch.object(agent_server, "server_update_runner_environment", return_value={
                      "XDG_RUNTIME_DIR": "/run/user/123",
                      "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/123/bus",
@@ -750,7 +750,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
                  patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
                  patch.object(agent_server, "server_update_is_active", return_value=False), \
-                 patch.object(agent_server.shutil, "which", return_value="/usr/bin/tmux"), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
                  patch.object(agent_server, "run_tmux", return_value=None) as run_tmux:
                 status = await agent_server.start_server_update(
                     agent_server.ServerUpdateRequest(
@@ -775,7 +775,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
                  patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
                  patch.object(agent_server, "server_update_is_active", return_value=False), \
-                 patch.object(agent_server.shutil, "which", return_value="/usr/bin/tmux"), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
                  patch.object(agent_server, "run_tmux", return_value=None) as run_tmux:
                 status = await agent_server.start_server_update(
                     agent_server.ServerUpdateRequest(version="1.1.0-beta.3")
@@ -796,7 +796,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
                  patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
                  patch.object(agent_server, "server_update_is_active", return_value=False), \
-                 patch.object(agent_server.shutil, "which", return_value="/usr/bin/tmux"), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
                  patch.object(agent_server, "run_tmux", return_value=None) as run_tmux:
                 status = await agent_server.start_server_update(
                     agent_server.ServerUpdateRequest(

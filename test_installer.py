@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 INSTALLER = ROOT / "install.sh"
+UNINSTALLER = ROOT / "uninstall.sh"
 DEPLOYER = ROOT / "deploy.sh"
 PACKAGER = ROOT / "scripts" / "package_release.py"
 
@@ -30,7 +32,7 @@ class InstallerContractTests(unittest.TestCase):
         self.assertIn("import croniter, dateutil", INSTALLER.read_text())
 
     def test_shell_syntax_is_valid(self):
-        for script in (INSTALLER, DEPLOYER):
+        for script in (INSTALLER, UNINSTALLER, DEPLOYER):
             with self.subTest(script=script.name):
                 result = subprocess.run(
                     ["bash", "-n", str(script)],
@@ -48,7 +50,7 @@ class InstallerContractTests(unittest.TestCase):
         self.assertIn("python-dateutil>=2.9,<3", source)
         self.assertIn("'$REMOTE_SERVER_DIR/codex_app_server.py'", source)
 
-    def test_installer_and_release_archive_include_app_server_runtime(self):
+    def test_installer_and_release_archive_include_app_server_and_uninstaller(self):
         installer_source = INSTALLER.read_text()
         packager_source = PACKAGER.read_text()
         self.assertIn(
@@ -56,7 +58,9 @@ class InstallerContractTests(unittest.TestCase):
             installer_source,
         )
         self.assertIn('"$STAGE_DIR/codex_app_server.py"', installer_source)
+        self.assertIn('"$STAGE_DIR/uninstall.sh"', installer_source)
         self.assertIn('"codex_app_server.py"', packager_source)
+        self.assertIn('"uninstall.sh"', packager_source)
 
         with tempfile.TemporaryDirectory() as temporary:
             result = subprocess.run(
@@ -74,10 +78,15 @@ class InstallerContractTests(unittest.TestCase):
             )
             with tarfile.open(archive_path, "r:gz") as archive:
                 members = set(archive.getnames())
+                uninstaller = archive.getmember(
+                    f"agents-server-{version}/uninstall.sh"
+                )
             self.assertIn(
                 f"agents-server-{version}/codex_app_server.py",
                 members,
             )
+            self.assertIn(f"agents-server-{version}/uninstall.sh", members)
+            self.assertNotEqual(uninstaller.mode & 0o111, 0)
             self.assertEqual(
                 manifest["track"],
                 "beta" if "-" in version.split("+", 1)[0] else "stable",
@@ -96,8 +105,10 @@ class InstallerContractTests(unittest.TestCase):
         self.assertIn('RELEASES_ROOT="$INSTALL_ROOT/releases"', source)
         self.assertIn('PREVIOUS_LINK="$INSTALL_ROOT/previous"', source)
         self.assertIn('REPLACED_DIR="$RELEASES_ROOT/$RELEASE_VERSION-replaced-', source)
+        self.assertIn("ManagedOOMPreference=avoid", source)
         self.assertLess(source.index('OLD_TARGET=""'), source.index('mv "$STAGE_DIR" "$RELEASE_DIR"'))
         self.assertIn("rolling back", source)
+        self.assertNotIn('echo "  ${COLOR_BOLD}Access token', source)
         self.assertIsNone(re.search(r"(?m)^\s*sudo\b", source))
 
     def test_help_does_not_modify_the_machine(self):
@@ -300,35 +311,20 @@ chmod 755 "$project/.venv/bin/python"
             self.assertNotIn("ZENITHDOCK_AGENT_TOKEN=", installed_env)
             self.assertIn(f'"access_token":"{preserved_token}"', result.stdout)
 
-    def test_missing_tmux_fails_before_mutating_an_existing_installation(self):
+    def test_broken_tmux_is_optional_and_installation_still_succeeds(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            home = root / "home"
-            fake_bin = root / "bin"
-            install_root = root / "install"
+            home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             config_root = root / "config"
             state_root = root / "state"
-            fake_bin.mkdir()
-            home.mkdir()
-            release = install_root / "releases" / "0.0.9"
-            release.mkdir(parents=True)
-            (release / "runtime-marker").write_text("keep runtime\n")
-            (install_root / "current").symlink_to(release, target_is_directory=True)
             config_root.mkdir()
-            (config_root / "env").write_text("AGENTSDOCK_AGENT_TOKEN=keep-token\n")
             state_root.mkdir()
             (state_root / "sessions.json").write_text('{"keep": true}\n')
-            self.prepare_preflight_path(fake_bin, os_name="Linux", commands=("curl", "systemctl"))
+            token = "preserved_token_abcdefghijklmnopqrstuvwxyz0123456789"
+            (config_root / "env").write_text(f"AGENTSDOCK_AGENT_TOKEN={token}\n")
             self.write_executable(fake_bin / "tmux", "#!/bin/sh\nexit 127\n")
-            environment = {
-                **os.environ,
-                "HOME": str(home),
-                "PATH": str(fake_bin),
-                "AGENTS_SERVER_INSTALL_DIR": str(install_root),
-                "AGENTS_SERVER_CONFIG_DIR": str(config_root),
-                "AGENTSDOCK_STATE_DIR": str(state_root),
-            }
-            before = self.snapshot_trees(install_root, config_root, state_root)
+            self.write_executable(fake_bin / "curl", "#!/bin/sh\nexit 0\n")
+            self.write_fake_uv(fake_bin)
 
             result = subprocess.run(
                 ["/bin/bash", str(INSTALLER), "--port", "17850", "--non-interactive"],
@@ -338,14 +334,20 @@ chmod 755 "$project/.venv/bin/python"
                 check=False,
             )
 
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("Unavailable prerequisite: tmux", result.stderr)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Optional prerequisite unavailable: tmux", result.stderr)
             self.assertIn("sudo apt install tmux", result.stderr)
-            final_error = result.stderr.strip().splitlines()[-1]
-            self.assertIn("Missing prerequisites: tmux.", final_error)
-            self.assertIn("sudo apt install tmux", final_error)
-            self.assertIn("no state, release, configuration, or service changes were made.", final_error)
-            self.assertEqual(self.snapshot_trees(install_root, config_root, state_root), before)
+            self.assertIn("everything else about AgentsServer works without it", result.stderr)
+            self.assertTrue((install_root / "current" / "agent_server.py").is_file())
+            self.assertEqual((state_root / "sessions.json").read_text(), '{"keep": true}\n')
+            human_output = "\n".join(
+                line
+                for line in result.stdout.splitlines()
+                if not line.startswith("AGENTSDOCK_SETUP_RESULT=")
+            )
+            self.assertNotIn(token, human_output)
+            self.assertNotIn("Access token", result.stdout)
+            self.assertEqual(result.stdout.count(token), 1)
 
     def test_preflight_reports_every_missing_platform_prerequisite(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -375,12 +377,133 @@ chmod 755 "$project/.venv/bin/python"
             )
 
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("Unavailable prerequisite: tmux", result.stderr)
+            self.assertIn("Optional prerequisite unavailable: tmux", result.stderr)
             self.assertIn("Unavailable prerequisite: curl or wget", result.stderr)
             self.assertIn("Unavailable prerequisite: systemctl --user session", result.stderr)
+            final_error = result.stderr.strip().splitlines()[-1]
+            self.assertNotIn("tmux", final_error)
+            self.assertIn("Missing prerequisites: curl or wget, systemctl --user session.", final_error)
             self.assertFalse((root / "install").exists())
             self.assertFalse((root / "config").exists())
             self.assertFalse((root / "state").exists())
+
+    def test_explicit_port_is_pinned_without_allow_port_fallback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_fake_uv(fake_bin)
+            listener, port = self.adjacent_port_listener()
+            try:
+                self.write_health_curl(fake_bin, conflict_port=port, healthy_port=port + 1)
+                environment.update({
+                    "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                })
+                result = subprocess.run(
+                    [
+                        "/bin/bash",
+                        str(INSTALLER),
+                        "--port",
+                        str(port),
+                        "--non-interactive",
+                    ],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            finally:
+                listener.close()
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(f"AgentsServer {self.release_version()} did not become healthy", result.stderr)
+            self.assertNotIn("Selecting port", result.stderr)
+            self.assertNotIn("AGENTSDOCK_SETUP_RESULT=", result.stdout)
+            self.assertTrue((install_root / "current" / "runtime-marker").is_file())
+
+    def test_explicit_port_fallback_is_opt_in_and_persists_selected_port(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            config_root = root / "config"
+            config_root.mkdir()
+            token = "preserved_token_abcdefghijklmnopqrstuvwxyz0123456789"
+            (config_root / "env").write_text(f"AGENTSDOCK_AGENT_TOKEN={token}\n")
+            self.write_fake_uv(fake_bin)
+            listener, port = self.adjacent_port_listener()
+            try:
+                self.write_health_curl(fake_bin, conflict_port=port, healthy_port=port + 1)
+                environment.update({
+                    "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                })
+                result = subprocess.run(
+                    [
+                        "/bin/bash",
+                        str(INSTALLER),
+                        "--port",
+                        str(port),
+                        "--allow-port-fallback",
+                        "--non-interactive",
+                    ],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            finally:
+                listener.close()
+
+            selected_port = port + 1
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                f"Selecting port {selected_port} instead",
+                result.stderr,
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            installed_env = (config_root / "env").read_text()
+            self.assertIn(f"AGENTSDOCK_AGENT_PORT={selected_port}\n", installed_env)
+            self.assertNotIn(f"AGENTSDOCK_AGENT_PORT={port}\n", installed_env)
+            service = (home / ".config" / "systemd" / "user" / "agents-server.service").read_text()
+            self.assertIn(f"--port {selected_port}", service)
+            self.assertIn("ManagedOOMPreference=avoid", service)
+            result_line = next(
+                line
+                for line in result.stdout.splitlines()
+                if line.startswith("AGENTSDOCK_SETUP_RESULT=")
+            )
+            payload = json.loads(result_line.removeprefix("AGENTSDOCK_SETUP_RESULT="))
+            self.assertTrue(payload["server_url"].endswith(f":{selected_port}"))
+            self.assertEqual(payload["access_token"], token)
+            human_output = "\n".join(
+                line
+                for line in result.stdout.splitlines()
+                if not line.startswith("AGENTSDOCK_SETUP_RESULT=")
+            )
+            self.assertNotIn(token, human_output)
+            self.assertNotIn("Access token", result.stdout)
+
+    def test_newly_started_unhealthy_server_rolls_back_without_fallback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_fake_uv(fake_bin)
+            listener, port = self.adjacent_port_listener()
+            listener.close()
+            self.write_health_curl(fake_bin, conflict_port=port, healthy_port=port + 1)
+            environment.update({
+                "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+            })
+
+            result = subprocess.run(
+                ["/bin/bash", str(INSTALLER), "--non-interactive", "--port", str(port), "--allow-port-fallback"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("Selecting port", result.stderr)
+            self.assertTrue((install_root / "current" / "runtime-marker").is_file())
 
     def test_uv_bootstrap_curl_is_bounded_and_reports_recovery_steps(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -640,6 +763,153 @@ chmod 755 "$project/.venv/bin/python"
             self.assertEqual(installed_path.split(":", 1)[0], str(custom_bin))
             self.assertIn("--user show-environment", systemctl_log.read_text().splitlines())
 
+    def test_uninstall_removes_runtime_and_config_but_preserves_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home, fake_bin, install_root, config_root, state_root, service_file, environment = (
+                self.fake_linux_uninstall_environment(root)
+            )
+
+            result = subprocess.run(
+                ["/bin/bash", str(UNINSTALLER), "--yes"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(install_root.exists())
+            self.assertFalse(config_root.exists())
+            self.assertFalse(service_file.exists())
+            self.assertTrue((state_root / "sessions.json").is_file())
+            self.assertIn("Preserved chat history", result.stdout)
+
+    def test_uninstall_purge_state_requires_interactive_exact_confirmation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home, fake_bin, install_root, config_root, state_root, service_file, environment = (
+                self.fake_linux_uninstall_environment(root)
+            )
+            before = self.snapshot_trees(install_root, config_root, state_root, service_file)
+
+            result = subprocess.run(
+                ["/bin/bash", str(UNINSTALLER), "--yes", "--purge-state"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Refusing to purge state without an interactive terminal", result.stderr)
+            self.assertIn("--yes never bypasses", result.stderr)
+            self.assertEqual(
+                self.snapshot_trees(install_root, config_root, state_root, service_file),
+                before,
+            )
+
+    def test_uninstall_refuses_broad_and_overlapping_managed_roots(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            fake_bin = root / "bin"
+            home.mkdir()
+            fake_bin.mkdir()
+            self.write_executable(fake_bin / "uname", "#!/bin/sh\necho Linux\n")
+            sentinel = home / "do-not-delete"
+            sentinel.write_text("preserved\n")
+            base_environment = {
+                **os.environ,
+                "HOME": str(home),
+                "PATH": f"{fake_bin}:/usr/bin:/bin",
+                "AGENTS_SERVER_CONFIG_DIR": str(root / "config"),
+                "AGENTSDOCK_STATE_DIR": str(root / "state"),
+            }
+
+            broad_result = subprocess.run(
+                ["/bin/bash", str(UNINSTALLER), "--yes"],
+                env={**base_environment, "AGENTS_SERVER_INSTALL_DIR": str(home)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(broad_result.returncode, 2)
+            self.assertIn("Refusing unsafe AGENTS_SERVER_INSTALL_DIR target", broad_result.stderr)
+            self.assertEqual(sentinel.read_text(), "preserved\n")
+
+            install_root = root / "managed"
+            config_root = install_root / "config"
+            install_root.mkdir()
+            config_root.mkdir()
+            overlap_sentinel = install_root / "do-not-delete"
+            overlap_sentinel.write_text("preserved\n")
+            overlap_result = subprocess.run(
+                ["/bin/bash", str(UNINSTALLER), "--yes"],
+                env={
+                    **base_environment,
+                    "AGENTS_SERVER_INSTALL_DIR": str(install_root),
+                    "AGENTS_SERVER_CONFIG_DIR": str(config_root),
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(overlap_result.returncode, 2)
+            self.assertIn("Refusing overlapping install, configuration, and state roots", overlap_result.stderr)
+            self.assertEqual(overlap_sentinel.read_text(), "preserved\n")
+
+    def test_uninstall_refuses_active_install_lock_without_mutation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home, fake_bin, install_root, config_root, state_root, service_file, environment = (
+                self.fake_linux_uninstall_environment(root)
+            )
+            lock = install_root / ".install-lock"
+            lock.mkdir()
+            (lock / "pid").write_text(f"{os.getpid()}\n")
+            before = self.snapshot_trees(install_root, config_root, state_root, service_file)
+
+            result = subprocess.run(
+                ["/bin/bash", str(UNINSTALLER), "--yes"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("install/update is active", result.stderr)
+            self.assertEqual(
+                self.snapshot_trees(install_root, config_root, state_root, service_file),
+                before,
+            )
+
+    def test_uninstall_stop_failure_preserves_all_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home, fake_bin, install_root, config_root, state_root, service_file, environment = (
+                self.fake_linux_uninstall_environment(root, stop_failure=True)
+            )
+            before = self.snapshot_trees(install_root, config_root, state_root, service_file)
+
+            result = subprocess.run(
+                ["/bin/bash", str(UNINSTALLER), "--yes"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Could not stop agents-server.service; no files were removed", result.stderr)
+            self.assertEqual(
+                self.snapshot_trees(install_root, config_root, state_root, service_file),
+                before,
+            )
+
     def test_darwin_restart_waits_for_bootout_and_retries_transient_bootstrap(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -825,6 +1095,100 @@ chmod 755 "$project/.venv/bin/python"
             "AGENTSDOCK_STATE_DIR": str(root / "state"),
         }
         return home, fake_bin, install_root, environment
+
+    def fake_linux_uninstall_environment(self, root: Path, *, stop_failure: bool = False):
+        home = root / "home"
+        fake_bin = root / "bin"
+        install_root = root / "install"
+        config_root = root / "config"
+        state_root = root / "state"
+        home.mkdir()
+        fake_bin.mkdir()
+        install_root.mkdir()
+        config_root.mkdir()
+        state_root.mkdir()
+        (install_root / "runtime-marker").write_text("preserved runtime\n")
+        (config_root / "env").write_text(
+            "AGENTSDOCK_AGENT_TOKEN=preserved_token_abcdefghijklmnopqrstuvwxyz0123456789\n"
+        )
+        (state_root / "sessions.json").write_text('{"keep": true}\n')
+        service_file = home / ".config" / "systemd" / "user" / "agents-server.service"
+        service_file.parent.mkdir(parents=True)
+        service_file.write_text("[Service]\nExecStart=/keep/running\n")
+        self.write_executable(fake_bin / "uname", "#!/bin/sh\necho Linux\n")
+        if stop_failure:
+            systemctl_source = """#!/bin/sh
+case "${2:-}" in
+  show-environment) exit 0 ;;
+  disable) exit 1 ;;
+  is-active) exit 0 ;;
+esac
+exit 0
+"""
+        else:
+            systemctl_source = """#!/bin/sh
+case "${2:-}" in
+  show-environment) exit 0 ;;
+  is-active) exit 1 ;;
+esac
+exit 0
+"""
+        self.write_executable(fake_bin / "systemctl", systemctl_source)
+        environment = {
+            **os.environ,
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "AGENTS_SERVER_INSTALL_DIR": str(install_root),
+            "AGENTS_SERVER_CONFIG_DIR": str(config_root),
+            "AGENTSDOCK_STATE_DIR": str(state_root),
+        }
+        return home, fake_bin, install_root, config_root, state_root, service_file, environment
+
+    def write_fake_uv(self, fake_bin: Path):
+        self.write_executable(fake_bin / "uv", """#!/bin/sh
+project=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--project" ]; then project="$2"; shift 2; else shift; fi
+done
+mkdir -p "$project/.venv/bin"
+printf '#!/bin/sh\nexit 0\n' > "$project/.venv/bin/python"
+chmod 755 "$project/.venv/bin/python"
+""")
+
+    def write_health_curl(self, fake_bin: Path, *, conflict_port: int, healthy_port: int):
+        self.write_executable(fake_bin / "curl", f"""#!/bin/sh
+case "$*" in
+  *":{conflict_port}/api/health"*) exit 22 ;;
+  *":{healthy_port}/api/health"*) exit 0 ;;
+esac
+exit 0
+""")
+
+    @staticmethod
+    def adjacent_port_listener() -> tuple[socket.socket, int]:
+        for _attempt in range(100):
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+            if port >= 65535:
+                listener.close()
+                continue
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                probe.bind(("127.0.0.1", port + 1))
+            except OSError:
+                listener.close()
+                continue
+            finally:
+                probe.close()
+            listener.listen(8)
+            return listener, port
+        raise AssertionError("could not reserve a listener with a free adjacent port")
+
+    @staticmethod
+    def release_version() -> str:
+        return (ROOT / "VERSION").read_text().strip()
 
     def prepare_preflight_path(self, fake_bin: Path, *, os_name: str, commands: tuple[str, ...]):
         self.write_executable(fake_bin / "uname", f"#!/bin/sh\necho {os_name}\n")

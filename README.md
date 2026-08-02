@@ -64,11 +64,30 @@ machine paths.
 - Linux or macOS host with Python 3.10+.
 - `uv` recommended for the runtime environment.
 - Claude CLI and/or Codex CLI installed and authenticated on the agent host.
-- `tmux` for persistent chat terminals, tmux-pane inspection, and detached
-  managed updates.
+- Optional: `tmux`, for the persistent chat terminal, tmux-pane inspection,
+  and in-app managed updates. Everything else (chats, turns, jobs, files)
+  works without it. `install.sh` offers to install it with Homebrew on macOS;
+  elsewhere, install it yourself and rerun `install.sh` any time to enable
+  these features.
 - Tailscale on the agent host and each client device if you want to use the
   server from another Mac, iPhone, or iPad.
 - Optional: a user-level `systemd` service on Linux.
+
+### Optional: tmux
+
+tmux is not required to run AgentsServer, chat with agents, or use jobs,
+files, or search. It only backs three features: the persistent interactive
+chat terminal, live tmux-pane inspection, and in-app managed updates
+(Settings > Install or update AgentsServer in AgentsDock), which needs tmux to
+survive the server restarting itself mid-update. `GET /api/health` reports
+`capabilities.tmux.available` so clients can grey those features out without
+tmux rather than failing.
+
+If tmux is missing, `install.sh` proceeds anyway and prints the install
+command for your platform. On macOS with Homebrew installed and an
+interactive terminal, it asks first whether to run `brew install tmux` for
+you. Install tmux at any time and rerun `install.sh` to pick it up; no state,
+release, or service is affected.
 
 ## AgentsDock
 
@@ -100,11 +119,17 @@ cd AgentsServer
 ```
 
 Before changing state, releases, configuration, or services, the installer
-checks for `tmux`, either `curl` or `wget`, and the platform service command
+checks for either `curl` or `wget` and the platform service command
 (`launchctl` on macOS or `systemctl` on Linux), and verifies that the current
 user's service domain responds. Missing tools or an unavailable user service
-session produce platform-specific guidance. The preflight never invokes a
-package manager or `sudo` itself.
+session produce platform-specific guidance and stop the install. The preflight
+never invokes a package manager or `sudo` itself, with one opt-in exception:
+on macOS with Homebrew present and an interactive terminal, it offers to run
+`brew install tmux` if tmux is missing. Declining, running unattended
+(`--non-interactive` or no TTY, as with the SSH-driven app flow), or being on
+a host without Homebrew all just print the manual `tmux` install command and
+continue — tmux is optional, so its absence never blocks setup. See
+[Optional: tmux](#optional-tmux) below for what it enables.
 
 After that preflight, the installer uses `uv`, installs a user-level service,
 creates a private access token, verifies authenticated health, and preserves
@@ -116,6 +141,16 @@ cancelled or disconnected SSH attempt from racing a retry, and timeout cleanup
 terminates the complete dependency-worker process group. Existing
 `~/.zenithbot-agent` state is migrated automatically and left behind as a
 compatibility link. The installer does not use `sudo`.
+
+If the default port is already held by something other than the AgentsServer
+release being replaced, the installer detects that listener before restarting
+the user service, reports what it found (with `lsof`, when available), and
+selects one of up to 5 higher free ports. It never treats a newly started but
+unhealthy AgentsServer as a port conflict; that path still rolls back. A port
+chosen this way is called out at the end of the run and reflected in
+`AGENTSDOCK_SETUP_RESULT`. Passing `--port` pins an exact port by default;
+combine it with `--allow-port-fallback` to opt an explicit port into nearby
+selection, or use `--no-port-fallback` to disable selection explicitly.
 
 AgentsDock desktop can run this same installer locally or over an existing SSH
 key connection from its first-run setup window. Remote clients should use the
@@ -249,7 +284,10 @@ Leave the variable unset only for trusted local development.
 
 Remote access is expected to go through Tailscale. This keeps the server
 reachable from phones, tablets, and laptops without publishing the raw agent
-port on the internet.
+port on the internet. It's optional: everything else in this README works
+without it, so `install.sh` only prints a reminder with the download link
+at the end of a successful run when Tailscale isn't already on the host —
+it never blocks setup or is installed automatically.
 
 On the agent host:
 
@@ -313,6 +351,25 @@ terminate its own installer. Progress is written to
 `server-update.log` beside it. Chat history, files, jobs, tokens, and tmux
 sessions remain under the persistent state/configuration roots and are never
 placed inside a release directory.
+
+## Uninstalling AgentsServer
+
+```bash
+./uninstall.sh
+```
+
+This stops and removes the user service, the versioned release runtime, and
+generated configuration (including the access token). It prompts before
+making changes unless `--yes` is passed. Chat history, jobs, files, and
+terminals under the state directory (`~/.agentsdock` by default) are kept by
+default, so a later `./install.sh` picks the same history back up. Passing
+`--purge-state` permanently deletes that too, but always requires an
+interactive exact-path confirmation that `--yes` cannot bypass. Before any
+change, the uninstaller rejects root, home, broad system/user directories,
+path traversal, and overlapping install/configuration/state roots. Like
+`install.sh`, it never invokes a package manager or `sudo`. Persistent chat
+terminal tmux sessions (named `zd_*`) are left running; list them with `tmux
+ls` and remove them yourself if you no longer need them.
 
 ## Development Deployment Helper
 

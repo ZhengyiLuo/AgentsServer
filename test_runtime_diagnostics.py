@@ -24,6 +24,62 @@ class RuntimeDiagnosticTests(unittest.TestCase):
         self.assertFalse(diagnostic["available"])
         self.assertIn("Install Claude Code", diagnostic["action"])
 
+    def test_broken_tmux_is_reported_unavailable_but_optional(self) -> None:
+        with patch.object(agent_server.shutil, "which", return_value="/usr/local/bin/tmux"), patch.object(
+            agent_server.subprocess,
+            "run",
+            return_value=completed(["/usr/local/bin/tmux", "-V"], returncode=127),
+        ) as run:
+            capability = agent_server.tmux_capability()
+
+        self.assertFalse(capability["available"])
+        self.assertFalse(capability["required"])
+        self.assertIn("failed its version check", capability["message"])
+        run.assert_called_once()
+
+    def test_failed_tmux_probe_is_cached_for_health_polling(self) -> None:
+        agent_server.TMUX_PROBE_CACHE.update({
+            "path": None,
+            "available": False,
+            "checked_at": 0.0,
+        })
+        with patch.object(
+            agent_server.shutil,
+            "which",
+            return_value="/usr/local/bin/tmux",
+        ), patch.object(
+            agent_server.subprocess,
+            "run",
+            side_effect=OSError("cannot execute tmux"),
+        ) as run:
+            self.assertIsNone(agent_server.working_tmux_bin(use_cache=True))
+            self.assertIsNone(agent_server.working_tmux_bin(use_cache=True))
+
+        run.assert_called_once()
+
+    def test_missing_tmux_is_reported_unavailable_but_optional(self) -> None:
+        with patch.object(agent_server.shutil, "which", return_value=None), patch.object(
+            agent_server.subprocess,
+            "run",
+        ) as run:
+            capability = agent_server.tmux_capability()
+
+        self.assertFalse(capability["available"])
+        self.assertFalse(capability["required"])
+        self.assertIn("rest of AgentsServer works without it", capability["message"])
+        run.assert_not_called()
+
+    def test_working_tmux_is_reported_available(self) -> None:
+        with patch.object(agent_server.shutil, "which", return_value="/usr/local/bin/tmux"), patch.object(
+            agent_server.subprocess,
+            "run",
+            return_value=completed(["/usr/local/bin/tmux", "-V"]),
+        ):
+            capability = agent_server.tmux_capability()
+
+        self.assertTrue(capability["available"])
+        self.assertFalse(capability["required"])
+
     def test_claude_ready_probe_does_not_expose_identity(self) -> None:
         responses = [
             completed(["claude", "--version"], stdout="2.3.4 (Claude Code)\n"),

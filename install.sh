@@ -11,6 +11,7 @@ UV_DOWNLOAD_RETRIES="${AGENTS_SERVER_DOWNLOAD_RETRIES:-3}"
 UV_INSTALL_TIMEOUT_SECONDS="${AGENTS_SERVER_UV_INSTALL_TIMEOUT_SECONDS:-300}"
 DEPENDENCY_SYNC_TIMEOUT_SECONDS="${AGENTS_SERVER_DEPENDENCY_TIMEOUT_SECONDS:-1200}"
 INSTALL_HEARTBEAT_SECONDS="${AGENTS_SERVER_INSTALL_HEARTBEAT_SECONDS:-15}"
+HEALTH_CHECK_ATTEMPTS="${AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS:-45}"
 INSTALL_ROOT="${AGENTS_SERVER_INSTALL_DIR:-$HOME/.local/share/agents-server}"
 CONFIG_ROOT="${AGENTS_SERVER_CONFIG_DIR:-$HOME/.config/agents-server}"
 LEGACY_STATE_ROOT="$HOME/.zenithbot-agent"
@@ -28,28 +29,72 @@ LEGACY_SERVICE_NAME="zenithbot-agent"
 LAUNCHCTL_STOP_ATTEMPTS=50
 LAUNCHCTL_STOP_DELAY=0.1
 LAUNCHCTL_BOOTSTRAP_ATTEMPTS=3
+NON_INTERACTIVE="false"
+PORT_EXPLICIT="false"
+PORT_FALLBACK="auto"
+PORT_FALLBACK_ATTEMPTS=5
+
+if [[ -t 1 ]] && [[ "${TERM:-}" != "dumb" ]] && [[ -z "${NO_COLOR:-}" ]]; then
+  COLOR_GREEN=$'\033[32m'
+  COLOR_RED=$'\033[31m'
+  COLOR_YELLOW=$'\033[33m'
+  COLOR_BOLD=$'\033[1m'
+  COLOR_RESET=$'\033[0m'
+else
+  COLOR_GREEN=""
+  COLOR_RED=""
+  COLOR_YELLOW=""
+  COLOR_BOLD=""
+  COLOR_RESET=""
+fi
+CHECK_MARK="${COLOR_GREEN}✓${COLOR_RESET}"
+CROSS_MARK="${COLOR_RED}✗${COLOR_RESET}"
+DOT_MARK="${COLOR_YELLOW}○${COLOR_RESET}"
 
 usage() {
   cat <<'USAGE'
-Usage: ./install.sh [--port PORT] [--bind ADDRESS] [--release-version VERSION]
+Usage: ./install.sh [--port PORT] [--bind ADDRESS] [--release-version VERSION] [--non-interactive] [--allow-port-fallback|--no-port-fallback]
 
 Installs or updates AgentsServer for the current user. Releases and Python
 runtimes are versioned, the previous healthy release is retained for rollback,
 and existing chat state and generated tokens are preserved. No sudo privileges
 are required.
+
+--non-interactive skips the optional tmux install prompt on macOS instead of
+asking; use it for unattended/SSH-driven runs.
+
+--port pins the exact requested port unless --allow-port-fallback is also set.
+Without --port, setup may select one of the next 5 ports when the default is
+already occupied by a service that does not authenticate as AgentsServer.
+
+--allow-port-fallback enables nearby-port selection even with an explicit
+--port value.
+
+--no-port-fallback disables automatically retrying on the next free port when
+the default port is already held by another process.
 USAGE
 }
 
 while (($#)); do
   case "$1" in
-    --port) PORT="${2:-}"; shift 2 ;;
+    --port) PORT="${2:-}"; PORT_EXPLICIT="true"; shift 2 ;;
     --bind) BIND_ADDRESS="${2:-}"; shift 2 ;;
     --release-version) RELEASE_VERSION="${2:-}"; shift 2 ;;
-    --non-interactive) shift ;;
+    --non-interactive) NON_INTERACTIVE="true"; shift ;;
+    --allow-port-fallback) PORT_FALLBACK="true"; shift ;;
+    --no-port-fallback) PORT_FALLBACK="false"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+if [[ "$PORT_FALLBACK" == "auto" ]]; then
+  if [[ "$PORT_EXPLICIT" == "true" ]]; then
+    PORT_FALLBACK="false"
+  else
+    PORT_FALLBACK="true"
+  fi
+fi
 
 if [[ ! "$PORT" =~ ^[0-9]+$ ]] || ((PORT < 1 || PORT > 65535)); then
   echo "Port must be an integer between 1 and 65535." >&2
@@ -80,6 +125,7 @@ validate_positive_integer "AGENTS_SERVER_DOWNLOAD_RETRIES" "$UV_DOWNLOAD_RETRIES
 validate_positive_integer "AGENTS_SERVER_UV_INSTALL_TIMEOUT_SECONDS" "$UV_INSTALL_TIMEOUT_SECONDS"
 validate_positive_integer "AGENTS_SERVER_DEPENDENCY_TIMEOUT_SECONDS" "$DEPENDENCY_SYNC_TIMEOUT_SECONDS"
 validate_positive_integer "AGENTS_SERVER_INSTALL_HEARTBEAT_SECONDS" "$INSTALL_HEARTBEAT_SECONDS"
+validate_positive_integer "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS" "$HEALTH_CHECK_ATTEMPTS"
 
 RELEASES_ROOT="$INSTALL_ROOT/releases"
 RELEASE_DIR="$RELEASES_ROOT/$RELEASE_VERSION"
@@ -143,7 +189,7 @@ append_server_path "/usr/local/bin"
 append_server_path "/usr/bin"
 append_server_path "/bin"
 export PATH="$SERVER_PATH"
-RELEASE_FILES=(agent_server.py agentsdock_jobs.py codex_app_server.py install.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem)
+RELEASE_FILES=(agent_server.py agentsdock_jobs.py codex_app_server.py install.sh uninstall.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem)
 
 for name in "${RELEASE_FILES[@]}"; do
   if [[ ! -f "$SOURCE_DIR/$name" ]]; then
@@ -201,28 +247,64 @@ probe_service_manager() {
   fi
 }
 
+TMUX_WARNING=""
+
+tmux_working() {
+  command -v tmux >/dev/null 2>&1 && tmux -V >/dev/null 2>&1
+}
+
+offer_brew_tmux_install() {
+  # Only ever offered on macOS with Homebrew present; never attempted over a
+  # non-interactive/SSH-driven run, where there is no one to answer a prompt.
+  [[ "$NON_INTERACTIVE" != "true" && -t 0 ]] || return 1
+  command -v brew >/dev/null 2>&1 || return 1
+  local reply=""
+  read -r -p "      tmux was not found. Install it now with Homebrew (brew install tmux)? [y/N] " reply || return 1
+  case "$reply" in
+    y|Y|yes|YES) ;;
+    *) return 1 ;;
+  esac
+  echo "      Installing tmux with Homebrew"
+  brew install tmux
+}
+
+check_tmux_prerequisite() {
+  # tmux is optional: it only backs the persistent chat terminal, tmux-pane
+  # inspection, and in-app managed updates. The rest of AgentsServer (chats,
+  # turns, jobs, files) runs without it, so a missing tmux is a warning, not
+  # a preflight failure.
+  local guidance=""
+  tmux_working && return 0
+  if [[ "$OS_NAME" == "Darwin" ]]; then
+    if offer_brew_tmux_install && tmux_working; then
+      return 0
+    fi
+    guidance="Install tmux with Homebrew: brew install tmux"
+  else
+    guidance="Install tmux with your package manager, for example: sudo apt install tmux, sudo dnf install tmux, or sudo pacman -S tmux."
+  fi
+  TMUX_WARNING="tmux is unavailable, so the persistent chat terminal, tmux-pane inspection, and in-app managed updates will not work. $guidance Then rerun install.sh to enable them; everything else about AgentsServer works without it."
+  echo "Optional prerequisite unavailable: tmux" >&2
+  echo "  $TMUX_WARNING" >&2
+}
+
 preflight_prerequisites() {
   case "$OS_NAME" in
     Darwin)
-      require_command "tmux" "Install tmux with Homebrew: brew install tmux"
       require_download_client "Restore the curl included with macOS, or install curl or wget with Homebrew: brew install curl."
       require_command "launchctl" "launchctl is included with macOS; run this installer from a supported macOS user session."
-      if command -v tmux >/dev/null 2>&1 && ! tmux -V >/dev/null 2>&1; then
-        record_prerequisite_failure "tmux" "Install a working tmux with Homebrew: brew install tmux"
-      fi
       ;;
     Linux)
-      require_command "tmux" "Install tmux with your package manager, for example: sudo apt install tmux, sudo dnf install tmux, or sudo pacman -S tmux."
       require_download_client "Install curl or wget with your package manager, for example: sudo apt install curl, sudo dnf install curl, or sudo pacman -S curl."
       require_command "systemctl" "AgentsServer's Linux installer requires systemd and a working systemctl --user session."
-      if command -v tmux >/dev/null 2>&1 && ! tmux -V >/dev/null 2>&1; then
-        record_prerequisite_failure "tmux" "Install a working tmux with your package manager, for example: sudo apt install tmux, sudo dnf install tmux, or sudo pacman -S tmux."
-      fi
       ;;
     *)
       echo "Unsupported host OS: $OS_NAME" >&2
       PREFLIGHT_FAILED="true"
       ;;
+  esac
+  case "$OS_NAME" in
+    Darwin|Linux) check_tmux_prerequisite ;;
   esac
   probe_service_manager
   if [[ "$PREFLIGHT_FAILED" == "true" ]]; then
@@ -476,7 +558,7 @@ mkdir -p "$STAGE_DIR"
 for name in "${RELEASE_FILES[@]}"; do
   install -m 644 "$SOURCE_DIR/$name" "$STAGE_DIR/$name"
 done
-chmod 755 "$STAGE_DIR/agent_server.py" "$STAGE_DIR/agentsdock_jobs.py" "$STAGE_DIR/install.sh" "$STAGE_DIR/update_runner.py"
+chmod 755 "$STAGE_DIR/agent_server.py" "$STAGE_DIR/agentsdock_jobs.py" "$STAGE_DIR/install.sh" "$STAGE_DIR/uninstall.sh" "$STAGE_DIR/update_runner.py"
 
 echo "[2/7] Resolving the release dependencies with uv"
 if run_timed_stage \
@@ -526,17 +608,19 @@ generate_token() {
 }
 [[ "$TOKEN" =~ ^[A-Za-z0-9_-]{32,}$ ]] || TOKEN="$(generate_token)"
 
-ENV_TEMP="$CONFIG_ROOT/.env.$$"
 PRESERVE_SOURCE=""
 [[ ! -f "$LEGACY_ENV_FILE" ]] || PRESERVE_SOURCE="$LEGACY_ENV_FILE"
 [[ ! -f "$ENV_FILE" ]] || PRESERVE_SOURCE="$ENV_FILE"
-if [[ -n "$PRESERVE_SOURCE" ]]; then
-  grep -Ev '^(AGENTSDOCK_(STATE_DIR|AGENT_CWD|AGENT_BIND|AGENT_PORT|AGENT_TOKEN)|AGENTS_SERVER_(STATE_DIR|INSTALL_DIR)|ZENITHBOT_AGENT_(DIR|CWD|BIND|PORT|TOKEN)|ZENITHDOCK_AGENT_TOKEN|PATH)=' \
-    "$PRESERVE_SOURCE" > "$ENV_TEMP" || true
-else
-  : > "$ENV_TEMP"
-fi
-cat >> "$ENV_TEMP" <<EOF
+
+write_runtime_env() {
+  local env_temp="$CONFIG_ROOT/.env.$$"
+  if [[ -n "$PRESERVE_SOURCE" ]]; then
+    grep -Ev '^(AGENTSDOCK_(STATE_DIR|AGENT_CWD|AGENT_BIND|AGENT_PORT|AGENT_TOKEN)|AGENTS_SERVER_(STATE_DIR|INSTALL_DIR)|ZENITHBOT_AGENT_(DIR|CWD|BIND|PORT|TOKEN)|ZENITHDOCK_AGENT_TOKEN|PATH)=' \
+      "$PRESERVE_SOURCE" > "$env_temp" || true
+  else
+    : > "$env_temp"
+  fi
+  cat >> "$env_temp" <<EOF
 AGENTSDOCK_STATE_DIR=$STATE_ROOT
 AGENTSDOCK_AGENT_CWD=$HOME
 AGENTSDOCK_AGENT_BIND=$BIND_ADDRESS
@@ -545,8 +629,12 @@ AGENTSDOCK_AGENT_TOKEN=$TOKEN
 AGENTS_SERVER_INSTALL_DIR=$INSTALL_ROOT
 PATH=$SERVER_PATH
 EOF
-chmod 600 "$ENV_TEMP"
-mv "$ENV_TEMP" "$ENV_FILE"
+  chmod 600 "$env_temp"
+  mv "$env_temp" "$ENV_FILE"
+  PRESERVE_SOURCE="$ENV_FILE"
+}
+
+write_runtime_env
 
 echo "[3/7] Activating release $RELEASE_VERSION"
 OLD_TARGET=""
@@ -668,11 +756,26 @@ restore_previous_release() {
   return 1
 }
 
-echo "[4/7] Installing the user service"
-if [[ "$OS_NAME" == "Linux" ]]; then
-  USER_SERVICE_DIR="$HOME/.config/systemd/user"
-  mkdir -p "$USER_SERVICE_DIR"
-  cat > "$USER_SERVICE_DIR/$SERVICE_NAME.service" <<EOF
+port_has_listener() {
+  local port="$1"
+  # Keep the probe in a subshell so both the socket descriptor and diagnostic
+  # redirection are scoped to this check. A bare `exec ... 2>/dev/null` here
+  # would permanently silence the installer's stderr after the first probe.
+  (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null || return 1
+  return 0
+}
+
+describe_port_listener() {
+  local port="$1"
+  command -v lsof >/dev/null 2>&1 || return 0
+  lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print "  " $1 " (pid " $2 ")"}' | sort -u
+}
+
+write_service_files() {
+  if [[ "$OS_NAME" == "Linux" ]]; then
+    USER_SERVICE_DIR="$HOME/.config/systemd/user"
+    mkdir -p "$USER_SERVICE_DIR"
+    cat > "$USER_SERVICE_DIR/$SERVICE_NAME.service" <<EOF
 [Unit]
 Description=AgentsServer
 After=network-online.target
@@ -684,21 +787,25 @@ EnvironmentFile=$ENV_FILE
 ExecStart=$CURRENT_LINK/.venv/bin/python $CURRENT_LINK/agent_server.py serve --bind $BIND_ADDRESS --port $PORT
 Restart=always
 RestartSec=2
+# Keep the coordinator alive long enough to record/recover agent failures
+# when systemd-oomd must choose among pressured user services. Provider
+# subprocesses remain in this cgroup and are stopped with the service.
+ManagedOOMPreference=avoid
 
 [Install]
 WantedBy=default.target
 EOF
-  SERVICE_KIND="systemd-user"
-elif [[ "$OS_NAME" == "Darwin" ]]; then
-  LABEL="com.agentsdock.server"
-  LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
-  PLIST="$LAUNCH_AGENTS/$LABEL.plist"
-  mkdir -p "$LAUNCH_AGENTS" "$HOME/Library/Logs/AgentsServer"
-  if [[ -f "$PLIST" ]]; then
-    SERVICE_CONFIG_BACKUP="$(mktemp "${TMPDIR:-/tmp}/agents-server-launch-agent.XXXXXX")"
-    cp -p "$PLIST" "$SERVICE_CONFIG_BACKUP"
-  fi
-  cat > "$PLIST" <<EOF
+    SERVICE_KIND="systemd-user"
+  elif [[ "$OS_NAME" == "Darwin" ]]; then
+    LABEL="com.agentsdock.server"
+    LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
+    PLIST="$LAUNCH_AGENTS/$LABEL.plist"
+    mkdir -p "$LAUNCH_AGENTS" "$HOME/Library/Logs/AgentsServer"
+    if [[ -f "$PLIST" && -z "$SERVICE_CONFIG_BACKUP" ]]; then
+      SERVICE_CONFIG_BACKUP="$(mktemp "${TMPDIR:-/tmp}/agents-server-launch-agent.XXXXXX")"
+      cp -p "$PLIST" "$SERVICE_CONFIG_BACKUP"
+    fi
+    cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -724,45 +831,99 @@ elif [[ "$OS_NAME" == "Darwin" ]]; then
   <key>StandardErrorPath</key><string>$HOME/Library/Logs/AgentsServer/server-error.log</string>
 </dict></plist>
 EOF
-  chmod 600 "$PLIST"
-  SERVICE_KIND="launch-agent"
-else
-  echo "Unsupported host OS: $OS_NAME" >&2
-  exit 1
-fi
-if ! restart_service; then
-  echo "AgentsServer $RELEASE_VERSION could not start; restoring the previous service when possible." >&2
-  if restore_previous_release true; then
-    echo "The previous release and service were restored." >&2
+    chmod 600 "$PLIST"
+    SERVICE_KIND="launch-agent"
+  else
+    echo "Unsupported host OS: $OS_NAME" >&2
+    exit 1
   fi
-  exit 1
-fi
+}
 
-wait_for_health() {
-  for _attempt in $(seq 1 45); do
-    if command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1; then
-      if curl --fail --silent --show-error --connect-timeout 1 --max-time 2 \
-        -H "Authorization: Bearer $TOKEN" \
-        "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1; then
-        return 0
-      fi
-    elif wget \
-      --quiet \
-      --timeout=2 \
-      --tries=1 \
-      --header="Authorization: Bearer $TOKEN" \
-      --output-document=/dev/null \
-      "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1; then
+HEALTH_CHECK_HEARTBEAT_ATTEMPTS=5
+
+health_check_once() {
+  local port="$1"
+  if command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1; then
+    if curl --fail --silent --show-error --connect-timeout 1 --max-time 2 \
+      -H "Authorization: Bearer $TOKEN" \
+      "http://127.0.0.1:$port/api/health" >/dev/null 2>&1; then
       return 0
     fi
-    sleep 1
+  elif wget \
+    --quiet \
+    --timeout=2 \
+    --tries=1 \
+    --header="Authorization: Bearer $TOKEN" \
+    --output-document=/dev/null \
+    "http://127.0.0.1:$port/api/health" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+wait_for_health() {
+  local attempt
+  for ((attempt = 1; attempt <= HEALTH_CHECK_ATTEMPTS; attempt++)); do
+    if health_check_once "$PORT"; then
+      return 0
+    fi
+    if ((attempt < HEALTH_CHECK_ATTEMPTS)) && ((attempt % HEALTH_CHECK_HEARTBEAT_ATTEMPTS == 0)); then
+      echo "      Still waiting for health (${attempt}s elapsed, timeout ${HEALTH_CHECK_ATTEMPTS}s)"
+    fi
+    ((attempt == HEALTH_CHECK_ATTEMPTS)) || sleep 1
   done
   return 1
 }
 
-echo "[5/7] Waiting for authenticated health"
-if ! wait_for_health; then
+# A requested port held by an authenticated AgentsServer is the service being
+# replaced and will be released by restart_service. A listener that is present
+# before restart and rejects the preserved token is treated as a conflict.
+ORIGINAL_PORT="$PORT"
+PORT_AUTO_SELECTED="false"
+port_fallback_attempt=0
+
+while true; do
+  # Select a fallback only for a listener that was present before this service
+  # is restarted and does not authenticate with the preserved AgentsServer
+  # token. A newly started but unhealthy AgentsServer must be rolled back, not
+  # mistaken for a port conflict and silently moved to another port.
+  if [[ "$PORT_FALLBACK" == "true" ]] && port_has_listener "$PORT" && ! health_check_once "$PORT"; then
+    echo "Port $PORT is already held by another process:" >&2
+    describe_port_listener "$PORT" >&2
+    port_fallback_attempt=$((port_fallback_attempt + 1))
+    candidate=$((ORIGINAL_PORT + port_fallback_attempt))
+    while ((port_fallback_attempt <= PORT_FALLBACK_ATTEMPTS)) && ((candidate <= 65535)) && port_has_listener "$candidate"; do
+      port_fallback_attempt=$((port_fallback_attempt + 1))
+      candidate=$((ORIGINAL_PORT + port_fallback_attempt))
+    done
+    if ((port_fallback_attempt <= PORT_FALLBACK_ATTEMPTS)) && ((candidate <= 65535)); then
+      PORT="$candidate"
+      PORT_AUTO_SELECTED="true"
+      write_runtime_env
+      echo "Selecting port $PORT instead (attempt $port_fallback_attempt/$PORT_FALLBACK_ATTEMPTS)." >&2
+      continue
+    fi
+    echo "Ran out of nearby free ports to try." >&2
+  fi
+
+  echo "[4/7] Installing the user service (port $PORT)"
+  write_service_files
+  if ! restart_service; then
+    echo "AgentsServer $RELEASE_VERSION could not start; restoring the previous service when possible." >&2
+    if restore_previous_release true; then
+      echo "The previous release and service were restored." >&2
+    fi
+    exit 1
+  fi
+
+  echo "[5/7] Waiting for authenticated health"
+  if wait_for_health; then
+    break
+  fi
+
   echo "AgentsServer $RELEASE_VERSION did not become healthy; rolling back." >&2
+  PORT="$ORIGINAL_PORT"
+  write_service_files
   if restore_previous_release false; then
     wait_for_health || true
     echo "The previous release was restored." >&2
@@ -774,16 +935,25 @@ if ! wait_for_health; then
     systemctl --user status "$SERVICE_NAME.service" --no-pager -l >&2 || true
   fi
   exit 1
-fi
+done
 
 echo "[6/7] Checking optional agent runtimes"
-RUNTIMES=()
-command -v claude >/dev/null 2>&1 && RUNTIMES+=(claude)
-command -v codex >/dev/null 2>&1 && RUNTIMES+=(codex)
-if ((${#RUNTIMES[@]} == 0)); then
-  echo "      Server is ready; install and sign in to Claude Code or Codex before starting a chat."
-else
-  echo "      Found: ${RUNTIMES[*]}"
+check_runtime_cli() {
+  local name="$1"
+  local install_hint="$2"
+  if command -v "$name" >/dev/null 2>&1; then
+    echo "      $CHECK_MARK $name found"
+    return 0
+  fi
+  echo "      $CROSS_MARK $name not found - $install_hint"
+  return 1
+}
+CLAUDE_READY="false"
+CODEX_READY="false"
+check_runtime_cli claude "npm install -g @anthropic-ai/claude-code, then run: claude" && CLAUDE_READY="true"
+check_runtime_cli codex "npm install -g @openai/codex, then run: codex login" && CODEX_READY="true"
+if [[ "$CLAUDE_READY" == "false" && "$CODEX_READY" == "false" ]]; then
+  echo "      Sign in to at least one before starting a chat."
 fi
 
 TAILSCALE_IP=""
@@ -794,5 +964,26 @@ SERVER_URL="http://127.0.0.1:$PORT"
 [[ -z "$TAILSCALE_IP" ]] || SERVER_URL="http://$TAILSCALE_IP:$PORT"
 
 echo "[7/7] AgentsServer $RELEASE_VERSION is ready"
+echo
+echo "  ${COLOR_BOLD}Server URL${COLOR_RESET}    $SERVER_URL"
+echo
+echo "  ${COLOR_BOLD}Next steps${COLOR_RESET}"
+if [[ "$PORT_AUTO_SELECTED" == "true" ]]; then
+  echo "  $DOT_MARK port $ORIGINAL_PORT was already in use, installed on $PORT instead (--port pins an exact port unless --allow-port-fallback is supplied)"
+fi
+if [[ "$CLAUDE_READY" == "false" && "$CODEX_READY" == "false" ]]; then
+  echo "  $CROSS_MARK install and sign in to Claude Code or Codex (see [6/7] above) before starting a chat"
+fi
+if [[ -n "$TMUX_WARNING" ]]; then
+  echo "  $CROSS_MARK tmux unavailable: persistent terminal, pane inspection, and in-app updates won't work - $TMUX_WARNING"
+else
+  echo "  $CHECK_MARK tmux available"
+fi
+if [[ -n "$TAILSCALE_IP" ]]; then
+  echo "  $CHECK_MARK reachable via Tailscale at $TAILSCALE_IP"
+else
+  echo "  $DOT_MARK optional: install and connect Tailscale to reach this server from another device or WiFi network: https://tailscale.com/download"
+fi
+echo
 printf 'AGENTSDOCK_SETUP_RESULT={"server_url":"%s","access_token":"%s","service":"%s","tailscale_ip":"%s","server_version":"%s"}\n' \
   "$SERVER_URL" "$TOKEN" "$SERVICE_KIND" "$TAILSCALE_IP" "$RELEASE_VERSION"

@@ -18,6 +18,7 @@ FILES = (
     "agentsdock_jobs.py",
     "codex_app_server.py",
     "install.sh",
+    "uninstall.sh",
     "update_runner.py",
     "pyproject.toml",
     "uv.lock",
@@ -48,6 +49,7 @@ def main() -> int:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(root / name, target)
         (package_root / "install.sh").chmod(0o755)
+        (package_root / "uninstall.sh").chmod(0o755)
         (package_root / "agentsdock_jobs.py").chmod(0o755)
         (package_root / "update_runner.py").chmod(0o755)
         with tarfile.open(archive_path, "w:gz", format=tarfile.PAX_FORMAT) as archive:

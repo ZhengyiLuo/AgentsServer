@@ -142,15 +142,15 @@ terminates the complete dependency-worker process group. Existing
 `~/.zenithbot-agent` state is migrated automatically and left behind as a
 compatibility link. The installer does not use `sudo`.
 
-If the requested port is already held by something other than the
-AgentsServer release being replaced, health checks on it will keep failing
-silently for up to 45 seconds. Rather than grind through that on every retry,
-the installer detects the still-active listener, reports what it found (with
-`lsof`, when available), and automatically retries on up to 5 higher ports
-before giving up and rolling back. A port chosen this way is called out at
-the end of the run and reflected in `AGENTSDOCK_SETUP_RESULT`. Pass `--port`
-to pin an exact port, or `--no-port-fallback` to fail immediately instead of
-switching.
+If the default port is already held by something other than the AgentsServer
+release being replaced, the installer detects that listener before restarting
+the user service, reports what it found (with `lsof`, when available), and
+selects one of up to 5 higher free ports. It never treats a newly started but
+unhealthy AgentsServer as a port conflict; that path still rolls back. A port
+chosen this way is called out at the end of the run and reflected in
+`AGENTSDOCK_SETUP_RESULT`. Passing `--port` pins an exact port by default;
+combine it with `--allow-port-fallback` to opt an explicit port into nearby
+selection, or use `--no-port-fallback` to disable selection explicitly.
 
 AgentsDock desktop can run this same installer locally or over an existing SSH
 key connection from its first-run setup window. Remote clients should use the
@@ -362,12 +362,14 @@ This stops and removes the user service, the versioned release runtime, and
 generated configuration (including the access token). It prompts before
 making changes unless `--yes` is passed. Chat history, jobs, files, and
 terminals under the state directory (`~/.agentsdock` by default) are kept by
-default, so a later `./install.sh` picks the same history back up; pass
-`--purge-state` to permanently delete that too (prompted separately even with
-`--yes`, so a single flag can never wipe chat history by accident). Like
+default, so a later `./install.sh` picks the same history back up. Passing
+`--purge-state` permanently deletes that too, but always requires an
+interactive exact-path confirmation that `--yes` cannot bypass. Before any
+change, the uninstaller rejects root, home, broad system/user directories,
+path traversal, and overlapping install/configuration/state roots. Like
 `install.sh`, it never invokes a package manager or `sudo`. Persistent chat
-terminal tmux sessions (named `zd_*`) are left running; list them with
-`tmux ls` and remove them yourself if you no longer need them.
+terminal tmux sessions (named `zd_*`) are left running; list them with `tmux
+ls` and remove them yourself if you no longer need them.
 
 ## Development Deployment Helper
 

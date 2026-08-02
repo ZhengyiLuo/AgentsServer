@@ -11,6 +11,7 @@ UV_DOWNLOAD_RETRIES="${AGENTS_SERVER_DOWNLOAD_RETRIES:-3}"
 UV_INSTALL_TIMEOUT_SECONDS="${AGENTS_SERVER_UV_INSTALL_TIMEOUT_SECONDS:-300}"
 DEPENDENCY_SYNC_TIMEOUT_SECONDS="${AGENTS_SERVER_DEPENDENCY_TIMEOUT_SECONDS:-1200}"
 INSTALL_HEARTBEAT_SECONDS="${AGENTS_SERVER_INSTALL_HEARTBEAT_SECONDS:-15}"
+HEALTH_CHECK_ATTEMPTS="${AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS:-45}"
 INSTALL_ROOT="${AGENTS_SERVER_INSTALL_DIR:-$HOME/.local/share/agents-server}"
 CONFIG_ROOT="${AGENTS_SERVER_CONFIG_DIR:-$HOME/.config/agents-server}"
 LEGACY_STATE_ROOT="$HOME/.zenithbot-agent"
@@ -29,7 +30,8 @@ LAUNCHCTL_STOP_ATTEMPTS=50
 LAUNCHCTL_STOP_DELAY=0.1
 LAUNCHCTL_BOOTSTRAP_ATTEMPTS=3
 NON_INTERACTIVE="false"
-PORT_FALLBACK="true"
+PORT_EXPLICIT="false"
+PORT_FALLBACK="auto"
 PORT_FALLBACK_ATTEMPTS=5
 
 if [[ -t 1 ]] && [[ "${TERM:-}" != "dumb" ]] && [[ -z "${NO_COLOR:-}" ]]; then
@@ -51,7 +53,7 @@ DOT_MARK="${COLOR_YELLOW}○${COLOR_RESET}"
 
 usage() {
   cat <<'USAGE'
-Usage: ./install.sh [--port PORT] [--bind ADDRESS] [--release-version VERSION] [--non-interactive] [--no-port-fallback]
+Usage: ./install.sh [--port PORT] [--bind ADDRESS] [--release-version VERSION] [--non-interactive] [--allow-port-fallback|--no-port-fallback]
 
 Installs or updates AgentsServer for the current user. Releases and Python
 runtimes are versioned, the previous healthy release is retained for rollback,
@@ -61,23 +63,38 @@ are required.
 --non-interactive skips the optional tmux install prompt on macOS instead of
 asking; use it for unattended/SSH-driven runs.
 
+--port pins the exact requested port unless --allow-port-fallback is also set.
+Without --port, setup may select one of the next 5 ports when the default is
+already occupied by a service that does not authenticate as AgentsServer.
+
+--allow-port-fallback enables nearby-port selection even with an explicit
+--port value.
+
 --no-port-fallback disables automatically retrying on the next free port when
-the requested one is already held by another process; it fails and rolls back
-instead. By default, up to 5 higher ports are tried automatically.
+the default port is already held by another process.
 USAGE
 }
 
 while (($#)); do
   case "$1" in
-    --port) PORT="${2:-}"; shift 2 ;;
+    --port) PORT="${2:-}"; PORT_EXPLICIT="true"; shift 2 ;;
     --bind) BIND_ADDRESS="${2:-}"; shift 2 ;;
     --release-version) RELEASE_VERSION="${2:-}"; shift 2 ;;
     --non-interactive) NON_INTERACTIVE="true"; shift ;;
+    --allow-port-fallback) PORT_FALLBACK="true"; shift ;;
     --no-port-fallback) PORT_FALLBACK="false"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+if [[ "$PORT_FALLBACK" == "auto" ]]; then
+  if [[ "$PORT_EXPLICIT" == "true" ]]; then
+    PORT_FALLBACK="false"
+  else
+    PORT_FALLBACK="true"
+  fi
+fi
 
 if [[ ! "$PORT" =~ ^[0-9]+$ ]] || ((PORT < 1 || PORT > 65535)); then
   echo "Port must be an integer between 1 and 65535." >&2
@@ -108,6 +125,7 @@ validate_positive_integer "AGENTS_SERVER_DOWNLOAD_RETRIES" "$UV_DOWNLOAD_RETRIES
 validate_positive_integer "AGENTS_SERVER_UV_INSTALL_TIMEOUT_SECONDS" "$UV_INSTALL_TIMEOUT_SECONDS"
 validate_positive_integer "AGENTS_SERVER_DEPENDENCY_TIMEOUT_SECONDS" "$DEPENDENCY_SYNC_TIMEOUT_SECONDS"
 validate_positive_integer "AGENTS_SERVER_INSTALL_HEARTBEAT_SECONDS" "$INSTALL_HEARTBEAT_SECONDS"
+validate_positive_integer "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS" "$HEALTH_CHECK_ATTEMPTS"
 
 RELEASES_ROOT="$INSTALL_ROOT/releases"
 RELEASE_DIR="$RELEASES_ROOT/$RELEASE_VERSION"
@@ -171,7 +189,7 @@ append_server_path "/usr/local/bin"
 append_server_path "/usr/bin"
 append_server_path "/bin"
 export PATH="$SERVER_PATH"
-RELEASE_FILES=(agent_server.py agentsdock_jobs.py codex_app_server.py install.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem)
+RELEASE_FILES=(agent_server.py agentsdock_jobs.py codex_app_server.py install.sh uninstall.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem)
 
 for name in "${RELEASE_FILES[@]}"; do
   if [[ ! -f "$SOURCE_DIR/$name" ]]; then
@@ -540,7 +558,7 @@ mkdir -p "$STAGE_DIR"
 for name in "${RELEASE_FILES[@]}"; do
   install -m 644 "$SOURCE_DIR/$name" "$STAGE_DIR/$name"
 done
-chmod 755 "$STAGE_DIR/agent_server.py" "$STAGE_DIR/agentsdock_jobs.py" "$STAGE_DIR/install.sh" "$STAGE_DIR/update_runner.py"
+chmod 755 "$STAGE_DIR/agent_server.py" "$STAGE_DIR/agentsdock_jobs.py" "$STAGE_DIR/install.sh" "$STAGE_DIR/uninstall.sh" "$STAGE_DIR/update_runner.py"
 
 echo "[2/7] Resolving the release dependencies with uv"
 if run_timed_stage \
@@ -590,17 +608,19 @@ generate_token() {
 }
 [[ "$TOKEN" =~ ^[A-Za-z0-9_-]{32,}$ ]] || TOKEN="$(generate_token)"
 
-ENV_TEMP="$CONFIG_ROOT/.env.$$"
 PRESERVE_SOURCE=""
 [[ ! -f "$LEGACY_ENV_FILE" ]] || PRESERVE_SOURCE="$LEGACY_ENV_FILE"
 [[ ! -f "$ENV_FILE" ]] || PRESERVE_SOURCE="$ENV_FILE"
-if [[ -n "$PRESERVE_SOURCE" ]]; then
-  grep -Ev '^(AGENTSDOCK_(STATE_DIR|AGENT_CWD|AGENT_BIND|AGENT_PORT|AGENT_TOKEN)|AGENTS_SERVER_(STATE_DIR|INSTALL_DIR)|ZENITHBOT_AGENT_(DIR|CWD|BIND|PORT|TOKEN)|ZENITHDOCK_AGENT_TOKEN|PATH)=' \
-    "$PRESERVE_SOURCE" > "$ENV_TEMP" || true
-else
-  : > "$ENV_TEMP"
-fi
-cat >> "$ENV_TEMP" <<EOF
+
+write_runtime_env() {
+  local env_temp="$CONFIG_ROOT/.env.$$"
+  if [[ -n "$PRESERVE_SOURCE" ]]; then
+    grep -Ev '^(AGENTSDOCK_(STATE_DIR|AGENT_CWD|AGENT_BIND|AGENT_PORT|AGENT_TOKEN)|AGENTS_SERVER_(STATE_DIR|INSTALL_DIR)|ZENITHBOT_AGENT_(DIR|CWD|BIND|PORT|TOKEN)|ZENITHDOCK_AGENT_TOKEN|PATH)=' \
+      "$PRESERVE_SOURCE" > "$env_temp" || true
+  else
+    : > "$env_temp"
+  fi
+  cat >> "$env_temp" <<EOF
 AGENTSDOCK_STATE_DIR=$STATE_ROOT
 AGENTSDOCK_AGENT_CWD=$HOME
 AGENTSDOCK_AGENT_BIND=$BIND_ADDRESS
@@ -609,8 +629,12 @@ AGENTSDOCK_AGENT_TOKEN=$TOKEN
 AGENTS_SERVER_INSTALL_DIR=$INSTALL_ROOT
 PATH=$SERVER_PATH
 EOF
-chmod 600 "$ENV_TEMP"
-mv "$ENV_TEMP" "$ENV_FILE"
+  chmod 600 "$env_temp"
+  mv "$env_temp" "$ENV_FILE"
+  PRESERVE_SOURCE="$ENV_FILE"
+}
+
+write_runtime_env
 
 echo "[3/7] Activating release $RELEASE_VERSION"
 OLD_TARGET=""
@@ -734,8 +758,10 @@ restore_previous_release() {
 
 port_has_listener() {
   local port="$1"
+  # Keep the probe in a subshell so both the socket descriptor and diagnostic
+  # redirection are scoped to this check. A bare `exec ... 2>/dev/null` here
+  # would permanently silence the installer's stderr after the first probe.
   (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null || return 1
-  exec 3>&- 2>/dev/null || true
   return 0
 }
 
@@ -761,6 +787,10 @@ EnvironmentFile=$ENV_FILE
 ExecStart=$CURRENT_LINK/.venv/bin/python $CURRENT_LINK/agent_server.py serve --bind $BIND_ADDRESS --port $PORT
 Restart=always
 RestartSec=2
+# Keep the coordinator alive long enough to record/recover agent failures
+# when systemd-oomd must choose among pressured user services. Provider
+# subprocesses remain in this cgroup and are stopped with the service.
+ManagedOOMPreference=avoid
 
 [Install]
 WantedBy=default.target
@@ -809,45 +839,73 @@ EOF
   fi
 }
 
-HEALTH_CHECK_ATTEMPTS=45
 HEALTH_CHECK_HEARTBEAT_ATTEMPTS=5
+
+health_check_once() {
+  local port="$1"
+  if command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1; then
+    if curl --fail --silent --show-error --connect-timeout 1 --max-time 2 \
+      -H "Authorization: Bearer $TOKEN" \
+      "http://127.0.0.1:$port/api/health" >/dev/null 2>&1; then
+      return 0
+    fi
+  elif wget \
+    --quiet \
+    --timeout=2 \
+    --tries=1 \
+    --header="Authorization: Bearer $TOKEN" \
+    --output-document=/dev/null \
+    "http://127.0.0.1:$port/api/health" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
 
 wait_for_health() {
   local attempt
   for ((attempt = 1; attempt <= HEALTH_CHECK_ATTEMPTS; attempt++)); do
-    if command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1; then
-      if curl --fail --silent --show-error --connect-timeout 1 --max-time 2 \
-        -H "Authorization: Bearer $TOKEN" \
-        "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1; then
-        return 0
-      fi
-    elif wget \
-      --quiet \
-      --timeout=2 \
-      --tries=1 \
-      --header="Authorization: Bearer $TOKEN" \
-      --output-document=/dev/null \
-      "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1; then
+    if health_check_once "$PORT"; then
       return 0
     fi
     if ((attempt < HEALTH_CHECK_ATTEMPTS)) && ((attempt % HEALTH_CHECK_HEARTBEAT_ATTEMPTS == 0)); then
       echo "      Still waiting for health (${attempt}s elapsed, timeout ${HEALTH_CHECK_ATTEMPTS}s)"
     fi
-    sleep 1
+    ((attempt == HEALTH_CHECK_ATTEMPTS)) || sleep 1
   done
   return 1
 }
 
-# A requested port already held by AgentsServer's own about-to-be-replaced
-# service is normal and resolves itself once restart_service stops it below.
-# A port that still has a listener after a failed health check, though, means
-# something else is squatting on it; automatically try nearby ports instead
-# of grinding through the same silent 45s timeout on every retry.
+# A requested port held by an authenticated AgentsServer is the service being
+# replaced and will be released by restart_service. A listener that is present
+# before restart and rejects the preserved token is treated as a conflict.
 ORIGINAL_PORT="$PORT"
 PORT_AUTO_SELECTED="false"
 port_fallback_attempt=0
 
 while true; do
+  # Select a fallback only for a listener that was present before this service
+  # is restarted and does not authenticate with the preserved AgentsServer
+  # token. A newly started but unhealthy AgentsServer must be rolled back, not
+  # mistaken for a port conflict and silently moved to another port.
+  if [[ "$PORT_FALLBACK" == "true" ]] && port_has_listener "$PORT" && ! health_check_once "$PORT"; then
+    echo "Port $PORT is already held by another process:" >&2
+    describe_port_listener "$PORT" >&2
+    port_fallback_attempt=$((port_fallback_attempt + 1))
+    candidate=$((ORIGINAL_PORT + port_fallback_attempt))
+    while ((port_fallback_attempt <= PORT_FALLBACK_ATTEMPTS)) && ((candidate <= 65535)) && port_has_listener "$candidate"; do
+      port_fallback_attempt=$((port_fallback_attempt + 1))
+      candidate=$((ORIGINAL_PORT + port_fallback_attempt))
+    done
+    if ((port_fallback_attempt <= PORT_FALLBACK_ATTEMPTS)) && ((candidate <= 65535)); then
+      PORT="$candidate"
+      PORT_AUTO_SELECTED="true"
+      write_runtime_env
+      echo "Selecting port $PORT instead (attempt $port_fallback_attempt/$PORT_FALLBACK_ATTEMPTS)." >&2
+      continue
+    fi
+    echo "Ran out of nearby free ports to try." >&2
+  fi
+
   echo "[4/7] Installing the user service (port $PORT)"
   write_service_files
   if ! restart_service; then
@@ -861,24 +919,6 @@ while true; do
   echo "[5/7] Waiting for authenticated health"
   if wait_for_health; then
     break
-  fi
-
-  if [[ "$PORT_FALLBACK" == "true" ]] && port_has_listener "$PORT" && ((port_fallback_attempt < PORT_FALLBACK_ATTEMPTS)); then
-    echo "Port $PORT did not become healthy and is still held by another process:" >&2
-    describe_port_listener "$PORT" >&2
-    port_fallback_attempt=$((port_fallback_attempt + 1))
-    candidate=$((ORIGINAL_PORT + port_fallback_attempt))
-    while ((port_fallback_attempt <= PORT_FALLBACK_ATTEMPTS)) && ((candidate <= 65535)) && port_has_listener "$candidate"; do
-      port_fallback_attempt=$((port_fallback_attempt + 1))
-      candidate=$((ORIGINAL_PORT + port_fallback_attempt))
-    done
-    if ((port_fallback_attempt <= PORT_FALLBACK_ATTEMPTS)) && ((candidate <= 65535)); then
-      PORT="$candidate"
-      PORT_AUTO_SELECTED="true"
-      echo "Retrying on port $PORT instead (attempt $port_fallback_attempt/$PORT_FALLBACK_ATTEMPTS). Pass --port to pin a specific port, or --no-port-fallback to disable this." >&2
-      continue
-    fi
-    echo "Ran out of nearby free ports to try." >&2
   fi
 
   echo "AgentsServer $RELEASE_VERSION did not become healthy; rolling back." >&2
@@ -926,11 +966,10 @@ SERVER_URL="http://127.0.0.1:$PORT"
 echo "[7/7] AgentsServer $RELEASE_VERSION is ready"
 echo
 echo "  ${COLOR_BOLD}Server URL${COLOR_RESET}    $SERVER_URL"
-echo "  ${COLOR_BOLD}Access token${COLOR_RESET}  $TOKEN"
 echo
 echo "  ${COLOR_BOLD}Next steps${COLOR_RESET}"
 if [[ "$PORT_AUTO_SELECTED" == "true" ]]; then
-  echo "  $DOT_MARK port $ORIGINAL_PORT was already in use, installed on $PORT instead (--port to pin, --no-port-fallback to disable)"
+  echo "  $DOT_MARK port $ORIGINAL_PORT was already in use, installed on $PORT instead (--port pins an exact port unless --allow-port-fallback is supplied)"
 fi
 if [[ "$CLAUDE_READY" == "false" && "$CODEX_READY" == "false" ]]; then
   echo "  $CROSS_MARK install and sign in to Claude Code or Codex (see [6/7] above) before starting a chat"
@@ -940,10 +979,10 @@ if [[ -n "$TMUX_WARNING" ]]; then
 else
   echo "  $CHECK_MARK tmux available"
 fi
-if [[ -z "$TAILSCALE_IP" ]] && ! command -v tailscale >/dev/null 2>&1; then
-  echo "  $DOT_MARK optional: install Tailscale to reach this server from another device or WiFi network: https://tailscale.com/download"
-else
+if [[ -n "$TAILSCALE_IP" ]]; then
   echo "  $CHECK_MARK reachable via Tailscale at $TAILSCALE_IP"
+else
+  echo "  $DOT_MARK optional: install and connect Tailscale to reach this server from another device or WiFi network: https://tailscale.com/download"
 fi
 echo
 printf 'AGENTSDOCK_SETUP_RESULT={"server_url":"%s","access_token":"%s","service":"%s","tailscale_ip":"%s","server_version":"%s"}\n' \

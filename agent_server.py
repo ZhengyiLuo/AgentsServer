@@ -4664,6 +4664,33 @@ async def update_session_event_metadata(session_id: str, event: dict[str, Any]) 
     if not sess:
         return
     event_type = str(event.get("type") or "")
+    run_id = str(event.get("run_id") or "").strip()
+    active_run_changed = False
+    if event_type == "turn_started" and run_id:
+        sess["active_run"] = {
+            key: event[key]
+            for key in (
+                "run_id",
+                "backend",
+                "purpose",
+                "job_id",
+                "job_title",
+                "job_scheduled_run_at",
+                "digest_job_id",
+                "source_session_id",
+                "target_session_id",
+            )
+            if event.get(key) is not None
+        }
+        active_run_changed = True
+    elif event_type in {"turn_finished", "turn_stopped"} and run_id:
+        active_run = sess.get("active_run")
+        if (
+            isinstance(active_run, dict)
+            and str(active_run.get("run_id") or "") == run_id
+        ):
+            sess.pop("active_run", None)
+            active_run_changed = True
     sess["latest_event_seq"] = int(event.get("seq") or 0)
     sess["latest_event_at"] = event.get("ts")
     sess["latest_event_type"] = event_type
@@ -4671,8 +4698,10 @@ async def update_session_event_metadata(session_id: str, event: dict[str, Any]) 
         sess["latest_agent_event_seq"] = int(event.get("seq") or 0)
         sess["latest_agent_event_at"] = event.get("ts")
         sess["latest_agent_event_type"] = event_type
-    if should_bump_session_updated_at(event_type, event):
+    bump_updated_at = should_bump_session_updated_at(event_type, event)
+    if bump_updated_at:
         sess["updated_at"] = event.get("ts") or now_iso()
+    if bump_updated_at or active_run_changed:
         await STORE.save()
 
 
@@ -5840,6 +5869,168 @@ async def recover_queued_turns_after_start() -> tuple[int, int]:
     return rebuilt, scheduled
 
 
+RESTART_ORPHAN_ACTIVITY_TYPES = {
+    "turn_started",
+    "process_started",
+    "provider_session",
+    "assistant_text",
+    "reasoning_summary",
+    "tool_started",
+    "tool_finished",
+    "artifact_created",
+    "idle_warning",
+    # Provider errors are emitted before the normal turn_finished marker. A
+    # crash in that narrow window still leaves an open turn to retire.
+    "error",
+}
+RESTART_ORPHAN_TERMINAL_TYPES = {
+    "turn_finished",
+    "turn_stopped",
+}
+
+
+def abandoned_turn_after_restart(
+    session_id: str,
+    session: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return the newest run left open when the server process disappeared.
+
+    Active turns live in memory, so a SIGKILL cannot persist their normal
+    terminal event.  Restrict the recovery scan to chats whose last durable
+    event is turn activity; this keeps startup proportional to the number of
+    interrupted chats instead of rescanning every large history.
+    """
+
+    persisted_active = (
+        dict(session.get("active_run"))
+        if isinstance(session.get("active_run"), dict)
+        else {}
+    )
+    latest_type = str(session.get("latest_event_type") or "")
+    if (
+        not str(persisted_active.get("run_id") or "").strip()
+        and latest_type not in RESTART_ORPHAN_ACTIVITY_TYPES
+        and not latest_type.startswith("codex_")
+    ):
+        return None
+    records = tail_jsonl_file(
+        events_path(session_id),
+        limit=200,
+        max_bytes=8 * 1024 * 1024,
+    )
+    active_run_id = str(persisted_active.get("run_id") or "").strip()
+    open_runs: dict[str, dict[str, Any]] = (
+        {active_run_id: persisted_active}
+        if active_run_id
+        else {}
+    )
+    closed_runs: set[str] = set()
+    for event in records:
+        event_type = str(event.get("type") or "")
+        run_id = str(event.get("run_id") or "").strip()
+        if not run_id:
+            continue
+        if event_type in RESTART_ORPHAN_TERMINAL_TYPES:
+            open_runs.pop(run_id, None)
+            closed_runs.add(run_id)
+            continue
+        if event_type == "turn_started":
+            closed_runs.discard(run_id)
+            open_runs[run_id] = dict(event)
+            open_runs[run_id]["last_activity_seq"] = int(event.get("seq") or 0)
+            continue
+        if event_type in RESTART_ORPHAN_ACTIVITY_TYPES and run_id not in closed_runs:
+            candidate = open_runs.setdefault(run_id, {"run_id": run_id})
+            candidate["last_activity_seq"] = int(event.get("seq") or 0)
+            for key in (
+                "backend",
+                "purpose",
+                "job_id",
+                "job_title",
+                "digest_job_id",
+                "source_session_id",
+                "target_session_id",
+            ):
+                if candidate.get(key) is None and event.get(key) is not None:
+                    candidate[key] = event.get(key)
+    if not open_runs:
+        return None
+    return max(
+        open_runs.values(),
+        key=lambda event: int(event.get("last_activity_seq") or event.get("seq") or 0),
+    )
+
+
+async def recover_abandoned_turns_after_start() -> int:
+    """Close runs orphaned by a crash without replaying accepted user input."""
+
+    session_items = [
+        (session_id, dict(session))
+        for session_id, session in STORE.sessions.items()
+    ]
+
+    def scan_candidates() -> list[tuple[str, dict[str, Any]]]:
+        found: list[tuple[str, dict[str, Any]]] = []
+        for session_id, session in session_items:
+            try:
+                abandoned = abandoned_turn_after_restart(session_id, session)
+            except Exception as exc:
+                logger.warning(
+                    "could not inspect abandoned turn session=%s error=%s",
+                    session_id,
+                    concise_error_message(exc),
+                )
+                continue
+            if abandoned:
+                found.append((session_id, abandoned))
+        return found
+
+    candidates = await asyncio.to_thread(scan_candidates)
+    recovered = 0
+    for session_id, abandoned in candidates:
+        run_id = str(abandoned.get("run_id") or "").strip()
+        if not run_id:
+            continue
+        payload: dict[str, Any] = {
+            "run_id": run_id,
+            "backend": abandoned.get("backend")
+            or (STORE.sessions.get(session_id) or {}).get("backend"),
+            "stopped": True,
+            "recovered_after_restart": True,
+            "message": (
+                "This agent turn was interrupted when AgentsServer restarted. "
+                "Its accepted user message was not replayed."
+            ),
+        }
+        for key in (
+            "purpose",
+            "job_id",
+            "job_title",
+            "digest_job_id",
+            "source_session_id",
+            "target_session_id",
+        ):
+            if abandoned.get(key) is not None:
+                payload[key] = abandoned[key]
+        try:
+            await append_event(session_id, "turn_stopped", payload)
+        except Exception as exc:
+            logger.warning(
+                "could not close abandoned turn session=%s run=%s error=%s",
+                session_id,
+                run_id,
+                concise_error_message(exc),
+            )
+        else:
+            recovered += 1
+    if recovered:
+        logger.warning(
+            "closed abandoned agent turns after restart count=%d",
+            recovered,
+        )
+    return recovered
+
+
 async def terminate_process_tree(proc: asyncio.subprocess.Process, *, grace: float = STOP_GRACE_SECONDS) -> bool:
     if proc.returncode is not None:
         return False
@@ -6108,15 +6299,68 @@ def command_log_hints(args: str, cwd: str | None) -> list[dict[str, str]]:
     return hints
 
 
-def tmux_bin() -> str:
+TMUX_PROBE_CACHE_SECONDS = 30.0
+TMUX_PROBE_CACHE: dict[str, Any] = {
+    "path": None,
+    "available": False,
+    "checked_at": 0.0,
+}
+
+
+def working_tmux_bin(*, use_cache: bool = False) -> str | None:
     found = shutil.which("tmux")
+    now = time.monotonic()
+    if (
+        use_cache
+        and TMUX_PROBE_CACHE.get("path") == found
+        and now - float(TMUX_PROBE_CACHE.get("checked_at") or 0.0)
+        < TMUX_PROBE_CACHE_SECONDS
+    ):
+        return found if TMUX_PROBE_CACHE.get("available") else None
     if not found:
-        raise HTTPException(status_code=503, detail="tmux is not installed on the agent server")
+        TMUX_PROBE_CACHE.update({
+            "path": None,
+            "available": False,
+            "checked_at": now,
+        })
+        return None
+    try:
+        probe = subprocess.run(
+            [found, "-V"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        TMUX_PROBE_CACHE.update({
+            "path": found,
+            "available": False,
+            "checked_at": now,
+        })
+        return None
+    available = probe.returncode == 0
+    TMUX_PROBE_CACHE.update({
+        "path": found,
+        "available": available,
+        "checked_at": now,
+    })
+    return found if available else None
+
+
+def tmux_bin() -> str:
+    # Every terminal operation already fails clearly if tmux disappears. Do
+    # not spawn an extra `tmux -V` process for every capture, resize, or key
+    # press; the cache is path-sensitive and expires quickly.
+    found = working_tmux_bin(use_cache=True)
+    if not found:
+        raise HTTPException(status_code=503, detail="tmux is unavailable or not working on the agent server")
     return found
 
 
-def tmux_capability() -> dict[str, Any]:
-    available = shutil.which("tmux") is not None
+def tmux_capability(*, use_cache: bool = False) -> dict[str, Any]:
+    available = working_tmux_bin(use_cache=use_cache) is not None
     if available:
         return {
             "available": True,
@@ -6137,7 +6381,7 @@ def tmux_capability() -> dict[str, Any]:
         "available": False,
         "required": False,
         "message": (
-            "tmux was not found, so the persistent chat terminal, tmux-pane inspection, "
+            "tmux was not found or failed its version check, so the persistent chat terminal, tmux-pane inspection, "
             "and in-app managed updates are unavailable. The rest of AgentsServer works without it."
         ),
         "action": action,
@@ -18829,7 +19073,9 @@ def server_update_is_active(status: dict[str, Any]) -> bool:
     if str(status.get("phase") or "") not in SERVER_UPDATE_ACTIVE_PHASES:
         return False
     update_id = str(status.get("update_id") or "")
-    if not update_id or shutil.which("tmux") is None:
+    # tmux is optional. Treat a missing or broken binary as an absent detached
+    # updater instead of letting status polling raise from ``run_tmux``.
+    if not update_id or working_tmux_bin(use_cache=True) is None:
         return False
     return run_tmux(["has-session", "-t", server_update_tmux_name(update_id)], check=False).returncode == 0
 
@@ -18916,6 +19162,7 @@ async def lifespan(app: FastAPI):
     await JOBS.load()
     ensure_dirs()
     await reconcile_server_update_status_after_startup()
+    abandoned_turn_count = await recover_abandoned_turns_after_start()
     digest_job_count = await load_handoff_digest_jobs()
     JOBS.start_scheduler()
     queue_recovery_task = asyncio.create_task(recover_queued_turns_after_start())
@@ -18930,11 +19177,12 @@ async def lifespan(app: FastAPI):
     history_search_task = asyncio.create_task(history_search_index_loop())
     runtime_probe_task = asyncio.create_task(asyncio.to_thread(refresh_runtime_diagnostics, force=True))
     logger.info(
-        "agent server ready state=%s sessions=%d jobs=%d digests=%d queue_recovery=background",
+        "agent server ready state=%s sessions=%d jobs=%d digests=%d abandoned_turns=%d queue_recovery=background",
         STATE_DIR,
         len(STORE.sessions),
         len(JOBS.jobs),
         digest_job_count,
+        abandoned_turn_count,
     )
     try:
         yield
@@ -18984,7 +19232,7 @@ async def health() -> dict[str, Any]:
     async with QUEUE_LOCK:
         queued = {sid: len(queue) for sid, queue in QUEUED_TURNS.items() if queue}
     pressure = host_pressure_snapshot()
-    tmux = tmux_capability()
+    tmux = tmux_capability(use_cache=True)
     return {
         "ok": True,
         "server_version": SERVER_VERSION,

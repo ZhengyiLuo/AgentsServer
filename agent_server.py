@@ -140,6 +140,7 @@ HOST_HEALTH_FILE = STATE_DIR / "host_health.jsonl"
 SERVER_ADMIN_ROOT = STATE_DIR / "admin"
 SERVER_UPDATE_STATUS_FILE = SERVER_ADMIN_ROOT / "server-update.json"
 SERVER_UPDATE_LOG_FILE = SERVER_ADMIN_ROOT / "server-update.log"
+CODEX_SETTINGS_FILE = SERVER_ADMIN_ROOT / "codex-settings.json"
 SERVER_UPDATE_PUBLIC_KEY = SERVER_ROOT / "release-public-key.pem"
 SERVER_UPDATE_RUNNER = SERVER_ROOT / "update_runner.py"
 CLAUDE_PROJECTS_ROOT = Path(os.environ.get("CLAUDE_PROJECTS_ROOT", Path.home() / ".claude" / "projects"))
@@ -155,6 +156,59 @@ DEFAULT_CWD = agentsdock_setting("AGENT_CWD", str(Path.home()))
 DEFAULT_BACKEND = agentsdock_setting("BACKEND", BACKEND_CLAUDE).lower()
 if DEFAULT_BACKEND not in VALID_BACKENDS:
     DEFAULT_BACKEND = BACKEND_CLAUDE
+
+
+def boolean_setting(suffix: str, default: bool) -> bool:
+    raw = agentsdock_setting(suffix, "true" if default else "false")
+    normalized = str(raw or "").strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    logger.warning(
+        "ignoring invalid boolean setting AGENTSDOCK_%s=%r",
+        suffix,
+        raw,
+    )
+    return default
+
+
+CODEX_GOALS_DEFAULT_ENABLED = boolean_setting("CODEX_GOALS_ENABLED", True)
+
+
+def read_codex_goals_enabled(path: Path | None = None) -> bool:
+    """Read the persistent server-wide Codex goals policy.
+
+    Existing installations have no settings file, so goals remain enabled by
+    default.  An environment setting can choose the first-run default, while
+    an administrator's persisted choice remains authoritative afterward.
+    """
+
+    settings_path = path or CODEX_SETTINGS_FILE
+    try:
+        value = json.loads(settings_path.read_text())
+    except FileNotFoundError:
+        return CODEX_GOALS_DEFAULT_ENABLED
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning(
+            "could not read Codex server settings from %s: %s",
+            settings_path,
+            exc,
+        )
+        return CODEX_GOALS_DEFAULT_ENABLED
+    if not isinstance(value, dict) or not isinstance(
+        value.get("goals_enabled"),
+        bool,
+    ):
+        logger.warning(
+            "ignoring malformed Codex server settings at %s",
+            settings_path,
+        )
+        return CODEX_GOALS_DEFAULT_ENABLED
+    return bool(value["goals_enabled"])
+
+
+CODEX_GOALS_ENABLED = read_codex_goals_enabled()
 
 CODEX_FALLBACK_MODELS = (
     ("gpt-5.6-sol", "GPT-5.6-Sol"),
@@ -386,7 +440,7 @@ AGENT_TOKEN = env_setting(
 ) or ""
 SERVER_BIND_ADDRESS = agentsdock_setting("AGENT_BIND", "0.0.0.0")
 SERVER_PORT = int(agentsdock_setting("AGENT_PORT", "7850"))
-API_CONTRACT_VERSION = 9
+API_CONTRACT_VERSION = 10
 SESSION_ORDER_STEP = 1000.0
 FORK_INTERNAL_PURPOSES = {"handoff_digest", "handoff_digest_delivery"}
 CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS = int(agentsdock_setting("CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS", "120"))
@@ -3168,6 +3222,10 @@ class ServerUpdateCheckRequest(BaseModel):
     track: Literal["stable", "beta"] | None = None
 
 
+class CodexGoalsAdminRequest(BaseModel):
+    enabled: bool
+
+
 class CodexInteractionResponseRequest(BaseModel):
     response: dict[str, Any]
 
@@ -4477,6 +4535,8 @@ RUN_NOW_COMPLETED_RESULTS: OrderedDict[
 RUN_METADATA: dict[str, dict[str, Any]] = {}
 CODEX_APP_SERVER_MANAGER: CodexAppServerManager | None = None
 CODEX_APP_SERVER_MANAGER_LOCK = asyncio.Lock()
+CODEX_GOALS_CONFIG_LOCK = asyncio.Lock()
+CODEX_GOALS_RECONFIGURING = False
 CODEX_APP_SERVER_THREAD_LRU: OrderedDict[str, float] = OrderedDict()
 CODEX_APP_SERVER_PINNED_THREADS: set[str] = set()
 CODEX_APP_SERVER_THREAD_PIN_COUNTS: dict[str, int] = {}
@@ -4494,6 +4554,11 @@ CODEX_GOAL_SYNC_GENERATIONS: dict[str, tuple[int, str]] = {}
 CODEX_QUARANTINED_GOAL_THREADS: dict[str, str] = {}
 CODEX_SUBAGENT_SESSION_INDEX: dict[str, str] = {}
 CODEX_SUBAGENT_STATE: dict[str, dict[str, Any]] = {}
+# Runtime-only proof that an active child state came from the current provider
+# generation. Persisted "running" cards are historical hints, not evidence
+# that work survived an AgentsServer/app-server restart.
+CODEX_SUBAGENT_LIVE_GENERATIONS: dict[str, int] = {}
+CODEX_COMPACTION_TERMINAL_HISTORY_LIMIT = 128
 CODEX_PENDING_INTERACTIONS: dict[str, dict[str, Any]] = {}
 CODEX_PENDING_INTERACTIONS_LOCK = asyncio.Lock()
 CODEX_APPROVAL_ITEM_CACHE: OrderedDict[
@@ -4611,6 +4676,7 @@ async def reset_codex_ephemeral_runtime_metadata() -> None:
     """Clear process-owned Codex state after transport shutdown or restart."""
     CODEX_GOAL_SYNC_GENERATIONS.clear()
     CODEX_QUARANTINED_GOAL_THREADS.clear()
+    CODEX_SUBAGENT_LIVE_GENERATIONS.clear()
     changed = False
     async with STORE._lock:
         for session in STORE.sessions.values():
@@ -4772,6 +4838,7 @@ async def update_session_event_metadata(session_id: str, event: dict[str, Any]) 
     event_type = str(event.get("type") or "")
     run_id = str(event.get("run_id") or "").strip()
     active_run_changed = False
+    compaction_state_changed = False
     if event_type == "turn_started" and run_id:
         sess["active_run"] = {
             key: event[key]
@@ -4797,6 +4864,64 @@ async def update_session_event_metadata(session_id: str, event: dict[str, Any]) 
         ):
             sess.pop("active_run", None)
             active_run_changed = True
+    if event_type in TIMELINE_INDEX_CODEX_COMPACTION_TYPES:
+        lifecycle_key = timeline_index_codex_lifecycle_key(event)
+        if lifecycle_key:
+            active_compactions = sess.get("_active_codex_compactions")
+            if not isinstance(active_compactions, dict):
+                active_compactions = {}
+            else:
+                active_compactions = dict(active_compactions)
+            terminal_keys_value = sess.get("_codex_compaction_terminal_keys")
+            terminal_keys = [
+                str(value)
+                for value in (
+                    terminal_keys_value
+                    if isinstance(terminal_keys_value, list)
+                    else []
+                )
+                if str(value or "").strip()
+            ]
+            if event_type == "codex_compaction_completed":
+                if lifecycle_key in active_compactions:
+                    active_compactions.pop(lifecycle_key, None)
+                    compaction_state_changed = True
+                if lifecycle_key in terminal_keys:
+                    terminal_keys.remove(lifecycle_key)
+                terminal_keys.append(lifecycle_key)
+                terminal_keys = terminal_keys[-CODEX_COMPACTION_TERMINAL_HISTORY_LIMIT:]
+                compaction_state_changed = True
+            elif lifecycle_key not in terminal_keys:
+                tracked = {
+                    key: event.get(key)
+                    for key in (
+                        "compaction_id",
+                        "operation_id",
+                        "thread_id",
+                        "turn_id",
+                        "item_id",
+                        "run_id",
+                    )
+                    if event.get(key) is not None
+                }
+                tracked.update({
+                    "lifecycle_key": lifecycle_key,
+                    "started_seq": int(event.get("seq") or 0),
+                    "started_at": event.get("ts"),
+                })
+                if active_compactions.get(lifecycle_key) != tracked:
+                    active_compactions[lifecycle_key] = tracked
+                    compaction_state_changed = True
+            if active_compactions:
+                sess["_active_codex_compactions"] = active_compactions
+            elif "_active_codex_compactions" in sess:
+                sess.pop("_active_codex_compactions", None)
+                compaction_state_changed = True
+            if terminal_keys:
+                sess["_codex_compaction_terminal_keys"] = terminal_keys
+            elif "_codex_compaction_terminal_keys" in sess:
+                sess.pop("_codex_compaction_terminal_keys", None)
+                compaction_state_changed = True
     sess["latest_event_seq"] = int(event.get("seq") or 0)
     sess["latest_event_at"] = event.get("ts")
     sess["latest_event_type"] = event_type
@@ -4807,7 +4932,7 @@ async def update_session_event_metadata(session_id: str, event: dict[str, Any]) 
     bump_updated_at = should_bump_session_updated_at(event_type, event)
     if bump_updated_at:
         sess["updated_at"] = event.get("ts") or now_iso()
-    if bump_updated_at or active_run_changed:
+    if bump_updated_at or active_run_changed or compaction_state_changed:
         await STORE.save()
 
 
@@ -6134,6 +6259,69 @@ async def recover_abandoned_turns_after_start() -> int:
     if recovered:
         logger.warning(
             "closed abandoned agent turns after restart count=%d",
+            recovered,
+        )
+    return recovered
+
+
+async def recover_abandoned_codex_compactions_after_start() -> int:
+    """Close compaction rows whose provider process vanished mid-operation.
+
+    The bounded pending index lives in sessions.json, so startup does not scan
+    large transcripts. A terminal marker uses the original lifecycle identity
+    and therefore updates the existing row at its arrival position.
+    """
+
+    pending: list[tuple[str, dict[str, Any]]] = []
+    for session_id, session in tuple(STORE.sessions.items()):
+        value = session.get("_active_codex_compactions")
+        if not isinstance(value, dict):
+            continue
+        for compaction in value.values():
+            if isinstance(compaction, dict):
+                pending.append((session_id, dict(compaction)))
+
+    recovered = 0
+    for session_id, compaction in pending:
+        if session_id not in STORE.sessions:
+            continue
+        payload = {
+            key: compaction.get(key)
+            for key in (
+                "compaction_id",
+                "operation_id",
+                "thread_id",
+                "turn_id",
+                "item_id",
+                "run_id",
+            )
+            if compaction.get(key) is not None
+        }
+        payload.update({
+            "status": "interrupted",
+            "recovered_after_restart": True,
+            "message": (
+                "Context compaction was interrupted when AgentsServer restarted."
+            ),
+        })
+        try:
+            await append_event(
+                session_id,
+                "codex_compaction_completed",
+                payload,
+            )
+        except Exception as exc:
+            logger.warning(
+                "could not close abandoned Codex compaction session=%s key=%s error=%s",
+                session_id,
+                compaction.get("lifecycle_key") or "unknown",
+                concise_error_message(exc),
+            )
+        else:
+            recovered += 1
+    if recovered:
+        logger.warning(
+            "closed abandoned Codex compactions after restart count=%d",
             recovered,
         )
     return recovered
@@ -8066,6 +8254,7 @@ def rebuild_codex_subagent_indexes() -> None:
 
     CODEX_SUBAGENT_SESSION_INDEX.clear()
     CODEX_SUBAGENT_STATE.clear()
+    CODEX_SUBAGENT_LIVE_GENERATIONS.clear()
     for session_id in STORE.sessions:
         for state in session_codex_subagent_states(session_id):
             if str(state.get("backend") or "") != BACKEND_CODEX:
@@ -8144,6 +8333,16 @@ async def emit_codex_subagent_state(
         "subagent_parent_thread_id",
         "subagent_log",
     )
+    manager = CODEX_APP_SERVER_MANAGER
+    if (
+        normalized in {"starting", "running"}
+        and manager is not None
+        and getattr(manager, "ready", False) is True
+        and isinstance(getattr(manager, "generation", None), int)
+    ):
+        CODEX_SUBAGENT_LIVE_GENERATIONS[child_thread_id] = manager.generation
+    else:
+        CODEX_SUBAGENT_LIVE_GENERATIONS.pop(child_thread_id, None)
     if previous and all(previous.get(key) == payload.get(key) for key in comparable_keys):
         CODEX_SUBAGENT_SESSION_INDEX[child_thread_id] = session_id
         return previous
@@ -8839,13 +9038,13 @@ TIMELINE_INDEX_HIDDEN_TYPES = {
     # Legacy beta servers briefly emitted usage as timeline events. Keep those
     # old rows out of pagination even though current servers never emit them.
     "codex_token_usage",
-    "codex_compaction_started",
 }
 TIMELINE_INDEX_JOB_TYPES = {"job_created", "job_ran", "job_started", "job_deferred", "job_finished", "job_error"}
 TIMELINE_INDEX_CODEX_GOAL_TYPES = {
     "codex_goal_budget_limited",
 }
 TIMELINE_INDEX_CODEX_COMPACTION_TYPES = {
+    "codex_compaction_started",
     "codex_compaction_completed",
 }
 TIMELINE_INDEX_TRACE_TYPES = {
@@ -8893,6 +9092,9 @@ def timeline_index_codex_lifecycle_key(
         return "codex:goal-budget"
     if event_type not in TIMELINE_INDEX_CODEX_COMPACTION_TYPES:
         return None
+    compaction_id = str(event.get("compaction_id") or "").strip()
+    if compaction_id:
+        return f"codex:compaction:{compaction_id}"
     operation_id = str(event.get("operation_id") or "").strip()
     if operation_id:
         return f"codex:compaction:{operation_id}"
@@ -8903,6 +9105,21 @@ def timeline_index_codex_lifecycle_key(
         or str(event.get("seq") or "")
     )
     return f"codex:compaction:{native_id}"
+
+
+def native_codex_compaction_id(
+    thread_id: str,
+    turn_id: str | None,
+    item_id: str | None,
+) -> str:
+    """Return one durable identity shared by native start/completion events."""
+
+    return ":".join((
+        "native",
+        str(thread_id or "-").strip() or "-",
+        str(turn_id or "-").strip() or "-",
+        str(item_id or "-").strip() or "-",
+    ))
 
 
 def timeline_index_event_is_hidden(event: dict[str, Any]) -> bool:
@@ -9661,8 +9878,19 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                     if event_type in TIMELINE_INDEX_CODEX_GOAL_TYPES
                     else "Codex Compaction"
                 )
-                record["preview"] = text or record["title"]
-                record["timestamp"] = event.get("ts") or record.get("timestamp")
+                if event_type == "codex_compaction_completed":
+                    record["_codex_lifecycle_terminal_seq"] = seq
+                    record["preview"] = text or record["title"]
+                elif not record.get("_codex_lifecycle_terminal_seq"):
+                    # Provider retries can duplicate a late start after the
+                    # terminal notification. Keep the completed/interrupted
+                    # state authoritative without moving the arrival anchor.
+                    record["preview"] = text or record["title"]
+                # A lifecycle row is anchored where it started. Its latest
+                # event updates the row's content without moving it later in
+                # the timeline.
+                if not record.get("timestamp"):
+                    record["timestamp"] = event.get("ts")
                 continue
 
             if (
@@ -9883,7 +10111,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
             meta_parts.append(f"{event_count} update{'s' if event_count != 1 else ''}")
         landmark_seq = (
             stored["end_seq"]
-            if kind in {"job", "codex_lifecycle"}
+            if kind == "job"
             else stored["start_seq"]
         )
         return {
@@ -10846,12 +11074,46 @@ def collect_semantic_timeline_events(
             ))
         elif str(landmark.get("kind") or "") == "codex_lifecycle":
             lifecycle_events = events_by_key.get(key, [])
+            started = min(
+                (
+                    event
+                    for event in lifecycle_events
+                    if str(event.get("type") or "")
+                    == "codex_compaction_started"
+                ),
+                key=lambda event: int(event.get("seq") or 0),
+                default=None,
+            )
+            completed = max(
+                (
+                    event
+                    for event in lifecycle_events
+                    if str(event.get("type") or "")
+                    == "codex_compaction_completed"
+                ),
+                key=lambda event: int(event.get("seq") or 0),
+                default=None,
+            )
             latest = max(
                 lifecycle_events,
                 key=lambda event: int(event.get("seq") or 0),
                 default=None,
             )
-            bundles.append(([latest] if latest is not None else [], [], [], []))
+            anchor = started or completed or latest
+            completion = (
+                completed
+                if completed is not None and completed is not anchor
+                else None
+            )
+            # Preserve the arrival anchor and the latest state as one semantic
+            # unit. The renderer can update the row in place after completion,
+            # while history reload still receives its original position.
+            bundles.append((
+                [anchor] if anchor is not None else [],
+                [],
+                [completion] if completion is not None else [],
+                [],
+            ))
         else:
             bundles.append(semantic_timeline_ordinary_candidates(
                 events_by_key.get(key, []),
@@ -11773,8 +12035,20 @@ def parse_codex_digest_output(stdout: str) -> str:
     return clean_assistant_text("\n\n".join(text_parts).strip())
 
 
+def codex_goals_cli_args() -> list[str]:
+    """Apply the server-wide goal policy to every one-shot Codex process."""
+
+    return [] if CODEX_GOALS_ENABLED else ["--disable", "goals"]
+
+
 async def run_codex_handoff_summarizer(prompt: str, *, model: str | None, effort: str | None) -> str:
-    cmd = [CODEX_BIN, "exec", "--json", "--skip-git-repo-check"]
+    cmd = [
+        CODEX_BIN,
+        "exec",
+        *codex_goals_cli_args(),
+        "--json",
+        "--skip-git-repo-check",
+    ]
     configured_model, _configured_effort, configured_service_tier = codex_user_config_defaults()
     effective_model = str(model or configured_model or CODEX_DEFAULT_MODEL).strip()
     effective_service_tier = configured_service_tier or codex_default_service_tier(effective_model)
@@ -12770,7 +13044,8 @@ def provider_context_goal_is_exhausted(
     """Apply a parent chat's goal budget only when continuing that chat."""
 
     return (
-        provider_context_mode == "chat"
+        CODEX_GOALS_ENABLED
+        and provider_context_mode == "chat"
         and str(sess.get("backend") or DEFAULT_BACKEND) == BACKEND_CODEX
         and codex_goal_time_budget_remaining(sess) == 0
     )
@@ -13316,6 +13591,7 @@ def codex_session_id_for_thread(thread_id: str) -> str | None:
             return child_session_id
         CODEX_SUBAGENT_SESSION_INDEX.pop(thread_id, None)
         CODEX_SUBAGENT_STATE.pop(thread_id, None)
+        CODEX_SUBAGENT_LIVE_GENERATIONS.pop(thread_id, None)
     indexed = CODEX_THREAD_SESSION_INDEX.get(thread_id)
     if indexed:
         session = STORE.sessions.get(indexed)
@@ -14335,6 +14611,11 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
         goal = bounded_codex_interaction_value(params.get("goal"), remaining=12_000)
         if not isinstance(goal, dict):
             return
+        if not CODEX_GOALS_ENABLED and str(goal.get("status") or "").lower() == "active":
+            # A late notification from the manager generation being replaced
+            # must never resurrect automatic continuation after the server-wide
+            # policy was disabled.
+            goal = {**goal, "status": "paused"}
         async with STORE._lock:
             session = STORE.sessions.get(session_id)
             if session:
@@ -14474,18 +14755,46 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
         item_id = str(params.get("itemId") or item.get("id") or "") or None
         if method == "item/started":
             before = current_codex_token_usage_snapshot(session_id)
+            explicit_native_compaction = False
+            run_id = ""
             async with ACTIVE_LOCK:
                 active = ACTIVE.get(session_id)
                 if active and (
                     not active.get("provider_thread_id")
                     or str(active.get("provider_thread_id")) == thread_id
                 ):
+                    explicit_native_compaction = bool(
+                        active.get("codex_native_operation")
+                        and active.get("codex_native_operation_kind")
+                        == "compaction"
+                    )
+                    run_id = str(active.get("run_id") or "")
                     active["codex_compaction_in_progress"] = True
                     active["codex_compaction_item_id"] = item_id
                     if "codex_compaction_token_usage_before" not in active:
                         active["codex_compaction_token_usage_before"] = (
                             dict(before) if before is not None else None
                         )
+            if not explicit_native_compaction:
+                compaction_id = native_codex_compaction_id(
+                    thread_id,
+                    turn_id,
+                    item_id,
+                )
+                await append_event(
+                    session_id,
+                    "codex_compaction_started",
+                    {
+                        "run_id": run_id or None,
+                        "compaction_id": compaction_id,
+                        "thread_id": thread_id,
+                        "turn_id": turn_id,
+                        "item_id": item_id,
+                        "status": "in_progress",
+                        "token_usage_before": before,
+                        "message": "Codex started automatic context compaction.",
+                    },
+                )
             return
         async with ACTIVE_LOCK:
             active = ACTIVE.get(session_id)
@@ -14537,6 +14846,12 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
             "codex_compaction_completed",
             {
                 "run_id": run_id or None,
+                "compaction_id": native_codex_compaction_id(
+                    thread_id,
+                    turn_id,
+                    item_id,
+                ),
+                "thread_id": thread_id,
                 "turn_id": turn_id,
                 "item_id": item_id,
                 "status": "completed",
@@ -14550,39 +14865,46 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
 async def codex_app_server_manager() -> CodexAppServerManager:
     """Return the one lazy, multiplexed Codex app-server for this server."""
     global CODEX_APP_SERVER_MANAGER
-    manager = CODEX_APP_SERVER_MANAGER
-    if manager is not None:
-        return manager
-    async with CODEX_APP_SERVER_MANAGER_LOCK:
+    # Goal enablement is a process launch flag. Manager lookup therefore takes
+    # the same barrier as configuration replacement, including the fast path;
+    # no caller can retain/create the old generation halfway through a toggle.
+    async with CODEX_GOALS_CONFIG_LOCK:
         manager = CODEX_APP_SERVER_MANAGER
-        if manager is None:
-            manager = CodexAppServerManager(
-                CODEX_BIN,
-                cwd=existing_cwd(DEFAULT_CWD),
-                env_factory=codex_app_server_env,
-                request_timeout=CODEX_APP_SERVER_TIMEOUT_SECONDS,
-                lifecycle_timeout=CODEX_APP_SERVER_LIFECYCLE_TIMEOUT_SECONDS,
-                process_stream_limit=CODEX_APP_SERVER_JSONL_LIMIT_BYTES,
-                notification_queue_limit=(
-                    CODEX_APP_SERVER_NOTIFICATION_QUEUE_LIMIT
-                ),
-                server_request_handler=handle_codex_server_request,
-                initialize_params={
-                    "clientInfo": {
-                        "name": "agents_server",
-                        "title": "AgentsServer",
-                        "version": SERVER_VERSION,
+        if manager is not None:
+            return manager
+        async with CODEX_APP_SERVER_MANAGER_LOCK:
+            manager = CODEX_APP_SERVER_MANAGER
+            if manager is None:
+                manager = CodexAppServerManager(
+                    CODEX_BIN,
+                    cwd=existing_cwd(DEFAULT_CWD),
+                    env_factory=codex_app_server_env,
+                    app_server_args=(
+                        () if CODEX_GOALS_ENABLED else ("--disable", "goals")
+                    ),
+                    request_timeout=CODEX_APP_SERVER_TIMEOUT_SECONDS,
+                    lifecycle_timeout=CODEX_APP_SERVER_LIFECYCLE_TIMEOUT_SECONDS,
+                    process_stream_limit=CODEX_APP_SERVER_JSONL_LIMIT_BYTES,
+                    notification_queue_limit=(
+                        CODEX_APP_SERVER_NOTIFICATION_QUEUE_LIMIT
+                    ),
+                    server_request_handler=handle_codex_server_request,
+                    initialize_params={
+                        "clientInfo": {
+                            "name": "agents_server",
+                            "title": "AgentsServer",
+                            "version": SERVER_VERSION,
+                        },
+                        "capabilities": {
+                            "experimentalApi": True,
+                            "mcpServerOpenaiFormElicitation": True,
+                        },
                     },
-                    "capabilities": {
-                        "experimentalApi": True,
-                        "mcpServerOpenaiFormElicitation": True,
-                    },
-                },
-            )
-            manager.add_notification_handler(project_codex_notification)
-            manager.add_notification_handler(cache_codex_approval_item)
-            CODEX_APP_SERVER_MANAGER = manager
-        return manager
+                )
+                manager.add_notification_handler(project_codex_notification)
+                manager.add_notification_handler(cache_codex_approval_item)
+                CODEX_APP_SERVER_MANAGER = manager
+            return manager
 
 
 async def close_codex_app_server_manager() -> None:
@@ -14690,6 +15012,11 @@ async def acquire_codex_control_thread(
         update_blocker = managed_server_update_blocker()
         if update_blocker:
             raise HTTPException(status_code=503, detail=update_blocker)
+        if CODEX_GOALS_RECONFIGURING:
+            raise HTTPException(
+                status_code=409,
+                detail="wait for Codex goals configuration to finish",
+            )
         if session_id in SERVER_MAINTENANCE_SESSIONS:
             raise HTTPException(
                 status_code=409,
@@ -16670,7 +16997,7 @@ def build_codex_cmd(
     model, normalized_effort, effective_service_tier = codex_runtime_settings(
         sess
     )
-    cmd = [CODEX_BIN, "exec"]
+    cmd = [CODEX_BIN, "exec", *codex_goals_cli_args()]
     if provider_id:
         cmd.append("resume")
     if model:
@@ -19922,6 +20249,14 @@ async def _start_turn_locked(
         update_blocker = managed_server_update_blocker()
         if update_blocker:
             raise HTTPException(status_code=503, detail=update_blocker)
+        requested_backend = str(
+            req.backend or sess.get("backend") or DEFAULT_BACKEND
+        ).strip().lower()
+        if CODEX_GOALS_RECONFIGURING and requested_backend == BACKEND_CODEX:
+            raise HTTPException(
+                status_code=409,
+                detail="wait for Codex goals configuration to finish",
+            )
         if session_id in SERVER_MAINTENANCE_SESSIONS:
             raise HTTPException(
                 status_code=409,
@@ -20272,6 +20607,9 @@ async def lifespan(app: FastAPI):
     await JOBS.load()
     ensure_dirs()
     await reconcile_server_update_status_after_startup()
+    abandoned_compaction_count = (
+        await recover_abandoned_codex_compactions_after_start()
+    )
     abandoned_turn_count = await recover_abandoned_turns_after_start()
     digest_job_count = await load_handoff_digest_jobs()
     JOBS.start_scheduler()
@@ -20287,12 +20625,13 @@ async def lifespan(app: FastAPI):
     history_search_task = asyncio.create_task(history_search_index_loop())
     runtime_probe_task = asyncio.create_task(asyncio.to_thread(refresh_runtime_diagnostics, force=True))
     logger.info(
-        "agent server ready state=%s sessions=%d jobs=%d digests=%d abandoned_turns=%d queue_recovery=background",
+        "agent server ready state=%s sessions=%d jobs=%d digests=%d abandoned_turns=%d abandoned_compactions=%d queue_recovery=background",
         STATE_DIR,
         len(STORE.sessions),
         len(JOBS.jobs),
         digest_job_count,
         abandoned_turn_count,
+        abandoned_compaction_count,
     )
     try:
         yield
@@ -20412,13 +20751,13 @@ async def health() -> dict[str, Any]:
                     if CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC
                     else "Set AGENTSDOCK_CODEX_TRANSPORT=app-server or auto."
                 ),
-                "version": 1,
+                "version": 2,
                 "interactive_client_capability": CODEX_INTERACTIVE_CLIENT_CAPABILITY,
                 "features": {
                     "approvals": True,
                     "questions": True,
                     "permission_profiles": True,
-                    "goals": True,
+                    "goals": CODEX_GOALS_ENABLED,
                     "compaction": True,
                     "rollback": True,
                     "review": True,
@@ -20438,6 +20777,233 @@ async def health() -> dict[str, Any]:
         "host_health_log": str(HOST_HEALTH_FILE),
         "runtimes": runtime_diagnostics_snapshot(),
     }
+
+
+def codex_goals_admin_status() -> dict[str, Any]:
+    enabled = bool(CODEX_GOALS_ENABLED)
+    return {
+        "enabled": enabled,
+        "configurable": True,
+        "default_enabled": bool(CODEX_GOALS_DEFAULT_ENABLED),
+        "scope": "server",
+        "reconfiguring": bool(CODEX_GOALS_RECONFIGURING),
+        "message": (
+            "Persistent Codex goals are enabled for this server."
+            if enabled
+            else "Persistent Codex goals are disabled for this server."
+        ),
+    }
+
+
+def queued_turn_backend(session_id: str, item: dict[str, Any]) -> str:
+    session = STORE.sessions.get(session_id) or {}
+    return str(
+        item.get("backend") or session.get("backend") or DEFAULT_BACKEND
+    ).strip().lower()
+
+
+def codex_subagent_has_live_owner(
+    thread_id: str,
+    state: dict[str, Any],
+) -> bool:
+    """Distinguish a live child from a persisted pre-restart running card."""
+
+    status = normalize_subagent_status(
+        state.get("subagent_status") or state.get("status")
+    )
+    if status not in {"starting", "running"}:
+        return False
+    session_id = str(
+        state.get("session_id")
+        or CODEX_SUBAGENT_SESSION_INDEX.get(thread_id)
+        or ""
+    ).strip()
+    if session_id and session_id in BUSY_SESSIONS:
+        owner = ACTIVE.get(session_id) or CURRENT_TURNS.get(session_id) or {}
+        state_run_id = str(state.get("run_id") or "").strip()
+        owner_run_id = str(owner.get("run_id") or "").strip()
+        if not state_run_id or not owner_run_id or state_run_id == owner_run_id:
+            return True
+
+    manager = CODEX_APP_SERVER_MANAGER
+    if manager is None:
+        return False
+    with suppress(Exception):
+        if manager.active_turn(thread_id) is not None:
+            return True
+    generation = CODEX_SUBAGENT_LIVE_GENERATIONS.get(thread_id)
+    return bool(
+        generation is not None
+        and getattr(manager, "ready", False) is True
+        and getattr(manager, "generation", None) == generation
+    )
+
+
+def active_codex_work_labels() -> list[str]:
+    labels: set[str] = set()
+    for session_id in BUSY_SESSIONS:
+        current = CURRENT_TURNS.get(session_id) or {}
+        active = ACTIVE.get(session_id) or {}
+        session = STORE.sessions.get(session_id) or {}
+        backend = str(
+            active.get("backend")
+            or current.get("backend")
+            or session.get("backend")
+            or DEFAULT_BACKEND
+        ).strip().lower()
+        if backend == BACKEND_CODEX:
+            labels.add(f"active chat {session_id}")
+    for session_id in SERVER_MAINTENANCE_SESSIONS:
+        session = STORE.sessions.get(session_id) or {}
+        if str(session.get("backend") or DEFAULT_BACKEND).lower() == BACKEND_CODEX:
+            labels.add(f"Codex maintenance for {session_id}")
+    for (session_id, operation_id), task in CODEX_NATIVE_ACTION_TASKS.items():
+        if not task.done():
+            labels.add(f"Codex operation {operation_id} in {session_id}")
+    for pending in CODEX_PENDING_INTERACTIONS.values():
+        session_id = str(pending.get("session_id") or "unknown")
+        labels.add(f"Codex prompt in {session_id}")
+    for thread_id, state in CODEX_SUBAGENT_STATE.items():
+        if codex_subagent_has_live_owner(thread_id, state):
+            labels.add(f"Codex subagent {thread_id}")
+    return sorted(labels)
+
+
+async def reserve_codex_goals_reconfiguration() -> None:
+    """Close Codex admission and reject a setting change if work exists."""
+
+    global CODEX_GOALS_RECONFIGURING
+    async with ACTIVE_LOCK:
+        if CODEX_GOALS_RECONFIGURING:
+            raise HTTPException(
+                status_code=409,
+                detail="Codex goals configuration is already changing",
+            )
+        CODEX_GOALS_RECONFIGURING = True
+        active_labels = active_codex_work_labels()
+    try:
+        async with QUEUE_LOCK:
+            queued_labels = [
+                f"queued Codex turn {item.get('queued_id') or 'unknown'} in {session_id}"
+                for session_id, queue in QUEUED_TURNS.items()
+                for item in queue
+                if queued_turn_backend(session_id, item) == BACKEND_CODEX
+            ]
+            for session_id, item in RUN_NOW_TURNS.items():
+                if queued_turn_backend(session_id, item) == BACKEND_CODEX:
+                    queued_labels.append(f"queued Codex Force Send in {session_id}")
+        blockers = [*active_labels, *queued_labels]
+        if blockers:
+            preview = ", ".join(blockers[:3])
+            remainder = len(blockers) - min(3, len(blockers))
+            if remainder:
+                preview += f", and {remainder} more"
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Codex goals cannot be reconfigured while Codex work is "
+                    f"active or queued: {preview}"
+                ),
+            )
+    except BaseException:
+        async with ACTIVE_LOCK:
+            CODEX_GOALS_RECONFIGURING = False
+        raise
+
+
+async def release_codex_goals_reconfiguration() -> None:
+    global CODEX_GOALS_RECONFIGURING
+    async with ACTIVE_LOCK:
+        CODEX_GOALS_RECONFIGURING = False
+
+
+async def pause_idle_codex_goals_before_disable() -> dict[str, int]:
+    paused = 0
+    fenced = 0
+    manager = CODEX_APP_SERVER_MANAGER
+
+    def loaded_provider_goal_may_exist(session: dict[str, Any]) -> bool:
+        thread_id = str(session_provider_id(session) or "").strip()
+        return bool(
+            manager is not None
+            and thread_id
+            and manager.is_thread_loaded(thread_id)
+        )
+
+    candidates = [
+        session_id
+        for session_id, session in list(STORE.sessions.items())
+        if str(session.get("backend") or DEFAULT_BACKEND).lower() == BACKEND_CODEX
+        and (
+            isinstance(session.get("codex_goal"), dict)
+            or bool(session.get("_codex_goal_reconciliation_required"))
+            or loaded_provider_goal_may_exist(session)
+        )
+    ]
+    for session_id in candidates:
+        async with session_lifecycle_lock(session_id):
+            if (
+                session_id in DELETING_SESSIONS
+                or session_id not in STORE.sessions
+            ):
+                continue
+            result = await settle_idle_codex_goal_for_stop(session_id)
+            if result.get("goal_paused"):
+                paused += 1
+            if result.get("goal_fenced"):
+                fenced += 1
+            current_goal = (STORE.sessions.get(session_id) or {}).get("codex_goal")
+            if (
+                isinstance(current_goal, dict)
+                and str(current_goal.get("status") or "").lower() == "active"
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Could not safely pause the active Codex goal in "
+                        f"{session_id}; retry after stopping that chat"
+                    ),
+                )
+    return {"paused_goal_count": paused, "fenced_goal_count": fenced}
+
+
+@app.get("/api/admin/codex/goals")
+async def get_codex_goals_admin() -> dict[str, Any]:
+    return codex_goals_admin_status()
+
+
+@app.put("/api/admin/codex/goals")
+async def put_codex_goals_admin(
+    req: CodexGoalsAdminRequest,
+) -> dict[str, Any]:
+    global CODEX_GOALS_ENABLED
+    async with CODEX_GOALS_CONFIG_LOCK:
+        requested = bool(req.enabled)
+        if requested == CODEX_GOALS_ENABLED:
+            return codex_goals_admin_status()
+        await reserve_codex_goals_reconfiguration()
+        transition: dict[str, int] = {
+            "paused_goal_count": 0,
+            "fenced_goal_count": 0,
+        }
+        try:
+            if not requested:
+                transition = await pause_idle_codex_goals_before_disable()
+            # The feature flag is a process-level Codex setting. Replacing the
+            # shared, idle manager is the only way to make it authoritative for
+            # every loaded and future thread.
+            await close_codex_app_server_manager()
+            atomic_update_json(
+                CODEX_SETTINGS_FILE,
+                {
+                    "goals_enabled": requested,
+                    "updated_at": update_utc_now(),
+                },
+            )
+            CODEX_GOALS_ENABLED = requested
+        finally:
+            await release_codex_goals_reconfiguration()
+        return {**codex_goals_admin_status(), **transition}
 
 
 @app.get("/api/admin/update")
@@ -21015,6 +21581,7 @@ async def codex_runtime_snapshot(session_id: str) -> dict[str, Any]:
     return {
         "available": available,
         "transport": CODEX_TRANSPORT,
+        "goals_enabled": CODEX_GOALS_ENABLED,
         "interactive_capability": CODEX_INTERACTIVE_CLIENT_CAPABILITY,
         "persisted_thread": bool(thread_id),
         "thread_loaded": thread_loaded,
@@ -21243,6 +21810,7 @@ async def get_codex_goal(session_id: str) -> dict[str, Any]:
     if not session:
         raise HTTPException(status_code=404, detail="session not found")
     return {
+        "enabled": CODEX_GOALS_ENABLED,
         "goal": session.get("codex_goal"),
         "time_budget_seconds": session.get("codex_goal_time_budget_seconds"),
         "time_budget_exhausted": codex_goal_time_budget_is_exhausted(session),
@@ -21263,6 +21831,14 @@ async def _put_codex_goal_locked(
     session_id: str,
     req: CodexGoalRequest,
 ) -> dict[str, Any]:
+    if not CODEX_GOALS_ENABLED:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Persistent Codex goals are disabled for this server. "
+                "Enable them in server settings before creating or updating a goal."
+            ),
+        )
     fields_set = request_fields_set(req)
     if not fields_set:
         raise HTTPException(status_code=400, detail="provide at least one goal field")
@@ -21376,6 +21952,14 @@ async def delete_codex_goal(session_id: str) -> dict[str, Any]:
 
 
 async def _delete_codex_goal_locked(session_id: str) -> dict[str, Any]:
+    if not CODEX_GOALS_ENABLED:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Persistent Codex goals are disabled for this server. "
+                "Enable them in server settings before clearing a saved goal."
+            ),
+        )
     def cleared_result() -> dict[str, Any]:
         return {
             "goal": None,

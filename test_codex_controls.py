@@ -815,9 +815,13 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
     async def test_runtime_policy_reports_canonical_defaults_for_legacy_session(
         self,
     ) -> None:
-        with patch.object(agent_server, "CODEX_APP_SERVER_MANAGER", None):
+        with (
+            patch.object(agent_server, "CODEX_APP_SERVER_MANAGER", None),
+            patch.object(agent_server, "CODEX_GOALS_ENABLED", False),
+        ):
             runtime = await agent_server.codex_runtime_snapshot("chat")
 
+        self.assertFalse(runtime["goals_enabled"])
         self.assertEqual(
             runtime["policy"],
             {
@@ -1182,6 +1186,19 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
             for event_type, payload in events
             if event_type == "codex_compaction_completed"
         )
+        compaction_started = next(
+            payload
+            for event_type, payload in events
+            if event_type == "codex_compaction_started"
+        )
+        self.assertEqual(
+            compaction_started["compaction_id"],
+            compaction["compaction_id"],
+        )
+        self.assertEqual(compaction_started["run_id"], "run-compact")
+        self.assertEqual(compaction_started["thread_id"], "thread")
+        self.assertEqual(compaction_started["turn_id"], "turn-1")
+        self.assertEqual(compaction_started["item_id"], "compact-1")
         self.assertEqual(
             compaction["token_usage_before"]["context_tokens"],
             90_000,
@@ -2465,6 +2482,146 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 timeout=0.01,
             )
         )
+
+    async def test_delete_pauses_active_goal_before_interrupting_turn(self) -> None:
+        order: list[str] = []
+        paused_goal = {
+            "id": "goal",
+            "threadId": "thread",
+            "objective": "Finish the task",
+            "status": "paused",
+        }
+        agent_server.STORE.sessions["chat"]["codex_goal"] = {
+            **paused_goal,
+            "status": "active",
+        }
+        interrupted = asyncio.Event()
+        native_turn = Mock(turn_id="turn")
+
+        async def interrupt() -> None:
+            order.append("interrupt")
+            interrupted.set()
+
+        native_turn.interrupt = AsyncMock(side_effect=interrupt)
+        agent_server.ACTIVE["chat"] = {
+            "run_id": "run",
+            "backend": agent_server.BACKEND_CODEX,
+            "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
+            "provider_thread_id": "thread",
+            "provider_session_id": "thread",
+            "provider_turn_id": "turn",
+            "provider_turn_ready": True,
+            "codex_native_operation": False,
+            "codex_app_server_turn": native_turn,
+        }
+
+        manager = Mock()
+        manager.is_thread_loaded = Mock(return_value=True)
+        manager.unsubscribe_thread = AsyncMock()
+
+        async def pause_goal(
+            thread_id: str,
+            *,
+            status: str,
+        ) -> dict[str, object]:
+            self.assertEqual(thread_id, "thread")
+            self.assertEqual(status, "paused")
+            order.append("pause")
+            return paused_goal
+
+        manager.set_thread_goal = AsyncMock(side_effect=pause_goal)
+        turn_task = asyncio.create_task(interrupted.wait())
+        agent_server.register_session_task(
+            agent_server.SESSION_TURN_TASKS,
+            "chat",
+            turn_task,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir)
+            session_path = state_dir / "sessions" / "chat"
+            session_path.mkdir(parents=True)
+            with (
+                patch.object(agent_server, "STATE_DIR", state_dir),
+                patch.object(
+                    agent_server,
+                    "SESSIONS_FILE",
+                    state_dir / "sessions.json",
+                ),
+                patch.object(agent_server, "ensure_dirs"),
+                patch.object(
+                    agent_server,
+                    "CODEX_APP_SERVER_MANAGER",
+                    manager,
+                ),
+                patch.object(
+                    agent_server.JOBS,
+                    "delete_for_session",
+                    AsyncMock(return_value=0),
+                ),
+                patch.object(agent_server, "kill_terminal_session"),
+            ):
+                try:
+                    result = await agent_server.delete_session("chat")
+                finally:
+                    agent_server.DELETED_SESSION_TOMBSTONES.discard("chat")
+
+        self.assertEqual(order, ["pause", "interrupt"])
+        manager.set_thread_goal.assert_awaited_once_with(
+            "thread",
+            status="paused",
+        )
+        native_turn.interrupt.assert_awaited_once()
+        self.assertTrue(result["deleted"])
+        self.assertNotIn("chat", agent_server.STORE.sessions)
+
+    async def test_delete_preserves_session_when_active_goal_cannot_pause(
+        self,
+    ) -> None:
+        active_goal = {
+            "id": "goal",
+            "threadId": "thread",
+            "objective": "Finish the task",
+            "status": "active",
+        }
+        agent_server.STORE.sessions["chat"]["codex_goal"] = active_goal
+        native_turn = Mock(turn_id="turn")
+        native_turn.interrupt = AsyncMock()
+        agent_server.ACTIVE["chat"] = {
+            "run_id": "run",
+            "backend": agent_server.BACKEND_CODEX,
+            "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
+            "provider_thread_id": "thread",
+            "provider_session_id": "thread",
+            "provider_turn_id": "turn",
+            "provider_turn_ready": True,
+            "codex_native_operation": False,
+            "codex_app_server_turn": native_turn,
+        }
+        manager = Mock()
+        manager.set_thread_goal = AsyncMock(
+            side_effect=RuntimeError("goal control unavailable")
+        )
+
+        with (
+            patch.object(
+                agent_server,
+                "CODEX_APP_SERVER_MANAGER",
+                manager,
+            ),
+            self.assertRaises(HTTPException) as raised,
+        ):
+            await agent_server.delete_session("chat")
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("goal control unavailable", str(raised.exception.detail))
+        self.assertIn("chat", agent_server.STORE.sessions)
+        self.assertEqual(
+            agent_server.STORE.sessions["chat"]["codex_goal"],
+            active_goal,
+        )
+        self.assertNotIn("chat", agent_server.DELETED_SESSION_TOMBSTONES)
+        self.assertNotIn("chat", agent_server.DELETING_SESSIONS)
+        native_turn.interrupt.assert_not_awaited()
 
     async def test_delete_drains_late_turn_before_removing_session(self) -> None:
         late_event: dict[str, object] = {}

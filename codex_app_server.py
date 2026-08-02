@@ -14,7 +14,7 @@ import json
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Sequence
 
 
 class CodexAppServerError(RuntimeError):
@@ -435,6 +435,7 @@ class CodexAppServerClient:
         *,
         cwd: str,
         env_factory: Callable[[], dict[str, str]],
+        app_server_args: Sequence[str] = (),
         request_timeout: float = 30.0,
         lifecycle_timeout: float = 300.0,
         process_exit_timeout: float = 1.0,
@@ -448,6 +449,7 @@ class CodexAppServerClient:
         self.codex_bin = codex_bin
         self.cwd = cwd
         self.env_factory = env_factory
+        self.app_server_args = tuple(str(value) for value in app_server_args)
         self.request_timeout = request_timeout
         self.lifecycle_timeout = lifecycle_timeout
         self.process_exit_timeout = max(0.0, float(process_exit_timeout))
@@ -553,6 +555,7 @@ class CodexAppServerClient:
                 proc = await self._process_factory(
                     self.codex_bin,
                     "app-server",
+                    *self.app_server_args,
                     "--listen",
                     "stdio://",
                     stdin=asyncio.subprocess.PIPE,
@@ -1861,6 +1864,7 @@ class CodexAppServerManager:
         *,
         cwd: str,
         env_factory: Callable[[], dict[str, str]],
+        app_server_args: Sequence[str] = (),
         request_timeout: float = 30.0,
         lifecycle_timeout: float = 300.0,
         process_stream_limit: int = 16 * 1024 * 1024,
@@ -1874,6 +1878,7 @@ class CodexAppServerManager:
             codex_bin,
             cwd=cwd,
             env_factory=env_factory,
+            app_server_args=app_server_args,
             request_timeout=request_timeout,
             lifecycle_timeout=lifecycle_timeout,
             process_stream_limit=process_stream_limit,

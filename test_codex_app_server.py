@@ -256,6 +256,28 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
+    async def test_app_server_args_are_passed_before_listen(self) -> None:
+        factory = FakeProcessFactory()
+        client = self.make_client(
+            factory,
+            app_server_args=("--disable", "goals"),
+        )
+        self.addAsyncCleanup(client.close)
+
+        await client.start()
+
+        self.assertEqual(
+            factory.calls[0][0],
+            (
+                "codex",
+                "app-server",
+                "--disable",
+                "goals",
+                "--listen",
+                "stdio://",
+            ),
+        )
+
     async def test_thread_methods_track_loaded_threads_and_exact_payloads(self) -> None:
         factory = FakeProcessFactory()
         process = factory.process

@@ -1123,6 +1123,7 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
             [(event["seq"], event["type"]) for event in lifecycle_events],
             [
                 (6, "codex_goal_budget_limited"),
+                (7, "codex_compaction_started"),
                 (8, "codex_compaction_completed"),
                 (10, "codex_compaction_completed"),
             ],
@@ -1131,7 +1132,6 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
             "codex_thread_status",
             "codex_goal_updated",
             "codex_goal_cleared",
-            "codex_compaction_started",
             "turn_stopped",
         }.intersection(event["type"] for event in page["events"]))
         # Semantic projection is additive: durable/raw history remains
@@ -1190,7 +1190,7 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [(item["key"], item["start_seq"]) for item in first["landmarks"]],
-            [],
+            [("codex:compaction:compact-incremental", 2)],
         )
         self.assertEqual(
             [
@@ -1198,16 +1198,100 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
                 for item in refreshed["landmarks"]
             ],
             [
+                ("codex:compaction:compact-incremental", 2),
                 ("codex:goal-budget", 4),
-                ("codex:compaction:compact-incremental", 5),
             ],
         )
         self.assertEqual(page["semantic_total"], 2)
         self.assertEqual(
             [(event["seq"], event["type"]) for event in page["events"]],
             [
+                (2, "codex_compaction_started"),
                 (4, "codex_goal_budget_limited"),
                 (5, "codex_compaction_completed"),
+            ],
+        )
+
+    def test_compaction_stays_at_arrival_and_completion_beats_late_start(
+        self,
+    ) -> None:
+        self.write_events([
+            self.event(
+                1,
+                "turn_started",
+                run_id="before-run",
+                prompt="Before compaction",
+            ),
+            self.event(
+                2,
+                "turn_finished",
+                run_id="before-run",
+                result_text="Before answer",
+            ),
+            self.event(
+                3,
+                "codex_compaction_started",
+                operation_id="compact-race",
+                message="Compaction started.",
+            ),
+            self.event(
+                4,
+                "turn_started",
+                run_id="after-run",
+                prompt="After compaction started",
+            ),
+            self.event(
+                5,
+                "turn_finished",
+                run_id="after-run",
+                result_text="After answer",
+            ),
+            self.event(
+                6,
+                "codex_compaction_completed",
+                operation_id="compact-race",
+                status="completed",
+                message="Compaction completed.",
+            ),
+            self.event(
+                7,
+                "codex_compaction_started",
+                operation_id="compact-race",
+                message="Duplicate start delivered late.",
+            ),
+        ])
+
+        index = agent_server.build_timeline_index(self.session_id)
+        page = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            limit=10,
+            tail=True,
+        )
+
+        compaction = next(
+            item
+            for item in index["landmarks"]
+            if item["key"] == "codex:compaction:compact-race"
+        )
+        self.assertEqual(compaction["start_seq"], 3)
+        self.assertEqual(compaction["preview"], "Compaction completed.")
+        self.assertEqual(
+            [item["key"] for item in index["landmarks"]],
+            [
+                "turn:before-run",
+                "codex:compaction:compact-race",
+                "turn:after-run",
+            ],
+        )
+        self.assertEqual(
+            [
+                (event["seq"], event["type"])
+                for event in page["events"]
+                if str(event["type"]).startswith("codex_compaction_")
+            ],
+            [
+                (3, "codex_compaction_started"),
+                (6, "codex_compaction_completed"),
             ],
         )
 

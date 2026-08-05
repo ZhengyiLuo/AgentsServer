@@ -3478,8 +3478,9 @@ class SessionStore:
         DELETING_SESSIONS.clear()
         DELETED_SESSION_TOMBSTONES.clear()
         CODEX_THREAD_SESSION_INDEX.clear()
-        CODEX_SUBAGENT_SESSION_INDEX.clear()
-        CODEX_SUBAGENT_STATE.clear()
+        with CODEX_SUBAGENT_INDEX_LOCK:
+            CODEX_SUBAGENT_SESSION_INDEX.clear()
+            CODEX_SUBAGENT_STATE.clear()
         if SESSIONS_FILE.exists():
             try:
                 self.sessions = json.loads(SESSIONS_FILE.read_text())
@@ -4808,6 +4809,10 @@ CODEX_SUBAGENT_STATE: dict[str, dict[str, Any]] = {}
 # generation. Persisted "running" cards are historical hints, not evidence
 # that work survived an AgentsServer/app-server restart.
 CODEX_SUBAGENT_LIVE_GENERATIONS: dict[str, int] = {}
+# Timeline indexes are built in worker threads while provider notifications
+# update these maps on the event loop. Protect compound mutations and snapshots
+# so a semantic-page rebuild never iterates a dictionary that is changing.
+CODEX_SUBAGENT_INDEX_LOCK = threading.RLock()
 CODEX_COMPACTION_TERMINAL_HISTORY_LIMIT = 128
 CODEX_PENDING_INTERACTIONS: dict[str, dict[str, Any]] = {}
 CODEX_PENDING_INTERACTIONS_LOCK = asyncio.Lock()
@@ -4866,6 +4871,20 @@ def session_references_codex_thread(
         else ""
     )
     return thread_id in {codex_thread_id, active_session_id}
+
+
+def session_codex_thread_id(session: dict[str, Any]) -> str:
+    """Return the chat's Codex root whether Codex is active or parked."""
+
+    parked = str(session.get("codex_thread_id") or "").strip()
+    if parked:
+        return parked
+    if (
+        str(session.get("backend") or DEFAULT_BACKEND).strip().lower()
+        == BACKEND_CODEX
+    ):
+        return str(session.get("session_id") or "").strip()
+    return ""
 
 
 def session_lifecycle_lock(session_id: str) -> asyncio.Lock:
@@ -4965,7 +4984,8 @@ async def reset_codex_ephemeral_runtime_metadata() -> None:
     """Clear process-owned Codex state after transport shutdown or restart."""
     CODEX_GOAL_SYNC_GENERATIONS.clear()
     CODEX_QUARANTINED_GOAL_THREADS.clear()
-    CODEX_SUBAGENT_LIVE_GENERATIONS.clear()
+    with CODEX_SUBAGENT_INDEX_LOCK:
+        CODEX_SUBAGENT_LIVE_GENERATIONS.clear()
     changed = False
     async with STORE._lock:
         for session in STORE.sessions.values():
@@ -5395,6 +5415,13 @@ async def update_session_event_metadata(session_id: str, event: dict[str, Any]) 
                 if str(value or "").strip()
             ]
             if event_type == "codex_compaction_completed":
+                if str(event.get("compaction_id") or "").startswith("native:"):
+                    remember_codex_native_compaction_terminal(
+                        session_id,
+                        str(event.get("thread_id") or ""),
+                        str(event.get("turn_id") or "") or None,
+                        str(event.get("item_id") or "") or None,
+                    )
                 if lifecycle_key in active_compactions:
                     active_compactions.pop(lifecycle_key, None)
                     compaction_state_changed = True
@@ -9022,29 +9049,49 @@ def session_codex_subagent_states(session_id: str) -> list[dict[str, Any]]:
     """Read the bounded child index embedded in sessions.json metadata."""
 
     session = STORE.sessions.get(session_id) or {}
+    root_thread_id = session_codex_thread_id(session)
     value = session.get("codex_subagents")
     if isinstance(value, dict):
-        return [dict(state) for state in value.values() if isinstance(state, dict)]
-    if isinstance(value, list):
-        return [dict(state) for state in value if isinstance(state, dict)]
-    return []
+        states = [dict(state) for state in value.values() if isinstance(state, dict)]
+    elif isinstance(value, list):
+        states = [dict(state) for state in value if isinstance(state, dict)]
+    else:
+        states = []
+    # A collaboration message sent from a child back to its parent can expose
+    # the parent in a receiver list. Older servers briefly persisted that root
+    # thread as if it were its own child; never hydrate or present that record.
+    return [
+        state
+        for state in states
+        if str(state.get("subagent_id") or "").strip() != root_thread_id
+    ]
+
+
+def codex_subagent_ownership_snapshot() -> dict[str, str]:
+    """Return one thread-safe point-in-time copy for worker-thread readers."""
+
+    with CODEX_SUBAGENT_INDEX_LOCK:
+        return dict(CODEX_SUBAGENT_SESSION_INDEX)
 
 
 def rebuild_codex_subagent_indexes() -> None:
     """Restore child ownership/status indexes from durable timeline records."""
 
-    CODEX_SUBAGENT_SESSION_INDEX.clear()
-    CODEX_SUBAGENT_STATE.clear()
-    CODEX_SUBAGENT_LIVE_GENERATIONS.clear()
+    rebuilt: list[tuple[str, str, dict[str, Any]]] = []
     for session_id in STORE.sessions:
         for state in session_codex_subagent_states(session_id):
             if str(state.get("backend") or "") != BACKEND_CODEX:
                 continue
             child_thread_id = str(state.get("subagent_id") or "").strip()
-            if not child_thread_id:
-                continue
+            if child_thread_id:
+                rebuilt.append((child_thread_id, session_id, dict(state)))
+    with CODEX_SUBAGENT_INDEX_LOCK:
+        CODEX_SUBAGENT_SESSION_INDEX.clear()
+        CODEX_SUBAGENT_STATE.clear()
+        CODEX_SUBAGENT_LIVE_GENERATIONS.clear()
+        for child_thread_id, session_id, state in rebuilt:
             CODEX_SUBAGENT_SESSION_INDEX[child_thread_id] = session_id
-            CODEX_SUBAGENT_STATE[child_thread_id] = dict(state)
+            CODEX_SUBAGENT_STATE[child_thread_id] = state
 
 
 async def emit_codex_subagent_state(
@@ -9066,7 +9113,18 @@ async def emit_codex_subagent_state(
     child_thread_id = str(child_thread_id or "").strip()
     if not child_thread_id or session_id not in STORE.sessions:
         return None
-    previous = CODEX_SUBAGENT_STATE.get(child_thread_id) or {}
+    if child_thread_id == str(
+        session_codex_thread_id(STORE.sessions.get(session_id) or {})
+    ).strip():
+        # The chat's provider thread is the root, even when it appears as the
+        # receiver of a child-to-parent collaboration message.
+        with CODEX_SUBAGENT_INDEX_LOCK:
+            CODEX_SUBAGENT_SESSION_INDEX.pop(child_thread_id, None)
+            CODEX_SUBAGENT_STATE.pop(child_thread_id, None)
+            CODEX_SUBAGENT_LIVE_GENERATIONS.pop(child_thread_id, None)
+        return None
+    with CODEX_SUBAGENT_INDEX_LOCK:
+        previous = dict(CODEX_SUBAGENT_STATE.get(child_thread_id) or {})
     if previous and str(previous.get("session_id") or "") != session_id:
         previous = {}
     normalized = normalize_subagent_status(status or previous.get("subagent_status"))
@@ -9090,7 +9148,7 @@ async def emit_codex_subagent_state(
     resolved_parent = str(
         parent_thread_id
         or previous.get("subagent_parent_thread_id")
-        or session_provider_id(STORE.sessions.get(session_id) or {})
+        or session_codex_thread_id(STORE.sessions.get(session_id) or {})
         or ""
     ).strip()
     resolved_run = str(run_id or previous.get("run_id") or "").strip() or None
@@ -9134,17 +9192,19 @@ async def emit_codex_subagent_state(
         "subagent_log",
     )
     manager = CODEX_APP_SERVER_MANAGER
-    if (
-        normalized in {"starting", "running"}
-        and manager is not None
-        and getattr(manager, "ready", False) is True
-        and isinstance(getattr(manager, "generation", None), int)
-    ):
-        CODEX_SUBAGENT_LIVE_GENERATIONS[child_thread_id] = manager.generation
-    else:
-        CODEX_SUBAGENT_LIVE_GENERATIONS.pop(child_thread_id, None)
+    with CODEX_SUBAGENT_INDEX_LOCK:
+        if (
+            normalized in {"starting", "running"}
+            and manager is not None
+            and getattr(manager, "ready", False) is True
+            and isinstance(getattr(manager, "generation", None), int)
+        ):
+            CODEX_SUBAGENT_LIVE_GENERATIONS[child_thread_id] = manager.generation
+        else:
+            CODEX_SUBAGENT_LIVE_GENERATIONS.pop(child_thread_id, None)
     if previous and all(previous.get(key) == payload.get(key) for key in comparable_keys):
-        CODEX_SUBAGENT_SESSION_INDEX[child_thread_id] = session_id
+        with CODEX_SUBAGENT_INDEX_LOCK:
+            CODEX_SUBAGENT_SESSION_INDEX[child_thread_id] = session_id
         return previous
 
     event = await append_event(session_id, "subagent_state", payload)
@@ -9155,8 +9215,9 @@ async def emit_codex_subagent_state(
         **payload,
         **(event if isinstance(event, dict) else {}),
     }
-    CODEX_SUBAGENT_SESSION_INDEX[child_thread_id] = session_id
-    CODEX_SUBAGENT_STATE[child_thread_id] = stored
+    with CODEX_SUBAGENT_INDEX_LOCK:
+        CODEX_SUBAGENT_SESSION_INDEX[child_thread_id] = session_id
+        CODEX_SUBAGENT_STATE[child_thread_id] = stored
     async with STORE._lock:
         session = STORE.sessions.get(session_id)
         if session is not None:
@@ -9192,7 +9253,9 @@ def build_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str, Any]:
         for state in claude.get("subagents") or []:
             key = f"{str(state.get('backend') or BACKEND_CLAUDE)}:{state.get('subagent_id')}"
             merged[key] = dict(state)
-    for state in CODEX_SUBAGENT_STATE.values():
+    with CODEX_SUBAGENT_INDEX_LOCK:
+        codex_states = [dict(state) for state in CODEX_SUBAGENT_STATE.values()]
+    for state in codex_states:
         if str(state.get("session_id") or "") != session_id:
             continue
         key = f"{str(state.get('backend') or '')}:{state.get('subagent_id')}"
@@ -9235,7 +9298,7 @@ async def reconcile_codex_subagents(
     """Refresh durable child states from app-server's persisted spawn tree."""
 
     session = STORE.sessions.get(session_id) or {}
-    root_thread_id = str(session_provider_id(session) or "").strip()
+    root_thread_id = session_codex_thread_id(session)
     manager = manager or CODEX_APP_SERVER_MANAGER
     list_descendants = getattr(manager, "list_descendant_threads", None)
     if not root_thread_id or manager is None or not callable(list_descendants):
@@ -9260,8 +9323,9 @@ async def reconcile_codex_subagents(
         child_thread_id = str(thread.get("id") or "").strip()
         if not child_thread_id:
             continue
-        CODEX_SUBAGENT_SESSION_INDEX[child_thread_id] = session_id
-        previous = CODEX_SUBAGENT_STATE.get(child_thread_id) or {}
+        with CODEX_SUBAGENT_INDEX_LOCK:
+            CODEX_SUBAGENT_SESSION_INDEX[child_thread_id] = session_id
+            previous = dict(CODEX_SUBAGENT_STATE.get(child_thread_id) or {})
         status = codex_child_status_from_thread(thread.get("status"))
         turns = thread.get("turns") if isinstance(thread.get("turns"), list) else []
         latest_turn = turns[0] if turns else None
@@ -9341,7 +9405,8 @@ async def stop_codex_descendant_subagents(
         child_thread_id = str(thread.get("id") or "").strip()
         if not child_thread_id or (targets is not None and child_thread_id not in targets):
             continue
-        CODEX_SUBAGENT_SESSION_INDEX[child_thread_id] = session_id
+        with CODEX_SUBAGENT_INDEX_LOCK:
+            CODEX_SUBAGENT_SESSION_INDEX[child_thread_id] = session_id
         try:
             turns = await list_turns(
                 child_thread_id,
@@ -9360,9 +9425,11 @@ async def stop_codex_descendant_subagents(
             if active_turns:
                 requested.append(child_thread_id)
                 pending[child_thread_id] = thread
-                previous_status = normalize_subagent_status(
-                    (CODEX_SUBAGENT_STATE.get(child_thread_id) or {}).get("subagent_status")
-                )
+                with CODEX_SUBAGENT_INDEX_LOCK:
+                    previous_status_value = (
+                        CODEX_SUBAGENT_STATE.get(child_thread_id) or {}
+                    ).get("subagent_status")
+                previous_status = normalize_subagent_status(previous_status_value)
                 await emit_codex_subagent_state(
                     session_id,
                     child_thread_id,
@@ -9925,6 +9992,104 @@ def native_codex_compaction_id(
     ))
 
 
+def native_codex_compaction_terminal_aliases(
+    thread_id: str,
+    turn_id: str | None,
+    item_id: str | None,
+) -> tuple[str, ...]:
+    """Return stable, unambiguous identities for a provider compaction.
+
+    App-server can replay a completion with either the turn or item field
+    omitted after the owning ACTIVE record has been released. Thread+turn and
+    thread+item remain safe aliases; thread alone does not, because it could
+    suppress a later legitimate compaction on the same conversation.
+    """
+
+    thread_id = str(thread_id or "").strip()
+    turn_id = str(turn_id or "").strip()
+    item_id = str(item_id or "").strip()
+    if not thread_id or (not turn_id and not item_id):
+        return ()
+
+    aliases = [
+        f"codex:compaction:{native_codex_compaction_id(thread_id, turn_id, item_id)}"
+    ]
+    for kind, value in (("turn", turn_id), ("item", item_id)):
+        if not value:
+            continue
+        encoded = json.dumps(
+            [thread_id, value],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8", errors="surrogatepass")
+        aliases.append(
+            f"codex:compaction-native:{kind}:{hashlib.sha256(encoded).hexdigest()}"
+        )
+    return tuple(aliases)
+
+
+def codex_native_compaction_was_terminal(
+    session_id: str,
+    thread_id: str,
+    turn_id: str | None,
+    item_id: str | None,
+) -> bool:
+    """Return whether this provider compaction already reached a terminal row."""
+
+    aliases = set(native_codex_compaction_terminal_aliases(
+        thread_id,
+        turn_id,
+        item_id,
+    ))
+    if not aliases:
+        return False
+    session = STORE.sessions.get(session_id) or {}
+    for field in (
+        "_codex_compaction_native_terminal_keys",
+        "_codex_compaction_terminal_keys",
+    ):
+        values = session.get(field)
+        if isinstance(values, list) and aliases.intersection(map(str, values)):
+            return True
+    return False
+
+
+def remember_codex_native_compaction_terminal(
+    session_id: str,
+    thread_id: str,
+    turn_id: str | None,
+    item_id: str | None,
+) -> None:
+    """Remember a native identity suppressed in favor of its manual row.
+
+    The owning manual completion is persisted immediately afterwards, so its
+    normal session save also durably carries this bounded alias list. Keeping
+    the in-memory mutation synchronous closes the smaller replay race first.
+    """
+
+    session = STORE.sessions.get(session_id)
+    if session is None:
+        return
+    aliases = native_codex_compaction_terminal_aliases(
+        thread_id,
+        turn_id,
+        item_id,
+    )
+    if not aliases:
+        return
+    alias_set = set(aliases)
+    value = session.get("_codex_compaction_native_terminal_keys")
+    keys = [
+        str(candidate)
+        for candidate in (value if isinstance(value, list) else [])
+        if str(candidate or "").strip() and str(candidate) not in alias_set
+    ]
+    keys.extend(aliases)
+    session["_codex_compaction_native_terminal_keys"] = keys[
+        -(CODEX_COMPACTION_TERMINAL_HISTORY_LIMIT * 3):
+    ]
+
+
 def timeline_index_event_is_hidden(event: dict[str, Any]) -> bool:
     # Native-steer stops need routing context before they can be classified:
     # ordinary chat transitions are hidden, while a scheduled-job transition
@@ -10291,9 +10456,41 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
             "event_count": 0,
             "generated_at": now_iso(),
         }
-    stat = path.stat()
-    signature = (stat.st_size, stat.st_mtime_ns)
+    session = STORE.sessions.get(session_id) or {}
+    root_codex_thread_id = session_codex_thread_id(session)
     cached = timeline_index_cached_entry(session_id, touch=True)
+    durable_child_codex_thread_ids = {
+        str(thread_id or "").strip()
+        for thread_id in (
+            cached.get("durable_child_codex_thread_ids") or set()
+            if cached
+            else set()
+        )
+        if str(thread_id or "").strip()
+    }
+    child_codex_thread_ids = {
+        str(state.get("subagent_id") or "").strip()
+        for state in session_codex_subagent_states(session_id)
+        if str(state.get("backend") or "") == BACKEND_CODEX
+    }
+    child_codex_thread_ids.update(durable_child_codex_thread_ids)
+    subagent_ownership = codex_subagent_ownership_snapshot()
+    child_codex_thread_ids.update(
+        thread_id
+        for thread_id, owner_session_id in subagent_ownership.items()
+        if owner_session_id == session_id and thread_id != root_codex_thread_id
+    )
+    child_codex_thread_ids.discard("")
+    codex_scope_signature = (
+        root_codex_thread_id,
+        tuple(sorted(child_codex_thread_ids)),
+    )
+    stat = path.stat()
+    signature = (
+        stat.st_size,
+        stat.st_mtime_ns,
+        *codex_scope_signature,
+    )
     if (
         cached
         and cached.get("signature") == signature
@@ -10303,6 +10500,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
 
     can_append = bool(
         cached and cached.get("inode") == stat.st_ino and
+        cached.get("codex_scope_signature") == codex_scope_signature and
         0 <= int(cached.get("offset") or 0) < stat.st_size
     )
     records: list[dict[str, Any]] = cached["records"] if can_append else []
@@ -10594,6 +10792,45 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
             if not event_files_belong_to_session(event, session_id):
                 continue
             latest_seq = max(latest_seq, seq)
+            if (
+                event_type == "subagent_state"
+                and str(event.get("backend") or "") == BACKEND_CODEX
+            ):
+                durable_child_thread_id = str(
+                    event.get("subagent_id") or ""
+                ).strip()
+                if (
+                    durable_child_thread_id
+                    and durable_child_thread_id != root_codex_thread_id
+                ):
+                    durable_child_codex_thread_ids.add(durable_child_thread_id)
+                    child_codex_thread_ids.add(durable_child_thread_id)
+            event_thread_id = str(event.get("thread_id") or "").strip()
+            usage_thread_ids = {
+                str(usage.get("thread_id") or "").strip()
+                for usage in (
+                    event.get("token_usage_before"),
+                    event.get("token_usage_after"),
+                )
+                if isinstance(usage, dict)
+                and str(usage.get("thread_id") or "").strip()
+            }
+            leaked_child_compaction = bool(
+                event_type in TIMELINE_INDEX_CODEX_COMPACTION_TYPES
+                and event_thread_id
+                and (
+                    event_thread_id in child_codex_thread_ids
+                    or any(
+                        usage_thread_id != event_thread_id
+                        for usage_thread_id in usage_thread_ids
+                    )
+                )
+            )
+            if leaked_child_compaction:
+                # Older app-server builds projected child-native compactions
+                # into the parent's JSONL. Keep the durable audit record, but
+                # do not expose it as a top-level chat lifecycle landmark.
+                continue
             is_forked = event.get("forked") is True
             is_fork_internal = event.get("purpose") in FORK_INTERNAL_PURPOSES
             if is_forked and is_fork_internal and run_id:
@@ -10675,6 +10912,10 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                     "codex_lifecycle",
                     event,
                 )
+                if event_type in TIMELINE_INDEX_CODEX_COMPACTION_TYPES:
+                    record["_codex_thread_id"] = event_thread_id or record.get(
+                        "_codex_thread_id"
+                    )
                 text = timeline_index_event_text(event)
                 record["title"] = (
                     "Codex Goal"
@@ -10886,6 +11127,28 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
             record["title"] = compact_timeline_index_text(event_type.replace("_", " ").title() or "System", 72)
             record["preview"] = text or record["title"]
 
+    leaked_child_lifecycle_keys = [
+        str(record.get("key") or "")
+        for record in records
+        if record.get("kind") == "codex_lifecycle"
+        and str(record.get("_codex_thread_id") or "")
+        in durable_child_codex_thread_ids
+    ]
+    for leaked_key in leaked_child_lifecycle_keys:
+        leaked_record = by_key.pop(leaked_key, None)
+        if leaked_record is None:
+            continue
+        visible_count = max(
+            0,
+            visible_count - int(leaked_record.get("event_count") or 0),
+        )
+        with suppress(ValueError):
+            records.remove(leaked_record)
+        landmarks_by_key.pop(leaked_key, None)
+        dirty_record_keys.discard(leaked_key)
+        with suppress(ValueError):
+            landmark_order.remove(leaked_key)
+
     def landmark_from_record(stored: dict[str, Any]) -> dict[str, Any]:
         file_names = list(stored.get("file_names") or [])
         tool_count = int(stored.get("tool_count") or 0)
@@ -10990,9 +11253,18 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
         "generated_at": now_iso(),
     }
     final_stat = path.stat()
-    final_signature = (final_stat.st_size, final_stat.st_mtime_ns)
+    codex_scope_signature = (
+        root_codex_thread_id,
+        tuple(sorted(child_codex_thread_ids)),
+    )
+    final_signature = (
+        final_stat.st_size,
+        final_stat.st_mtime_ns,
+        *codex_scope_signature,
+    )
     cache_entry = {
         "signature": final_signature,
+        "codex_scope_signature": codex_scope_signature,
         "payload": payload,
         "records": records,
         "by_key": by_key,
@@ -11007,6 +11279,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
         "run_history_keys_by_run_id": run_history_keys_by_run_id,
         "current_run_history_key": current_run_history_key,
         "fork_internal_run_ids": fork_internal_run_ids,
+        "durable_child_codex_thread_ids": durable_child_codex_thread_ids,
         "visible_count": visible_count,
         "latest_seq": latest_seq,
         "offset": final_offset,
@@ -14824,17 +15097,27 @@ def codex_app_server_env() -> dict[str, str]:
 def codex_session_id_for_thread(thread_id: str) -> str | None:
     if not thread_id:
         return None
-    child_session_id = CODEX_SUBAGENT_SESSION_INDEX.get(thread_id)
+    with CODEX_SUBAGENT_INDEX_LOCK:
+        child_session_id = CODEX_SUBAGENT_SESSION_INDEX.get(thread_id)
     if child_session_id:
+        child_session = STORE.sessions.get(child_session_id)
         if (
-            child_session_id in STORE.sessions
+            child_session is not None
             and child_session_id not in DELETING_SESSIONS
             and child_session_id not in DELETED_SESSION_TOMBSTONES
         ):
+            if session_codex_thread_id(child_session) == thread_id:
+                # Root ownership wins over a stale child receiver record.
+                with CODEX_SUBAGENT_INDEX_LOCK:
+                    CODEX_SUBAGENT_SESSION_INDEX.pop(thread_id, None)
+                    CODEX_SUBAGENT_STATE.pop(thread_id, None)
+                    CODEX_SUBAGENT_LIVE_GENERATIONS.pop(thread_id, None)
+                CODEX_THREAD_SESSION_INDEX[thread_id] = child_session_id
             return child_session_id
-        CODEX_SUBAGENT_SESSION_INDEX.pop(thread_id, None)
-        CODEX_SUBAGENT_STATE.pop(thread_id, None)
-        CODEX_SUBAGENT_LIVE_GENERATIONS.pop(thread_id, None)
+        with CODEX_SUBAGENT_INDEX_LOCK:
+            CODEX_SUBAGENT_SESSION_INDEX.pop(thread_id, None)
+            CODEX_SUBAGENT_STATE.pop(thread_id, None)
+            CODEX_SUBAGENT_LIVE_GENERATIONS.pop(thread_id, None)
     indexed = CODEX_THREAD_SESSION_INDEX.get(thread_id)
     if indexed:
         session = STORE.sessions.get(indexed)
@@ -15699,9 +15982,15 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
     thread_id = str(params.get("threadId") or "")
     session_id = codex_session_id_for_thread(thread_id)
     quarantined_session_id = CODEX_QUARANTINED_GOAL_THREADS.get(thread_id)
+    root_thread_id = session_codex_thread_id(
+        STORE.sessions.get(session_id) or {}
+    )
+    with CODEX_SUBAGENT_INDEX_LOCK:
+        indexed_child_session_id = CODEX_SUBAGENT_SESSION_INDEX.get(thread_id)
     is_child_thread = bool(
         session_id
-        and CODEX_SUBAGENT_SESSION_INDEX.get(thread_id) == session_id
+        and thread_id != root_thread_id
+        and indexed_child_session_id == session_id
     )
     if method == "turn/started" and thread_id and not is_child_thread:
         owner_session_id = session_id or quarantined_session_id
@@ -15832,6 +16121,11 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
                 activity="Subagent closed",
             )
             return
+        # Child threads share their owning chat for lifecycle cards, but their
+        # context window and native control items are provider-local. Falling
+        # through here used to overwrite the parent's context meter and render
+        # child context compactions as top-level chat landmarks.
+        return
 
     if method == "thread/status/changed":
         status = bounded_codex_interaction_value(params.get("status"), remaining=4_000)
@@ -16003,6 +16297,7 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
         if method == "item/started":
             before = current_codex_token_usage_snapshot(session_id)
             explicit_native_compaction = False
+            terminal_replay = False
             run_id = ""
             async with ACTIVE_LOCK:
                 active = ACTIVE.get(session_id)
@@ -16016,18 +16311,50 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
                         == "compaction"
                     )
                     run_id = str(active.get("run_id") or "")
-                    active["codex_compaction_in_progress"] = True
-                    active["codex_compaction_item_id"] = item_id
-                    if "codex_compaction_token_usage_before" not in active:
-                        active["codex_compaction_token_usage_before"] = (
-                            dict(before) if before is not None else None
+                    turn_id = (
+                        turn_id
+                        or str(active.get("codex_compaction_turn_id") or "")
+                        or str(active.get("provider_turn_id") or "")
+                        or None
+                    )
+                    terminal_replay = (
+                        not explicit_native_compaction
+                        and codex_native_compaction_was_terminal(
+                            session_id,
+                            thread_id,
+                            turn_id,
+                            item_id,
                         )
+                    )
+                    if not terminal_replay:
+                        active["codex_compaction_in_progress"] = True
+                        active["codex_compaction_item_id"] = item_id
+                        active["codex_compaction_turn_id"] = turn_id
+                        if "codex_compaction_token_usage_before" not in active:
+                            active["codex_compaction_token_usage_before"] = (
+                                dict(before) if before is not None else None
+                            )
+            if terminal_replay:
+                # Do not mutate ACTIVE for a replayed start. A matching
+                # completion is not guaranteed to follow after thread resume.
+                return
             if not explicit_native_compaction:
                 compaction_id = native_codex_compaction_id(
                     thread_id,
                     turn_id,
                     item_id,
                 )
+                if codex_native_compaction_was_terminal(
+                    session_id,
+                    thread_id,
+                    turn_id,
+                    item_id,
+                ):
+                    # A reloaded thread can replay both lifecycle edges after
+                    # the manual owner has already persisted its terminal row.
+                    # Suppress the late start too, otherwise it becomes an
+                    # orphan "Compacting" marker with no matching completion.
+                    return
                 await append_event(
                     session_id,
                     "codex_compaction_started",
@@ -16051,6 +16378,18 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
                 and active.get("codex_native_operation_kind") == "compaction"
             )
             run_id = str(active.get("run_id") or "") if active else ""
+            if active:
+                turn_id = (
+                    turn_id
+                    or str(active.get("codex_compaction_turn_id") or "")
+                    or str(active.get("provider_turn_id") or "")
+                    or None
+                )
+                item_id = (
+                    item_id
+                    or str(active.get("codex_compaction_item_id") or "")
+                    or None
+                )
             if active and "codex_compaction_token_usage_before" in active:
                 recorded_before = active.get(
                     "codex_compaction_token_usage_before"
@@ -16074,13 +16413,32 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
                 for key in (
                     "codex_compaction_in_progress",
                     "codex_compaction_item_id",
+                    "codex_compaction_turn_id",
                     "codex_compaction_token_usage_before",
                     "codex_compaction_token_usage_after",
                 ):
                     active.pop(key, None)
+        native_compaction_id = native_codex_compaction_id(
+            thread_id,
+            turn_id,
+            item_id,
+        )
         if explicit_native_compaction:
             # Its owner emits one terminal event after canonical
             # turn/completed, while the chat remains reserved.
+            remember_codex_native_compaction_terminal(
+                session_id,
+                thread_id,
+                turn_id,
+                item_id,
+            )
+            return
+        if codex_native_compaction_was_terminal(
+            session_id,
+            thread_id,
+            turn_id,
+            item_id,
+        ):
             return
         if after is not None:
             await record_codex_token_usage(
@@ -16093,11 +16451,7 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
             "codex_compaction_completed",
             {
                 "run_id": run_id or None,
-                "compaction_id": native_codex_compaction_id(
-                    thread_id,
-                    turn_id,
-                    item_id,
-                ),
+                "compaction_id": native_compaction_id,
                 "thread_id": thread_id,
                 "turn_id": turn_id,
                 "item_id": item_id,
@@ -16757,6 +17111,25 @@ async def consume_codex_native_turn(
                                 "purpose": f"codex_{operation}",
                             },
                         )
+                elif item_type == "contextCompaction" and operation == "compaction":
+                    native_turn_id = str(params.get("turnId") or turn_id or "") or None
+                    native_item_id = str(
+                        params.get("itemId") or item.get("id") or ""
+                    ) or None
+                    remember_codex_native_compaction_terminal(
+                        session_id,
+                        thread_id,
+                        native_turn_id,
+                        native_item_id,
+                    )
+                    async with ACTIVE_LOCK:
+                        active = ACTIVE.get(session_id)
+                        if (
+                            active
+                            and str(active.get("run_id") or "") == operation_id
+                        ):
+                            active["codex_compaction_turn_id"] = native_turn_id
+                            active["codex_compaction_item_id"] = native_item_id
                 else:
                     tool = codex_app_server_tool(item)
                     if tool:
@@ -19139,14 +19512,17 @@ async def cleanup_aborted_session_fork(
         ):
             if owner_session_id == child_session_id:
                 CODEX_THREAD_SESSION_INDEX.pop(thread_id, None)
-        for thread_id, owner_session_id in tuple(
-            CODEX_SUBAGENT_SESSION_INDEX.items()
-        ):
-            if owner_session_id != child_session_id:
-                continue
-            CODEX_SUBAGENT_SESSION_INDEX.pop(thread_id, None)
-            CODEX_SUBAGENT_STATE.pop(thread_id, None)
-            CODEX_SUBAGENT_LIVE_GENERATIONS.pop(thread_id, None)
+        with CODEX_SUBAGENT_INDEX_LOCK:
+            owned_child_threads = [
+                thread_id
+                for thread_id, owner_session_id
+                in CODEX_SUBAGENT_SESSION_INDEX.items()
+                if owner_session_id == child_session_id
+            ]
+            for thread_id in owned_child_threads:
+                CODEX_SUBAGENT_SESSION_INDEX.pop(thread_id, None)
+                CODEX_SUBAGENT_STATE.pop(thread_id, None)
+                CODEX_SUBAGENT_LIVE_GENERATIONS.pop(thread_id, None)
         for thread_id, owner_session_id in tuple(
             CODEX_QUARANTINED_GOAL_THREADS.items()
         ):
@@ -23283,10 +23659,11 @@ def codex_subagent_has_live_owner(
     )
     if status not in {"starting", "running"}:
         return False
+    with CODEX_SUBAGENT_INDEX_LOCK:
+        indexed_session_id = CODEX_SUBAGENT_SESSION_INDEX.get(thread_id)
+        generation = CODEX_SUBAGENT_LIVE_GENERATIONS.get(thread_id)
     session_id = str(
-        state.get("session_id")
-        or CODEX_SUBAGENT_SESSION_INDEX.get(thread_id)
-        or ""
+        state.get("session_id") or indexed_session_id or ""
     ).strip()
     if session_id and session_id in BUSY_SESSIONS:
         owner = ACTIVE.get(session_id) or CURRENT_TURNS.get(session_id) or {}
@@ -23301,7 +23678,6 @@ def codex_subagent_has_live_owner(
     with suppress(Exception):
         if manager.active_turn(thread_id) is not None:
             return True
-    generation = CODEX_SUBAGENT_LIVE_GENERATIONS.get(thread_id)
     return bool(
         generation is not None
         and getattr(manager, "ready", False) is True
@@ -23333,7 +23709,12 @@ def active_codex_work_labels() -> list[str]:
     for pending in CODEX_PENDING_INTERACTIONS.values():
         session_id = str(pending.get("session_id") or "unknown")
         labels.add(f"Codex prompt in {session_id}")
-    for thread_id, state in CODEX_SUBAGENT_STATE.items():
+    with CODEX_SUBAGENT_INDEX_LOCK:
+        codex_subagent_states = [
+            (thread_id, dict(state))
+            for thread_id, state in CODEX_SUBAGENT_STATE.items()
+        ]
+    for thread_id, state in codex_subagent_states:
         if codex_subagent_has_live_owner(thread_id, state):
             labels.add(f"Codex subagent {thread_id}")
     return sorted(labels)

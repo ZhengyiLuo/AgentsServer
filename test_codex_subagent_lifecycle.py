@@ -120,6 +120,114 @@ class CodexSubagentLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["subagent_provider_ref"], "child-a")
         self.assertEqual(self.session["codex_subagents"]["child-a"]["subagent_status"], "stopped")
 
+    async def test_child_usage_and_compaction_never_project_as_parent_lifecycle(self) -> None:
+        self.session["codex_token_usage_snapshot"] = {
+            "thread_id": "parent-thread",
+            "turn_id": "parent-turn",
+            "context_tokens": 42_000,
+            "context_window": 100_000,
+        }
+        agent_server.CODEX_SUBAGENT_SESSION_INDEX["child-a"] = "chat"
+        append_event = AsyncMock()
+        record_usage = AsyncMock()
+
+        with (
+            patch.object(agent_server, "append_event", append_event),
+            patch.object(agent_server, "record_codex_token_usage", record_usage),
+        ):
+            await agent_server.project_codex_notification({
+                "method": "thread/tokenUsage/updated",
+                "params": {
+                    "threadId": "child-a",
+                    "turnId": "child-turn",
+                    "tokenUsage": {
+                        "last": {"totalTokens": 91_000},
+                        "total": {"totalTokens": 500_000},
+                        "modelContextWindow": 100_000,
+                    },
+                },
+            })
+            for method in ("item/started", "item/completed"):
+                await agent_server.project_codex_notification({
+                    "method": method,
+                    "params": {
+                        "threadId": "child-a",
+                        "turnId": "child-turn",
+                        "item": {
+                            "id": "child-compaction",
+                            "type": "contextCompaction",
+                        },
+                    },
+                })
+
+        append_event.assert_not_awaited()
+        record_usage.assert_not_awaited()
+        self.assertEqual(
+            self.session["codex_token_usage_snapshot"]["thread_id"],
+            "parent-thread",
+        )
+
+    async def test_root_thread_is_never_classified_as_its_own_subagent(self) -> None:
+        agent_server.CODEX_SUBAGENT_SESSION_INDEX["parent-thread"] = "chat"
+        agent_server.CODEX_SUBAGENT_STATE["parent-thread"] = {
+            "session_id": "chat",
+            "subagent_id": "parent-thread",
+            "backend": agent_server.BACKEND_CODEX,
+        }
+
+        self.assertEqual(
+            agent_server.codex_session_id_for_thread("parent-thread"),
+            "chat",
+        )
+        self.assertNotIn("parent-thread", agent_server.CODEX_SUBAGENT_SESSION_INDEX)
+        self.assertNotIn("parent-thread", agent_server.CODEX_SUBAGENT_STATE)
+
+    async def test_parked_codex_root_is_not_a_child_after_backend_switch(self) -> None:
+        self.session.update({
+            "backend": agent_server.BACKEND_CLAUDE,
+            "session_id": "claude-thread",
+            "claude_session_id": "claude-thread",
+        })
+        agent_server.CODEX_SUBAGENT_SESSION_INDEX["parent-thread"] = "chat"
+        agent_server.CODEX_SUBAGENT_STATE["parent-thread"] = {
+            "session_id": "chat",
+            "subagent_id": "parent-thread",
+            "backend": agent_server.BACKEND_CODEX,
+        }
+        append_event = AsyncMock()
+
+        with patch.object(agent_server, "append_event", append_event):
+            await agent_server.project_codex_notification({
+                "method": "item/started",
+                "params": {
+                    "threadId": "parent-thread",
+                    "turnId": "codex-turn",
+                    "item": {
+                        "id": "compact-item",
+                        "type": "contextCompaction",
+                    },
+                },
+            })
+
+        append_event.assert_awaited_once()
+        self.assertEqual(
+            append_event.await_args.args[:2],
+            ("chat", "codex_compaction_started"),
+        )
+        self.assertNotIn("parent-thread", agent_server.CODEX_SUBAGENT_SESSION_INDEX)
+
+    def test_subagent_ownership_snapshot_is_detached_from_live_index(self) -> None:
+        agent_server.CODEX_SUBAGENT_SESSION_INDEX["child-a"] = "chat"
+
+        snapshot = agent_server.codex_subagent_ownership_snapshot()
+        agent_server.CODEX_SUBAGENT_SESSION_INDEX["child-b"] = "chat"
+
+        self.assertEqual(snapshot, {"child-a": "chat"})
+        self.assertEqual(
+            agent_server.codex_subagent_ownership_snapshot(),
+            {"child-a": "chat", "child-b": "chat"},
+        )
+
     async def test_parent_stop_interrupts_every_active_descendant_and_confirms_state(self) -> None:
         manager = FakeSubagentManager()
         with (

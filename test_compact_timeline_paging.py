@@ -1144,6 +1144,162 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
             "turn_stopped",
         }.issubset(event["type"] for event in raw_page))
 
+    def test_semantic_paging_hides_compactions_owned_by_known_subagents(self) -> None:
+        self.write_events([
+            self.event(
+                1,
+                "codex_compaction_started",
+                compaction_id="native:child-thread:child-turn:child-item",
+                thread_id="child-thread",
+                turn_id="child-turn",
+                item_id="child-item",
+            ),
+            self.event(
+                2,
+                "codex_compaction_completed",
+                compaction_id="native:child-thread:child-turn:child-item",
+                thread_id="child-thread",
+                turn_id="child-turn",
+                item_id="child-item",
+            ),
+            self.event(
+                3,
+                "codex_compaction_started",
+                compaction_id="native:pruned-child:child-turn:child-item",
+                thread_id="pruned-child",
+                turn_id="child-turn",
+                item_id="child-item",
+                token_usage_before={"thread_id": "root-thread"},
+            ),
+            self.event(
+                4,
+                "codex_compaction_completed",
+                compaction_id="native:pruned-child:child-turn:child-item",
+                thread_id="pruned-child",
+                turn_id="child-turn",
+                item_id="child-item",
+                token_usage_before={"thread_id": "root-thread"},
+            ),
+            self.event(
+                5,
+                "codex_compaction_started",
+                compaction_id="native:root-thread:root-turn:root-item",
+                thread_id="root-thread",
+                turn_id="root-turn",
+                item_id="root-item",
+            ),
+            self.event(
+                6,
+                "codex_compaction_completed",
+                compaction_id="native:root-thread:root-turn:root-item",
+                thread_id="root-thread",
+                turn_id="root-turn",
+                item_id="root-item",
+            ),
+        ])
+        sessions = {
+            self.session_id: {
+                "id": self.session_id,
+                "backend": agent_server.BACKEND_CODEX,
+                "codex_thread_id": "root-thread",
+                "codex_subagents": {
+                    "child-thread": {
+                        "backend": agent_server.BACKEND_CODEX,
+                        "subagent_id": "child-thread",
+                    },
+                },
+            },
+        }
+
+        with patch.object(agent_server.STORE, "sessions", sessions):
+            index = agent_server.build_timeline_index(self.session_id)
+            page = agent_server.read_semantic_timeline_page(
+                self.session_id,
+                limit=10,
+                tail=True,
+            )
+
+        self.assertEqual(
+            [landmark["key"] for landmark in index["landmarks"]],
+            ["codex:compaction:native:root-thread:root-turn:root-item"],
+        )
+        self.assertEqual(
+            [event["thread_id"] for event in page["events"]],
+            ["root-thread", "root-thread"],
+        )
+
+    def test_semantic_paging_recovers_pruned_child_ownership_from_timeline(self) -> None:
+        self.write_events([
+            self.event(
+                1,
+                "codex_compaction_started",
+                compaction_id="native:old-child:child-turn:child-item",
+                thread_id="old-child",
+                turn_id="child-turn",
+                item_id="child-item",
+                token_usage_before={"thread_id": "old-child"},
+            ),
+            self.event(
+                2,
+                "codex_compaction_completed",
+                compaction_id="native:old-child:child-turn:child-item",
+                thread_id="old-child",
+                turn_id="child-turn",
+                item_id="child-item",
+                token_usage_after={"thread_id": "old-child"},
+            ),
+            # This durable audit event can occur later in the file and remains
+            # authoritative after the bounded session snapshot prunes a child.
+            self.event(
+                3,
+                "subagent_state",
+                backend=agent_server.BACKEND_CODEX,
+                subagent_id="old-child",
+                subagent_status="completed",
+            ),
+            self.event(
+                4,
+                "codex_compaction_started",
+                compaction_id="native:root-thread:root-turn:root-item",
+                thread_id="root-thread",
+                turn_id="root-turn",
+                item_id="root-item",
+            ),
+            self.event(
+                5,
+                "codex_compaction_completed",
+                compaction_id="native:root-thread:root-turn:root-item",
+                thread_id="root-thread",
+                turn_id="root-turn",
+                item_id="root-item",
+            ),
+        ])
+        sessions = {
+            self.session_id: {
+                "id": self.session_id,
+                "backend": agent_server.BACKEND_CODEX,
+                "codex_thread_id": "root-thread",
+                # Simulate a restart after this child fell out of the bounded
+                # codex_subagents snapshot.
+                "codex_subagents": {},
+            },
+        }
+
+        with patch.object(agent_server.STORE, "sessions", sessions):
+            index = agent_server.build_timeline_index(self.session_id)
+            agent_server.TIMELINE_INDEX_CACHE.clear()
+            rebuilt = agent_server.build_timeline_index(self.session_id)
+
+        expected = ["codex:compaction:native:root-thread:root-turn:root-item"]
+        self.assertEqual(
+            [landmark["key"] for landmark in index["landmarks"]],
+            expected,
+        )
+        self.assertEqual(
+            [landmark["key"] for landmark in rebuilt["landmarks"]],
+            expected,
+        )
+
     def test_codex_lifecycle_landmarks_update_incrementally(self) -> None:
         self.write_events([
             self.event(

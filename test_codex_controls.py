@@ -1208,6 +1208,64 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
             10_000,
         )
 
+    async def test_automatic_compaction_reuses_start_identity_when_completion_is_sparse(
+        self,
+    ) -> None:
+        active = {
+            "chat": {
+                "run_id": "run-compact",
+                "provider_thread_id": "thread",
+                "provider_turn_id": "turn-1",
+            }
+        }
+        events: list[tuple[str, dict[str, object]]] = []
+
+        async def record_event(
+            _session_id: str,
+            event_type: str,
+            payload: dict[str, object],
+        ) -> dict[str, object]:
+            events.append((event_type, payload))
+            return {}
+
+        with (
+            patch.object(agent_server, "ACTIVE", active),
+            patch.object(
+                agent_server,
+                "codex_session_id_for_thread",
+                return_value="chat",
+            ),
+            patch.object(agent_server, "append_event", side_effect=record_event),
+        ):
+            await agent_server.project_codex_notification({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread",
+                    "turnId": "turn-1",
+                    "item": {"id": "compact-1", "type": "contextCompaction"},
+                },
+            })
+            await agent_server.project_codex_notification({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread",
+                    "item": {"type": "contextCompaction"},
+                },
+            })
+
+        compactions = [
+            payload
+            for event_type, payload in events
+            if event_type in {
+                "codex_compaction_started",
+                "codex_compaction_completed",
+            }
+        ]
+        self.assertEqual(len(compactions), 2)
+        self.assertEqual(compactions[0]["compaction_id"], compactions[1]["compaction_id"])
+        self.assertEqual(compactions[1]["turn_id"], "turn-1")
+        self.assertEqual(compactions[1]["item_id"], "compact-1")
+
     async def test_automatic_compaction_does_not_invent_before_usage(self) -> None:
         after_usage = {
             "last": {"totalTokens": 10_000},
@@ -1820,6 +1878,187 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "thread",
         )
         release_thread.assert_awaited_once()
+
+    async def test_sparse_late_replayed_compaction_completion_does_not_persist_twice(
+        self,
+    ) -> None:
+        agent_server.ACTIVE["chat"].update(
+            {
+                "codex_native_operation_kind": "compaction",
+                "codex_compaction_in_progress": True,
+            }
+        )
+        completed_notification = {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn-compact",
+                "item": {
+                    "id": "compact-item",
+                    "type": "contextCompaction",
+                },
+            },
+        }
+        subscription = GatedNativeSubscription(
+            [
+                {
+                    "method": "turn/started",
+                    "params": {
+                        "threadId": "thread",
+                        "turn": {"id": "turn-compact"},
+                    },
+                },
+                completed_notification,
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread",
+                        "turn": {
+                            "id": "turn-compact",
+                            "status": "completed",
+                        },
+                    },
+                },
+            ],
+            gate_at=3,
+        )
+        events: list[tuple[str, dict[str, object]]] = []
+
+        async def record_event(
+            _session_id: str,
+            event_type: str,
+            payload: dict[str, object],
+        ) -> dict[str, object]:
+            events.append((event_type, payload))
+            return {}
+
+        async def release_control_thread(
+            session_id: str,
+            _manager: object,
+            thread_id: str,
+            *,
+            reserved_session: bool = False,
+            schedule_queue: bool = True,
+        ) -> None:
+            del schedule_queue
+            self.assertTrue(reserved_session)
+            released = await agent_server.release_codex_control_slot(
+                session_id,
+                expected_thread_id=thread_id,
+            )
+            self.assertTrue(released)
+
+        manager = AsyncMock()
+        with (
+            patch.object(agent_server, "append_event", side_effect=record_event),
+            patch.object(
+                agent_server,
+                "release_codex_control_thread",
+                side_effect=release_control_thread,
+            ),
+        ):
+            # The global projector sees the provider completion while the
+            # manual operation still owns ACTIVE and correctly suppresses it.
+            await agent_server.project_codex_notification(completed_notification)
+            await agent_server.consume_codex_native_turn(
+                "chat",
+                "operation",
+                "compaction",
+                manager,
+                "thread",
+                subscription,
+            )
+            self.assertNotIn("chat", agent_server.ACTIVE)
+
+            manual_completions = [
+                payload
+                for event_type, payload in events
+                if event_type == "codex_compaction_completed"
+            ]
+            self.assertEqual(len(manual_completions), 1)
+            self.assertEqual(manual_completions[0]["operation_id"], "operation")
+
+            # Replaying either lifecycle edge after ACTIVE was released must
+            # not leave an orphan start or a second automatic completion.
+            # Either provider identity is sufficient when the other is sparse.
+            agent_server.ACTIVE["chat"] = {
+                "run_id": "next-run",
+                "provider_thread_id": "thread",
+                "provider_turn_id": "turn-next",
+            }
+            await agent_server.project_codex_notification({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread",
+                    "item": {
+                        "id": "compact-item",
+                        "type": "contextCompaction",
+                    },
+                },
+            })
+            self.assertNotIn(
+                "codex_compaction_in_progress",
+                agent_server.ACTIVE["chat"],
+            )
+            self.assertNotIn(
+                "codex_compaction_item_id",
+                agent_server.ACTIVE["chat"],
+            )
+            agent_server.ACTIVE.pop("chat")
+            await agent_server.project_codex_notification({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread",
+                    "turnId": "turn-compact",
+                    "item": {"type": "contextCompaction"},
+                },
+            })
+            await agent_server.project_codex_notification(completed_notification)
+            await agent_server.project_codex_notification({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread",
+                    "item": {
+                        "id": "compact-item",
+                        "type": "contextCompaction",
+                    },
+                },
+            })
+            await agent_server.project_codex_notification({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread",
+                    "turnId": "turn-compact",
+                    "item": {"type": "contextCompaction"},
+                },
+            })
+
+        lifecycle_keys = [
+            agent_server.timeline_index_codex_lifecycle_key(
+                {"type": event_type, **payload}
+            )
+            for event_type, payload in events
+            if event_type == "codex_compaction_completed"
+        ]
+        self.assertFalse(any(
+            event_type == "codex_compaction_started"
+            for event_type, _payload in events
+        ))
+        self.assertEqual(
+            lifecycle_keys,
+            ["codex:compaction:operation"],
+            "one provider compaction persisted under distinct lifecycle keys",
+        )
+
+    def test_native_compaction_terminal_aliases_never_use_thread_alone(self) -> None:
+        self.assertEqual(
+            agent_server.native_codex_compaction_terminal_aliases(
+                "thread",
+                None,
+                None,
+            ),
+            (),
+        )
 
     async def test_pending_stop_interrupts_when_compaction_turn_id_arrives(
         self,

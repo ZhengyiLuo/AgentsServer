@@ -58,9 +58,9 @@ class FakeClaudeManager:
                 query_session_id,
             )
         )
+        self.active_run_id = run_id
         if on_supervisor_ready is not None:
             await on_supervisor_ready(self.owner_token)  # type: ignore[operator]
-        self.active_run_id = run_id
         return self.handle
 
     async def evict(self, chat_id: str, *, force: bool = False) -> bool:
@@ -107,9 +107,9 @@ class SequencedClaudeManager(FakeClaudeManager):
                 query_session_id,
             )
         )
+        self.active_run_id = run_id
         if on_supervisor_ready is not None:
             await on_supervisor_ready(self.owner_token)  # type: ignore[operator]
-        self.active_run_id = run_id
         return self.handles.popleft()
 
 
@@ -149,11 +149,11 @@ class PermissionDuringStartManager(SequencedClaudeManager):
                 query_session_id,
             )
         )
+        self.active_run_id = run_id
         if on_supervisor_ready is not None:
             await on_supervisor_ready(self.owner_token)  # type: ignore[operator]
         # A real supervisor sets _active_run immediately before client.query;
         # can_use_tool can then fire while query/start_run is still awaiting.
-        self.active_run_id = run_id
         if call_number in self.permission_on_calls:
             callback = (
                 options.get("can_use_tool")
@@ -199,9 +199,9 @@ class BlockingCandidateStartManager(SequencedClaudeManager):
                 query_session_id,
             )
         )
+        self.active_run_id = run_id
         if on_supervisor_ready is not None:
             await on_supervisor_ready(self.owner_token)  # type: ignore[operator]
-        self.active_run_id = run_id
         if call_number == 2:
             self.candidate_query_started.set()
             await asyncio.Event().wait()
@@ -1929,6 +1929,168 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(result, FakePermissionResultDeny)
         self.assertTrue(getattr(result, "interrupt", False))
         self.assertFalse(agent_server.CLAUDE_PENDING_INTERACTIONS)
+
+    async def test_delete_force_retires_sdk_when_interrupt_has_no_terminal_result(self) -> None:
+        handle = FakeClaudeRun()
+        manager = FakeClaudeManager(handle)
+        manager.active_run_id = "run-claude"
+        agent_server.CLAUDE_SDK_MANAGER = manager
+        agent_server.ACTIVE = {
+            "chat-claude": {
+                "run_id": "run-claude",
+                "backend": agent_server.BACKEND_CLAUDE,
+                "transport": agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+                "claude_sdk_run": handle,
+                "interactive_agent_sdk": True,
+                "stop_requested": False,
+                "claude_sdk_owner_token": manager.owner_token,
+                "claude_permission_run_id": "run-claude",
+                "claude_permissions_open": True,
+            }
+        }
+        turn_task = asyncio.create_task(wait_forever())
+        agent_server.register_session_task(
+            agent_server.SESSION_TURN_TASKS,
+            "chat-claude",
+            turn_task,
+        )
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary)
+            (state_dir / "sessions" / "chat-claude").mkdir(parents=True)
+            with patch.object(
+                agent_server,
+                "STATE_DIR",
+                state_dir,
+            ), patch.object(
+                agent_server,
+                "SESSIONS_FILE",
+                state_dir / "sessions.json",
+            ), patch.object(
+                agent_server,
+                "ensure_dirs",
+            ), patch.object(
+                agent_server,
+                "CODEX_SESSION_CLEANUP_TIMEOUT_SECONDS",
+                0.01,
+            ), patch.object(
+                agent_server,
+                "wait_for_session_tasks",
+                AsyncMock(side_effect=[True, True, False, True]),
+            ), patch.object(
+                agent_server.JOBS,
+                "delete_for_session",
+                AsyncMock(return_value=0),
+            ), patch.object(
+                agent_server,
+                "kill_terminal_session",
+            ):
+                try:
+                    result = await asyncio.wait_for(
+                        agent_server.delete_session("chat-claude"),
+                        0.5,
+                    )
+                finally:
+                    agent_server.DELETED_SESSION_TOMBSTONES.discard(
+                        "chat-claude"
+                    )
+
+        self.assertTrue(result["deleted"])
+        self.assertGreaterEqual(handle.interrupt_calls, 1)
+        self.assertIn(("chat-claude", True), manager.evict_calls)
+        self.assertTrue(turn_task.cancelled() or turn_task.done())
+
+    async def test_delete_bounds_cancellation_hostile_run_now_then_retries(self) -> None:
+        cancellation_observed = asyncio.Event()
+        release = asyncio.Event()
+
+        async def cancellation_hostile_run_now() -> dict[str, object]:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # Model a Force Send handoff that must finish provider-side
+                # cleanup after receiving its first local cancellation.
+                cancellation_observed.set()
+                await release.wait()
+            return {"ok": True}
+
+        run_now_task = asyncio.create_task(cancellation_hostile_run_now())
+        run_now_requests = {
+            "chat-claude": ("queued-steer", run_now_task),
+        }
+
+        import tempfile
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                state_dir = Path(temporary)
+                (state_dir / "sessions" / "chat-claude").mkdir(parents=True)
+                with patch.object(
+                    agent_server,
+                    "STATE_DIR",
+                    state_dir,
+                ), patch.object(
+                    agent_server,
+                    "SESSIONS_FILE",
+                    state_dir / "sessions.json",
+                ), patch.object(
+                    agent_server,
+                    "ensure_dirs",
+                ), patch.object(
+                    agent_server,
+                    "CODEX_SESSION_CLEANUP_TIMEOUT_SECONDS",
+                    0.01,
+                ), patch.object(
+                    agent_server,
+                    "RUN_NOW_REQUESTS",
+                    run_now_requests,
+                ), patch.object(
+                    agent_server,
+                    "CODEX_APP_SERVER_MANAGER",
+                    None,
+                ), patch.object(
+                    agent_server.JOBS,
+                    "delete_for_session",
+                    AsyncMock(return_value=0),
+                ), patch.object(
+                    agent_server,
+                    "kill_terminal_session",
+                ):
+                    with self.assertRaises(agent_server.HTTPException) as raised:
+                        await asyncio.wait_for(
+                            agent_server.delete_session("chat-claude"),
+                            0.5,
+                        )
+
+                    self.assertEqual(raised.exception.status_code, 409)
+                    self.assertIn("Force Send cleanup", str(raised.exception.detail))
+                    await asyncio.wait_for(cancellation_observed.wait(), 0.5)
+                    self.assertFalse(run_now_task.done())
+                    self.assertIn("chat-claude", agent_server.STORE.sessions)
+                    self.assertNotIn(
+                        "chat-claude",
+                        agent_server.DELETING_SESSIONS,
+                    )
+
+                    release.set()
+                    self.assertEqual(
+                        await asyncio.wait_for(run_now_task, 0.5),
+                        {"ok": True},
+                    )
+                    result = await asyncio.wait_for(
+                        agent_server.delete_session("chat-claude"),
+                        0.5,
+                    )
+
+                    self.assertTrue(result["deleted"])
+                    self.assertNotIn("chat-claude", run_now_requests)
+                    self.assertNotIn("chat-claude", agent_server.STORE.sessions)
+        finally:
+            release.set()
+            if not run_now_task.done():
+                run_now_task.cancel()
+            await asyncio.gather(run_now_task, return_exceptions=True)
+            agent_server.DELETED_SESSION_TOMBSTONES.discard("chat-claude")
 
     async def test_late_approval_response_is_rejected_after_delete_reservation(self) -> None:
         agent_server.DELETING_SESSIONS.add("chat-claude")

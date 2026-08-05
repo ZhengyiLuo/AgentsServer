@@ -27919,19 +27919,32 @@ async def delete_session(session_id: str) -> dict[str, Any]:
                         await native_turn.interrupt()
                 elif (
                     active.get("transport") == CLAUDE_TRANSPORT_AGENT_SDK
-                    and active.get("claude_sdk_run") is not None
                 ):
-                    try:
-                        await interrupt_claude_sdk_run_bounded(
-                            active["claude_sdk_run"],
-                        )
-                    except Exception:
-                        # A hung/failed interrupt must not wedge deletion.
-                        # Force-retire only this chat; the task-drain check
-                        # below remains the fail-closed deletion barrier.
-                        await evict_claude_sdk_chat(
-                            session_id,
-                            force=True,
+                    claude_sdk_run = active.get("claude_sdk_run")
+                    if claude_sdk_run is not None:
+                        try:
+                            await interrupt_claude_sdk_run_bounded(
+                                claude_sdk_run,
+                            )
+                        except Exception:
+                            # Deletion retires the chat below regardless; an
+                            # interrupt failure only changes how it gets there.
+                            pass
+                    # Delete is terminal, unlike Stop. Retire this one chat's
+                    # SDK process immediately even when interrupt returned an
+                    # acknowledgement: the provider stream is not required to
+                    # emit a terminal Result after that acknowledgement.
+                    if not await evict_claude_sdk_chat(
+                        session_id,
+                        force=True,
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "The Claude chat process is still shutting "
+                                "down; the session was not deleted. Retry "
+                                "shortly."
+                            ),
                         )
                 elif proc:
                     await terminate_process_tree(proc)
@@ -27940,6 +27953,49 @@ async def delete_session(session_id: str) -> dict[str, Any]:
                 SESSION_TURN_TASKS,
                 session_id,
             )
+            if not turns_finished:
+                async with ACTIVE_LOCK:
+                    unsettled_active = ACTIVE.get(session_id)
+                if (
+                    unsettled_active
+                    and unsettled_active.get("transport")
+                    == CLAUDE_TRANSPORT_AGENT_SDK
+                ):
+                    # An SDK interrupt acknowledgement does not guarantee the
+                    # message stream will emit a terminal Result. Deletion is
+                    # terminal, so retire this chat's process and cancel its
+                    # local consumer before deciding cleanup is stuck.
+                    claude_evicted = await evict_claude_sdk_chat(
+                        session_id,
+                        force=True,
+                    )
+                    if claude_evicted:
+                        current_task = asyncio.current_task()
+                        unsettled_tasks = {
+                            task
+                            for task in tuple(
+                                SESSION_TURN_TASKS.get(session_id) or ()
+                            )
+                            if (
+                                task is not current_task
+                                and not task.done()
+                            )
+                        }
+                        for task in unsettled_tasks:
+                            task.cancel()
+                        if unsettled_tasks:
+                            await asyncio.wait(
+                                unsettled_tasks,
+                                timeout=max(
+                                    0.01,
+                                    CODEX_SESSION_CLEANUP_TIMEOUT_SECONDS,
+                                ),
+                            )
+                        turns_finished = await wait_for_session_tasks(
+                            SESSION_TURN_TASKS,
+                            session_id,
+                            timeout=0.01,
+                        )
             if not turns_finished:
                 raise HTTPException(
                     status_code=409,
@@ -27959,10 +28015,21 @@ async def delete_session(session_id: str) -> dict[str, Any]:
                 )
                 if pending_run_now:
                     run_now_task.cancel()
-                    await asyncio.gather(
-                        run_now_task,
-                        return_exceptions=True,
+                    _done, still_pending_run_now = await asyncio.wait(
+                        {run_now_task},
+                        timeout=max(
+                            0.01,
+                            CODEX_SESSION_CLEANUP_TIMEOUT_SECONDS,
+                        ),
                     )
+                    if still_pending_run_now:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "Force Send cleanup is still finishing; "
+                                "the session was not deleted. Retry shortly."
+                            ),
+                        )
             async with RUN_NOW_REQUEST_LOCK:
                 current_run_now = RUN_NOW_REQUESTS.get(session_id)
                 if (

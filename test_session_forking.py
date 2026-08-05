@@ -372,6 +372,202 @@ class ForkHistoryCloneTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
+    def test_validated_claude_fork_identity_drives_sdk_and_print_fork_flags(
+        self,
+    ) -> None:
+        parent_id = "claude-parent-resumable"
+        provider_id = "claude-provider-resumable"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cwd = root / "workspace"
+            cwd.mkdir()
+            projects_root = root / "claude-projects"
+            parent = {
+                "id": parent_id,
+                "title": "Claude parent",
+                "cwd": str(cwd),
+                "backend": agent_server.BACKEND_CLAUDE,
+                "session_id": provider_id,
+                "claude_session_id": provider_id,
+                "claude_session_cwd": str(cwd),
+            }
+            with patch.object(
+                agent_server,
+                "CLAUDE_PROJECTS_ROOT",
+                projects_root,
+            ):
+                transcript = agent_server.claude_resume_file_for_cwd(
+                    provider_id,
+                    str(cwd),
+                )
+                transcript.parent.mkdir(parents=True)
+                transcript.write_text("{}\n")
+                resolved = agent_server.validated_claude_fork_provider_id(
+                    parent,
+                    parent_id,
+                    str(cwd),
+                )
+                child = {
+                    **parent,
+                    "id": "claude-child",
+                    "session_id": None,
+                    "claude_session_id": None,
+                    "fork_from": resolved,
+                }
+                print_cmd = agent_server.build_claude_cmd(
+                    child["id"],
+                    child,
+                    root / "manifest.json",
+                    provider_id=agent_server.resolve_claude_resume_provider(
+                        child,
+                        str(cwd),
+                    )[0],
+                )
+                captured_options: dict[str, object] = {}
+
+                def capture_options(**kwargs: object) -> dict[str, object]:
+                    captured_options.update(kwargs)
+                    return kwargs
+
+                with patch.object(
+                    agent_server,
+                    "claude_sdk_cli_path",
+                    return_value="/usr/bin/claude",
+                ), patch.object(
+                    agent_server,
+                    "create_claude_agent_options",
+                    side_effect=capture_options,
+                ):
+                    agent_server.build_claude_sdk_options(
+                        child["id"],
+                        child,
+                        str(cwd),
+                        root / "manifest.json",
+                    )
+
+        self.assertEqual(resolved, provider_id)
+        self.assertEqual(
+            print_cmd[print_cmd.index("--resume") + 1],
+            provider_id,
+        )
+        self.assertIn("--fork-session", print_cmd)
+        self.assertEqual(captured_options["resume"], provider_id)
+        self.assertIs(captured_options["fork_session"], True)
+
+    async def test_claude_fork_missing_transcript_is_rejected_before_child_creation(
+        self,
+    ) -> None:
+        parent_id = "claude-parent-missing-transcript"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cwd = root / "workspace"
+            cwd.mkdir()
+            projects_root = root / "claude-projects"
+            projects_root.mkdir()
+            parent = {
+                "id": parent_id,
+                "title": "Claude parent",
+                "cwd": str(cwd),
+                "backend": agent_server.BACKEND_CLAUDE,
+                "session_id": "claude-provider-missing",
+                "claude_session_id": "claude-provider-missing",
+                "claude_session_cwd": str(cwd),
+            }
+            create = AsyncMock()
+            with patch.object(
+                agent_server.STORE,
+                "sessions",
+                {parent_id: parent},
+            ), patch.object(
+                agent_server.STORE,
+                "create",
+                create,
+            ), patch.object(
+                agent_server,
+                "CLAUDE_PROJECTS_ROOT",
+                projects_root,
+            ):
+                with self.assertRaises(agent_server.HTTPException) as raised:
+                    await agent_server._fork_session_locked(
+                        parent_id,
+                        agent_server.ForkSessionRequest(),
+                    )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("no local transcript", str(raised.exception.detail))
+        create.assert_not_awaited()
+
+    async def test_claude_fork_cwd_mismatch_is_rejected_before_child_creation(
+        self,
+    ) -> None:
+        parent_id = "claude-parent-cwd-mismatch"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            current_cwd = root / "current-workspace"
+            current_cwd.mkdir()
+            parent = {
+                "id": parent_id,
+                "title": "Claude parent",
+                "cwd": str(current_cwd),
+                "backend": agent_server.BACKEND_CLAUDE,
+                "session_id": "claude-provider-old-cwd",
+                "claude_session_id": "claude-provider-old-cwd",
+                "claude_session_cwd": str(root / "old-workspace"),
+            }
+            create = AsyncMock()
+            with patch.object(
+                agent_server.STORE,
+                "sessions",
+                {parent_id: parent},
+            ), patch.object(
+                agent_server.STORE,
+                "create",
+                create,
+            ):
+                with self.assertRaises(agent_server.HTTPException) as raised:
+                    await agent_server._fork_session_locked(
+                        parent_id,
+                        agent_server.ForkSessionRequest(),
+                    )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("original working directory", str(raised.exception.detail))
+        self.assertIn("old-workspace", str(raised.exception.detail))
+        create.assert_not_awaited()
+
+    async def test_providerless_claude_fork_with_history_is_rejected(self) -> None:
+        parent_id = "claude-parent-without-provider"
+        parent = {
+            "id": parent_id,
+            "title": "Claude parent",
+            "cwd": "/tmp",
+            "backend": agent_server.BACKEND_CLAUDE,
+        }
+        create = AsyncMock()
+        events = [{"type": "turn_started", "prompt": "Existing question"}]
+        with patch.object(
+            agent_server.STORE,
+            "sessions",
+            {parent_id: parent},
+        ), patch.object(
+            agent_server.STORE,
+            "create",
+            create,
+        ), patch.object(
+            agent_server,
+            "iter_session_events",
+            return_value=iter(events),
+        ):
+            with self.assertRaises(agent_server.HTTPException) as raised:
+                await agent_server._fork_session_locked(
+                    parent_id,
+                    agent_server.ForkSessionRequest(),
+                )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("no resumable provider session", str(raised.exception.detail))
+        create.assert_not_awaited()
+
     async def test_cwd_update_waits_for_fork_lifecycle_snapshot(self) -> None:
         session_id = "fork-update-serialization"
         parent = {

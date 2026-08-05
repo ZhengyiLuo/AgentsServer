@@ -24,12 +24,23 @@ class InstallerContractTests(unittest.TestCase):
     def test_runtime_includes_and_verifies_websocket_support(self):
         project = tomllib.loads((ROOT / "pyproject.toml").read_text())
         dependencies = project["project"]["dependencies"]
+        self.assertIn("claude-agent-sdk==0.2.130", dependencies)
+        self.assertEqual(
+            project["tool"]["uv"]["no-binary-package"],
+            ["claude-agent-sdk"],
+        )
         self.assertTrue(any(item.startswith("websockets") for item in dependencies))
         self.assertTrue(any(item.startswith("croniter") for item in dependencies))
         self.assertTrue(any(item.startswith("python-dateutil") for item in dependencies))
         self.assertTrue(any(item.startswith("tzdata") for item in dependencies))
         self.assertIn("-c 'import websockets'", INSTALLER.read_text())
+        self.assertIn("import claude_agent_sdk", INSTALLER.read_text())
         self.assertIn("import croniter, dateutil", INSTALLER.read_text())
+        self.assertIn('version("claude-agent-sdk")', INSTALLER.read_text())
+        self.assertIn(
+            'raise SystemExit(0 if sdk_version == "0.2.130"',
+            INSTALLER.read_text(),
+        )
 
     def test_shell_syntax_is_valid(self):
         for script in (INSTALLER, UNINSTALLER, DEPLOYER):
@@ -46,22 +57,30 @@ class InstallerContractTests(unittest.TestCase):
         source = DEPLOYER.read_text()
         self.assertIn('"$SCRIPT_DIR/agentsdock_jobs.py"', source)
         self.assertIn('"$SCRIPT_DIR/agentsdock_publish.py"', source)
+        self.assertIn('"$SCRIPT_DIR/claude_sdk_client.py"', source)
         self.assertIn('"$SCRIPT_DIR/codex_app_server.py"', source)
-        self.assertIn("import croniter, cryptography, dateutil, tzdata", source)
+        self.assertIn("import claude_agent_sdk, croniter, cryptography, dateutil, tzdata", source)
+        self.assertIn(r'version(\"claude-agent-sdk\")', source)
+        self.assertIn(r'raise SystemExit(0 if sdk_version == \"0.2.130\"', source)
+        self.assertIn("'claude-agent-sdk==0.2.130'", source)
+        self.assertIn("--no-binary claude-agent-sdk", source)
         self.assertIn("python-dateutil>=2.9,<3", source)
+        self.assertIn("'$REMOTE_SERVER_DIR/claude_sdk_client.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/codex_app_server.py'", source)
 
     def test_installer_and_release_archive_include_runtime_tools_and_uninstaller(self):
         installer_source = INSTALLER.read_text()
         packager_source = PACKAGER.read_text()
         self.assertIn(
-            "RELEASE_FILES=(agent_server.py agentsdock_jobs.py agentsdock_publish.py codex_app_server.py",
+            "RELEASE_FILES=(agent_server.py agentsdock_jobs.py agentsdock_publish.py claude_sdk_client.py codex_app_server.py",
             installer_source,
         )
         self.assertIn('"$STAGE_DIR/agentsdock_publish.py"', installer_source)
+        self.assertIn('"$STAGE_DIR/claude_sdk_client.py"', installer_source)
         self.assertIn('"$STAGE_DIR/codex_app_server.py"', installer_source)
         self.assertIn('"$STAGE_DIR/uninstall.sh"', installer_source)
         self.assertIn('"agentsdock_publish.py"', packager_source)
+        self.assertIn('"claude_sdk_client.py"', packager_source)
         self.assertIn('"codex_app_server.py"', packager_source)
         self.assertIn('"uninstall.sh"', packager_source)
 
@@ -93,6 +112,10 @@ class InstallerContractTests(unittest.TestCase):
             )
             self.assertIn(
                 f"agents-server-{version}/codex_app_server.py",
+                members,
+            )
+            self.assertIn(
+                f"agents-server-{version}/claude_sdk_client.py",
                 members,
             )
             self.assertIn(f"agents-server-{version}/uninstall.sh", members)

@@ -3,6 +3,7 @@ name = "agents-server-runtime"
 version = "0.1.6"
 requires-python = ">=3.10"
 dependencies = [
+  "claude-agent-sdk==0.2.130",
   "croniter>=6,<7",
   "cryptography>=44,<47",
   "fastapi>=0.115,<1",
@@ -16,3 +17,4 @@ dependencies = [
 
 [tool.uv]
 package = false
+no-binary-package = ["claude-agent-sdk"]

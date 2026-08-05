@@ -14,6 +14,7 @@ RUNTIME_FILES=(
   "$SCRIPT_DIR/agent_server.py"
   "$SCRIPT_DIR/agentsdock_jobs.py"
   "$SCRIPT_DIR/agentsdock_publish.py"
+  "$SCRIPT_DIR/claude_sdk_client.py"
   "$SCRIPT_DIR/codex_app_server.py"
   "$SCRIPT_DIR/update_runner.py"
   "$SCRIPT_DIR/release-public-key.pem"
@@ -41,19 +42,22 @@ scp "${RUNTIME_FILES[@]}" "$REMOTE_HOST:$REMOTE_SERVER_DIR/"
 
 echo "Checking server runtime dependencies"
 ssh "$REMOTE_HOST" "
-  if ! '$REMOTE_PYTHON' -c 'import croniter, cryptography, dateutil, tzdata' >/dev/null 2>&1; then
+  if ! '$REMOTE_PYTHON' -c 'from importlib.metadata import version; import claude_agent_sdk, croniter, cryptography, dateutil, tzdata; sdk_version = version(\"claude-agent-sdk\"); raise SystemExit(0 if sdk_version == \"0.2.130\" else f\"expected claude-agent-sdk 0.2.130, got {sdk_version}\")' >/dev/null 2>&1; then
     if [[ -x \"\$HOME/.local/bin/uv\" ]]; then
       \"\$HOME/.local/bin/uv\" pip install --python '$REMOTE_PYTHON' \
-        'croniter>=6,<7' 'cryptography>=44,<47' 'python-dateutil>=2.9,<3' 'tzdata>=2025.2'
+        --no-binary claude-agent-sdk \
+        'claude-agent-sdk==0.2.130' 'croniter>=6,<7' 'cryptography>=44,<47' 'python-dateutil>=2.9,<3' 'tzdata>=2025.2'
     else
       '$REMOTE_PYTHON' -m pip install \
-        'croniter>=6,<7' 'cryptography>=44,<47' 'python-dateutil>=2.9,<3' 'tzdata>=2025.2'
+        --no-binary claude-agent-sdk \
+        'claude-agent-sdk==0.2.130' 'croniter>=6,<7' 'cryptography>=44,<47' 'python-dateutil>=2.9,<3' 'tzdata>=2025.2'
     fi
   fi
+  '$REMOTE_PYTHON' -c 'from importlib.metadata import version; import claude_agent_sdk; sdk_version = version(\"claude-agent-sdk\"); raise SystemExit(0 if sdk_version == \"0.2.130\" else f\"expected claude-agent-sdk 0.2.130, got {sdk_version}\")'
 "
 
 echo "Compiling server on $REMOTE_HOST"
-ssh "$REMOTE_HOST" "chmod 755 '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/agentsdock_publish.py' && '$REMOTE_PYTHON' -m py_compile '$REMOTE_SERVER_PATH' '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/agentsdock_publish.py' '$REMOTE_SERVER_DIR/codex_app_server.py' '$REMOTE_SERVER_DIR/update_runner.py'"
+ssh "$REMOTE_HOST" "chmod 755 '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/agentsdock_publish.py' && '$REMOTE_PYTHON' -m py_compile '$REMOTE_SERVER_PATH' '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/agentsdock_publish.py' '$REMOTE_SERVER_DIR/claude_sdk_client.py' '$REMOTE_SERVER_DIR/codex_app_server.py' '$REMOTE_SERVER_DIR/update_runner.py'"
 
 echo "Restarting $SERVICE_NAME"
 ssh "$REMOTE_HOST" "systemctl --user restart '$SERVICE_NAME'"

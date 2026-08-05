@@ -19,6 +19,7 @@ import glob
 import hashlib
 import hmac
 import ipaddress
+import importlib.util
 import inspect
 import json
 import logging
@@ -68,6 +69,12 @@ from codex_app_server import (
     CodexAppServerRequestError,
     CodexAppServerSubscriptionClosed,
     decline_server_request,
+)
+from claude_sdk_client import (
+    ClaudeSDKQueryError,
+    ClaudeSDKSupervisorManager,
+    ClaudeSDKUnavailable,
+    create_claude_agent_options,
 )
 from update_runner import atomic_json as atomic_update_json
 from update_runner import ReleaseUnavailableError, check_release, utc_now as update_utc_now, version_key
@@ -257,6 +264,10 @@ CODEX_TRANSPORT_AUTO = "auto"
 CODEX_TRANSPORT_APP_SERVER = "app-server"
 CODEX_TRANSPORT_EXEC = "exec"
 CODEX_INTERACTIVE_CLIENT_CAPABILITY = "codex_interactive_v1"
+CLAUDE_TRANSPORT_AUTO = "auto"
+CLAUDE_TRANSPORT_AGENT_SDK = "agent-sdk"
+CLAUDE_TRANSPORT_PRINT = "print"
+CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY = "claude_sdk_interactive_v1"
 CODEX_APPROVAL_POLICIES = {"never", "on-request", "untrusted"}
 CODEX_SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
 CODEX_APPROVAL_REVIEWERS = {"user", "auto_review", "guardian_subagent"}
@@ -293,6 +304,24 @@ CODEX_INTERACTION_METHODS = {
 CODEX_TRANSPORT = agentsdock_setting("CODEX_TRANSPORT", CODEX_TRANSPORT_AUTO).strip().lower()
 if CODEX_TRANSPORT not in {CODEX_TRANSPORT_AUTO, CODEX_TRANSPORT_APP_SERVER, CODEX_TRANSPORT_EXEC}:
     CODEX_TRANSPORT = CODEX_TRANSPORT_AUTO
+CLAUDE_TRANSPORT = agentsdock_setting(
+    "CLAUDE_TRANSPORT",
+    CLAUDE_TRANSPORT_AUTO,
+).strip().lower()
+if CLAUDE_TRANSPORT not in {
+    CLAUDE_TRANSPORT_AUTO,
+    CLAUDE_TRANSPORT_AGENT_SDK,
+    CLAUDE_TRANSPORT_PRINT,
+}:
+    CLAUDE_TRANSPORT = CLAUDE_TRANSPORT_AUTO
+CLAUDE_SDK_MAX_LOADED_CHATS = max(
+    1,
+    int(agentsdock_setting("CLAUDE_SDK_MAX_LOADED_CHATS", "4")),
+)
+CLAUDE_SDK_IDLE_TTL_SECONDS = max(
+    30,
+    int(agentsdock_setting("CLAUDE_SDK_IDLE_TTL_SECONDS", "300")),
+)
 CODEX_APP_SERVER_MAX_LOADED_THREADS = max(
     1,
     int(agentsdock_setting("CODEX_APP_SERVER_MAX_LOADED_THREADS", "12")),
@@ -464,7 +493,7 @@ You are operating through AgentsDock, backed by AgentsServer.
 - Keep the final answer concise; the UI renders tool calls, command output, reasoning, and artifacts separately.
 - Render inline math as `$...$` and display math as `$$...$$`.
 - Continue through ordinary inspection errors when a safe retry or narrow fix is available.
-- Your Claude process ends with this turn; join child tasks before finishing and create durable automation only when explicitly asked.
+- Before finishing, join child tasks you started; create durable automation only when explicitly asked.
 - This is AgentsDock, not Slack; create files locally and never call Slack file helpers.
 - Link editor-readable files with Markdown paths relative to the chat working directory, optionally with `#L42`; do not use `file://`.
 - Publish user-facing files with `"$AGENTSDOCK_PUBLISH_CLI" --chat-id "$AGENTSDOCK_CHAT_ID" /absolute/path.ext`; metadata: `--entry-json '{{"path":"/absolute/video.mp4","title":"Demo","text":"Optional note"}}'`. Say “attached” only after a successful JSON receipt. Older-server fallback: resolve `$AGENTSDOCK_MANIFEST_PATH`, write `{{"files":["/absolute/path.ext"]}}` there (not to a literal `$...` path), and say only “submitted for attachment.” Use absolute paths and playable `.mp4`/`.mov` videos.
@@ -3329,6 +3358,10 @@ class CodexInteractionResponseRequest(BaseModel):
     response: dict[str, Any]
 
 
+class ClaudeInteractionResponseRequest(BaseModel):
+    response: dict[str, Any]
+
+
 class CodexGoalRequest(BaseModel):
     objective: str | None = Field(default=None, max_length=MAX_CODEX_GOAL_CHARS)
     status: Literal[
@@ -3579,6 +3612,16 @@ class SessionStore:
             if normalized_effort != previous_effort:
                 sess["effort"] = normalized_effort
                 runtime_changed = True
+            if backend == BACKEND_CLAUDE:
+                # SDK supervisors and their approval waiters are process-owned.
+                # Never revive a stale action badge after AgentsServer restarts.
+                for key, value in (
+                    ("claude_pending_interaction_count", 0),
+                    ("claude_needs_user_action", False),
+                ):
+                    if sess.get(key) != value:
+                        sess[key] = value
+                        runtime_changed = True
             if backend == BACKEND_CODEX:
                 provider_id = str(
                     sess.get("codex_thread_id") or sess.get("session_id") or ""
@@ -3717,6 +3760,8 @@ class SessionStore:
                 req.codex_approvals_reviewer
                 or CODEX_DEFAULT_APPROVALS_REVIEWER
             ),
+            "claude_pending_interaction_count": 0,
+            "claude_needs_user_action": False,
             "parent_id": parent_id,
             "fork_from": None,
             "pinned": pinned,
@@ -4786,6 +4831,8 @@ RUN_NOW_COMPLETED_RESULTS: OrderedDict[
 RUN_METADATA: dict[str, dict[str, Any]] = {}
 CODEX_APP_SERVER_MANAGER: CodexAppServerManager | None = None
 CODEX_APP_SERVER_MANAGER_LOCK = asyncio.Lock()
+CLAUDE_SDK_MANAGER: ClaudeSDKSupervisorManager | None = None
+CLAUDE_SDK_MANAGER_LOCK = asyncio.Lock()
 CODEX_GOALS_CONFIG_LOCK = asyncio.Lock()
 CODEX_GOALS_RECONFIGURING = False
 CODEX_APP_SERVER_THREAD_LRU: OrderedDict[str, float] = OrderedDict()
@@ -4816,6 +4863,8 @@ CODEX_SUBAGENT_INDEX_LOCK = threading.RLock()
 CODEX_COMPACTION_TERMINAL_HISTORY_LIMIT = 128
 CODEX_PENDING_INTERACTIONS: dict[str, dict[str, Any]] = {}
 CODEX_PENDING_INTERACTIONS_LOCK = asyncio.Lock()
+CLAUDE_PENDING_INTERACTIONS: dict[str, dict[str, Any]] = {}
+CLAUDE_PENDING_INTERACTIONS_LOCK = asyncio.Lock()
 CODEX_APPROVAL_ITEM_CACHE: OrderedDict[
     tuple[str, str],
     dict[str, Any],
@@ -4825,6 +4874,7 @@ CODEX_INTERACTIVE_CONTROL_THREAD_COUNTS: dict[str, int] = {}
 CODEX_NATIVE_ACTION_TASKS: dict[tuple[str, str], asyncio.Task[Any]] = {}
 SESSION_TURN_TASKS: dict[str, set[asyncio.Task[Any]]] = {}
 CODEX_INTERACTION_HANDLER_TASKS: dict[str, set[asyncio.Task[Any]]] = {}
+CLAUDE_INTERACTION_HANDLER_TASKS: dict[str, set[asyncio.Task[Any]]] = {}
 SESSION_LIFECYCLE_LOCKS: dict[str, asyncio.Lock] = {}
 DELETING_SESSIONS: set[str] = set()
 DELETED_SESSION_TOMBSTONES: set[str] = set()
@@ -5986,10 +6036,54 @@ def queued_codex_runtime_matches_active(
     )
 
 
+def queued_claude_runtime_matches_active(
+    session_id: str,
+    selected: dict[str, Any],
+    active: dict[str, Any],
+) -> bool:
+    if CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY not in {
+        str(value)
+        for value in selected.get("client_capabilities") or []
+    }:
+        # Native SDK steering may immediately surface an approval/question.
+        # Never steer into a client that did not advertise those cards.
+        return False
+    session = dict(STORE.sessions.get(session_id) or {})
+    if selected.get("model") is not None:
+        session["model"] = selected.get("model")
+    if selected.get("effort") is not None:
+        session["effort"] = selected.get("effort")
+    try:
+        cwd = existing_cwd(str(session.get("cwd") or DEFAULT_CWD))
+        cli_path = claude_sdk_cli_path(agent_runner_env(session_id))
+        configuration_key = claude_sdk_configuration_key(
+            session,
+            cwd,
+            cli_path,
+            session_system_prompt(
+                session_id,
+                session,
+                codex_manifest_path(session_id),
+            ),
+        )
+    except Exception:
+        # A changed or currently invalid runtime must go through the ordinary
+        # queued-turn path, where setup can surface an actionable error. It
+        # must never reuse the active SDK process merely because model/effort
+        # happen to match.
+        return False
+    return configuration_key == str(active.get("configuration_key") or "")
+
+
 async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]:
     """Coalesce duplicate Force Send requests without replaying a steer."""
+    ensure_session_not_deleting(session_id)
     cached: dict[str, Any] | None = None
     async with RUN_NOW_REQUEST_LOCK:
+        # Delete reserves the tombstone before acquiring this same lock. A
+        # request that was waiting behind deletion must not register a new
+        # control task after deletion captured the previous owner.
+        ensure_session_not_deleting(session_id)
         now = time.monotonic()
         for key, outcome in list(RUN_NOW_COMPLETED_RESULTS.items()):
             if float(outcome.get("expires_at") or 0) <= now:
@@ -6184,14 +6278,29 @@ async def _run_queued_turn_now_once(
                     or DEFAULT_BACKEND
                 )
                 native_steer = bool(
-                    active_turn.get("transport") == CODEX_TRANSPORT_APP_SERVER
-                    and active_turn.get("provider_turn_ready")
+                    active_turn.get("provider_turn_ready")
                     and native_steer_queue is not None
-                    and selected_backend == BACKEND_CODEX
-                    and queued_codex_runtime_matches_active(
-                        session_id,
-                        selected,
-                        active_turn,
+                    and (
+                        (
+                            active_turn.get("transport")
+                            == CODEX_TRANSPORT_APP_SERVER
+                            and selected_backend == BACKEND_CODEX
+                            and queued_codex_runtime_matches_active(
+                                session_id,
+                                selected,
+                                active_turn,
+                            )
+                        )
+                        or (
+                            active_turn.get("transport")
+                            == CLAUDE_TRANSPORT_AGENT_SDK
+                            and selected_backend == BACKEND_CLAUDE
+                            and queued_claude_runtime_matches_active(
+                                session_id,
+                                selected,
+                                active_turn,
+                            )
+                        )
                     )
                 )
                 kept = deque(
@@ -6221,11 +6330,34 @@ async def _run_queued_turn_now_once(
         loop = asyncio.get_running_loop()
         future: asyncio.Future[dict[str, Any]] = loop.create_future()
         try:
-            await native_steer_queue.put({
+            request = {
                 "selected": selected,
                 "remaining": remaining,
                 "future": future,
-            })
+            }
+            # Commit delivery against the live ACTIVE record. The provider can
+            # become terminal after the initial eligibility snapshot; putting
+            # into that now-detached queue would strand this Future forever.
+            async with ACTIVE_LOCK:
+                current = ACTIVE.get(session_id)
+                if (
+                    not current
+                    or not current.get("provider_turn_ready")
+                    or current.get("native_steer_queue") is not native_steer_queue
+                    or str(current.get("run_id") or "")
+                    != str(active_turn.get("run_id") or "")
+                ):
+                    raise NativeSteerHandoffError(
+                        "The active provider turn finished before steering delivery",
+                        safe_to_requeue=True,
+                    )
+                try:
+                    native_steer_queue.put_nowait(request)
+                except asyncio.QueueFull as exc:
+                    raise NativeSteerHandoffError(
+                        "The active provider is already applying another steering message",
+                        safe_to_requeue=True,
+                    ) from exc
             result = await future
             result["remaining"] = remaining
             return result
@@ -8105,13 +8237,16 @@ def active_process_snapshot(session_id: str, active: dict[str, Any]) -> dict[str
     if pid and not pgid:
         pgid = process_group_for_pid(pid)
     if not pid:
-        if active.get("transport") == CODEX_TRANSPORT_APP_SERVER:
+        if active.get("transport") in {
+            CODEX_TRANSPORT_APP_SERVER,
+            CLAUDE_TRANSPORT_AGENT_SDK,
+        }:
             return {
                 "session_id": session_id,
                 "active": True,
                 "run_id": active.get("run_id"),
                 "backend": active.get("backend"),
-                "transport": CODEX_TRANSPORT_APP_SERVER,
+                "transport": active.get("transport"),
                 "pid": None,
                 "pgid": None,
                 "cwd": active.get("cwd"),
@@ -13955,6 +14090,54 @@ def resolve_claude_resume_provider(sess: dict[str, Any], cwd: str) -> tuple[str 
     return None, f"Claude resume skipped: provider session {provider_id} has no local transcript for cwd {cwd}."
 
 
+def claude_fork_has_conversation(session_id: str) -> bool:
+    """Return whether a provider-less Claude parent has context to preserve."""
+
+    for event in iter_session_events(session_id):
+        event_type = str(event.get("type") or "")
+        if event_type == "turn_started" and str(event.get("prompt") or "").strip():
+            return True
+        if event_type == "assistant_text" and str(event.get("text") or "").strip():
+            return True
+        if event_type == "turn_finished" and str(event.get("result_text") or "").strip():
+            return True
+    return False
+
+
+def validated_claude_fork_provider_id(
+    parent: dict[str, Any],
+    parent_session_id: str,
+    cwd: str,
+) -> str | None:
+    """Fail closed unless a non-empty Claude fork can inherit provider context."""
+
+    requested_provider_id = claude_provider_id_for_session(parent)
+    if not requested_provider_id:
+        if claude_fork_has_conversation(parent_session_id):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This Claude chat has conversation history but no resumable "
+                    "provider session, so it cannot be forked safely. Start a new "
+                    "chat or restore the original Claude session transcript first."
+                ),
+            )
+        return None
+
+    resolved_provider_id, resume_error = resolve_claude_resume_provider(parent, cwd)
+    if resolved_provider_id != requested_provider_id:
+        detail = str(resume_error or "the provider session could not be resolved").strip()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This Claude chat cannot be forked without losing its provider "
+                f"context. {detail} Restore the transcript or the chat's original "
+                "working directory, then retry."
+            ),
+        )
+    return requested_provider_id
+
+
 def find_codex_history(provider_id: str) -> Path | None:
     direct = path_if_jsonl(provider_id)
     if direct:
@@ -14894,6 +15077,7 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
             *detail_fields,
             "codex_thread_status",
             "codex_pending_interaction_count", "codex_needs_user_action",
+            "claude_pending_interaction_count", "claude_needs_user_action",
             "parent_id", "fork_from", "memory_forked", "memory_seed_used",
             "pinned", "pinned_at", "archived", "archived_at", "sort_order", "created_at", "updated_at",
             "latest_event_seq", "latest_event_at", "latest_event_type",
@@ -15817,6 +16001,464 @@ async def handle_codex_server_request(
             )
 
 
+def public_claude_interaction(pending: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": pending["id"],
+        "session_id": pending["session_id"],
+        "thread_id": pending.get("thread_id") or pending["session_id"],
+        "turn_id": pending.get("turn_id"),
+        "item_id": pending.get("item_id"),
+        "method": pending["method"],
+        "params": pending["params"],
+        "created_at": pending["created_at"],
+        "auto_resolution_ms": None,
+    }
+
+
+async def update_claude_pending_session_metadata(session_id: str) -> None:
+    async with CLAUDE_PENDING_INTERACTIONS_LOCK:
+        count = sum(
+            1
+            for pending in CLAUDE_PENDING_INTERACTIONS.values()
+            if pending.get("session_id") == session_id
+            and not pending.get("responded")
+        )
+    async with STORE._lock:
+        session = STORE.sessions.get(session_id)
+        if not session:
+            return
+        changed = (
+            int(session.get("claude_pending_interaction_count") or 0) != count
+            or bool(session.get("claude_needs_user_action")) != bool(count)
+        )
+        session["claude_pending_interaction_count"] = count
+        session["claude_needs_user_action"] = bool(count)
+        if changed:
+            session["updated_at"] = now_iso()
+            await STORE.save()
+
+
+def validate_claude_interaction_response(
+    pending: dict[str, Any],
+    response: dict[str, Any],
+) -> dict[str, Any]:
+    method = str(pending.get("method") or "")
+    params = pending.get("params") if isinstance(pending.get("params"), dict) else {}
+    if method == "item/tool/requestUserInput":
+        if set(response) != {"answers"} or not isinstance(response.get("answers"), dict):
+            raise HTTPException(status_code=400, detail="question response requires an answers map")
+        questions = {
+            str(question.get("id") or ""): question
+            for question in params.get("questions") or []
+            if isinstance(question, dict) and question.get("id")
+        }
+        answers: dict[str, dict[str, list[str]]] = {}
+        for question_id, answer in response["answers"].items():
+            question = questions.get(str(question_id))
+            if question is None:
+                raise HTTPException(status_code=400, detail=f"unknown question id: {question_id}")
+            values = answer.get("answers") if isinstance(answer, dict) else None
+            if (
+                not isinstance(values, list)
+                or len(values) > 20
+                or any(not isinstance(value, str) or len(value) > 8_000 for value in values)
+                or (not bool(question.get("multiSelect")) and len(values) > 1)
+            ):
+                raise HTTPException(status_code=400, detail=f"invalid answer for {question_id}")
+            answers[str(question_id)] = {"answers": list(values)}
+        return {"answers": answers}
+
+    if set(response) != {"decision"}:
+        raise HTTPException(status_code=400, detail="approval response requires only decision")
+    decision = str(response.get("decision") or "")
+    allowed = {"accept", "decline", "cancel"}
+    if pending.get("session_permission_suggestions"):
+        allowed.add("acceptForSession")
+    if decision not in allowed:
+        raise HTTPException(status_code=400, detail="invalid or unavailable approval decision")
+    return {"decision": decision}
+
+
+async def resolve_claude_interaction(
+    session_id: str,
+    interaction_id: str,
+    response: dict[str, Any],
+) -> dict[str, Any]:
+    async with CLAUDE_PENDING_INTERACTIONS_LOCK:
+        pending = CLAUDE_PENDING_INTERACTIONS.get(interaction_id)
+        if not pending or pending.get("session_id") != session_id:
+            raise HTTPException(status_code=404, detail="pending Claude interaction not found")
+        future = pending.get("future")
+        if (
+            pending.get("responded")
+            or not isinstance(future, asyncio.Future)
+            or future.done()
+        ):
+            raise HTTPException(status_code=409, detail="Claude interaction is already resolved")
+        validated = validate_claude_interaction_response(pending, response)
+        pending["responded"] = True
+        pending["resolution"] = "answered"
+        future.set_result(validated)
+        interaction = public_claude_interaction(pending)
+    return interaction
+
+
+async def cancel_claude_interactions(
+    session_id: str | None = None,
+    *,
+    resolution: str = "dismissed",
+) -> None:
+    affected: set[str] = set()
+    async with CLAUDE_PENDING_INTERACTIONS_LOCK:
+        for pending in CLAUDE_PENDING_INTERACTIONS.values():
+            if session_id is not None and pending.get("session_id") != session_id:
+                continue
+            future = pending.get("future")
+            if (
+                pending.get("responded")
+                or not isinstance(future, asyncio.Future)
+                or future.done()
+            ):
+                continue
+            pending["responded"] = True
+            pending["resolution"] = resolution
+            future.set_result({"decision": "cancel"})
+            affected.add(str(pending.get("session_id") or ""))
+    for affected_session_id in affected:
+        if affected_session_id:
+            with suppress(Exception):
+                await update_claude_pending_session_metadata(affected_session_id)
+
+
+def claude_permission_context_value(context: Any, name: str) -> Any:
+    if isinstance(context, dict):
+        return context.get(name)
+    return getattr(context, name, None)
+
+
+def claude_permission_update_public_value(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        raw = dict(value)
+    else:
+        converter = getattr(value, "to_dict", None)
+        if callable(converter):
+            with suppress(Exception):
+                raw = converter()
+                if isinstance(raw, dict):
+                    bounded = bounded_codex_interaction_value(raw)
+                    return bounded if isinstance(bounded, dict) else None
+        raw = {
+            key: getattr(value, key, None)
+            for key in (
+                "type", "behavior", "mode", "directories", "destination"
+            )
+            if getattr(value, key, None) is not None
+        }
+    bounded = bounded_codex_interaction_value(raw)
+    return bounded if isinstance(bounded, dict) else None
+
+
+def claude_interaction_method(tool_name: str) -> str:
+    if tool_name == "AskUserQuestion":
+        return "item/tool/requestUserInput"
+    if tool_name == "Bash":
+        return "item/commandExecution/requestApproval"
+    if tool_name in {"Write", "Edit", "MultiEdit", "NotebookEdit", "ApplyPatch"}:
+        return "item/fileChange/requestApproval"
+    return "item/tool/requestApproval"
+
+
+def claude_question_params(input_data: dict[str, Any]) -> dict[str, Any]:
+    questions: list[dict[str, Any]] = []
+    for index, raw_question in enumerate(input_data.get("questions") or []):
+        if not isinstance(raw_question, dict):
+            continue
+        question = bounded_codex_interaction_value(raw_question)
+        if not isinstance(question, dict):
+            continue
+        question["id"] = f"question_{index + 1}"
+        question["isOther"] = True
+        questions.append(question)
+    return {"questions": questions}
+
+
+async def handle_claude_tool_permission(
+    session_id: str,
+    tool_name: str,
+    input_data: dict[str, Any],
+    context: Any,
+    *,
+    owner_token: str = "",
+) -> Any:
+    """Bridge one Agent SDK permission callback to its opted-in desktop chat."""
+    from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
+
+    completion_event: asyncio.Event | None = None
+    completion_task: asyncio.Task[Any] | None = None
+    pending: dict[str, Any] | None = None
+    try:
+        async with session_lifecycle_lock(session_id):
+            async with ACTIVE_LOCK:
+                active = ACTIVE.get(session_id)
+                permission_run_id = str(
+                    (active or {}).get("claude_permission_run_id") or ""
+                )
+                manager = CLAUDE_SDK_MANAGER
+                ownership_valid = bool(
+                    active
+                    and owner_token
+                    and str(active.get("claude_sdk_owner_token") or "")
+                    == owner_token
+                    and permission_run_id
+                    and manager is not None
+                    and manager.owns_active_run(
+                        session_id,
+                        owner_token,
+                        permission_run_id,
+                    )
+                )
+                interactive = bool(
+                    active
+                    and active.get("backend") == BACKEND_CLAUDE
+                    and active.get("transport") == CLAUDE_TRANSPORT_AGENT_SDK
+                    and active.get("interactive_agent_sdk")
+                    and not active.get("stop_requested")
+                    and active.get("claude_permissions_open")
+                    and ownership_valid
+                )
+                run_id = permission_run_id
+            if (
+                not interactive
+                or session_id in DELETING_SESSIONS
+                or session_id in DELETED_SESSION_TOMBSTONES
+            ):
+                return PermissionResultDeny(
+                    message="AgentsDock could not safely route this permission request.",
+                )
+
+            method = claude_interaction_method(tool_name)
+            tool_use_id = str(
+                claude_permission_context_value(context, "tool_use_id") or ""
+            ) or None
+            suggestions = list(
+                claude_permission_context_value(context, "suggestions") or []
+            )
+            session_suggestions = [
+                suggestion
+                for suggestion in suggestions
+                if (
+                    getattr(suggestion, "destination", None)
+                    if not isinstance(suggestion, dict)
+                    else suggestion.get("destination")
+                ) == "session"
+            ]
+            if method == "item/tool/requestUserInput":
+                params = claude_question_params(input_data)
+            else:
+                bounded_input = bounded_codex_interaction_value(input_data)
+                approval_item = {
+                    "id": tool_use_id,
+                    "type": "toolCall",
+                    "name": tool_name,
+                    "input": bounded_input if isinstance(bounded_input, dict) else {},
+                }
+                params = {
+                    "toolName": tool_name,
+                    "toolInput": approval_item["input"],
+                    "approvalItem": approval_item,
+                    "availableDecisions": [
+                        "accept",
+                        *( ["acceptForSession"] if session_suggestions else [] ),
+                        "decline",
+                        "cancel",
+                    ],
+                }
+                if tool_name == "Bash" and isinstance(bounded_input, dict):
+                    params["command"] = str(bounded_input.get("command") or "")
+                if method == "item/fileChange/requestApproval" and isinstance(bounded_input, dict):
+                    params["changes"] = [bounded_input]
+                for source_name, target_name in (
+                    ("decision_reason", "reason"),
+                    ("blocked_path", "blockedPath"),
+                    ("title", "title"),
+                    ("display_name", "displayName"),
+                    ("description", "description"),
+                    ("agent_id", "agentId"),
+                ):
+                    value = claude_permission_context_value(context, source_name)
+                    if value not in (None, ""):
+                        params[target_name] = str(value)
+                public_suggestions = [
+                    value
+                    for suggestion in session_suggestions
+                    if (value := claude_permission_update_public_value(suggestion))
+                ]
+                if public_suggestions:
+                    params["permissionSuggestions"] = public_suggestions
+
+            loop = asyncio.get_running_loop()
+            future: asyncio.Future[dict[str, Any]] = loop.create_future()
+            interaction_id = f"claudereq_{uuid.uuid4().hex[:16]}"
+            candidate = {
+                "id": interaction_id,
+                "session_id": session_id,
+                "thread_id": str(
+                    session_provider_id(STORE.sessions.get(session_id) or {})
+                    or session_id
+                ),
+                "turn_id": run_id or None,
+                "item_id": tool_use_id,
+                "method": method,
+                "params": params,
+                "created_at": now_iso(),
+                "future": future,
+                "responded": False,
+                "resolution": "dismissed",
+                "original_input": dict(input_data),
+                "session_permission_suggestions": session_suggestions,
+            }
+            async with CLAUDE_PENDING_INTERACTIONS_LOCK:
+                if len(CLAUDE_PENDING_INTERACTIONS) < MAX_CODEX_PENDING_INTERACTIONS:
+                    CLAUDE_PENDING_INTERACTIONS[interaction_id] = candidate
+                    pending = candidate
+            if pending is not None:
+                # The SDK may invoke callbacks on a long-lived receiver task.
+                # Deletion must wait for this one interaction to settle, not
+                # for that persistent provider task to terminate.
+                completion_event = asyncio.Event()
+                completion_task = asyncio.create_task(
+                    completion_event.wait(),
+                    name=f"claude-interaction:{session_id}:{interaction_id}",
+                )
+                register_session_task(
+                    CLAUDE_INTERACTION_HANDLER_TASKS,
+                    session_id,
+                    completion_task,
+                )
+
+        if pending is None:
+            return PermissionResultDeny(
+                message="AgentsDock has too many pending permission requests.",
+            )
+
+        interaction_id = str(pending["id"])
+        await update_claude_pending_session_metadata(session_id)
+        await append_event(
+            session_id,
+            "claude_interaction_requested",
+            {"interaction": public_claude_interaction(pending)},
+        )
+        response = await asyncio.shield(pending["future"])
+        # The UI response can race Stop, Delete, a native steering handoff, or
+        # supervisor replacement after the card was rendered. Revalidate the
+        # exact owner/run immediately before returning an allow decision so a
+        # late click cannot authorize work on a fenced provider generation.
+        async with ACTIVE_LOCK:
+            active = ACTIVE.get(session_id)
+            manager = CLAUDE_SDK_MANAGER
+            still_owned = bool(
+                active
+                and not active.get("stop_requested")
+                and active.get("claude_permissions_open")
+                and str(active.get("claude_sdk_owner_token") or "")
+                == owner_token
+                and str(active.get("claude_permission_run_id") or "")
+                == run_id
+                and manager is not None
+                and manager.owns_active_run(
+                    session_id,
+                    owner_token,
+                    run_id,
+                )
+            )
+        if not still_owned:
+            return PermissionResultDeny(
+                message="This Claude turn is no longer active.",
+                interrupt=True,
+            )
+        if pending["method"] == "item/tool/requestUserInput":
+            if str(response.get("decision") or "") == "cancel":
+                return PermissionResultDeny(
+                    message="The user cancelled this question.",
+                    interrupt=True,
+                )
+            if not any(
+                isinstance(answer, dict) and bool(answer.get("answers"))
+                for answer in response.get("answers", {}).values()
+            ):
+                return PermissionResultDeny(
+                    message="The user skipped this question.",
+                    interrupt=False,
+                )
+            answers_by_text: dict[str, Any] = {}
+            by_id = {
+                str(question.get("id") or ""): question
+                for question in pending["params"].get("questions") or []
+                if isinstance(question, dict)
+            }
+            for question_id, answer in response.get("answers", {}).items():
+                question = by_id.get(str(question_id))
+                values = answer.get("answers") if isinstance(answer, dict) else []
+                if not question or not isinstance(values, list) or not values:
+                    continue
+                answers_by_text[str(question.get("question") or question_id)] = (
+                    values if bool(question.get("multiSelect")) else values[0]
+                )
+            updated_input = {
+                "questions": pending["original_input"].get("questions", []),
+                "answers": answers_by_text,
+            }
+            return PermissionResultAllow(updated_input=updated_input)
+
+        decision = str(response.get("decision") or "decline")
+        if decision in {"accept", "acceptForSession"}:
+            return PermissionResultAllow(
+                updated_input=pending["original_input"],
+                updated_permissions=(
+                    pending["session_permission_suggestions"]
+                    if decision == "acceptForSession"
+                    else None
+                ),
+            )
+        return PermissionResultDeny(
+            message=(
+                "The user cancelled this request."
+                if decision == "cancel"
+                else "The user denied this request."
+            ),
+            interrupt=decision == "cancel",
+        )
+    except asyncio.CancelledError:
+        raise
+    finally:
+        if pending is not None:
+            interaction_id = str(pending["id"])
+            async with CLAUDE_PENDING_INTERACTIONS_LOCK:
+                if CLAUDE_PENDING_INTERACTIONS.get(interaction_id) is pending:
+                    CLAUDE_PENDING_INTERACTIONS.pop(interaction_id, None)
+            with suppress(Exception):
+                await asyncio.shield(
+                    update_claude_pending_session_metadata(session_id)
+                )
+            with suppress(Exception):
+                await asyncio.shield(
+                    append_event(
+                        session_id,
+                        "claude_interaction_resolved",
+                        {
+                            "interaction_id": interaction_id,
+                            "request_method": pending["method"],
+                            "resolution": pending.get("resolution") or "dismissed",
+                        },
+                    )
+                )
+        if completion_event is not None:
+            completion_event.set()
+        if completion_task is not None:
+            with suppress(asyncio.CancelledError):
+                await asyncio.shield(completion_task)
+
+
 def codex_thread_status_message(status: dict[str, Any]) -> str:
     status_type = str(status.get("type") or "")
     if status_type == "active":
@@ -16508,6 +17150,131 @@ async def codex_app_server_manager() -> CodexAppServerManager:
             return manager
 
 
+async def claude_sdk_manager() -> ClaudeSDKSupervisorManager:
+    """Return the bounded registry of independent per-chat Claude clients."""
+
+    global CLAUDE_SDK_MANAGER
+    manager = CLAUDE_SDK_MANAGER
+    if manager is not None:
+        return manager
+    async with CLAUDE_SDK_MANAGER_LOCK:
+        manager = CLAUDE_SDK_MANAGER
+        if manager is None:
+            manager = ClaudeSDKSupervisorManager(
+                max_clients=CLAUDE_SDK_MAX_LOADED_CHATS,
+                idle_ttl_seconds=CLAUDE_SDK_IDLE_TTL_SECONDS,
+            )
+            CLAUDE_SDK_MANAGER = manager
+        return manager
+
+
+async def close_claude_sdk_manager() -> None:
+    """Resolve pending UI requests and stop every chat-owned Claude process."""
+
+    global CLAUDE_SDK_MANAGER
+    async with CLAUDE_SDK_MANAGER_LOCK:
+        manager = CLAUDE_SDK_MANAGER
+        # Invalidate ownership before resolving existing cards. A late SDK
+        # callback from a cancellation-hostile process must fail the manager
+        # ownership check instead of registering after this cancellation pass.
+        CLAUDE_SDK_MANAGER = None
+    await cancel_claude_interactions(resolution="server_closed")
+    interaction_tasks = [
+        task
+        for tasks in tuple(CLAUDE_INTERACTION_HANDLER_TASKS.values())
+        for task in tuple(tasks)
+        if not task.done()
+    ]
+    if interaction_tasks:
+        _done, pending = await asyncio.wait(
+            interaction_tasks,
+            timeout=max(0.01, CODEX_SESSION_CLEANUP_TIMEOUT_SECONDS),
+        )
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+    if manager is not None:
+        await manager.close_all()
+
+
+async def evict_claude_sdk_chat(
+    session_id: str,
+    *,
+    force: bool,
+    manager: ClaudeSDKSupervisorManager | None = None,
+) -> bool:
+    """Return when one chat is absent/closed, without touching other clients."""
+
+    selected_manager = manager or CLAUDE_SDK_MANAGER
+    if selected_manager is None:
+        return True
+    try:
+        await asyncio.wait_for(
+            selected_manager.evict(session_id, force=force),
+            timeout=STOP_CONFIRM_TIMEOUT_SECONDS,
+        )
+        # ``False`` means there was no supervisor, which is already the
+        # desired settled state.
+        return True
+    except asyncio.TimeoutError:
+        logger.error(
+            "Claude SDK chat eviction timed out session=%s force=%s",
+            session_id,
+            force,
+        )
+        return False
+    except Exception as exc:
+        logger.error(
+            "Claude SDK chat eviction failed session=%s force=%s: %s",
+            session_id,
+            force,
+            concise_error_message(exc),
+        )
+        return False
+
+
+async def interrupt_claude_sdk_run_bounded(
+    run: Any,
+    *,
+    timeout: float | None = None,
+) -> bool:
+    """Interrupt one SDK run without trusting third-party cancellation.
+
+    ``asyncio.wait_for`` can itself remain blocked when the awaited SDK call
+    suppresses cancellation. Use a detached, result-consuming task so Stop,
+    Delete, and Force Send retain a hard local bound; callers then retire the
+    owning chat supervisor when delivery state is no longer trustworthy.
+    """
+
+    limit = max(
+        0.01,
+        float(
+            STOP_CONFIRM_TIMEOUT_SECONDS
+            if timeout is None
+            else timeout
+        ),
+    )
+    task = asyncio.create_task(run.interrupt())
+
+    def consume_result(completed: asyncio.Task[Any]) -> None:
+        if not completed.cancelled():
+            with suppress(BaseException):
+                completed.exception()
+
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=limit)
+    except asyncio.CancelledError:
+        task.cancel()
+        task.add_done_callback(consume_result)
+        raise
+    if task not in done:
+        task.cancel()
+        task.add_done_callback(consume_result)
+        raise asyncio.TimeoutError("Claude SDK interrupt did not settle in time")
+    return bool(task.result())
+
+
 async def close_codex_app_server_manager() -> None:
     global CODEX_APP_SERVER_MANAGER
     await cancel_codex_interactions(resolution="server_closed")
@@ -16526,7 +17293,11 @@ async def close_codex_app_server_manager() -> None:
         await manager.close()
     shutdown_tasks = [
         task
-        for registry in (SESSION_TURN_TASKS, CODEX_INTERACTION_HANDLER_TASKS)
+        for registry in (
+            SESSION_TURN_TASKS,
+            CODEX_INTERACTION_HANDLER_TASKS,
+            CLAUDE_INTERACTION_HANDLER_TASKS,
+        )
         for tasks in tuple(registry.values())
         for task in tuple(tasks)
         if not task.done()
@@ -18672,6 +19443,116 @@ def build_claude_cmd(
     return cmd
 
 
+def claude_sdk_cli_path(env: dict[str, str]) -> str:
+    """Resolve the user's existing Claude CLI so SDK mode keeps its auth."""
+
+    configured = str(CLAUDE_BIN or "claude").strip() or "claude"
+    expanded = str(Path(configured).expanduser())
+    if os.path.sep in expanded:
+        if Path(expanded).is_file():
+            return expanded
+        raise ClaudeSDKUnavailable(
+            f"Claude CLI was not found at the configured path: {expanded}"
+        )
+    resolved = shutil.which(configured, path=env.get("PATH"))
+    if not resolved:
+        raise ClaudeSDKUnavailable(
+            "Claude CLI is not available in the AgentsServer runtime PATH"
+        )
+    return resolved
+
+
+def claude_sdk_configuration_key(
+    sess: dict[str, Any],
+    cwd: str,
+    cli_path: str,
+    system_prompt: str,
+) -> str:
+    """Hash only process configuration, not the evolving provider session ID."""
+
+    payload = {
+        "version": 1,
+        "cwd": cwd,
+        "cli_path": cli_path,
+        "model": str(sess.get("model") or ""),
+        "effort": str(sess.get("effort") or ""),
+        "system_prompt": system_prompt,
+        "permission_mode": "default",
+        "setting_sources": ["user", "project", "local"],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def build_claude_sdk_options(
+    session_id: str,
+    sess: dict[str, Any],
+    cwd: str,
+    manifest_path: Path,
+) -> tuple[Any, str, str]:
+    """Build one stable, chat-scoped SDK process configuration."""
+
+    env = agent_runner_env(session_id)
+    cli_path = claude_sdk_cli_path(env)
+    system_prompt = session_system_prompt(session_id, sess, manifest_path)
+    provider_id = resolve_claude_resume_provider(sess, cwd)[0]
+    permission_owner = {"token": ""}
+
+    async def can_use_tool(
+        tool_name: str,
+        input_data: dict[str, Any],
+        context: Any,
+    ) -> Any:
+        return await handle_claude_tool_permission(
+            session_id,
+            tool_name,
+            input_data,
+            context,
+            owner_token=permission_owner["token"],
+        )
+
+    def bind_permission_owner(ownership_token: str) -> None:
+        permission_owner["token"] = str(ownership_token)
+
+    setattr(can_use_tool, "_agentsdock_bind_owner", bind_permission_owner)
+
+    extra_args: dict[str, str | None] = {}
+    if provider_id and sess.get("fork_from"):
+        extra_args["name"] = f"Fork: {sess.get('title') or sess['id']}"
+    options = create_claude_agent_options(
+        system_prompt={
+            "type": "preset",
+            "preset": "claude_code",
+            "append": system_prompt,
+        },
+        permission_mode="default",
+        can_use_tool=can_use_tool,
+        disallowed_tools=["EnterPlanMode", "ExitPlanMode"],
+        model=str(sess.get("model") or "").strip() or None,
+        effort=str(sess.get("effort") or "").strip() or None,
+        cwd=cwd,
+        cli_path=cli_path,
+        env=env,
+        resume=provider_id,
+        fork_session=bool(provider_id and sess.get("fork_from")),
+        setting_sources=["user", "project", "local"],
+        include_partial_messages=False,
+        max_buffer_size=PROCESS_STREAM_LIMIT,
+        extra_args=extra_args,
+        stderr=lambda line: logger.warning(
+            "Claude SDK stderr session=%s: %s",
+            session_id,
+            compact_memory_text(line, 2_000),
+        ),
+    )
+    return (
+        options,
+        claude_sdk_configuration_key(sess, cwd, cli_path, system_prompt),
+        cli_path,
+    )
+
+
 def redacted_provider_argv(cmd: list[str], backend: str) -> list[str]:
     """Keep generated provider context and user prompts out of stored diagnostics."""
     redacted = list(cmd)
@@ -20485,7 +21366,7 @@ async def persist_run_provider_session(
     return True
 
 
-async def run_claude(
+async def run_claude_print(
     session_id: str,
     run_id: str,
     prompt: str,
@@ -20522,7 +21403,13 @@ async def run_claude(
             "message": resume_skip_message,
         })
     public_cmd = redacted_provider_argv(cmd, BACKEND_CLAUDE)
-    await append_event(session_id, "process_started", {"run_id": run_id, "backend": BACKEND_CLAUDE, "argv": public_cmd, "cwd": cwd})
+    await append_event(session_id, "process_started", {
+        "run_id": run_id,
+        "backend": BACKEND_CLAUDE,
+        "transport": CLAUDE_TRANSPORT_PRINT,
+        "argv": public_cmd,
+        "cwd": cwd,
+    })
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -20561,6 +21448,7 @@ async def run_claude(
             "proc": proc,
             "run_id": run_id,
             "backend": BACKEND_CLAUDE,
+            "transport": CLAUDE_TRANSPORT_PRINT,
             "pid": proc.pid,
             "pgid": pgid,
             "cwd": cwd,
@@ -20706,6 +21594,7 @@ async def run_claude(
     await append_turn_finished_event(session_id, {
         "run_id": run_id,
         "backend": BACKEND_CLAUDE,
+        "transport": CLAUDE_TRANSPORT_PRINT,
         "exit_code": proc.returncode,
         "result_text": result_text,
         "stopped": stopped,
@@ -20717,6 +21606,1482 @@ async def run_claude(
     STOPPED_RUNS.discard(run_id)
     if drain_queue:
         schedule_next_queued_turn(session_id)
+
+
+def claude_sdk_field(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def claude_sdk_type(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(value.get("type") or "")
+    return type(value).__name__
+
+
+def claude_sdk_subagent_lifecycle_raw(message: Any) -> dict[str, Any] | None:
+    """Return the minimum legacy-shaped record needed by subagent folding.
+
+    ``claude -p`` stores the provider's complete stream record as ``raw_event``.
+    The typed SDK must not regress background-agent status, but it also should
+    not persist prompts, child output, or arbitrary provider payloads merely to
+    feed that fold.  Project only the lifecycle identifiers and short labels
+    consumed by :func:`build_claude_subagent_snapshot`.
+    """
+
+    message_type = claude_sdk_type(message)
+    if message_type == "UserMessage":
+        result = claude_sdk_field(message, "tool_use_result")
+        if not isinstance(result, dict):
+            return None
+        status = str(result.get("status") or "").strip().lower()
+        is_async = result.get("isAsync") is True or status in {
+            "async_launched", "running", "pending",
+        }
+        if not is_async:
+            return None
+        tool_results = []
+        content = claude_sdk_field(message, "content", [])
+        for block in content if isinstance(content, list) else []:
+            if claude_sdk_type(block) not in {
+                "ToolResultBlock", "ServerToolResultBlock",
+                "tool_result", "server_tool_result", "advisor_tool_result",
+            }:
+                continue
+            tool_id = str(claude_sdk_field(block, "tool_use_id") or "")[:512]
+            if tool_id:
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                })
+            if len(tool_results) >= 32:
+                break
+        return {
+            "type": "user",
+            "tool_use_result": {
+                "status": status[:64],
+                "isAsync": True,
+                "agentId": str(result.get("agentId") or "")[:512],
+                "task_id": str(result.get("task_id") or "")[:512],
+            },
+            "message": {"content": tool_results},
+        }
+
+    if message_type == "AssistantMessage":
+        parent_tool_id = str(
+            claude_sdk_field(message, "parent_tool_use_id") or ""
+        )[:512]
+        if not parent_tool_id:
+            return None
+        safe_blocks: list[dict[str, Any]] = []
+        content = claude_sdk_field(message, "content", [])
+        for block in content if isinstance(content, list) else []:
+            if claude_sdk_type(block) not in {
+                "ToolUseBlock", "ServerToolUseBlock",
+                "tool_use", "server_tool_use",
+            }:
+                continue
+            raw_input = claude_sdk_field(block, "input", {})
+            raw_input = raw_input if isinstance(raw_input, dict) else {}
+            safe_input = {
+                key: compact_subagent_text(raw_input.get(key))
+                for key in ("description", "subagent_type")
+                if compact_subagent_text(raw_input.get(key))
+            }
+            safe_blocks.append({
+                "type": "tool_use",
+                "name": compact_subagent_text(
+                    claude_sdk_field(block, "name") or "tool"
+                ),
+                "input": safe_input,
+            })
+            # The snapshot uses only the first child tool for its activity.
+            break
+        if not safe_blocks:
+            return None
+        return {
+            "type": "assistant",
+            "parent_tool_use_id": parent_tool_id,
+            "message": {"content": safe_blocks},
+        }
+
+    data = claude_sdk_field(message, "data", {})
+    if not isinstance(data, dict):
+        return None
+    subtype = str(
+        data.get("subtype") or claude_sdk_field(message, "subtype") or ""
+    )
+    if subtype == "background_tasks_changed":
+        tasks: list[dict[str, Any]] = []
+        for task in data.get("tasks") if isinstance(data.get("tasks"), list) else []:
+            if not isinstance(task, dict):
+                continue
+            tasks.append({
+                "task_id": str(task.get("task_id") or "")[:512],
+                "task_type": compact_subagent_text(task.get("task_type")),
+                "description": compact_subagent_text(task.get("description")),
+                "status": compact_subagent_text(task.get("status")),
+            })
+            if len(tasks) >= SUBAGENT_SNAPSHOT_STATE_LIMIT:
+                break
+        return {
+            "type": "system",
+            "subtype": subtype,
+            "tasks": tasks,
+        }
+    if subtype not in {
+        "task_started", "task_progress", "task_updated", "task_notification",
+    }:
+        return None
+
+    raw_patch = data.get("patch") if isinstance(data.get("patch"), dict) else {}
+    patch = {
+        key: (
+            value
+            if isinstance(value, bool)
+            else compact_subagent_text(value)
+        )
+        for key in (
+            "status", "is_backgrounded", "summary", "description", "message",
+        )
+        if (value := raw_patch.get(key)) not in (None, "")
+    }
+    record: dict[str, Any] = {
+        "type": "system",
+        "subtype": subtype,
+        "task_id": str(
+            data.get("task_id") or claude_sdk_field(message, "task_id") or ""
+        )[:512],
+        "tool_use_id": str(
+            data.get("tool_use_id")
+            or claude_sdk_field(message, "tool_use_id")
+            or ""
+        )[:512],
+        "task_type": compact_subagent_text(
+            data.get("task_type") or claude_sdk_field(message, "task_type")
+        ),
+        "subagent_type": compact_subagent_text(data.get("subagent_type")),
+        "description": compact_subagent_text(
+            data.get("description") or claude_sdk_field(message, "description")
+        ),
+        "last_tool_name": compact_subagent_text(
+            data.get("last_tool_name")
+            or claude_sdk_field(message, "last_tool_name")
+        ),
+        "status": compact_subagent_text(
+            data.get("status") or claude_sdk_field(message, "status")
+        ),
+        "summary": compact_subagent_text(
+            data.get("summary") or claude_sdk_field(message, "summary")
+        ),
+    }
+    if patch:
+        record["patch"] = patch
+    return record
+
+
+def claude_sdk_result_details(message: Any) -> dict[str, Any]:
+    errors = claude_sdk_field(message, "errors")
+    if isinstance(errors, list):
+        error_text = "\n".join(str(value) for value in errors if str(value))
+    else:
+        error_text = ""
+    result = clean_assistant_text(
+        str(claude_sdk_field(message, "result") or "")
+    )
+    subtype = str(claude_sdk_field(message, "subtype") or "")
+    terminal_reason = str(
+        claude_sdk_field(message, "terminal_reason") or ""
+    )
+    is_error = bool(claude_sdk_field(message, "is_error", False))
+    return {
+        "session_id": str(claude_sdk_field(message, "session_id") or ""),
+        "result_text": result,
+        "is_error": is_error,
+        "error": error_text or (result if is_error else "") or (
+            f"Claude SDK ended with {subtype or 'an error'}" if is_error else ""
+        ),
+        "subtype": subtype,
+        "terminal_reason": terminal_reason,
+        "aborted": terminal_reason in {"aborted_streaming", "aborted_tools"},
+    }
+
+
+async def project_claude_sdk_message(
+    session_id: str,
+    run_id: str,
+    message: Any,
+    *,
+    text_parts: list[str],
+    current_tools: dict[str, dict[str, Any]],
+    changed_paths: set[str],
+) -> dict[str, Any] | None:
+    """Project one typed SDK message into the existing durable timeline."""
+
+    message_type = claude_sdk_type(message)
+    provider_id = str(claude_sdk_field(message, "session_id") or "")
+    if message_type == "SystemMessage":
+        data = claude_sdk_field(message, "data", {})
+        if isinstance(data, dict):
+            provider_id = str(data.get("session_id") or provider_id)
+    if provider_id:
+        await mark_provider_turn_ready(session_id, run_id, provider_id)
+
+    async def project_tool_result(block: Any) -> None:
+        tool_id = str(claude_sdk_field(block, "tool_use_id") or "")
+        await append_event(session_id, "tool_finished", {
+            "run_id": run_id,
+            "tool_id": tool_id or None,
+            "tool": current_tools.pop(tool_id, None),
+            "output": event_output_text(
+                claude_sdk_field(block, "content", "")
+            ),
+            "is_error": claude_sdk_field(block, "is_error") is True,
+        })
+
+    async def project_subagent_lifecycle() -> None:
+        raw = claude_sdk_subagent_lifecycle_raw(message)
+        if raw is None:
+            return
+        await append_event(session_id, "raw_event", {
+            "run_id": run_id,
+            "backend": BACKEND_CLAUDE,
+            "raw": json.dumps(raw, separators=(",", ":")),
+        })
+
+    if message_type == "AssistantMessage":
+        assistant_error = str(claude_sdk_field(message, "error") or "")
+        if assistant_error:
+            await append_event(session_id, "error", {
+                "run_id": run_id,
+                "backend": BACKEND_CLAUDE,
+                "transport": CLAUDE_TRANSPORT_AGENT_SDK,
+                "message": f"Claude assistant error: {assistant_error}",
+                **run_event_metadata(run_id),
+            })
+        content = claude_sdk_field(message, "content", [])
+        for block in content if isinstance(content, list) else []:
+            block_type = claude_sdk_type(block)
+            if block_type in {"TextBlock", "text"}:
+                text = clean_assistant_text(
+                    str(claude_sdk_field(block, "text") or "")
+                )
+                if text:
+                    text_parts.append(text)
+                    await append_event(session_id, "assistant_text", {
+                        "run_id": run_id,
+                        "text": text,
+                        **run_event_metadata(run_id),
+                    })
+            elif block_type in {"ThinkingBlock", "thinking"}:
+                thinking = str(claude_sdk_field(block, "thinking") or "")
+                if thinking:
+                    await append_event(session_id, "reasoning_summary", {
+                        "run_id": run_id,
+                        "text": thinking,
+                    })
+            elif block_type in {
+                "ToolUseBlock",
+                "ServerToolUseBlock",
+                "tool_use",
+                "server_tool_use",
+            }:
+                tool_id = str(
+                    claude_sdk_field(block, "id")
+                    or f"tool_{uuid.uuid4().hex[:8]}"
+                )
+                tool_input = claude_sdk_field(block, "input", {})
+                tool = {
+                    "id": tool_id,
+                    "name": str(claude_sdk_field(block, "name") or "tool"),
+                    "input": tool_input if isinstance(tool_input, dict) else {},
+                }
+                current_tools[tool_id] = tool
+                changed_paths.update(tool_changed_paths(tool))
+                await append_event(session_id, "tool_started", {
+                    "run_id": run_id,
+                    "tool": tool,
+                })
+            elif block_type in {
+                "ToolResultBlock",
+                "ServerToolResultBlock",
+                "tool_result",
+                "server_tool_result",
+                "advisor_tool_result",
+            }:
+                await project_tool_result(block)
+        await project_subagent_lifecycle()
+        return None
+
+    if message_type == "UserMessage":
+        content = claude_sdk_field(message, "content", [])
+        for block in content if isinstance(content, list) else []:
+            if claude_sdk_type(block) not in {
+                "ToolResultBlock",
+                "ServerToolResultBlock",
+                "tool_result",
+                "server_tool_result",
+                "advisor_tool_result",
+            }:
+                continue
+            await project_tool_result(block)
+        await project_subagent_lifecycle()
+        return None
+
+    if message_type in {"ResultMessage", "result"}:
+        return claude_sdk_result_details(message)
+    await project_subagent_lifecycle()
+    return None
+
+
+async def finish_claude_sdk_start_failure(
+    session_id: str,
+    run_id: str,
+    message: str,
+    *,
+    delivery_uncertain: bool = False,
+) -> None:
+    async with ACTIVE_LOCK:
+        active = ACTIVE.get(session_id)
+        if active and str(active.get("run_id") or "") == run_id:
+            active["provider_turn_ready"] = False
+            active["native_steer_queue"] = None
+            active["claude_permissions_open"] = False
+    await cancel_claude_interactions(
+        session_id,
+        resolution="turn_failed",
+    )
+    record_runtime_failure(BACKEND_CLAUDE, message, spawn_failure=True)
+    await append_event(session_id, "error", {
+        "run_id": run_id,
+        "backend": BACKEND_CLAUDE,
+        "transport": CLAUDE_TRANSPORT_AGENT_SDK,
+        "message": message,
+        "delivery_unknown": delivery_uncertain,
+        **run_event_metadata(run_id),
+    })
+    await append_turn_finished_event(session_id, {
+        "run_id": run_id,
+        "backend": BACKEND_CLAUDE,
+        "transport": CLAUDE_TRANSPORT_AGENT_SDK,
+        "exit_code": None,
+        "result_text": "",
+        "delivery_unknown": delivery_uncertain,
+        **run_event_metadata(run_id),
+    })
+    RUN_METADATA.pop(run_id, None)
+    await release_turn_slot(session_id, expected_run_id=run_id)
+    schedule_next_queued_turn(session_id)
+
+
+async def finish_cancelled_claude_sdk_start(
+    session_id: str,
+    run_id: str,
+    manager: ClaudeSDKSupervisorManager,
+) -> None:
+    """Retire a possibly accepted query and clear its reservation safely."""
+
+    STOPPED_RUNS.add(run_id)
+    await evict_claude_sdk_chat(
+        session_id,
+        force=True,
+        manager=manager,
+    )
+    await cancel_claude_interactions(
+        session_id,
+        resolution="turn_stopped",
+    )
+    released = await release_turn_slot(
+        session_id,
+        expected_run_id=run_id,
+    )
+    if released:
+        await append_event(session_id, "turn_stopped", {
+            "run_id": run_id,
+            "backend": BACKEND_CLAUDE,
+            "transport": CLAUDE_TRANSPORT_AGENT_SDK,
+            "message": "Claude was stopped while the SDK turn was starting.",
+            **run_event_metadata(run_id),
+        })
+    RUN_METADATA.pop(run_id, None)
+    STOPPED_RUNS.discard(run_id)
+
+
+async def run_claude_sdk(
+    session_id: str,
+    run_id: str,
+    prompt: str,
+    sess: dict[str, Any],
+    manifest_path: Path,
+) -> None:
+    """Run Claude on one persistent, chat-owned Agent SDK process."""
+
+    requested_cwd = str(sess.get("cwd") or DEFAULT_CWD)
+    cwd = existing_cwd(requested_cwd)
+    resume_provider_id, resume_skip_message = resolve_claude_resume_provider(
+        sess,
+        cwd,
+    )
+    diff_baseline = await capture_git_baseline(session_id, run_id, cwd)
+    try:
+        options, configuration_key, cli_path = build_claude_sdk_options(
+            session_id,
+            sess,
+            cwd,
+            manifest_path,
+        )
+        manager = await claude_sdk_manager()
+    except ClaudeSDKUnavailable:
+        raise
+    except Exception as exc:
+        raise ClaudeSDKUnavailable(
+            f"Claude Agent SDK setup failed before prompt delivery: {exc}"
+        ) from exc
+    if str(Path(requested_cwd).expanduser()) != cwd:
+        await append_event(session_id, "cwd_fallback", {
+            "run_id": run_id,
+            "requested_cwd": requested_cwd,
+            "cwd": cwd,
+        })
+    if resume_skip_message:
+        await append_event(session_id, "cwd_fallback", {
+            "run_id": run_id,
+            "requested_cwd": requested_cwd,
+            "cwd": cwd,
+            "provider_session_id": claude_provider_id_for_session(sess),
+            "message": resume_skip_message,
+        })
+    await append_event(session_id, "process_started", {
+        "run_id": run_id,
+        "backend": BACKEND_CLAUDE,
+        "transport": CLAUDE_TRANSPORT_AGENT_SDK,
+        "argv": [cli_path, "<ClaudeSDKClient>", "--permission-mode", "default"],
+        "cwd": cwd,
+    })
+
+    # Publish the chat-owned SDK reservation before query delivery. The SDK
+    # may invoke ``can_use_tool`` from inside ``client.query()`` and therefore
+    # before ``manager.start_run()`` returns a handle. The approval callback
+    # must already be able to verify an opted-in ACTIVE turn at that point.
+    native_steer_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1)
+    startup_active = {
+        "proc": None,
+        "run_id": run_id,
+        "backend": BACKEND_CLAUDE,
+        "transport": CLAUDE_TRANSPORT_AGENT_SDK,
+        "claude_sdk_run": None,
+        "native_steer_queue": native_steer_queue,
+        "interactive_agent_sdk": True,
+        "provider_model": str(sess.get("model") or ""),
+        "provider_effort": str(sess.get("effort") or ""),
+        "configuration_key": configuration_key,
+        "provider_session_id": resume_provider_id,
+        "provider_turn_ready": False,
+        "claude_sdk_owner_token": "",
+        "claude_permission_run_id": run_id,
+        "claude_permissions_open": False,
+        "cwd": cwd,
+        "argv": [cli_path, "<ClaudeSDKClient>"],
+        "started_at": time.time(),
+        "started_at_iso": now_iso(),
+        "native_interrupt_sent": False,
+        "stop_requested": False,
+        "provider_starting": True,
+        "stdout_tail": deque(maxlen=LIVE_STDOUT_MAX_LINES),
+        "stdout_total_lines": 0,
+        "stdout_updated_at": None,
+    }
+    async with ACTIVE_LOCK:
+        BUSY_SESSIONS.add(session_id)
+        stop_requested = session_id in STOP_REQUESTS or run_id in STOPPED_RUNS
+        if stop_requested:
+            STOP_REQUESTS.discard(session_id)
+            STOPPED_RUNS.add(run_id)
+        startup_active["stop_requested"] = stop_requested
+        ACTIVE[session_id] = startup_active
+    if stop_requested:
+        # Stop won before provider delivery. Do not submit the prompt merely
+        # to acquire a handle that would immediately be interrupted.
+        await finish_cancelled_claude_sdk_start(
+            session_id,
+            run_id,
+            manager,
+        )
+        return
+
+    async def activate_initial_supervisor(ownership_token: str) -> None:
+        async with ACTIVE_LOCK:
+            active = ACTIVE.get(session_id)
+            if (
+                active is not startup_active
+                or str(active.get("run_id") or "") != run_id
+                or active.get("stop_requested")
+                or session_id not in BUSY_SESSIONS
+            ):
+                # This hook runs before supervisor.start_run/query. Raising
+                # cancellation guarantees that a Stop/delete winner cannot
+                # deliver the prompt afterward.
+                raise asyncio.CancelledError
+            active["claude_sdk_owner_token"] = str(ownership_token)
+            active["claude_permission_run_id"] = run_id
+            active["claude_permissions_open"] = True
+    try:
+        handle = await manager.start_run(
+            session_id,
+            prompt,
+            run_id=run_id,
+            options=options,
+            configuration_key=configuration_key,
+            on_supervisor_ready=activate_initial_supervisor,
+        )
+    except asyncio.CancelledError:
+        cleanup_task = asyncio.create_task(
+            finish_cancelled_claude_sdk_start(
+                session_id,
+                run_id,
+                manager,
+            )
+        )
+        await join_task_despite_caller_cancellation(cleanup_task)
+        raise
+    except ClaudeSDKUnavailable:
+        raise
+    except ClaudeSDKQueryError as exc:
+        await finish_claude_sdk_start_failure(
+            session_id,
+            run_id,
+            (
+                "Claude SDK prompt delivery could not be confirmed. The prompt "
+                "was not replayed through the fallback transport."
+            ),
+            delivery_uncertain=True,
+        )
+        logger.warning(
+            "Claude SDK query delivery uncertain session=%s run=%s: %s",
+            session_id,
+            run_id,
+            concise_error_message(exc),
+        )
+        return
+    except Exception as exc:
+        await finish_claude_sdk_start_failure(
+            session_id,
+            run_id,
+            f"Claude SDK could not start: {concise_error_message(exc)}",
+        )
+        return
+
+    attached = False
+    async with ACTIVE_LOCK:
+        active = ACTIVE.get(session_id)
+        if (
+            active is startup_active
+            and str(active.get("run_id") or "") == run_id
+            and session_id in BUSY_SESSIONS
+        ):
+            active.update({
+                "claude_sdk_run": handle,
+                "provider_turn_ready": True,
+                "provider_starting": False,
+            })
+            stop_requested = bool(active.get("stop_requested"))
+            attached = True
+        else:
+            stop_requested = True
+    if not attached:
+        # Stop/delete may have hard-terminalized and released the placeholder
+        # while a cancellation-hostile SDK query was returning. Interrupt only
+        # this old handle; chat-ID eviction could target a newer replacement.
+        with suppress(Exception):
+            await interrupt_claude_sdk_run_bounded(handle)
+        return
+    if stop_requested:
+        try:
+            await interrupt_claude_sdk_run_bounded(handle)
+        except Exception:
+            await finish_cancelled_claude_sdk_start(
+                session_id,
+                run_id,
+                manager,
+            )
+            return
+
+    current_run_id = run_id
+    current_handle = handle
+    current_diff_baseline = diff_baseline
+    text_parts: list[str] = []
+    current_tools: dict[str, dict[str, Any]] = {}
+    changed_paths: set[str] = set()
+    seen_artifacts: set[str] = set()
+    provider_id = str(resume_provider_id or "")
+    provider_persisted_id = str(resume_provider_id or "")
+    result_details: dict[str, Any] | None = None
+    stream_error: str | None = None
+    cancelled_error: asyncio.CancelledError | None = None
+    retire_supervisor = False
+    pending_steer: dict[str, Any] | None = None
+    message_task: asyncio.Task[Any] | None = None
+    steer_task: asyncio.Task[Any] | None = None
+    outputs_finished_run_ids: set[str] = set()
+    manifest_watch_task: asyncio.Task[Any] | None = asyncio.create_task(
+        watch_manifest_artifacts(
+            session_id,
+            current_run_id,
+            manifest_path,
+            seen_artifacts,
+        )
+    )
+
+    async def finish_outputs(
+        logical_run_id: str,
+        baseline: dict[str, Any],
+        paths: set[str],
+        artifacts: set[str],
+        logical_manifest_path: Path,
+    ) -> None:
+        if logical_run_id in outputs_finished_run_ids:
+            return
+        await collect_manifest(
+            session_id,
+            logical_run_id,
+            logical_manifest_path,
+            seen_artifacts=artifacts,
+            final=True,
+        )
+        await publish_turn_code_diff(
+            session_id,
+            logical_run_id,
+            BACKEND_CLAUDE,
+            cwd,
+            baseline,
+            paths,
+        )
+        outputs_finished_run_ids.add(logical_run_id)
+
+    async def release_transition(event: asyncio.Event) -> None:
+        event.set()
+        async with ACTIVE_LOCK:
+            active = ACTIVE.get(session_id)
+            if active and active.get("logical_transition_ready") is event:
+                active.pop("logical_transition_ready", None)
+                active.pop("logical_transition_candidate_run_id", None)
+                active.pop("logical_transition_accepting_permissions", None)
+
+    try:
+        while True:
+            if message_task is None:
+                message_task = asyncio.create_task(current_handle.__anext__())
+            if pending_steer is None and steer_task is None:
+                steer_task = asyncio.create_task(native_steer_queue.get())
+            waiters = {message_task}
+            if steer_task is not None:
+                waiters.add(steer_task)
+            done, _pending = await asyncio.wait(
+                waiters,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if steer_task is not None and steer_task in done:
+                request = steer_task.result()
+                steer_task = None
+                selected = request.get("selected") or {}
+                future = request.get("future")
+                candidate_run_id = f"run_{uuid.uuid4().hex[:16]}"
+                try:
+                    request_prompt = build_user_provider_prompt(
+                        session_id,
+                        str(selected.get("prompt") or ""),
+                        list(selected.get("file_ids") or []),
+                    )
+                except Exception as exc:
+                    if isinstance(future, asyncio.Future) and not future.done():
+                        future.set_exception(NativeSteerHandoffError(
+                            concise_error_message(exc),
+                            safe_to_requeue=True,
+                        ))
+                    continue
+
+                transition_ready = asyncio.Event()
+                transition_reserved = False
+                async with ACTIVE_LOCK:
+                    active = ACTIVE.get(session_id)
+                    if not active or active.get("stop_requested"):
+                        if isinstance(future, asyncio.Future) and not future.done():
+                            future.set_exception(NativeSteerHandoffError(
+                                "the active Claude turn is already stopping",
+                                safe_to_requeue=True,
+                            ))
+                        continue
+                    active["logical_transition_ready"] = transition_ready
+                    active["logical_transition_candidate_run_id"] = candidate_run_id
+                    active["logical_transition_accepting_permissions"] = False
+                    active["claude_permissions_open"] = False
+                    transition_reserved = True
+                interrupt_sent = False
+                try:
+                    await cancel_claude_interactions(
+                        session_id,
+                        resolution="turn_steered",
+                    )
+                    interrupt_sent = await interrupt_claude_sdk_run_bounded(
+                        current_handle,
+                    )
+                except asyncio.TimeoutError as exc:
+                    if transition_reserved:
+                        await release_transition(transition_ready)
+                    if isinstance(future, asyncio.Future) and not future.done():
+                        future.set_exception(NativeSteerHandoffError(
+                            (
+                                "Claude steering interrupt timed out before "
+                                "the next prompt was sent"
+                            ),
+                            safe_to_requeue=True,
+                        ))
+                    # The selected steering prompt has not been queried, but
+                    # the old run's interrupt state is unknowable. Retire only
+                    # this chat supervisor and finish the current logical run.
+                    retire_supervisor = True
+                    stream_error = concise_error_message(exc)
+                    STOPPED_RUNS.add(current_run_id)
+                    break
+                except Exception as exc:
+                    async with ACTIVE_LOCK:
+                        active = ACTIVE.get(session_id)
+                        if (
+                            active
+                            and not active.get("stop_requested")
+                            and active.get("logical_transition_ready")
+                            is transition_ready
+                        ):
+                            active["claude_permissions_open"] = True
+                    if transition_reserved:
+                        await release_transition(transition_ready)
+                    if isinstance(future, asyncio.Future) and not future.done():
+                        future.set_exception(NativeSteerHandoffError(
+                            f"Claude steering interrupt failed: {concise_error_message(exc)}",
+                            safe_to_requeue=True,
+                        ))
+                    continue
+                pending_steer = {
+                    "selected": selected,
+                    "remaining": int(request.get("remaining") or 0),
+                    "future": future,
+                    "candidate_run_id": candidate_run_id,
+                    "request_prompt": request_prompt,
+                    "transition_ready": transition_ready,
+                    "transition_reserved": transition_reserved,
+                    "interrupt_sent": interrupt_sent,
+                }
+
+            if message_task not in done:
+                continue
+            try:
+                message = message_task.result()
+            except StopAsyncIteration:
+                message_task = None
+                result_details = claude_sdk_result_details(
+                    await current_handle.wait_result()
+                )
+            except Exception as exc:
+                message_task = None
+                stream_error = concise_error_message(exc)
+                result_details = None
+            else:
+                message_task = None
+                message_provider_id = str(
+                    claude_sdk_field(message, "session_id") or ""
+                )
+                if claude_sdk_type(message) == "SystemMessage":
+                    system_data = claude_sdk_field(message, "data", {})
+                    if isinstance(system_data, dict):
+                        message_provider_id = str(
+                            system_data.get("session_id")
+                            or message_provider_id
+                        )
+                if message_provider_id:
+                    provider_id = message_provider_id
+                    if message_provider_id != provider_persisted_id:
+                        await persist_run_provider_session(
+                            session_id,
+                            current_run_id,
+                            BACKEND_CLAUDE,
+                            message_provider_id,
+                            cwd=cwd,
+                        )
+                        provider_persisted_id = message_provider_id
+                projected_result = await project_claude_sdk_message(
+                    session_id,
+                    current_run_id,
+                    message,
+                    text_parts=text_parts,
+                    current_tools=current_tools,
+                    changed_paths=changed_paths,
+                )
+                if projected_result is None:
+                    continue
+                result_details = projected_result
+
+            if result_details and result_details.get("session_id"):
+                provider_id = str(result_details["session_id"])
+            if pending_steer is None:
+                # Stop advertising native steering as soon as this provider
+                # result is terminal. A Force Send that raced the result is
+                # rejected below and safely requeued onto the next turn.
+                async with ACTIVE_LOCK:
+                    active = ACTIVE.get(session_id)
+                    if (
+                        active
+                        and str(active.get("run_id") or "") == current_run_id
+                    ):
+                        active["provider_turn_ready"] = False
+                        active["native_steer_queue"] = None
+                        active["claude_permissions_open"] = False
+                break
+
+            steer_state = pending_steer
+            selected = steer_state["selected"]
+            future = steer_state["future"]
+            transition_ready = steer_state["transition_ready"]
+            # Prefer the provider's terminal reason when available. An
+            # interrupt acknowledgement can lose a race with natural
+            # completion; it is only a compatibility fallback for older CLIs
+            # that omit terminal_reason.
+            terminal_reason = str(
+                (result_details or {}).get("terminal_reason") or ""
+            )
+            prior_aborted = (
+                bool((result_details or {}).get("aborted"))
+                if terminal_reason
+                else bool(steer_state.get("interrupt_sent"))
+            )
+            active_stopping = False
+            async with ACTIVE_LOCK:
+                active = ACTIVE.get(session_id)
+                active_stopping = not active or bool(active.get("stop_requested"))
+            if active_stopping or stream_error or (
+                result_details
+                and result_details.get("is_error")
+                and not prior_aborted
+            ):
+                await release_transition(transition_ready)
+                if isinstance(future, asyncio.Future) and not future.done():
+                    future.set_exception(NativeSteerHandoffError(
+                        stream_error or str((result_details or {}).get("error") or "Claude ended before steering"),
+                        safe_to_requeue=True,
+                    ))
+                break
+
+            candidate_run_id = str(steer_state["candidate_run_id"])
+            if provider_id:
+                await persist_run_provider_session(
+                    session_id,
+                    current_run_id,
+                    BACKEND_CLAUDE,
+                    provider_id,
+                    cwd=cwd,
+                )
+            candidate_query_allowed = False
+            async with ACTIVE_LOCK:
+                active = ACTIVE.get(session_id)
+                if (
+                    active
+                    and not active.get("stop_requested")
+                    and active.get("logical_transition_ready")
+                    is transition_ready
+                    and str(
+                        active.get("logical_transition_candidate_run_id") or ""
+                    ) == candidate_run_id
+                ):
+                    # The old response is terminal. Open approval routing for
+                    # the candidate before query(), which may synchronously
+                    # invoke can_use_tool before returning its run handle.
+                    active["logical_transition_accepting_permissions"] = True
+                    candidate_query_allowed = True
+            if not candidate_query_allowed:
+                await release_transition(transition_ready)
+                if isinstance(future, asyncio.Future) and not future.done():
+                    future.set_exception(NativeSteerHandoffError(
+                        "the active Claude turn stopped before steering delivery",
+                        safe_to_requeue=True,
+                    ))
+                break
+
+            # Seal every old-run observable before candidate delivery. A fast
+            # steered query can write the manifest/worktree before query()
+            # returns; rolling or diffing afterward would attribute those
+            # writes to the interrupted run and contaminate its diff.
+            previous_run_id = current_run_id
+            previous_metadata = run_event_metadata(previous_run_id)
+            previous_watcher = manifest_watch_task
+            manifest_watch_task = None
+            if previous_watcher is not None:
+                previous_watcher.cancel()
+                await asyncio.gather(previous_watcher, return_exceptions=True)
+            previous_manifest_path = manifest_path.with_name(
+                f".{previous_run_id}.json"
+            )
+            with suppress(OSError):
+                previous_manifest_path.unlink()
+            with suppress(OSError):
+                manifest_path.replace(previous_manifest_path)
+            previous_baseline = current_diff_baseline
+            previous_paths = set(changed_paths)
+            previous_artifacts = set(seen_artifacts)
+            previous_result_details = dict(result_details or {})
+            previous_text_parts = list(text_parts)
+            try:
+                await finish_outputs(
+                    previous_run_id,
+                    previous_baseline,
+                    previous_paths,
+                    previous_artifacts,
+                    previous_manifest_path,
+                )
+                candidate_baseline = await capture_git_baseline(
+                    session_id,
+                    candidate_run_id,
+                    cwd,
+                )
+            except Exception as exc:
+                # Keep the rolled old manifest reachable by the ordinary
+                # finalizer if sealing itself failed. A partial collection may
+                # already have consumed it, in which case retrying remains
+                # harmless and diff publication stays idempotent.
+                with suppress(Exception):
+                    await finish_outputs(
+                        previous_run_id,
+                        previous_baseline,
+                        previous_paths,
+                        previous_artifacts,
+                        previous_manifest_path,
+                    )
+                if previous_run_id not in outputs_finished_run_ids:
+                    with suppress(OSError):
+                        previous_manifest_path.replace(manifest_path)
+                async with ACTIVE_LOCK:
+                    active = ACTIVE.get(session_id)
+                    if (
+                        active
+                        and active.get("logical_transition_ready")
+                        is transition_ready
+                    ):
+                        active["claude_permissions_open"] = False
+                await release_transition(transition_ready)
+                if isinstance(future, asyncio.Future) and not future.done():
+                    future.set_exception(NativeSteerHandoffError(
+                        f"Claude steering preparation failed: {concise_error_message(exc)}",
+                        safe_to_requeue=True,
+                    ))
+                break
+            candidate_paths: set[str] = set()
+            candidate_artifacts: set[str] = set()
+            steer_state.update({
+                "candidate_baseline": candidate_baseline,
+                "candidate_paths": candidate_paths,
+                "candidate_artifacts": candidate_artifacts,
+                "candidate_query_attempted": False,
+                "candidate_failure_handled": False,
+            })
+            with suppress(OSError):
+                manifest_path.unlink()
+            manifest_watch_task = asyncio.create_task(
+                watch_manifest_artifacts(
+                    session_id,
+                    candidate_run_id,
+                    manifest_path,
+                    candidate_artifacts,
+                )
+            )
+
+            async def activate_candidate_supervisor(
+                ownership_token: str,
+            ) -> None:
+                async with ACTIVE_LOCK:
+                    active = ACTIVE.get(session_id)
+                    if (
+                        not active
+                        or active.get("stop_requested")
+                        or active.get("logical_transition_ready")
+                        is not transition_ready
+                        or str(
+                            active.get("logical_transition_candidate_run_id")
+                            or ""
+                        ) != candidate_run_id
+                    ):
+                        raise NativeSteerHandoffError(
+                            "the active Claude turn stopped before steering delivery",
+                            safe_to_requeue=True,
+                        )
+                    active["claude_sdk_owner_token"] = str(ownership_token)
+                    active["claude_permission_run_id"] = candidate_run_id
+                    active["claude_permissions_open"] = True
+            try:
+                # Once manager.start_run is entered, cancellation cannot
+                # prove whether client.query accepted the prompt: the SDK
+                # actor deliberately shields its command response. Preserve
+                # this boundary for Force Send replay decisions and cleanup.
+                steer_state["candidate_query_attempted"] = True
+                candidate_handle = await manager.start_run(
+                    session_id,
+                    str(steer_state["request_prompt"]),
+                    run_id=candidate_run_id,
+                    options=options,
+                    configuration_key=configuration_key,
+                    on_supervisor_ready=activate_candidate_supervisor,
+                )
+                # start_run returns only after query() acceptance. From this
+                # exact point onward the steering message is never safe to
+                # replay, even if local projection or bookkeeping fails.
+                steer_state["candidate_accepted"] = True
+            except Exception as exc:
+                steer_state["candidate_failure_handled"] = True
+                candidate_watcher = manifest_watch_task
+                manifest_watch_task = None
+                if candidate_watcher is not None:
+                    candidate_watcher.cancel()
+                    await asyncio.gather(
+                        candidate_watcher,
+                        return_exceptions=True,
+                    )
+                with suppress(Exception):
+                    await finish_outputs(
+                        candidate_run_id,
+                        candidate_baseline,
+                        candidate_paths,
+                        candidate_artifacts,
+                        manifest_path,
+                    )
+                async with ACTIVE_LOCK:
+                    active = ACTIVE.get(session_id)
+                    if (
+                        active
+                        and active.get("logical_transition_ready")
+                        is transition_ready
+                    ):
+                        active["claude_permissions_open"] = False
+                await release_transition(transition_ready)
+                safe_to_requeue = bool(getattr(exc, "safe_to_requeue", False))
+                if isinstance(future, asyncio.Future) and not future.done():
+                    future.set_exception(NativeSteerHandoffError(
+                        concise_error_message(exc),
+                        safe_to_requeue=safe_to_requeue,
+                        delivery_uncertain=not safe_to_requeue,
+                    ))
+                if not safe_to_requeue:
+                    stream_error = (
+                        "Claude steering delivery could not be confirmed. The "
+                        "message was not replayed."
+                    )
+                pending_steer = None
+                break
+
+            remaining = int(steer_state.get("remaining") or 0)
+
+            metadata = queued_turn_run_metadata(selected)
+            metadata["steer_interrupted_run_id"] = previous_run_id
+            RUN_METADATA[candidate_run_id] = metadata
+            display_prompt = str(
+                selected.get("display_prompt")
+                if selected.get("display_prompt") is not None
+                else selected.get("prompt") or ""
+            )
+            display_file_ids = list(
+                selected.get("display_file_ids")
+                if selected.get("display_file_ids") is not None
+                else selected.get("file_ids") or []
+            )
+            lineage = turn_steering_lineage(CURRENT_TURNS.get(session_id))
+            steering_message = {
+                "prompt": str(selected.get("prompt") or ""),
+                "file_ids": list(selected.get("file_ids") or []),
+            }
+            if not lineage or lineage[-1] != steering_message:
+                lineage.append(steering_message)
+
+            current_run_id = candidate_run_id
+            current_handle = candidate_handle
+            current_diff_baseline = candidate_baseline
+            text_parts = []
+            current_tools = {}
+            changed_paths = candidate_paths
+            seen_artifacts = candidate_artifacts
+            result_details = None
+            stream_error = None
+            stopped_during_handoff = False
+            async with ACTIVE_LOCK:
+                active = ACTIVE.get(session_id)
+                if active:
+                    stopped_during_handoff = bool(active.get("stop_requested"))
+                    active.update({
+                        "run_id": candidate_run_id,
+                        "claude_sdk_run": candidate_handle,
+                        "started_at": time.time(),
+                        "started_at_iso": now_iso(),
+                        "native_interrupt_sent": False,
+                        "stop_requested": stopped_during_handoff,
+                    })
+                    if stopped_during_handoff:
+                        STOPPED_RUNS.add(candidate_run_id)
+                    current = CURRENT_TURNS.get(session_id)
+                    if current is not None:
+                        current.update({
+                            "run_id": candidate_run_id,
+                            "prompt": str(selected.get("prompt") or ""),
+                            "display_prompt": display_prompt,
+                            "file_ids": list(selected.get("file_ids") or []),
+                            "queued_id": selected.get("queued_id"),
+                            "steering_lineage": lineage,
+                        })
+
+            if prior_aborted:
+                await append_event(session_id, "turn_stopped", {
+                    "run_id": previous_run_id,
+                    "backend": BACKEND_CLAUDE,
+                    "transport": CLAUDE_TRANSPORT_AGENT_SDK,
+                    "native_steer": True,
+                    "superseded_by_run_id": candidate_run_id,
+                    **previous_metadata,
+                })
+            else:
+                await append_turn_finished_event(session_id, {
+                    "run_id": previous_run_id,
+                    "backend": BACKEND_CLAUDE,
+                    "transport": CLAUDE_TRANSPORT_AGENT_SDK,
+                    "exit_code": 0,
+                    "result_text": clean_assistant_text(
+                        str(previous_result_details.get("result_text") or "")
+                        or "\n\n".join(previous_text_parts).strip()
+                    ),
+                    **previous_metadata,
+                })
+            await append_event(session_id, "turn_queue_run_now", {
+                "queued_id": selected.get("queued_id"),
+                "backend": BACKEND_CLAUDE,
+                "prompt": display_prompt,
+                "request_prompt": str(selected.get("prompt") or ""),
+                "display_prompt": display_prompt,
+                "file_ids": list(selected.get("file_ids") or []),
+                "display_file_ids": display_file_ids,
+                "interrupted_run_id": previous_run_id,
+                "replays_interrupted_message": False,
+                "native_steer": True,
+                "message": "Steering message sent to the active Claude chat.",
+                "remaining": remaining,
+                "superseded_queued_ids": [],
+            })
+            await append_event(session_id, "turn_started", {
+                "run_id": candidate_run_id,
+                "backend": BACKEND_CLAUDE,
+                "prompt": display_prompt,
+                "file_ids": display_file_ids,
+                "queued_id": selected.get("queued_id"),
+                "native_steer": True,
+                **metadata,
+            })
+            await release_transition(transition_ready)
+            if stopped_during_handoff:
+                with suppress(Exception):
+                    await interrupt_claude_sdk_run_bounded(candidate_handle)
+            RUN_METADATA.pop(previous_run_id, None)
+            STOPPED_RUNS.discard(previous_run_id)
+            if isinstance(future, asyncio.Future) and not future.done():
+                future.set_result({
+                    "ok": True,
+                    "queued_id": selected.get("queued_id"),
+                    "run_id": candidate_run_id,
+                    "interrupted": prior_aborted,
+                    "native_steer": True,
+                    "replays_interrupted_message": False,
+                    "superseded_queued_ids": [],
+                })
+            # Keep the accepted handoff visible to cancellation/error cleanup
+            # until its HTTP waiter has been resolved. Clearing this earlier
+            # can orphan Force Send after provider delivery succeeded but
+            # before local timeline bookkeeping completed.
+            pending_steer = None
+    except asyncio.CancelledError as exc:
+        cancelled_error = exc
+        retire_supervisor = True
+        STOPPED_RUNS.add(current_run_id)
+    except Exception as exc:
+        stream_error = concise_error_message(exc)
+        retire_supervisor = True
+        logger.exception(
+            "Claude SDK run failed session=%s run=%s",
+            session_id,
+            current_run_id,
+        )
+
+    async def cleanup_live_sdk_state() -> None:
+        nonlocal retire_supervisor, stream_error
+        unhandled_steer: dict[str, Any] | None = None
+        if (
+            pending_steer is None
+            and steer_task is not None
+            and steer_task.done()
+            and not steer_task.cancelled()
+        ):
+            with suppress(Exception):
+                candidate = steer_task.result()
+                if isinstance(candidate, dict):
+                    unhandled_steer = candidate
+        for task in (message_task, steer_task):
+            if task is not None and not task.done():
+                task.cancel()
+        if message_task is not None or steer_task is not None:
+            await asyncio.gather(
+                *(task for task in (message_task, steer_task) if task is not None),
+                return_exceptions=True,
+            )
+        if pending_steer is not None:
+            transition_ready = pending_steer.get("transition_ready")
+            if isinstance(transition_ready, asyncio.Event):
+                await release_transition(transition_ready)
+            future = pending_steer.get("future")
+            candidate_accepted = bool(
+                pending_steer.get("candidate_accepted")
+            )
+            candidate_delivery_uncertain = bool(
+                candidate_accepted
+                or (
+                    pending_steer.get("candidate_query_attempted")
+                    and not pending_steer.get("candidate_failure_handled")
+                )
+            )
+            if candidate_delivery_uncertain:
+                retire_supervisor = True
+                stream_error = stream_error or (
+                    "Claude steering may have been accepted, but its local "
+                    "handoff did not complete. The message was not replayed."
+                )
+                candidate_baseline = pending_steer.get("candidate_baseline")
+                candidate_paths = pending_steer.get("candidate_paths")
+                candidate_artifacts = pending_steer.get("candidate_artifacts")
+                candidate_run_id = str(
+                    pending_steer.get("candidate_run_id") or ""
+                )
+                if (
+                    candidate_run_id
+                    and isinstance(candidate_baseline, dict)
+                    and isinstance(candidate_paths, set)
+                    and isinstance(candidate_artifacts, set)
+                ):
+                    with suppress(Exception):
+                        await finish_outputs(
+                            candidate_run_id,
+                            candidate_baseline,
+                            candidate_paths,
+                            candidate_artifacts,
+                            manifest_path,
+                        )
+            if isinstance(future, asyncio.Future) and not future.done():
+                future.set_exception(NativeSteerHandoffError(
+                    stream_error or "Claude steering ended before delivery",
+                    safe_to_requeue=not candidate_delivery_uncertain,
+                    delivery_uncertain=candidate_delivery_uncertain,
+                ))
+        elif unhandled_steer is None:
+            # A queue.put() can win just after asyncio.wait() selects the
+            # terminal ResultMessage. Drain the detached queue so its HTTP
+            # waiter is never stranded after ACTIVE is released.
+            with suppress(asyncio.QueueEmpty):
+                candidate = native_steer_queue.get_nowait()
+                if isinstance(candidate, dict):
+                    unhandled_steer = candidate
+        if unhandled_steer is not None:
+            future = unhandled_steer.get("future")
+            if isinstance(future, asyncio.Future) and not future.done():
+                future.set_exception(NativeSteerHandoffError(
+                    "Claude finished before the steering message was delivered",
+                    safe_to_requeue=True,
+                ))
+        if manifest_watch_task is not None:
+            manifest_watch_task.cancel()
+            await asyncio.gather(manifest_watch_task, return_exceptions=True)
+        await cancel_claude_interactions(
+            session_id,
+            resolution=(
+                "turn_stopped"
+                if cancelled_error is not None
+                else "turn_finished"
+            ),
+        )
+
+    cleanup_task = asyncio.create_task(cleanup_live_sdk_state())
+    try:
+        await asyncio.shield(cleanup_task)
+    except asyncio.CancelledError as exc:
+        cancelled_error = cancelled_error or exc
+        retire_supervisor = True
+        STOPPED_RUNS.add(current_run_id)
+        await join_task_despite_caller_cancellation(cleanup_task)
+
+    async def finalize_sdk_run() -> None:
+        if retire_supervisor:
+            with suppress(Exception):
+                await interrupt_claude_sdk_run_bounded(current_handle)
+            await evict_claude_sdk_chat(
+                session_id,
+                force=True,
+                manager=manager,
+            )
+        if provider_id:
+            with suppress(Exception):
+                await persist_run_provider_session(
+                    session_id,
+                    current_run_id,
+                    BACKEND_CLAUDE,
+                    provider_id,
+                    cwd=cwd,
+                )
+
+        stopped = bool(
+            cancelled_error is not None
+            or current_run_id in STOPPED_RUNS
+            or (result_details or {}).get("aborted")
+        )
+        result_error = str((result_details or {}).get("error") or "")
+        if stream_error and not stopped:
+            with suppress(Exception):
+                await append_event(session_id, "error", {
+                    "run_id": current_run_id,
+                    "backend": BACKEND_CLAUDE,
+                    "transport": CLAUDE_TRANSPORT_AGENT_SDK,
+                    "message": f"Claude SDK stream failed: {stream_error}",
+                    **run_event_metadata(current_run_id),
+                })
+        if result_error and not stopped:
+            with suppress(Exception):
+                await append_event(session_id, "error", {
+                    "run_id": current_run_id,
+                    "backend": BACKEND_CLAUDE,
+                    "transport": CLAUDE_TRANSPORT_AGENT_SDK,
+                    "message": result_error,
+                    **run_event_metadata(current_run_id),
+                })
+        if stream_error or (result_details or {}).get("is_error"):
+            if not stopped:
+                record_runtime_failure(
+                    BACKEND_CLAUDE,
+                    stream_error or result_error or "Claude SDK run failed",
+                )
+        elif not stopped:
+            record_runtime_success(BACKEND_CLAUDE)
+        with suppress(Exception):
+            await finish_outputs(
+                current_run_id,
+                current_diff_baseline,
+                changed_paths,
+                seen_artifacts,
+                manifest_path,
+            )
+            await collect_recent_leftover_manifests(
+                session_id,
+                current_run_id,
+                manifest_path,
+                seen_artifacts=seen_artifacts,
+            )
+        result_text = clean_assistant_text(
+            str((result_details or {}).get("result_text") or "")
+            or "\n\n".join(text_parts).strip()
+        )
+        drain_queue = should_schedule_queue_after_finish(session_id, stopped)
+        released = await release_turn_slot(
+            session_id,
+            expected_run_id=current_run_id,
+        )
+        if released:
+            with suppress(Exception):
+                await append_turn_finished_event(session_id, {
+                    "run_id": current_run_id,
+                    "backend": BACKEND_CLAUDE,
+                    "transport": CLAUDE_TRANSPORT_AGENT_SDK,
+                    "provider_session_id": provider_id or None,
+                    "exit_code": (
+                        None
+                        if stopped
+                        else 1 if stream_error or result_error else 0
+                    ),
+                    "result_text": result_text,
+                    "stopped": stopped,
+                    **run_event_metadata(current_run_id),
+                })
+        RUN_METADATA.pop(current_run_id, None)
+        STOPPED_RUNS.discard(current_run_id)
+        if released and drain_queue:
+            schedule_next_queued_turn(session_id)
+
+    finalize_task = asyncio.create_task(finalize_sdk_run())
+    try:
+        await asyncio.shield(finalize_task)
+    except asyncio.CancelledError as exc:
+        cancelled_error = cancelled_error or exc
+        retire_supervisor = True
+        STOPPED_RUNS.add(current_run_id)
+        await join_task_despite_caller_cancellation(finalize_task)
+    if cancelled_error is not None:
+        raise cancelled_error
+
+
+async def run_claude(
+    session_id: str,
+    run_id: str,
+    prompt: str,
+    sess: dict[str, Any],
+    manifest_path: Path,
+    *,
+    interactive_agent_sdk: bool = False,
+    standalone_provider_context: bool = False,
+) -> None:
+    use_sdk = bool(
+        interactive_agent_sdk
+        and not standalone_provider_context
+        and CLAUDE_TRANSPORT != CLAUDE_TRANSPORT_PRINT
+    )
+    if not use_sdk:
+        # A compatibility print turn advances the same provider conversation
+        # outside the in-memory SDK client. Retire an idle supervisor first so
+        # a later desktop SDK turn reconnects from the newly persisted ID
+        # instead of continuing stale process-local context.
+        if not await evict_claude_sdk_chat(session_id, force=True):
+            await finish_claude_sdk_start_failure(
+                session_id,
+                run_id,
+                (
+                    "Claude's previous chat process is still shutting down. "
+                    "No compatibility turn was started; retry shortly."
+                ),
+            )
+            return
+        await run_claude_print(
+            session_id,
+            run_id,
+            prompt,
+            sess,
+            manifest_path,
+            standalone_provider_context=standalone_provider_context,
+        )
+        return
+    try:
+        await run_claude_sdk(
+            session_id,
+            run_id,
+            prompt,
+            sess,
+            manifest_path,
+        )
+    except ClaudeSDKUnavailable as exc:
+        # Interactive desktop clients opted into approval/question semantics.
+        # The legacy print path deliberately skips permissions, so silently
+        # downgrading an opted-in turn would execute with weaker safety than
+        # the UI promised. Old clients and standalone jobs still select print
+        # before entering this function and remain fully compatible.
+        await finish_claude_sdk_start_failure(
+            session_id,
+            run_id,
+            f"Claude Agent SDK is unavailable: {concise_error_message(exc)}",
+        )
 
 
 def codex_app_server_tool(item: dict[str, Any]) -> dict[str, Any] | None:
@@ -23077,6 +25442,9 @@ async def _start_turn_locked(
     interactive_app_server = (
         CODEX_INTERACTIVE_CLIENT_CAPABILITY in req.client_capabilities
     )
+    interactive_agent_sdk = (
+        CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY in req.client_capabilities
+    )
     for item in normalized_lineage:
         item["file_ids"] = validate_session_file_ids(
             session_id,
@@ -23119,6 +25487,7 @@ async def _start_turn_locked(
                 "steering_lineage": normalized_lineage,
                 "client_capabilities": list(req.client_capabilities),
                 "interactive_app_server": interactive_app_server,
+                "interactive_agent_sdk": interactive_agent_sdk,
             }
             reserved = True
     if should_queue:
@@ -23233,6 +25602,7 @@ async def _start_turn_locked(
                 prompt,
                 dict(sess),
                 manifest_path,
+                interactive_agent_sdk=interactive_agent_sdk,
                 **(
                     {"standalone_provider_context": True}
                     if provider_context_mode == "standalone"
@@ -23480,6 +25850,8 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         with suppress(Exception):
+            await close_claude_sdk_manager()
+        with suppress(Exception):
             await close_codex_app_server_manager()
         digest_recovery_task.cancel()
         abandoned_fork_cleanup_task.cancel()
@@ -23611,6 +25983,39 @@ async def health() -> dict[str, Any]:
                     "shell_command": True,
                     "background_terminals": "experimental",
                 },
+            },
+            "claude_controls": {
+                "available": (
+                    CLAUDE_TRANSPORT != CLAUDE_TRANSPORT_PRINT
+                    and claude_sdk_dependency_available()
+                ),
+                "required": False,
+                "message": (
+                    "Per-chat Claude Agent SDK controls are available to opted-in clients."
+                    if (
+                        CLAUDE_TRANSPORT != CLAUDE_TRANSPORT_PRINT
+                        and claude_sdk_dependency_available()
+                    )
+                    else "Claude uses the compatible print transport."
+                ),
+                "action": (
+                    None
+                    if claude_sdk_dependency_available()
+                    else "Install the server release with Claude Agent SDK support."
+                ),
+                "version": 1,
+                "interactive_client_capability": (
+                    CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY
+                ),
+                "features": {
+                    "native_steer": True,
+                    "interrupt": True,
+                    "approvals": True,
+                    "questions": True,
+                    "resume": True,
+                    "fork": True,
+                },
+                "fallback_transport": CLAUDE_TRANSPORT_PRINT,
             },
         },
         "websocket_runtime": True,
@@ -24601,6 +27006,91 @@ async def post_codex_interaction_response(
     return {"interaction": interaction}
 
 
+def claude_sdk_dependency_available() -> bool:
+    return importlib.util.find_spec("claude_agent_sdk") is not None
+
+
+async def claude_runtime_snapshot(session_id: str) -> dict[str, Any]:
+    session = STORE.sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="session not found")
+    is_claude = str(session.get("backend") or DEFAULT_BACKEND) == BACKEND_CLAUDE
+    sdk_available = claude_sdk_dependency_available()
+    configured = CLAUDE_TRANSPORT != CLAUDE_TRANSPORT_PRINT
+    manager = globals().get("CLAUDE_SDK_MANAGER")
+    loaded = False
+    if manager is not None:
+        checker = getattr(manager, "is_loaded", None)
+        if callable(checker):
+            with suppress(Exception):
+                loaded = bool(checker(session_id))
+    async with CLAUDE_PENDING_INTERACTIONS_LOCK:
+        pending = [
+            public_claude_interaction(item)
+            for item in CLAUDE_PENDING_INTERACTIONS.values()
+            if item.get("session_id") == session_id
+            and not item.get("responded")
+        ]
+    async with ACTIVE_LOCK:
+        active_record = ACTIVE.get(session_id)
+        active = bool(
+            active_record
+            and active_record.get("backend") == BACKEND_CLAUDE
+            and active_record.get("transport") == CLAUDE_TRANSPORT_AGENT_SDK
+        )
+    if active:
+        status = {
+            "type": "active",
+            "activeFlags": ["waitingOnApproval"] if pending else [],
+        }
+    elif loaded:
+        status = {"type": "idle"}
+    else:
+        status = {"type": "notLoaded"}
+    return {
+        "available": bool(is_claude and configured and sdk_available),
+        "transport": CLAUDE_TRANSPORT,
+        "interactive_capability": CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY,
+        "persisted_session": bool(claude_provider_id_for_session(session)),
+        "session_loaded": loaded,
+        "status": status,
+        "pending_interactions": pending,
+        "features": {
+            "native_steer": True,
+            "interrupt": True,
+            "approvals": True,
+            "questions": True,
+        },
+        "fallback_transport": CLAUDE_TRANSPORT_PRINT,
+    }
+
+
+@app.get("/api/sessions/{session_id}/claude/runtime")
+async def get_claude_runtime(session_id: str) -> dict[str, Any]:
+    return await claude_runtime_snapshot(session_id)
+
+
+@app.post(
+    "/api/sessions/{session_id}/claude/interactions/{interaction_id}/resolve"
+)
+async def post_claude_interaction_response(
+    session_id: str,
+    interaction_id: str,
+    req: ClaudeInteractionResponseRequest,
+) -> dict[str, Any]:
+    # Serialize approval resolution with Stop/Delete lifecycle changes. Once
+    # deletion has reserved this chat, no late UI response may authorize a
+    # provider action while cleanup is fencing the SDK callback.
+    async with session_lifecycle_lock(session_id):
+        ensure_session_not_deleting(session_id)
+        interaction = await resolve_claude_interaction(
+            session_id,
+            interaction_id,
+            req.response,
+        )
+        return {"interaction": interaction}
+
+
 @app.get("/api/sessions/{session_id}/codex/permission-profiles")
 async def get_codex_permission_profiles(session_id: str) -> dict[str, Any]:
     async with session_lifecycle_lock(session_id):
@@ -25356,15 +27846,23 @@ async def delete_session(session_id: str) -> dict[str, Any]:
                 session_id,
                 resolution="session_deleted",
             )
+            await cancel_claude_interactions(
+                session_id,
+                resolution="session_deleted",
+            )
             interactions_finished = await wait_for_session_tasks(
                 CODEX_INTERACTION_HANDLER_TASKS,
                 session_id,
             )
-            if not interactions_finished:
+            claude_interactions_finished = await wait_for_session_tasks(
+                CLAUDE_INTERACTION_HANDLER_TASKS,
+                session_id,
+            )
+            if not interactions_finished or not claude_interactions_finished:
                 raise HTTPException(
                     status_code=409,
                     detail=(
-                        "Codex approval cleanup is still finishing; "
+                        "Provider approval cleanup is still finishing; "
                         "the session was not deleted. Retry shortly."
                     ),
                 )
@@ -25372,6 +27870,13 @@ async def delete_session(session_id: str) -> dict[str, Any]:
                 QUEUED_TURNS.pop(session_id, None)
                 RUN_NOW_TURNS.pop(session_id, None)
                 STEERING_SESSIONS.discard(session_id)
+            async with RUN_NOW_REQUEST_LOCK:
+                run_now_entry = RUN_NOW_REQUESTS.get(session_id)
+                run_now_task = (
+                    run_now_entry[1]
+                    if run_now_entry is not None
+                    else None
+                )
 
             await cancel_codex_native_actions(session_id)
 
@@ -25395,6 +27900,8 @@ async def delete_session(session_id: str) -> dict[str, Any]:
                 busy = session_id in BUSY_SESSIONS
                 if active and not active.get("codex_native_operation"):
                     active["stop_requested"] = True
+                    if active.get("transport") == CLAUDE_TRANSPORT_AGENT_SDK:
+                        active["claude_permissions_open"] = False
                     if active.get("run_id"):
                         STOPPED_RUNS.add(str(active["run_id"]))
                 elif busy and not active:
@@ -25410,6 +27917,22 @@ async def delete_session(session_id: str) -> dict[str, Any]:
                 ):
                     with suppress(Exception):
                         await native_turn.interrupt()
+                elif (
+                    active.get("transport") == CLAUDE_TRANSPORT_AGENT_SDK
+                    and active.get("claude_sdk_run") is not None
+                ):
+                    try:
+                        await interrupt_claude_sdk_run_bounded(
+                            active["claude_sdk_run"],
+                        )
+                    except Exception:
+                        # A hung/failed interrupt must not wedge deletion.
+                        # Force-retire only this chat; the task-drain check
+                        # below remains the fail-closed deletion barrier.
+                        await evict_claude_sdk_chat(
+                            session_id,
+                            force=True,
+                        )
                 elif proc:
                     await terminate_process_tree(proc)
 
@@ -25425,6 +27948,38 @@ async def delete_session(session_id: str) -> dict[str, Any]:
                         "yet; the session was not deleted. Retry shortly."
                     ),
                 )
+            if (
+                isinstance(run_now_task, asyncio.Task)
+                and run_now_task is not asyncio.current_task()
+                and not run_now_task.done()
+            ):
+                _done, pending_run_now = await asyncio.wait(
+                    {run_now_task},
+                    timeout=max(0.01, CODEX_SESSION_CLEANUP_TIMEOUT_SECONDS),
+                )
+                if pending_run_now:
+                    run_now_task.cancel()
+                    await asyncio.gather(
+                        run_now_task,
+                        return_exceptions=True,
+                    )
+            async with RUN_NOW_REQUEST_LOCK:
+                current_run_now = RUN_NOW_REQUESTS.get(session_id)
+                if (
+                    current_run_now is not None
+                    and current_run_now[1] is run_now_task
+                ):
+                    RUN_NOW_REQUESTS.pop(session_id, None)
+                for cache_key in tuple(RUN_NOW_COMPLETED_RESULTS):
+                    if cache_key[0] == session_id:
+                        RUN_NOW_COMPLETED_RESULTS.pop(cache_key, None)
+            # A native-steer waiter can resolve safe-to-requeue while the turn
+            # is settling. Deletion owns the queue terminally, so clear again
+            # after both the provider task and run-now control have stopped.
+            async with QUEUE_LOCK:
+                QUEUED_TURNS.pop(session_id, None)
+                RUN_NOW_TURNS.pop(session_id, None)
+                STEERING_SESSIONS.discard(session_id)
             # A turn can bind its provider thread after deletion captured the
             # initial session record but before its task acknowledges stop.
             # The task registry is now drained, so this reread is stable.
@@ -25448,6 +28003,21 @@ async def delete_session(session_id: str) -> dict[str, Any]:
                             await manager.unsubscribe_thread(
                                 provider_thread_id
                             )
+            claude_manager = globals().get("CLAUDE_SDK_MANAGER")
+            if claude_manager is not None:
+                claude_evicted = await evict_claude_sdk_chat(
+                    session_id,
+                    force=True,
+                    manager=claude_manager,
+                )
+                if not claude_evicted:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "The Claude chat process is still shutting down; "
+                            "the session was not deleted. Retry shortly."
+                        ),
+                    )
             if provider_thread_ids:
                 async with CODEX_APP_SERVER_THREAD_LRU_LOCK:
                     for provider_thread_id in provider_thread_ids:
@@ -25542,6 +28112,11 @@ async def _fork_session_locked(
     parent_backend = (parent.get("backend") or DEFAULT_BACKEND).lower()
     parent_codex_thread_id = parent.get("codex_thread_id") or (
         parent.get("session_id") if parent_backend == BACKEND_CODEX else None
+    )
+    parent_claude_session_id = (
+        validated_claude_fork_provider_id(parent, session_id, fork_cwd)
+        if parent_backend == BACKEND_CLAUDE
+        else None
     )
     forked_codex_thread_id: str | None = None
     codex_fork_error: str | None = None
@@ -25705,8 +28280,8 @@ async def _fork_session_locked(
         async with STORE._lock:
             STORE.sessions[child["id"]] = child
             await STORE.save()
-    if parent_backend == BACKEND_CLAUDE and (parent.get("claude_session_id") or parent.get("session_id")):
-        child["fork_from"] = parent.get("claude_session_id") or parent.get("session_id")
+    if parent_claude_session_id:
+        child["fork_from"] = parent_claude_session_id
         async with STORE._lock:
             STORE.sessions[child["id"]] = child
             await STORE.save()
@@ -26135,10 +28710,10 @@ async def stop_turn(
     cascade_codex_subagents: bool = True,
     hard_terminalize_on_timeout: bool = True,
 ) -> dict[str, Any]:
-    await cancel_codex_interactions(session_id, resolution="turn_stopped")
     deferred = False
     native_interrupt_reserved = False
     native_control_interrupt_reserved = False
+    native_claude_interrupt_reserved = False
     transition_ready: asyncio.Event | None = None
     owned_tasks: list[asyncio.Task[Any]] = []
     async with ACTIVE_LOCK:
@@ -26147,11 +28722,16 @@ async def stop_turn(
         if active:
             if require_provider_turn_ready and (
                 not active.get("provider_turn_ready")
-                or not active.get("provider_session_id")
+                or (
+                    active.get("transport") == CODEX_TRANSPORT_APP_SERVER
+                    and not active.get("provider_session_id")
+                )
             ):
                 deferred = True
             else:
                 active["stop_requested"] = True
+                if active.get("transport") == CLAUDE_TRANSPORT_AGENT_SDK:
+                    active["claude_permissions_open"] = False
                 if active.get("run_id"):
                     STOPPED_RUNS.add(str(active["run_id"]))
                 transition_value = active.get("logical_transition_ready")
@@ -26175,6 +28755,13 @@ async def stop_turn(
                 ):
                     active["native_interrupt_sent"] = True
                     native_control_interrupt_reserved = True
+                elif (
+                    active.get("transport") == CLAUDE_TRANSPORT_AGENT_SDK
+                    and active.get("claude_sdk_run") is not None
+                    and not active.get("native_interrupt_sent")
+                ):
+                    active["native_interrupt_sent"] = True
+                    native_claude_interrupt_reserved = True
         elif busy:
             if require_provider_turn_ready:
                 deferred = True
@@ -26232,6 +28819,12 @@ async def stop_turn(
             "deferred": True,
             "message": "The provider had not accepted the current turn yet, so it was left running.",
         }
+    # ACTIVE is now fenced with stop_requested under the same lock consulted
+    # by provider permission callbacks. Cancel existing requests only after
+    # that fence, so no callback can register in the old cancel-before-stop
+    # gap and survive this Stop operation.
+    await cancel_codex_interactions(session_id, resolution="turn_stopped")
+    await cancel_claude_interactions(session_id, resolution="turn_stopped")
     if not active:
         if busy:
             deadline = (
@@ -26298,8 +28891,12 @@ async def stop_turn(
             if pending:
                 if (
                     hard_terminalize_on_timeout
-                    and str(session.get("backend") or "") == BACKEND_CODEX
+                    and str(session.get("backend") or "") in {
+                        BACKEND_CODEX,
+                        BACKEND_CLAUDE,
+                    }
                 ):
+                    backend = str(session.get("backend") or "")
                     run_id = str(current_turn.get("run_id") or "") or None
                     if run_id:
                         STOPPED_RUNS.add(run_id)
@@ -26310,6 +28907,11 @@ async def stop_turn(
                             pending,
                             timeout=min(1.0, STOP_CONFIRM_TIMEOUT_SECONDS),
                         )
+                    if backend == BACKEND_CLAUDE:
+                        await evict_claude_sdk_chat(
+                            session_id,
+                            force=True,
+                        )
                     await release_turn_slot(
                         session_id,
                         expected_run_id=run_id,
@@ -26317,9 +28919,9 @@ async def stop_turn(
                     if emit_event:
                         await append_event(session_id, "turn_stopped", {
                             "run_id": run_id,
-                            "backend": BACKEND_CODEX,
+                            "backend": backend,
                             "message": (
-                                "Stopped while the Codex agent process was "
+                                "Stopped while the agent process was "
                                 "still starting."
                             ),
                             "hard_stop": True,
@@ -26327,8 +28929,10 @@ async def stop_turn(
                     RUN_METADATA.pop(run_id, None) if run_id else None
                     if run_id and all(task.done() for task in pending):
                         STOPPED_RUNS.discard(run_id)
-                    goal_result = await settle_idle_codex_goal_for_stop(
-                        session_id
+                    goal_result = (
+                        await settle_idle_codex_goal_for_stop(session_id)
+                        if backend == BACKEND_CODEX
+                        else {}
                     )
                     return {
                         "ok": True,
@@ -26423,7 +29027,7 @@ async def stop_turn(
         reason: str,
         tasks: set[asyncio.Task[Any]],
     ) -> dict[str, Any]:
-        """Bound explicit Stop even if a local app-server consumer is stale."""
+        """Bound explicit Stop even if a managed provider consumer is stale."""
 
         run_id = str(active.get("run_id") or "") or None
         if run_id:
@@ -26440,6 +29044,16 @@ async def stop_turn(
             await asyncio.wait(
                 owned,
                 timeout=min(1.0, STOP_CONFIRM_TIMEOUT_SECONDS),
+            )
+        is_claude_sdk = (
+            active.get("transport") == CLAUDE_TRANSPORT_AGENT_SDK
+        )
+        if is_claude_sdk:
+            # Force teardown is scoped to this chat's actor/CLI. Other Claude
+            # chats remain untouched even when this consumer is wedged.
+            await evict_claude_sdk_chat(
+                session_id,
+                force=True,
             )
 
         # A natural terminal notification may have won the race with local
@@ -26462,18 +29076,20 @@ async def stop_turn(
                 "subagents": subagent_stop,
             }
 
-        thread_id = str(
-            active.get("provider_thread_id")
-            or active.get("provider_session_id")
-            or session_provider_id(STORE.sessions.get(session_id) or {})
-            or ""
-        ).strip()
-        fenced = await quarantine_codex_goal_thread(
-            session_id,
-            thread_id,
-            run_id=run_id,
-            reason=reason,
-        )
+        fenced = False
+        if not is_claude_sdk:
+            thread_id = str(
+                active.get("provider_thread_id")
+                or active.get("provider_session_id")
+                or session_provider_id(STORE.sessions.get(session_id) or {})
+                or ""
+            ).strip()
+            fenced = await quarantine_codex_goal_thread(
+                session_id,
+                thread_id,
+                run_id=run_id,
+                reason=reason,
+            )
         released = await release_turn_slot(
             session_id,
             expected_run_id=run_id,
@@ -26498,7 +29114,7 @@ async def stop_turn(
                 "goal_fenced": fenced,
                 "hard_stop": True,
                 "message": (
-                    "Stopped after Codex did not acknowledge interruption in time."
+                    "Stopped after the provider did not acknowledge interruption in time."
                 ),
             })
         if run_id:
@@ -26515,8 +29131,15 @@ async def stop_turn(
             "goal_fenced": fenced,
             "subagents": subagent_stop,
             "message": (
-                "Turn stopped. The stale Codex thread was fenced and will not "
-                "be reused."
+                (
+                    "Turn stopped. The unresponsive Claude chat process was "
+                    "retired and will reconnect on the next turn."
+                )
+                if is_claude_sdk
+                else (
+                    "Turn stopped. The stale Codex thread was fenced and will "
+                    "not be reused."
+                )
             ),
         }
 
@@ -26555,6 +29178,23 @@ async def stop_turn(
                 session_id,
                 exc,
             )
+    elif native_claude_interrupt_reserved:
+        claude_sdk_run = active.get("claude_sdk_run")
+        try:
+            await interrupt_claude_sdk_run_bounded(
+                claude_sdk_run,
+            )
+            native_interrupt = True
+        except Exception as exc:
+            async with ACTIVE_LOCK:
+                current = ACTIVE.get(session_id)
+                if current is active:
+                    current["native_interrupt_sent"] = False
+            logger.warning(
+                "Claude Agent SDK interrupt failed session=%s error=%s",
+                session_id,
+                exc,
+            )
     if (
         cascade_codex_subagents
         and str(session.get("backend") or "") == BACKEND_CODEX
@@ -26584,13 +29224,16 @@ async def stop_turn(
                     current["native_interrupt_sent"] = False
             if (
                 hard_terminalize_on_timeout
-                and active.get("transport") == CODEX_TRANSPORT_APP_SERVER
+                and active.get("transport") in {
+                    CODEX_TRANSPORT_APP_SERVER,
+                    CLAUDE_TRANSPORT_AGENT_SDK,
+                }
             ):
                 return await hard_terminalize_active_stop(
                     native_interrupt=native_interrupt,
                     reason=(
                         goal_pause_error
-                        or "Codex steering transition did not settle after Stop."
+                        or "Provider steering transition did not settle after Stop."
                     ),
                     tasks=set(owned_tasks),
                 )
@@ -26711,13 +29354,16 @@ async def stop_turn(
             current["native_interrupt_sent"] = False
     if (
         hard_terminalize_on_timeout
-        and active.get("transport") == CODEX_TRANSPORT_APP_SERVER
+        and active.get("transport") in {
+            CODEX_TRANSPORT_APP_SERVER,
+            CLAUDE_TRANSPORT_AGENT_SDK,
+        }
     ):
         return await hard_terminalize_active_stop(
             native_interrupt=native_interrupt,
             reason=(
                 goal_pause_error
-                or "Codex did not confirm the requested Stop before timeout."
+                or "The provider did not confirm the requested Stop before timeout."
             ),
             tasks=dynamic_tasks,
         )
@@ -26729,7 +29375,7 @@ async def stop_turn(
         "goal_paused": goal_paused,
         "message": (
             goal_pause_error
-            or "Stop was sent; waiting for Codex to finish stopping."
+            or "Stop was sent; waiting for the provider to finish stopping."
         ),
     }
 

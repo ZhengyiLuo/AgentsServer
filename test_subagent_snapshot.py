@@ -337,6 +337,59 @@ class ClaudeSubagentSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(latest["subagent_log"]), agent_server.SUBAGENT_SNAPSHOT_LOG_LIMIT)
         self.assertEqual(latest["subagent_log"][-1]["text"], f"Step {agent_server.SUBAGENT_SNAPSHOT_LOG_LIMIT + 24}")
 
+    def test_sanitized_sdk_lifecycle_completes_background_agent(self) -> None:
+        self.write_events([
+            self.event(1, "tool_started", tool={
+                "id": "agent-tool",
+                "name": "Agent",
+                "input": {"description": "Review the server", "run_in_background": True},
+            }),
+            self.event(2, "raw_event", backend=agent_server.BACKEND_CLAUDE, raw=json.dumps({
+                "type": "user",
+                "tool_use_result": {
+                    "status": "async_launched",
+                    "isAsync": True,
+                    "agentId": "task-1",
+                    "task_id": "",
+                },
+                "message": {"content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "agent-tool",
+                }]},
+            })),
+            self.event(3, "raw_event", backend=agent_server.BACKEND_CLAUDE, raw=json.dumps({
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": "task-1",
+                "tool_use_id": "agent-tool",
+                "task_type": "local_agent",
+                "description": "Review the server",
+            })),
+            self.event(4, "raw_event", backend=agent_server.BACKEND_CLAUDE, raw=json.dumps({
+                "type": "system",
+                "subtype": "task_progress",
+                "task_id": "task-1",
+                "description": "Running tests",
+                "last_tool_name": "Bash",
+            })),
+            self.event(5, "raw_event", backend=agent_server.BACKEND_CLAUDE, raw=json.dumps({
+                "type": "system",
+                "subtype": "task_updated",
+                "task_id": "task-1",
+                "patch": {"status": "completed", "summary": "Review complete"},
+            })),
+        ])
+
+        snapshot = agent_server.build_claude_subagent_snapshot(self.session_id)
+
+        self.assertEqual(snapshot["active_count"], 0)
+        self.assertEqual(len(snapshot["subagents"]), 1)
+        self.assertEqual(snapshot["subagents"][0]["subagent_status"], "completed")
+        self.assertEqual(
+            snapshot["subagents"][0]["subagent_summary"],
+            "Review complete",
+        )
+
     async def test_endpoint_offloads_snapshot_and_rejects_unknown_sessions(self) -> None:
         self.write_events([])
         original_to_thread = asyncio.to_thread

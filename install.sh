@@ -189,7 +189,7 @@ append_server_path "/usr/local/bin"
 append_server_path "/usr/bin"
 append_server_path "/bin"
 export PATH="$SERVER_PATH"
-RELEASE_FILES=(agent_server.py agentsdock_jobs.py agentsdock_publish.py codex_app_server.py install.sh uninstall.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem)
+RELEASE_FILES=(agent_server.py agentsdock_jobs.py agentsdock_publish.py claude_sdk_client.py codex_app_server.py install.sh uninstall.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem)
 
 for name in "${RELEASE_FILES[@]}"; do
   if [[ ! -f "$SOURCE_DIR/$name" ]]; then
@@ -577,11 +577,13 @@ if [[ ! -d "$STAGE_DIR/.venv" || -L "$STAGE_DIR/.venv" || ! -x "$STAGE_DIR/.venv
   exit 1
 fi
 "$STAGE_DIR/.venv/bin/python" -c 'import websockets' >/dev/null
+"$STAGE_DIR/.venv/bin/python" -c 'from importlib.metadata import version; import claude_agent_sdk; sdk_version = version("claude-agent-sdk"); raise SystemExit(0 if sdk_version == "0.2.130" else f"expected claude-agent-sdk 0.2.130, got {sdk_version}")'
 "$STAGE_DIR/.venv/bin/python" -c 'import croniter, dateutil; from zoneinfo import ZoneInfo; ZoneInfo("America/Los_Angeles")' >/dev/null
 "$STAGE_DIR/.venv/bin/python" -m py_compile \
   "$STAGE_DIR/agent_server.py" \
   "$STAGE_DIR/agentsdock_jobs.py" \
   "$STAGE_DIR/agentsdock_publish.py" \
+  "$STAGE_DIR/claude_sdk_client.py" \
   "$STAGE_DIR/codex_app_server.py" \
   "$STAGE_DIR/update_runner.py"
 

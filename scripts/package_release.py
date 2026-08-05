@@ -17,6 +17,7 @@ FILES = (
     "agent_server.py",
     "agentsdock_jobs.py",
     "agentsdock_publish.py",
+    "claude_sdk_client.py",
     "codex_app_server.py",
     "install.sh",
     "uninstall.sh",

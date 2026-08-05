@@ -441,6 +441,9 @@ without losing chat state:
 | `AGENTS_SERVER_INSTALL_DIR` | Versioned server runtime root | `~/.local/share/agents-server` |
 | `AGENTSDOCK_BACKEND` | Default backend, `claude` or `codex` | `claude` |
 | `CLAUDE_BIN` | Claude Code executable name/path | `claude` |
+| `AGENTSDOCK_CLAUDE_TRANSPORT` | Interactive Claude transport: `auto`, `agent-sdk`, or `print` | `auto` |
+| `AGENTSDOCK_CLAUDE_SDK_IDLE_TTL_SECONDS` | Idle per-chat SDK client retention | `300` |
+| `AGENTSDOCK_CLAUDE_SDK_MAX_LOADED_CHATS` | Maximum retained per-chat SDK clients | `4` |
 | `CODEX_BIN` | Codex executable name/path | `codex` |
 | `AGENTSDOCK_RUNTIME_DIAGNOSTIC_TTL_SECONDS` | Cache lifetime for safe CLI version/auth probes | `60` |
 | `CLAUDE_PROJECTS_ROOT` | Claude history search root | `~/.claude/projects` |
@@ -473,6 +476,23 @@ AGENTSDOCK_HANDOFF_DIGEST_MODEL=sonnet
 
 You can switch it to Codex or another installed CLI model, but the relevant CLI
 must already be authenticated for the same Unix user that runs the service.
+
+## Claude Agent SDK Transport
+
+Interactive desktop clients can opt individual Claude chats into a persistent,
+per-chat `ClaudeSDKClient`. This enables native steering plus approval and
+question cards without sharing one Claude process across chats. The server
+advertises the exact `claude_sdk_interactive_v1` capability before the desktop
+app opts in.
+
+Set `AGENTSDOCK_CLAUDE_TRANSPORT` to `auto` (default), `agent-sdk`, or `print`.
+`print` always uses the compatible `claude -p` path. Clients that do not send
+the exact capability—including older iOS builds and scheduled jobs—also remain
+on `claude -p`, regardless of the server's interactive transport setting.
+
+Idle SDK clients are retained for at most five minutes by default, with up to
+four chat processes loaded. Active chats are never evicted to enforce the idle
+limit.
 
 ## Backend CLI Notes
 

@@ -362,6 +362,92 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second["run_id"], "run-steered")
         self.assertEqual(handoff.call_count, 2)
 
+    async def test_retry_safe_handoff_returns_deferred_queue_outcome(self) -> None:
+        retry_safe = agent_server.NativeSteerHandoffError(
+            "the active Codex turn has already completed",
+            safe_to_requeue=True,
+        )
+        with patch.object(
+            agent_server,
+            "_run_queued_turn_now_once",
+            side_effect=retry_safe,
+        ):
+            result = await run_queued_turn_now("chat-1", "queued-steer")
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["deferred"])
+        self.assertTrue(result["retryable"])
+        self.assertFalse(result["delivery_uncertain"])
+        self.assertEqual(result["remaining"], 1)
+        self.assertIn("kept for normal queue delivery", result["message"])
+        self.assertEqual(
+            [item["queued_id"] for item in agent_server.QUEUED_TURNS["chat-1"]],
+            ["queued-steer"],
+        )
+        self.assertNotIn("chat-1", agent_server.RUN_NOW_REQUESTS)
+        self.assertFalse(agent_server.RUN_NOW_COMPLETED_RESULTS)
+
+    async def test_deferred_response_requires_explicit_client_capability(self) -> None:
+        deferred = {
+            "ok": False,
+            "queued_id": "queued-steer",
+            "deferred": True,
+            "retryable": True,
+            "delivery_uncertain": False,
+            "message": "The message remains queued.",
+            "remaining": 1,
+        }
+        with patch.object(
+            agent_server,
+            "run_queued_turn_now",
+            new_callable=AsyncMock,
+            return_value=deferred,
+        ):
+            with self.assertRaises(agent_server.HTTPException) as legacy:
+                await agent_server.post_run_queued_turn_now(
+                    "chat-1",
+                    "queued-steer",
+                )
+            capable = await agent_server.post_run_queued_turn_now(
+                "chat-1",
+                "queued-steer",
+                agent_server.RunQueuedTurnNowRequest(
+                    accept_deferred_queue_response=True,
+                ),
+            )
+
+        self.assertEqual(legacy.exception.status_code, 409)
+        self.assertEqual(legacy.exception.detail["code"], "force_send_deferred")
+        self.assertTrue(legacy.exception.detail["retryable"])
+        self.assertFalse(legacy.exception.detail["delivery_uncertain"])
+        self.assertEqual(capable, deferred)
+
+    async def test_delivery_uncertain_handoff_is_explicit_non_retryable_conflict(self) -> None:
+        uncertain = agent_server.NativeSteerHandoffError(
+            "the provider turn completed at the Force Send boundary",
+            safe_to_requeue=False,
+            delivery_uncertain=True,
+        )
+        with patch.object(
+            agent_server,
+            "run_queued_turn_now",
+            new_callable=AsyncMock,
+            side_effect=uncertain,
+        ):
+            with self.assertRaises(agent_server.HTTPException) as raised:
+                await agent_server.post_run_queued_turn_now(
+                    "chat-1",
+                    "queued-steer",
+                )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        detail = raised.exception.detail
+        self.assertEqual(detail["code"], "force_send_delivery_uncertain")
+        self.assertFalse(detail["retryable"])
+        self.assertTrue(detail["delivery_uncertain"])
+        self.assertEqual(detail["queued_id"], "queued-steer")
+        self.assertIn("Do not retry automatically", detail["action"])
+
     async def test_different_force_send_is_rejected_with_friendly_state(
         self,
     ) -> None:

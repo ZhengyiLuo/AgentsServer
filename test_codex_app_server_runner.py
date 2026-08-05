@@ -2372,11 +2372,23 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         agent_server.QUEUED_TURNS["chat-native"] = deque(
             [
                 {
+                    "queued_id": "queued-before-completion",
+                    "prompt": "Remove me while Force Send is pending",
+                    "file_ids": [],
+                    "backend": agent_server.BACKEND_CODEX,
+                },
+                {
                     "queued_id": "queued-at-completion",
                     "prompt": "Too late to steer",
                     "file_ids": [],
                     "backend": agent_server.BACKEND_CODEX,
-                }
+                },
+                {
+                    "queued_id": "queued-after-completion",
+                    "prompt": "Keep me after the deferred message",
+                    "file_ids": [],
+                    "backend": agent_server.BACKEND_CODEX,
+                },
             ]
         )
         stack, _events, _finished, _exec_fallback = self.runner_patches(manager)
@@ -2411,12 +2423,29 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             else:
                 self.fail("Force Send never reached the native runner queue")
 
+            async with agent_server.QUEUE_LOCK:
+                agent_server.QUEUED_TURNS["chat-native"] = deque(
+                    item
+                    for item in agent_server.QUEUED_TURNS["chat-native"]
+                    if item.get("queued_id") != "queued-before-completion"
+                )
             manager.release_turn_start.set()
             await asyncio.wait_for(runner, timeout=2)
-            with self.assertRaises(agent_server.CodexAppServerError):
-                await asyncio.wait_for(force_send, timeout=2)
+            result = await asyncio.wait_for(force_send, timeout=2)
 
         self.assertTrue(force_send.done())
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["deferred"])
+        self.assertTrue(result["retryable"])
+        self.assertFalse(result["delivery_uncertain"])
+        self.assertEqual(result["remaining"], 2)
+        self.assertEqual(
+            [
+                item["queued_id"]
+                for item in agent_server.QUEUED_TURNS["chat-native"]
+            ],
+            ["queued-at-completion", "queued-after-completion"],
+        )
 
     async def test_completion_during_steer_ack_is_terminally_uncertain(self) -> None:
         turn = GatedSteerTurn()
@@ -2654,7 +2683,21 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             "file_ids": [],
             "backend": agent_server.BACKEND_CODEX,
         }
-        agent_server.QUEUED_TURNS["chat-native"] = deque([selected])
+        agent_server.QUEUED_TURNS["chat-native"] = deque([
+            {
+                "queued_id": "queued-before",
+                "prompt": "Keep this before the rejected steer",
+                "file_ids": [],
+                "backend": agent_server.BACKEND_CODEX,
+            },
+            selected,
+            {
+                "queued_id": "queued-after",
+                "prompt": "Keep this after the rejected steer",
+                "file_ids": [],
+                "backend": agent_server.BACKEND_CODEX,
+            },
+        ])
         stack, _events, _finished, _exec_fallback = self.runner_patches(manager)
         with stack:
             runner = asyncio.create_task(
@@ -2687,16 +2730,19 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(force_send, done)
             turn.feed(completed_notification())
             await asyncio.wait_for(runner, timeout=2)
-            with self.assertRaises(agent_server.NativeSteerHandoffError) as raised:
-                await force_send
+            result = await force_send
 
-        self.assertTrue(raised.exception.safe_to_requeue)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["deferred"])
+        self.assertTrue(result["retryable"])
+        self.assertFalse(result["delivery_uncertain"])
+        self.assertEqual(result["remaining"], 3)
         self.assertEqual(
             [
                 item["queued_id"]
                 for item in agent_server.QUEUED_TURNS["chat-native"]
             ],
-            ["queued-rejected"],
+            ["queued-before", "queued-rejected", "queued-after"],
         )
         self.assertEqual(turn.interrupt_calls, 0)
 

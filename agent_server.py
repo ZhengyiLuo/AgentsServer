@@ -3037,6 +3037,10 @@ class MoveQueuedTurnRequest(BaseModel):
     direction: str
 
 
+class RunQueuedTurnNowRequest(BaseModel):
+    accept_deferred_queue_response: bool = False
+
+
 class ForkSessionRequest(BaseModel):
     title: str | None = None
 
@@ -6006,6 +6010,55 @@ async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]
     return await asyncio.shield(task)
 
 
+async def deferred_force_send_outcome(
+    session_id: str,
+    queued_id: str,
+    error: NativeSteerHandoffError,
+) -> dict[str, Any]:
+    """Describe a retry-safe handoff race without turning it into HTTP 500."""
+    async with QUEUE_LOCK:
+        remaining = len(QUEUED_TURNS.get(session_id) or ())
+    reason = concise_error_message(error)
+    return {
+        "ok": False,
+        "queued_id": queued_id,
+        "interrupted": False,
+        "deferred": True,
+        "retryable": True,
+        "delivery_uncertain": False,
+        "replays_interrupted_message": False,
+        "message": (
+            f"Force Send was deferred: {reason}. "
+            "The message was kept for normal queue delivery."
+        ),
+        "remaining": remaining,
+        "superseded_queued_ids": [],
+    }
+
+
+def deferred_force_send_response_for_client(
+    result: dict[str, Any],
+    request: RunQueuedTurnNowRequest | None,
+) -> dict[str, Any]:
+    """Expose the additive deferred contract only to clients that opt in."""
+    if request is not None and request.accept_deferred_queue_response:
+        return result
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "force_send_deferred",
+            "message": str(
+                result.get("message")
+                or "Force Send was deferred and the message remains queued."
+            ),
+            "action": "Refresh the queue before trying Force Send again.",
+            "retryable": True,
+            "delivery_uncertain": False,
+            "queued_id": result.get("queued_id"),
+        },
+    )
+
+
 async def _run_queued_turn_now_and_release(
     session_id: str,
     queued_id: str,
@@ -6016,6 +6069,9 @@ async def _run_queued_turn_now_and_release(
         result = await _run_queued_turn_now_once(session_id, queued_id)
         return result
     except NativeSteerHandoffError as exc:
+        if exc.safe_to_requeue:
+            result = await deferred_force_send_outcome(session_id, queued_id, exc)
+            return result
         if exc.delivery_uncertain or not exc.safe_to_requeue:
             uncertain_error = {"message": str(exc)}
         raise
@@ -6064,6 +6120,8 @@ async def _run_queued_turn_now_once(
 
     selected: dict[str, Any] | None = None
     selected_index: int | None = None
+    selected_predecessor_id: str | None = None
+    selected_successor_id: str | None = None
     native_steer = False
     native_steer_queue = active_turn.get("native_steer_queue")
     remaining: int
@@ -6085,6 +6143,14 @@ async def _run_queued_turn_now_once(
             )
             if selected_index is not None:
                 selected = items[selected_index]
+                if selected_index > 0:
+                    selected_predecessor_id = str(
+                        items[selected_index - 1].get("queued_id") or ""
+                    ) or None
+                if selected_index + 1 < len(items):
+                    selected_successor_id = str(
+                        items[selected_index + 1].get("queued_id") or ""
+                    ) or None
                 selected_backend = (
                     selected.get("backend")
                     or STORE.sessions[session_id].get("backend")
@@ -6143,7 +6209,37 @@ async def _run_queued_turn_now_once(
             ):
                 async with QUEUE_LOCK:
                     items = list(QUEUED_TURNS.get(session_id) or [])
-                    items.insert(min(selected_index, len(items)), selected)
+                    successor_index = (
+                        next(
+                            (
+                                idx
+                                for idx, item in enumerate(items)
+                                if item.get("queued_id") == selected_successor_id
+                            ),
+                            None,
+                        )
+                        if selected_successor_id is not None
+                        else None
+                    )
+                    predecessor_index = (
+                        next(
+                            (
+                                idx
+                                for idx, item in enumerate(items)
+                                if item.get("queued_id") == selected_predecessor_id
+                            ),
+                            None,
+                        )
+                        if selected_predecessor_id is not None
+                        else None
+                    )
+                    if successor_index is not None:
+                        insert_at = successor_index
+                    elif predecessor_index is not None:
+                        insert_at = predecessor_index + 1
+                    else:
+                        insert_at = min(selected_index, len(items))
+                    items.insert(insert_at, selected)
                     QUEUED_TURNS[session_id] = deque(items)
             raise
         finally:
@@ -25351,8 +25447,45 @@ async def post_move_queued_turn(session_id: str, queued_id: str, req: MoveQueued
 
 
 @app.post("/api/sessions/{session_id}/queue/{queued_id}/run-now")
-async def post_run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]:
-    return await run_queued_turn_now(session_id, queued_id)
+async def post_run_queued_turn_now(
+    session_id: str,
+    queued_id: str,
+    req: RunQueuedTurnNowRequest | None = None,
+) -> dict[str, Any]:
+    try:
+        result = await run_queued_turn_now(session_id, queued_id)
+        if result.get("deferred"):
+            return deferred_force_send_response_for_client(result, req)
+        return result
+    except NativeSteerHandoffError as exc:
+        # Retry-safe races normally become deferred outcomes in the coalesced
+        # operation above. Keep this defensive boundary so no future handoff
+        # path can leak an expected provider-completion race as a raw 500.
+        if exc.safe_to_requeue:
+            result = await deferred_force_send_outcome(session_id, queued_id, exc)
+            return deferred_force_send_response_for_client(result, req)
+        delivery_uncertain = bool(exc.delivery_uncertain)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": (
+                    "force_send_delivery_uncertain"
+                    if delivery_uncertain
+                    else "force_send_not_retryable"
+                ),
+                "message": (
+                    "Force Send delivery could not be confirmed: "
+                    f"{concise_error_message(exc)}"
+                ),
+                "action": (
+                    "Do not retry automatically. Refresh the chat and verify "
+                    "whether the message appeared."
+                ),
+                "retryable": False,
+                "delivery_uncertain": delivery_uncertain,
+                "queued_id": queued_id,
+            },
+        ) from exc
 
 
 @app.post("/api/sessions/{session_id}/stop")

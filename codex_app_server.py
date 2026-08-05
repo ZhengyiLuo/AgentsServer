@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import time
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
@@ -442,6 +443,7 @@ class CodexAppServerClient:
         process_stream_limit: int = 16 * 1024 * 1024,
         notification_queue_limit: int = 8192,
         json_parse_thread_threshold: int = 1024 * 1024,
+        fork_cleanup_grace: float = 30.0,
         process_factory: ProcessFactory | None = None,
         server_request_handler: ServerRequestHandler | None = None,
         initialize_params: dict[str, Any] | None = None,
@@ -459,6 +461,10 @@ class CodexAppServerClient:
             0,
             int(json_parse_thread_threshold),
         )
+        # Fork creation itself may consume the full lifecycle timeout. Allow a
+        # substantial post-timeout window for the adjacent thread/started
+        # notification instead of relying on sub-second scheduling luck.
+        self.fork_cleanup_grace = max(0.0, float(fork_cleanup_grace))
         self._process_factory = process_factory or asyncio.create_subprocess_exec
         self._server_request_handler = server_request_handler or decline_server_request
         self._initialize_params = initialize_params or {
@@ -474,6 +480,10 @@ class CodexAppServerClient:
         self._stderr_task: asyncio.Task[None] | None = None
         self._start_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
+        # A timed-out/cancelled thread/fork may still finish in app-server.
+        # Keep each source serialized through its late-notification cleanup so
+        # one watcher can never claim a later fork from the same source.
+        self._fork_source_locks: dict[str, asyncio.Lock] = {}
         self._next_id = 0
         self._pending: dict[
             int,
@@ -485,6 +495,10 @@ class CodexAppServerClient:
         ] = {}
         self._turns_by_thread: dict[str, CodexAppServerTurn] = {}
         self._loaded_threads: set[str] = set()
+        # Provider identity outlives subscription/load state for one app-server
+        # process. Fork cleanup uses this to distinguish a newly-created child
+        # from an existing child that another operation merely resumed.
+        self._known_thread_ids: set[str] = set()
         self._subscriptions: set[CodexAppServerSubscription] = set()
         self._notification_handlers: set[NotificationHandler] = set()
         self._callback_tasks: set[asyncio.Task[Any]] = set()
@@ -678,6 +692,7 @@ class CodexAppServerClient:
             or stderr_task
             or self._pending
             or self._turns_by_thread
+            or self._known_thread_ids
             or self._subscriptions
             or self._server_request_tasks
         )
@@ -737,6 +752,7 @@ class CodexAppServerClient:
 
         self._turns_by_thread.clear()
         self._loaded_threads.clear()
+        self._known_thread_ids.clear()
         for subscription in tuple(self._subscriptions):
             subscription._finish(error)
 
@@ -999,6 +1015,12 @@ class CodexAppServerClient:
                 )
             )
 
+        # Synchronous handlers (including the scoped fork watcher) must see
+        # whether this identity was known *before* this notification. Record a
+        # genuinely new notification only after they have made that decision.
+        if method == "thread/started" and thread_id:
+            self._known_thread_ids.add(thread_id)
+
         if method == "turn/completed" and active_turn:
             if not turn_id or not active_turn.turn_id or turn_id == active_turn.turn_id:
                 active_turn._completed = True
@@ -1122,6 +1144,7 @@ class CodexAppServerClient:
             timeout=self.lifecycle_timeout,
         )
         thread_id = self._thread_id_from_result("thread/start", result)
+        self._known_thread_ids.add(thread_id)
         self._loaded_threads.add(thread_id)
         return thread_id
 
@@ -1130,6 +1153,10 @@ class CodexAppServerClient:
         thread_id: str,
         params: dict[str, Any] | None = None,
     ) -> str:
+        thread_id = _require_nonempty_string(thread_id, "thread_id")
+        # Register before the first await: thread/started can be routed before
+        # the resume response and must not look like this process's late fork.
+        self._known_thread_ids.add(thread_id)
         payload = dict(params or {})
         payload["threadId"] = thread_id
         payload.setdefault("excludeTurns", True)
@@ -1139,6 +1166,7 @@ class CodexAppServerClient:
             timeout=self.lifecycle_timeout,
         )
         resolved = self._thread_id_from_result("thread/resume", result)
+        self._known_thread_ids.add(resolved)
         if resolved != thread_id:
             raise CodexAppServerProtocolError(
                 "thread/resume returned a different thread id",
@@ -1155,25 +1183,186 @@ class CodexAppServerClient:
         *,
         last_turn_id: str | None = None,
     ) -> str:
+        thread_id = _require_nonempty_string(thread_id, "thread_id")
+        # The source itself is provider-owned even if it is currently unloaded.
+        self._known_thread_ids.add(thread_id)
+        source_lock = self._fork_source_locks.setdefault(
+            thread_id,
+            asyncio.Lock(),
+        )
+        async with source_lock:
+            return await self._fork_thread_serialized(
+                thread_id,
+                params,
+                last_turn_id=last_turn_id,
+            )
+
+    async def _fork_thread_serialized(
+        self,
+        thread_id: str,
+        params: dict[str, Any] | None,
+        *,
+        last_turn_id: str | None,
+    ) -> str:
         payload = dict(params or {})
         payload["threadId"] = thread_id
         payload.setdefault("excludeTurns", True)
         if last_turn_id is not None:
             payload["lastTurnId"] = last_turn_id
-        result = await self.request(
-            "thread/fork",
-            payload,
-            timeout=self.lifecycle_timeout,
-        )
+        expected_cwd = str(payload.get("cwd") or "").strip()
+        fork_started_at = int(time.time())
+        late_children: asyncio.Queue[str] = asyncio.Queue()
+        queued_late_children: set[str] = set()
+
+        def watch_started_fork(notification: dict[str, Any]) -> None:
+            if notification.get("method") != "thread/started":
+                return
+            notification_params = notification.get("params")
+            thread = (
+                notification_params.get("thread")
+                if isinstance(notification_params, dict)
+                else None
+            )
+            if not isinstance(thread, dict):
+                return
+            child_id = str(thread.get("id") or "").strip()
+            forked_from_id = str(thread.get("forkedFromId") or "").strip()
+            child_cwd = str(thread.get("cwd") or "").strip()
+            created_at = thread.get("createdAt")
+            if (
+                child_id
+                and child_id != thread_id
+                and forked_from_id == thread_id
+                and child_id not in self._known_thread_ids
+                and child_id not in queued_late_children
+                # Destructive cleanup requires request-local evidence. An old
+                # fork resumed after an app-server reconnect can share the same
+                # ancestry but cannot share this creation window.
+                and expected_cwd
+                and child_cwd == expected_cwd
+                and isinstance(created_at, int)
+                and not isinstance(created_at, bool)
+                and fork_started_at - 1 <= created_at <= int(time.time()) + 1
+            ):
+                queued_late_children.add(child_id)
+                late_children.put_nowait(child_id)
+
+        # This must be installed before the request is written. A fast provider
+        # can announce the child before returning the JSON-RPC response.
+        self.add_notification_handler(watch_started_fork)
+        try:
+            try:
+                result = await self.request(
+                    "thread/fork",
+                    payload,
+                    timeout=self.lifecycle_timeout,
+                )
+            except BaseException as exc:
+                ambiguous = isinstance(
+                    exc,
+                    (asyncio.CancelledError, CodexAppServerTimeout),
+                ) or (
+                    isinstance(exc, CodexAppServerDisconnected)
+                    and exc.request_sent
+                )
+                if ambiguous:
+                    cleanup = asyncio.create_task(
+                        self._delete_late_fork_child(late_children)
+                    )
+                    try:
+                        unretired_thread_ids = await self._join_shielded_task(
+                            cleanup
+                        )
+                    except BaseException:
+                        # The timeout/cancellation is the actionable transport
+                        # result. A cleanup failure before a child identity is
+                        # known must not hide it.
+                        pass
+                    else:
+                        if unretired_thread_ids:
+                            # Preserve the original timeout/cancellation while
+                            # handing the known provider identity to the owning
+                            # layer for durable cleanup. A tuple prevents later
+                            # mutation while the exception crosses task layers.
+                            exc.unretired_fork_thread_ids = tuple(
+                                unretired_thread_ids
+                            )
+                raise
+        finally:
+            self.remove_notification_handler(watch_started_fork)
         resolved = self._thread_id_from_result("thread/fork", result)
+        self._known_thread_ids.add(resolved)
+        if resolved == thread_id:
+            raise CodexAppServerProtocolError(
+                "thread/fork returned the source thread id",
+                request_sent=True,
+                safe_to_retry=False,
+            )
+        thread = result.get("thread") if isinstance(result, dict) else None
+        forked_from_id = (
+            thread.get("forkedFromId") if isinstance(thread, dict) else None
+        )
+        if forked_from_id is not None and forked_from_id != thread_id:
+            error = CodexAppServerProtocolError(
+                "thread/fork returned a thread with a different source id",
+                request_sent=True,
+                safe_to_retry=False,
+            )
+            cleanup = asyncio.create_task(self.delete_thread(resolved))
+            try:
+                await self._join_shielded_task(cleanup)
+            except BaseException:
+                # Preserve the ancestry violation even when an older provider
+                # cannot delete the untrusted child.
+                pass
+            raise error
         self._loaded_threads.add(resolved)
         return resolved
+
+    async def _delete_late_fork_child(
+        self,
+        late_children: asyncio.Queue[str],
+    ) -> tuple[str, ...]:
+        """Delete an announced child or return identities needing retirement."""
+
+        try:
+            child_id = await asyncio.wait_for(
+                late_children.get(),
+                timeout=self.fork_cleanup_grace,
+            )
+        except asyncio.TimeoutError:
+            return ()
+        # Drain notifications already routed in this event-loop turn. If more
+        # than one request-correlated identity exists, ownership is ambiguous;
+        # leak an unexposed provider fork rather than deleting user history.
+        await asyncio.sleep(0)
+        candidates = {child_id}
+        while not late_children.empty():
+            candidates.add(late_children.get_nowait())
+        if len(candidates) != 1:
+            return ()
+        try:
+            await self.delete_thread(child_id)
+        except BaseException:
+            return (child_id,)
+        return ()
+
+    @staticmethod
+    async def _join_shielded_task(task: asyncio.Task[Any]) -> Any:
+        """Join cleanup even if the caller receives repeated cancellation."""
+
+        while True:
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if task.done():
+                    return task.result()
 
     @staticmethod
     def _thread_id_from_result(method: str, result: Any) -> str:
         thread = result.get("thread") if isinstance(result, dict) else None
         resolved = str(thread.get("id") or "") if isinstance(thread, dict) else ""
-        if not resolved:
+        if not resolved.strip():
             raise CodexAppServerProtocolError(
                 f"{method} did not return a thread id",
                 request_sent=True,
@@ -1210,18 +1399,44 @@ class CodexAppServerClient:
         *,
         include_turns: bool = False,
     ) -> dict[str, Any]:
+        thread_id = _require_nonempty_string(thread_id, "thread_id")
+        # A read is sufficient proof that the provider identity predates any
+        # concurrent fork watcher, regardless of current load state.
+        self._known_thread_ids.add(thread_id)
         result = await self.request(
             "thread/read",
             {"threadId": thread_id, "includeTurns": include_turns},
         )
         thread = result.get("thread") if isinstance(result, dict) else None
-        if not isinstance(thread, dict) or str(thread.get("id") or "") != thread_id:
+        returned_thread_id = (
+            str(thread.get("id") or "").strip()
+            if isinstance(thread, dict)
+            else ""
+        )
+        if returned_thread_id:
+            self._known_thread_ids.add(returned_thread_id)
+        if not isinstance(thread, dict) or returned_thread_id != thread_id:
             raise CodexAppServerProtocolError(
                 "thread/read did not return the requested thread",
                 request_sent=True,
                 safe_to_retry=False,
             )
         return thread
+
+    async def delete_thread(self, thread_id: str) -> None:
+        """Permanently remove a newly-created, unexposed provider thread."""
+        thread_id = _require_nonempty_string(thread_id, "thread_id")
+        method = "thread/delete"
+        _protocol_empty_object(
+            method,
+            await self.request(
+                method,
+                {"threadId": thread_id},
+                timeout=self.lifecycle_timeout,
+            ),
+        )
+        self._loaded_threads.discard(thread_id)
+        self._known_thread_ids.discard(thread_id)
 
     async def list_turns(
         self,
@@ -1304,6 +1519,7 @@ class CodexAppServerClient:
                         request_sent=True,
                         safe_to_retry=False,
                     )
+                self._known_thread_ids.add(str(thread["id"]).strip())
                 descendants.append(dict(thread))
 
             cursor = _protocol_cursor(method, result)
@@ -2008,6 +2224,9 @@ class CodexAppServerManager:
             thread_id,
             include_turns=include_turns,
         )
+
+    async def delete_thread(self, thread_id: str) -> None:
+        await self.client.delete_thread(thread_id)
 
     async def list_turns(
         self,

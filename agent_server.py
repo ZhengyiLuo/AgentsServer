@@ -18,14 +18,17 @@ import fcntl
 import glob
 import hashlib
 import hmac
+import ipaddress
 import inspect
 import json
 import logging
 import math
 import mmap
 import os
+import pwd
 import pty
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -141,6 +144,7 @@ SERVER_ADMIN_ROOT = STATE_DIR / "admin"
 SERVER_UPDATE_STATUS_FILE = SERVER_ADMIN_ROOT / "server-update.json"
 SERVER_UPDATE_LOG_FILE = SERVER_ADMIN_ROOT / "server-update.log"
 CODEX_SETTINGS_FILE = SERVER_ADMIN_ROOT / "codex-settings.json"
+ABANDONED_FORK_THREADS_FILE = SERVER_ADMIN_ROOT / "abandoned-fork-threads.json"
 SERVER_UPDATE_PUBLIC_KEY = SERVER_ROOT / "release-public-key.pem"
 SERVER_UPDATE_RUNNER = SERVER_ROOT / "update_runner.py"
 CLAUDE_PROJECTS_ROOT = Path(os.environ.get("CLAUDE_PROJECTS_ROOT", Path.home() / ".claude" / "projects"))
@@ -352,6 +356,9 @@ WEBSOCKET_SEND_TIMEOUT_SECONDS = max(
     float(agentsdock_setting("WEBSOCKET_SEND_TIMEOUT_SECONDS", "2")),
 )
 MAX_UPLOAD_BYTES = int(agentsdock_setting("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024 * 1024)))
+MAX_ARTIFACT_PUBLISH_FILES = int(agentsdock_setting("ARTIFACT_PUBLISH_MAX_FILES", "64"))
+MAX_ARTIFACT_TITLE_CHARS = int(agentsdock_setting("ARTIFACT_TITLE_MAX_CHARS", "1000"))
+MAX_ARTIFACT_TEXT_CHARS = int(agentsdock_setting("ARTIFACT_TEXT_MAX_CHARS", "12000"))
 MAX_IMPORT_MESSAGES = int(agentsdock_setting("HISTORY_IMPORT_LIMIT", "400"))
 MAX_IMPORTED_TEXT_CHARS = int(agentsdock_setting("HISTORY_IMPORT_TEXT_CHARS", "12000"))
 MAX_FORK_MEMORY_CHARS = int(agentsdock_setting("FORK_MEMORY_CHARS", "24000"))
@@ -438,6 +445,10 @@ AGENT_TOKEN = env_setting(
     "ZENITHDOCK_AGENT_TOKEN",
     "ZENITHBOT_AGENT_TOKEN",
 ) or ""
+# Artifact publication can copy arbitrary agent-produced host paths, so it uses
+# a process-local credential distinct from the normal client API token. Only
+# agent subprocesses receive it; desktop/mobile clients never do.
+ARTIFACT_PUBLISH_TOKEN = secrets.token_urlsafe(32)
 SERVER_BIND_ADDRESS = agentsdock_setting("AGENT_BIND", "0.0.0.0")
 SERVER_PORT = int(agentsdock_setting("AGENT_PORT", "7850"))
 API_CONTRACT_VERSION = 10
@@ -456,19 +467,19 @@ You are operating through AgentsDock, backed by AgentsServer.
 - Your Claude process ends with this turn; join child tasks before finishing and create durable automation only when explicitly asked.
 - This is AgentsDock, not Slack; create files locally and never call Slack file helpers.
 - Link editor-readable files with Markdown paths relative to the chat working directory, optionally with `#L42`; do not use `file://`.
-- When you create a file the user should receive, write it locally, then publish it by resolving `$AGENTSDOCK_MANIFEST_PATH` (the stable `manifests/current.json` path) and writing `{{"files":["/absolute/path.ext",{{"path":"/absolute/video.mp4","title":"Demo","text":"Optional note"}}]}}` there; use absolute paths, make videos normal playable `.mp4`/`.mov` files, and never pass the literal `$...` path to Write.
+- Publish user-facing files with `"$AGENTSDOCK_PUBLISH_CLI" --chat-id "$AGENTSDOCK_CHAT_ID" /absolute/path.ext`; metadata: `--entry-json '{{"path":"/absolute/video.mp4","title":"Demo","text":"Optional note"}}'`. Say “attached” only after a successful JSON receipt. Older-server fallback: resolve `$AGENTSDOCK_MANIFEST_PATH`, write `{{"files":["/absolute/path.ext"]}}` there (not to a literal `$...` path), and say only “submitted for attachment.” Use absolute paths and playable `.mp4`/`.mov` videos.
 - Manage scheduled jobs only when explicitly asked; use `"$AGENTSDOCK_JOBS_CLI"` (start with list/help), not the API or prompt snapshots.
 - Inspect the persistent terminal named by `$AGENTSDOCK_TMUX_SESSION` read-only unless the user explicitly asks you to operate it.
 - Check installed skills and project playbooks before claiming a specialized environment or remote path is unavailable.
 - If an incidental cleanup or optional clause makes a compound command fail, immediately retry the still-safe requested operation without that clause.
 - Keep the main chat focused; delegate bounded noisy exploration and return summaries instead of dumping large logs or tool output into the thread.
-- Preserve user work, avoid destructive actions without clear authorization, and continue until the request is complete or genuinely blocked.
+- Preserve user work; avoid destructive actions without authorization; continue until complete or blocked.
 """
 
 # Compatibility alias for integrations which imported the historical name.
 SYSTEM_PROMPT = CLAUDE_PROMPT_PRELUDE
 
-CODEX_THREAD_POLICY_VERSION = "3"
+CODEX_THREAD_POLICY_VERSION = "4"
 CODEX_PROMPT_PRELUDE = """\
 You are operating through AgentsDock, backed by AgentsServer.
 - Keep the final answer concise; the UI renders tool calls, command output, reasoning, and artifacts separately.
@@ -476,13 +487,13 @@ You are operating through AgentsDock, backed by AgentsServer.
 - Continue through ordinary inspection errors when a safe retry or narrow fix is available.
 - This is AgentsDock, not Slack; create files locally and never call Slack file helpers.
 - Link editor-readable files with Markdown paths relative to the chat working directory, optionally with `#L42`; do not use `file://`.
-- When you create a file the user should receive, write it locally, then publish it by writing `{{"files":["/absolute/path.ext",{{"path":"/absolute/video.mp4","title":"Demo","text":"Optional note"}}]}}` to `{manifest_path}`; use absolute paths and make videos normal playable `.mp4`/`.mov` files.
+- Publish user-facing files with `"$AGENTSDOCK_PUBLISH_CLI" --chat-id {chat_id} /absolute/path.ext`; metadata: `--entry-json '{{"path":"/absolute/video.mp4","title":"Demo","text":"Optional note"}}'`. Say “attached” only after a successful JSON receipt. Older-server fallback: write `{{"files":["/absolute/path.ext"]}}` to `{manifest_path}` and say only “submitted for attachment.” Use absolute paths and playable `.mp4`/`.mov` videos.
 - Manage scheduled jobs only when explicitly asked, using `"$AGENTSDOCK_JOBS_CLI" --chat-id {chat_id} <command>`; query it instead of relying on a prompt snapshot.
 - The persistent terminal is tmux session `{terminal_session}`; inspect it read-only unless the user explicitly asks you to operate it.
 - Check installed skills and project playbooks before claiming a specialized environment or remote path is unavailable.
 - If an incidental cleanup or optional clause makes a compound command fail, immediately retry the still-safe requested operation without that clause.
 - Keep the main chat focused; delegate bounded noisy exploration and return summaries instead of dumping large logs or tool output into the thread.
-- Preserve user work, avoid destructive actions without clear authorization, and continue until the request is complete or genuinely blocked.
+- Preserve user work; avoid destructive actions without authorization; continue until complete or blocked.
 """
 
 AGENTSDOCK_CONTEXT_END_MARKER = "[End AgentsDock context]"
@@ -934,6 +945,10 @@ def manifests_dir(session_id: str) -> Path:
     return session_dir(session_id) / "manifests"
 
 
+def artifact_publications_dir(session_id: str) -> Path:
+    return session_dir(session_id) / "artifact_publications"
+
+
 def codex_manifest_path(session_id: str) -> Path:
     """Stable per-chat artifact handoff path used by provider turns."""
     return manifests_dir(session_id) / "current.json"
@@ -952,6 +967,29 @@ def existing_cwd(requested: str | None) -> str:
         if path.is_dir():
             return str(path)
     return "/tmp"
+
+
+def validated_fork_cwd(session: dict[str, Any]) -> str:
+    """Require an exact usable parent workspace instead of silently falling back."""
+    raw = str(session.get("cwd") or "").strip()
+    if not raw:
+        raise HTTPException(
+            status_code=409,
+            detail="the parent chat has no working directory; set one before forking",
+        )
+    expanded = Path(raw).expanduser()
+    if not expanded.is_absolute():
+        raise HTTPException(
+            status_code=409,
+            detail="the parent chat working directory must be an absolute path",
+        )
+    normalized = Path(os.path.normpath(str(expanded)))
+    if not normalized.is_dir():
+        raise HTTPException(
+            status_code=409,
+            detail=f"the parent chat working directory is unavailable: {normalized}",
+        )
+    return str(normalized)
 
 
 def workspace_http_error(status_code: int, code: str, message: str, action: str | None = None) -> HTTPException:
@@ -2470,6 +2508,7 @@ def ensure_dirs(session_id: str | None = None) -> None:
         session_dir(session_id).mkdir(parents=True, exist_ok=True)
         uploads_dir(session_id).mkdir(parents=True, exist_ok=True)
         manifests_dir(session_id).mkdir(parents=True, exist_ok=True)
+        artifact_publications_dir(session_id).mkdir(parents=True, exist_ok=True)
         code_diffs_dir(session_id).mkdir(parents=True, exist_ok=True)
 
 
@@ -2737,6 +2776,7 @@ async def publish_turn_code_diff(
 EVENT_SEQ_CACHE: dict[str, int] = {}
 EVENT_SEQ_LOCK = asyncio.Lock()
 EVENT_DELIVERY_LOCKS: dict[str, asyncio.Lock] = {}
+ARTIFACT_PUBLICATION_LOCK_STRIPES = tuple(asyncio.Lock() for _ in range(64))
 TIMELINE_INDEX_CACHE_MAX = int(agentsdock_setting("TIMELINE_INDEX_CACHE_MAX", "24"))
 TIMELINE_INDEX_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 # Retained as a compatibility/testing surface; synchronization uses the fixed
@@ -2815,6 +2855,18 @@ def event_delivery_lock(session_id: str) -> asyncio.Lock:
     return EVENT_DELIVERY_LOCKS.setdefault(session_id, asyncio.Lock())
 
 
+def artifact_publication_lock(
+    session_id: str,
+    publication_id: str,
+) -> asyncio.Lock:
+    digest = hashlib.sha256(
+        f"{session_id}\0{publication_id}".encode("utf-8")
+    ).digest()
+    return ARTIFACT_PUBLICATION_LOCK_STRIPES[
+        int.from_bytes(digest[:2], "big") % len(ARTIFACT_PUBLICATION_LOCK_STRIPES)
+    ]
+
+
 async def forget_event_seq(session_id: str) -> None:
     async with EVENT_SEQ_LOCK:
         EVENT_SEQ_CACHE.pop(session_id, None)
@@ -2853,6 +2905,28 @@ def request_authorized(request: Request) -> bool:
         or token_matches(request.headers.get("x-zenithdock-token"))
         or token_matches(request.query_params.get("token"))
     )
+
+
+def network_host_is_loopback(host: str) -> bool:
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host.lower() == "localhost"
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    return address.is_loopback
+
+
+def request_client_is_loopback(request: Request) -> bool:
+    # Deliberately ignore Forwarded/X-Forwarded-For. This privileged endpoint
+    # is for an agent process talking directly to its own AgentsServer only.
+    client = request.client
+    return bool(client and network_host_is_loopback(str(client.host or "")))
+
+
+def request_artifact_publish_authorized(request: Request) -> bool:
+    candidate = request.headers.get("x-agentsdock-publish-token")
+    return bool(candidate and hmac.compare_digest(candidate, ARTIFACT_PUBLISH_TOKEN))
 
 
 def websocket_authorized(ws: WebSocket) -> bool:
@@ -2903,6 +2977,19 @@ class UpdateSessionRequest(BaseModel):
     codex_approvals_reviewer: Literal["user", "auto_review", "guardian_subagent"] | None = None
 
 
+SESSION_LIFECYCLE_UPDATE_FIELDS = frozenset({
+    "cwd",
+    "backend",
+    "model",
+    "effort",
+    "system_prompt",
+    "codex_approval_policy",
+    "codex_sandbox_mode",
+    "codex_permission_profile",
+    "codex_approvals_reviewer",
+})
+
+
 class ReorderSessionRequest(BaseModel):
     direction: str | None = None
     target_id: str | None = None
@@ -2931,6 +3018,14 @@ class TurnRequest(BaseModel):
     target_session_id: str | None = None
     steer_interrupted_run_id: str | None = None
     client_capabilities: list[str] = Field(default_factory=list, max_length=16)
+
+
+class PublishArtifactsRequest(BaseModel):
+    publication_id: str = Field(min_length=1, max_length=128)
+    files: list[Any] = Field(
+        min_length=1,
+        max_length=MAX_ARTIFACT_PUBLISH_FILES,
+    )
 
 
 class UpdateQueuedTurnRequest(BaseModel):
@@ -3328,6 +3423,46 @@ def sorted_sessions(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
 
 
+def read_abandoned_fork_thread_ids(
+    path: Path | None = None,
+) -> set[str]:
+    """Read provider forks awaiting post-crash retirement."""
+
+    ledger_path = path or ABANDONED_FORK_THREADS_FILE
+    try:
+        value = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return set()
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning(
+            "could not read abandoned fork cleanup ledger %s: %s",
+            ledger_path,
+            concise_error_message(exc),
+        )
+        return set()
+    raw_ids = value.get("thread_ids") if isinstance(value, dict) else None
+    if not isinstance(raw_ids, list):
+        logger.warning("ignoring malformed abandoned fork cleanup ledger %s", ledger_path)
+        return set()
+    return {
+        clean
+        for raw in raw_ids
+        if (clean := str(raw or "").strip())
+    }
+
+
+def write_abandoned_fork_thread_ids(
+    thread_ids: set[str],
+    path: Path | None = None,
+) -> None:
+    """Atomically persist provider forks that must be retired."""
+
+    atomic_update_json(
+        path or ABANDONED_FORK_THREADS_FILE,
+        {"thread_ids": sorted(thread_ids)},
+    )
+
+
 class SessionStore:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -3347,6 +3482,71 @@ class SessionStore:
             except Exception as e:
                 logger.warning("failed to load sessions: %s", e)
                 self.sessions = {}
+        abandoned_forks = {
+            str(session_id): session
+            for session_id, session in self.sessions.items()
+            if isinstance(session, dict) and session.get("_fork_initializing")
+        }
+        pending_provider_cleanup = read_abandoned_fork_thread_ids()
+        durable_provider_cleanup = set(pending_provider_cleanup)
+        staged_provider_ids = {
+            clean_provider_id
+            for session in abandoned_forks.values()
+            if str(session.get("backend") or DEFAULT_BACKEND).strip().lower()
+            == BACKEND_CODEX
+            and (
+                clean_provider_id := str(
+                    session.get("codex_thread_id")
+                    or session.get("session_id")
+                    or ""
+                ).strip()
+            )
+        }
+        if staged_provider_ids - pending_provider_cleanup:
+            proposed_provider_cleanup = (
+                pending_provider_cleanup | staged_provider_ids
+            )
+            try:
+                write_abandoned_fork_thread_ids(proposed_provider_cleanup)
+                pending_provider_cleanup = proposed_provider_cleanup
+                durable_provider_cleanup = set(proposed_provider_cleanup)
+            except OSError as exc:
+                # Never erase the only durable reference to an unexposed
+                # persistent provider fork. The hidden staged session remains
+                # available for the next startup to retry ledger persistence.
+                logger.warning(
+                    "could not persist abandoned provider fork cleanup ledger: %s",
+                    concise_error_message(exc),
+                )
+        ABANDONED_FORK_PROVIDER_THREADS.clear()
+        ABANDONED_FORK_PROVIDER_THREADS.update(pending_provider_cleanup)
+        for session_id in abandoned_forks:
+            provider_id = str(
+                abandoned_forks[session_id].get("codex_thread_id")
+                or abandoned_forks[session_id].get("session_id")
+                or ""
+            ).strip()
+            if provider_id and provider_id not in durable_provider_cleanup:
+                continue
+            self.sessions.pop(session_id, None)
+            with suppress(Exception):
+                await asyncio.to_thread(delete_session_owned_file_records, session_id)
+            with suppress(OSError):
+                shutil.rmtree(session_dir(session_id), ignore_errors=True)
+            with suppress(Exception):
+                await forget_event_seq(session_id)
+            HISTORY_SEARCH_DIRTY.add(session_id)
+        removed_abandoned_forks = len(abandoned_forks) - sum(
+            1
+            for session_id in abandoned_forks
+            if session_id in self.sessions
+        )
+        if removed_abandoned_forks:
+            runtime_changed = True
+            logger.warning(
+                "removed abandoned staged session forks after restart count=%s",
+                removed_abandoned_forks,
+            )
         for sess in self.sessions.values():
             backend = str(sess.get("backend") or DEFAULT_BACKEND).strip().lower()
             for key, default in (
@@ -3449,7 +3649,13 @@ class SessionStore:
             return SESSION_ORDER_STEP
         return min(section_orders) - SESSION_ORDER_STEP
 
-    async def create(self, req: CreateSessionRequest, *, parent_id: str | None = None) -> dict[str, Any]:
+    async def create(
+        self,
+        req: CreateSessionRequest,
+        *,
+        parent_id: str | None = None,
+        initializing_fork: bool = False,
+    ) -> dict[str, Any]:
         backend = (req.backend or DEFAULT_BACKEND).lower()
         if backend not in VALID_BACKENDS:
             raise HTTPException(status_code=400, detail=f"backend must be one of {sorted(VALID_BACKENDS)}")
@@ -3460,13 +3666,17 @@ class SessionStore:
             req.effort,
             strict=True,
         )
-        sid = f"sess_{uuid.uuid4().hex[:16]}"
-        ensure_dirs(sid)
-        now = now_iso()
         provider_id = req.provider_session_id or req.session_id
         claude_session_id = req.claude_session_id or (provider_id if backend == BACKEND_CLAUDE else None)
         codex_thread_id = req.codex_thread_id or (provider_id if backend == BACKEND_CODEX else None)
         active_provider_id = claude_session_id if backend == BACKEND_CLAUDE else codex_thread_id
+        # A Claude chat can park an inactive Codex identity for later backend
+        # switching, so validate every supplied Codex thread, not only the
+        # currently active provider identity.
+        ensure_codex_thread_not_pending_fork_cleanup(codex_thread_id)
+        sid = f"sess_{uuid.uuid4().hex[:16]}"
+        ensure_dirs(sid)
+        now = now_iso()
         title = req.title or (
             f"Resumed {backend.title()} {str(active_provider_id)[:8]}" if active_provider_id else "New chat"
         )
@@ -3511,11 +3721,44 @@ class SessionStore:
             "created_at": now,
             "updated_at": now,
         }
+        if initializing_fork:
+            # Persist the staging marker so a server crash can discard this
+            # child instead of exposing a half-bound provider/history clone.
+            sess["_fork_initializing"] = True
         sess["sort_order"] = self.top_order_for_section(session_section_key(sess))
-        async with self._lock:
-            self.sessions[sid] = sess
-            await self.save()
-        await append_event(sid, "session_created", {"session": public_session(sess)})
+        try:
+            async with self._lock:
+                self.sessions[sid] = sess
+                await self.save()
+            await append_event(sid, "session_created", {"session": public_session(sess)})
+        except BaseException:
+            # The session may enter memory (and even reach disk) before save or
+            # the first event fails. Roll back in a separate task so caller
+            # cancellation cannot strand an invisible session or directory.
+            async def rollback_create() -> None:
+                async with self._lock:
+                    if self.sessions.get(sid) is sess:
+                        self.sessions.pop(sid, None)
+                    try:
+                        await self.save()
+                    except BaseException as cleanup_exc:
+                        logger.warning(
+                            "failed to persist session-create rollback session=%s: %s",
+                            sid,
+                            concise_error_message(cleanup_exc),
+                        )
+                with suppress(BaseException):
+                    await asyncio.to_thread(delete_session_owned_file_records, sid)
+                with suppress(OSError):
+                    shutil.rmtree(session_dir(sid), ignore_errors=True)
+                with suppress(BaseException):
+                    await forget_event_seq(sid)
+                HISTORY_SEARCH_DIRTY.add(sid)
+
+            cleanup_task = asyncio.create_task(rollback_create())
+            with suppress(BaseException):
+                await join_task_despite_caller_cancellation(cleanup_task)
+            raise
         return sess
 
     async def update(self, sid: str, patch: dict[str, Any]) -> dict[str, Any]:
@@ -3757,6 +4000,7 @@ class SessionStore:
             existed = self.sessions.pop(sid, None)
             await self.save()
         if existed:
+            await asyncio.to_thread(delete_session_owned_file_records, sid)
             shutil.rmtree(session_dir(sid), ignore_errors=True)
             await forget_event_seq(sid)
             HISTORY_SEARCH_DIRTY.add(sid)
@@ -3771,6 +4015,8 @@ class SessionStore:
         cwd: str | None = None,
         codex_instruction_hash: str | None = None,
     ) -> None:
+        if backend == BACKEND_CODEX:
+            ensure_codex_thread_not_pending_fork_cleanup(provider_id)
         async with self._lock:
             sess = self.sessions.get(sid)
             if not sess:
@@ -4584,6 +4830,38 @@ HANDOFF_DIGEST_JOBS_LOCK = asyncio.Lock()
 HANDOFF_DIGEST_FINALIZING: set[str] = set()
 RUNTIME_DIAGNOSTICS: dict[str, dict[str, Any]] = {}
 RUNTIME_DIAGNOSTICS_LOCK = threading.RLock()
+ABANDONED_FORK_PROVIDER_THREADS: set[str] = set()
+ABANDONED_FORK_PROVIDER_THREADS_LOCK = asyncio.Lock()
+
+
+def ensure_codex_thread_not_pending_fork_cleanup(thread_id: Any) -> None:
+    """Fence provider identities while post-crash fork cleanup owns them."""
+
+    clean_thread_id = str(thread_id or "").strip()
+    if clean_thread_id and clean_thread_id in ABANDONED_FORK_PROVIDER_THREADS:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "this Codex thread is being retired after an interrupted fork; "
+                "retry after cleanup completes"
+            ),
+        )
+
+
+def session_references_codex_thread(
+    session: dict[str, Any],
+    thread_id: str,
+) -> bool:
+    """Return whether a chat owns a Codex identity, active or parked."""
+
+    codex_thread_id = str(session.get("codex_thread_id") or "").strip()
+    active_session_id = (
+        str(session.get("session_id") or "").strip()
+        if str(session.get("backend") or DEFAULT_BACKEND).strip().lower()
+        == BACKEND_CODEX
+        else ""
+    )
+    return thread_id in {codex_thread_id, active_session_id}
 
 
 def session_lifecycle_lock(session_id: str) -> asyncio.Lock:
@@ -4594,7 +4872,14 @@ def session_lifecycle_lock(session_id: str) -> asyncio.Lock:
     return lock
 
 
+def ensure_session_not_initializing(session_id: str) -> None:
+    session = STORE.sessions.get(session_id)
+    if isinstance(session, dict) and session.get("_fork_initializing"):
+        raise HTTPException(status_code=409, detail="session fork is still initializing")
+
+
 def ensure_session_not_deleting(session_id: str) -> None:
+    ensure_session_not_initializing(session_id)
     if (
         session_id in DELETING_SESSIONS
         or session_id in DELETED_SESSION_TOMBSTONES
@@ -4731,7 +5016,11 @@ def run_event_metadata(run_id: str) -> dict[str, Any]:
     return {key: value for key, value in metadata.items() if value is not None}
 
 
-async def append_event(session_id: str, event_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+async def append_event(
+    session_id: str,
+    event_type: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     def discarded_event() -> dict[str, Any]:
         return {
             "seq": 0,
@@ -4781,6 +5070,225 @@ async def append_event(session_id: str, event_type: str, payload: dict[str, Any]
         if event_files_belong_to_session(event, session_id):
             await HUB.broadcast(session_id, client_safe_event(event))
         return event
+
+
+def append_imported_events_sync(
+    path: Path,
+    session_id: str,
+    first_seq: int,
+    imported_events: list[tuple[str, dict[str, Any]]],
+) -> int:
+    """Write one rollback-capable imported JSONL batch off the event loop."""
+    original_size = path.stat().st_size if path.exists() else 0
+    last_seq = first_seq - 1
+    try:
+        with path.open("a", encoding="utf-8") as stream:
+            for event_type, payload in imported_events:
+                last_seq += 1
+                stored_payload = dict(payload)
+                output = stored_payload.get("output")
+                if event_type == "tool_finished" and output is not None:
+                    output_text = event_output_text(output)
+                    if len(output_text) > CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS:
+                        stored_payload["output"] = bounded_codex_output_text(output_text)
+                        stored_payload["output_chars"] = len(output_text)
+                        stored_payload["output_truncated"] = True
+                event = {
+                    "seq": last_seq,
+                    "id": f"evt_{uuid.uuid4().hex[:16]}",
+                    "session_id": session_id,
+                    "type": event_type,
+                    "ts": now_iso(),
+                    **stored_payload,
+                }
+                stream.write(json.dumps(event, separators=(",", ":")) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    except Exception:
+        with suppress(OSError):
+            with path.open("r+b") as stream:
+                stream.truncate(original_size)
+        raise
+    return last_seq
+
+
+async def join_task_despite_caller_cancellation(task: asyncio.Task[Any]) -> Any:
+    """Wait for an already-started side effect before re-raising cancellation."""
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                return task.result()
+
+
+async def append_imported_events(
+    session_id: str,
+    imported_events: list[tuple[str, dict[str, Any]]],
+) -> int:
+    """Transactionally append historical events without live-state side effects.
+
+    A forked chat does not become observable until its endpoint returns, so a
+    single locked file append replaces thousands of per-event locks, metadata
+    writes, and websocket broadcasts.
+    """
+    if not imported_events:
+        return 0
+    async with event_delivery_lock(session_id):
+        ensure_dirs(session_id)
+        path = events_path(session_id)
+        first_seq = await next_event_seq(session_id, path)
+        write_task = asyncio.create_task(asyncio.to_thread(
+            append_imported_events_sync,
+            path,
+            session_id,
+            first_seq,
+            imported_events,
+        ))
+        try:
+            last_seq = await asyncio.shield(write_task)
+        except BaseException:
+            # asyncio.to_thread cannot be cancelled once the filesystem write
+            # has begun. Join it before releasing the per-chat event lock so a
+            # caller cancellation cannot race deletion or a later event seq.
+            completed_seq = first_seq - 1
+            try:
+                completed_seq = await join_task_despite_caller_cancellation(
+                    write_task
+                )
+            except BaseException:
+                # append_imported_events_sync rolls its partial batch back.
+                pass
+            async with EVENT_SEQ_LOCK:
+                EVENT_SEQ_CACHE[session_id] = completed_seq
+            raise
+        async with EVENT_SEQ_LOCK:
+            EVENT_SEQ_CACHE[session_id] = last_seq
+        HISTORY_SEARCH_DIRTY.add(session_id)
+        return len(imported_events)
+
+
+def append_durable_event_batch_sync(
+    path: Path,
+    session_id: str,
+    first_seq: int,
+    event_specs: list[tuple[str, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Append and fsync an event batch, rolling back every partial write."""
+    original_size = path.stat().st_size if path.exists() else 0
+    events: list[dict[str, Any]] = []
+    try:
+        with path.open("a", encoding="utf-8") as stream:
+            for offset, (event_type, payload) in enumerate(event_specs):
+                event = {
+                    "seq": first_seq + offset,
+                    "id": f"evt_{uuid.uuid4().hex[:16]}",
+                    "session_id": session_id,
+                    "type": event_type,
+                    "ts": now_iso(),
+                    **dict(payload),
+                }
+                stream.write(json.dumps(event, separators=(",", ":")) + "\n")
+                events.append(event)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        with suppress(OSError):
+            with path.open("r+b") as stream:
+                stream.truncate(original_size)
+                stream.flush()
+                os.fsync(stream.fileno())
+        raise
+    return events
+
+
+async def append_durable_event_batch_locked(
+    session_id: str,
+    event_specs: list[tuple[str, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Append a durable batch while the caller owns event_delivery_lock."""
+    if not event_specs:
+        return []
+    if (
+        session_id in DELETING_SESSIONS
+        or session_id in DELETED_SESSION_TOMBSTONES
+    ):
+        raise ArtifactPublicationError("chat is being deleted")
+    ensure_dirs(session_id)
+    path = events_path(session_id)
+    first_seq = await next_event_seq(session_id, path)
+    write_task = asyncio.create_task(asyncio.to_thread(
+        append_durable_event_batch_sync,
+        path,
+        session_id,
+        first_seq,
+        event_specs,
+    ))
+    try:
+        events = await asyncio.shield(write_task)
+    except BaseException:
+        committed: list[dict[str, Any]] = []
+        try:
+            committed = await join_task_despite_caller_cancellation(write_task)
+        except BaseException:
+            pass
+        async with EVENT_SEQ_LOCK:
+            EVENT_SEQ_CACHE[session_id] = (
+                int(committed[-1]["seq"]) if committed else first_seq - 1
+            )
+        if committed:
+            # Once fsync succeeds the events are authoritative. Do not report a
+            # failed publication that could prompt an unsafe duplicate retry.
+            events = committed
+        else:
+            raise
+    async with EVENT_SEQ_LOCK:
+        EVENT_SEQ_CACHE[session_id] = int(events[-1]["seq"])
+    HISTORY_SEARCH_DIRTY.add(session_id)
+
+    async def deliver_committed_events() -> None:
+        for event in events:
+            try:
+                await update_session_event_metadata(session_id, event)
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                logger.warning(
+                    "artifact event metadata update failed session=%s seq=%s: %s",
+                    session_id,
+                    event.get("seq"),
+                    concise_error_message(exc),
+                )
+            try:
+                if event_files_belong_to_session(event, session_id):
+                    await HUB.broadcast(session_id, client_safe_event(event))
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                logger.warning(
+                    "artifact event broadcast failed session=%s seq=%s: %s",
+                    session_id,
+                    event.get("seq"),
+                    concise_error_message(exc),
+                )
+
+    # After fsync, cancellation cannot turn success into failure: that would
+    # invite a duplicate retry or cleanup files referenced by durable events.
+    delivery_task = asyncio.create_task(deliver_committed_events())
+    try:
+        await asyncio.shield(delivery_task)
+    except BaseException as exc:
+        with suppress(BaseException):
+            await join_task_despite_caller_cancellation(delivery_task)
+    return events
+
+
+async def append_durable_event_batch(
+    session_id: str,
+    event_specs: list[tuple[str, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    async with event_delivery_lock(session_id):
+        return await append_durable_event_batch_locked(session_id, event_specs)
 
 
 def is_agent_visible_event(event_type: str, event: dict[str, Any]) -> bool:
@@ -6707,6 +7215,89 @@ def tmux_session_exists(name: str) -> bool:
     return run_tmux(["has-session", "-t", name], check=False).returncode == 0
 
 
+TERMINAL_FALLBACK_SHELLS = ("/bin/bash", "/bin/zsh", "/bin/sh")
+TERMINAL_DISABLED_SHELL_NAMES = {"false", "nologin"}
+
+
+def valid_terminal_login_shell(candidate: str | None) -> str | None:
+    """Return an executable login shell path, excluding disabled account shells."""
+    raw = str(candidate or "").strip()
+    if not raw or "\x00" in raw:
+        return None
+    path = Path(raw)
+    if not path.is_absolute() or path.name.lower() in TERMINAL_DISABLED_SHELL_NAMES:
+        return None
+    try:
+        if not path.is_file() or not os.access(path, os.X_OK):
+            return None
+        return str(path)
+    except OSError:
+        return None
+
+
+def resolve_terminal_login_shell() -> str:
+    """Resolve the server account's real shell without trusting inherited ``$SHELL``."""
+    account_shell: str | None = None
+    try:
+        account_shell = pwd.getpwuid(os.getuid()).pw_shell
+    except (KeyError, OSError):
+        pass
+    account_shell = str(account_shell or "").strip()
+    if account_shell:
+        account_shell_name = Path(account_shell).name.lower()
+        if account_shell_name in TERMINAL_DISABLED_SHELL_NAMES:
+            raise HTTPException(
+                status_code=503,
+                detail="the agent server user has a disabled login shell",
+            )
+        if shell := valid_terminal_login_shell(account_shell):
+            return shell
+        raise HTTPException(
+            status_code=503,
+            detail="the agent server user's configured login shell is unavailable",
+        )
+    for candidate in TERMINAL_FALLBACK_SHELLS:
+        if shell := valid_terminal_login_shell(candidate):
+            return shell
+    raise HTTPException(
+        status_code=503,
+        detail="no executable login shell is available for the agent server user",
+    )
+
+
+def terminal_session_path() -> str:
+    """Build a useful, deterministic PATH even when tmux inherited a service PATH."""
+    configured = runner_env().get("PATH") or os.defpath
+    entries: list[str] = []
+    for entry in configured.split(os.pathsep):
+        clean = entry.strip()
+        if clean and clean not in entries:
+            entries.append(clean)
+    for standard in ("/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"):
+        if standard not in entries:
+            entries.append(standard)
+    return os.pathsep.join(entries)
+
+
+def terminal_login_command(shell: str, path: str | None = None) -> str:
+    """Return a tmux shell-command that starts a login shell with known env."""
+    if path is None:
+        return f"exec {shlex.quote(shell)} -l"
+    return (
+        f"SHELL={shlex.quote(shell)} PATH={shlex.quote(path)} "
+        f"exec {shlex.quote(shell)} -l"
+    )
+
+
+def configure_terminal_session_shell(name: str, shell: str, path: str) -> None:
+    """Scope shell defaults to one AgentsDock session, never the shared tmux server."""
+    login_command = terminal_login_command(shell)
+    run_tmux(["set-environment", "-t", name, "SHELL", shell])
+    run_tmux(["set-environment", "-t", name, "PATH", path])
+    run_tmux(["set-option", "-t", name, "default-shell", shell])
+    run_tmux(["set-option", "-t", name, "default-command", login_command])
+
+
 def terminal_dimensions(columns: int | None = None, rows: int | None = None) -> tuple[int, int]:
     cols = max(TERMINAL_MIN_COLUMNS, min(int(columns or 120), TERMINAL_MAX_COLUMNS))
     lines = max(TERMINAL_MIN_ROWS, min(int(rows or 36), TERMINAL_MAX_ROWS))
@@ -6740,12 +7331,31 @@ def ensure_terminal_session(
     if bool(sess.get("archived")):
         raise HTTPException(status_code=409, detail="unarchive this chat before opening its terminal")
     name = terminal_session_name(session_id)
+    shell = resolve_terminal_login_shell()
+    path = terminal_session_path()
     created = False
     if not tmux_session_exists(name):
         workdir = existing_cwd(cwd or sess.get("cwd") or DEFAULT_CWD)
         cols, lines = terminal_dimensions(columns, rows)
-        run_tmux(["new-session", "-d", "-s", name, "-x", str(cols), "-y", str(lines), "-c", workdir])
+        run_tmux([
+            "new-session",
+            "-d",
+            "-s",
+            name,
+            "-x",
+            str(cols),
+            "-y",
+            str(lines),
+            "-c",
+            workdir,
+            terminal_login_command(shell, path),
+        ])
         created = True
+    # The tmux daemon may predate AgentsServer and carry a stale SHELL/PATH
+    # from an SSH tunnel or service. Keep all repairs scoped to this Dock-owned
+    # session. This also corrects future windows/panes in pre-existing sessions
+    # without interrupting a user's currently running pane.
+    configure_terminal_session_shell(name, shell, path)
     # These are session-scoped defaults. Existing user-created windows and
     # panes remain untouched while newly created panes keep useful history.
     run_tmux(["set-option", "-t", name, "history-limit", "100000"], check=False)
@@ -7685,6 +8295,30 @@ def read_file_meta_record(file_id: str) -> dict[str, Any] | None:
     return None
 
 
+def delete_session_owned_file_records(session_id: str) -> int:
+    """Delete only registry entries explicitly owned by a removed chat."""
+    removed = 0
+    if not FILES_ROOT.is_dir():
+        return removed
+    for entry in FILES_ROOT.iterdir():
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        metadata = read_file_meta_record(entry.name)
+        if str((metadata or {}).get("session_id") or "").strip() != session_id:
+            continue
+        try:
+            shutil.rmtree(entry)
+            removed += 1
+        except OSError as exc:
+            logger.warning(
+                "failed to remove session-owned file session=%s file_id=%s: %s",
+                session_id,
+                entry.name,
+                concise_error_message(exc),
+            )
+    return removed
+
+
 def legacy_session_event_file_ids(session_id: str) -> set[str]:
     """Return ownerless/owned file IDs whose origin is recorded in this chat.
 
@@ -8216,6 +8850,57 @@ def compact_subagent_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()[:SUBAGENT_SNAPSHOT_TEXT_LIMIT]
 
 
+def useful_subagent_identity_text(value: Any) -> str:
+    """Return a compact identity label, excluding generated prompt wrappers."""
+
+    clean = compact_subagent_text(value)
+    if (
+        not clean
+        or clean.casefold() == "codex subagent"
+        or re.match(r"^\[AgentsDock context\](?:\s|$)", clean, re.IGNORECASE)
+    ):
+        return ""
+    return clean
+
+
+def codex_subagent_thread_identity(
+    thread: dict[str, Any],
+) -> tuple[str, str, str]:
+    """Read authoritative nickname/path/parent fields from a Codex thread."""
+
+    source = thread.get("source") or thread.get("threadSource")
+    source = source if isinstance(source, dict) else {}
+    subagent_source = source.get("subagent") or source.get("subAgent")
+    subagent_source = subagent_source if isinstance(subagent_source, dict) else {}
+    spawn = (
+        subagent_source.get("thread_spawn")
+        or subagent_source.get("threadSpawn")
+        or source.get("thread_spawn")
+        or source.get("threadSpawn")
+    )
+    spawn = spawn if isinstance(spawn, dict) else {}
+    nickname = useful_subagent_identity_text(
+        thread.get("agentNickname")
+        or thread.get("agent_nickname")
+        or spawn.get("agentNickname")
+        or spawn.get("agent_nickname")
+    )
+    agent_path = useful_subagent_identity_text(
+        thread.get("agentPath")
+        or thread.get("agent_path")
+        or spawn.get("agentPath")
+        or spawn.get("agent_path")
+    )
+    parent_thread_id = str(
+        thread.get("parentThreadId")
+        or thread.get("parent_thread_id")
+        or spawn.get("parentThreadId")
+        or spawn.get("parent_thread_id")
+        or ""
+    ).strip()
+    return nickname, agent_path, parent_thread_id
+
+
 def normalize_subagent_status(value: Any) -> str:
     status = str(value or "").strip().lower()
     if status in {"completed", "complete", "done"}:
@@ -8275,6 +8960,8 @@ async def emit_codex_subagent_state(
     run_id: str | None = None,
     tool_id: str | None = None,
     name: Any = None,
+    nickname: Any = None,
+    agent_path: Any = None,
     activity: Any = None,
     summary: Any = None,
 ) -> dict[str, Any] | None:
@@ -8287,8 +8974,21 @@ async def emit_codex_subagent_state(
     if previous and str(previous.get("session_id") or "") != session_id:
         previous = {}
     normalized = normalize_subagent_status(status or previous.get("subagent_status"))
-    clean_name = compact_subagent_text(name) or str(previous.get("subagent_name") or "")
-    clean_name = clean_name or "Codex subagent"
+    clean_nickname = (
+        useful_subagent_identity_text(nickname)
+        or useful_subagent_identity_text(previous.get("subagent_nickname"))
+    )
+    clean_path = (
+        useful_subagent_identity_text(agent_path)
+        or useful_subagent_identity_text(previous.get("subagent_path"))
+    )
+    clean_name = (
+        clean_nickname
+        or clean_path
+        or useful_subagent_identity_text(previous.get("subagent_name"))
+        or useful_subagent_identity_text(name)
+        or "Codex subagent"
+    )
     clean_activity = compact_subagent_text(activity)
     clean_summary = compact_subagent_text(summary)
     resolved_parent = str(
@@ -8312,6 +9012,8 @@ async def emit_codex_subagent_state(
             tool_id or previous.get("subagent_tool_id") or child_thread_id
         ),
         "subagent_name": clean_name,
+        "subagent_nickname": clean_nickname or None,
+        "subagent_path": clean_path or None,
         "subagent_kind": "collaborator",
         "subagent_status": normalized,
         "subagent_activity": clean_activity or previous.get("subagent_activity"),
@@ -8327,6 +9029,8 @@ async def emit_codex_subagent_state(
         "subagent_id",
         "subagent_tool_id",
         "subagent_name",
+        "subagent_nickname",
+        "subagent_path",
         "subagent_status",
         "subagent_activity",
         "subagent_summary",
@@ -8477,12 +9181,15 @@ async def reconcile_codex_subagents(
         if status is None:
             # Unknown states must not manufacture an immortal active card.
             status = "completed"
+        nickname, agent_path, source_parent_thread_id = codex_subagent_thread_identity(thread)
         await emit_codex_subagent_state(
             session_id,
             child_thread_id,
             status,
-            parent_thread_id=str(thread.get("parentThreadId") or root_thread_id),
+            parent_thread_id=source_parent_thread_id or root_thread_id,
             name=thread.get("preview"),
+            nickname=nickname,
+            agent_path=agent_path,
             activity=f"Subagent {status}",
         )
         reconciled += 1
@@ -11355,7 +12062,10 @@ def read_semantic_timeline_page(
 
 def search_timeline_index(session_id: str, query: str, limit: int = 40) -> dict[str, Any]:
     tokens = timeline_search_tokens(query)
-    if not tokens:
+    session = STORE.sessions.get(session_id)
+    if not tokens or (
+        isinstance(session, dict) and session.get("_fork_initializing")
+    ):
         return {"session_id": session_id, "query": query, "results": []}
     connection = history_search_connection()
     try:
@@ -11600,16 +12310,24 @@ def run_history_search_sync(
             connection.close()
 
 
+def active_history_search_session_ids() -> set[str]:
+    """Return committed, non-archived chats eligible for global indexing."""
+
+    return {
+        session_id
+        for session_id, session in STORE.sessions.items()
+        if isinstance(session, dict)
+        and not bool(session.get("archived"))
+        and not bool(session.get("_fork_initializing"))
+    }
+
+
 async def history_search_index_loop() -> None:
     if HISTORY_SEARCH_INITIAL_DELAY_SECONDS:
         await asyncio.sleep(HISTORY_SEARCH_INITIAL_DELAY_SECONDS)
     last_full_sync: float | None = None
     while True:
-        active_session_ids = {
-            session_id
-            for session_id, session in STORE.sessions.items()
-            if not bool(session.get("archived"))
-        }
+        active_session_ids = active_history_search_session_ids()
         now = time.monotonic()
         full_sync = last_full_sync is None or now - last_full_sync >= HISTORY_SEARCH_FULL_SYNC_INTERVAL_SECONDS
         if full_sync:
@@ -11644,14 +12362,32 @@ async def history_search_index_loop() -> None:
         await asyncio.sleep(HISTORY_SEARCH_SYNC_INTERVAL_SECONDS)
 
 
-def search_all_timelines(query: str, limit: int = 40) -> dict[str, Any]:
+def search_all_timelines(
+    query: str,
+    limit: int = 40,
+    eligible_session_ids: set[str] | None = None,
+) -> dict[str, Any]:
     tokens = timeline_search_tokens(query)
     if not tokens:
         return {"query": query, "results": []}
     fts_query = timeline_search_fts_query(query)
+    # Restrict against the authoritative in-memory session set, not only the
+    # asynchronously maintained SQLite active bit. This prevents staged or
+    # just-removed fork rows from leaking during background-index latency.
+    eligible = sorted(
+        active_history_search_session_ids()
+        if eligible_session_ids is None
+        else eligible_session_ids
+    )
+    if not eligible:
+        return {"query": query, "results": []}
+    placeholders = ", ".join("?" for _ in eligible)
+    eligibility_clause = f" AND history_search.session_id IN ({placeholders})"
+    parameters: list[Any] = [fts_query, *eligible]
+    parameters.append(max(1, min(100, limit)))
     connection = history_search_connection()
     try:
-        rows = connection.execute("""
+        rows = connection.execute(f"""
             WITH ranked AS (
                 SELECT history_search.session_id, event_id, seq, ts, role, text,
                        ROW_NUMBER() OVER (
@@ -11664,13 +12400,14 @@ def search_all_timelines(query: str, limit: int = 40) -> dict[str, Any]:
                   ON history_search_sessions.session_id = history_search.session_id
                  AND history_search_sessions.active = 1
                 WHERE history_search MATCH ?
+                {eligibility_clause}
             )
             SELECT session_id, event_id, seq, ts, role, text, match_count
             FROM ranked
             WHERE match_rank = 1
             ORDER BY COALESCE(ts, '') DESC, CAST(seq AS INTEGER) DESC
             LIMIT ?
-        """, (fts_query, max(1, min(100, limit)))).fetchall()
+        """, parameters).fetchall()
     finally:
         connection.close()
     return {
@@ -12860,7 +13597,8 @@ def find_codex_history(provider_id: str) -> Path | None:
         return max(name_matches, key=lambda p: p.stat().st_mtime)
     for path in sorted(CODEX_SESSIONS_ROOT.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True):
         with suppress(Exception):
-            first = path.open("r", encoding="utf-8", errors="ignore").readline()
+            with path.open("r", encoding="utf-8", errors="ignore") as stream:
+                first = stream.readline()
             meta = json.loads(first)
             if meta.get("type") == "session_meta" and meta.get("payload", {}).get("id") == provider_id:
                 return path
@@ -12869,20 +13607,21 @@ def find_codex_history(provider_id: str) -> Path | None:
 
 def parse_claude_history(path: Path, limit: int | None) -> list[dict[str, str]]:
     items: list[dict[str, str]] = []
-    for line in path.open("r", encoding="utf-8", errors="ignore"):
-        if not line.strip():
-            continue
-        with suppress(Exception):
-            event = json.loads(line)
-            event_type = event.get("type")
-            if event_type == "user":
-                add_history_item(
-                    items,
-                    "user",
-                    strip_agentsdock_generated_user_text(message_text(event.get("message"))),
-                )
-            elif event_type == "assistant":
-                add_history_item(items, "assistant", message_text(event.get("message")))
+    with path.open("r", encoding="utf-8", errors="ignore") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            with suppress(Exception):
+                event = json.loads(line)
+                event_type = event.get("type")
+                if event_type == "user":
+                    add_history_item(
+                        items,
+                        "user",
+                        strip_agentsdock_generated_user_text(message_text(event.get("message"))),
+                    )
+                elif event_type == "assistant":
+                    add_history_item(items, "assistant", message_text(event.get("message")))
     return tail_limit_items(items, limit)
 
 
@@ -12977,33 +13716,34 @@ def strip_agentsdock_generated_user_text(text: str) -> str:
 
 def parse_codex_history(path: Path, limit: int | None) -> list[dict[str, str]]:
     items: list[dict[str, str]] = []
-    for line in path.open("r", encoding="utf-8", errors="ignore"):
-        if not line.strip():
-            continue
-        with suppress(Exception):
-            event = json.loads(line)
-            event_type = event.get("type")
-            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-            if event_type == "event_msg":
-                payload_type = payload.get("type")
-                if payload_type == "user_message":
-                    add_history_item(
-                        items,
-                        "user",
-                        strip_agentsdock_generated_user_text(str(payload.get("message") or "")),
-                    )
-                elif payload_type == "agent_message":
-                    add_history_item(items, "assistant", str(payload.get("message") or ""))
-            elif event_type == "response_item" and payload.get("type") == "message":
-                role = payload.get("role")
-                if role == "user":
-                    add_history_item(
-                        items,
-                        "user",
-                        strip_agentsdock_generated_user_text(text_from_content(payload.get("content"))),
-                    )
-                elif role == "assistant":
-                    add_history_item(items, "assistant", text_from_content(payload.get("content")))
+    with path.open("r", encoding="utf-8", errors="ignore") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            with suppress(Exception):
+                event = json.loads(line)
+                event_type = event.get("type")
+                payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+                if event_type == "event_msg":
+                    payload_type = payload.get("type")
+                    if payload_type == "user_message":
+                        add_history_item(
+                            items,
+                            "user",
+                            strip_agentsdock_generated_user_text(str(payload.get("message") or "")),
+                        )
+                    elif payload_type == "agent_message":
+                        add_history_item(items, "assistant", str(payload.get("message") or ""))
+                elif event_type == "response_item" and payload.get("type") == "message":
+                    role = payload.get("role")
+                    if role == "user":
+                        add_history_item(
+                            items,
+                            "user",
+                            strip_agentsdock_generated_user_text(text_from_content(payload.get("content"))),
+                        )
+                    elif role == "assistant":
+                        add_history_item(items, "assistant", text_from_content(payload.get("content")))
     return tail_limit_items(items, limit)
 
 
@@ -13132,43 +13872,428 @@ async def import_session_history(sess: dict[str, Any], *, force: bool = False, l
     return {"imported": len(items), "source_path": str(source_path), "message": message}
 
 
+FORK_HISTORY_EVENT_TYPES = {
+    "turn_started",
+    "assistant_text",
+    "reasoning_summary",
+    "tool_started",
+    "tool_finished",
+    "turn_finished",
+    # Interrupted Codex commentary is promoted into durable assistant chat by
+    # this lifecycle event. Omitting it leaves the copied text trapped in the
+    # folded reasoning trace.
+    "turn_stopped",
+    # Files remain chat-owned. These events are copied only after their file
+    # records have been cloned and rebound to the child session below.
+    "file_uploaded",
+    "artifact_created",
+    "artifact_error",
+    "code_diff",
+    "error",
+    # These are user-visible timeline landmarks rather than live provider
+    # state, so retaining them preserves the chronology of the conversation.
+    "codex_compaction_started",
+    "codex_compaction_completed",
+}
+
+
+def fork_file_source_path(file_id: str, record: dict[str, Any]) -> Path | None:
+    """Resolve one registered file without trusting an arbitrary metadata path."""
+    clean_file_id = normalized_file_id(file_id)
+    if not clean_file_id:
+        return None
+    file_root = FILES_ROOT / clean_file_id
+    try:
+        registry_root = FILES_ROOT.resolve(strict=True)
+        resolved_root = file_root.resolve(strict=True)
+    except OSError:
+        return None
+    # Reject a registry-entry symlink even when it points to another otherwise
+    # valid file directory. Ownership is scoped to the literal registered ID.
+    if resolved_root != registry_root / clean_file_id:
+        return None
+
+    raw_path = str(record.get("path") or "").strip()
+    if raw_path:
+        with suppress(OSError, ValueError):
+            candidate = Path(raw_path).resolve(strict=True)
+            candidate.relative_to(resolved_root)
+            if candidate.is_file() and candidate.name != "meta.json":
+                return candidate
+
+    with suppress(OSError):
+        candidates: list[Path] = []
+        for candidate in file_root.iterdir():
+            if candidate.name == "meta.json":
+                continue
+            with suppress(OSError, ValueError):
+                resolved = candidate.resolve(strict=True)
+                resolved.relative_to(resolved_root)
+                if resolved.is_file():
+                    candidates.append(resolved)
+        if len(candidates) == 1:
+            return candidates[0]
+    return None
+
+
+def copy_fork_file_data(source: Path, destination: Path) -> None:
+    """Create an isolated copy, preferring copy-on-write where available."""
+    if sys.platform == "darwin":
+        with suppress(Exception):
+            clonefile = ctypes.CDLL(None, use_errno=True).clonefile
+            clonefile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+            clonefile.restype = ctypes.c_int
+            if clonefile(os.fsencode(source), os.fsencode(destination), 0) == 0:
+                shutil.copystat(source, destination)
+                return
+            with suppress(OSError):
+                destination.unlink()
+    elif sys.platform.startswith("linux"):
+        # Linux FICLONE creates a reflink: independent file semantics without
+        # eagerly duplicating a potentially multi-gigabyte upload.
+        with suppress(Exception):
+            with source.open("rb") as source_stream, destination.open("xb") as destination_stream:
+                fcntl.ioctl(destination_stream.fileno(), 0x40049409, source_stream.fileno())
+            shutil.copystat(source, destination)
+            return
+        with suppress(OSError):
+            destination.unlink()
+    # Hardlinks are intentionally not used: attachment paths are visible to
+    # local agents, so an in-place write must never mutate the parent snapshot.
+    shutil.copy2(source, destination)
+
+
+def clone_fork_file_record(
+    parent_id: str,
+    child_id: str,
+    source_record: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Atomically clone one parent-owned file into the child ownership scope."""
+    source_id = normalized_file_id(source_record.get("id"))
+    if not source_id or not file_record_belongs_to_session(source_record, parent_id):
+        return None
+    metadata = read_file_meta_record(source_id)
+    if not isinstance(metadata, dict):
+        return None
+    metadata_owner = str(metadata.get("session_id") or "").strip()
+    if metadata_owner and metadata_owner != parent_id:
+        return None
+    source = fork_file_source_path(source_id, metadata)
+    if source is None:
+        return None
+
+    kind = str(metadata.get("kind") or source_record.get("kind") or "artifact")
+    prefix = "file" if kind == "upload" else "art"
+    cloned_id = f"{prefix}_{uuid.uuid4().hex[:16]}"
+    filename = safe_name(
+        str(metadata.get("filename") or source_record.get("filename") or source.name)
+    )
+    FILES_ROOT.mkdir(parents=True, exist_ok=True)
+    final_root = FILES_ROOT / cloned_id
+    temporary_root = Path(
+        tempfile.mkdtemp(prefix=f".{cloned_id}-", dir=str(FILES_ROOT))
+    )
+    try:
+        temporary_file = temporary_root / filename
+        copy_fork_file_data(source, temporary_file)
+        cloned = {
+            **metadata,
+            **source_record,
+            "id": cloned_id,
+            "session_id": child_id,
+            "kind": kind,
+            "filename": filename,
+            "path": str(final_root / filename),
+            "size": temporary_file.stat().st_size,
+            "forked_from_file_id": source_id,
+            "forked_from_session_id": parent_id,
+        }
+        (temporary_root / "meta.json").write_text(
+            json.dumps(cloned, indent=2),
+            encoding="utf-8",
+        )
+        temporary_root.replace(final_root)
+        return cloned
+    except Exception:
+        with suppress(OSError):
+            shutil.rmtree(temporary_root)
+        raise
+
+
+async def clone_fork_file_record_async(
+    parent_id: str,
+    child_id: str,
+    source_record: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Join an in-flight clone before propagating caller cancellation."""
+    clone_task = asyncio.create_task(asyncio.to_thread(
+        clone_fork_file_record,
+        parent_id,
+        child_id,
+        source_record,
+    ))
+    try:
+        return await asyncio.shield(clone_task)
+    except BaseException:
+        cloned: dict[str, Any] | None = None
+        try:
+            cloned = await join_task_despite_caller_cancellation(clone_task)
+        except BaseException:
+            pass
+        cloned_id = normalized_file_id((cloned or {}).get("id"))
+        if cloned_id:
+            cleanup_task = asyncio.create_task(asyncio.to_thread(
+                shutil.rmtree,
+                FILES_ROOT / cloned_id,
+                True,
+            ))
+            with suppress(BaseException):
+                await join_task_despite_caller_cancellation(cleanup_task)
+        raise
+
+
+def delete_cloned_fork_files(
+    cloned_files: dict[str, dict[str, Any]],
+) -> None:
+    for cloned in cloned_files.values():
+        cloned_id = normalized_file_id(cloned.get("id"))
+        if cloned_id:
+            with suppress(OSError):
+                shutil.rmtree(FILES_ROOT / cloned_id)
+
+
+def fork_source_file_records(
+    parent_id: str,
+    parent_events: list[dict[str, Any]],
+    referenced_file_ids: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Return only file records whose parent-chat origin can be established."""
+    event_records: dict[str, dict[str, Any]] = {}
+    for event in parent_events:
+        if not event_establishes_session_file_origin(event, parent_id):
+            continue
+        for key in ("file", "artifact"):
+            record = event.get(key)
+            if not isinstance(record, dict):
+                continue
+            file_id = normalized_file_id(record.get("id"))
+            if not file_id or not file_record_belongs_to_session(record, parent_id):
+                continue
+            metadata = read_file_meta_record(file_id)
+            metadata_owner = str((metadata or {}).get("session_id") or "").strip()
+            if metadata_owner and metadata_owner != parent_id:
+                continue
+            event_records[file_id] = {**(metadata or {}), **record}
+
+    # Resolve only files referenced by copied events. Scanning the complete
+    # global file registry made one chat fork scale with every chat's files.
+    records: dict[str, dict[str, Any]] = {}
+    for file_id in referenced_file_ids:
+        metadata = read_file_meta_record(file_id)
+        metadata_owner = str((metadata or {}).get("session_id") or "").strip()
+        if metadata_owner == parent_id:
+            records[file_id] = dict(metadata or {})
+        elif not metadata_owner and file_id in event_records:
+            records[file_id] = event_records[file_id]
+    return records
+
+
+def fork_event_file_ids(event: dict[str, Any]) -> list[str]:
+    file_ids = list(event.get("file_ids") or []) if isinstance(event.get("file_ids"), list) else []
+    for key in ("file", "artifact"):
+        record = event.get(key)
+        if isinstance(record, dict):
+            file_ids.append(str(record.get("id") or ""))
+    return merged_file_ids(file_ids)
+
+
 async def copy_fork_history(parent_id: str, child_id: str) -> int:
     # Fork history copy is an internal clone operation, not an API page. Do not
     # route it through read_events(), which clamps responses for UI pagination.
-    parent_events = list(iter_session_events(parent_id))
+    parent_events = await asyncio.to_thread(
+        lambda: list(iter_session_events(parent_id))
+    )
     internal_run_ids = {
         str(event.get("run_id"))
         for event in parent_events
         if event.get("purpose") in FORK_INTERNAL_PURPOSES and str(event.get("run_id") or "").strip()
     }
-    assistant_runs = {
-        event.get("run_id")
+    eligible_events = [
+        event
         for event in parent_events
-        if event.get("type") == "assistant_text" and str(event.get("text") or "").strip()
+        if event.get("purpose") not in FORK_INTERNAL_PURPOSES
+        and str(event.get("run_id") or "").strip() not in internal_run_ids
+        and event.get("type") in FORK_HISTORY_EVENT_TYPES
+    ]
+    assistant_runs = {
+        str(event.get("run_id") or "").strip()
+        for event in eligible_events
+        if event.get("type") == "assistant_text"
+        and str(event.get("run_id") or "").strip()
+        and str(event.get("text") or "").strip()
     }
-    copied = 0
-    for event in parent_events:
+    terminal_run_ids = {
+        str(event.get("run_id") or "").strip()
+        for event in eligible_events
+        if event.get("type") in {"turn_finished", "turn_stopped", "error"}
+        and str(event.get("run_id") or "").strip()
+    }
+    open_run_ids = list(dict.fromkeys(
+        str(event.get("run_id") or "").strip()
+        for event in eligible_events
+        if event.get("type") == "turn_started"
+        and str(event.get("run_id") or "").strip()
+        and str(event.get("run_id") or "").strip() not in terminal_run_ids
+    ))
+    referenced_file_ids = merged_file_ids(*[
+        fork_event_file_ids(event) for event in eligible_events
+    ])
+    source_records = fork_source_file_records(
+        parent_id,
+        parent_events,
+        referenced_file_ids,
+    )
+    cloned_files: dict[str, dict[str, Any]] = {}
+    file_clone_failures: dict[str, str] = {}
+    for file_id in referenced_file_ids:
+        source_record = source_records.get(file_id)
+        if not source_record:
+            logger.warning(
+                "fork file metadata unavailable parent_session=%s child_session=%s file_id=%s",
+                parent_id,
+                child_id,
+                file_id,
+            )
+            file_clone_failures[file_id] = "registered attachment metadata is unavailable"
+            continue
+        try:
+            cloned = await clone_fork_file_record_async(
+                parent_id,
+                child_id,
+                source_record,
+            )
+        except asyncio.CancelledError:
+            cleanup_task = asyncio.create_task(asyncio.to_thread(
+                delete_cloned_fork_files,
+                cloned_files,
+            ))
+            with suppress(BaseException):
+                await join_task_despite_caller_cancellation(cleanup_task)
+            raise
+        except Exception as exc:
+            logger.warning(
+                "fork file clone failed parent_session=%s child_session=%s file_id=%s: %s",
+                parent_id,
+                child_id,
+                file_id,
+                concise_error_message(exc),
+            )
+            file_clone_failures[file_id] = concise_error_message(exc)
+            continue
+        if cloned:
+            cloned_files[file_id] = cloned
+        else:
+            file_clone_failures[file_id] = "attachment could not be cloned safely"
+
+    imported_events: list[tuple[str, dict[str, Any]]] = []
+    surfaced_file_failures: set[str] = set()
+    for event in eligible_events:
         event_type = event.get("type")
-        run_id = str(event.get("run_id") or "").strip()
-        if event.get("purpose") in FORK_INTERNAL_PURPOSES or run_id in internal_run_ids:
-            continue
-        if event_type not in {"turn_started", "assistant_text", "reasoning_summary", "tool_started", "tool_finished", "turn_finished"}:
-            continue
-        if event_type == "turn_finished":
-            if not str(event.get("result_text") or "").strip() or event.get("run_id") in assistant_runs:
+        for file_id in fork_event_file_ids(event):
+            if file_id not in file_clone_failures or file_id in surfaced_file_failures:
                 continue
+            source_record = source_records.get(file_id) or {}
+            source_ts = str(event.get("ts") or "").strip()
+            error_payload: dict[str, Any] = {
+                "error": "A parent attachment could not be copied into this fork.",
+                "detail": file_clone_failures[file_id],
+                "source_file_id": file_id,
+                "filename": source_record.get("filename"),
+                "forked": True,
+                "original_session_id": parent_id,
+                "original_seq": event.get("seq"),
+            }
+            if source_ts:
+                error_payload["ts"] = source_ts
+                error_payload["original_ts"] = source_ts
+            imported_events.append(("artifact_error", error_payload))
+            surfaced_file_failures.add(file_id)
         payload = {
             key: value
             for key, value in event.items()
             if key not in {"seq", "id", "session_id", "ts"}
         }
+        if (
+            event_type == "turn_finished"
+            and str(event.get("run_id") or "").strip() in assistant_runs
+        ):
+            # Preserve the terminal lifecycle so desktop and iOS flush the
+            # run, while keeping the established final-answer dedupe behavior.
+            payload["result_text"] = ""
+        source_ts = str(event.get("ts") or "").strip()
+        if source_ts:
+            # Preserve the original timeline chronology while retaining an
+            # explicit provenance field for clients and future migrations.
+            payload["ts"] = source_ts
+            payload["original_ts"] = source_ts
+        if event_type == "turn_started":
+            source_file_ids = (
+                list(event.get("file_ids") or [])
+                if isinstance(event.get("file_ids"), list)
+                else []
+            )
+            payload["file_ids"] = [
+                cloned_files[file_id]["id"]
+                for file_id in merged_file_ids(source_file_ids)
+                if file_id in cloned_files
+            ]
+        nested_file_key = next(
+            (key for key in ("file", "artifact") if isinstance(event.get(key), dict)),
+            None,
+        )
+        if nested_file_key:
+            source_file_id = normalized_file_id(event[nested_file_key].get("id"))
+            cloned = cloned_files.get(source_file_id)
+            if not cloned:
+                # Never copy a parent-owned record into the child. The text
+                # history remains useful even if one best-effort file copy
+                # could not be completed.
+                continue
+            payload[nested_file_key] = dict(cloned)
         payload["forked"] = True
         payload["original_session_id"] = parent_id
         payload["original_seq"] = event.get("seq")
-        await append_event(child_id, event_type, payload)
-        copied += 1
-    await append_event(parent_id, "session_forked", {"child_id": child_id})
-    return copied
+        imported_events.append((str(event_type), payload))
+    for run_id in open_run_ids:
+        # The parent may still be running, but a fork is a point-in-time
+        # snapshot. Close that run locally so copied commentary is durable and
+        # the child never renders historical work as live.
+        imported_events.append((
+            "turn_stopped",
+            {
+                "run_id": run_id,
+                "reason": "fork_snapshot",
+                "message": "This run was still active at the fork point.",
+                "forked": True,
+                "synthetic": True,
+                "original_session_id": parent_id,
+            },
+        ))
+    try:
+        return await append_imported_events(child_id, imported_events)
+    except BaseException:
+        # The JSONL append is transactional; roll back the corresponding file
+        # registry entries too so a failed fork does not leak large orphaned
+        # copies outside the child session directory.
+        cleanup_task = asyncio.create_task(asyncio.to_thread(
+            delete_cloned_fork_files,
+            cloned_files,
+        ))
+        try:
+            await join_task_despite_caller_cancellation(cleanup_task)
+        except BaseException:
+            pass
+        raise
 
 
 def build_fork_memory(
@@ -13195,11 +14320,29 @@ def build_fork_memory(
         header.append(f"Fork fallback reason: {compact_memory_text(reason, 800)}")
 
     lines: list[str] = header + ["", "Recent rough conversation:"]
-    events = [
-        event
-        for event in read_events(parent_id, limit=160, tail=True)
-        if not exclude_run_id or event.get("run_id") != exclude_run_id
-    ]
+    # Select the most recent useful conversational events, not merely the last
+    # raw events. A single tool-heavy turn can contain thousands of tool events
+    # and previously displaced every user/assistant message from the fallback.
+    internal_run_ids = {
+        str(event.get("run_id"))
+        for event in iter_session_events(parent_id)
+        if event.get("purpose") in FORK_INTERNAL_PURPOSES
+        and str(event.get("run_id") or "").strip()
+    }
+    events: deque[dict[str, Any]] = deque(maxlen=160)
+    for event in iter_session_events(parent_id):
+        run_id = str(event.get("run_id") or "").strip()
+        event_type = str(event.get("type") or "")
+        if (
+            (exclude_run_id and run_id == exclude_run_id)
+            or event.get("purpose") in FORK_INTERNAL_PURPOSES
+            or (run_id and run_id in internal_run_ids)
+        ):
+            continue
+        if event_type in {"turn_started", "assistant_text", "turn_finished", "artifact_created"}:
+            events.append(event)
+        elif event_type == "reasoning_summary" and event.get("phase") == "commentary":
+            events.append(event)
     assistant_runs = {
         event.get("run_id")
         for event in events
@@ -13223,7 +14366,7 @@ def build_fork_memory(
         elif event_type == "reasoning_summary":
             text = compact_memory_text(event.get("text") or "", 900)
             if text:
-                lines.append(f"\nReasoning summary:\n{text}")
+                lines.append(f"\nAssistant commentary:\n{text}")
         elif event_type == "artifact_created":
             artifact = event.get("artifact") if isinstance(event.get("artifact"), dict) else {}
             title = artifact.get("title") or artifact.get("filename") or artifact.get("id") or "artifact"
@@ -13562,7 +14705,9 @@ def agent_runner_env(session_id: str) -> dict[str, str]:
     env["AGENTSDOCK_MANIFEST_PATH"] = str(codex_manifest_path(session_id))
     env["AGENTSDOCK_SERVER_URL"] = f"http://127.0.0.1:{SERVER_PORT}"
     env["AGENTSDOCK_JOBS_CLI"] = str(SERVER_ROOT / "agentsdock_jobs.py")
+    env["AGENTSDOCK_PUBLISH_CLI"] = str(SERVER_ROOT / "agentsdock_publish.py")
     env["AGENTSDOCK_AGENT_TOKEN"] = AGENT_TOKEN
+    env["AGENTSDOCK_PUBLISH_TOKEN"] = ARTIFACT_PUBLISH_TOKEN
     return env
 
 
@@ -13574,7 +14719,9 @@ def codex_app_server_env() -> dict[str, str]:
         env["PATH"] = codex_dir + os.pathsep + env.get("PATH", "")
     env["AGENTSDOCK_SERVER_URL"] = f"http://127.0.0.1:{SERVER_PORT}"
     env["AGENTSDOCK_JOBS_CLI"] = str(SERVER_ROOT / "agentsdock_jobs.py")
+    env["AGENTSDOCK_PUBLISH_CLI"] = str(SERVER_ROOT / "agentsdock_publish.py")
     env["AGENTSDOCK_AGENT_TOKEN"] = AGENT_TOKEN
+    env["AGENTSDOCK_PUBLISH_TOKEN"] = ARTIFACT_PUBLISH_TOKEN
     return env
 
 
@@ -14376,6 +15523,8 @@ async def project_codex_subagent_item(
             run_id=run_id,
             tool_id=str(item.get("id") or "") or None,
             name=item.get("agentPath"),
+            nickname=item.get("agentNickname"),
+            agent_path=item.get("agentPath"),
             activity=activity,
         )
         return
@@ -14423,6 +15572,8 @@ async def project_codex_subagent_item(
             parent_thread_id=str(item.get("senderThreadId") or parent_thread_id),
             run_id=run_id,
             tool_id=str(item.get("id") or "") or None,
+            nickname=state.get("agentNickname") or item.get("agentNickname"),
+            agent_path=state.get("agentPath") or item.get("agentPath"),
             activity=activity,
             summary=state.get("message"),
         )
@@ -16626,6 +17777,66 @@ async def persist_reconciled_codex_goal(
     return True
 
 
+def validate_inherited_codex_goal(
+    expected_goal: dict[str, Any],
+    native_goal: dict[str, Any] | None,
+) -> None:
+    """Require a native fork to preserve the parent goal faithfully.
+
+    A forked active goal is deliberately paused before it is exposed because
+    the new chat has no local run owner. All other representable fields must
+    match the parent snapshot exactly; otherwise the caller must discard the
+    native fork and use the bounded-memory fallback.
+    """
+
+    if not isinstance(native_goal, dict):
+        raise CodexAppServerProtocolError(
+            "the native fork did not preserve the inherited goal",
+            request_sent=True,
+            safe_to_retry=False,
+        )
+
+    expected_objective = str(expected_goal.get("objective") or "").strip()
+    native_objective = str(native_goal.get("objective") or "").strip()
+    if not expected_objective or native_objective != expected_objective:
+        raise CodexAppServerProtocolError(
+            "the native fork did not preserve the inherited goal objective",
+            request_sent=True,
+            safe_to_retry=False,
+        )
+
+    expected_token_budget = expected_goal.get("tokenBudget")
+    if expected_token_budget is None and "tokenBudget" not in expected_goal:
+        expected_token_budget = expected_goal.get("token_budget")
+    if isinstance(expected_token_budget, bool) or (
+        expected_token_budget is not None
+        and not isinstance(expected_token_budget, int)
+    ):
+        raise CodexAppServerProtocolError(
+            "the cached inherited goal has an invalid token budget",
+            request_sent=False,
+            safe_to_retry=False,
+        )
+    if native_goal.get("tokenBudget") != expected_token_budget:
+        raise CodexAppServerProtocolError(
+            "the native fork did not preserve the inherited goal token budget",
+            request_sent=True,
+            safe_to_retry=False,
+        )
+
+    expected_status = str(expected_goal.get("status") or "").strip()
+    if expected_status in CODEX_GOAL_STATUSES:
+        # Reconciliation pauses an inherited active goal before validation so
+        # ownerless background work can never escape through the new chat.
+        exposed_status = "paused" if expected_status == "active" else expected_status
+        if str(native_goal.get("status") or "").strip() != exposed_status:
+            raise CodexAppServerProtocolError(
+                "the native fork did not preserve the inherited goal status",
+                request_sent=True,
+                safe_to_retry=False,
+            )
+
+
 async def reconcile_codex_thread_goal(
     manager: CodexAppServerManager,
     session_id: str,
@@ -16633,6 +17844,8 @@ async def reconcile_codex_thread_goal(
     *,
     new_thread: bool = False,
     force: bool = False,
+    require_goal_support: bool = False,
+    expected_goal: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Reconcile cached and native goal state once per provider generation.
 
@@ -16646,7 +17859,11 @@ async def reconcile_codex_thread_goal(
     generation = generation_value if isinstance(generation_value, int) else 0
     sync_key = (generation, thread_id)
     session = STORE.sessions.get(session_id) or {}
-    if not force and CODEX_GOAL_SYNC_GENERATIONS.get(session_id) == sync_key:
+    if (
+        expected_goal is None
+        and not force
+        and CODEX_GOAL_SYNC_GENERATIONS.get(session_id) == sync_key
+    ):
         cached = session.get("codex_goal")
         return dict(cached) if isinstance(cached, dict) else None
 
@@ -16691,12 +17908,24 @@ async def reconcile_codex_thread_goal(
             if get_goal is None:
                 # Test doubles and legacy managers without native goals keep
                 # the old behavior. Production managers always expose this.
+                if require_goal_support or expected_goal is not None:
+                    raise CodexAppServerProtocolError(
+                        "the native fork cannot verify the inherited goal",
+                        request_sent=False,
+                        safe_to_retry=False,
+                    )
                 CODEX_GOAL_SYNC_GENERATIONS[session_id] = sync_key
                 return dict(cached_goal) if isinstance(cached_goal, dict) else None
             get_result = get_goal(thread_id)
             if not inspect.isawaitable(get_result):
                 # Keep lightweight protocol test doubles compatible; a real
                 # Codex manager always returns an awaitable here.
+                if require_goal_support or expected_goal is not None:
+                    raise CodexAppServerProtocolError(
+                        "the native fork cannot verify the inherited goal",
+                        request_sent=False,
+                        safe_to_retry=False,
+                    )
                 CODEX_GOAL_SYNC_GENERATIONS[session_id] = sync_key
                 return dict(cached_goal) if isinstance(cached_goal, dict) else None
             native_goal = await asyncio.wait_for(
@@ -16718,6 +17947,8 @@ async def reconcile_codex_thread_goal(
     except Exception as exc:
         if not codex_goal_api_is_unsupported(exc):
             raise
+        if require_goal_support:
+            raise
         logger.info(
             "Codex goal reconciliation unsupported session=%s thread=%s",
             session_id,
@@ -16726,12 +17957,20 @@ async def reconcile_codex_thread_goal(
         CODEX_GOAL_SYNC_GENERATIONS[session_id] = sync_key
         return dict(cached_goal) if isinstance(cached_goal, dict) else None
 
+    if (require_goal_support or expected_goal is not None) and native_goal is None:
+        raise CodexAppServerProtocolError(
+            "the native fork did not preserve the inherited goal",
+            request_sent=True,
+            safe_to_retry=False,
+        )
     if native_goal is not None and not isinstance(native_goal, dict):
         raise CodexAppServerProtocolError(
             "thread goal reconciliation returned invalid state",
             request_sent=True,
             safe_to_retry=False,
         )
+    if expected_goal is not None:
+        validate_inherited_codex_goal(expected_goal, native_goal)
     persisted = await persist_reconciled_codex_goal(
         session_id,
         thread_id,
@@ -17334,6 +18573,18 @@ def codex_turn_matches_client_user_message(
     )
 
 
+class CodexForkCleanupError(CodexAppServerProtocolError):
+    """A created provider fork has no crash-safe cleanup owner yet."""
+
+    def __init__(self, thread_id: str) -> None:
+        self.thread_id = str(thread_id or "").strip()
+        super().__init__(
+            "thread/fork could not establish crash-safe cleanup ownership",
+            request_sent=True,
+            safe_to_retry=False,
+        )
+
+
 async def fork_codex_thread(source_thread_id: str, sess: dict[str, Any]) -> str:
     cwd = existing_cwd(str(sess.get("cwd") or DEFAULT_CWD))
     manager = await codex_app_server_manager()
@@ -17341,16 +18592,138 @@ async def fork_codex_thread(source_thread_id: str, sess: dict[str, Any]) -> str:
         **codex_thread_params(sess, cwd),
         "ephemeral": False,
         "excludeTurns": True,
+        # A fork can inherit a persistent goal. Keep it dormant until the
+        # child chat has its own policy and the inherited goal is reconciled.
+        "deferGoalContinuation": True,
     }
-    forked_id = await manager.fork_thread(source_thread_id, params)
-    await touch_codex_app_server_thread(manager, forked_id)
-    return forked_id
+    try:
+        forked_id = await manager.fork_thread(source_thread_id, params)
+    except BaseException as fork_exc:
+        # app-server can report a late-created child after thread/fork itself
+        # timed out or was cancelled.  If deleting that child also failed, the
+        # transport preserves its ID on the original exception.  Take durable
+        # ownership here before propagating the original failure; otherwise a
+        # cancelled HTTP request could strand a provider thread that no local
+        # session references.
+        unretired_ids = tuple(
+            dict.fromkeys(
+                str(thread_id or "").strip()
+                for thread_id in (
+                    getattr(fork_exc, "unretired_fork_thread_ids", ()) or ()
+                )
+                if str(thread_id or "").strip()
+            )
+        )
+        for unretired_id in unretired_ids:
+            journal_task = asyncio.create_task(
+                persist_abandoned_fork_provider_thread(unretired_id)
+            )
+            journaled = False
+            try:
+                journaled = bool(await asyncio.shield(journal_task))
+            except BaseException:
+                with suppress(BaseException):
+                    journaled = bool(
+                        await join_task_despite_caller_cancellation(
+                            journal_task
+                        )
+                    )
+            if journaled:
+                continue
+            cleanup_task = asyncio.create_task(
+                retire_or_record_failed_codex_fork(unretired_id)
+            )
+            cleanup_is_durable = False
+            with suppress(BaseException):
+                cleanup_is_durable = bool(
+                    await join_task_despite_caller_cancellation(cleanup_task)
+                )
+            if not cleanup_is_durable:
+                raise CodexForkCleanupError(unretired_id) from fork_exc
+        raise
+
+    # thread/fork creates a persistent provider object before AgentsDock has a
+    # local child session that can own it. Journal the ID before verification
+    # (or any other await) so a process crash cannot leave an undiscoverable
+    # provider fork behind.
+    journal_task = asyncio.create_task(
+        persist_abandoned_fork_provider_thread(forked_id)
+    )
+    try:
+        journaled = await asyncio.shield(journal_task)
+    except BaseException as journal_exc:
+        journal_is_durable = False
+        with suppress(BaseException):
+            journal_is_durable = bool(
+                await join_task_despite_caller_cancellation(journal_task)
+            )
+        cleanup_task = asyncio.create_task(
+            retire_or_record_failed_codex_fork(forked_id)
+        )
+        cleanup_is_durable = False
+        with suppress(BaseException):
+            cleanup_is_durable = bool(
+                await join_task_despite_caller_cancellation(cleanup_task)
+            )
+        if not (journal_is_durable or cleanup_is_durable):
+            raise CodexForkCleanupError(forked_id) from journal_exc
+        raise
+    if not journaled:
+        cleanup_task = asyncio.create_task(
+            retire_or_record_failed_codex_fork(forked_id)
+        )
+        cleanup_is_durable = False
+        with suppress(BaseException):
+            cleanup_is_durable = bool(
+                await join_task_despite_caller_cancellation(cleanup_task)
+            )
+        if not cleanup_is_durable:
+            raise CodexForkCleanupError(forked_id)
+        raise CodexAppServerProtocolError(
+            "thread/fork cleanup journal could not be persisted",
+            request_sent=True,
+            safe_to_retry=False,
+        )
+
+    try:
+        forked_thread = await manager.read_thread(
+            forked_id,
+            include_turns=False,
+        )
+        if str(forked_thread.get("forkedFromId") or "").strip() != source_thread_id:
+            raise CodexAppServerProtocolError(
+                "thread/fork ancestry could not be verified",
+                request_sent=True,
+                safe_to_retry=False,
+            )
+        forked_cwd = str(forked_thread.get("cwd") or "").strip()
+        if not forked_cwd or os.path.normpath(forked_cwd) != os.path.normpath(cwd):
+            raise CodexAppServerProtocolError(
+                "thread/fork working directory could not be verified",
+                request_sent=True,
+                safe_to_retry=False,
+            )
+        await touch_codex_app_server_thread(manager, forked_id)
+        return forked_id
+    except BaseException:
+        # The ID is known but the child cannot be trusted. It was never exposed
+        # to a user, so delete it when possible and otherwise retain the durable
+        # cleanup journal for startup recovery.
+        cleanup_task = asyncio.create_task(
+            retire_or_record_failed_codex_fork(forked_id)
+        )
+        with suppress(BaseException):
+            await join_task_despite_caller_cancellation(cleanup_task)
+        raise
 
 
 async def bind_forked_codex_thread(
     session_id: str,
     thread_id: str,
     sess: dict[str, Any],
+    *,
+    require_goal_support: bool = False,
+    expected_goal: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Bind a native fork to its child chat's policy before exposing it."""
     cwd = existing_cwd(str(sess.get("cwd") or DEFAULT_CWD))
@@ -17362,7 +18735,7 @@ async def bind_forked_codex_thread(
     try:
         if manager.is_thread_loaded(thread_id):
             await manager.unsubscribe_thread(thread_id)
-        bound_thread_id = await manager.resume_thread(
+        resumed_thread_id = await manager.resume_thread(
             thread_id,
             {
                 **codex_thread_params(
@@ -17373,6 +18746,13 @@ async def bind_forked_codex_thread(
                 "excludeTurns": True,
             },
         )
+        if resumed_thread_id != thread_id:
+            raise CodexAppServerProtocolError(
+                "thread/resume changed the forked thread identity",
+                request_sent=True,
+                safe_to_retry=False,
+            )
+        bound_thread_id = resumed_thread_id
         # Current Codex releases can defer changed resume instructions until a
         # later turn. Persist the child-scoped policy as a developer item too,
         # before the fork is returned to any client.
@@ -17386,10 +18766,475 @@ async def bind_forked_codex_thread(
             BACKEND_CODEX,
             codex_instruction_hash=instruction_hash,
         )
+        # thread/fork deferred inherited goal continuation. Reconcile now,
+        # before the endpoint exposes the child; an active goal is paused
+        # because this new chat has no local run owner.
+        await reconcile_codex_thread_goal(
+            manager,
+            session_id,
+            bound_thread_id,
+            force=True,
+            require_goal_support=require_goal_support,
+            expected_goal=expected_goal,
+        )
         await touch_codex_app_server_thread(manager, bound_thread_id)
         return bound_thread_id, instruction_hash
+    except Exception:
+        # Any failed bind (resume, policy injection, persistence, or goal
+        # reconciliation) must leave neither an attached nor a loaded provider
+        # fork. The caller can safely fall back to bounded memory afterward.
+        async with STORE._lock:
+            current = STORE.sessions.get(session_id)
+            if current and session_provider_id(current) == bound_thread_id:
+                current["session_id"] = None
+                # A hidden staged fork remains the durable recovery owner until
+                # its caller either retires the provider or publishes the
+                # successfully bound child. Never erase that last reference on
+                # a failed policy/goal bind.
+                current["codex_thread_id"] = (
+                    thread_id if current.get("_fork_initializing") else None
+                )
+                current.pop("codex_instruction_hash", None)
+                current.pop("codex_instruction_version", None)
+                await STORE.save()
+        if manager.is_thread_loaded(bound_thread_id):
+            with suppress(Exception):
+                await manager.unsubscribe_thread(bound_thread_id)
+        raise
     finally:
         await unpin_codex_app_server_thread(manager, bound_thread_id)
+
+
+async def retire_failed_codex_fork(thread_id: str) -> bool:
+    """Unload a provider fork that will not be exposed as an AgentsDock chat."""
+    clean_thread_id = str(thread_id or "").strip()
+    if not clean_thread_id:
+        return True
+    # Stop routing provider callbacks before remote cleanup yields. This is
+    # also used when a staged child survives as a memory fallback after native
+    # bind failure, so a late event must not leak into that local child.
+    CODEX_THREAD_SESSION_INDEX.pop(clean_thread_id, None)
+    deleted = False
+    try:
+        manager = await codex_app_server_manager()
+        try:
+            await manager.delete_thread(clean_thread_id)
+            deleted = True
+        except Exception:
+            if manager.is_thread_loaded(clean_thread_id):
+                await manager.unsubscribe_thread(clean_thread_id)
+    except Exception as exc:
+        logger.warning(
+            "failed to unload abandoned Codex fork thread=%s: %s",
+            clean_thread_id,
+            concise_error_message(exc),
+        )
+    async with CODEX_APP_SERVER_THREAD_LRU_LOCK:
+        CODEX_APP_SERVER_THREAD_LRU.pop(clean_thread_id, None)
+        CODEX_APP_SERVER_THREAD_PIN_COUNTS.pop(clean_thread_id, None)
+        CODEX_APP_SERVER_PINNED_THREADS.discard(clean_thread_id)
+    return deleted
+
+
+async def persist_abandoned_fork_provider_thread(thread_id: str) -> bool:
+    """Durably fence a provider fork that could not be retired immediately."""
+
+    clean_thread_id = str(thread_id or "").strip()
+    if not clean_thread_id:
+        return True
+    async with ABANDONED_FORK_PROVIDER_THREADS_LOCK:
+        pending = set(ABANDONED_FORK_PROVIDER_THREADS)
+        pending.add(clean_thread_id)
+        try:
+            await asyncio.to_thread(
+                write_abandoned_fork_thread_ids,
+                pending,
+            )
+        except OSError as exc:
+            # Retain the in-memory fence even though a crash would lose it.
+            # A staged local child, when present, remains durable and lets the
+            # next startup retry this ledger write before removing the child.
+            ABANDONED_FORK_PROVIDER_THREADS.add(clean_thread_id)
+            logger.warning(
+                "could not persist abandoned provider fork thread=%s: %s",
+                clean_thread_id,
+                concise_error_message(exc),
+            )
+            return False
+        ABANDONED_FORK_PROVIDER_THREADS.clear()
+        ABANDONED_FORK_PROVIDER_THREADS.update(pending)
+        return True
+
+
+async def forget_abandoned_fork_provider_thread(thread_id: str) -> bool:
+    """Remove a cleanup fence only after another durable owner exists."""
+
+    clean_thread_id = str(thread_id or "").strip()
+    if not clean_thread_id:
+        return True
+    async with ABANDONED_FORK_PROVIDER_THREADS_LOCK:
+        if clean_thread_id not in ABANDONED_FORK_PROVIDER_THREADS:
+            return True
+        remaining = ABANDONED_FORK_PROVIDER_THREADS - {clean_thread_id}
+        try:
+            await asyncio.to_thread(
+                write_abandoned_fork_thread_ids,
+                remaining,
+            )
+        except OSError as exc:
+            logger.warning(
+                "could not clear abandoned provider fork thread=%s: %s",
+                clean_thread_id,
+                concise_error_message(exc),
+            )
+            return False
+        ABANDONED_FORK_PROVIDER_THREADS.clear()
+        ABANDONED_FORK_PROVIDER_THREADS.update(remaining)
+        return True
+
+
+async def save_staged_fork_provider_reference(
+    session_id: str,
+    thread_id: str,
+) -> None:
+    """Persist the provider ID before the cleanup ledger can be released."""
+
+    clean_thread_id = str(thread_id or "").strip()
+    if not clean_thread_id:
+        raise ValueError("missing staged provider fork thread")
+    async with STORE._lock:
+        session = STORE.sessions.get(session_id)
+        if not session or not session.get("_fork_initializing"):
+            raise RuntimeError("staged fork session is unavailable")
+        previous_thread_id = session.get("codex_thread_id")
+        session["codex_thread_id"] = clean_thread_id
+        try:
+            await STORE.save()
+        except BaseException:
+            session["codex_thread_id"] = previous_thread_id
+            raise
+
+
+async def clear_staged_fork_provider_reference(
+    session_id: str,
+    thread_id: str,
+) -> None:
+    """Release staged ownership only after cleanup is independently durable."""
+
+    clean_thread_id = str(thread_id or "").strip()
+    async with STORE._lock:
+        session = STORE.sessions.get(session_id)
+        if not session or not session.get("_fork_initializing"):
+            raise RuntimeError("staged fork session is unavailable")
+        current_thread_id = str(session.get("codex_thread_id") or "").strip()
+        if current_thread_id and current_thread_id != clean_thread_id:
+            raise RuntimeError("staged fork provider identity changed unexpectedly")
+        previous_session_id = session.get("session_id")
+        previous_thread_id = session.get("codex_thread_id")
+        if str(session.get("session_id") or "").strip() == clean_thread_id:
+            session["session_id"] = None
+        session["codex_thread_id"] = None
+        try:
+            await STORE.save()
+        except BaseException:
+            session["session_id"] = previous_session_id
+            session["codex_thread_id"] = previous_thread_id
+            raise
+
+
+async def retire_or_record_failed_codex_fork(thread_id: str) -> bool:
+    """Make a failed provider fork either deleted or durably recoverable."""
+
+    clean_thread_id = str(thread_id or "").strip()
+    if not clean_thread_id:
+        return True
+    deleted = await retire_failed_codex_fork(clean_thread_id)
+    if deleted:
+        # Remote deletion itself is durable cleanup. A failed ledger rewrite
+        # can leave a harmless stale fence for startup to remove, but must not
+        # prevent deletion of the hidden local child.
+        await forget_abandoned_fork_provider_thread(clean_thread_id)
+        return True
+    return await persist_abandoned_fork_provider_thread(clean_thread_id)
+
+
+async def cleanup_abandoned_fork_provider_threads(
+    startup_thread_ids: set[str] | None = None,
+) -> None:
+    """Retire durable provider orphans without delaying server startup."""
+
+    async with ABANDONED_FORK_PROVIDER_THREADS_LOCK:
+        pending = set(ABANDONED_FORK_PROVIDER_THREADS)
+        if startup_thread_ids is not None:
+            # The startup worker runs after the server begins accepting
+            # requests. Never let it consume a journal entry created by a new
+            # in-flight fork after STORE.load() completed.
+            pending.intersection_update(startup_thread_ids)
+    if not pending:
+        return
+
+    resolved: set[str] = set()
+    for thread_id in sorted(pending):
+        # The ledger is recovery state, but never trust it over current session
+        # ownership. A manually resumed/imported thread must not be deleted.
+        if any(
+            session_references_codex_thread(session, thread_id)
+            for session in STORE.sessions.values()
+            if isinstance(session, dict)
+            and not session.get("_fork_initializing")
+        ):
+            logger.warning(
+                "discarding stale abandoned-fork cleanup entry for owned thread=%s",
+                thread_id,
+            )
+            resolved.add(thread_id)
+            continue
+        try:
+            if await retire_failed_codex_fork(thread_id):
+                resolved.add(thread_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "abandoned provider fork cleanup failed thread=%s: %s",
+                thread_id,
+                concise_error_message(exc),
+            )
+
+    if not resolved:
+        return
+    async with ABANDONED_FORK_PROVIDER_THREADS_LOCK:
+        remaining = ABANDONED_FORK_PROVIDER_THREADS - resolved
+        try:
+            await asyncio.to_thread(
+                write_abandoned_fork_thread_ids,
+                remaining,
+            )
+        except OSError as exc:
+            # Keep the in-memory entries too; a later retry or restart must
+            # still know that durable cleanup was not committed.
+            logger.warning(
+                "could not update abandoned fork cleanup ledger: %s",
+                concise_error_message(exc),
+            )
+            return
+        ABANDONED_FORK_PROVIDER_THREADS.clear()
+        ABANDONED_FORK_PROVIDER_THREADS.update(remaining)
+
+
+async def cleanup_aborted_session_fork(
+    cleanup_state: dict[str, str | None],
+) -> None:
+    """Best-effort cleanup that survives cancellation of the HTTP request."""
+
+    provider_thread_id = str(
+        cleanup_state.get("provider_thread_id") or ""
+    ).strip()
+    child_session_id = str(cleanup_state.get("child_session_id") or "").strip()
+
+    # Fence synchronously, before the first await. A provider callback may
+    # already be queued when the HTTP task is cancelled; it must neither route
+    # back to this staged child nor recreate its directory via append_event.
+    if child_session_id:
+        DELETING_SESSIONS.add(child_session_id)
+        DELETED_SESSION_TOMBSTONES.add(child_session_id)
+        for thread_id, owner_session_id in tuple(
+            CODEX_THREAD_SESSION_INDEX.items()
+        ):
+            if owner_session_id == child_session_id:
+                CODEX_THREAD_SESSION_INDEX.pop(thread_id, None)
+        for thread_id, owner_session_id in tuple(
+            CODEX_SUBAGENT_SESSION_INDEX.items()
+        ):
+            if owner_session_id != child_session_id:
+                continue
+            CODEX_SUBAGENT_SESSION_INDEX.pop(thread_id, None)
+            CODEX_SUBAGENT_STATE.pop(thread_id, None)
+            CODEX_SUBAGENT_LIVE_GENERATIONS.pop(thread_id, None)
+        for thread_id, owner_session_id in tuple(
+            CODEX_QUARANTINED_GOAL_THREADS.items()
+        ):
+            if owner_session_id == child_session_id:
+                CODEX_QUARANTINED_GOAL_THREADS.pop(thread_id, None)
+        CODEX_GOAL_SYNC_GENERATIONS.pop(child_session_id, None)
+
+    async def delete_local_child() -> None:
+        # An append that passed its second deletion check already owns this
+        # lock. Join it before removing the directory; all later appends see
+        # the tombstone and return without touching the filesystem.
+        async with event_delivery_lock(child_session_id):
+            await STORE.delete(child_session_id)
+
+    async def cleanup_fork_resources() -> None:
+        provider_reference_is_durable = not provider_thread_id
+        if provider_thread_id:
+            try:
+                provider_reference_is_durable = await retire_or_record_failed_codex_fork(
+                    provider_thread_id
+                )
+            except BaseException as exc:
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                logger.warning(
+                    "aborted provider fork retirement failed thread=%s: %s",
+                    provider_thread_id,
+                    concise_error_message(exc),
+                )
+        if child_session_id and provider_reference_is_durable:
+            await delete_local_child()
+        elif child_session_id:
+            logger.warning(
+                "retaining hidden staged fork after cleanup persistence failure "
+                "session=%s thread=%s",
+                child_session_id,
+                provider_thread_id,
+            )
+
+    cleanup_task = asyncio.create_task(cleanup_fork_resources())
+    try:
+        with suppress(BaseException):
+            await join_task_despite_caller_cancellation(cleanup_task)
+    finally:
+        if child_session_id:
+            # The durable runtime fence is the tombstone. "Deleting" only
+            # describes the period while local/provider cleanup is joining.
+            DELETING_SESSIONS.discard(child_session_id)
+
+
+class ArtifactPublicationError(RuntimeError):
+    pass
+
+
+def artifact_publication_id(value: str) -> str:
+    clean = str(value or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", clean):
+        raise ArtifactPublicationError(
+            "publication_id must contain only letters, numbers, '.', '_', ':', or '-'"
+        )
+    return clean
+
+
+def normalize_artifact_entry_shapes(
+    entries: Any,
+    *,
+    allow_empty: bool = False,
+) -> list[dict[str, Any]]:
+    """Validate request fields without touching potentially remote files."""
+    if not isinstance(entries, list):
+        raise ArtifactPublicationError("files must be an array")
+    if not entries and not allow_empty:
+        raise ArtifactPublicationError("files must contain at least one entry")
+    if len(entries) > MAX_ARTIFACT_PUBLISH_FILES:
+        raise ArtifactPublicationError(
+            f"files must contain at most {MAX_ARTIFACT_PUBLISH_FILES} entries"
+        )
+
+    normalized: list[dict[str, Any]] = []
+    requested_paths: set[str] = set()
+    for index, entry in enumerate(entries):
+        label = f"files[{index}]"
+        if isinstance(entry, str):
+            raw_path = entry
+            title = None
+            text = None
+        elif isinstance(entry, dict):
+            unknown = set(entry) - {"path", "title", "text"}
+            if unknown:
+                raise ArtifactPublicationError(
+                    f"{label} contains unsupported keys: {', '.join(sorted(unknown))}"
+                )
+            raw_path = entry.get("path")
+            title = entry.get("title")
+            text = entry.get("text")
+        else:
+            raise ArtifactPublicationError(f"{label} must be a path string or object")
+
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise ArtifactPublicationError(f"{label}.path must be a non-empty string")
+        if "\x00" in raw_path or len(raw_path) > MAX_WORKSPACE_PATH_CHARS:
+            raise ArtifactPublicationError(f"{label}.path is invalid or too long")
+        source = Path(raw_path)
+        if not source.is_absolute():
+            raise ArtifactPublicationError(f"{label}.path must be absolute")
+
+        if title is not None and not isinstance(title, str):
+            raise ArtifactPublicationError(f"{label}.title must be a string or null")
+        if text is not None and not isinstance(text, str):
+            raise ArtifactPublicationError(f"{label}.text must be a string or null")
+        if isinstance(title, str) and (
+            "\x00" in title or len(title) > MAX_ARTIFACT_TITLE_CHARS
+        ):
+            raise ArtifactPublicationError(f"{label}.title is invalid or too long")
+        if isinstance(text, str) and (
+            "\x00" in text or len(text) > MAX_ARTIFACT_TEXT_CHARS
+        ):
+            raise ArtifactPublicationError(f"{label}.text is invalid or too long")
+
+        requested = str(source)
+        if requested in requested_paths:
+            raise ArtifactPublicationError(f"{label}.path duplicates an earlier file")
+        requested_paths.add(requested)
+        normalized.append({"path": requested, "title": title, "text": text})
+    return normalized
+
+
+def normalize_artifact_entries(
+    entries: Any,
+    *,
+    allow_empty: bool = False,
+) -> list[dict[str, Any]]:
+    """Validate a complete artifact batch before any destination is created."""
+    shapes = normalize_artifact_entry_shapes(entries, allow_empty=allow_empty)
+    normalized: list[dict[str, Any]] = []
+    canonical_paths: set[str] = set()
+    total_size = 0
+    for index, entry in enumerate(shapes):
+        label = f"files[{index}]"
+        try:
+            source = Path(str(entry["path"])).resolve(strict=True)
+            is_regular_file = source.is_file()
+            is_readable = os.access(source, os.R_OK)
+            source_size = source.stat().st_size
+        except OSError as exc:
+            raise ArtifactPublicationError(f"{label}.path is unavailable: {exc}") from exc
+        if not is_regular_file:
+            raise ArtifactPublicationError(f"{label}.path is not a regular file")
+        if not is_readable:
+            raise ArtifactPublicationError(f"{label}.path is not readable")
+        if source_size > MAX_UPLOAD_BYTES:
+            raise ArtifactPublicationError(f"{label}.path exceeds the file size limit")
+        total_size += source_size
+        if total_size > MAX_UPLOAD_BYTES:
+            raise ArtifactPublicationError("artifact batch exceeds the total size limit")
+        canonical = str(source)
+        if canonical in canonical_paths:
+            raise ArtifactPublicationError(f"{label}.path duplicates an earlier file")
+        canonical_paths.add(canonical)
+        normalized.append({
+            "path": canonical,
+            "title": entry.get("title"),
+            "text": entry.get("text"),
+        })
+    return normalized
+
+
+def artifact_entries_digest(entries: list[dict[str, Any]]) -> str:
+    encoded = json.dumps(
+        entries,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def normalized_artifact_request(
+    publication_id: str,
+    entries: Any,
+) -> tuple[str, list[dict[str, Any]], str]:
+    clean_publication_id = artifact_publication_id(publication_id)
+    shapes = normalize_artifact_entry_shapes(entries)
+    return clean_publication_id, shapes, artifact_entries_digest(shapes)
 
 
 def artifact_record(session_id: str, entry: str | dict[str, Any]) -> dict[str, Any] | None:
@@ -17409,25 +19254,397 @@ def artifact_record(session_id: str, entry: str | dict[str, Any]) -> dict[str, A
     src = Path(path)
     ext = src.suffix
     dest_dir = FILES_ROOT / file_id
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / safe_name(src.name)
-    if src.resolve() != dest.resolve():
-        shutil.copy2(src, dest)
-    rec = {
-        "id": file_id,
+    try:
+        source_before = src.stat()
+        dest_dir.mkdir(parents=True, exist_ok=False)
+        dest = dest_dir / safe_name(src.name)
+        if src.resolve() != dest.resolve():
+            copy_fork_file_data(src, dest)
+        source_after = src.stat()
+        if (
+            source_before.st_size != source_after.st_size
+            or source_before.st_mtime_ns != source_after.st_mtime_ns
+        ):
+            raise ArtifactPublicationError(
+                f"source file changed while it was being copied: {src}"
+            )
+        rec = {
+            "id": file_id,
+            "session_id": session_id,
+            "kind": "artifact",
+            "title": title or src.name,
+            "text": text,
+            "path": str(dest),
+            "source_path": str(src),
+            "filename": dest.name,
+            "size": dest.stat().st_size,
+            "content_type": guess_content_type(dest.name),
+            "created_at": now_iso(),
+        }
+        (dest_dir / "meta.json").write_text(json.dumps(rec, indent=2))
+        return rec
+    except BaseException:
+        with suppress(OSError):
+            shutil.rmtree(dest_dir)
+        raise
+
+
+def remove_artifact_records(records: list[dict[str, Any]]) -> None:
+    files_root = FILES_ROOT.resolve()
+    for record in records:
+        artifact_id = str(record.get("id") or "")
+        if not re.fullmatch(r"art_[0-9a-f]{16}", artifact_id):
+            continue
+        artifact_dir = (FILES_ROOT / artifact_id).resolve()
+        if artifact_dir.parent != files_root:
+            continue
+        with suppress(OSError):
+            shutil.rmtree(artifact_dir)
+
+
+async def remove_artifact_records_async(records: list[dict[str, Any]]) -> None:
+    cleanup_task = asyncio.create_task(asyncio.to_thread(
+        remove_artifact_records,
+        records,
+    ))
+    with suppress(BaseException):
+        await join_task_despite_caller_cancellation(cleanup_task)
+
+
+def prepare_artifact_records(
+    session_id: str,
+    entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    try:
+        for entry in entries:
+            record = artifact_record(session_id, entry)
+            if record is None:
+                raise ArtifactPublicationError(
+                    f"artifact source became unavailable: {entry['path']}"
+                )
+            records.append(record)
+        return records
+    except BaseException:
+        remove_artifact_records(records)
+        raise
+
+
+def publication_receipt_path(session_id: str, publication_id: str) -> Path:
+    filename = hashlib.sha256(publication_id.encode("utf-8")).hexdigest() + ".json"
+    return artifact_publications_dir(session_id) / filename
+
+
+def load_publication_events(
+    session_id: str,
+    publication_id: str,
+) -> list[dict[str, Any]]:
+    path = publication_receipt_path(session_id, publication_id)
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ArtifactPublicationError(
+            "the durable publication receipt is unreadable"
+        ) from exc
+    if (
+        not isinstance(data, dict)
+        or data.get("publication_id") != publication_id
+        or not isinstance(data.get("events"), list)
+        or not data.get("events")
+    ):
+        raise ArtifactPublicationError("the durable publication receipt is invalid")
+    return list(data["events"])
+
+
+def recover_publication_events_from_tail(
+    session_id: str,
+    publication_id: str,
+    *,
+    max_bytes: int = 16 * 1024 * 1024,
+) -> list[dict[str, Any]]:
+    """Rare recovery path for a lost response before its sidecar was written."""
+    path = events_path(session_id)
+    if not path.is_file():
+        return []
+    with path.open("rb") as stream:
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        start = max(0, size - max_bytes)
+        stream.seek(start)
+        raw = stream.read()
+    if start:
+        _, _, raw = raw.partition(b"\n")
+    events: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        with suppress(Exception):
+            event = json.loads(line.decode("utf-8", errors="replace"))
+            if (
+                event.get("type") == "artifact_created"
+                and event.get("publication_id") == publication_id
+            ):
+                events.append(event)
+    return events
+
+
+def store_publication_events(
+    session_id: str,
+    publication_id: str,
+    events: list[dict[str, Any]],
+) -> None:
+    directory = artifact_publications_dir(session_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = publication_receipt_path(session_id, publication_id)
+    temp = directory / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    payload = {
+        "version": 1,
         "session_id": session_id,
-        "kind": "artifact",
-        "title": title or src.name,
-        "text": text,
-        "path": str(dest),
-        "source_path": str(src),
-        "filename": dest.name,
-        "size": dest.stat().st_size,
-        "content_type": guess_content_type(dest.name),
-        "created_at": now_iso(),
+        "publication_id": publication_id,
+        "events": events,
     }
-    (dest_dir / "meta.json").write_text(json.dumps(rec, indent=2))
-    return rec
+    try:
+        with temp.open("w", encoding="utf-8") as stream:
+            json.dump(payload, stream, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        temp.replace(path)
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        with suppress(OSError):
+            temp.unlink()
+
+
+def verified_publication_events(
+    events: list[dict[str, Any]],
+    *,
+    run_id: str,
+    publication_id: str,
+    publication_digest: str,
+    expected_count: int,
+) -> list[dict[str, Any]]:
+    if not events:
+        return []
+    by_index: dict[int, dict[str, Any]] = {}
+    for event in events:
+        if (
+            event.get("publication_id") != publication_id
+            or event.get("publication_digest") != publication_digest
+            or event.get("run_id") != run_id
+            or event.get("publication_count") != expected_count
+        ):
+            raise ArtifactPublicationError(
+                "publication_id is already bound to another artifact batch or run"
+            )
+        index = event.get("publication_index")
+        artifact = event.get("artifact")
+        if (
+            not isinstance(index, int)
+            or isinstance(index, bool)
+            or index < 0
+            or index >= expected_count
+            or index in by_index
+            or not isinstance(artifact, dict)
+            or not str(artifact.get("id") or "").strip()
+            or not isinstance(event.get("seq"), int)
+            or int(event["seq"]) <= 0
+        ):
+            raise ArtifactPublicationError(
+                "publication_id has an incomplete or invalid durable receipt"
+            )
+        artifact_id = str(artifact["id"])
+        metadata = read_file_meta_record(artifact_id)
+        artifact_path = Path(str(artifact.get("path") or ""))
+        if (
+            not isinstance(metadata, dict)
+            or str(metadata.get("session_id") or "")
+            != str(event.get("session_id") or "")
+            or str(metadata.get("path") or "") != str(artifact_path)
+            or not artifact_path.is_file()
+        ):
+            raise ArtifactPublicationError(
+                "publication_id references an unavailable artifact"
+            )
+        by_index[index] = event
+    if set(by_index) != set(range(expected_count)):
+        raise ArtifactPublicationError(
+            "publication_id has an incomplete durable receipt"
+        )
+    return [by_index[index] for index in range(expected_count)]
+
+
+def artifact_event_receipt(event: dict[str, Any]) -> dict[str, Any]:
+    artifact = dict(event.get("artifact") or {})
+    return {
+        "artifact_id": artifact.get("id"),
+        "event_id": event.get("id"),
+        "event_seq": event.get("seq"),
+        "run_id": event.get("run_id"),
+        "filename": artifact.get("filename"),
+        "content_type": artifact.get("content_type"),
+        "size": artifact.get("size"),
+    }
+
+
+async def persist_artifact_records(
+    session_id: str,
+    run_id: str,
+    records: list[dict[str, Any]],
+    *,
+    publication_id: str | None = None,
+    publication_digest: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Fsync artifact events as one batch and deduplicate verified retries."""
+    async with event_delivery_lock(session_id):
+        if publication_id:
+            existing = await asyncio.to_thread(
+                load_publication_events,
+                session_id,
+                publication_id,
+            )
+            verified = await asyncio.to_thread(
+                verified_publication_events,
+                existing,
+                run_id=run_id,
+                publication_id=publication_id,
+                publication_digest=str(publication_digest or ""),
+                expected_count=len(records),
+            )
+            if verified:
+                return verified, True
+
+        stored_metadata = dict(metadata) if metadata is not None else run_event_metadata(run_id)
+        event_specs: list[tuple[str, dict[str, Any]]] = []
+        for index, record in enumerate(records):
+            payload: dict[str, Any] = {
+                "run_id": run_id,
+                "artifact": record,
+                **stored_metadata,
+            }
+            if publication_id:
+                payload.update({
+                    "publication_id": publication_id,
+                    "publication_digest": publication_digest,
+                    "publication_index": index,
+                    "publication_count": len(records),
+                })
+            event_specs.append(("artifact_created", payload))
+        events = await append_durable_event_batch_locked(session_id, event_specs)
+        if publication_id:
+            sidecar_task = asyncio.create_task(asyncio.to_thread(
+                store_publication_events,
+                session_id,
+                publication_id,
+                events,
+            ))
+            try:
+                await asyncio.shield(sidecar_task)
+            except BaseException as exc:
+                try:
+                    await join_task_despite_caller_cancellation(sidecar_task)
+                except BaseException as sidecar_exc:
+                    exc = sidecar_exc
+                # The event batch is already durable and authoritative. A CLI
+                # retry explicitly asks the endpoint to recover it from the
+                # bounded JSONL tail and repair this O(1) sidecar.
+                logger.warning(
+                    "publication receipt sidecar failed session=%s publication=%s: %s",
+                    session_id,
+                    publication_id,
+                    concise_error_message(exc),
+                )
+        return events, False
+
+
+async def _publish_artifact_entries_unlocked(
+    session_id: str,
+    run_id: str,
+    entries: list[dict[str, Any]],
+    *,
+    publication_id: str | None = None,
+    publication_digest: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    if publication_id:
+        existing = await asyncio.to_thread(
+            load_publication_events,
+            session_id,
+            publication_id,
+        )
+        verified = await asyncio.to_thread(
+            verified_publication_events,
+            existing,
+            run_id=run_id,
+            publication_id=publication_id,
+            publication_digest=str(publication_digest or ""),
+            expected_count=len(entries),
+        )
+        if verified:
+            return verified
+    copy_task = asyncio.create_task(asyncio.to_thread(
+        prepare_artifact_records,
+        session_id,
+        entries,
+    ))
+    try:
+        records = await asyncio.shield(copy_task)
+    except BaseException:
+        completed_records: list[dict[str, Any]] = []
+        try:
+            completed_records = await join_task_despite_caller_cancellation(copy_task)
+        except BaseException:
+            # prepare_artifact_records cleans any partial batch itself.
+            pass
+        if completed_records:
+            await remove_artifact_records_async(completed_records)
+        raise
+    try:
+        events, duplicate = await persist_artifact_records(
+            session_id,
+            run_id,
+            records,
+            publication_id=publication_id,
+            publication_digest=publication_digest,
+            metadata=metadata,
+        )
+    except BaseException:
+        await remove_artifact_records_async(records)
+        raise
+    if duplicate:
+        await remove_artifact_records_async(records)
+    return events
+
+
+async def publish_artifact_entries(
+    session_id: str,
+    run_id: str,
+    entries: list[dict[str, Any]],
+    *,
+    publication_id: str | None = None,
+    publication_digest: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    if publication_id:
+        async with artifact_publication_lock(session_id, publication_id):
+            return await _publish_artifact_entries_unlocked(
+                session_id,
+                run_id,
+                entries,
+                publication_id=publication_id,
+                publication_digest=publication_digest,
+                metadata=metadata,
+            )
+    return await _publish_artifact_entries_unlocked(
+        session_id,
+        run_id,
+        entries,
+        metadata=metadata,
+    )
 
 
 def path_is_relative_to(path: Path, root: Path) -> bool:
@@ -17515,6 +19732,41 @@ def manifest_entry_path(entry: str | dict[str, Any]) -> str:
     return ""
 
 
+def read_artifact_manifest(
+    manifest_path: Path,
+) -> tuple[list[dict[str, Any]], str | None, str | None]:
+    try:
+        raw = manifest_path.read_bytes()
+    except FileNotFoundError:
+        return [], None, None
+    except OSError as exc:
+        return [], None, f"manifest read failed: {exc}"
+    digest = hashlib.sha256(raw).hexdigest()
+    try:
+        data = json.loads(raw.decode("utf-8"))
+        if not isinstance(data, dict) or set(data) != {"files"}:
+            raise ArtifactPublicationError(
+                "manifest must be an object containing only a files array"
+            )
+        entries = normalize_artifact_entries(data.get("files"), allow_empty=True)
+        return entries, digest, None
+    except (UnicodeDecodeError, json.JSONDecodeError, ArtifactPublicationError) as exc:
+        return [], digest, f"manifest validation failed: {exc}"
+
+
+def unlink_manifest_if_unchanged(manifest_path: Path, expected_digest: str) -> bool:
+    try:
+        current = manifest_path.read_bytes()
+        if hashlib.sha256(current).hexdigest() != expected_digest:
+            return False
+        manifest_path.unlink()
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
 def file_signature(path: str) -> tuple[int, int] | None:
     try:
         stat = Path(path).expanduser().stat()
@@ -17532,6 +19784,31 @@ def live_manifest_entry_ready(path: str, stable_files: dict[str, tuple[int, int]
     return previous == signature and time.time_ns() - signature[1] > 750_000_000
 
 
+def live_manifest_batch_ready(
+    entries: list[dict[str, Any]],
+    stable_files: dict[str, tuple[int, int]],
+) -> bool:
+    ready = True
+    for entry in entries:
+        if not live_manifest_entry_ready(str(entry["path"]), stable_files):
+            ready = False
+    return ready
+
+
+async def append_manifest_artifact_error(
+    session_id: str,
+    run_id: str,
+    manifest_path: Path,
+    error: str,
+) -> None:
+    await append_durable_event_batch(session_id, [("artifact_error", {
+        "run_id": run_id,
+        "path": str(manifest_path),
+        "error": error,
+        **run_event_metadata(run_id),
+    })])
+
+
 async def collect_manifest(
     session_id: str,
     run_id: str,
@@ -17543,41 +19820,131 @@ async def collect_manifest(
 ) -> None:
     if not manifest_path.exists():
         return
-    try:
-        data = json.loads(manifest_path.read_text())
-    except Exception as e:
+    entries, manifest_digest, validation_error = await asyncio.to_thread(
+        read_artifact_manifest,
+        manifest_path,
+    )
+    if manifest_digest is None:
+        return
+    if validation_error:
         if final:
-            await append_event(session_id, "artifact_error", {"run_id": run_id, "error": f"manifest parse failed: {e}"})
+            await append_manifest_artifact_error(
+                session_id,
+                run_id,
+                manifest_path,
+                validation_error,
+            )
+            await asyncio.to_thread(
+                unlink_manifest_if_unchanged,
+                manifest_path,
+                manifest_digest,
+            )
+        return
+
+    seen = seen_artifacts if seen_artifacts is not None else set()
+    unseen = [entry for entry in entries if str(entry["path"]) not in seen]
+    if not unseen:
+        if final:
+            await asyncio.to_thread(
+                unlink_manifest_if_unchanged,
+                manifest_path,
+                manifest_digest,
+            )
+        return
+    if not final and stable_files is not None:
+        if not await asyncio.to_thread(
+            live_manifest_batch_ready,
+            unseen,
+            stable_files,
+        ):
+            return
+
+    try:
+        publication_digest = await asyncio.to_thread(
+            artifact_entries_digest,
+            unseen,
+        )
+        legacy_publication_id = "legacy_" + hashlib.sha256(
+            (
+                f"{session_id}\0{run_id}\0{manifest_path}\0{manifest_digest}"
+            ).encode("utf-8")
+        ).hexdigest()
+        publish_task = asyncio.create_task(publish_artifact_entries(
+            session_id,
+            run_id,
+            unseen,
+            publication_id=legacy_publication_id,
+            publication_digest=publication_digest,
+            metadata=run_event_metadata(run_id),
+        ))
+        cancelled_after_commit = False
+        try:
+            await asyncio.shield(publish_task)
+        except asyncio.CancelledError:
+            await join_task_despite_caller_cancellation(publish_task)
+            cancelled_after_commit = True
+        published_paths = {str(entry["path"]) for entry in unseen}
+        seen.update(published_paths)
+        if stable_files is not None:
+            for path in published_paths:
+                stable_files.pop(path, None)
+    except BaseException as exc:
+        if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+            raise
+        logger.warning(
+            "artifact manifest publication failed session=%s run=%s path=%s: %s",
+            session_id,
+            run_id,
+            manifest_path,
+            concise_error_message(exc),
+        )
+        if final:
+            await append_manifest_artifact_error(
+                session_id,
+                run_id,
+                manifest_path,
+                f"artifact publication failed: {concise_error_message(exc)}",
+            )
+            await asyncio.to_thread(
+                unlink_manifest_if_unchanged,
+                manifest_path,
+                manifest_digest,
+            )
         return
     if final:
-        with suppress(OSError):
-            manifest_path.unlink()
-    seen = seen_artifacts if seen_artifacts is not None else set()
-    for entry in data.get("files", []):
-        path = manifest_entry_path(entry)
-        if not path or path in seen:
-            continue
-        if not final and stable_files is not None and not live_manifest_entry_ready(path, stable_files):
-            continue
-        seen.add(path)
-        rec = artifact_record(session_id, entry)
-        if rec:
-            await append_event(session_id, "artifact_created", {"run_id": run_id, "artifact": rec})
-        elif final:
-            await append_event(session_id, "artifact_error", {"run_id": run_id, "path": path, "error": "file not found"})
+        await asyncio.to_thread(
+            unlink_manifest_if_unchanged,
+            manifest_path,
+            manifest_digest,
+        )
+    if cancelled_after_commit:
+        raise asyncio.CancelledError
 
 
 async def watch_manifest_artifacts(session_id: str, run_id: str, manifest_path: Path, seen_artifacts: set[str]) -> None:
     stable_files: dict[str, tuple[int, int]] = {}
     while True:
-        await collect_manifest(
-            session_id,
-            run_id,
-            manifest_path,
-            seen_artifacts=seen_artifacts,
-            stable_files=stable_files,
-            final=False,
-        )
+        try:
+            await collect_manifest(
+                session_id,
+                run_id,
+                manifest_path,
+                seen_artifacts=seen_artifacts,
+                stable_files=stable_files,
+                final=False,
+            )
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            logger.warning(
+                "artifact manifest watcher recovered session=%s run=%s path=%s: %s",
+                session_id,
+                run_id,
+                manifest_path,
+                concise_error_message(exc),
+            )
         await asyncio.sleep(1.0)
 
 
@@ -20621,6 +22988,10 @@ async def lifespan(app: FastAPI):
         await reconcile_handoff_digest_jobs()
 
     digest_recovery_task = asyncio.create_task(reconcile_digests_after_queue_recovery())
+    startup_abandoned_fork_threads = set(ABANDONED_FORK_PROVIDER_THREADS)
+    abandoned_fork_cleanup_task = asyncio.create_task(
+        cleanup_abandoned_fork_provider_threads(startup_abandoned_fork_threads)
+    )
     host_monitor_task = asyncio.create_task(host_monitor_loop())
     history_search_task = asyncio.create_task(history_search_index_loop())
     runtime_probe_task = asyncio.create_task(asyncio.to_thread(refresh_runtime_diagnostics, force=True))
@@ -20639,12 +23010,15 @@ async def lifespan(app: FastAPI):
         with suppress(Exception):
             await close_codex_app_server_manager()
         digest_recovery_task.cancel()
+        abandoned_fork_cleanup_task.cancel()
         queue_recovery_task.cancel()
         host_monitor_task.cancel()
         history_search_task.cancel()
         runtime_probe_task.cancel()
         with suppress(asyncio.CancelledError, Exception):
             await digest_recovery_task
+        with suppress(asyncio.CancelledError, Exception):
+            await abandoned_fork_cleanup_task
         with suppress(asyncio.CancelledError, Exception):
             await queue_recovery_task
         with suppress(asyncio.CancelledError):
@@ -21299,6 +23673,7 @@ async def list_sessions(summary: bool = False) -> dict[str, Any]:
     sessions = [
         public_session(session, summary=summary)
         for session in sorted_sessions(list(STORE.sessions.values()))
+        if not session.get("_fork_initializing")
     ]
     return {"sessions": sessions}
 
@@ -21308,7 +23683,13 @@ async def search_all_session_timelines(
     q: str = Query(min_length=2, max_length=500),
     limit: int = Query(default=40, ge=1, le=100),
 ) -> dict[str, Any]:
-    return await asyncio.to_thread(search_all_timelines, q, limit)
+    eligible_session_ids = active_history_search_session_ids()
+    return await asyncio.to_thread(
+        search_all_timelines,
+        q,
+        limit,
+        eligible_session_ids,
+    )
 
 
 @app.post("/api/sessions")
@@ -21357,6 +23738,7 @@ async def search_session_timeline(
 ) -> dict[str, Any]:
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
+    ensure_session_not_initializing(session_id)
     return await asyncio.to_thread(search_timeline_index, session_id, q, limit)
 
 
@@ -21372,6 +23754,7 @@ async def get_session(
     page_mode: str | None = None,
     semantic_before: int | None = None,
 ) -> dict[str, Any]:
+    ensure_session_not_initializing(session_id)
     sess = STORE.sessions.get(session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="session not found")
@@ -21508,8 +23891,9 @@ async def send_handoff_digest_background(session_id: str, req: HandoffDigestSend
 
 @app.patch("/api/sessions/{session_id}")
 async def update_session(session_id: str, req: UpdateSessionRequest) -> dict[str, Any]:
+    ensure_session_not_initializing(session_id)
     patch = req.model_dump(exclude_unset=True)
-    if {"backend", "model", "effort"}.intersection(patch):
+    if SESSION_LIFECYCLE_UPDATE_FIELDS.intersection(patch):
         async with session_lifecycle_lock(session_id):
             current = STORE.sessions.get(session_id)
             if not current:
@@ -22440,6 +24824,7 @@ async def _post_codex_background_terminals_clean_locked(
 
 @app.post("/api/sessions/{session_id}/order")
 async def reorder_session(session_id: str, req: ReorderSessionRequest) -> dict[str, Any]:
+    ensure_session_not_initializing(session_id)
     sessions = await STORE.reorder(
         session_id,
         req.direction,
@@ -22447,17 +24832,25 @@ async def reorder_session(session_id: str, req: ReorderSessionRequest) -> dict[s
         req.placement,
         req.target_folder,
     )
-    return {"sessions": [public_session(sess) for sess in sessions]}
+    return {
+        "sessions": [
+            public_session(sess)
+            for sess in sessions
+            if not sess.get("_fork_initializing")
+        ]
+    }
 
 
 @app.post("/api/sessions/{session_id}/read")
 async def mark_session_read(session_id: str, req: ReadSessionRequest) -> dict[str, Any]:
+    ensure_session_not_initializing(session_id)
     sess = await STORE.mark_read(session_id, req.last_read_agent_event_seq)
     return {"session": public_session(sess)}
 
 
 @app.post("/api/sessions/{session_id}/unread")
 async def mark_session_unread(session_id: str) -> dict[str, Any]:
+    ensure_session_not_initializing(session_id)
     sess = await STORE.mark_unread(session_id)
     return {"session": public_session(sess)}
 
@@ -22465,6 +24858,7 @@ async def mark_session_unread(session_id: str) -> dict[str, Any]:
 @app.delete("/api/sessions/{session_id}")
 async def delete_session(session_id: str) -> dict[str, Any]:
     async with session_lifecycle_lock(session_id):
+        ensure_session_not_initializing(session_id)
         if session_id in DELETED_SESSION_TOMBSTONES:
             deleted_jobs = await JOBS.delete_for_session(session_id)
             return {
@@ -22632,9 +25026,42 @@ async def delete_session(session_id: str) -> dict[str, Any]:
 
 @app.post("/api/sessions/{session_id}/fork")
 async def fork_session(session_id: str, req: ForkSessionRequest) -> dict[str, Any]:
-    parent = STORE.sessions.get(session_id)
+    cleanup_state: dict[str, str | None] = {}
+    async with session_lifecycle_lock(session_id):
+        try:
+            ensure_session_not_deleting(session_id)
+            async with ACTIVE_LOCK:
+                if session_id in BUSY_SESSIONS or ACTIVE.get(session_id):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="wait for or stop the active turn before forking this chat",
+                    )
+            # Holding the lifecycle lock prevents a new turn or deletion from
+            # crossing the provider snapshot and local-history snapshot.
+            return await _fork_session_locked(
+                session_id,
+                req,
+                cleanup_state=cleanup_state,
+            )
+        except BaseException:
+            await cleanup_aborted_session_fork(cleanup_state)
+            raise
+
+
+async def _fork_session_locked(
+    session_id: str,
+    req: ForkSessionRequest,
+    *,
+    cleanup_state: dict[str, str | None] | None = None,
+) -> dict[str, Any]:
+    if cleanup_state is None:
+        cleanup_state = {}
+    parent_record = STORE.sessions.get(session_id)
+    parent = dict(parent_record) if isinstance(parent_record, dict) else None
     if not parent:
         raise HTTPException(status_code=404, detail="session not found")
+    fork_cwd = validated_fork_cwd(parent)
+    parent["cwd"] = fork_cwd
     parent_backend = (parent.get("backend") or DEFAULT_BACKEND).lower()
     parent_codex_thread_id = parent.get("codex_thread_id") or (
         parent.get("session_id") if parent_backend == BACKEND_CODEX else None
@@ -22645,12 +25072,19 @@ async def fork_session(session_id: str, req: ForkSessionRequest) -> dict[str, An
     if parent_backend == BACKEND_CODEX and parent_codex_thread_id:
         try:
             forked_codex_thread_id = await fork_codex_thread(str(parent_codex_thread_id), parent)
+            cleanup_state["provider_thread_id"] = forked_codex_thread_id
             logger.info(
                 "forked codex thread parent_session=%s source_thread=%s forked_thread=%s",
                 session_id,
                 parent_codex_thread_id,
                 forked_codex_thread_id,
             )
+        except CodexForkCleanupError as e:
+            # The low-level fork could neither delete nor journal its provider
+            # object. Preserve the ID for the endpoint's cancellation-safe
+            # cleanup and fail closed instead of publishing a memory fallback.
+            cleanup_state["provider_thread_id"] = e.thread_id
+            raise
         except Exception as e:
             logger.warning(
                 "codex fork failed parent_session=%s source_thread=%s: %s",
@@ -22659,6 +25093,15 @@ async def fork_session(session_id: str, req: ForkSessionRequest) -> dict[str, An
                 e,
             )
             codex_fork_error = str(e)
+    elif parent_backend == BACKEND_CODEX:
+        # A goal-reconciliation rollover can deliberately detach an unsafe
+        # provider thread. A UI fork must still inherit bounded conversational
+        # memory; silently creating an empty Codex thread makes the fork look
+        # correct while the model has none of the displayed context.
+        codex_fork_error = (
+            "the parent Codex provider thread is unavailable; "
+            "using a bounded memory fork"
+        )
 
     child = await STORE.create(
         CreateSessionRequest(
@@ -22675,13 +25118,57 @@ async def fork_session(session_id: str, req: ForkSessionRequest) -> dict[str, An
             codex_approvals_reviewer=parent.get("codex_approvals_reviewer"),
             pinned=bool(parent.get("pinned")),
             archived=bool(parent.get("archived")),
-            # Bind a native Codex fork only after the child session ID exists,
-            # because its manifest/jobs/terminal policy is chat-scoped.
+            # Bind a native Codex fork only after the child session ID
+            # exists, because manifest/jobs/terminal policy is chat-scoped.
             provider_session_id=None,
             codex_thread_id=None,
         ),
         parent_id=session_id,
+        initializing_fork=True,
     )
+    cleanup_state["child_session_id"] = child["id"]
+
+    if forked_codex_thread_id:
+        # Transfer crash-recovery ownership from the cleanup ledger to the
+        # hidden staged child before binding. Startup can reconstruct the
+        # ledger from this child if the process dies at any later point.
+        await save_staged_fork_provider_reference(
+            child["id"],
+            forked_codex_thread_id,
+        )
+        if not await forget_abandoned_fork_provider_thread(
+            forked_codex_thread_id
+        ):
+            raise RuntimeError(
+                "could not commit native fork cleanup ownership transfer"
+            )
+        child = STORE.sessions[child["id"]]
+
+    if str(child.get("cwd") or "") != fork_cwd:
+        raise HTTPException(
+            status_code=409,
+            detail="the forked chat did not preserve the parent working directory",
+        )
+
+    parent_goal = parent.get("codex_goal")
+    parent_goal_active = bool(
+        isinstance(parent_goal, dict)
+        and str(parent_goal.get("status") or "") == "active"
+    )
+    if parent_backend == BACKEND_CODEX and isinstance(parent_goal, dict):
+        async with STORE._lock:
+            current = STORE.sessions.get(child["id"])
+            if current:
+                current["codex_goal"] = {
+                    **parent_goal,
+                    "status": "paused" if parent_goal_active else parent_goal.get("status"),
+                }
+                if parent.get("codex_goal_time_budget_seconds") is not None:
+                    current["codex_goal_time_budget_seconds"] = parent.get(
+                        "codex_goal_time_budget_seconds"
+                    )
+                await STORE.save()
+                child = current
     if forked_codex_thread_id:
         try:
             forked_codex_thread_id, _instruction_hash = (
@@ -22689,8 +25176,15 @@ async def fork_session(session_id: str, req: ForkSessionRequest) -> dict[str, An
                     child["id"],
                     forked_codex_thread_id,
                     child,
+                    require_goal_support=isinstance(parent_goal, dict),
+                    expected_goal=(
+                        dict(parent_goal)
+                        if isinstance(parent_goal, dict)
+                        else None
+                    ),
                 )
             )
+            cleanup_state["provider_thread_id"] = forked_codex_thread_id
             child = STORE.sessions[child["id"]]
         except Exception as exc:
             logger.warning(
@@ -22701,12 +25195,33 @@ async def fork_session(session_id: str, req: ForkSessionRequest) -> dict[str, An
                 forked_codex_thread_id,
                 exc,
             )
+            cleanup_is_durable = await retire_or_record_failed_codex_fork(
+                forked_codex_thread_id
+            )
+            if not cleanup_is_durable:
+                # bind_forked_codex_thread deliberately restores the provider
+                # ID on the hidden staged child. Leave both cleanup references
+                # intact and fail closed; the outer cancellation-safe cleanup
+                # will retry and retain the child if persistence remains down.
+                raise RuntimeError(
+                    "failed Codex fork could not be retired or journaled"
+                ) from exc
+            await clear_staged_fork_provider_reference(
+                child["id"],
+                forked_codex_thread_id,
+            )
+            cleanup_state["provider_thread_id"] = None
             codex_fork_error = str(exc)
             forked_codex_thread_id = None
     ordered_sessions = await STORE.reorder(child["id"], target_id=session_id, placement="after")
     child = STORE.sessions[child["id"]]
     if parent_backend == BACKEND_CODEX and codex_fork_error:
-        child["memory_seed"] = build_fork_memory(parent, session_id, reason=codex_fork_error)
+        child["memory_seed"] = await asyncio.to_thread(
+            build_fork_memory,
+            parent,
+            session_id,
+            reason=codex_fork_error,
+        )
         child["memory_seed_used"] = False
         child["memory_forked"] = True
         child["memory_fork_reason"] = codex_fork_error[:2000]
@@ -22718,7 +25233,12 @@ async def fork_session(session_id: str, req: ForkSessionRequest) -> dict[str, An
         async with STORE._lock:
             STORE.sessions[child["id"]] = child
             await STORE.save()
+    # Individual missing/corrupt attachments degrade to visible artifact_error
+    # rows inside copy_fork_history. Any exception escaping that function is a
+    # transactional clone failure, so fail closed and let the outer wrapper
+    # remove both the local child and its provider fork.
     copied = await copy_fork_history(session_id, child["id"])
+    history_copy_error: str | None = None
     if forked_codex_thread_id:
         await append_event(
             child["id"],
@@ -22727,6 +25247,8 @@ async def fork_session(session_id: str, req: ForkSessionRequest) -> dict[str, An
                 "backend": BACKEND_CODEX,
                 "provider_session_id": forked_codex_thread_id,
                 "forked_from_provider_id": parent_codex_thread_id,
+                "copied_events": copied,
+                "history_copy_error": history_copy_error,
             },
         )
     elif codex_fork_error:
@@ -22736,11 +25258,75 @@ async def fork_session(session_id: str, req: ForkSessionRequest) -> dict[str, An
             {
                 "backend": BACKEND_CODEX,
                 "provider_session_id": parent_codex_thread_id,
-                "message": "Codex provider fork was too large, so this is a memory fork with bounded rough history. The first turn will seed a fresh Codex thread with the memory dump.",
+                "message": "The native Codex provider thread could not be forked, so this chat uses bounded rough history. The first turn will seed a fresh Codex thread with that memory.",
                 "error": codex_fork_error[:4000],
                 "copied_events": copied,
+                "history_copy_error": history_copy_error,
             },
         )
+    else:
+        # Claude forks and any future backend still need one current event so
+        # copied source timestamps do not become the child's latest activity.
+        await append_event(
+            child["id"],
+            "history_imported",
+            {
+                "backend": parent_backend,
+                "message": f"Forked {copied} conversation events from the parent chat.",
+                "copied_events": copied,
+                "history_copy_error": history_copy_error,
+            },
+        )
+    # Copied events retain source timestamps for truthful chronology. Keep the
+    # newly created chat itself at the current edge of the sidebar ordering and
+    # persist any memory-fork metadata after the clone completes.
+    child = await STORE.update(child["id"], {})
+    async with STORE._lock:
+        current = STORE.sessions.get(child["id"])
+        if current is None:
+            raise HTTPException(status_code=409, detail="forked session disappeared before publish")
+        initializing_marker = current.pop("_fork_initializing", None)
+        try:
+            await STORE.save()
+        except BaseException:
+            # Visibility is committed by the same durable save that removes
+            # the marker. Restore the in-memory fence if persistence fails so
+            # list/get/turn routes cannot observe a half-published child.
+            if initializing_marker is not None:
+                current["_fork_initializing"] = initializing_marker
+            raise
+        child = current
+    # The fork is now complete and durable. Cancellation after this commit
+    # point must leave the usable child in place rather than rolling it back.
+    cleanup_state["provider_thread_id"] = None
+    cleanup_state["child_session_id"] = None
+    try:
+        await append_event(
+            session_id,
+            "session_forked",
+            {
+                "child_id": child["id"],
+                "copied_events": copied,
+                "history_copy_error": history_copy_error,
+            },
+        )
+    except asyncio.CancelledError:
+        # The child is already committed and must survive request
+        # cancellation. Preserve cancellation semantics for the caller.
+        raise
+    except Exception:
+        # A parent-side audit marker is best effort and must never roll back a
+        # fully committed, independently usable child.
+        logger.exception(
+            "fork parent audit event failed parent_session=%s child_session=%s",
+            session_id,
+            child["id"],
+        )
+    ordered_sessions = sorted_sessions([
+        session
+        for session in STORE.sessions.values()
+        if not session.get("_fork_initializing")
+    ])
     return {"session": public_session(child), "sessions": [public_session(sess) for sess in ordered_sessions]}
 
 
@@ -24131,6 +26717,153 @@ async def delete_session_workspace_entry(
     )
 
 
+async def active_artifact_publication_run(
+    session_id: str,
+) -> tuple[str, dict[str, Any]]:
+    async with ACTIVE_LOCK:
+        current = CURRENT_TURNS.get(session_id)
+        active = ACTIVE.get(session_id)
+        run_id = str((current or {}).get("run_id") or "").strip()
+        if (
+            session_id not in BUSY_SESSIONS
+            or not isinstance(current, dict)
+            or not isinstance(active, dict)
+            or not run_id
+            or str(active.get("run_id") or "").strip() != run_id
+            or active.get("codex_native_operation") is True
+            or active.get("stop_requested") is True
+            or run_id in STOPPED_RUNS
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="no active agent turn can receive artifacts for this chat",
+            )
+        return run_id, run_event_metadata(run_id)
+
+
+def publication_response(
+    session_id: str,
+    publication_id: str,
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "chat_id": session_id,
+        "publication_id": publication_id,
+        "run_id": events[0].get("run_id") if events else None,
+        "receipts": [artifact_event_receipt(event) for event in events],
+    }
+
+
+@app.post("/api/agent/sessions/{session_id}/artifacts")
+async def publish_agent_artifacts(
+    request: Request,
+    session_id: str,
+    req: PublishArtifactsRequest,
+) -> dict[str, Any]:
+    if not request_client_is_loopback(request):
+        raise HTTPException(
+            status_code=403,
+            detail="agent artifact publication is restricted to loopback clients",
+        )
+    if not request_artifact_publish_authorized(request):
+        raise HTTPException(status_code=401, detail="unauthorized artifact publication")
+    if session_id not in STORE.sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+    ensure_session_not_deleting(session_id)
+
+    try:
+        publication_id, entries, digest = await asyncio.to_thread(
+            normalized_artifact_request,
+            req.publication_id,
+            req.files,
+        )
+    except ArtifactPublicationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # O(1) idempotency lookup precedes the active-run requirement. A retry
+    # after a lost response must retrieve its original durable receipts even if
+    # the turn has since finished or another turn has started.
+    try:
+        existing = await asyncio.to_thread(
+            load_publication_events,
+            session_id,
+            publication_id,
+        )
+        receipt_sidecar_exists = bool(existing)
+        if not existing and request.headers.get("x-agentsdock-publication-retry") == "1":
+            existing = await asyncio.to_thread(
+                recover_publication_events_from_tail,
+                session_id,
+                publication_id,
+            )
+        if existing:
+            original_run_id = str(existing[0].get("run_id") or "")
+            verified = await asyncio.to_thread(
+                verified_publication_events,
+                existing,
+                run_id=original_run_id,
+                publication_id=publication_id,
+                publication_digest=digest,
+                expected_count=len(entries),
+            )
+            if not receipt_sidecar_exists:
+                try:
+                    await asyncio.to_thread(
+                        store_publication_events,
+                        session_id,
+                        publication_id,
+                        verified,
+                    )
+                except BaseException as exc:
+                    logger.warning(
+                        "recovered publication sidecar repair failed session=%s publication=%s: %s",
+                        session_id,
+                        publication_id,
+                        concise_error_message(exc),
+                    )
+            return publication_response(session_id, publication_id, verified)
+    except ArtifactPublicationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    run_id, metadata = await active_artifact_publication_run(session_id)
+    try:
+        entries = await asyncio.to_thread(normalize_artifact_entries, entries)
+    except ArtifactPublicationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    publication_task = asyncio.create_task(publish_artifact_entries(
+        session_id,
+        run_id,
+        entries,
+        publication_id=publication_id,
+        publication_digest=digest,
+        metadata=metadata,
+    ))
+    try:
+        events = await asyncio.shield(publication_task)
+    except BaseException as exc:
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        try:
+            events = await join_task_despite_caller_cancellation(publication_task)
+        except ArtifactPublicationError as publication_exc:
+            raise HTTPException(status_code=409, detail=str(publication_exc)) from publication_exc
+        except BaseException as publication_exc:
+            if isinstance(publication_exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            logger.exception(
+                "agent artifact publication failed session=%s run=%s publication=%s",
+                session_id,
+                run_id,
+                publication_id,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"artifact publication failed: {concise_error_message(publication_exc)}",
+            ) from publication_exc
+    return publication_response(session_id, publication_id, events)
+
+
 @app.post("/api/sessions/{session_id}/files")
 async def upload_file(session_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
     if session_id not in STORE.sessions:
@@ -24195,15 +26928,16 @@ def iter_session_events(session_id: str):
     path = events_path(session_id)
     if not path.exists():
         return
-    for line in path.open("r", encoding="utf-8", errors="ignore"):
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except Exception:
-            continue
-        if event_files_belong_to_session(event, session_id):
-            yield event
+    with path.open("r", encoding="utf-8", errors="ignore") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except Exception:
+                continue
+            if event_files_belong_to_session(event, session_id):
+                yield event
 
 
 def file_event_record(event: dict[str, Any], file_id: str, session_id: str | None = None) -> dict[str, Any] | None:

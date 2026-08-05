@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import agent_server
 
@@ -85,6 +86,114 @@ class TimelineSearchForkTests(unittest.TestCase):
             )
         finally:
             migrated.close()
+
+    def test_initializing_fork_is_not_eligible_for_history_indexing(self) -> None:
+        staged_id = "staged-fork"
+        staged_path = agent_server.events_path(staged_id)
+        staged_path.parent.mkdir(parents=True, exist_ok=True)
+        staged_path.write_text(
+            json.dumps({
+                "id": "staged-event",
+                "session_id": staged_id,
+                "seq": 1,
+                "type": "assistant_text",
+                "ts": "2026-07-21T01:00:00Z",
+                "text": "staged-only needle",
+            }, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        sessions = {
+            self.session_id: {
+                "id": self.session_id,
+                "archived": False,
+            },
+            staged_id: {
+                "id": staged_id,
+                "archived": False,
+                "_fork_initializing": True,
+            },
+        }
+
+        with patch.object(agent_server.STORE, "sessions", sessions):
+            active_ids = agent_server.active_history_search_session_ids()
+            connection = agent_server.history_search_connection()
+            try:
+                agent_server.sync_history_search_index(
+                    connection,
+                    {self.session_id, staged_id},
+                    active_ids,
+                )
+                indexed_session_ids = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT DISTINCT session_id FROM history_search"
+                    ).fetchall()
+                }
+            finally:
+                connection.close()
+
+        self.assertEqual(active_ids, {self.session_id})
+        self.assertEqual(indexed_session_ids, {self.session_id})
+
+    def test_queries_hide_stale_rows_from_initializing_fork(self) -> None:
+        staged_id = "staged-fork"
+        removed_id = "removed-staged-fork"
+        connection = agent_server.history_search_connection()
+        try:
+            connection.executemany(
+                "INSERT INTO history_search(text, session_id, event_id, seq, ts, role) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        "sharedneedle visible",
+                        self.session_id,
+                        "visible-event",
+                        10,
+                        "2026-07-21T01:00:00Z",
+                        "assistant",
+                    ),
+                    (
+                        "sharedneedle hidden",
+                        staged_id,
+                        "hidden-event",
+                        20,
+                        "2026-07-21T02:00:00Z",
+                        "assistant",
+                    ),
+                    (
+                        "sharedneedle removed",
+                        removed_id,
+                        "removed-event",
+                        30,
+                        "2026-07-21T03:00:00Z",
+                        "assistant",
+                    ),
+                ],
+            )
+            connection.executemany(
+                "INSERT INTO history_search_sessions(session_id, active) VALUES (?, 1)",
+                [(self.session_id,), (staged_id,), (removed_id,)],
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        sessions = {
+            self.session_id: {"id": self.session_id},
+            staged_id: {"id": staged_id, "_fork_initializing": True},
+        }
+        with patch.object(agent_server.STORE, "sessions", sessions):
+            global_results = agent_server.search_all_timelines("sharedneedle")
+            staged_results = agent_server.search_timeline_index(
+                staged_id,
+                "sharedneedle",
+            )
+
+        self.assertEqual(
+            [result["session_id"] for result in global_results["results"]],
+            [self.session_id],
+        )
+        self.assertEqual(staged_results["results"], [])
 
     def event(self, seq: int, event_type: str, **fields: object) -> dict[str, object]:
         return {

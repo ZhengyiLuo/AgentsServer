@@ -208,6 +208,86 @@ class CodexSubagentLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["reconciled"], 1)
         self.assertEqual(agent_server.CODEX_SUBAGENT_STATE["child-a"]["subagent_status"], "completed")
 
+    async def test_emit_preserves_authoritative_identity_over_generated_preview(self) -> None:
+        with (
+            patch.object(agent_server, "append_event", AsyncMock(side_effect=self.append)),
+            patch.object(agent_server.STORE, "save", AsyncMock()),
+        ):
+            await agent_server.emit_codex_subagent_state(
+                "chat",
+                "child-a",
+                "running",
+                parent_thread_id="parent-thread",
+                name="Audit readonly files",
+                nickname="Leibniz the 2nd",
+                agent_path="/root/readonly_round2",
+                activity="Working",
+            )
+            await agent_server.emit_codex_subagent_state(
+                "chat",
+                "child-a",
+                "completed",
+                name="[AgentsDock context] generated wrapper",
+                activity="Subagent completed",
+            )
+
+        state = agent_server.CODEX_SUBAGENT_STATE["child-a"]
+        self.assertEqual(state["subagent_name"], "Leibniz the 2nd")
+        self.assertEqual(state["subagent_nickname"], "Leibniz the 2nd")
+        self.assertEqual(state["subagent_path"], "/root/readonly_round2")
+        self.assertEqual(state["subagent_status"], "completed")
+        self.assertEqual(
+            self.session["codex_subagents"]["child-a"]["subagent_name"],
+            "Leibniz the 2nd",
+        )
+
+    async def test_reconciliation_reads_thread_and_spawn_source_identity(self) -> None:
+        manager = FakeSubagentManager()
+        manager.descendants = [
+            {
+                "id": "child-a",
+                "parentThreadId": "parent-thread",
+                "preview": "[AgentsDock context] generated wrapper",
+                "agentNickname": "Leibniz the 2nd",
+                "agentPath": "/root/readonly_round2",
+                "status": {"type": "active", "activeFlags": []},
+            },
+            {
+                "id": "child-b",
+                "preview": "Full path",
+                "source": {
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": "child-a",
+                            "agent_nickname": "Carson the 2nd",
+                            "agent_path": "/root/readonly_round2/source_trace",
+                        },
+                    },
+                },
+                "status": {"type": "idle"},
+            },
+        ]
+
+        with (
+            patch.object(agent_server, "append_event", AsyncMock(side_effect=self.append)),
+            patch.object(agent_server.STORE, "save", AsyncMock()),
+        ):
+            result = await agent_server.reconcile_codex_subagents(
+                "chat",
+                manager,  # type: ignore[arg-type]
+            )
+
+        self.assertEqual(result["reconciled"], 2)
+        child_a = agent_server.CODEX_SUBAGENT_STATE["child-a"]
+        self.assertEqual(child_a["subagent_name"], "Leibniz the 2nd")
+        self.assertEqual(child_a["subagent_nickname"], "Leibniz the 2nd")
+        self.assertEqual(child_a["subagent_path"], "/root/readonly_round2")
+        child_b = agent_server.CODEX_SUBAGENT_STATE["child-b"]
+        self.assertEqual(child_b["subagent_name"], "Carson the 2nd")
+        self.assertEqual(child_b["subagent_nickname"], "Carson the 2nd")
+        self.assertEqual(child_b["subagent_path"], "/root/readonly_round2/source_trace")
+        self.assertEqual(child_b["subagent_parent_thread_id"], "child-a")
+
     async def _seed_running_child(self) -> None:
         with (
             patch.object(agent_server, "append_event", AsyncMock(side_effect=self.append)),

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 import unittest
 from collections.abc import Callable
 from typing import Any
@@ -287,7 +288,12 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
                 "thread/resume": lambda message: {
                     "thread": {"id": message["params"]["threadId"]}
                 },
-                "thread/fork": lambda _: {"thread": {"id": "thr_fork"}},
+                "thread/fork": lambda _: {
+                    "thread": {
+                        "id": "thr_fork",
+                        "forkedFromId": "thr_existing",
+                    }
+                },
                 "thread/inject_items": lambda _: {},
                 "thread/read": lambda message: {
                     "thread": {
@@ -328,7 +334,11 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await client.fork_thread(
                 "thr_existing",
-                {"cwd": "/repo", "developerInstructions": "fork instructions"},
+                {
+                    "cwd": "/repo",
+                    "developerInstructions": "fork instructions",
+                    "deferGoalContinuation": True,
+                },
                 last_turn_id="turn_4",
             ),
             "thr_fork",
@@ -376,6 +386,7 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
             {
                 "cwd": "/repo",
                 "developerInstructions": "fork instructions",
+                "deferGoalContinuation": True,
                 "threadId": "thr_existing",
                 "lastTurnId": "turn_4",
                 "excludeTurns": True,
@@ -409,6 +420,428 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(CodexAppServerSubscriptionClosed):
             await fork_events.next_notification(timeout=1)
         await wait_until(lambda: not client.is_thread_loaded("thr_fork"))
+
+    async def test_fork_accepts_distinct_child_with_matching_parent(self) -> None:
+        factory = FakeProcessFactory()
+        process = factory.process
+        process.responders["thread/fork"] = lambda _: {
+            "thread": {
+                "id": "thr_fork",
+                "forkedFromId": "thr_source",
+            }
+        }
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+
+        resolved = await client.fork_thread(
+            "thr_source",
+            {
+                "cwd": "/repo",
+                "deferGoalContinuation": True,
+            },
+        )
+
+        self.assertEqual(resolved, "thr_fork")
+        self.assertTrue(client.is_thread_loaded("thr_fork"))
+        request = next(
+            message
+            for message in process.messages
+            if message.get("method") == "thread/fork"
+        )
+        self.assertEqual(
+            request["params"],
+            {
+                "cwd": "/repo",
+                "deferGoalContinuation": True,
+                "threadId": "thr_source",
+                "excludeTurns": True,
+            },
+        )
+
+    async def test_timed_out_fork_deletes_child_from_late_started_notification(
+        self,
+    ) -> None:
+        factory = FakeProcessFactory()
+        process = factory.process
+
+        def fork_without_response(_message: dict[str, Any]) -> object:
+            asyncio.get_running_loop().call_later(
+                0.02,
+                process.feed,
+                {
+                    "method": "thread/started",
+                    "params": {
+                        "thread": {
+                            "id": "thr_late_child",
+                            "forkedFromId": "thr_source",
+                            "cwd": "/repo",
+                            "createdAt": int(time.time()),
+                        }
+                    },
+                },
+            )
+            return NO_RESPONSE
+
+        process.responders["thread/fork"] = fork_without_response
+        process.responders["thread/delete"] = lambda _: {}
+        client = self.make_client(
+            factory,
+            lifecycle_timeout=0.05,
+            fork_cleanup_grace=0.2,
+        )
+        self.addAsyncCleanup(client.close)
+
+        with self.assertRaises(CodexAppServerTimeout) as raised:
+            await client.fork_thread("thr_source", {"cwd": "/repo"})
+
+        self.assertEqual(raised.exception.method, "thread/fork")
+        self.assertFalse(
+            hasattr(raised.exception, "unretired_fork_thread_ids")
+        )
+        self.assertEqual(
+            [
+                message["params"]
+                for message in process.messages
+                if message.get("method") == "thread/delete"
+            ],
+            [{"threadId": "thr_late_child"}],
+        )
+        self.assertFalse(client.is_thread_loaded("thr_late_child"))
+
+    async def test_late_fork_cleanup_failure_preserves_original_timeout(self) -> None:
+        factory = FakeProcessFactory()
+        process = factory.process
+
+        def fork_without_response(_message: dict[str, Any]) -> object:
+            asyncio.get_running_loop().call_later(
+                0.02,
+                process.feed,
+                {
+                    "method": "thread/started",
+                    "params": {
+                        "thread": {
+                            "id": "thr_late_child",
+                            "forkedFromId": "thr_source",
+                            "cwd": "/repo",
+                            "createdAt": int(time.time()),
+                        }
+                    },
+                },
+            )
+            return NO_RESPONSE
+
+        process.responders["thread/fork"] = fork_without_response
+        # Hold the cleanup request open so the test proves the original timeout
+        # does not escape before cleanup has either retired or handed off the
+        # observed provider identity.
+        process.responders["thread/delete"] = lambda _: NO_RESPONSE
+        client = self.make_client(
+            factory,
+            lifecycle_timeout=0.05,
+            fork_cleanup_grace=0.2,
+        )
+        self.addAsyncCleanup(client.close)
+
+        fork_task = asyncio.create_task(
+            client.fork_thread("thr_source", {"cwd": "/repo"})
+        )
+        await wait_until(lambda: any(
+            message.get("method") == "thread/delete"
+            for message in process.messages
+        ))
+        self.assertFalse(fork_task.done())
+        delete_request = next(
+            message
+            for message in process.messages
+            if message.get("method") == "thread/delete"
+        )
+        # An invalid response makes delete_thread fail after it was attempted.
+        process.feed({"id": delete_request["id"], "result": None})
+
+        with self.assertRaises(CodexAppServerTimeout) as raised:
+            await fork_task
+
+        self.assertEqual(raised.exception.method, "thread/fork")
+        self.assertEqual(
+            raised.exception.unretired_fork_thread_ids,
+            ("thr_late_child",),
+        )
+        self.assertEqual(
+            [
+                message["params"]
+                for message in process.messages
+                if message.get("method") == "thread/delete"
+            ],
+            [{"threadId": "thr_late_child"}],
+        )
+
+    async def test_late_fork_cleanup_failure_preserves_cancellation(self) -> None:
+        factory = FakeProcessFactory()
+        process = factory.process
+        process.responders["thread/fork"] = lambda _: NO_RESPONSE
+        process.responders["thread/delete"] = lambda _: NO_RESPONSE
+        client = self.make_client(
+            factory,
+            lifecycle_timeout=1,
+            fork_cleanup_grace=0.2,
+        )
+        self.addAsyncCleanup(client.close)
+
+        fork_task = asyncio.create_task(
+            client.fork_thread("thr_source", {"cwd": "/repo"})
+        )
+        await wait_until(lambda: any(
+            message.get("method") == "thread/fork"
+            for message in process.messages
+        ))
+        asyncio.get_running_loop().call_later(
+            0.01,
+            process.feed,
+            {
+                "method": "thread/started",
+                "params": {
+                    "thread": {
+                        "id": "thr_late_child",
+                        "forkedFromId": "thr_source",
+                        "cwd": "/repo",
+                        "createdAt": int(time.time()),
+                    }
+                },
+            },
+        )
+        fork_task.cancel()
+
+        await wait_until(lambda: any(
+            message.get("method") == "thread/delete"
+            for message in process.messages
+        ))
+        self.assertFalse(fork_task.done())
+        delete_request = next(
+            message
+            for message in process.messages
+            if message.get("method") == "thread/delete"
+        )
+        process.feed({"id": delete_request["id"], "result": None})
+
+        with self.assertRaises(asyncio.CancelledError) as raised:
+            await fork_task
+        self.assertEqual(
+            raised.exception.unretired_fork_thread_ids,
+            ("thr_late_child",),
+        )
+        self.assertEqual(
+            [
+                message["params"]
+                for message in process.messages
+                if message.get("method") == "thread/delete"
+            ],
+            [{"threadId": "thr_late_child"}],
+        )
+
+    async def test_ambiguous_fork_does_not_delete_concurrently_resumed_child(
+        self,
+    ) -> None:
+        factory = FakeProcessFactory()
+        process = factory.process
+        fork_request_seen = asyncio.Event()
+
+        def fork_without_response(_message: dict[str, Any]) -> object:
+            fork_request_seen.set()
+            return NO_RESPONSE
+
+        process.responders["thread/fork"] = fork_without_response
+
+        def resume_existing(_message: dict[str, Any]) -> dict[str, Any]:
+            # app-server can announce an existing fork before responding to
+            # thread/resume. Its ancestry alone does not make it a new child.
+            process.feed({
+                "method": "thread/started",
+                "params": {
+                    "thread": {
+                        "id": "thr_existing_fork",
+                        "forkedFromId": "thr_source",
+                        "cwd": "/repo",
+                        "createdAt": int(time.time()),
+                    }
+                },
+            })
+            return {"thread": {"id": "thr_existing_fork"}}
+
+        process.responders["thread/resume"] = resume_existing
+        process.responders["thread/unsubscribe"] = lambda _: {
+            "status": "unsubscribed"
+        }
+        process.responders["thread/delete"] = lambda _: {}
+        client = self.make_client(
+            factory,
+            lifecycle_timeout=1,
+            fork_cleanup_grace=0.05,
+        )
+        self.addAsyncCleanup(client.close)
+
+        fork_task = asyncio.create_task(
+            client.fork_thread("thr_source", {"cwd": "/repo"})
+        )
+        await asyncio.wait_for(fork_request_seen.wait(), timeout=1)
+
+        self.assertEqual(
+            await client.resume_thread("thr_existing_fork"),
+            "thr_existing_fork",
+        )
+        await client.unsubscribe_thread("thr_existing_fork")
+        # Known identity survives unload. A delayed duplicate start notice is
+        # still not eligible for destructive late-fork cleanup.
+        process.feed({
+            "method": "thread/started",
+            "params": {
+                "thread": {
+                    "id": "thr_existing_fork",
+                    "forkedFromId": "thr_source",
+                    "cwd": "/repo",
+                    "createdAt": int(time.time()),
+                }
+            },
+        })
+
+        fork_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await fork_task
+        self.assertFalse(any(
+            message.get("method") == "thread/delete"
+            for message in process.messages
+        ))
+
+    async def test_reconnect_old_fork_notification_is_never_deleted(self) -> None:
+        factory = FakeProcessFactory()
+        process = factory.process
+        fork_request_seen = asyncio.Event()
+
+        def fork_without_response(_message: dict[str, Any]) -> object:
+            fork_request_seen.set()
+            return NO_RESPONSE
+
+        process.responders["thread/fork"] = fork_without_response
+        process.responders["thread/delete"] = lambda _: {}
+        client = self.make_client(
+            factory,
+            lifecycle_timeout=1,
+            fork_cleanup_grace=0.02,
+        )
+        self.addAsyncCleanup(client.close)
+
+        fork_task = asyncio.create_task(
+            client.fork_thread("thr_source", {"cwd": "/repo"})
+        )
+        await asyncio.wait_for(fork_request_seen.wait(), timeout=1)
+        # Simulate a reconnect: this legitimate provider identity is not in
+        # the client's process-local known set, but its creation time proves it
+        # predates the current fork request.
+        process.feed({
+            "method": "thread/started",
+            "params": {
+                "thread": {
+                    "id": "thr_existing_fork",
+                    "forkedFromId": "thr_source",
+                    "cwd": "/repo",
+                    "createdAt": int(time.time()) - 3600,
+                }
+            },
+        })
+        fork_task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await fork_task
+        self.assertFalse(any(
+            message.get("method") == "thread/delete"
+            for message in process.messages
+        ))
+
+    async def test_fork_rejects_source_thread_as_result(self) -> None:
+        factory = FakeProcessFactory()
+        process = factory.process
+        process.responders["thread/fork"] = lambda _: {
+            "thread": {
+                "id": "thr_source",
+                "forkedFromId": "thr_source",
+            }
+        }
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+
+        with self.assertRaisesRegex(
+            CodexAppServerProtocolError,
+            "source thread id",
+        ) as raised:
+            await client.fork_thread("thr_source")
+
+        self.assertTrue(raised.exception.request_sent)
+        self.assertFalse(raised.exception.safe_to_retry)
+        self.assertFalse(client.is_thread_loaded("thr_source"))
+
+    async def test_fork_rejects_result_with_wrong_parent(self) -> None:
+        factory = FakeProcessFactory()
+        process = factory.process
+        process.responders["thread/fork"] = lambda _: {
+            "thread": {
+                "id": "thr_fork",
+                "forkedFromId": "thr_other",
+            }
+        }
+        process.responders["thread/delete"] = lambda _: {}
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+
+        with self.assertRaisesRegex(
+            CodexAppServerProtocolError,
+            "different source id",
+        ) as raised:
+            await client.fork_thread("thr_source")
+
+        self.assertTrue(raised.exception.request_sent)
+        self.assertFalse(raised.exception.safe_to_retry)
+        self.assertFalse(client.is_thread_loaded("thr_fork"))
+        delete_request = next(
+            message
+            for message in process.messages
+            if message.get("method") == "thread/delete"
+        )
+        self.assertEqual(delete_request["params"], {"threadId": "thr_fork"})
+
+    async def test_delete_thread_validates_and_unloads_exact_thread(self) -> None:
+        factory = FakeProcessFactory()
+        process = factory.process
+        process.responders["thread/delete"] = lambda _: {}
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+        client._loaded_threads.add("thr_abandoned")
+
+        await client.delete_thread("thr_abandoned")
+
+        request = next(
+            message
+            for message in process.messages
+            if message.get("method") == "thread/delete"
+        )
+        self.assertEqual(request["params"], {"threadId": "thr_abandoned"})
+        self.assertFalse(client.is_thread_loaded("thr_abandoned"))
+        with self.assertRaisesRegex(ValueError, "thread_id"):
+            await client.delete_thread("  ")
+
+    async def test_delete_thread_rejects_invalid_response_without_unloading(self) -> None:
+        factory = FakeProcessFactory()
+        process = factory.process
+        process.responders["thread/delete"] = lambda _: None
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+        client._loaded_threads.add("thr_abandoned")
+
+        with self.assertRaisesRegex(
+            CodexAppServerProtocolError,
+            "thread/delete did not return an object",
+        ):
+            await client.delete_thread("thr_abandoned")
+
+        self.assertTrue(client.is_thread_loaded("thr_abandoned"))
 
     async def test_native_thread_controls_validate_and_send_exact_payloads(self) -> None:
         factory = FakeProcessFactory()

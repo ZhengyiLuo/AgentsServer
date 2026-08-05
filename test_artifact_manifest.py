@@ -29,11 +29,11 @@ class ArtifactManifestContractTests(unittest.IsolatedAsyncioTestCase):
                     },
                 ],
             }))
-            append_event = AsyncMock()
-
             with (
+                patch.object(agent_server, "STATE_DIR", root / "state"),
                 patch.object(agent_server, "FILES_ROOT", root / "published"),
-                patch.object(agent_server, "append_event", append_event),
+                patch.object(agent_server, "EVENT_SEQ_CACHE", {}),
+                patch.object(agent_server.HUB, "broadcast", AsyncMock()),
             ):
                 await agent_server.collect_manifest(
                     "sess-artifacts",
@@ -43,10 +43,19 @@ class ArtifactManifestContractTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             self.assertFalse(manifest.exists())
-            self.assertEqual(append_event.await_count, 2)
+            events_path = root / "state" / "sessions" / "sess-artifacts" / "events.jsonl"
+            events = [
+                json.loads(line)
+                for line in events_path.read_text().splitlines()
+                if line.strip()
+            ]
+            artifact_events = [
+                event for event in events if event["type"] == "artifact_created"
+            ]
+            self.assertEqual(len(artifact_events), 2)
             records = {
-                call.args[2]["artifact"]["filename"]: call.args[2]["artifact"]
-                for call in append_event.await_args_list
+                event["artifact"]["filename"]: event["artifact"]
+                for event in artifact_events
             }
             self.assertEqual(records["report.txt"]["content_type"], "text/plain")
             self.assertEqual(records["preview.mov"]["content_type"], "video/quicktime")

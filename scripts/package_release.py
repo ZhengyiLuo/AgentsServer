@@ -16,6 +16,7 @@ from pathlib import Path
 FILES = (
     "agent_server.py",
     "agentsdock_jobs.py",
+    "agentsdock_publish.py",
     "codex_app_server.py",
     "install.sh",
     "uninstall.sh",
@@ -51,6 +52,7 @@ def main() -> int:
         (package_root / "install.sh").chmod(0o755)
         (package_root / "uninstall.sh").chmod(0o755)
         (package_root / "agentsdock_jobs.py").chmod(0o755)
+        (package_root / "agentsdock_publish.py").chmod(0o755)
         (package_root / "update_runner.py").chmod(0o755)
         with tarfile.open(archive_path, "w:gz", format=tarfile.PAX_FORMAT) as archive:
             archive.add(package_root, arcname=package_root.name)

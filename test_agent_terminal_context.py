@@ -27,6 +27,26 @@ class AgentTerminalContextTests(unittest.TestCase):
             str(agent_server.codex_manifest_path("sess-ab/cd")),
         )
         self.assertTrue(env["AGENTSDOCK_MANIFEST_PATH"].endswith("/manifests/current.json"))
+        self.assertEqual(
+            env["AGENTSDOCK_PUBLISH_CLI"],
+            str(agent_server.SERVER_ROOT / "agentsdock_publish.py"),
+        )
+        self.assertEqual(env["AGENTSDOCK_AGENT_TOKEN"], agent_server.AGENT_TOKEN)
+        self.assertEqual(env["AGENTSDOCK_PUBLISH_TOKEN"], agent_server.ARTIFACT_PUBLISH_TOKEN)
+        self.assertNotEqual(
+            env["AGENTSDOCK_PUBLISH_TOKEN"],
+            env["AGENTSDOCK_AGENT_TOKEN"],
+        )
+
+    def test_codex_app_server_environment_exports_publisher(self) -> None:
+        env = agent_server.codex_app_server_env()
+
+        self.assertEqual(
+            env["AGENTSDOCK_PUBLISH_CLI"],
+            str(agent_server.SERVER_ROOT / "agentsdock_publish.py"),
+        )
+        self.assertEqual(env["AGENTSDOCK_AGENT_TOKEN"], agent_server.AGENT_TOKEN)
+        self.assertEqual(env["AGENTSDOCK_PUBLISH_TOKEN"], agent_server.ARTIFACT_PUBLISH_TOKEN)
 
     def test_claude_prompt_uses_stable_terminal_indirection(self) -> None:
         command = agent_server.build_claude_cmd(
@@ -426,13 +446,16 @@ class AgentTerminalContextTests(unittest.TestCase):
 
         for prompt in (claude_prompt, codex_prompt):
             compact = " ".join(prompt.split())
-            self.assertIn("create a file the user should receive", compact)
+            self.assertIn("Publish user-facing files", compact)
             self.assertIn('"files":["/absolute/path.ext"', compact)
             self.assertIn('"title":"Demo"', compact)
             self.assertIn('"text":"Optional note"', compact)
-            self.assertIn("normal playable `.mp4`/`.mov` files", compact)
+            self.assertIn("playable `.mp4`/`.mov` videos", compact)
+            self.assertIn("AGENTSDOCK_PUBLISH_CLI", compact)
+            self.assertIn("successful JSON receipt", compact)
+            self.assertIn("submitted for attachment", compact)
             self.assertIn("not Slack", compact)
-        self.assertIn("stable `manifests/current.json` path", claude_prompt)
+        self.assertIn("$AGENTSDOCK_MANIFEST_PATH", claude_prompt)
         self.assertIn("/tmp/manifests/current.json", codex_prompt)
 
 

@@ -280,6 +280,15 @@ or `X-AgentsDock-Token`. The legacy `X-ZenithDock-Token` header remains
 accepted for existing clients.
 Leave the variable unset only for trusted local development.
 
+`install.sh` prints the generated token once, at the end of setup. To see it
+again later without reinstalling anything:
+
+```bash
+./install.sh --show-token
+```
+
+This only reads the existing configuration and exits; it makes no changes.
+
 ## Remote Access With Tailscale
 
 Remote access is expected to go through Tailscale. This keeps the server

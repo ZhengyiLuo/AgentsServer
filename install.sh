@@ -72,8 +72,13 @@ already occupied by a service that does not authenticate as AgentsServer.
 
 --no-port-fallback disables automatically retrying on the next free port when
 the default port is already held by another process.
+
+--show-token prints the current access token for an already-installed
+AgentsServer and exits immediately; it makes no other changes.
 USAGE
 }
+
+SHOW_TOKEN="false"
 
 while (($#)); do
   case "$1" in
@@ -83,6 +88,7 @@ while (($#)); do
     --non-interactive) NON_INTERACTIVE="true"; shift ;;
     --allow-port-fallback) PORT_FALLBACK="true"; shift ;;
     --no-port-fallback) PORT_FALLBACK="false"; shift ;;
+    --show-token) SHOW_TOKEN="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -152,6 +158,33 @@ if [[ -f "$LEGACY_SERVICE_FILE" ]]; then
 fi
 if [[ ! -f "$LEGACY_ENV_FILE" && -f "$HOME/Zenithbot/.env" ]]; then
   LEGACY_ENV_FILE="$HOME/Zenithbot/.env"
+fi
+
+find_existing_token() {
+  local candidate found_token
+  for candidate in "$ENV_FILE" "$LEGACY_ENV_FILE"; do
+    [[ -n "$candidate" && -f "$candidate" ]] || continue
+    found_token="$(read_env_value "$candidate" AGENTSDOCK_AGENT_TOKEN)"
+    [[ -n "$found_token" ]] || found_token="$(read_env_value "$candidate" ZENITHDOCK_AGENT_TOKEN)"
+    [[ -n "$found_token" ]] || found_token="$(read_env_value "$candidate" ZENITHBOT_AGENT_TOKEN)"
+    [[ -z "$found_token" ]] || { printf '%s' "$found_token"; return 0; }
+  done
+  if [[ -f "$LEGACY_SERVICE_FILE" ]]; then
+    found_token="$(grep -E '^Environment="?ZENITHDOCK_AGENT_TOKEN=' "$LEGACY_SERVICE_FILE" | tail -n 1 || true)"
+    found_token="${found_token#*ZENITHDOCK_AGENT_TOKEN=}"
+    found_token="${found_token%\"}"
+    [[ -z "$found_token" ]] || { printf '%s' "$found_token"; return 0; }
+  fi
+  return 1
+}
+
+if [[ "$SHOW_TOKEN" == "true" ]]; then
+  if TOKEN_TO_SHOW="$(find_existing_token)"; then
+    printf '%s\n' "$TOKEN_TO_SHOW"
+    exit 0
+  fi
+  echo "No AgentsServer access token found at $ENV_FILE. Run install.sh first." >&2
+  exit 1
 fi
 
 OS_NAME="$(uname -s)"
@@ -585,21 +618,7 @@ fi
   "$STAGE_DIR/codex_app_server.py" \
   "$STAGE_DIR/update_runner.py"
 
-TOKEN=""
-for candidate in "$ENV_FILE" "$LEGACY_ENV_FILE"; do
-  [[ -n "$candidate" && -f "$candidate" ]] || continue
-  TOKEN="$(read_env_value "$candidate" AGENTSDOCK_AGENT_TOKEN)"
-  [[ -n "$TOKEN" ]] || TOKEN="$(read_env_value "$candidate" ZENITHDOCK_AGENT_TOKEN)"
-  [[ -n "$TOKEN" ]] || TOKEN="$(read_env_value "$candidate" ZENITHBOT_AGENT_TOKEN)"
-  [[ -z "$TOKEN" ]] || break
-done
-if [[ -z "$TOKEN" ]]; then
-  if [[ -f "$LEGACY_SERVICE_FILE" ]]; then
-    TOKEN="$(grep -E '^Environment="?ZENITHDOCK_AGENT_TOKEN=' "$LEGACY_SERVICE_FILE" | tail -n 1 || true)"
-    TOKEN="${TOKEN#*ZENITHDOCK_AGENT_TOKEN=}"
-    TOKEN="${TOKEN%\"}"
-  fi
-fi
+TOKEN="$(find_existing_token || true)"
 generate_token() {
   if command -v openssl >/dev/null 2>&1; then
     openssl rand -hex 32

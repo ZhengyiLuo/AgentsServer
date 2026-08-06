@@ -85,6 +85,7 @@ class FakeClaudeManager:
         self.active_run_id: str | None = None
         self.context_usage_response: tuple[dict[str, Any], int] | None = None
         self.context_usage_calls: list[tuple[str, str | None]] = []
+        self.loaded = True
 
     async def start_run(
         self,
@@ -115,6 +116,7 @@ class FakeClaudeManager:
     async def evict(self, chat_id: str, *, force: bool = False) -> bool:
         self.evict_calls.append((chat_id, force))
         self.active_run_id = None
+        self.loaded = False
         return True
 
     def owns_active_run(
@@ -137,6 +139,9 @@ class FakeClaudeManager:
     ) -> tuple[dict[str, Any], int] | None:
         self.context_usage_calls.append((chat_id, ownership_token))
         return self.context_usage_response
+
+    def is_loaded(self, chat_id: str) -> bool:
+        return self.loaded and chat_id == "chat-claude"
 
 
 class SequencedClaudeManager(FakeClaudeManager):
@@ -731,6 +736,366 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(packet["type"], "provider_runtime_changed")
         self.assertEqual(packet["session_id"], "chat-claude")
         self.assertNotIn("seq", packet)
+
+    async def test_manual_context_refresh_samples_loaded_idle_sdk_chat(self) -> None:
+        manager = FakeClaudeManager()
+        manager.context_usage_response = ({
+            "totalTokens": 66_000,
+            "maxTokens": 188_000,
+            "rawMaxTokens": 200_000,
+            "percentage": 35.11,
+            "model": "claude-opus-4-1",
+        }, 12)
+        self.session["claude_session_id"] = "provider-manual"
+        agent_server.CLAUDE_SDK_MANAGER = manager
+        agent_server.ACTIVE = {}
+        agent_server.BUSY_SESSIONS = set()
+        agent_server.CURRENT_TURNS = {}
+        broadcast = AsyncMock()
+        with patch.object(
+            agent_server,
+            "CLAUDE_TRANSPORT",
+            agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+        ), patch.object(
+            agent_server,
+            "claude_sdk_dependency_available",
+            return_value=True,
+        ), patch.object(
+            agent_server.STORE,
+            "save",
+            AsyncMock(),
+        ), patch.object(
+            agent_server.HUB,
+            "broadcast",
+            broadcast,
+        ):
+            observed = await agent_server.get_claude_runtime("chat-claude")
+            self.assertTrue(
+                observed["features"]["context_usage_refresh"]
+            )
+            self.assertEqual(manager.context_usage_calls, [])
+            refreshed = await agent_server.post_claude_context_usage_refresh(
+                "chat-claude"
+            )
+
+        self.assertTrue(refreshed["context_usage_refreshed"])
+        self.assertEqual(
+            manager.context_usage_calls,
+            [("chat-claude", None)],
+        )
+        snapshot = refreshed["context_usage_snapshot"]
+        self.assertEqual(snapshot["context_tokens"], 66_000)
+        self.assertEqual(snapshot["provider_generation"], 12)
+        self.assertEqual(snapshot["usage_generation"], 1)
+        self.assertNotIn("run_id", snapshot)
+        self.assertEqual(
+            broadcast.await_args.args[1]["context_usage_snapshot"],
+            snapshot,
+        )
+
+    async def test_manual_context_refresh_rejects_busy_or_unloaded_chat(self) -> None:
+        manager = FakeClaudeManager()
+        manager.context_usage_response = ({
+            "totalTokens": 1,
+            "maxTokens": 100,
+        }, 1)
+        stale_snapshot = {
+            "provider_session_id": "provider-manual",
+            "context_tokens": 55_000,
+            "usage_generation": 4,
+        }
+        self.session.update({
+            "claude_session_id": "provider-manual",
+            "_context_usage_generation": 4,
+            "context_usage_state": "available",
+            "context_usage_snapshot": stale_snapshot,
+            "claude_context_usage_snapshot": stale_snapshot,
+        })
+        agent_server.CLAUDE_SDK_MANAGER = manager
+        agent_server.ACTIVE = {}
+        agent_server.CURRENT_TURNS = {}
+        with patch.object(
+            agent_server,
+            "CLAUDE_TRANSPORT",
+            agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+        ), patch.object(
+            agent_server,
+            "claude_sdk_dependency_available",
+            return_value=True,
+        ):
+            agent_server.BUSY_SESSIONS = {"chat-claude"}
+            with self.assertRaises(agent_server.HTTPException) as busy:
+                await agent_server.post_claude_context_usage_refresh(
+                    "chat-claude"
+                )
+            self.assertEqual(busy.exception.status_code, 409)
+            self.assertEqual(manager.context_usage_calls, [])
+
+            agent_server.BUSY_SESSIONS = set()
+            manager.loaded = False
+            with self.assertRaises(agent_server.HTTPException) as unloaded:
+                await agent_server.post_claude_context_usage_refresh(
+                    "chat-claude"
+                )
+            self.assertEqual(unloaded.exception.status_code, 409)
+
+        self.assertIs(self.session["context_usage_snapshot"], stale_snapshot)
+        self.assertEqual(self.session["context_usage_state"], "available")
+
+    async def test_manual_context_refresh_cannot_overwrite_newer_generation(self) -> None:
+        manager = FakeClaudeManager()
+        self.session["claude_session_id"] = "provider-manual"
+        agent_server.CLAUDE_SDK_MANAGER = manager
+        agent_server.ACTIVE = {}
+        agent_server.BUSY_SESSIONS = set()
+        agent_server.CURRENT_TURNS = {}
+        newer_snapshot = {
+            "provider_session_id": "provider-manual",
+            "context_tokens": 77_000,
+            "usage_generation": 5,
+        }
+
+        async def sample_after_newer_write(
+            *_args: object,
+            **_kwargs: object,
+        ) -> tuple[dict[str, Any], int]:
+            self.session.update({
+                "_context_usage_generation": 5,
+                "context_usage_state": "available",
+                "context_usage_snapshot": newer_snapshot,
+                "claude_context_usage_snapshot": newer_snapshot,
+            })
+            return ({
+                "totalTokens": 20_000,
+                "maxTokens": 188_000,
+            }, 7)
+
+        manager.get_context_usage = AsyncMock(  # type: ignore[method-assign]
+            side_effect=sample_after_newer_write
+        )
+        with patch.object(
+            agent_server,
+            "CLAUDE_TRANSPORT",
+            agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+        ), patch.object(
+            agent_server,
+            "claude_sdk_dependency_available",
+            return_value=True,
+        ):
+            with self.assertRaises(agent_server.HTTPException) as changed:
+                await agent_server.post_claude_context_usage_refresh(
+                    "chat-claude"
+                )
+
+        self.assertEqual(changed.exception.status_code, 409)
+        self.assertIs(self.session["context_usage_snapshot"], newer_snapshot)
+
+    async def test_manual_context_timeout_preserves_snapshot_and_resets_idle_client(self) -> None:
+        manager = FakeClaudeManager()
+        manager.get_context_usage = AsyncMock(  # type: ignore[method-assign]
+            side_effect=wait_forever
+        )
+        stale_snapshot = {
+            "provider_session_id": "provider-manual",
+            "context_tokens": 42_000,
+            "usage_generation": 3,
+        }
+        self.session.update({
+            "claude_session_id": "provider-manual",
+            "_context_usage_generation": 3,
+            "context_usage_state": "available",
+            "context_usage_snapshot": stale_snapshot,
+            "claude_context_usage_snapshot": stale_snapshot,
+        })
+        agent_server.CLAUDE_SDK_MANAGER = manager
+        agent_server.ACTIVE = {}
+        agent_server.BUSY_SESSIONS = set()
+        agent_server.CURRENT_TURNS = {}
+        with patch.object(
+            agent_server,
+            "CLAUDE_TRANSPORT",
+            agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+        ), patch.object(
+            agent_server,
+            "claude_sdk_dependency_available",
+            return_value=True,
+        ), patch.object(
+            agent_server,
+            "CLAUDE_CONTEXT_USAGE_TIMEOUT_SECONDS",
+            0.01,
+        ):
+            with self.assertRaises(agent_server.HTTPException) as timed_out:
+                await asyncio.wait_for(
+                    agent_server.post_claude_context_usage_refresh(
+                        "chat-claude"
+                    ),
+                    0.2,
+                )
+
+        self.assertEqual(timed_out.exception.status_code, 504)
+        self.assertEqual(manager.evict_calls, [("chat-claude", True)])
+        self.assertIs(self.session["context_usage_snapshot"], stale_snapshot)
+        self.assertEqual(self.session["context_usage_state"], "available")
+
+    async def test_cancelled_manual_context_refresh_retires_only_idle_client(self) -> None:
+        manager = FakeClaudeManager()
+        sampling_started = asyncio.Event()
+
+        async def blocked_sample(
+            *_args: object,
+            **_kwargs: object,
+        ) -> None:
+            sampling_started.set()
+            await asyncio.Event().wait()
+
+        manager.get_context_usage = AsyncMock(  # type: ignore[method-assign]
+            side_effect=blocked_sample
+        )
+        stale_snapshot = {
+            "provider_session_id": "provider-manual",
+            "context_tokens": 19_000,
+            "usage_generation": 2,
+        }
+        self.session.update({
+            "claude_session_id": "provider-manual",
+            "_context_usage_generation": 2,
+            "context_usage_state": "available",
+            "context_usage_snapshot": stale_snapshot,
+            "claude_context_usage_snapshot": stale_snapshot,
+        })
+        agent_server.CLAUDE_SDK_MANAGER = manager
+        agent_server.ACTIVE = {}
+        agent_server.BUSY_SESSIONS = set()
+        agent_server.CURRENT_TURNS = {}
+        with patch.object(
+            agent_server,
+            "CLAUDE_TRANSPORT",
+            agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+        ), patch.object(
+            agent_server,
+            "claude_sdk_dependency_available",
+            return_value=True,
+        ):
+            request = asyncio.create_task(
+                agent_server.post_claude_context_usage_refresh("chat-claude")
+            )
+            await asyncio.wait_for(sampling_started.wait(), 0.2)
+            request.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await request
+            for _ in range(10):
+                if manager.evict_calls:
+                    break
+                await asyncio.sleep(0)
+
+        self.assertEqual(manager.evict_calls, [("chat-claude", True)])
+        self.assertIs(self.session["context_usage_snapshot"], stale_snapshot)
+
+    async def test_cancelled_context_refresh_cannot_late_evict_replacement_turn(
+        self,
+    ) -> None:
+        manager = FakeClaudeManager()
+        sampling_started = asyncio.Event()
+        eviction_started = asyncio.Event()
+        release_eviction = asyncio.Event()
+        replacement_running = asyncio.Event()
+
+        async def blocked_sample(
+            *_args: object,
+            **_kwargs: object,
+        ) -> None:
+            sampling_started.set()
+            await asyncio.Event().wait()
+
+        async def delayed_evict(
+            chat_id: str,
+            *,
+            force: bool = False,
+        ) -> bool:
+            manager.evict_calls.append((chat_id, force))
+            eviction_started.set()
+            await release_eviction.wait()
+            manager.active_run_id = None
+            manager.loaded = False
+            return True
+
+        async def replacement_runner(
+            _session_id: str,
+            run_id: str,
+            *_args: object,
+            **_kwargs: object,
+        ) -> None:
+            manager.active_run_id = run_id
+            manager.loaded = True
+            replacement_running.set()
+            await asyncio.Event().wait()
+
+        manager.get_context_usage = AsyncMock(  # type: ignore[method-assign]
+            side_effect=blocked_sample
+        )
+        manager.evict = AsyncMock(  # type: ignore[method-assign]
+            side_effect=delayed_evict
+        )
+        self.session["claude_session_id"] = "provider-manual"
+        agent_server.CLAUDE_SDK_MANAGER = manager
+        agent_server.ACTIVE = {}
+        agent_server.BUSY_SESSIONS = set()
+        agent_server.CURRENT_TURNS = {}
+
+        with patch.object(
+            agent_server,
+            "CLAUDE_TRANSPORT",
+            agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+        ), patch.object(
+            agent_server,
+            "claude_sdk_dependency_available",
+            return_value=True,
+        ), patch.object(
+            agent_server,
+            "turn_start_blocker",
+            AsyncMock(return_value=None),
+        ), patch.object(
+            agent_server,
+            "ensure_runtime_available",
+            AsyncMock(return_value={}),
+        ), patch.object(
+            agent_server,
+            "append_event",
+            AsyncMock(return_value={"id": "started", "seq": 1}),
+        ), patch.object(
+            agent_server.STORE,
+            "update",
+            AsyncMock(return_value=self.session),
+        ), patch.object(
+            agent_server,
+            "run_claude",
+            replacement_runner,
+        ):
+            refresh = asyncio.create_task(
+                agent_server.post_claude_context_usage_refresh("chat-claude")
+            )
+            await asyncio.wait_for(sampling_started.wait(), 0.2)
+            refresh.cancel()
+            await asyncio.wait_for(eviction_started.wait(), 0.2)
+
+            replacement = asyncio.create_task(
+                agent_server.start_turn(
+                    "chat-claude",
+                    agent_server.TurnRequest(prompt="Replacement turn"),
+                )
+            )
+            await asyncio.sleep(0)
+            self.assertFalse(replacement_running.is_set())
+
+            release_eviction.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await refresh
+            started = await asyncio.wait_for(replacement, 0.2)
+            await asyncio.wait_for(replacement_running.wait(), 0.2)
+
+        self.assertEqual(manager.evict_calls, [("chat-claude", True)])
+        self.assertTrue(manager.loaded)
+        self.assertEqual(manager.active_run_id, started["run_id"])
 
     async def test_context_usage_rejects_stale_provider_and_stop_owner(self) -> None:
         manager = FakeClaudeManager()

@@ -15666,7 +15666,7 @@ def claude_context_usage_snapshot(
     usage: Any,
     *,
     provider_session_id: str,
-    run_id: str,
+    run_id: str | None,
     provider_generation: int,
     snapshot_at: str | None = None,
 ) -> dict[str, Any] | None:
@@ -15712,6 +15712,251 @@ def claude_context_usage_snapshot(
         "context_usage_state": "available",
     }
     return {key: value for key, value in snapshot.items() if value is not None}
+
+
+async def evict_failed_idle_claude_context_sample(
+    session_id: str,
+    manager: Any,
+) -> None:
+    """Retire the sampled idle actor before releasing its lifecycle lock.
+
+    A canceled context-usage request can leave the SDK actor waiting on a
+    provider response. Remove only the manager instance that issued this
+    sample. The caller owns the session lifecycle lock, so this helper must
+    never leave a late eviction task that could race a replacement turn.
+    """
+
+    if globals().get("CLAUDE_SDK_MANAGER") is not manager:
+        return
+    evict = getattr(manager, "evict", None)
+    if not callable(evict):
+        return
+    try:
+        task = asyncio.create_task(evict(session_id, force=True))
+    except Exception:
+        return
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # The caller still owns session_lifecycle_lock. Finish retirement
+        # before propagating cancellation so a queued start cannot bind a new
+        # actor and then be killed by this stale cleanup.
+        with suppress(BaseException):
+            await join_task_despite_caller_cancellation(task)
+        raise
+    except Exception:
+        # Cleanup is best-effort, but it is never detached.
+        return
+
+
+async def refresh_idle_claude_context_usage(session_id: str) -> bool:
+    """Ask an already-loaded, idle Claude SDK client for fresh usage.
+
+    This is deliberately observational: it never creates or resumes a Claude
+    client, never runs beside a provider turn, and never clears the last good
+    snapshot when the auxiliary SDK RPC fails.
+    """
+
+    async with session_lifecycle_lock(session_id):
+        ensure_session_not_deleting(session_id)
+        session = STORE.sessions.get(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="session not found")
+        if str(session.get("backend") or DEFAULT_BACKEND) != BACKEND_CLAUDE:
+            raise HTTPException(
+                status_code=409,
+                detail="Claude context usage requires a Claude chat",
+            )
+        if (
+            CLAUDE_TRANSPORT == CLAUDE_TRANSPORT_PRINT
+            or not claude_sdk_dependency_available()
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail="Claude context refresh requires the Agent SDK transport",
+            )
+
+        manager = globals().get("CLAUDE_SDK_MANAGER")
+        checker = getattr(manager, "is_loaded", None) if manager else None
+        if not callable(checker):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Claude is not loaded; context usage will refresh after "
+                    "the next SDK turn"
+                ),
+            )
+        try:
+            loaded = bool(checker(session_id))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Claude context state could not be inspected",
+            ) from exc
+        if not loaded:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Claude is not loaded; context usage will refresh after "
+                    "the next SDK turn"
+                ),
+            )
+
+        async with ACTIVE_LOCK:
+            provider_starting = any(
+                not task.done()
+                for task in tuple(SESSION_TURN_TASKS.get(session_id) or ())
+            )
+            if (
+                session_id in BUSY_SESSIONS
+                or session_id in SERVER_MAINTENANCE_SESSIONS
+                or ACTIVE.get(session_id) is not None
+                or CURRENT_TURNS.get(session_id) is not None
+                or provider_starting
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "wait for the active Claude turn to finish before "
+                        "refreshing context usage"
+                    ),
+                )
+
+        async with STORE._lock:
+            current = STORE.sessions.get(session_id)
+            if not current:
+                raise HTTPException(status_code=404, detail="session not found")
+            provider_session_id = str(
+                claude_provider_id_for_session(current) or ""
+            ).strip()
+            expected_usage_generation = current_provider_context_usage_generation(
+                current
+            )
+        if not provider_session_id:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Claude has no persisted SDK session yet; context usage "
+                    "will refresh after the next turn"
+                ),
+            )
+
+        getter = getattr(manager, "get_context_usage", None)
+        if not callable(getter):
+            raise HTTPException(
+                status_code=503,
+                detail="This AgentsServer cannot sample Claude context usage",
+            )
+        try:
+            sample_task = asyncio.create_task(
+                getter(session_id, ownership_token=None)
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="Claude context sampling could not start",
+            ) from exc
+        try:
+            done, _pending = await asyncio.wait(
+                {sample_task},
+                timeout=CLAUDE_CONTEXT_USAGE_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            sample_task.cancel()
+            sample_task.add_done_callback(
+                lambda completed: (
+                    None if completed.cancelled() else completed.exception()
+                )
+            )
+            cleanup_task = asyncio.create_task(
+                evict_failed_idle_claude_context_sample(session_id, manager)
+            )
+            with suppress(BaseException):
+                await join_task_despite_caller_cancellation(cleanup_task)
+            raise
+        if sample_task not in done:
+            sample_task.cancel()
+            sample_task.add_done_callback(
+                lambda completed: (
+                    None if completed.cancelled() else completed.exception()
+                )
+            )
+            await evict_failed_idle_claude_context_sample(session_id, manager)
+            raise HTTPException(
+                status_code=504,
+                detail="Claude context sampling timed out; the idle SDK client was reset",
+            )
+        if sample_task.cancelled():
+            await evict_failed_idle_claude_context_sample(session_id, manager)
+            raise HTTPException(
+                status_code=502,
+                detail="Claude context sampling was canceled",
+            )
+        try:
+            sampled = sample_task.result()
+        except Exception as exc:
+            await evict_failed_idle_claude_context_sample(session_id, manager)
+            raise HTTPException(
+                status_code=502,
+                detail=f"Claude context sampling failed: {concise_error_message(exc)}",
+            ) from exc
+        if isinstance(sampled, tuple) and len(sampled) == 2:
+            usage, provider_generation = sampled
+        elif isinstance(sampled, dict):
+            # Compatibility for early manager adapters.
+            usage, provider_generation = sampled, 0
+        else:
+            await evict_failed_idle_claude_context_sample(session_id, manager)
+            raise HTTPException(
+                status_code=502,
+                detail="Claude did not return context usage",
+            )
+        try:
+            snapshot = claude_context_usage_snapshot(
+                usage,
+                provider_session_id=provider_session_id,
+                run_id=None,
+                provider_generation=int(provider_generation),
+            )
+        except (TypeError, ValueError, OverflowError):
+            snapshot = None
+        if snapshot is None:
+            await evict_failed_idle_claude_context_sample(session_id, manager)
+            raise HTTPException(
+                status_code=502,
+                detail="Claude returned invalid context usage",
+            )
+
+        signal: dict[str, Any] | None = None
+        async with STORE._lock:
+            current = STORE.sessions.get(session_id)
+            if (
+                current is None
+                or str(current.get("backend") or DEFAULT_BACKEND)
+                != BACKEND_CLAUDE
+                or str(claude_provider_id_for_session(current) or "")
+                != provider_session_id
+                or current_provider_context_usage_generation(current)
+                != expected_usage_generation
+            ):
+                return False
+            stored = dict(snapshot)
+            generation = next_provider_context_usage_generation(current)
+            stored["usage_generation"] = generation
+            current["context_usage_state"] = "available"
+            current["context_usage_snapshot"] = stored
+            current["claude_context_usage_snapshot"] = stored
+            await STORE.save()
+            signal = provider_context_usage_signal(
+                BACKEND_CLAUDE,
+                state="available",
+                generation=generation,
+                provider_session_id=provider_session_id,
+                snapshot=stored,
+            )
+        if signal is not None:
+            await broadcast_provider_runtime_changed(session_id, signal)
+        return signal is not None
 
 
 async def record_claude_context_usage(
@@ -26888,6 +27133,7 @@ async def health() -> dict[str, Any]:
                     "questions": True,
                     "permission_mode_control": True,
                     "permission_modes": True,
+                    "context_usage_refresh": True,
                     "resume": True,
                     "fork": True,
                 },
@@ -27731,6 +27977,49 @@ async def ensure_claude_permission_mode_update_allowed(
             )
 
 
+async def ensure_backend_update_allowed(
+    session_id: str,
+    current: dict[str, Any],
+    patch: dict[str, Any],
+) -> None:
+    """Fence real backend changes while provider work owns the session.
+
+    ``start_turn`` registers its request task before it acquires the session
+    lifecycle lock or reserves ``BUSY_SESSIONS``.  Checking the task registry
+    closes that launch race, including a first turn with no provider identity
+    yet, while still allowing idempotent saves from older clients.
+    """
+
+    if "backend" not in patch or patch.get("backend") is None:
+        return
+    current_backend = str(
+        current.get("backend") or DEFAULT_BACKEND
+    ).strip().lower()
+    requested_backend = str(
+        patch.get("backend") or DEFAULT_BACKEND
+    ).strip().lower()
+    if requested_backend == current_backend:
+        return
+
+    async with ACTIVE_LOCK:
+        provider_starting = any(
+            not task.done()
+            for task in tuple(SESSION_TURN_TASKS.get(session_id) or ())
+        )
+        if (
+            session_id in BUSY_SESSIONS
+            or ACTIVE.get(session_id) is not None
+            or provider_starting
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "wait for or stop the active turn before changing its "
+                    "backend"
+                ),
+            )
+
+
 @app.patch("/api/sessions/{session_id}")
 async def update_session(session_id: str, req: UpdateSessionRequest) -> dict[str, Any]:
     ensure_session_not_initializing(session_id)
@@ -27744,6 +28033,11 @@ async def update_session(session_id: str, req: UpdateSessionRequest) -> dict[str
             # applies the saved selection through the next turn/start; it does
             # not currently expose a client RPC for mutating a loaded thread.
             preview_session_runtime_update(current, patch)
+            await ensure_backend_update_allowed(
+                session_id,
+                current,
+                patch,
+            )
             await ensure_claude_permission_mode_update_allowed(
                 session_id,
                 current,
@@ -28033,6 +28327,7 @@ async def claude_runtime_snapshot(session_id: str) -> dict[str, Any]:
             "questions": True,
             "permission_mode_control": True,
             "permission_modes": True,
+            "context_usage_refresh": True,
         },
         "fallback_transport": CLAUDE_TRANSPORT_PRINT,
     }
@@ -28041,6 +28336,22 @@ async def claude_runtime_snapshot(session_id: str) -> dict[str, Any]:
 @app.get("/api/sessions/{session_id}/claude/runtime")
 async def get_claude_runtime(session_id: str) -> dict[str, Any]:
     return await claude_runtime_snapshot(session_id)
+
+
+@app.post("/api/sessions/{session_id}/claude/context-usage/refresh")
+async def post_claude_context_usage_refresh(
+    session_id: str,
+) -> dict[str, Any]:
+    refreshed = await refresh_idle_claude_context_usage(session_id)
+    if not refreshed:
+        raise HTTPException(
+            status_code=409,
+            detail="Claude context changed while sampling; retry the refresh",
+        )
+    return {
+        **await claude_runtime_snapshot(session_id),
+        "context_usage_refreshed": True,
+    }
 
 
 @app.post(

@@ -682,7 +682,7 @@ class ClaudeSDKSupervisor:
         client_factory: ClientFactory = default_claude_sdk_client_factory,
         is_result_message: ResultPredicate = default_is_result_message,
         disconnect_timeout_seconds: float = 2.0,
-        ack_timeout_seconds: float = 10.0,
+        ack_timeout_seconds: float = 60.0,
         query_delivery_timeout_seconds: float = 10.0,
     ) -> None:
         clean_chat_id = str(chat_id or "").strip()
@@ -1430,7 +1430,7 @@ class ClaudeSDKSupervisorManager:
         max_clients: int = 12,
         idle_ttl_seconds: float | None = 15 * 60,
         disconnect_timeout_seconds: float = 2.0,
-        ack_timeout_seconds: float = 10.0,
+        ack_timeout_seconds: float = 60.0,
         query_delivery_timeout_seconds: float = 10.0,
     ) -> None:
         if max_clients < 1:

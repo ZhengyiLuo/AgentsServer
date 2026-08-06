@@ -715,6 +715,31 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
         )
         await manager.close_all()
 
+    async def test_default_ack_window_accepts_matching_replay_after_ten_seconds(self) -> None:
+        factory = FakeFactory()
+        factory.auto_ack = False
+        manager = ClaudeSDKSupervisorManager(
+            client_factory=factory,
+            idle_ttl_seconds=None,
+        )
+        handle = await manager.start_run(
+            "chat-slow-ack",
+            "Prompt",
+            run_id="run-slow-ack",
+            options={},
+            configuration_key="same",
+        )
+        client = factory.clients[0]
+
+        await asyncio.sleep(10.05)
+        self.assertFalse(handle.done)
+        await client.emit(replay_ack(handle.correlation_id))
+        result = {"type": "result", "result": "late but valid"}
+        await client.emit(result)
+        self.assertEqual(await asyncio.wait_for(collect(handle), 1), [result])
+        self.assertEqual(await handle.wait_result(), result)
+        await manager.close_all()
+
     async def test_query_delivery_timeout_bounds_cancellation_hostile_write(self) -> None:
         factory = CancellationHostileQueryFactory()
         manager = ClaudeSDKSupervisorManager(

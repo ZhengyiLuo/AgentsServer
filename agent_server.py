@@ -6482,11 +6482,32 @@ async def _run_queued_turn_now_and_release(
         raise
     finally:
         async with RUN_NOW_REQUEST_LOCK:
+            paused_after_stop = False
+            if (
+                result is not None
+                and result.get("ok") is True
+                and not result.get("deferred")
+            ):
+                # Stop may durably pause a non-native promotion after its
+                # handoff returned but before this completion cache is written.
+                # Validate under the same lock order used by Stop so a later
+                # Run Now can never receive stale success for a held message.
+                async with QUEUE_LOCK:
+                    candidates = list(QUEUED_TURNS.get(session_id) or ())
+                    promoted = RUN_NOW_TURNS.get(session_id)
+                    if promoted is not None:
+                        candidates.append(promoted)
+                    paused_after_stop = any(
+                        str(item.get("queued_id") or "") == queued_id
+                        and item.get("_paused_after_stop") is True
+                        for item in candidates
+                    )
             cacheable_result = (
                 result
                 if result is not None
                 and result.get("ok") is True
                 and not result.get("deferred")
+                and not paused_after_stop
                 else None
             )
             if cacheable_result is not None or uncertain_error is not None:
@@ -6870,39 +6891,44 @@ async def pause_queued_turns_after_explicit_stop(session_id: str) -> int:
     run them. A later explicit Run Now operation clears the per-item hold.
     """
 
-    async with QUEUE_LOCK:
-        items = list(QUEUED_TURNS.get(session_id) or ())
-        run_now = RUN_NOW_TURNS.get(session_id)
-        if run_now is not None:
-            items.insert(0, run_now)
-        queued_ids = [
-            str(item.get("queued_id") or "").strip()
-            for item in items
-            if str(item.get("queued_id") or "").strip()
-        ]
-        if not queued_ids:
-            return 0
-        # Persist before changing the in-memory scheduling state. If durable
-        # storage fails, mark the entries provisional so the managed updater
-        # remains fail-closed, while Stop can still terminate the parent.
-        durable = True
-        try:
-            await append_durable_event(session_id, "turn_queue_paused", {
-                "queued_ids": queued_ids,
-                "message": "Queued messages were kept after the parent turn stopped.",
-            })
-        except Exception as exc:
-            durable = False
-            logger.error(
-                "could not persist stopped queue hold session=%s error=%s",
-                session_id,
-                concise_error_message(exc),
-            )
-        for item in items:
-            if str(item.get("queued_id") or "").strip() in queued_ids:
-                item["_paused_after_stop"] = True
-                if not durable:
-                    item["_durable"] = False
+    # Match Force Send completion's lock order. This makes pausing the promoted
+    # item and invalidating its short-lived idempotency result one transition.
+    async with RUN_NOW_REQUEST_LOCK:
+        async with QUEUE_LOCK:
+            items = list(QUEUED_TURNS.get(session_id) or ())
+            run_now = RUN_NOW_TURNS.get(session_id)
+            if run_now is not None:
+                items.insert(0, run_now)
+            queued_ids = [
+                str(item.get("queued_id") or "").strip()
+                for item in items
+                if str(item.get("queued_id") or "").strip()
+            ]
+            if not queued_ids:
+                return 0
+            # Persist before changing the in-memory scheduling state. If durable
+            # storage fails, mark the entries provisional so the managed updater
+            # remains fail-closed, while Stop can still terminate the parent.
+            durable = True
+            try:
+                await append_durable_event(session_id, "turn_queue_paused", {
+                    "queued_ids": queued_ids,
+                    "message": "Queued messages were kept after the parent turn stopped.",
+                })
+            except Exception as exc:
+                durable = False
+                logger.error(
+                    "could not persist stopped queue hold session=%s error=%s",
+                    session_id,
+                    concise_error_message(exc),
+                )
+            for item in items:
+                if str(item.get("queued_id") or "").strip() in queued_ids:
+                    item["_paused_after_stop"] = True
+                    if not durable:
+                        item["_durable"] = False
+            for queued_id in queued_ids:
+                RUN_NOW_COMPLETED_RESULTS.pop((session_id, queued_id), None)
     return len(queued_ids)
 
 
@@ -6962,10 +6988,25 @@ async def start_next_queued_turn(session_id: str) -> None:
     async with QUEUE_LOCK:
         if session_id in STEERING_SESSIONS:
             return
+        item = RUN_NOW_TURNS.get(session_id)
+        if item is not None and (
+            item.get("_durable") is False
+            or item.get("_paused_after_stop") is True
+        ):
+            if item.get("_paused_after_stop") is True:
+                # An explicit Stop that lands after promotion wins. Return the
+                # user message to the visible queue, preserving its hold until
+                # a new Run Now request explicitly releases it.
+                RUN_NOW_TURNS.pop(session_id, None)
+                queue = QUEUED_TURNS.setdefault(session_id, deque())
+                queued_id = str(item.get("queued_id") or "")
+                if not any(
+                    str(candidate.get("queued_id") or "") == queued_id
+                    for candidate in queue
+                ):
+                    queue.appendleft(item)
+            return
         item = RUN_NOW_TURNS.pop(session_id, None)
-        if item is not None:
-            # Run Now is the explicit user action that releases a queue hold.
-            item["_paused_after_stop"] = False
         if item is None:
             queue = QUEUED_TURNS.get(session_id)
             if queue and (

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import tempfile
+import time
 import unittest
 from collections import OrderedDict, deque
 from pathlib import Path
@@ -595,6 +596,67 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
             await explicit_stop
 
         stop_turn.assert_awaited_once_with("chat-1")
+
+    async def test_stop_after_promotion_holds_run_now_and_clears_cached_success(
+        self,
+    ) -> None:
+        promoted = agent_server.QUEUED_TURNS.pop("chat-1")[0]
+        promoted["_durable"] = True
+        promoted["_paused_after_stop"] = False
+        agent_server.RUN_NOW_TURNS["chat-1"] = promoted
+        agent_server.RUN_NOW_COMPLETED_RESULTS[("chat-1", "queued-steer")] = {
+            "expires_at": time.monotonic() + 30,
+            "result": {"ok": True, "queued_id": "queued-steer"},
+        }
+
+        with patch.object(
+            agent_server,
+            "append_durable_event",
+            new_callable=AsyncMock,
+            return_value={},
+        ), patch.object(
+            agent_server,
+            "start_turn",
+            new_callable=AsyncMock,
+        ) as start:
+            paused = await agent_server.pause_queued_turns_after_explicit_stop(
+                "chat-1"
+            )
+            await agent_server.start_next_queued_turn("chat-1")
+
+        self.assertEqual(paused, 1)
+        self.assertNotIn("chat-1", agent_server.RUN_NOW_TURNS)
+        self.assertTrue(
+            agent_server.QUEUED_TURNS["chat-1"][0]["_paused_after_stop"]
+        )
+        self.assertNotIn(
+            ("chat-1", "queued-steer"),
+            agent_server.RUN_NOW_COMPLETED_RESULTS,
+        )
+        start.assert_not_awaited()
+
+    async def test_force_send_does_not_cache_success_after_stop_pauses_item(
+        self,
+    ) -> None:
+        async def paused_handoff(
+            _session_id: str,
+            _queued_id: str,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            promoted = agent_server.QUEUED_TURNS.pop("chat-1")[0]
+            promoted["_paused_after_stop"] = True
+            agent_server.RUN_NOW_TURNS["chat-1"] = promoted
+            return {"ok": True, "queued_id": "queued-steer"}
+
+        with patch.object(
+            agent_server,
+            "_run_queued_turn_now_once",
+            side_effect=paused_handoff,
+        ):
+            result = await run_queued_turn_now("chat-1", "queued-steer")
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(agent_server.RUN_NOW_COMPLETED_RESULTS)
 
     async def test_interrupted_turn_promotes_only_the_exact_steering_message(self) -> None:
         append_durable_event = AsyncMock(return_value={})

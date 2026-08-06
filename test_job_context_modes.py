@@ -304,6 +304,7 @@ class StandaloneProviderContextTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
 
         self.assertFalse(result["queued"])
+        self.assertFalse(parent.get("backend_locked", False))
         launched = run_claude.await_args.args[3]
         self.assertEqual(launched["backend"], agent_server.BACKEND_CLAUDE)
         self.assertEqual(launched["model"], "sonnet")

@@ -532,6 +532,7 @@ class ClaudeSDKRunHandle:
         self._terminal: asyncio.Future[Any] = loop.create_future()
         self.accepted_at: float | None = None
         self._acknowledged = False
+        self._acknowledged_event = asyncio.Event()
 
     def _check_loop(self) -> None:
         try:
@@ -560,6 +561,12 @@ class ClaudeSDKRunHandle:
 
         self._check_loop()
         return await asyncio.shield(self._terminal)
+
+    async def wait_acknowledged(self) -> None:
+        """Wait until the CLI replays this query's exact UUID-bearing frame."""
+
+        self._check_loop()
+        await self._acknowledged_event.wait()
 
     async def interrupt(self) -> bool:
         """Interrupt only this accepted run, returning false once it is no longer active."""
@@ -594,6 +601,7 @@ class ClaudeSDKRunHandle:
         ):
             return False
         self._acknowledged = True
+        self._acknowledged_event.set()
         return True
 
     def _finish(self, terminal: Any) -> None:

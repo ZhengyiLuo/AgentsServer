@@ -158,6 +158,159 @@ class SessionBackendUpdateFenceTests(unittest.IsolatedAsyncioTestCase):
             {"backend": agent_server.BACKEND_CODEX},
         )
 
+    async def test_backend_patch_that_wins_invalidates_a_waiting_turn(self) -> None:
+        update_entered = asyncio.Event()
+        allow_update = asyncio.Event()
+
+        async def gated_update(
+            session_id: str,
+            patch_payload: dict[str, object],
+        ) -> dict[str, object]:
+            self.assertEqual(session_id, self.session_id)
+            update_entered.set()
+            await allow_update.wait()
+            self.session.update(patch_payload)
+            return self.session
+
+        with patch.object(
+            agent_server.STORE,
+            "update",
+            AsyncMock(side_effect=gated_update),
+        ):
+            update_task = asyncio.create_task(
+                agent_server.update_session(
+                    self.session_id,
+                    agent_server.UpdateSessionRequest(
+                        backend=agent_server.BACKEND_CODEX,
+                    ),
+                )
+            )
+            await asyncio.wait_for(update_entered.wait(), timeout=1)
+
+            turn_task = asyncio.create_task(
+                agent_server.start_turn(
+                    self.session_id,
+                    agent_server.TurnRequest(
+                        prompt="Use the backend selected when I pressed Send",
+                        backend=agent_server.BACKEND_CLAUDE,
+                    ),
+                )
+            )
+            for _attempt in range(20):
+                if agent_server.SESSION_TURN_TASKS.get(self.session_id):
+                    break
+                await asyncio.sleep(0)
+            self.assertIn(
+                turn_task,
+                agent_server.SESSION_TURN_TASKS.get(self.session_id, set()),
+            )
+
+            allow_update.set()
+            update_response = await asyncio.wait_for(update_task, timeout=1)
+            with self.assertRaises(agent_server.HTTPException) as raised:
+                await asyncio.wait_for(turn_task, timeout=1)
+
+        self.assertEqual(update_response["session"]["backend"], "codex")
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("backend changed", str(raised.exception.detail))
+        self.assertNotIn(self.session_id, agent_server.BUSY_SESSIONS)
+        self.assertNotIn(self.session_id, agent_server.CURRENT_TURNS)
+        self.assertNotIn(self.session_id, agent_server.SESSION_TURN_TASKS)
+
+    async def test_durable_first_turn_lock_blocks_backend_without_provider_id(
+        self,
+    ) -> None:
+        self.session["backend_locked"] = True
+        update = AsyncMock(return_value=self.session)
+
+        self.assertTrue(
+            agent_server.public_session(self.session, summary=True)["backend_locked"]
+        )
+        with patch.object(agent_server.STORE, "update", update):
+            with self.assertRaises(agent_server.HTTPException) as raised:
+                await agent_server.update_session(
+                    self.session_id,
+                    agent_server.UpdateSessionRequest(
+                        backend=agent_server.BACKEND_CODEX,
+                    ),
+                )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("backend is locked", str(raised.exception.detail))
+        update.assert_not_awaited()
+
+    async def test_mark_backend_started_persists_summary_lock(self) -> None:
+        save = AsyncMock()
+
+        with patch.object(agent_server.STORE, "save", save):
+            marked = await agent_server.STORE.mark_backend_started(
+                self.session_id,
+                agent_server.BACKEND_CLAUDE,
+            )
+
+        self.assertTrue(marked["backend_locked"])
+        self.assertTrue(
+            agent_server.public_session(marked, summary=True)["backend_locked"]
+        )
+        save.assert_awaited_once()
+
+    async def test_chat_turn_marks_backend_before_returning_admission(self) -> None:
+        self.session["title"] = "Existing chat"
+
+        async def mark_started(
+            session_id: str,
+            backend: str,
+        ) -> dict[str, object]:
+            self.assertEqual(session_id, self.session_id)
+            self.assertEqual(backend, agent_server.BACKEND_CLAUDE)
+            self.session["backend_locked"] = True
+            return self.session
+
+        mark = AsyncMock(side_effect=mark_started)
+        update = AsyncMock(return_value=self.session)
+        append_event = AsyncMock(return_value={"type": "turn_started", "seq": 1})
+        run_claude = AsyncMock()
+
+        with (
+            patch.object(agent_server.STORE, "mark_backend_started", mark),
+            patch.object(agent_server.STORE, "update", update),
+            patch.object(
+                agent_server,
+                "managed_server_update_blocker",
+                return_value=None,
+            ),
+            patch.object(
+                agent_server,
+                "turn_start_blocker",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(
+                agent_server,
+                "ensure_runtime_available",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "build_turn_provider_prompt",
+                return_value="provider prompt",
+            ),
+            patch.object(agent_server, "append_event", append_event),
+            patch.object(agent_server, "run_claude", run_claude),
+        ):
+            result = await agent_server._start_turn_locked(
+                self.session_id,
+                agent_server.TurnRequest(prompt="Start"),
+                admission_backend=agent_server.BACKEND_CLAUDE,
+            )
+            await asyncio.sleep(0)
+
+        mark.assert_awaited_once_with(
+            self.session_id,
+            agent_server.BACKEND_CLAUDE,
+        )
+        self.assertTrue(result["session"]["backend_locked"])
+        run_claude.assert_awaited_once()
+
 
 if __name__ == "__main__":
     unittest.main()

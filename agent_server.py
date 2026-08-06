@@ -3794,6 +3794,10 @@ class SessionStore:
             "session_id": active_provider_id,
             "claude_session_id": claude_session_id,
             "codex_thread_id": codex_thread_id,
+            # Backend identity becomes immutable as soon as an ordinary chat
+            # turn is admitted, before the provider has necessarily returned
+            # its durable thread/session id.
+            "backend_locked": bool(active_provider_id),
             "claude_permission_mode": (
                 req.claude_permission_mode or CLAUDE_DEFAULT_PERMISSION_MODE
             ),
@@ -4116,6 +4120,35 @@ class SessionStore:
             HISTORY_SEARCH_DIRTY.add(sid)
         return existed is not None
 
+    async def mark_backend_started(
+        self,
+        sid: str,
+        backend: str,
+    ) -> dict[str, Any]:
+        """Persist first-turn backend ownership before provider id binding."""
+
+        expected_backend = str(backend or DEFAULT_BACKEND).strip().lower()
+        async with self._lock:
+            sess = self.sessions.get(sid)
+            if not sess:
+                raise HTTPException(status_code=404, detail="session not found")
+            current_backend = str(
+                sess.get("backend") or DEFAULT_BACKEND
+            ).strip().lower()
+            if current_backend != expected_backend:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "the chat backend changed before the turn could be "
+                        "accepted; retry the message"
+                    ),
+                )
+            if not bool(sess.get("backend_locked")):
+                sess["backend_locked"] = True
+                sess["updated_at"] = now_iso()
+                await self.save()
+            return sess
+
     async def save_provider_session(
         self,
         sid: str,
@@ -4153,6 +4186,7 @@ class SessionStore:
             )
             sess["session_id"] = provider_id
             sess["backend"] = sess.get("backend") or backend
+            sess["backend_locked"] = True
             sess["claude_session_id" if backend == BACKEND_CLAUDE else "codex_thread_id"] = provider_id
             if backend == BACKEND_CLAUDE and cwd:
                 sess["claude_session_cwd"] = cwd
@@ -8839,6 +8873,50 @@ async def mark_provider_turn_ready(
             return
         active["provider_turn_ready"] = True
         active["provider_session_id"] = provider_session_id
+
+
+async def mark_claude_sdk_turn_ready_after_ack(
+    session_id: str,
+    run_id: str,
+    handle: Any,
+) -> bool:
+    """Publish native-steer readiness only after Claude replays this query.
+
+    ``ClaudeSDKClient.query()`` returning proves only that the stdin write was
+    accepted. Interrupting before the CLI replays the exact UUID-bearing frame
+    makes delivery uncertain, so Force Send must remain deferred until this
+    stronger provider boundary. Run and handle identity fence late ACKs from a
+    superseded logical turn.
+    """
+
+    wait_acknowledged = getattr(handle, "wait_acknowledged", None)
+    if not callable(wait_acknowledged):
+        return False
+    try:
+        await wait_acknowledged()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.debug(
+            "Claude replay acknowledgment waiter failed session=%s run=%s: %s",
+            session_id,
+            run_id,
+            concise_error_message(exc),
+        )
+        return False
+    async with ACTIVE_LOCK:
+        active = ACTIVE.get(session_id)
+        if (
+            not active
+            or str(active.get("run_id") or "") != run_id
+            or active.get("claude_sdk_run") is not handle
+            or active.get("stop_requested")
+            or bool(getattr(handle, "done", False))
+        ):
+            return False
+        active["provider_turn_ready"] = True
+        active["provider_starting"] = False
+        return True
 
 
 def active_snapshot_input(active: dict[str, Any]) -> dict[str, Any]:
@@ -15189,6 +15267,9 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
             "last_read_agent_event_seq", "last_read_agent_event_at", "manual_unread",
         )
     }
+    # Provider ids are intentionally omitted from summary responses, but the
+    # UI still needs the authoritative first-turn backend fence.
+    public["backend_locked"] = session_backend_locked(sess)
     if not summary:
         public["codex_goal_time_budget_exhausted"] = (
             codex_goal_time_budget_is_exhausted(sess)
@@ -19379,7 +19460,10 @@ def runtime_priority(model: dict[str, Any]) -> int:
 
 
 def session_backend_locked(sess: dict[str, Any]) -> bool:
-    return any(str(sess.get(key) or "").strip() for key in ("session_id", "claude_session_id", "codex_thread_id"))
+    return bool(sess.get("backend_locked")) or any(
+        str(sess.get(key) or "").strip()
+        for key in ("session_id", "claude_session_id", "codex_thread_id")
+    )
 
 
 def codex_user_config_path() -> Path:
@@ -23156,6 +23240,10 @@ async def run_claude_sdk(
         return
 
     attached = False
+    initial_provider_ready = bool(
+        getattr(handle, "acknowledged", False)
+        and not getattr(handle, "done", False)
+    )
     async with ACTIVE_LOCK:
         active = ACTIVE.get(session_id)
         if (
@@ -23165,8 +23253,8 @@ async def run_claude_sdk(
         ):
             active.update({
                 "claude_sdk_run": handle,
-                "provider_turn_ready": True,
-                "provider_starting": False,
+                "provider_turn_ready": initial_provider_ready,
+                "provider_starting": not initial_provider_ready,
             })
             stop_requested = bool(active.get("stop_requested"))
             attached = True
@@ -23209,6 +23297,7 @@ async def run_claude_sdk(
     pending_steer: dict[str, Any] | None = None
     message_task: asyncio.Task[Any] | None = None
     steer_task: asyncio.Task[Any] | None = None
+    provider_ready_tasks: set[asyncio.Task[bool]] = set()
     outputs_finished_run_ids: set[str] = set()
     manifest_watch_task: asyncio.Task[Any] | None = asyncio.create_task(
         watch_manifest_artifacts(
@@ -23217,6 +23306,30 @@ async def run_claude_sdk(
             manifest_path,
             seen_artifacts,
         )
+    )
+
+    def watch_provider_readiness(
+        logical_run_id: str,
+        logical_handle: Any,
+        *,
+        already_published_ready: bool,
+    ) -> None:
+        if already_published_ready:
+            return
+        task = asyncio.create_task(
+            mark_claude_sdk_turn_ready_after_ack(
+                session_id,
+                logical_run_id,
+                logical_handle,
+            )
+        )
+        provider_ready_tasks.add(task)
+        task.add_done_callback(provider_ready_tasks.discard)
+
+    watch_provider_readiness(
+        current_run_id,
+        current_handle,
+        already_published_ready=initial_provider_ready,
     )
 
     async def finish_outputs(
@@ -23723,6 +23836,10 @@ async def run_claude_sdk(
             result_details = None
             stream_error = None
             stopped_during_handoff = False
+            candidate_provider_ready = bool(
+                getattr(candidate_handle, "acknowledged", False)
+                and not getattr(candidate_handle, "done", False)
+            )
             async with ACTIVE_LOCK:
                 active = ACTIVE.get(session_id)
                 if active:
@@ -23734,6 +23851,8 @@ async def run_claude_sdk(
                         "started_at_iso": now_iso(),
                         "native_interrupt_sent": False,
                         "stop_requested": stopped_during_handoff,
+                        "provider_turn_ready": candidate_provider_ready,
+                        "provider_starting": not candidate_provider_ready,
                     })
                     if stopped_during_handoff:
                         STOPPED_RUNS.add(candidate_run_id)
@@ -23747,6 +23866,12 @@ async def run_claude_sdk(
                             "queued_id": selected.get("queued_id"),
                             "steering_lineage": lineage,
                         })
+
+            watch_provider_readiness(
+                candidate_run_id,
+                candidate_handle,
+                already_published_ready=candidate_provider_ready,
+            )
 
             if prior_aborted:
                 await append_event(session_id, "turn_stopped", {
@@ -23865,6 +23990,12 @@ async def run_claude_sdk(
     async def cleanup_live_sdk_state() -> None:
         nonlocal retire_supervisor, stream_error
         unhandled_steer: dict[str, Any] | None = None
+        readiness_tasks = tuple(provider_ready_tasks)
+        for task in readiness_tasks:
+            if not task.done():
+                task.cancel()
+        if readiness_tasks:
+            await asyncio.gather(*readiness_tasks, return_exceptions=True)
         if (
             pending_steer is None
             and steer_task is not None
@@ -26482,6 +26613,16 @@ async def start_turn(
     steering_lineage: list[dict[str, Any]] | None = None,
     provider_context_mode: Literal["chat", "standalone"] = "chat",
 ) -> dict[str, Any]:
+    # Capture the chat backend before this request can wait on lifecycle work.
+    # If a concurrent backend PATCH wins the lock, the request must be retried
+    # instead of applying a now-stale per-turn backend after the PATCH.
+    admission_backend: str | None = None
+    if provider_context_mode == "chat":
+        admission_session = STORE.sessions.get(session_id)
+        if admission_session is not None:
+            admission_backend = str(
+                admission_session.get("backend") or DEFAULT_BACKEND
+            ).strip().lower()
     # Register the request task before BUSY_SESSIONS is reserved. Stop can then
     # distinguish a legitimate slow launch from an orphaned reservation and
     # leave a deferred stop marker for the runner to reconcile when it binds.
@@ -26499,6 +26640,7 @@ async def start_turn(
                 display_file_ids=display_file_ids,
                 steering_lineage=steering_lineage,
                 provider_context_mode=provider_context_mode,
+                admission_backend=admission_backend,
             )
     finally:
         if request_task is not None:
@@ -26518,6 +26660,7 @@ async def _start_turn_locked(
     display_file_ids: list[str] | None = None,
     steering_lineage: list[dict[str, Any]] | None = None,
     provider_context_mode: Literal["chat", "standalone"] = "chat",
+    admission_backend: str | None = None,
 ) -> dict[str, Any]:
     sess = STORE.sessions.get(session_id)
     if not sess:
@@ -26528,6 +26671,21 @@ async def _start_turn_locked(
             detail=(
                 "provider_context_mode must be one of "
                 f"{sorted(VALID_JOB_CONTEXT_MODES)}"
+            ),
+        )
+    current_backend = str(
+        sess.get("backend") or DEFAULT_BACKEND
+    ).strip().lower()
+    if (
+        provider_context_mode == "chat"
+        and admission_backend is not None
+        and current_backend != admission_backend
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "the chat backend changed while the message was waiting to be "
+                "accepted; retry the message"
             ),
         )
     if provider_context_goal_is_exhausted(sess, provider_context_mode):
@@ -26633,6 +26791,8 @@ async def _start_turn_locked(
 
         backend = sess.get("backend") or DEFAULT_BACKEND
         await ensure_runtime_available(backend)
+        if provider_context_mode == "chat":
+            sess = await STORE.mark_backend_started(session_id, str(backend))
 
         run_id = f"run_{uuid.uuid4().hex[:16]}"
         async with ACTIVE_LOCK:

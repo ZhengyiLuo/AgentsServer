@@ -155,6 +155,111 @@ class InstallerContractTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Installs or updates AgentsServer", result.stdout)
 
+    def test_show_token_reads_current_token_without_mutating_configured_roots(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home, install_root, config_root, state_root, environment = (
+                self.show_token_environment(root)
+            )
+            token = "current_agentsdock_token_abcdefghijklmnopqrstuvwxyz"
+            (config_root / "env").write_text(
+                f"AGENTSDOCK_AGENT_TOKEN={token}\n"
+                "PRESERVED_SETTING=unchanged\n"
+            )
+            (install_root / "release-marker").write_text("keep runtime\n")
+            (state_root / "sessions.json").write_text('{"keep": true}\n')
+            before = self.snapshot_trees(home, install_root, config_root, state_root)
+
+            result = subprocess.run(
+                ["/bin/bash", str(INSTALLER), "--show-token"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, f"{token}\n")
+            self.assertEqual(result.stderr, "")
+            self.assertEqual(
+                self.snapshot_trees(home, install_root, config_root, state_root),
+                before,
+            )
+
+    def test_show_token_reads_legacy_token_names_and_sources(self):
+        scenarios = (
+            ("canonical_env_zenithdock_name", "ZENITHDOCK_AGENT_TOKEN", "config"),
+            ("canonical_env_zenithbot_name", "ZENITHBOT_AGENT_TOKEN", "config"),
+            ("legacy_zenithbot_env", "ZENITHDOCK_AGENT_TOKEN", "legacy_env"),
+            ("legacy_systemd_service", "ZENITHDOCK_AGENT_TOKEN", "legacy_service"),
+        )
+        for scenario, variable_name, source in scenarios:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                home, _install_root, config_root, _state_root, environment = (
+                    self.show_token_environment(root)
+                )
+                token = f"{scenario}_token_abcdefghijklmnopqrstuvwxyz"
+                if source == "config":
+                    (config_root / "env").write_text(f"{variable_name}={token}\n")
+                elif source == "legacy_env":
+                    legacy_env = home / "Zenithbot" / ".env"
+                    legacy_env.parent.mkdir(parents=True)
+                    legacy_env.write_text(f"{variable_name}={token}\n")
+                else:
+                    legacy_service = (
+                        home
+                        / ".config"
+                        / "systemd"
+                        / "user"
+                        / "zenithbot-agent.service"
+                    )
+                    legacy_service.parent.mkdir(parents=True)
+                    legacy_service.write_text(
+                        "[Service]\n"
+                        f'Environment="{variable_name}={token}"\n'
+                    )
+
+                result = subprocess.run(
+                    ["/bin/bash", str(INSTALLER), "--show-token"],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, f"{token}\n")
+                self.assertEqual(result.stderr, "")
+
+    def test_show_token_fails_without_a_token_and_does_not_mutate_roots(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home, install_root, config_root, state_root, environment = (
+                self.show_token_environment(root)
+            )
+            (install_root / "release-marker").write_text("keep runtime\n")
+            (config_root / "settings").write_text("keep config\n")
+            (state_root / "sessions.json").write_text('{"keep": true}\n')
+            before = self.snapshot_trees(home, install_root, config_root, state_root)
+
+            result = subprocess.run(
+                ["/bin/bash", str(INSTALLER), "--show-token"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("No AgentsServer access token found", result.stderr)
+            self.assertIn(str(config_root / "env"), result.stderr)
+            self.assertEqual(
+                self.snapshot_trees(home, install_root, config_root, state_root),
+                before,
+            )
+
     def test_same_version_reinstall_keeps_the_replaced_runtime_for_rollback(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1108,6 +1213,23 @@ chmod 755 "$project/.venv/bin/python"
             "FAKE_LAUNCHCTL_LOG": str(root / "launchctl.log"),
         }
         return home, fake_bin, install_root, environment
+
+    @staticmethod
+    def show_token_environment(root: Path):
+        home = root / "home"
+        install_root = root / "install"
+        config_root = root / "config"
+        state_root = root / "state"
+        for directory in (home, install_root, config_root, state_root):
+            directory.mkdir()
+        environment = {
+            **os.environ,
+            "HOME": str(home),
+            "AGENTS_SERVER_INSTALL_DIR": str(install_root),
+            "AGENTS_SERVER_CONFIG_DIR": str(config_root),
+            "AGENTSDOCK_STATE_DIR": str(state_root),
+        }
+        return home, install_root, config_root, state_root, environment
 
     def fake_linux_preinstall_environment(self, root: Path):
         home = root / "home"

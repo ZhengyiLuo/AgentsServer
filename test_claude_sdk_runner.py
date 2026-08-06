@@ -12,11 +12,31 @@ from claude_sdk_client import ClaudeSDKQueryError, ClaudeSDKUnavailable
 
 
 class FakeClaudeRun:
-    def __init__(self, messages: list[object] | None = None) -> None:
+    def __init__(
+        self,
+        messages: list[object] | None = None,
+        *,
+        acknowledged: bool = True,
+    ) -> None:
         self.messages: asyncio.Queue[object] = asyncio.Queue()
         for message in messages or []:
             self.messages.put_nowait(message)
         self.interrupt_calls = 0
+        self.acknowledged = acknowledged
+        self._acknowledged_event = asyncio.Event()
+        if acknowledged:
+            self._acknowledged_event.set()
+
+    @property
+    def done(self) -> bool:
+        return False
+
+    async def wait_acknowledged(self) -> None:
+        await self._acknowledged_event.wait()
+
+    def acknowledge(self) -> None:
+        self.acknowledged = True
+        self._acknowledged_event.set()
 
     async def __anext__(self) -> object:
         return await self.messages.get()
@@ -31,7 +51,7 @@ class FakeClaudeRun:
 
 class FailingClaudeRun(FakeClaudeRun):
     def __init__(self, error: BaseException) -> None:
-        super().__init__()
+        super().__init__(acknowledged=False)
         self.error = error
 
     async def __anext__(self) -> object:
@@ -1065,6 +1085,10 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         ), patch.object(
             agent_server.STORE,
             "update",
+            AsyncMock(return_value=self.session),
+        ), patch.object(
+            agent_server.STORE,
+            "mark_backend_started",
             AsyncMock(return_value=self.session),
         ), patch.object(
             agent_server,
@@ -2530,7 +2554,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_natural_completion_wins_race_with_steering_interrupt(self) -> None:
         first = FakeClaudeRun()
-        second = FakeClaudeRun()
+        second = FakeClaudeRun(acknowledged=False)
         manager = SequencedClaudeManager([first, second])
         append_event = AsyncMock(return_value={})
         append_finished = AsyncMock(return_value={})
@@ -2641,6 +2665,26 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                 "terminal_reason": "end_turn",
             })
             steer_result = await asyncio.wait_for(steer_future, 0.5)
+            self.assertIs(
+                agent_server.ACTIVE["chat-claude"]["claude_sdk_run"],
+                second,
+            )
+            self.assertFalse(
+                agent_server.ACTIVE["chat-claude"]["provider_turn_ready"]
+            )
+            self.assertTrue(
+                agent_server.ACTIVE["chat-claude"]["provider_starting"]
+            )
+            second.acknowledge()
+            for _ in range(100):
+                if agent_server.ACTIVE["chat-claude"].get(
+                    "provider_turn_ready"
+                ):
+                    break
+                await asyncio.sleep(0)
+            self.assertTrue(
+                agent_server.ACTIVE["chat-claude"]["provider_turn_ready"]
+            )
             await second.messages.put({
                 "type": "result",
                 "result": "Steered result",
@@ -3392,6 +3436,162 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             ["queued-race"],
         )
         self.assertTrue(native_queue.empty())
+
+    async def test_force_send_defers_until_exact_claude_replay_ack(self) -> None:
+        handle = FakeClaudeRun(acknowledged=False)
+        manager = FakeClaudeManager(handle)
+        append_event = AsyncMock(return_value={})
+
+        with patch.object(
+            agent_server,
+            "resolve_claude_resume_provider",
+            return_value=(None, None),
+        ), patch.object(
+            agent_server,
+            "capture_git_baseline",
+            AsyncMock(return_value={"head": "base"}),
+        ), patch.object(
+            agent_server,
+            "build_claude_sdk_options",
+            return_value=(object(), "config", "/usr/bin/claude"),
+        ), patch.object(
+            agent_server,
+            "claude_sdk_manager",
+            AsyncMock(return_value=manager),
+        ), patch.object(
+            agent_server,
+            "watch_manifest_artifacts",
+            wait_forever,
+        ), patch.object(
+            agent_server,
+            "append_event",
+            append_event,
+        ), patch.object(
+            agent_server,
+            "append_turn_finished_event",
+            AsyncMock(return_value={}),
+        ), patch.object(
+            agent_server,
+            "mark_provider_turn_ready",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "persist_run_provider_session",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "sample_claude_context_usage",
+            AsyncMock(return_value=False),
+        ), patch.object(
+            agent_server,
+            "cancel_claude_interactions",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "collect_manifest",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "collect_recent_leftover_manifests",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "publish_turn_code_diff",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "release_turn_slot",
+            AsyncMock(return_value=True),
+        ), patch.object(
+            agent_server,
+            "record_runtime_success",
+            Mock(),
+        ), patch.object(
+            agent_server,
+            "record_runtime_failure",
+            Mock(),
+        ), patch.object(
+            agent_server,
+            "should_schedule_queue_after_finish",
+            return_value=False,
+        ):
+            runner = asyncio.create_task(agent_server.run_claude_sdk(
+                "chat-claude",
+                "run-claude",
+                "Prompt",
+                dict(self.session),
+                Path(self.cwd) / ".manifest.json",
+            ))
+            for _ in range(100):
+                active = agent_server.ACTIVE.get("chat-claude") or {}
+                if active.get("claude_sdk_run") is handle:
+                    break
+                await asyncio.sleep(0)
+
+            active = agent_server.ACTIVE["chat-claude"]
+            self.assertIs(active["claude_sdk_run"], handle)
+            self.assertFalse(active["provider_turn_ready"])
+            self.assertTrue(active["provider_starting"])
+
+            selected = {
+                "queued_id": "queued-pre-ack",
+                "prompt": "Steer only after delivery is certain",
+                "file_ids": [],
+                "backend": agent_server.BACKEND_CLAUDE,
+                "client_capabilities": [
+                    agent_server.CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY
+                ],
+            }
+            agent_server.QUEUED_TURNS = {
+                "chat-claude": deque([selected]),
+            }
+            deferred = await agent_server._run_queued_turn_now_once(
+                "chat-claude",
+                "queued-pre-ack",
+            )
+
+            self.assertTrue(deferred["deferred"])
+            self.assertFalse(deferred["interrupted"])
+            self.assertEqual(handle.interrupt_calls, 0)
+            self.assertEqual(
+                [
+                    item.get("queued_id")
+                    for item in agent_server.QUEUED_TURNS["chat-claude"]
+                ],
+                ["queued-pre-ack"],
+            )
+            self.assertTrue(
+                agent_server.ACTIVE["chat-claude"][
+                    "native_steer_queue"
+                ].empty()
+            )
+
+            handle.acknowledge()
+            for _ in range(100):
+                if agent_server.ACTIVE["chat-claude"].get(
+                    "provider_turn_ready"
+                ):
+                    break
+                await asyncio.sleep(0)
+            self.assertTrue(
+                agent_server.ACTIVE["chat-claude"]["provider_turn_ready"]
+            )
+            self.assertFalse(
+                agent_server.ACTIVE["chat-claude"]["provider_starting"]
+            )
+
+            await handle.messages.put({
+                "type": "result",
+                "result": "done",
+                "session_id": "provider",
+                "terminal_reason": "end_turn",
+            })
+            await asyncio.wait_for(runner, 0.5)
+
+        self.assertTrue(any(
+            call.args[1] == "turn_deferred"
+            for call in append_event.await_args_list
+        ))
 
     async def test_deletion_cleanup_waits_for_one_approval_not_sdk_receiver(self) -> None:
         manager = FakeClaudeManager()

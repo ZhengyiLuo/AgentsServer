@@ -597,6 +597,40 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await asyncio.wait_for(collect(handle), 1), [result])
         self.assertEqual(await handle.wait_result(), result)
 
+    async def test_ack_waiter_opens_only_for_exact_replay_ack(self) -> None:
+        self.factory.auto_ack = False
+        handle = await self.manager.start_run(
+            "chat-1",
+            "Prompt",
+            run_id="run-1",
+            options={},
+            configuration_key="same",
+        )
+        client = self.factory.clients[0]
+        waiter = asyncio.create_task(handle.wait_acknowledged())
+
+        await client.emit(replay_ack("wrong-uuid"))
+        await client.emit({
+            "type": "user",
+            "uuid": handle.correlation_id,
+            "isReplay": False,
+        })
+        await asyncio.sleep(0)
+        self.assertFalse(waiter.done())
+        self.assertFalse(handle.acknowledged)
+
+        await client.emit(replay_ack(handle.correlation_id))
+        await asyncio.wait_for(waiter, 1)
+        self.assertTrue(handle.acknowledged)
+        # Event semantics also cover ACKs that arrive before the server starts
+        # watching provider readiness.
+        await asyncio.wait_for(handle.wait_acknowledged(), 1)
+
+        result = {"type": "result", "result": "done"}
+        await client.emit(result)
+        self.assertEqual(await asyncio.wait_for(collect(handle), 1), [result])
+        self.assertEqual(await handle.wait_result(), result)
+
     async def test_duplicate_matching_ack_is_suppressed(self) -> None:
         handle = await self.manager.start_run(
             "chat-1",

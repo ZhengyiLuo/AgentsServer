@@ -30,6 +30,10 @@ jobs:
       - name: Lock and test
         run: |
           uv lock --check
+          for source in test_*.py; do
+            echo "Compiling $source"
+            PYTHONFAULTHANDLER=1 uv run python -X faulthandler -m py_compile "$source"
+          done
           PYTHONFAULTHANDLER=1 uv run python -X faulthandler -m unittest discover -v -p 'test_*.py'
       - name: Build release assets
         run: |

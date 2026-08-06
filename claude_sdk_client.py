@@ -15,12 +15,22 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
+import shlex
 import time
 import uuid
 from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Awaitable, Callable, Protocol, runtime_checkable
+from typing import (
+    Any,
+    AsyncIterable,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Protocol,
+    runtime_checkable,
+)
 
 
 CLAUDE_AGENT_SDK_MIN_VERSION = "0.2.130"
@@ -71,11 +81,17 @@ class ClaudeSDKConfigurationConflict(ClaudeSDKSupervisorError):
 class ClaudeSDKClientProtocol(Protocol):
     async def connect(self) -> None: ...
 
-    async def query(self, prompt: str, **kwargs: Any) -> None: ...
+    async def query(
+        self,
+        prompt: str | AsyncIterable[dict[str, Any]],
+        **kwargs: Any,
+    ) -> None: ...
 
     def receive_messages(self) -> AsyncIterator[Any]: ...
 
     async def interrupt(self) -> None: ...
+
+    async def get_context_usage(self) -> dict[str, Any]: ...
 
     async def disconnect(self) -> None: ...
 
@@ -95,6 +111,95 @@ def default_is_result_message(message: Any) -> bool:
     if type(message).__name__ == "ResultMessage":
         return True
     return isinstance(message, dict) and str(message.get("type") or "") == "result"
+
+
+def _message_field(message: Any, field: str, default: Any = None) -> Any:
+    if isinstance(message, dict):
+        return message.get(field, default)
+    return getattr(message, field, default)
+
+
+def _message_type(message: Any) -> str:
+    if isinstance(message, dict):
+        return str(message.get("type") or "").strip().lower()
+    class_name = type(message).__name__
+    if class_name == "UserMessage":
+        return "user"
+    if class_name == "ResultMessage":
+        return "result"
+    return class_name.lower()
+
+
+_DEFERRING_TASK_TYPES = frozenset({"local_agent", "local_workflow"})
+_TERMINAL_TASK_STATUSES = frozenset(
+    {"completed", "failed", "stopped", "killed"}
+)
+_ABORTED_RESULT_REASONS = frozenset({"aborted_streaming", "aborted_tools"})
+
+
+def _task_lifecycle_fields(message: Any) -> tuple[str, str, str, str]:
+    """Return the bounded task fields needed to identify a run boundary.
+
+    Agent SDK 0.2.130 exposes task lifecycle frames as typed ``SystemMessage``
+    subclasses while test/compatibility adapters use dictionaries.  Keep this
+    module's optional-SDK boundary by reading either shape without importing the
+    SDK package.
+    """
+
+    data = _message_field(message, "data", {})
+    if not isinstance(data, dict):
+        data = {}
+    subtype = str(_message_field(message, "subtype") or data.get("subtype") or "")
+    task_id = str(_message_field(message, "task_id") or data.get("task_id") or "")
+    task_type = str(
+        _message_field(message, "task_type") or data.get("task_type") or ""
+    )
+    status = str(_message_field(message, "status") or "")
+    if not status:
+        patch = _message_field(message, "patch", data.get("patch"))
+        if isinstance(patch, dict):
+            status = str(patch.get("status") or "")
+    return subtype, task_id, task_type, status
+
+
+def _result_forces_run_end(message: Any) -> bool:
+    """Return whether a Result is terminal even with delegated work in flight."""
+
+    return bool(_message_field(message, "is_error", False)) or str(
+        _message_field(message, "terminal_reason") or ""
+    ) in _ABORTED_RESULT_REASONS
+
+
+def _is_matching_replay_ack(message: Any, correlation_id: str) -> bool:
+    """Match the CLI's replayed stdin acknowledgment for exactly one query.
+
+    ``claude-agent-sdk`` 0.2.130 preserves ``UserMessage.uuid`` but its typed
+    parser drops the raw ``isReplay`` field. JSON-shaped adapters must prove
+    ``isReplay`` explicitly; a typed ``UserMessage`` with the caller-generated
+    UUID is equivalent because that UUID is unique to the submitted stdin frame.
+    """
+
+    if _message_type(message) != "user":
+        return False
+    if str(_message_field(message, "uuid") or "") != correlation_id:
+        return False
+    if isinstance(message, dict):
+        return message.get("isReplay") is True
+    return type(message).__name__ == "UserMessage"
+
+
+async def _query_message_stream(
+    prompt: str,
+    correlation_id: str,
+) -> AsyncIterator[dict[str, Any]]:
+    """Yield the single UUID-bearing SDK stdin frame for one logical turn."""
+
+    yield {
+        "type": "user",
+        "message": {"role": "user", "content": prompt},
+        "parent_tool_use_id": None,
+        "uuid": correlation_id,
+    }
 
 
 def default_claude_sdk_client_factory(options: Any) -> ClaudeSDKClientProtocol:
@@ -119,6 +224,265 @@ def create_claude_agent_options(**kwargs: Any) -> Any:
             "claude-agent-sdk is not installed; use the claude -p fallback"
         ) from exc
     return ClaudeAgentOptions(**kwargs)
+
+
+@dataclass
+class ClaudeSDKHookMatcher:
+    """Structural HookMatcher accepted by every supported Agent SDK build."""
+
+    matcher: str | None
+    hooks: list[Callable[..., Awaitable[dict[str, Any]]]]
+    timeout: float | None = None
+
+
+_SHELL_CONTROL_TOKENS = {";", "&&", "||", "|", "&", "(", ")", "\n"}
+_SHELL_COMMAND_WRAPPERS = {"builtin", "command", "env"}
+_SHELL_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_UNTRACKED_BACKGROUND_REASON = (
+    "AgentsDock cannot reliably keep background Bash attached or wake this chat when "
+    "it finishes. Retry without run_in_background, nohup, disown, setsid, or shell "
+    "'&'. Keep work needed for the current reply in the foreground. For asynchronous "
+    "completion that must notify this chat, delegate a tracked Agent/workflow. If the "
+    "user explicitly requested a durable service, use an observable service manager."
+)
+
+
+def _heredoc_delimiters(line: str) -> list[tuple[str, bool]]:
+    """Find conventional shell heredocs without interpreting quoted text."""
+
+    delimiters: list[tuple[str, bool]] = []
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if char == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if quote:
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if char == "#" and (
+            index == 0
+            or line[index - 1].isspace()
+            or line[index - 1] in ";|&()"
+        ):
+            break
+        if not line.startswith("<<", index) or line.startswith("<<<", index):
+            index += 1
+            continue
+        cursor = index + 2
+        strip_tabs = cursor < len(line) and line[cursor] == "-"
+        if strip_tabs:
+            cursor += 1
+        while cursor < len(line) and line[cursor] in " \t":
+            cursor += 1
+        delimiter_quote = line[cursor] if cursor < len(line) and line[cursor] in {"'", '"'} else None
+        if delimiter_quote:
+            cursor += 1
+            end = line.find(delimiter_quote, cursor)
+            if end < 0:
+                break
+            delimiter = line[cursor:end]
+            cursor = end + 1
+        else:
+            start = cursor
+            while cursor < len(line) and (
+                line[cursor].isalnum() or line[cursor] in {"_", "-"}
+            ):
+                cursor += 1
+            delimiter = line[start:cursor]
+        if delimiter and (delimiter[0].isalpha() or delimiter[0] == "_"):
+            delimiters.append((delimiter, strip_tabs))
+        index = max(cursor, index + 2)
+    return delimiters
+
+
+def _without_heredoc_bodies(command: str) -> str:
+    """Blank data bodies so source-code ampersands are not treated as shell jobs."""
+
+    pending: list[tuple[str, bool]] = []
+    output: list[str] = []
+    for line in command.splitlines(keepends=True):
+        ending = "\n" if line.endswith(("\n", "\r")) else ""
+        content = line.rstrip("\r\n")
+        if pending:
+            delimiter, strip_tabs = pending[0]
+            candidate = content.lstrip("\t") if strip_tabs else content
+            if candidate == delimiter:
+                pending.pop(0)
+            output.append(ending)
+            continue
+        pending.extend(_heredoc_delimiters(content))
+        output.append(line)
+    return "".join(output)
+
+
+def _has_unquoted_background_operator(command: str) -> bool:
+    """Return true for a shell control ``&``, excluding data and redirections."""
+
+    command = _without_heredoc_bodies(command)
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if char == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if quote:
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if char == "#" and (
+            index == 0
+            or command[index - 1].isspace()
+            or command[index - 1] in ";|&()"
+        ):
+            newline = command.find("\n", index)
+            if newline < 0:
+                return False
+            index = newline + 1
+            continue
+        if char != "&":
+            index += 1
+            continue
+        previous = command[index - 1] if index else ""
+        following = command[index + 1] if index + 1 < len(command) else ""
+        if previous in {"&", ">", "<"} or following in {"&", ">"}:
+            index += 1
+            continue
+        return True
+    return False
+
+
+def _shell_tokens(command: str) -> list[str]:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        return list(lexer)
+    except ValueError:
+        # An incomplete command will fail in Bash itself. Do not turn a parser
+        # disagreement into a misleading policy denial.
+        return []
+
+
+def claude_untracked_background_reason(
+    tool_name: str,
+    tool_input: dict[str, Any] | None,
+) -> str | None:
+    """Identify common shell detachment that bypasses SDK task tracking."""
+
+    if str(tool_name or "").strip().lower() != "bash":
+        return None
+    normalized_input = tool_input or {}
+    if normalized_input.get("run_in_background") is True:
+        return _UNTRACKED_BACKGROUND_REASON
+    command = str(normalized_input.get("command") or "")
+    if not command.strip():
+        return None
+    if _has_unquoted_background_operator(command):
+        return _UNTRACKED_BACKGROUND_REASON
+
+    tokens = _shell_tokens(command)
+    expect_command = True
+    wrapper_active = False
+    for index, token in enumerate(tokens):
+        if token in _SHELL_CONTROL_TOKENS:
+            expect_command = True
+            wrapper_active = False
+            continue
+        if not expect_command:
+            continue
+        if _SHELL_ASSIGNMENT_RE.match(token):
+            continue
+        executable = token.rsplit("/", 1)[-1]
+        if executable in _SHELL_COMMAND_WRAPPERS:
+            wrapper_active = True
+            continue
+        if wrapper_active and token.startswith("-"):
+            continue
+        if executable in {"nohup", "disown"}:
+            return _UNTRACKED_BACKGROUND_REASON
+        if executable in {"bash", "dash", "ksh", "sh", "zsh"}:
+            arguments = tokens[index + 1:]
+            for argument_index, argument in enumerate(arguments[:-1]):
+                if (
+                    argument.startswith("-")
+                    and not argument.startswith("--")
+                    and "c" in argument[1:]
+                    and claude_untracked_background_reason(
+                        "Bash", {"command": arguments[argument_index + 1]}
+                    ) is not None
+                ):
+                    return _UNTRACKED_BACKGROUND_REASON
+        if executable == "setsid":
+            # Even without --fork, a new session can escape process-group
+            # cleanup if the provider/server disappears. Keep it out of the
+            # untracked Bash path entirely.
+            return _UNTRACKED_BACKGROUND_REASON
+        expect_command = False
+    return None
+
+
+async def reject_untracked_background_hook(
+    hook_input: dict[str, Any],
+    _tool_use_id: str | None,
+    _context: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep Claude background work attached to the SDK's task lifecycle."""
+
+    reason = claude_untracked_background_reason(
+        str(hook_input.get("tool_name") or ""),
+        hook_input.get("tool_input")
+        if isinstance(hook_input.get("tool_input"), dict)
+        else {},
+    )
+    if reason is None:
+        return {}
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
+
+
+def claude_background_tracking_hooks() -> dict[str, list[ClaudeSDKHookMatcher]]:
+    """Return the stable SDK hook policy for shell background work."""
+
+    return {
+        "PreToolUse": [
+            ClaudeSDKHookMatcher(
+                matcher="Bash",
+                hooks=[reject_untracked_background_hook],
+                timeout=5.0,
+            )
+        ]
+    }
 
 
 def bind_permission_owner(options: Any, ownership_token: str) -> None:
@@ -155,16 +519,19 @@ class ClaudeSDKRunHandle:
         self,
         chat_id: str,
         run_id: str,
+        correlation_id: str,
         loop: asyncio.AbstractEventLoop,
         interrupt_callback: InterruptCallback,
     ) -> None:
         self.chat_id = chat_id
         self.run_id = run_id
+        self.correlation_id = correlation_id
         self._loop = loop
         self._interrupt_callback = interrupt_callback
         self._messages: asyncio.Queue[Any] = asyncio.Queue()
         self._terminal: asyncio.Future[Any] = loop.create_future()
         self.accepted_at: float | None = None
+        self._acknowledged = False
 
     def _check_loop(self) -> None:
         try:
@@ -183,6 +550,10 @@ class ClaudeSDKRunHandle:
     @property
     def accepted(self) -> bool:
         return self.accepted_at is not None
+
+    @property
+    def acknowledged(self) -> bool:
+        return self._acknowledged
 
     async def wait_result(self) -> Any:
         """Return the terminal ResultMessage, or raise the terminal transport error."""
@@ -215,6 +586,15 @@ class ClaudeSDKRunHandle:
     def _deliver(self, message: Any) -> None:
         if not self.done:
             self._messages.put_nowait(message)
+
+    def _acknowledge(self, message: Any) -> bool:
+        if self._acknowledged or not _is_matching_replay_ack(
+            message,
+            self.correlation_id,
+        ):
+            return False
+        self._acknowledged = True
+        return True
 
     def _finish(self, terminal: Any) -> None:
         if self.done:
@@ -262,6 +642,11 @@ class _Interrupt:
 
 
 @dataclass
+class _GetContextUsage:
+    response: asyncio.Future[dict[str, Any] | None]
+
+
+@dataclass
 class _Close:
     response: asyncio.Future[None]
 
@@ -278,6 +663,13 @@ class _ReceiverStopped:
     error: BaseException | None
 
 
+@dataclass(frozen=True)
+class _AckTimeout:
+    generation: int
+    run_id: str
+    correlation_id: str
+
+
 class ClaudeSDKSupervisor:
     """One lazy, restartable Claude SDK actor for one AgentsDock chat."""
 
@@ -290,6 +682,8 @@ class ClaudeSDKSupervisor:
         client_factory: ClientFactory = default_claude_sdk_client_factory,
         is_result_message: ResultPredicate = default_is_result_message,
         disconnect_timeout_seconds: float = 2.0,
+        ack_timeout_seconds: float = 10.0,
+        query_delivery_timeout_seconds: float = 10.0,
     ) -> None:
         clean_chat_id = str(chat_id or "").strip()
         if not clean_chat_id:
@@ -304,13 +698,21 @@ class ClaudeSDKSupervisor:
         if disconnect_timeout_seconds <= 0:
             raise ValueError("disconnect_timeout_seconds must be positive")
         self._disconnect_timeout_seconds = float(disconnect_timeout_seconds)
+        if ack_timeout_seconds <= 0:
+            raise ValueError("ack_timeout_seconds must be positive")
+        self._ack_timeout_seconds = float(ack_timeout_seconds)
+        if query_delivery_timeout_seconds <= 0:
+            raise ValueError("query_delivery_timeout_seconds must be positive")
+        self._query_delivery_timeout_seconds = float(query_delivery_timeout_seconds)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._commands: asyncio.Queue[Any] | None = None
         self._actor_task: asyncio.Task[None] | None = None
         self._client: ClaudeSDKClientProtocol | None = None
         self._connecting_client: ClaudeSDKClientProtocol | None = None
         self._receiver_task: asyncio.Task[None] | None = None
+        self._ack_timeout_task: asyncio.Task[None] | None = None
         self._active_run: ClaudeSDKRunHandle | None = None
+        self._inflight_tasks: set[str] = set()
         self._generation = 0
         self._closed = False
         self._connected = False
@@ -413,6 +815,15 @@ class ClaudeSDKSupervisor:
         response: asyncio.Future[bool] = loop.create_future()
         assert self._commands is not None
         await self._commands.put(_Interrupt(run_id=run_id, response=response))
+        return await asyncio.shield(response)
+
+    async def get_context_usage(self) -> dict[str, Any] | None:
+        """Sample usage through the chat actor that owns the SDK client."""
+
+        loop = self._ensure_actor()
+        response: asyncio.Future[dict[str, Any] | None] = loop.create_future()
+        assert self._commands is not None
+        await self._commands.put(_GetContextUsage(response=response))
         return await asyncio.shield(response)
 
     async def close(self) -> None:
@@ -597,6 +1008,7 @@ class ClaudeSDKSupervisor:
                 )
 
     async def _disconnect_current_client(self) -> None:
+        self._cancel_ack_timeout()
         client = self._client
         receiver = self._receiver_task
         self._client = None
@@ -608,10 +1020,76 @@ class ClaudeSDKSupervisor:
             await self._cancel_task_bounded(receiver)
 
     def _fail_active(self, error: BaseException) -> None:
+        self._cancel_ack_timeout()
         active = self._active_run
         self._active_run = None
+        self._inflight_tasks.clear()
         if active is not None:
             active._fail(error)
+
+    def _cancel_ack_timeout(self) -> None:
+        task = self._ack_timeout_task
+        self._ack_timeout_task = None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+
+    def _schedule_ack_timeout(self, handle: ClaudeSDKRunHandle) -> None:
+        self._cancel_ack_timeout()
+        generation = self._generation
+        commands = self._commands
+        assert commands is not None
+
+        async def expire() -> None:
+            try:
+                await asyncio.sleep(self._ack_timeout_seconds)
+                await commands.put(_AckTimeout(
+                    generation=generation,
+                    run_id=handle.run_id,
+                    correlation_id=handle.correlation_id,
+                ))
+            except asyncio.CancelledError:
+                return
+
+        self._ack_timeout_task = asyncio.create_task(
+            expire(),
+            name=f"claude-sdk-ack:{self.chat_id}:{handle.run_id}",
+        )
+
+    async def _deliver_query_bounded(
+        self,
+        query: Awaitable[None],
+        *,
+        run_id: str,
+    ) -> None:
+        """Bound stdin delivery without awaiting cancellation-hostile SDK code."""
+
+        task = asyncio.create_task(
+            query,
+            name=f"claude-sdk-query:{self.chat_id}:{run_id}",
+        )
+
+        def consume_result(completed: asyncio.Task[Any]) -> None:
+            if not completed.cancelled():
+                with suppress(BaseException):
+                    completed.exception()
+
+        try:
+            done, _pending = await asyncio.wait(
+                {task},
+                timeout=self._query_delivery_timeout_seconds,
+            )
+        except BaseException:
+            task.cancel()
+            task.add_done_callback(consume_result)
+            raise
+        if task not in done:
+            task.cancel()
+            task.add_done_callback(consume_result)
+            raise ClaudeSDKQueryError(
+                f"Claude SDK query delivery timed out for chat {self.chat_id}; "
+                "delivery is uncertain"
+            )
+        await task
 
     async def _handle_start(self, command: _StartRun) -> None:
         if self._active_run is not None and not self._active_run.done:
@@ -635,9 +1113,11 @@ class ClaudeSDKSupervisor:
         async def interrupt_this_run(run_id: str) -> bool:
             return await self.interrupt(run_id=run_id)
 
+        correlation_id = str(uuid.uuid4())
         handle = ClaudeSDKRunHandle(
             self.chat_id,
             command.run_id,
+            correlation_id,
             self._loop,
             interrupt_this_run,
         )
@@ -668,11 +1148,19 @@ class ClaudeSDKSupervisor:
                     f"Claude SDK supervisor for {self.chat_id} closed before query"
                 )
             if command.query_session_id is None:
-                await client.query(command.prompt)
+                await self._deliver_query_bounded(
+                    client.query(
+                        _query_message_stream(command.prompt, correlation_id)
+                    ),
+                    run_id=command.run_id,
+                )
             else:
-                await client.query(
-                    command.prompt,
-                    session_id=command.query_session_id,
+                await self._deliver_query_bounded(
+                    client.query(
+                        _query_message_stream(command.prompt, correlation_id),
+                        session_id=command.query_session_id,
+                    ),
+                    run_id=command.run_id,
                 )
         except ClaudeSDKSupervisorClosed as exc:
             self._active_run = None
@@ -695,6 +1183,7 @@ class ClaudeSDKSupervisor:
             await self._disconnect_current_client()
             return
         handle._mark_accepted()
+        self._schedule_ack_timeout(handle)
         if not command.response.done():
             command.response.set_result(handle)
 
@@ -727,9 +1216,40 @@ class ClaudeSDKSupervisor:
                     )
                 )
             return
+        if not active.acknowledged:
+            error = ClaudeSDKQueryError(
+                f"Claude SDK query {active.run_id} for chat {self.chat_id} was "
+                "interrupted before its replay acknowledgment; delivery is uncertain"
+            )
+            self._fail_active(error)
+            await self._disconnect_current_client()
         self._last_used_at = time.monotonic()
         if not command.response.done():
             command.response.set_result(True)
+
+    async def _handle_get_context_usage(
+        self,
+        command: _GetContextUsage,
+    ) -> None:
+        client = self._client
+        getter = getattr(client, "get_context_usage", None)
+        if client is None or not self._connected or not callable(getter):
+            if not command.response.done():
+                command.response.set_result(None)
+            return
+        try:
+            value = await getter()
+        except Exception as exc:
+            if not command.response.done():
+                command.response.set_exception(
+                    ClaudeSDKSupervisorError(
+                        f"Claude SDK context usage failed for {self.chat_id}: {exc}"
+                    )
+                )
+            return
+        self._last_used_at = time.monotonic()
+        if not command.response.done():
+            command.response.set_result(dict(value) if isinstance(value, dict) else None)
 
     async def _handle_received(self, command: _ReceivedMessage) -> None:
         if command.generation != self._generation:
@@ -737,16 +1257,88 @@ class ClaudeSDKSupervisor:
         active = self._active_run
         if active is None or active.done:
             return
-        active._deliver(command.message)
         self._last_used_at = time.monotonic()
+        if not active.acknowledged:
+            if active._acknowledge(command.message):
+                self._cancel_ack_timeout()
+                return
+            # The persistent stream may contain resumed-session output from
+            # before this query. Nothing owns the new run until its exact UUID
+            # is replayed by the CLI.
+            return
+        elif _is_matching_replay_ack(
+            command.message,
+            active.correlation_id,
+        ):
+            # A duplicate acknowledgment is protocol metadata, never a second
+            # user bubble.
+            return
+
         if self._is_result_message(command.message):
+            # A Claude Result ends one model turn, not necessarily the logical
+            # run. Delegated local agents/workflows can outlive that Result;
+            # their completion wakes Claude for a follow-up model turn and a
+            # later Result. The Agent SDK itself uses this exact ledger to keep
+            # its control channel open. Suppress the intermediate Result so the
+            # runner cannot mistake it for the terminal response.
+            had_inflight_tasks = bool(self._inflight_tasks)
+            forced_run_end = _result_forces_run_end(command.message)
+            if had_inflight_tasks and not forced_run_end:
+                return
+            active._deliver(command.message)
+            self._cancel_ack_timeout()
             active._finish(command.message)
             self._active_run = None
+            self._inflight_tasks.clear()
+            if had_inflight_tasks and forced_run_end:
+                # An interrupted/error response can strand provider-side task
+                # frames after this logical run has ended. Retire only this
+                # chat's connection so those late frames cannot cross the next
+                # query's replay-ACK boundary and terminate a fresh run.
+                await self._disconnect_current_client()
+            return
+
+        subtype, task_id, task_type, status = _task_lifecycle_fields(
+            command.message
+        )
+        if task_id:
+            if subtype == "task_started" and task_type in _DEFERRING_TASK_TYPES:
+                self._inflight_tasks.add(task_id)
+            elif subtype == "task_notification":
+                self._inflight_tasks.discard(task_id)
+            elif subtype == "task_updated" and status in _TERMINAL_TASK_STATUSES:
+                self._inflight_tasks.discard(task_id)
+        active._deliver(command.message)
+
+    async def _handle_ack_timeout(self, command: _AckTimeout) -> None:
+        if command.generation != self._generation:
+            return
+        active = self._active_run
+        if (
+            active is None
+            or active.done
+            or active.acknowledged
+            or active.run_id != command.run_id
+            or active.correlation_id != command.correlation_id
+        ):
+            return
+        error = ClaudeSDKQueryError(
+            f"Claude SDK did not acknowledge query {command.run_id} for chat "
+            f"{self.chat_id}; delivery is uncertain"
+        )
+        self._fail_active(error)
+        await self._disconnect_current_client()
 
     async def _handle_receiver_stopped(self, command: _ReceiverStopped) -> None:
         if command.generation != self._generation:
             return
-        error = ClaudeSDKSupervisorError(
+        active = self._active_run
+        error_type = (
+            ClaudeSDKQueryError
+            if active is not None and not active.acknowledged
+            else ClaudeSDKSupervisorError
+        )
+        error = error_type(
             f"Claude SDK message stream stopped for chat {self.chat_id}"
             + (f": {command.error}" if command.error is not None else "")
         )
@@ -783,8 +1375,12 @@ class ClaudeSDKSupervisor:
                     await self._handle_start(command)
                 elif isinstance(command, _Interrupt):
                     await self._handle_interrupt(command)
+                elif isinstance(command, _GetContextUsage):
+                    await self._handle_get_context_usage(command)
                 elif isinstance(command, _ReceivedMessage):
                     await self._handle_received(command)
+                elif isinstance(command, _AckTimeout):
+                    await self._handle_ack_timeout(command)
                 elif isinstance(command, _ReceiverStopped):
                     await self._handle_receiver_stopped(command)
                 elif isinstance(command, _Close):
@@ -834,6 +1430,8 @@ class ClaudeSDKSupervisorManager:
         max_clients: int = 12,
         idle_ttl_seconds: float | None = 15 * 60,
         disconnect_timeout_seconds: float = 2.0,
+        ack_timeout_seconds: float = 10.0,
+        query_delivery_timeout_seconds: float = 10.0,
     ) -> None:
         if max_clients < 1:
             raise ValueError("max_clients must be positive")
@@ -846,6 +1444,12 @@ class ClaudeSDKSupervisorManager:
         if disconnect_timeout_seconds <= 0:
             raise ValueError("disconnect_timeout_seconds must be positive")
         self._disconnect_timeout_seconds = float(disconnect_timeout_seconds)
+        if ack_timeout_seconds <= 0:
+            raise ValueError("ack_timeout_seconds must be positive")
+        self._ack_timeout_seconds = float(ack_timeout_seconds)
+        if query_delivery_timeout_seconds <= 0:
+            raise ValueError("query_delivery_timeout_seconds must be positive")
+        self._query_delivery_timeout_seconds = float(query_delivery_timeout_seconds)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._lock: asyncio.Lock | None = None
         self._supervisors: OrderedDict[str, ClaudeSDKSupervisor] = OrderedDict()
@@ -928,6 +1532,8 @@ class ClaudeSDKSupervisorManager:
                 client_factory=self._client_factory,
                 is_result_message=self._is_result_message,
                 disconnect_timeout_seconds=self._disconnect_timeout_seconds,
+                ack_timeout_seconds=self._ack_timeout_seconds,
+                query_delivery_timeout_seconds=self._query_delivery_timeout_seconds,
             )
             self._supervisors[chat_id] = supervisor
         else:
@@ -1041,6 +1647,56 @@ class ClaudeSDKSupervisorManager:
         if supervisor is None:
             return False
         return await supervisor.interrupt(run_id=run_id)
+
+    async def get_context_usage(
+        self,
+        chat_id: str,
+        *,
+        ownership_token: str | None = None,
+    ) -> tuple[dict[str, Any], int] | None:
+        """Sample one chat's connected client with registry/generation fencing."""
+
+        self._bind_loop()
+        assert self._lock is not None
+        clean_chat_id = str(chat_id)
+        async with self._lock:
+            supervisor = self._supervisors.get(clean_chat_id)
+            if (
+                supervisor is None
+                or supervisor.closed
+                or not supervisor.connected
+                or (
+                    ownership_token is not None
+                    and supervisor.ownership_token != str(ownership_token)
+                )
+            ):
+                return None
+            self._pins[clean_chat_id] = self._pins.get(clean_chat_id, 0) + 1
+            generation = supervisor.snapshot().generation
+        try:
+            usage = await supervisor.get_context_usage()
+            if usage is None:
+                return None
+            async with self._lock:
+                if (
+                    self._supervisors.get(clean_chat_id) is not supervisor
+                    or supervisor.closed
+                    or supervisor.snapshot().generation != generation
+                    or (
+                        ownership_token is not None
+                        and supervisor.ownership_token != str(ownership_token)
+                    )
+                ):
+                    return None
+                self._supervisors.move_to_end(clean_chat_id)
+            return dict(usage), generation
+        finally:
+            async with self._lock:
+                count = self._pins.get(clean_chat_id, 0) - 1
+                if count > 0:
+                    self._pins[clean_chat_id] = count
+                else:
+                    self._pins.pop(clean_chat_id, None)
 
     def is_loaded(self, chat_id: str) -> bool:
         """Return whether this manager currently owns a connected SDK client."""

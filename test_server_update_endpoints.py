@@ -6,7 +6,7 @@ import unittest
 from collections import deque
 from contextlib import ExitStack
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import agent_server
 from fastapi import HTTPException
@@ -437,6 +437,222 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 409)
         self.assertIn("2 queued turns", str(raised.exception.detail))
         run_tmux.assert_not_called()
+
+    async def test_start_rejects_update_while_a_codex_subagent_is_live(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "update_runner.py"
+            key = root / "release-public-key.pem"
+            runner.write_text("# runner\n")
+            key.write_text("public key\n")
+            status_path = root / "status.json"
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", status_path), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server, "BUSY_SESSIONS", set()), \
+                 patch.object(agent_server, "SERVER_MAINTENANCE_SESSIONS", set()), \
+                 patch.object(agent_server, "QUEUED_TURNS", {}), \
+                 patch.object(agent_server, "RUN_NOW_TURNS", {}), \
+                 patch.object(agent_server, "CLAUDE_SDK_MANAGER", None), \
+                 patch.object(
+                     agent_server,
+                     "active_codex_work_labels",
+                     return_value=["Codex subagent child-thread"],
+                 ), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
+                 patch.object(agent_server, "run_tmux") as run_tmux:
+                with self.assertRaises(HTTPException) as raised:
+                    await agent_server.start_server_update(
+                        agent_server.ServerUpdateRequest(version="1.1.0"),
+                    )
+
+            self.assertFalse(status_path.exists())
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("Codex subagent child-thread", str(raised.exception.detail))
+        run_tmux.assert_not_called()
+
+    async def test_start_rejects_loaded_claude_background_subagent(self):
+        class LoadedClaudeManager:
+            @staticmethod
+            def is_loaded(session_id):
+                return session_id == "claude-chat"
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "update_runner.py"
+            key = root / "release-public-key.pem"
+            runner.write_text("# runner\n")
+            key.write_text("public key\n")
+            status_path = root / "status.json"
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", status_path), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server.STORE, "sessions", {
+                     "claude-chat": {
+                         "id": "claude-chat",
+                         "backend": agent_server.BACKEND_CLAUDE,
+                     },
+                 }), \
+                 patch.object(agent_server, "BUSY_SESSIONS", set()), \
+                 patch.object(agent_server, "SERVER_MAINTENANCE_SESSIONS", set()), \
+                 patch.object(agent_server, "QUEUED_TURNS", {}), \
+                 patch.object(agent_server, "RUN_NOW_TURNS", {}), \
+                 patch.object(agent_server, "CLAUDE_SDK_MANAGER", LoadedClaudeManager()), \
+                 patch.object(agent_server, "active_codex_work_labels", return_value=[]), \
+                 patch.object(
+                     agent_server,
+                     "build_claude_subagent_snapshot",
+                     return_value={"active_count": 1},
+                 ), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
+                 patch.object(agent_server, "run_tmux") as run_tmux:
+                with self.assertRaises(HTTPException) as raised:
+                    await agent_server.start_server_update(
+                        agent_server.ServerUpdateRequest(version="1.1.0"),
+                    )
+
+            self.assertFalse(status_path.exists())
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("Claude background work in claude-chat", str(raised.exception.detail))
+        run_tmux.assert_not_called()
+
+    async def test_start_ignores_stale_claude_history_when_supervisor_is_unloaded(self):
+        class UnloadedClaudeManager:
+            @staticmethod
+            def is_loaded(_session_id):
+                return False
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "update_runner.py"
+            key = root / "release-public-key.pem"
+            runner.write_text("# runner\n")
+            key.write_text("public key\n")
+            snapshot = MagicMock(return_value={"active_count": 1})
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", root / "status.json"), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server, "AGENT_TOKEN", ""), \
+                 patch.object(agent_server.STORE, "sessions", {
+                     "claude-chat": {
+                         "id": "claude-chat",
+                         "backend": agent_server.BACKEND_CLAUDE,
+                     },
+                 }), \
+                 patch.object(agent_server, "BUSY_SESSIONS", set()), \
+                 patch.object(agent_server, "SERVER_MAINTENANCE_SESSIONS", set()), \
+                 patch.object(agent_server, "QUEUED_TURNS", {}), \
+                 patch.object(agent_server, "RUN_NOW_TURNS", {}), \
+                 patch.object(agent_server, "CLAUDE_SDK_MANAGER", UnloadedClaudeManager()), \
+                 patch.object(agent_server, "active_codex_work_labels", return_value=[]), \
+                 patch.object(agent_server, "build_claude_subagent_snapshot", snapshot), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
+                 patch.object(agent_server, "run_tmux", return_value=None) as run_tmux:
+                status = await agent_server.start_server_update(
+                    agent_server.ServerUpdateRequest(version="1.1.0"),
+                )
+
+        self.assertEqual(status["phase"], "starting")
+        snapshot.assert_not_called()
+        run_tmux.assert_called_once()
+
+    async def test_start_fails_closed_when_claude_load_state_cannot_be_inspected(self):
+        class BrokenClaudeManager:
+            @staticmethod
+            def is_loaded(_session_id):
+                raise RuntimeError("supervisor registry unavailable")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "update_runner.py"
+            key = root / "release-public-key.pem"
+            runner.write_text("# runner\n")
+            key.write_text("public key\n")
+            status_path = root / "status.json"
+            snapshot = MagicMock(return_value={"active_count": 0})
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", status_path), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server.STORE, "sessions", {
+                     "claude-chat": {
+                         "id": "claude-chat",
+                         "backend": agent_server.BACKEND_CLAUDE,
+                     },
+                 }), \
+                 patch.object(agent_server, "BUSY_SESSIONS", set()), \
+                 patch.object(agent_server, "SERVER_MAINTENANCE_SESSIONS", set()), \
+                 patch.object(agent_server, "QUEUED_TURNS", {}), \
+                 patch.object(agent_server, "RUN_NOW_TURNS", {}), \
+                 patch.object(agent_server, "CLAUDE_SDK_MANAGER", BrokenClaudeManager()), \
+                 patch.object(agent_server, "active_codex_work_labels", return_value=[]), \
+                 patch.object(agent_server, "build_claude_subagent_snapshot", snapshot), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
+                 patch.object(agent_server, "run_tmux") as run_tmux:
+                with self.assertRaises(HTTPException) as raised:
+                    await agent_server.start_server_update(
+                        agent_server.ServerUpdateRequest(version="1.1.0"),
+                    )
+
+            self.assertFalse(status_path.exists())
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn(
+            "Claude provider state unknown in claude-chat",
+            str(raised.exception.detail),
+        )
+        snapshot.assert_not_called()
+        run_tmux.assert_not_called()
+
+    async def test_start_allows_loaded_claude_with_terminal_subagents(self):
+        class LoadedClaudeManager:
+            @staticmethod
+            def is_loaded(session_id):
+                return session_id == "claude-chat"
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "update_runner.py"
+            key = root / "release-public-key.pem"
+            runner.write_text("# runner\n")
+            key.write_text("public key\n")
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", root / "status.json"), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server, "AGENT_TOKEN", ""), \
+                 patch.object(agent_server.STORE, "sessions", {
+                     "claude-chat": {
+                         "id": "claude-chat",
+                         "backend": agent_server.BACKEND_CLAUDE,
+                     },
+                 }), \
+                 patch.object(agent_server, "BUSY_SESSIONS", set()), \
+                 patch.object(agent_server, "SERVER_MAINTENANCE_SESSIONS", set()), \
+                 patch.object(agent_server, "QUEUED_TURNS", {}), \
+                 patch.object(agent_server, "RUN_NOW_TURNS", {}), \
+                 patch.object(agent_server, "CLAUDE_SDK_MANAGER", LoadedClaudeManager()), \
+                 patch.object(agent_server, "active_codex_work_labels", return_value=[]), \
+                 patch.object(
+                     agent_server,
+                     "build_claude_subagent_snapshot",
+                     return_value={"active_count": 0},
+                 ), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
+                 patch.object(agent_server, "run_tmux", return_value=None) as run_tmux:
+                status = await agent_server.start_server_update(
+                    agent_server.ServerUpdateRequest(version="1.1.0"),
+                )
+
+        self.assertEqual(status["phase"], "starting")
+        run_tmux.assert_called_once()
 
     async def test_update_admission_wins_race_with_new_turn_reservation(self):
         with tempfile.TemporaryDirectory() as temporary:

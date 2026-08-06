@@ -400,6 +400,14 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         stack.enter_context(
             patch.object(
                 agent_server,
+                "mark_codex_exec_context_usage_unavailable",
+                context_invalidator := AsyncMock(),
+            )
+        )
+        self.context_invalidator = context_invalidator
+        stack.enter_context(
+            patch.object(
+                agent_server,
                 "record_runtime_failure",
                 runtime_failure := Mock(),
             )
@@ -482,6 +490,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
     async def test_dispatcher_preserves_explicit_exec_compatibility(self) -> None:
         app_server = AsyncMock()
         exec_runner = AsyncMock()
+        invalidate_context = AsyncMock()
         manifest = Path(self.cwd) / ".runner-test-manifest.json"
         with patch.object(
             agent_server,
@@ -495,6 +504,10 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             agent_server,
             "CODEX_TRANSPORT",
             agent_server.CODEX_TRANSPORT_EXEC,
+        ), patch.object(
+            agent_server,
+            "mark_codex_exec_context_usage_unavailable",
+            invalidate_context,
         ):
             await agent_server.run_codex(
                 "chat-native",
@@ -511,6 +524,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.session,
             manifest,
         )
+        invalidate_context.assert_awaited_once_with("chat-native")
         app_server.assert_not_awaited()
 
     async def test_turn_start_gets_only_current_text_and_maps_message_phases(self) -> None:
@@ -841,6 +855,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         exec_fallback.assert_awaited_once()
+        self.context_invalidator.assert_awaited_once_with("chat-native")
         self.assertEqual(exec_fallback.await_args.args[2], "Safe to retry exactly once")
         fallback_events = [
             call.args[2]

@@ -8,7 +8,7 @@ from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import agent_server
-from claude_sdk_client import ClaudeSDKUnavailable
+from claude_sdk_client import ClaudeSDKQueryError, ClaudeSDKUnavailable
 
 
 class FakeClaudeRun:
@@ -29,6 +29,53 @@ class FakeClaudeRun:
         return True
 
 
+class FailingClaudeRun(FakeClaudeRun):
+    def __init__(self, error: BaseException) -> None:
+        super().__init__()
+        self.error = error
+
+    async def __anext__(self) -> object:
+        raise self.error
+
+    async def wait_result(self) -> object:
+        raise self.error
+
+
+class FakeClaudePrintStdin:
+    def __init__(self) -> None:
+        self.writes: list[bytes] = []
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        self.writes.append(data)
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeClaudePrintStream:
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = deque(chunks)
+
+    async def readline(self) -> bytes:
+        return self.chunks.popleft() if self.chunks else b""
+
+    async def read(self) -> bytes:
+        return b"".join(self.chunks)
+
+
+class FakeClaudePrintProcess:
+    def __init__(self, stdout_chunks: list[bytes]) -> None:
+        self.pid = 4242
+        self.returncode = 0
+        self.stdin = FakeClaudePrintStdin()
+        self.stdout = FakeClaudePrintStream(stdout_chunks)
+        self.stderr = FakeClaudePrintStream([])
+
+
 class FakeClaudeManager:
     def __init__(self, handle: FakeClaudeRun | None = None) -> None:
         self.handle = handle or FakeClaudeRun()
@@ -36,6 +83,8 @@ class FakeClaudeManager:
         self.evict_calls: list[tuple[str, bool]] = []
         self.owner_token = "fake-claude-owner"
         self.active_run_id: str | None = None
+        self.context_usage_response: tuple[dict[str, Any], int] | None = None
+        self.context_usage_calls: list[tuple[str, str | None]] = []
 
     async def start_run(
         self,
@@ -79,6 +128,15 @@ class FakeClaudeManager:
             and ownership_token == self.owner_token
             and run_id == self.active_run_id
         )
+
+    async def get_context_usage(
+        self,
+        chat_id: str,
+        *,
+        ownership_token: str | None = None,
+    ) -> tuple[dict[str, Any], int] | None:
+        self.context_usage_calls.append((chat_id, ownership_token))
+        return self.context_usage_response
 
 
 class SequencedClaudeManager(FakeClaudeManager):
@@ -318,6 +376,276 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         agent_server.DELETING_SESSIONS = self.previous_deleting
         agent_server.DELETED_SESSION_TOMBSTONES = self.previous_deleted
 
+    async def _run_sdk_terminal_case(
+        self,
+        messages: list[object],
+    ) -> tuple[AsyncMock, AsyncMock, Mock, Mock]:
+        manager = FakeClaudeManager(FakeClaudeRun(messages))
+        append_event = AsyncMock(return_value={})
+        append_finished = AsyncMock(return_value={})
+        runtime_success = Mock()
+        runtime_failure = Mock()
+        with patch.object(
+            agent_server,
+            "resolve_claude_resume_provider",
+            return_value=(None, None),
+        ), patch.object(
+            agent_server,
+            "capture_git_baseline",
+            AsyncMock(return_value={"head": "base"}),
+        ), patch.object(
+            agent_server,
+            "build_claude_sdk_options",
+            return_value=(object(), "config", "/usr/bin/claude"),
+        ), patch.object(
+            agent_server,
+            "claude_sdk_manager",
+            AsyncMock(return_value=manager),
+        ), patch.object(
+            agent_server,
+            "watch_manifest_artifacts",
+            wait_forever,
+        ), patch.object(
+            agent_server,
+            "append_event",
+            append_event,
+        ), patch.object(
+            agent_server,
+            "append_turn_finished_event",
+            append_finished,
+        ), patch.object(
+            agent_server,
+            "mark_provider_turn_ready",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "persist_run_provider_session",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "sample_claude_context_usage",
+            AsyncMock(return_value=False),
+        ), patch.object(
+            agent_server,
+            "cancel_claude_interactions",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "collect_manifest",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "collect_recent_leftover_manifests",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "publish_turn_code_diff",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "release_turn_slot",
+            AsyncMock(return_value=True),
+        ), patch.object(
+            agent_server,
+            "record_runtime_success",
+            runtime_success,
+        ), patch.object(
+            agent_server,
+            "record_runtime_failure",
+            runtime_failure,
+        ), patch.object(
+            agent_server,
+            "should_schedule_queue_after_finish",
+            return_value=False,
+        ):
+            await agent_server.run_claude_sdk(
+                "chat-claude",
+                "run-claude",
+                "Prompt",
+                dict(self.session),
+                Path(self.cwd) / ".manifest.json",
+            )
+        return append_event, append_finished, runtime_success, runtime_failure
+
+    async def test_empty_sdk_result_without_tools_is_visible_failure(self) -> None:
+        append_event, append_finished, runtime_success, runtime_failure = (
+            await self._run_sdk_terminal_case([{
+                "type": "result",
+                "result": "",
+                "session_id": "provider",
+                "terminal_reason": "end_turn",
+            }])
+        )
+
+        terminal = append_finished.await_args.args[1]
+        self.assertEqual(terminal["exit_code"], 1)
+        self.assertEqual(terminal["result_text"], "")
+        self.assertTrue(any(
+            call.args[1] == "error"
+            and call.args[2]["message"]
+            == agent_server.CLAUDE_EMPTY_TURN_ERROR
+            for call in append_event.await_args_list
+        ))
+        runtime_success.assert_not_called()
+        runtime_failure.assert_called_once_with(
+            agent_server.BACKEND_CLAUDE,
+            agent_server.CLAUDE_EMPTY_TURN_ERROR,
+        )
+
+    async def test_tool_only_empty_sdk_result_remains_success(self) -> None:
+        append_event, append_finished, runtime_success, runtime_failure = (
+            await self._run_sdk_terminal_case([
+                {
+                    "type": "AssistantMessage",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "Read",
+                        "input": {"file_path": "/tmp/example"},
+                    }],
+                    "session_id": "provider",
+                },
+                {
+                    "type": "UserMessage",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": "done",
+                    }],
+                },
+                {
+                    "type": "result",
+                    "result": "",
+                    "session_id": "provider",
+                    "terminal_reason": "end_turn",
+                },
+            ])
+        )
+
+        terminal = append_finished.await_args.args[1]
+        self.assertEqual(terminal["exit_code"], 0)
+        self.assertEqual(terminal["result_text"], "")
+        self.assertFalse(any(
+            call.args[1] == "error"
+            and call.args[2].get("message")
+            == agent_server.CLAUDE_EMPTY_TURN_ERROR
+            for call in append_event.await_args_list
+        ))
+        runtime_success.assert_called_once_with(agent_server.BACKEND_CLAUDE)
+        runtime_failure.assert_not_called()
+
+    async def test_empty_print_result_without_tools_is_visible_failure(self) -> None:
+        process = FakeClaudePrintProcess([
+            b'{"type":"result","result":"","session_id":"provider"}\n',
+        ])
+        append_event = AsyncMock(return_value={})
+        append_finished = AsyncMock(return_value={})
+        runtime_success = Mock()
+        runtime_failure = Mock()
+        with patch.object(
+            agent_server,
+            "resolve_claude_resume_provider",
+            return_value=(None, None),
+        ), patch.object(
+            agent_server,
+            "capture_git_baseline",
+            AsyncMock(return_value={"head": "base"}),
+        ), patch.object(
+            agent_server,
+            "build_claude_cmd",
+            return_value=["claude", "-p"],
+        ), patch.object(
+            agent_server.asyncio,
+            "create_subprocess_exec",
+            AsyncMock(return_value=process),
+        ), patch.object(
+            agent_server,
+            "process_group_for_pid",
+            return_value=4242,
+        ), patch.object(
+            agent_server,
+            "watch_manifest_artifacts",
+            wait_forever,
+        ), patch.object(
+            agent_server,
+            "append_event",
+            append_event,
+        ), patch.object(
+            agent_server,
+            "append_turn_finished_event",
+            append_finished,
+        ), patch.object(
+            agent_server,
+            "append_active_stdout",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "mark_provider_turn_ready",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "persist_run_provider_session",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "terminate_process_tree",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "clear_active_process",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "collect_manifest",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "collect_recent_leftover_manifests",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "publish_turn_code_diff",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "release_turn_slot",
+            AsyncMock(return_value=True),
+        ), patch.object(
+            agent_server,
+            "record_runtime_success",
+            runtime_success,
+        ), patch.object(
+            agent_server,
+            "record_runtime_failure",
+            runtime_failure,
+        ), patch.object(
+            agent_server,
+            "should_schedule_queue_after_finish",
+            return_value=False,
+        ):
+            await agent_server.run_claude_print(
+                "chat-claude",
+                "run-claude",
+                "Prompt",
+                dict(self.session),
+                Path(self.cwd) / ".manifest.json",
+            )
+
+        terminal = append_finished.await_args.args[1]
+        self.assertEqual(terminal["exit_code"], 1)
+        self.assertEqual(terminal["result_text"], "")
+        self.assertTrue(any(
+            call.args[1] == "error"
+            and call.args[2].get("message")
+            == agent_server.CLAUDE_EMPTY_TURN_ERROR
+            for call in append_event.await_args_list
+        ))
+        runtime_success.assert_not_called()
+        runtime_failure.assert_called_once_with(
+            agent_server.BACKEND_CLAUDE,
+            agent_server.CLAUDE_EMPTY_TURN_ERROR,
+        )
+
     async def test_interactive_auto_never_downgrades_to_unattended_print(self) -> None:
         sdk = AsyncMock(side_effect=ClaudeSDKUnavailable("missing SDK"))
         print_runner = AsyncMock()
@@ -347,6 +675,412 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         sdk.assert_awaited_once()
         print_runner.assert_not_awaited()
         terminal_failure.assert_awaited_once()
+
+    async def test_terminal_context_usage_is_normalized_persisted_and_broadcast(self) -> None:
+        manager = FakeClaudeManager()
+        manager.context_usage_response = ({
+            "totalTokens": 45_000,
+            "maxTokens": 188_000,
+            "rawMaxTokens": 200_000,
+            "percentage": 23.94,
+            "model": "claude-opus-4-1",
+            "categories": {"ignored": "not persisted"},
+        }, 9)
+        self.session["claude_session_id"] = "provider-usage"
+        agent_server.ACTIVE = {
+            "chat-claude": {
+                "run_id": "run-claude",
+                "backend": agent_server.BACKEND_CLAUDE,
+                "transport": agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+                "claude_sdk_owner_token": manager.owner_token,
+                "stop_requested": False,
+            }
+        }
+        broadcast = AsyncMock()
+        with patch.object(
+            agent_server.STORE,
+            "save",
+            AsyncMock(),
+        ), patch.object(
+            agent_server.HUB,
+            "broadcast",
+            broadcast,
+        ):
+            stored = await agent_server.sample_claude_context_usage(
+                "chat-claude",
+                "run-claude",
+                "provider-usage",
+                manager,
+            )
+
+        self.assertTrue(stored)
+        snapshot = self.session["claude_context_usage_snapshot"]
+        self.assertEqual(snapshot["context_tokens"], 45_000)
+        self.assertEqual(snapshot["totalTokens"], 45_000)
+        self.assertEqual(snapshot["maxTokens"], 188_000)
+        self.assertEqual(snapshot["rawMaxTokens"], 200_000)
+        self.assertEqual(snapshot["effective_context_window"], 188_000)
+        self.assertEqual(snapshot["raw_context_window"], 200_000)
+        self.assertEqual(snapshot["provider_generation"], 9)
+        self.assertEqual(snapshot["usage_generation"], 1)
+        self.assertNotIn("categories", snapshot)
+        runtime = await agent_server.claude_runtime_snapshot("chat-claude")
+        self.assertEqual(runtime["context_usage_state"], "available")
+        self.assertEqual(runtime["context_usage_snapshot"], snapshot)
+        packet = broadcast.await_args.args[1]
+        self.assertEqual(packet["type"], "provider_runtime_changed")
+        self.assertEqual(packet["session_id"], "chat-claude")
+        self.assertNotIn("seq", packet)
+
+    async def test_context_usage_rejects_stale_provider_and_stop_owner(self) -> None:
+        manager = FakeClaudeManager()
+        manager.context_usage_response = ({
+            "totalTokens": 10,
+            "maxTokens": 100,
+            "rawMaxTokens": 120,
+            "percentage": 10,
+            "model": "claude",
+        }, 3)
+        self.session["claude_session_id"] = "current-provider"
+        agent_server.ACTIVE = {
+            "chat-claude": {
+                "run_id": "run-claude",
+                "backend": agent_server.BACKEND_CLAUDE,
+                "transport": agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+                "claude_sdk_owner_token": manager.owner_token,
+                "stop_requested": False,
+            }
+        }
+        self.assertFalse(await agent_server.sample_claude_context_usage(
+            "chat-claude",
+            "run-claude",
+            "stale-provider",
+            manager,
+        ))
+        agent_server.ACTIVE["chat-claude"]["stop_requested"] = True
+        self.assertFalse(await agent_server.sample_claude_context_usage(
+            "chat-claude",
+            "run-claude",
+            "current-provider",
+            manager,
+        ))
+        self.assertNotIn("context_usage_snapshot", self.session)
+
+    async def test_context_usage_timeout_does_not_wait_for_slow_eviction(self) -> None:
+        manager = FakeClaudeManager()
+        manager.get_context_usage = AsyncMock(side_effect=wait_forever)  # type: ignore[method-assign]
+
+        async def slow_evict(*_args: object, **_kwargs: object) -> bool:
+            await asyncio.sleep(0.05)
+            return True
+
+        manager.evict = AsyncMock(side_effect=slow_evict)  # type: ignore[method-assign]
+        self.session["claude_session_id"] = "provider-usage"
+        stale_snapshot = {
+            "provider_session_id": "provider-usage",
+            "context_tokens": 50_000,
+            "usage_generation": 4,
+        }
+        self.session.update({
+            "_context_usage_generation": 4,
+            "context_usage_state": "available",
+            "context_usage_snapshot": stale_snapshot,
+            "claude_context_usage_snapshot": stale_snapshot,
+        })
+        agent_server.ACTIVE = {
+            "chat-claude": {
+                "run_id": "run-claude",
+                "backend": agent_server.BACKEND_CLAUDE,
+                "transport": agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+                "claude_sdk_owner_token": manager.owner_token,
+                "stop_requested": False,
+            }
+        }
+        broadcast = AsyncMock()
+        with patch.object(
+            agent_server,
+            "CLAUDE_CONTEXT_USAGE_TIMEOUT_SECONDS",
+            0.01,
+        ), patch.object(
+            agent_server.STORE,
+            "save",
+            AsyncMock(),
+        ), patch.object(
+            agent_server.HUB,
+            "broadcast",
+            broadcast,
+        ):
+            self.assertFalse(await asyncio.wait_for(
+                agent_server.sample_claude_context_usage(
+                    "chat-claude",
+                    "run-claude",
+                    "provider-usage",
+                    manager,
+                ),
+                0.1,
+            ))
+        manager.evict.assert_awaited_once_with("chat-claude", force=True)
+        self.assertEqual(self.session["context_usage_state"], "unavailable")
+        self.assertNotIn("context_usage_snapshot", self.session)
+        self.assertNotIn("claude_context_usage_snapshot", self.session)
+        self.assertEqual(self.session["_context_usage_generation"], 5)
+        packet = broadcast.await_args.args[1]
+        self.assertEqual(packet["context_usage_state"], "unavailable")
+        await asyncio.sleep(0.06)
+
+    async def test_stop_before_sampling_invalidates_without_rpc(self) -> None:
+        manager = FakeClaudeManager()
+        manager.get_context_usage = AsyncMock()  # type: ignore[method-assign]
+        self.session["claude_session_id"] = "provider-usage"
+        stale_snapshot = {
+            "provider_session_id": "provider-usage",
+            "context_tokens": 22_000,
+            "usage_generation": 2,
+        }
+        self.session.update({
+            "_context_usage_generation": 2,
+            "context_usage_state": "available",
+            "context_usage_snapshot": stale_snapshot,
+            "claude_context_usage_snapshot": stale_snapshot,
+        })
+        agent_server.ACTIVE = {
+            "chat-claude": {
+                "run_id": "run-claude",
+                "backend": agent_server.BACKEND_CLAUDE,
+                "transport": agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+                "claude_sdk_owner_token": manager.owner_token,
+                "stop_requested": True,
+            }
+        }
+        broadcast = AsyncMock()
+        with patch.object(
+            agent_server.STORE,
+            "save",
+            AsyncMock(),
+        ), patch.object(
+            agent_server.HUB,
+            "broadcast",
+            broadcast,
+        ):
+            self.assertFalse(await agent_server.sample_claude_context_usage(
+                "chat-claude",
+                "run-claude",
+                "provider-usage",
+                manager,
+            ))
+
+        manager.get_context_usage.assert_not_awaited()
+        self.assertEqual(self.session["context_usage_state"], "unavailable")
+        self.assertNotIn("context_usage_snapshot", self.session)
+        self.assertEqual(
+            broadcast.await_args.args[1]["context_usage_state"],
+            "unavailable",
+        )
+
+    async def test_stop_during_successful_rpc_invalidates_rejected_sample(self) -> None:
+        manager = FakeClaudeManager()
+        sampling_started = asyncio.Event()
+        release_sampling = asyncio.Event()
+
+        async def valid_after_stop(
+            *_args: object,
+            **_kwargs: object,
+        ) -> tuple[dict[str, Any], int]:
+            sampling_started.set()
+            await release_sampling.wait()
+            return ({
+                "totalTokens": 25_000,
+                "maxTokens": 188_000,
+                "rawMaxTokens": 200_000,
+                "percentage": 13.3,
+                "model": "claude-opus",
+            }, 5)
+
+        manager.get_context_usage = AsyncMock(  # type: ignore[method-assign]
+            side_effect=valid_after_stop
+        )
+        self.session["claude_session_id"] = "provider-usage"
+        stale_snapshot = {
+            "provider_session_id": "provider-usage",
+            "context_tokens": 21_000,
+            "usage_generation": 6,
+        }
+        self.session.update({
+            "_context_usage_generation": 6,
+            "context_usage_state": "available",
+            "context_usage_snapshot": stale_snapshot,
+            "claude_context_usage_snapshot": stale_snapshot,
+        })
+        agent_server.ACTIVE = {
+            "chat-claude": {
+                "run_id": "run-claude",
+                "backend": agent_server.BACKEND_CLAUDE,
+                "transport": agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+                "claude_sdk_owner_token": manager.owner_token,
+                "stop_requested": False,
+            }
+        }
+        broadcast = AsyncMock()
+        with patch.object(
+            agent_server.STORE,
+            "save",
+            AsyncMock(),
+        ), patch.object(
+            agent_server.HUB,
+            "broadcast",
+            broadcast,
+        ):
+            sampling = asyncio.create_task(
+                agent_server.sample_claude_context_usage(
+                    "chat-claude",
+                    "run-claude",
+                    "provider-usage",
+                    manager,
+                )
+            )
+            await asyncio.wait_for(sampling_started.wait(), 0.2)
+            agent_server.ACTIVE["chat-claude"]["stop_requested"] = True
+            release_sampling.set()
+            self.assertFalse(await asyncio.wait_for(sampling, 0.2))
+
+        self.assertEqual(self.session["context_usage_state"], "unavailable")
+        self.assertNotIn("context_usage_snapshot", self.session)
+        self.assertEqual(
+            broadcast.await_args.args[1]["context_usage_state"],
+            "unavailable",
+        )
+
+    async def test_context_usage_rpc_and_invalid_results_clear_current_snapshot(self) -> None:
+        self.session["claude_session_id"] = "provider-usage"
+        agent_server.ACTIVE = {
+            "chat-claude": {
+                "run_id": "run-claude",
+                "backend": agent_server.BACKEND_CLAUDE,
+                "transport": agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+                "claude_sdk_owner_token": "fake-claude-owner",
+                "stop_requested": False,
+            }
+        }
+        cases = (
+            AsyncMock(side_effect=RuntimeError("usage RPC failed")),
+            AsyncMock(return_value=({"unexpected": True}, 7)),
+        )
+        for index, getter in enumerate(cases, start=1):
+            with self.subTest(case=index):
+                manager = FakeClaudeManager()
+                manager.get_context_usage = getter  # type: ignore[method-assign]
+                stale_snapshot = {
+                    "provider_session_id": "provider-usage",
+                    "context_tokens": 40_000 + index,
+                    "usage_generation": index * 10,
+                }
+                self.session.update({
+                    "_context_usage_generation": index * 10,
+                    "context_usage_state": "available",
+                    "context_usage_snapshot": stale_snapshot,
+                    "claude_context_usage_snapshot": stale_snapshot,
+                })
+                broadcast = AsyncMock()
+                with patch.object(
+                    agent_server.STORE,
+                    "save",
+                    AsyncMock(),
+                ), patch.object(
+                    agent_server.HUB,
+                    "broadcast",
+                    broadcast,
+                ):
+                    self.assertFalse(await agent_server.sample_claude_context_usage(
+                        "chat-claude",
+                        "run-claude",
+                        "provider-usage",
+                        manager,
+                    ))
+                self.assertEqual(
+                    self.session["context_usage_state"],
+                    "unavailable",
+                )
+                self.assertNotIn("context_usage_snapshot", self.session)
+                self.assertEqual(
+                    broadcast.await_args.args[1]["context_usage_state"],
+                    "unavailable",
+                )
+
+    async def test_failed_sample_cannot_clear_newer_generation(self) -> None:
+        manager = FakeClaudeManager()
+        sampling_started = asyncio.Event()
+        release_sampling = asyncio.Event()
+
+        async def invalid_after_race(
+            *_args: object,
+            **_kwargs: object,
+        ) -> tuple[dict[str, Any], int]:
+            sampling_started.set()
+            await release_sampling.wait()
+            return {"invalid": True}, 4
+
+        manager.get_context_usage = AsyncMock(  # type: ignore[method-assign]
+            side_effect=invalid_after_race
+        )
+        self.session["claude_session_id"] = "provider-usage"
+        old_snapshot = {
+            "provider_session_id": "provider-usage",
+            "context_tokens": 20_000,
+            "usage_generation": 8,
+        }
+        self.session.update({
+            "_context_usage_generation": 8,
+            "context_usage_state": "available",
+            "context_usage_snapshot": old_snapshot,
+            "claude_context_usage_snapshot": old_snapshot,
+        })
+        agent_server.ACTIVE = {
+            "chat-claude": {
+                "run_id": "run-claude",
+                "backend": agent_server.BACKEND_CLAUDE,
+                "transport": agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+                "claude_sdk_owner_token": manager.owner_token,
+                "stop_requested": False,
+            }
+        }
+        broadcast = AsyncMock()
+        with patch.object(
+            agent_server.STORE,
+            "save",
+            AsyncMock(),
+        ), patch.object(
+            agent_server.HUB,
+            "broadcast",
+            broadcast,
+        ):
+            sampling = asyncio.create_task(
+                agent_server.sample_claude_context_usage(
+                    "chat-claude",
+                    "run-claude",
+                    "provider-usage",
+                    manager,
+                )
+            )
+            await asyncio.wait_for(sampling_started.wait(), 0.2)
+            newer_snapshot = {
+                "provider_session_id": "provider-usage",
+                "context_tokens": 30_000,
+                "usage_generation": 9,
+            }
+            async with agent_server.STORE._lock:
+                self.session.update({
+                    "_context_usage_generation": 9,
+                    "context_usage_state": "available",
+                    "context_usage_snapshot": newer_snapshot,
+                    "claude_context_usage_snapshot": newer_snapshot,
+                })
+            agent_server.ACTIVE["chat-claude"]["stop_requested"] = True
+            release_sampling.set()
+            self.assertFalse(await asyncio.wait_for(sampling, 0.2))
+
+        self.assertIs(self.session["context_usage_snapshot"], newer_snapshot)
+        self.assertEqual(self.session["context_usage_state"], "available")
+        broadcast.assert_not_awaited()
 
     async def test_noninteractive_client_keeps_print_compatibility(self) -> None:
         sdk = AsyncMock()
@@ -445,6 +1179,195 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(captured_options["resume"], "provider-from-print")
+        self.assertEqual(
+            captured_options["extra_args"],
+            {
+                "replay-user-messages": None,
+                "allow-dangerously-skip-permissions": None,
+            },
+        )
+
+    async def test_permission_mode_options_hooks_and_plan_tools_are_wired(self) -> None:
+        session = {**self.session, "claude_permission_mode": "plan"}
+        captured_options: dict[str, object] = {}
+        permission = AsyncMock(return_value={"behavior": "allow"})
+
+        def make_options(**kwargs: object) -> dict[str, object]:
+            captured_options.update(kwargs)
+            return kwargs
+
+        with patch.object(
+            agent_server,
+            "claude_sdk_cli_path",
+            return_value="/usr/bin/claude",
+        ), patch.object(
+            agent_server,
+            "resolve_claude_resume_provider",
+            return_value=(None, None),
+        ), patch.object(
+            agent_server,
+            "create_claude_agent_options",
+            side_effect=make_options,
+        ), patch.object(
+            agent_server,
+            "handle_claude_tool_permission",
+            permission,
+        ):
+            options, config_key, _ = agent_server.build_claude_sdk_options(
+                "chat-claude",
+                session,
+                self.cwd,
+                Path(self.cwd) / ".manifest.json",
+            )
+            result = await options["can_use_tool"](
+                "ExitPlanMode",
+                {"plan": "Proceed carefully"},
+                {"tool_use_id": "exit-plan"},
+            )
+
+        self.assertEqual(captured_options["permission_mode"], "plan")
+        self.assertNotIn("disallowed_tools", captured_options)
+        self.assertEqual(
+            captured_options["extra_args"],
+            {
+                "replay-user-messages": None,
+                "allow-dangerously-skip-permissions": None,
+            },
+        )
+        hooks = captured_options["hooks"]
+        self.assertEqual(hooks["PreToolUse"][0].matcher, "Bash")
+        self.assertEqual(result, {"behavior": "allow"})
+        permission.assert_awaited_once_with(
+            "chat-claude",
+            "ExitPlanMode",
+            {"plan": "Proceed carefully"},
+            {"tool_use_id": "exit-plan"},
+            owner_token="",
+        )
+        default_key = agent_server.claude_sdk_configuration_key(
+            {**session, "claude_permission_mode": "default"},
+            self.cwd,
+            "/usr/bin/claude",
+            agent_server.session_system_prompt(
+                "chat-claude",
+                session,
+                Path(self.cwd) / ".manifest.json",
+            ),
+        )
+        self.assertNotEqual(config_key, default_key)
+
+    async def test_permission_mode_runtime_contract_and_public_session(self) -> None:
+        self.session["claude_permission_mode"] = "acceptEdits"
+        with patch.object(
+            agent_server,
+            "claude_sdk_dependency_available",
+            return_value=True,
+        ), patch.object(
+            agent_server,
+            "CLAUDE_TRANSPORT",
+            agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+        ):
+            runtime = await agent_server.claude_runtime_snapshot("chat-claude")
+
+        self.assertEqual(runtime["policy"]["permission_mode"], "acceptEdits")
+        self.assertEqual(
+            runtime["permission_modes"],
+            list(agent_server.CLAUDE_PERMISSION_MODE_OPTIONS),
+        )
+        self.assertTrue(runtime["features"]["permission_mode_control"])
+        with patch.object(
+            agent_server,
+            "host_pressure_snapshot",
+            return_value={},
+        ), patch.object(
+            agent_server,
+            "tmux_capability",
+            return_value={"available": False},
+        ), patch.object(
+            agent_server,
+            "runtime_diagnostics_snapshot",
+            return_value={},
+        ), patch.object(
+            agent_server,
+            "claude_sdk_dependency_available",
+            return_value=True,
+        ), patch.object(
+            agent_server,
+            "CLAUDE_TRANSPORT",
+            agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+        ):
+            health = await agent_server.health()
+        capability = health["capabilities"]["claude_controls"]
+        self.assertTrue(capability["features"]["permission_mode_control"])
+        self.assertEqual(
+            capability["permission_modes"],
+            list(agent_server.CLAUDE_PERMISSION_MODE_OPTIONS),
+        )
+        self.assertEqual(
+            agent_server.public_session(self.session)["claude_permission_mode"],
+            "acceptEdits",
+        )
+        legacy = {"id": "legacy", "backend": agent_server.BACKEND_CLAUDE}
+        self.assertEqual(
+            agent_server.effective_claude_permission_mode(legacy),
+            agent_server.CLAUDE_DEFAULT_PERMISSION_MODE,
+        )
+
+    async def test_permission_mode_change_is_fenced_but_noop_is_allowed(self) -> None:
+        self.session["claude_permission_mode"] = "default"
+        update = AsyncMock(return_value=self.session)
+        with patch.object(agent_server.STORE, "update", update):
+            with self.assertRaises(agent_server.HTTPException) as raised:
+                await agent_server.update_session(
+                    "chat-claude",
+                    agent_server.UpdateSessionRequest(
+                        claude_permission_mode="plan",
+                    ),
+                )
+            self.assertEqual(raised.exception.status_code, 409)
+            update.assert_not_awaited()
+
+            result = await agent_server.update_session(
+                "chat-claude",
+                agent_server.UpdateSessionRequest(
+                    claude_permission_mode="default",
+                ),
+            )
+
+        self.assertEqual(result["session"]["claude_permission_mode"], "default")
+        update.assert_awaited_once()
+
+    async def test_permission_mode_store_persists_and_null_resets(self) -> None:
+        self.session["claude_permission_mode"] = "default"
+        with patch.object(agent_server.STORE, "save", AsyncMock()):
+            updated = await agent_server.STORE.update(
+                "chat-claude",
+                {"claude_permission_mode": "dontAsk"},
+            )
+            persisted_mode = updated["claude_permission_mode"]
+            reset = await agent_server.STORE.update(
+                "chat-claude",
+                {"claude_permission_mode": None},
+            )
+
+        self.assertEqual(persisted_mode, "dontAsk")
+        self.assertEqual(reset["claude_permission_mode"], "default")
+
+    async def test_print_fallback_keeps_legacy_permission_behavior(self) -> None:
+        session = {**self.session, "claude_permission_mode": "plan"}
+        command = agent_server.build_claude_cmd(
+            "chat-claude",
+            session,
+            Path(self.cwd) / ".manifest.json",
+        )
+
+        self.assertIn("--dangerously-skip-permissions", command)
+        self.assertNotIn("--permission-mode", command)
+        disallowed_index = command.index("--disallowedTools")
+        self.assertEqual(
+            command[disallowed_index + 1:disallowed_index + 4],
+            ["AskUserQuestion", "EnterPlanMode", "ExitPlanMode"],
+        )
 
     async def test_sdk_stop_timeout_retires_only_chat_and_terminalizes(self) -> None:
         handle = FakeClaudeRun()
@@ -1075,6 +1998,90 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"status":"completed"', serialized)
         self.assertIn('"agentId":"task-1"', serialized)
 
+    async def test_delivery_uncertain_stream_retires_without_empty_success(self) -> None:
+        handle = FailingClaudeRun(ClaudeSDKQueryError("replay ACK missing"))
+        manager = FakeClaudeManager(handle)
+        append_event = AsyncMock(return_value={})
+        append_finished = AsyncMock(return_value={})
+        project = AsyncMock()
+
+        with patch.object(
+            agent_server,
+            "resolve_claude_resume_provider",
+            return_value=(None, None),
+        ), patch.object(
+            agent_server,
+            "capture_git_baseline",
+            AsyncMock(return_value={"head": "base"}),
+        ), patch.object(
+            agent_server,
+            "build_claude_sdk_options",
+            return_value=(object(), "config", "/usr/bin/claude"),
+        ), patch.object(
+            agent_server,
+            "claude_sdk_manager",
+            AsyncMock(return_value=manager),
+        ), patch.object(
+            agent_server,
+            "watch_manifest_artifacts",
+            wait_forever,
+        ), patch.object(
+            agent_server,
+            "append_event",
+            append_event,
+        ), patch.object(
+            agent_server,
+            "project_claude_sdk_message",
+            project,
+        ), patch.object(
+            agent_server,
+            "cancel_claude_interactions",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "collect_manifest",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "collect_recent_leftover_manifests",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "append_turn_finished_event",
+            append_finished,
+        ), patch.object(
+            agent_server,
+            "release_turn_slot",
+            AsyncMock(return_value=True),
+        ), patch.object(
+            agent_server,
+            "record_runtime_failure",
+            Mock(),
+        ), patch.object(
+            agent_server,
+            "should_schedule_queue_after_finish",
+            return_value=False,
+        ):
+            await agent_server.run_claude_sdk(
+                "chat-claude",
+                "run-claude",
+                "Prompt",
+                dict(self.session),
+                Path(self.cwd) / ".manifest.json",
+            )
+
+        self.assertEqual(len(manager.start_calls), 1)
+        self.assertEqual(manager.evict_calls, [("chat-claude", True)])
+        project.assert_not_awaited()
+        terminal = append_finished.await_args.args[1]
+        self.assertEqual(terminal["exit_code"], 1)
+        self.assertEqual(terminal["result_text"], "")
+        self.assertTrue(any(
+            call.args[1] == "error"
+            and "replay ACK missing" in call.args[2]["message"]
+            for call in append_event.await_args_list
+        ))
+
     async def test_projection_failure_retires_provider_before_releasing_slot(self) -> None:
         handle = FakeClaudeRun([{"type": "assistant"}])
         manager = FakeClaudeManager(handle)
@@ -1292,6 +2299,155 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             and call.args[2].get("run_id") == "run-claude"
         ]
         self.assertEqual(prior_stopped, [])
+
+    async def test_empty_natural_completion_during_steer_is_failed(self) -> None:
+        first = FakeClaudeRun()
+        second = FakeClaudeRun()
+        manager = SequencedClaudeManager([first, second])
+        append_event = AsyncMock(return_value={})
+        append_finished = AsyncMock(return_value={})
+        runtime_failure = Mock()
+
+        with patch.object(
+            agent_server,
+            "resolve_claude_resume_provider",
+            return_value=(None, None),
+        ), patch.object(
+            agent_server,
+            "capture_git_baseline",
+            AsyncMock(return_value={"head": "base"}),
+        ), patch.object(
+            agent_server,
+            "build_claude_sdk_options",
+            return_value=(object(), "config", "/usr/bin/claude"),
+        ), patch.object(
+            agent_server,
+            "claude_sdk_manager",
+            AsyncMock(return_value=manager),
+        ), patch.object(
+            agent_server,
+            "watch_manifest_artifacts",
+            wait_forever,
+        ), patch.object(
+            agent_server,
+            "append_event",
+            append_event,
+        ), patch.object(
+            agent_server,
+            "append_turn_finished_event",
+            append_finished,
+        ), patch.object(
+            agent_server,
+            "mark_provider_turn_ready",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "build_user_provider_prompt",
+            return_value="Steered prompt",
+        ), patch.object(
+            agent_server,
+            "persist_run_provider_session",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "sample_claude_context_usage",
+            AsyncMock(return_value=False),
+        ), patch.object(
+            agent_server,
+            "cancel_claude_interactions",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "collect_manifest",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "publish_turn_code_diff",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "collect_recent_leftover_manifests",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "release_turn_slot",
+            AsyncMock(return_value=True),
+        ), patch.object(
+            agent_server,
+            "record_runtime_success",
+            Mock(),
+        ), patch.object(
+            agent_server,
+            "record_runtime_failure",
+            runtime_failure,
+        ), patch.object(
+            agent_server,
+            "should_schedule_queue_after_finish",
+            return_value=False,
+        ):
+            runner = asyncio.create_task(agent_server.run_claude_sdk(
+                "chat-claude",
+                "run-claude",
+                "Prompt",
+                dict(self.session),
+                Path(self.cwd) / ".manifest.json",
+            ))
+            for _ in range(100):
+                active = agent_server.ACTIVE.get("chat-claude") or {}
+                if active.get("native_steer_queue") is not None:
+                    break
+                await asyncio.sleep(0)
+            steer_future = asyncio.get_running_loop().create_future()
+            await agent_server.ACTIVE["chat-claude"][
+                "native_steer_queue"
+            ].put({
+                "selected": {
+                    "queued_id": "queued-next",
+                    "prompt": "Steer",
+                    "file_ids": [],
+                },
+                "remaining": 0,
+                "future": steer_future,
+            })
+            for _ in range(100):
+                if first.interrupt_calls:
+                    break
+                await asyncio.sleep(0)
+            await first.messages.put({
+                "type": "result",
+                "result": "",
+                "session_id": "provider-1",
+                "terminal_reason": "end_turn",
+            })
+            steer_result = await asyncio.wait_for(steer_future, 0.5)
+            await second.messages.put({
+                "type": "result",
+                "result": "Steered result",
+                "session_id": "provider-2",
+                "terminal_reason": "end_turn",
+            })
+            await asyncio.wait_for(runner, 0.5)
+
+        self.assertFalse(steer_result["interrupted"])
+        prior_finished = [
+            call.args[1]
+            for call in append_finished.await_args_list
+            if call.args[1].get("run_id") == "run-claude"
+        ]
+        self.assertEqual(len(prior_finished), 1)
+        self.assertEqual(prior_finished[0]["exit_code"], 1)
+        self.assertEqual(prior_finished[0]["result_text"], "")
+        self.assertTrue(any(
+            call.args[1] == "error"
+            and call.args[2].get("run_id") == "run-claude"
+            and call.args[2].get("message")
+            == agent_server.CLAUDE_EMPTY_TURN_ERROR
+            for call in append_event.await_args_list
+        ))
+        runtime_failure.assert_any_call(
+            agent_server.BACKEND_CLAUDE,
+            agent_server.CLAUDE_EMPTY_TURN_ERROR,
+        )
 
     async def test_system_init_provider_id_survives_stop_before_result(self) -> None:
         handle = FakeClaudeRun([

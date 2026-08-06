@@ -1,6 +1,6 @@
 import asyncio
 import unittest
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterable, AsyncIterator
 from typing import Any
 
 from claude_sdk_client import (
@@ -11,6 +11,9 @@ from claude_sdk_client import (
     ClaudeSDKSupervisorClosed,
     ClaudeSDKSupervisorManager,
     ClaudeSDKUnavailable,
+    claude_background_tracking_hooks,
+    claude_untracked_background_reason,
+    reject_untracked_background_hook,
 )
 
 
@@ -21,15 +24,27 @@ class FakeClaudeClient:
         *,
         connect_error: Exception | None = None,
         query_error: Exception | None = None,
+        auto_ack: bool = True,
+        query_prefix_messages: list[Any] | None = None,
     ) -> None:
         self.options = options
         self.connect_error = connect_error
         self.query_error = query_error
+        self.auto_ack = auto_ack
+        self.query_prefix_messages = list(query_prefix_messages or [])
         self.messages: asyncio.Queue[Any] = asyncio.Queue()
         self.calls: list[tuple[Any, ...]] = []
+        self.query_envelopes: list[list[dict[str, Any]]] = []
         self.connected = False
         self.disconnected = False
         self.owner_loop: asyncio.AbstractEventLoop | None = None
+        self.context_usage: dict[str, Any] = {
+            "totalTokens": 12_345,
+            "maxTokens": 180_000,
+            "rawMaxTokens": 200_000,
+            "percentage": 6.86,
+            "model": "claude-sonnet-4-5",
+        }
 
     def _record(self, *call: Any) -> None:
         loop = asyncio.get_running_loop()
@@ -45,10 +60,20 @@ class FakeClaudeClient:
             raise self.connect_error
         self.connected = True
 
-    async def query(self, prompt: str, **kwargs: Any) -> None:
-        self._record("query", prompt, kwargs)
+    async def query(
+        self,
+        prompt: str | AsyncIterable[dict[str, Any]],
+        **kwargs: Any,
+    ) -> None:
+        prompt_text, correlation_id, envelope = await materialize_query(prompt)
+        self._record("query", prompt_text, kwargs)
+        self.query_envelopes.append(envelope)
         if self.query_error is not None:
             raise self.query_error
+        for message in self.query_prefix_messages:
+            await self.messages.put(message)
+        if self.auto_ack and correlation_id:
+            await self.messages.put(replay_ack(correlation_id))
 
     async def receive_messages(self) -> AsyncIterator[Any]:
         self._record("receive_messages")
@@ -62,6 +87,10 @@ class FakeClaudeClient:
 
     async def interrupt(self) -> None:
         self._record("interrupt")
+
+    async def get_context_usage(self) -> dict[str, Any]:
+        self._record("get_context_usage")
+        return dict(self.context_usage)
 
     async def disconnect(self) -> None:
         self._record("disconnect")
@@ -77,12 +106,16 @@ class FakeFactory:
         self.clients: list[FakeClaudeClient] = []
         self.connect_error: Exception | None = None
         self.query_error: Exception | None = None
+        self.auto_ack = True
+        self.query_prefix_messages: list[Any] = []
 
     def __call__(self, options: Any) -> FakeClaudeClient:
         client = FakeClaudeClient(
             options,
             connect_error=self.connect_error,
             query_error=self.query_error,
+            auto_ack=self.auto_ack,
+            query_prefix_messages=self.query_prefix_messages,
         )
         self.clients.append(client)
         return client
@@ -93,8 +126,14 @@ class BlockingQueryClient(FakeClaudeClient):
         super().__init__(options)
         self.query_started = asyncio.Event()
 
-    async def query(self, prompt: str, **kwargs: Any) -> None:
-        self._record("query", prompt, kwargs)
+    async def query(
+        self,
+        prompt: str | AsyncIterable[dict[str, Any]],
+        **kwargs: Any,
+    ) -> None:
+        prompt_text, _correlation_id, envelope = await materialize_query(prompt)
+        self._record("query", prompt_text, kwargs)
+        self.query_envelopes.append(envelope)
         self.query_started.set()
         await asyncio.Event().wait()
 
@@ -105,6 +144,38 @@ class BlockingQueryFactory:
 
     def __call__(self, options: Any) -> BlockingQueryClient:
         client = BlockingQueryClient(options)
+        self.clients.append(client)
+        return client
+
+
+class CancellationHostileQueryClient(FakeClaudeClient):
+    def __init__(self, options: Any) -> None:
+        super().__init__(options, auto_ack=False)
+        self.query_started = asyncio.Event()
+        self.release_query = asyncio.Event()
+
+    async def query(
+        self,
+        prompt: str | AsyncIterable[dict[str, Any]],
+        **kwargs: Any,
+    ) -> None:
+        prompt_text, _correlation_id, envelope = await materialize_query(prompt)
+        self._record("query", prompt_text, kwargs)
+        self.query_envelopes.append(envelope)
+        self.query_started.set()
+        while not self.release_query.is_set():
+            try:
+                await self.release_query.wait()
+            except asyncio.CancelledError:
+                continue
+
+
+class CancellationHostileQueryFactory:
+    def __init__(self) -> None:
+        self.clients: list[CancellationHostileQueryClient] = []
+
+    def __call__(self, options: Any) -> CancellationHostileQueryClient:
+        client = CancellationHostileQueryClient(options)
         self.clients.append(client)
         return client
 
@@ -176,6 +247,42 @@ async def collect(handle: Any) -> list[Any]:
     return [message async for message in handle]
 
 
+async def materialize_query(
+    prompt: str | AsyncIterable[dict[str, Any]],
+) -> tuple[str, str, list[dict[str, Any]]]:
+    if isinstance(prompt, str):
+        return prompt, "", []
+    envelope = [frame async for frame in prompt]
+    if len(envelope) != 1:
+        raise AssertionError(f"expected one query frame, got {len(envelope)}")
+    frame = envelope[0]
+    message = frame.get("message")
+    prompt_text = str(message.get("content") or "") if isinstance(message, dict) else ""
+    return prompt_text, str(frame.get("uuid") or ""), envelope
+
+
+def replay_ack(correlation_id: str) -> dict[str, Any]:
+    return {
+        "type": "user",
+        "uuid": correlation_id,
+        "isReplay": True,
+        "message": {"role": "user", "content": "ack"},
+    }
+
+
+class UserMessage:
+    """Minimal stand-in for the SDK type whose parser drops ``isReplay``."""
+
+    def __init__(self, correlation_id: str) -> None:
+        self.uuid = correlation_id
+        self.content: list[Any] = []
+
+
+class PlainMessage:
+    def __init__(self, correlation_id: str) -> None:
+        self.uuid = correlation_id
+
+
 class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.factory = FakeFactory()
@@ -212,6 +319,434 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual(await handle.wait_result(), result)
 
+    async def test_delegated_task_keeps_run_open_until_followup_result(self) -> None:
+        handle = await self.manager.start_run(
+            "chat-background",
+            "Delegate the review",
+            run_id="run-background",
+            options={},
+            configuration_key="same",
+        )
+        client = self.factory.clients[0]
+        task_started = {
+            "type": "system",
+            "subtype": "task_started",
+            "task_id": "task-1",
+            "task_type": "local_agent",
+        }
+        intermediate_result = {
+            "type": "result",
+            "is_error": False,
+            "result": "delegated",
+        }
+        task_finished = {
+            "type": "system",
+            "subtype": "task_notification",
+            "task_id": "task-1",
+            "status": "completed",
+        }
+        followup = {"type": "assistant", "text": "Review complete"}
+        final_result = {
+            "type": "result",
+            "is_error": False,
+            "result": "done",
+        }
+
+        await client.emit(task_started)
+        await client.emit(intermediate_result)
+        await asyncio.sleep(0)
+        self.assertFalse(handle.done)
+        for message in (task_finished, followup, final_result):
+            await client.emit(message)
+
+        self.assertEqual(
+            await asyncio.wait_for(collect(handle), 1),
+            [task_started, task_finished, followup, final_result],
+        )
+        self.assertEqual(await handle.wait_result(), final_result)
+
+    async def test_terminal_task_update_allows_followup_result(self) -> None:
+        from claude_agent_sdk.types import TaskUpdatedMessage
+
+        handle = await self.manager.start_run(
+            "chat-task-update",
+            "Delegate the workflow",
+            run_id="run-task-update",
+            options={},
+            configuration_key="same",
+        )
+        client = self.factory.clients[0]
+        task_started = {
+            "type": "system",
+            "subtype": "task_started",
+            "task_id": "workflow-1",
+            "task_type": "local_workflow",
+        }
+        task_updated = TaskUpdatedMessage(
+            subtype="task_updated",
+            data={
+                "subtype": "task_updated",
+                "task_id": "workflow-1",
+                "patch": {"status": "completed"},
+            },
+            task_id="workflow-1",
+            patch={"status": "completed"},
+            status="completed",
+        )
+        final_result = {"type": "result", "is_error": False, "result": "done"}
+        for message in (
+            task_started,
+            {"type": "result", "is_error": False, "result": "waiting"},
+            task_updated,
+            final_result,
+        ):
+            await client.emit(message)
+
+        self.assertEqual(
+            await asyncio.wait_for(collect(handle), 1),
+            [task_started, task_updated, final_result],
+        )
+
+    async def test_error_and_aborted_results_end_delegated_run(self) -> None:
+        terminal_results = (
+            {"type": "result", "is_error": True, "result": "failed"},
+            {
+                "type": "result",
+                "is_error": False,
+                "terminal_reason": "aborted_streaming",
+                "result": "stopped",
+            },
+        )
+        for index, terminal_result in enumerate(terminal_results):
+            with self.subTest(terminal_result=terminal_result):
+                chat_id = f"chat-terminal-{index}"
+                handle = await self.manager.start_run(
+                    chat_id,
+                    "Delegate then stop",
+                    run_id=f"run-terminal-{index}",
+                    options={},
+                    configuration_key="same",
+                )
+                client = self.factory.clients[index]
+                task_started = {
+                    "type": "system",
+                    "subtype": "task_started",
+                    "task_id": f"task-{index}",
+                    "task_type": "local_agent",
+                }
+                await client.emit(task_started)
+                await client.emit(terminal_result)
+                self.assertEqual(
+                    await asyncio.wait_for(collect(handle), 1),
+                    [task_started, terminal_result],
+                )
+                self.assertEqual(await handle.wait_result(), terminal_result)
+
+    async def test_forced_terminal_retires_late_frames_before_fresh_run(self) -> None:
+        first_handle = await self.manager.start_run(
+            "chat-reconnect",
+            "Delegate then stop",
+            run_id="run-before-stop",
+            options={},
+            configuration_key="same",
+        )
+        old_client = self.factory.clients[0]
+        task_started = {
+            "type": "system",
+            "subtype": "task_started",
+            "task_id": "task-before-stop",
+            "task_type": "local_agent",
+        }
+        aborted_result = {
+            "type": "result",
+            "is_error": False,
+            "terminal_reason": "aborted_tools",
+            "result": "stopped",
+        }
+        await old_client.emit(task_started)
+        await old_client.emit(aborted_result)
+        self.assertEqual(
+            await asyncio.wait_for(collect(first_handle), 1),
+            [task_started, aborted_result],
+        )
+
+        second_handle = await self.manager.start_run(
+            "chat-reconnect",
+            "Fresh prompt",
+            run_id="run-after-stop",
+            options={},
+            configuration_key="same",
+        )
+        self.assertTrue(old_client.disconnected)
+        self.assertEqual(len(self.factory.clients), 2)
+        new_client = self.factory.clients[1]
+
+        # The retired provider can no longer route an orphan continuation into
+        # the fresh, exactly-acknowledged query.
+        await old_client.emit({
+            "type": "system",
+            "subtype": "task_notification",
+            "task_id": "task-before-stop",
+            "status": "stopped",
+        })
+        await old_client.emit({"type": "result", "result": "orphan"})
+        fresh_assistant = {"type": "assistant", "text": "fresh"}
+        fresh_result = {"type": "result", "result": "fresh done"}
+        await new_client.emit(fresh_assistant)
+        await new_client.emit(fresh_result)
+        self.assertEqual(
+            await asyncio.wait_for(collect(second_handle), 1),
+            [fresh_assistant, fresh_result],
+        )
+
+
+    async def test_unknown_task_type_does_not_extend_run(self) -> None:
+        handle = await self.manager.start_run(
+            "chat-shell",
+            "Start a background shell",
+            run_id="run-shell",
+            options={},
+            configuration_key="same",
+        )
+        client = self.factory.clients[0]
+        task_started = {
+            "type": "system",
+            "subtype": "task_started",
+            "task_id": "shell-1",
+            "task_type": "background_shell",
+        }
+        result = {"type": "result", "is_error": False, "result": "done"}
+        await client.emit(task_started)
+        await client.emit(result)
+        self.assertEqual(
+            await asyncio.wait_for(collect(handle), 1),
+            [task_started, result],
+        )
+
+    async def test_stale_frames_are_dropped_until_exact_replay_ack(self) -> None:
+        notification = {
+            "type": "system",
+            "subtype": "task_notification",
+            "task_id": "stale-task",
+            "status": "stopped",
+        }
+        stale_result = {"type": "result", "result": "stale"}
+        stale_task_started = {
+            "type": "system",
+            "subtype": "task_started",
+            "task_id": "stale-agent",
+            "task_type": "local_agent",
+        }
+        self.factory.query_prefix_messages = [
+            stale_task_started,
+            notification,
+            stale_result,
+        ]
+        handle = await self.manager.start_run(
+            "chat-1",
+            "Fresh prompt",
+            run_id="run-1",
+            options={},
+            configuration_key="same",
+        )
+        client = self.factory.clients[0]
+        fresh_assistant = {"type": "assistant", "text": "fresh"}
+        fresh_result = {"type": "result", "result": "finished"}
+        await client.emit(fresh_assistant)
+        await client.emit(fresh_result)
+
+        self.assertEqual(
+            await asyncio.wait_for(collect(handle), 1),
+            [fresh_assistant, fresh_result],
+        )
+        self.assertEqual(await handle.wait_result(), fresh_result)
+        self.assertEqual(
+            [call for call in client.calls if call[0] == "query"],
+            [("query", "Fresh prompt", {})],
+        )
+        self.assertEqual(len(client.query_envelopes), 1)
+        self.assertEqual(
+            client.query_envelopes[0][0]["uuid"],
+            handle.correlation_id,
+        )
+
+    async def test_wrong_uuid_and_non_replay_user_never_open_gate(self) -> None:
+        self.factory.auto_ack = False
+        handle = await self.manager.start_run(
+            "chat-1",
+            "Prompt",
+            run_id="run-1",
+            options={},
+            configuration_key="same",
+        )
+        client = self.factory.clients[0]
+        await client.emit(replay_ack("wrong-uuid"))
+        await client.emit({
+            "type": "user",
+            "uuid": handle.correlation_id,
+            "isReplay": False,
+        })
+        await client.emit({"type": "result", "result": "stale"})
+        await asyncio.sleep(0)
+        self.assertFalse(handle.acknowledged)
+        self.assertFalse(handle.done)
+
+        await client.emit(replay_ack(handle.correlation_id))
+        result = {"type": "result", "result": "fresh"}
+        await client.emit(result)
+        self.assertEqual(await asyncio.wait_for(collect(handle), 1), [result])
+        self.assertEqual(await handle.wait_result(), result)
+
+    async def test_duplicate_matching_ack_is_suppressed(self) -> None:
+        handle = await self.manager.start_run(
+            "chat-1",
+            "Prompt",
+            run_id="run-1",
+            options={},
+            configuration_key="same",
+        )
+        client = self.factory.clients[0]
+        await client.emit(replay_ack(handle.correlation_id))
+        result = {"type": "result", "result": "done"}
+        await client.emit(result)
+        self.assertEqual(await asyncio.wait_for(collect(handle), 1), [result])
+
+    async def test_typed_user_message_ack_opens_gate_but_plain_object_does_not(self) -> None:
+        self.factory.auto_ack = False
+        handle = await self.manager.start_run(
+            "chat-1",
+            "Prompt",
+            run_id="run-1",
+            options={},
+            configuration_key="same",
+        )
+        client = self.factory.clients[0]
+        await client.emit(PlainMessage(handle.correlation_id))
+        await client.emit({"type": "result", "result": "stale"})
+        await asyncio.sleep(0)
+        self.assertFalse(handle.acknowledged)
+        self.assertFalse(handle.done)
+
+        await client.emit(UserMessage(handle.correlation_id))
+        result = {
+            "type": "result",
+            "result": "done",
+            "session_id": "provider-post-ack",
+        }
+        await client.emit(result)
+        self.assertEqual(await asyncio.wait_for(collect(handle), 1), [result])
+        self.assertEqual((await handle.wait_result())["session_id"], "provider-post-ack")
+
+    async def test_real_sdk_parser_preserves_uuid_for_typed_replay_ack(self) -> None:
+        from claude_agent_sdk._internal.message_parser import parse_message
+
+        self.factory.auto_ack = False
+        handle = await self.manager.start_run(
+            "chat-1",
+            "Prompt",
+            run_id="run-1",
+            options={},
+            configuration_key="same",
+        )
+        client = self.factory.clients[0]
+        typed_ack = parse_message({
+            "type": "user",
+            "uuid": handle.correlation_id,
+            "isReplay": True,
+            "message": {"role": "user", "content": "Prompt"},
+        })
+        self.assertIsNotNone(typed_ack)
+        self.assertFalse(hasattr(typed_ack, "isReplay"))
+        await client.emit(typed_ack)
+        result = {"type": "result", "result": "done"}
+        await client.emit(result)
+        self.assertEqual(await asyncio.wait_for(collect(handle), 1), [result])
+
+    async def test_stop_before_ack_fails_and_disconnects_without_accepting_abort(self) -> None:
+        self.factory.auto_ack = False
+        handle = await self.manager.start_run(
+            "chat-1",
+            "Prompt",
+            run_id="run-1",
+            options={},
+            configuration_key="same",
+        )
+        client = self.factory.clients[0]
+        self.assertTrue(await self.manager.interrupt("chat-1", run_id="run-1"))
+        await client.emit({
+            "type": "result",
+            "result": "stale abort",
+            "terminal_reason": "aborted_streaming",
+        })
+
+        with self.assertRaises(ClaudeSDKQueryError) as raised:
+            await handle.wait_result()
+        self.assertTrue(raised.exception.delivery_uncertain)
+        self.assertTrue(client.disconnected)
+        self.assertEqual(
+            [call for call in client.calls if call[0] == "interrupt"],
+            [("interrupt",)],
+        )
+
+    async def test_ack_timeout_fails_disconnects_and_never_replays_query(self) -> None:
+        factory = FakeFactory()
+        factory.auto_ack = False
+        manager = ClaudeSDKSupervisorManager(
+            client_factory=factory,
+            idle_ttl_seconds=None,
+            ack_timeout_seconds=0.01,
+        )
+        handle = await manager.start_run(
+            "chat-timeout",
+            "Prompt",
+            run_id="run-timeout",
+            options={},
+            configuration_key="same",
+        )
+        client = factory.clients[0]
+
+        with self.assertRaises(ClaudeSDKQueryError) as raised:
+            await asyncio.wait_for(handle.wait_result(), 1)
+        self.assertTrue(raised.exception.delivery_uncertain)
+        self.assertTrue(client.disconnected)
+        self.assertEqual(
+            [call for call in client.calls if call[0] == "query"],
+            [("query", "Prompt", {})],
+        )
+        await manager.close_all()
+
+    async def test_query_delivery_timeout_bounds_cancellation_hostile_write(self) -> None:
+        factory = CancellationHostileQueryFactory()
+        manager = ClaudeSDKSupervisorManager(
+            client_factory=factory,
+            idle_ttl_seconds=None,
+            disconnect_timeout_seconds=0.01,
+            query_delivery_timeout_seconds=0.01,
+        )
+        start_task = asyncio.create_task(manager.start_run(
+            "chat-query-timeout",
+            "Prompt",
+            run_id="run-query-timeout",
+            options={},
+            configuration_key="same",
+        ))
+        while not factory.clients:
+            await asyncio.sleep(0)
+        client = factory.clients[0]
+        await asyncio.wait_for(client.query_started.wait(), 1)
+
+        with self.assertRaises(ClaudeSDKQueryError) as raised:
+            await asyncio.wait_for(start_task, 0.5)
+        self.assertTrue(raised.exception.delivery_uncertain)
+        self.assertTrue(client.disconnected)
+        self.assertEqual(
+            [call for call in client.calls if call[0] == "query"],
+            [("query", "Prompt", {})],
+        )
+        client.release_query.set()
+        await asyncio.sleep(0)
+        await manager.close_all()
+
     async def test_one_permanent_receiver_serves_multiple_runs(self) -> None:
         first = await self.manager.start_run(
             "chat-1",
@@ -236,6 +771,11 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
         await second.wait_result()
 
         self.assertEqual(len(self.factory.clients), 1)
+        self.assertNotEqual(first.correlation_id, second.correlation_id)
+        self.assertEqual(
+            [frames[0]["uuid"] for frames in client.query_envelopes],
+            [first.correlation_id, second.correlation_id],
+        )
         self.assertEqual(
             [call for call in client.calls if call[0] == "receive_messages"],
             [("receive_messages",)],
@@ -244,6 +784,81 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
             ("query", "Second", {"session_id": "logical-session"}),
             client.calls,
         )
+
+    async def test_late_run_one_result_cannot_finish_unacknowledged_steer(self) -> None:
+        first = await self.manager.start_run(
+            "chat-1",
+            "First",
+            run_id="run-1",
+            options={},
+            configuration_key="same",
+        )
+        client = self.factory.clients[0]
+        for _ in range(100):
+            if first.acknowledged:
+                break
+            await asyncio.sleep(0)
+        self.assertTrue(first.acknowledged)
+        self.assertTrue(await first.interrupt())
+        first_result = {
+            "type": "result",
+            "result": "stopped",
+            "terminal_reason": "aborted_streaming",
+        }
+        await client.emit(first_result)
+        self.assertEqual(await first.wait_result(), first_result)
+
+        client.auto_ack = False
+        second = await self.manager.start_run(
+            "chat-1",
+            "Steered",
+            run_id="run-2",
+            options={},
+            configuration_key="same",
+        )
+        await client.emit({"type": "result", "result": "late run one"})
+        await asyncio.sleep(0)
+        self.assertFalse(second.acknowledged)
+        self.assertFalse(second.done)
+
+        await client.emit(replay_ack(second.correlation_id))
+        second_result = {"type": "result", "result": "fresh run two"}
+        await client.emit(second_result)
+        self.assertEqual(await asyncio.wait_for(collect(second), 1), [second_result])
+        self.assertEqual(await second.wait_result(), second_result)
+
+    async def test_context_usage_is_actor_serialized_and_owner_fenced(self) -> None:
+        supervisor = await self.manager.get(
+            "chat-1",
+            options={},
+            configuration_key="same",
+        )
+        handle = await self.manager.start_run(
+            "chat-1",
+            "Inspect",
+            run_id="run-1",
+            options={},
+            configuration_key="same",
+        )
+        client = self.factory.clients[0]
+        await client.emit({"type": "result", "result": "done"})
+        await handle.wait_result()
+
+        sampled = await self.manager.get_context_usage(
+            "chat-1",
+            ownership_token=supervisor.ownership_token,
+        )
+
+        self.assertIsNotNone(sampled)
+        assert sampled is not None
+        usage, generation = sampled
+        self.assertEqual(usage, client.context_usage)
+        self.assertEqual(generation, 1)
+        self.assertIn(("get_context_usage",), client.calls)
+        self.assertIsNone(await self.manager.get_context_usage(
+            "chat-1",
+            ownership_token="stale-owner",
+        ))
 
     async def test_second_run_is_rejected_while_first_is_active(self) -> None:
         await self.manager.start_run(
@@ -356,6 +971,23 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.factory.clients), 2)
         await self.factory.clients[1].emit({"type": "result", "result": "ok"})
         await replacement.wait_result()
+
+    async def test_receiver_stop_before_ack_is_delivery_uncertain(self) -> None:
+        self.factory.auto_ack = False
+        handle = await self.manager.start_run(
+            "chat-1",
+            "Prompt",
+            run_id="run-1",
+            options={},
+            configuration_key="a",
+        )
+        client = self.factory.clients[0]
+        await client.emit(StopAsyncIteration)
+
+        with self.assertRaises(ClaudeSDKQueryError) as raised:
+            await handle.wait_result()
+        self.assertTrue(raised.exception.delivery_uncertain)
+        self.assertTrue(client.disconnected)
 
     async def test_configuration_change_replaces_idle_client_but_not_active_one(self) -> None:
         first = await self.manager.start_run(
@@ -602,6 +1234,89 @@ class ClaudeSDKLoopOwnershipTests(unittest.TestCase):
                 )
 
         asyncio.run(cross_loop())
+
+
+class ClaudeSDKBackgroundTrackingHookTests(unittest.IsolatedAsyncioTestCase):
+    def test_rejects_common_untracked_shell_detachment(self) -> None:
+        for command in (
+            "nohup python sweep.py > sweep.log 2>&1 &",
+            "python sweep.py > sweep.log 2>&1 &",
+            "disown %1",
+            "env MODE=prod nohup ./worker",
+            "setsid --fork ./worker",
+            "setsid -f ./worker",
+            "setsid ./foreground-worker",
+            "bash -c 'python sweep.py > sweep.log 2>&1 &'",
+            "sh -lc 'nohup python sweep.py &'",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNotNone(
+                    claude_untracked_background_reason("Bash", {"command": command})
+                )
+
+    def test_rejects_native_bash_background_mode(self) -> None:
+        self.assertIsNotNone(
+            claude_untracked_background_reason(
+                "Bash",
+                {"command": "python sweep.py", "run_in_background": True},
+            )
+        )
+
+    def test_allows_foreground_shell_syntax_without_detachment(self) -> None:
+        for command in (
+            "python sweep.py",
+            "python sweep.py && python summarize.py",
+            "echo 'literal & text'",
+            r"echo literal \& text",
+            "echo 'setsid -f is documentation'",
+            "echo ok # later &",
+            "python3 - <<'PY'\nx = 1 & 2\nPY",
+            "cat <<'CPP'\nvoid f(int &value) {}\nCPP",
+            "cat <<'HTML'\na &copy; b\nHTML",
+            "python sweep.py > sweep.log 2>&1",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNone(
+                    claude_untracked_background_reason("Bash", {"command": command})
+                )
+        self.assertIsNone(
+            claude_untracked_background_reason(
+                "Read", {"command": "nohup worker &"}
+            )
+        )
+
+    async def test_hook_denies_with_actionable_tracked_background_instruction(self) -> None:
+        result = await reject_untracked_background_hook(
+            {
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": "./worker",
+                    "run_in_background": True,
+                },
+            },
+            "tool-1",
+            {"signal": None},
+        )
+        output = result["hookSpecificOutput"]
+        self.assertEqual(output["hookEventName"], "PreToolUse")
+        self.assertEqual(output["permissionDecision"], "deny")
+        self.assertIn("run_in_background", output["permissionDecisionReason"])
+
+    async def test_hook_allows_normal_bash_and_policy_is_bash_scoped(self) -> None:
+        self.assertEqual(
+            await reject_untracked_background_hook(
+                {"tool_name": "Bash", "tool_input": {"command": "pwd"}},
+                "tool-1",
+                {"signal": None},
+            ),
+            {},
+        )
+        hooks = claude_background_tracking_hooks()
+        self.assertEqual(set(hooks), {"PreToolUse"})
+        matcher = hooks["PreToolUse"][0]
+        self.assertEqual(matcher.matcher, "Bash")
+        self.assertEqual(matcher.timeout, 5.0)
+        self.assertEqual(matcher.hooks, [reject_untracked_background_hook])
 
 
 if __name__ == "__main__":

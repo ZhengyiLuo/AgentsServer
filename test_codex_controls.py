@@ -893,12 +893,15 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
         active = {
             "chat": {
                 "run_id": "run-1",
+                "backend": agent_server.BACKEND_CODEX,
+                "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
                 "provider_thread_id": "thread",
                 "provider_turn_id": "turn-1",
             }
         }
         save = AsyncMock()
         append_event = AsyncMock()
+        broadcast = AsyncMock()
         with (
             patch.object(agent_server, "ACTIVE", active),
             patch.object(
@@ -908,6 +911,7 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(agent_server.STORE, "save", save),
             patch.object(agent_server, "append_event", append_event),
+            patch.object(agent_server.HUB, "broadcast", broadcast),
             patch.object(
                 agent_server.time,
                 "time",
@@ -929,8 +933,18 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertEqual(first_payload["run_id"], "run-1")
             self.assertEqual(first_payload["turn_id"], "turn-1")
+            self.assertEqual(first_payload["raw_context_tokens"], 25_000)
             self.assertEqual(first_payload["context_tokens"], 25_000)
-            self.assertEqual(first_payload["context_percent"], 25.0)
+            self.assertEqual(first_payload["context_percent"], 14.77)
+            self.assertEqual(first_payload["context_window"], 100_000)
+            self.assertEqual(first_payload["baseline_tokens"], 12_000)
+            self.assertEqual(
+                first_payload["effective_context_window"],
+                88_000,
+            )
+            self.assertEqual(first_payload["raw_context_window"], 100_000)
+            self.assertEqual(first_payload["provider_session_id"], "thread")
+            self.assertEqual(first_payload["usage_generation"], 1)
             self.assertEqual(first_payload["cache_write_input_tokens"], 100)
             self.assertTrue(first_payload["snapshot_at"])
             self.assertEqual(
@@ -939,6 +953,11 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(save.await_count, 1)
             self.assertEqual(append_event.await_count, 0)
+            first_signal = broadcast.await_args_list[0].args[1]
+            self.assertEqual(first_signal["type"], "provider_runtime_changed")
+            self.assertEqual(first_signal["session_id"], "chat")
+            self.assertEqual(first_signal["context_usage_state"], "available")
+            self.assertNotIn("seq", first_signal)
 
             updated_usage = json.loads(json.dumps(usage))
             updated_usage["last"]["totalTokens"] = 25_500
@@ -987,6 +1006,7 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
         final_payload = agent_server.STORE.sessions["chat"][
             "codex_token_usage_snapshot"
         ]
+        self.assertEqual(final_payload["raw_context_tokens"], 26_000)
         self.assertEqual(final_payload["context_tokens"], 26_000)
         self.assertEqual(final_payload["run_id"], "run-1")
         self.assertEqual(
@@ -1008,6 +1028,8 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
         active = {
             "chat": {
                 "run_id": "run-new",
+                "backend": agent_server.BACKEND_CODEX,
+                "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
                 "provider_thread_id": "thread",
                 "provider_turn_id": "turn-new",
             }
@@ -1090,6 +1112,76 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(save.await_count, 0)
 
+    async def test_exec_invalidates_native_usage_and_rejects_late_samples(self) -> None:
+        session = agent_server.STORE.sessions["chat"]
+        session.update(
+            {
+                "context_usage_state": "available",
+                "context_usage_snapshot": {"context_tokens": 55_000},
+                "codex_token_usage": {"last": {"totalTokens": 55_000}},
+                "codex_token_usage_snapshot": {
+                    "thread_id": "thread",
+                    "turn_id": "turn-native",
+                    "run_id": "run-native",
+                    "context_tokens": 55_000,
+                },
+                "_codex_token_usage_checkpoint": {"run_id": "run-native"},
+                "_codex_token_usage_terminal": {
+                    "thread_id": "thread",
+                    "turn_id": "turn-native",
+                    "run_id": "run-native",
+                },
+            }
+        )
+        save = AsyncMock()
+        broadcast = AsyncMock()
+        active = {
+            "chat": {
+                "run_id": "run-exec",
+                "backend": agent_server.BACKEND_CODEX,
+                "transport": agent_server.CODEX_TRANSPORT_EXEC,
+            }
+        }
+        with (
+            patch.object(agent_server.STORE, "save", save),
+            patch.object(agent_server.HUB, "broadcast", broadcast),
+            patch.object(agent_server, "ACTIVE", active),
+            patch.object(
+                agent_server,
+                "codex_session_id_for_thread",
+                return_value="chat",
+            ),
+        ):
+            await agent_server.mark_codex_exec_context_usage_unavailable("chat")
+            for key in (
+                "context_usage_snapshot",
+                "codex_token_usage",
+                "codex_token_usage_snapshot",
+                "_codex_token_usage_checkpoint",
+                "_codex_token_usage_terminal",
+            ):
+                self.assertNotIn(key, session)
+            self.assertEqual(session["context_usage_state"], "unavailable")
+
+            save.reset_mock()
+            await agent_server.project_codex_notification(
+                {
+                    "method": "thread/tokenUsage/updated",
+                    "params": {
+                        "threadId": "thread",
+                        "turnId": "turn-native",
+                        "tokenUsage": {
+                            "last": {"totalTokens": 60_000},
+                            "total": {"totalTokens": 60_000},
+                            "modelContextWindow": 100_000,
+                        },
+                    },
+                }
+            )
+
+        self.assertNotIn("codex_token_usage_snapshot", session)
+        save.assert_not_awaited()
+
     async def test_automatic_compaction_preserves_before_and_after_usage(self) -> None:
         before_usage = {
             "last": {
@@ -1115,6 +1207,8 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
         active = {
             "chat": {
                 "run_id": "run-compact",
+                "backend": agent_server.BACKEND_CODEX,
+                "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
                 "provider_thread_id": "thread",
                 "provider_turn_id": "turn-1",
             }
@@ -1204,6 +1298,10 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
             90_000,
         )
         self.assertEqual(
+            compaction["token_usage_before"]["raw_context_tokens"],
+            90_000,
+        )
+        self.assertEqual(
             compaction["token_usage_after"]["context_tokens"],
             10_000,
         )
@@ -1214,6 +1312,8 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
         active = {
             "chat": {
                 "run_id": "run-compact",
+                "backend": agent_server.BACKEND_CODEX,
+                "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
                 "provider_thread_id": "thread",
                 "provider_turn_id": "turn-1",
             }
@@ -1275,6 +1375,8 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
         active = {
             "chat": {
                 "run_id": "run-compact",
+                "backend": agent_server.BACKEND_CODEX,
+                "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
                 "provider_thread_id": "thread",
                 "provider_turn_id": "turn-1",
             }

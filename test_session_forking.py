@@ -643,6 +643,7 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
                 "model",
                 "effort",
                 "system_prompt",
+                "claude_permission_mode",
                 "codex_approval_policy",
                 "codex_sandbox_mode",
                 "codex_permission_profile",

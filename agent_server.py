@@ -74,6 +74,7 @@ from claude_sdk_client import (
     ClaudeSDKQueryError,
     ClaudeSDKSupervisorManager,
     ClaudeSDKUnavailable,
+    claude_background_tracking_hooks,
     create_claude_agent_options,
 )
 from update_runner import atomic_json as atomic_update_json
@@ -268,6 +269,16 @@ CLAUDE_TRANSPORT_AUTO = "auto"
 CLAUDE_TRANSPORT_AGENT_SDK = "agent-sdk"
 CLAUDE_TRANSPORT_PRINT = "print"
 CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY = "claude_sdk_interactive_v1"
+CLAUDE_PERMISSION_MODE_OPTIONS = (
+    "default",
+    "acceptEdits",
+    "plan",
+    "auto",
+    "dontAsk",
+    "bypassPermissions",
+)
+CLAUDE_PERMISSION_MODES = set(CLAUDE_PERMISSION_MODE_OPTIONS)
+CLAUDE_DEFAULT_PERMISSION_MODE = "default"
 CODEX_APPROVAL_POLICIES = {"never", "on-request", "untrusted"}
 CODEX_SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
 CODEX_APPROVAL_REVIEWERS = {"user", "auto_review", "guardian_subagent"}
@@ -401,6 +412,11 @@ MAX_CODEX_APPROVAL_ITEM_CACHE = 256
 CODEX_PERMISSION_PROFILES_CACHE_SECONDS = 60.0
 CODEX_SESSION_CLEANUP_TIMEOUT_SECONDS = 15.0
 STOP_CONFIRM_TIMEOUT_SECONDS = 5.0
+CLAUDE_CONTEXT_USAGE_TIMEOUT_SECONDS = max(
+    0.1,
+    float(agentsdock_setting("CLAUDE_CONTEXT_USAGE_TIMEOUT_SECONDS", "2")),
+)
+CODEX_CONTEXT_WINDOW_RESERVE_TOKENS = 12_000
 CODEX_GOAL_CONTROL_TIMEOUT_SECONDS = max(
     0.1,
     float(agentsdock_setting("CODEX_GOAL_CONTROL_TIMEOUT_SECONDS", "5")),
@@ -490,18 +506,19 @@ SUBAGENT_SNAPSHOT_TEXT_LIMIT = 600
 
 CLAUDE_PROMPT_PRELUDE = """\
 You are operating through AgentsDock, backed by AgentsServer.
-- Keep the final answer concise; the UI renders tool calls, command output, reasoning, and artifacts separately.
+- Keep final answers concise; the UI separates tools, output, reasoning, and artifacts.
 - Render inline math as `$...$` and display math as `$$...$$`.
 - Continue through ordinary inspection errors when a safe retry or narrow fix is available.
-- Before finishing, join child tasks you started; create durable automation only when explicitly asked.
-- This is AgentsDock, not Slack; create files locally and never call Slack file helpers.
+- Before finishing, join child tasks you started; automate only when explicitly asked.
+- Never detach required work with `nohup`, `disown`, `setsid`, shell `&`, or Bash `run_in_background`. Keep work needed for the current reply in foreground. Async completion that must wake chat requires a tracked Agent/workflow; background Bash does not guarantee a completion wake-up.
+- This is AgentsDock, not Slack; never use Slack file helpers.
 - Link editor-readable files with Markdown paths relative to the chat working directory, optionally with `#L42`; do not use `file://`.
-- Publish user-facing files with `"$AGENTSDOCK_PUBLISH_CLI" --chat-id "$AGENTSDOCK_CHAT_ID" /absolute/path.ext`; metadata: `--entry-json '{{"path":"/absolute/video.mp4","title":"Demo","text":"Optional note"}}'`. Say “attached” only after a successful JSON receipt. Older-server fallback: resolve `$AGENTSDOCK_MANIFEST_PATH`, write `{{"files":["/absolute/path.ext"]}}` there (not to a literal `$...` path), and say only “submitted for attachment.” Use absolute paths and playable `.mp4`/`.mov` videos.
-- Manage scheduled jobs only when explicitly asked; use `"$AGENTSDOCK_JOBS_CLI"` (start with list/help), not the API or prompt snapshots.
-- Inspect the persistent terminal named by `$AGENTSDOCK_TMUX_SESSION` read-only unless the user explicitly asks you to operate it.
-- Check installed skills and project playbooks before claiming a specialized environment or remote path is unavailable.
-- If an incidental cleanup or optional clause makes a compound command fail, immediately retry the still-safe requested operation without that clause.
-- Keep the main chat focused; delegate bounded noisy exploration and return summaries instead of dumping large logs or tool output into the thread.
+- Publish user-facing files with `"$AGENTSDOCK_PUBLISH_CLI" --chat-id "$AGENTSDOCK_CHAT_ID" /absolute/path.ext`; metadata uses `--entry-json '{{"path":"/absolute/video.mp4","title":"Demo","text":"Optional note"}}'`. Say “attached” only after a successful JSON receipt. Older-server fallback: write `{{"files":["/absolute/path.ext"]}}` to resolved `$AGENTSDOCK_MANIFEST_PATH` and say only “submitted for attachment.” Use absolute paths and playable `.mp4`/`.mov` videos.
+- Manage jobs only when explicitly asked; use `"$AGENTSDOCK_JOBS_CLI"` list/help, not API or prompt snapshots.
+- Inspect `$AGENTSDOCK_TMUX_SESSION` read-only unless explicitly asked to operate it.
+- Check skills and project playbooks before claiming an environment or remote path is unavailable.
+- If optional cleanup makes a compound command fail, immediately retry the still-safe requested operation without it.
+- Keep chat focused; delegate bounded noisy exploration and return summaries.
 - Preserve user work; avoid destructive actions without authorization; continue until complete or blocked.
 """
 
@@ -2983,6 +3000,14 @@ class CreateSessionRequest(BaseModel):
     session_id: str | None = None
     claude_session_id: str | None = None
     codex_thread_id: str | None = None
+    claude_permission_mode: Literal[
+        "default",
+        "acceptEdits",
+        "plan",
+        "bypassPermissions",
+        "dontAsk",
+        "auto",
+    ] | None = None
     codex_approval_policy: Literal["never", "on-request", "untrusted"] | None = None
     codex_sandbox_mode: Literal["read-only", "workspace-write", "danger-full-access"] | None = None
     codex_permission_profile: str | None = Field(default=None, max_length=240)
@@ -3000,6 +3025,14 @@ class UpdateSessionRequest(BaseModel):
     system_prompt: str | None = Field(default=None, max_length=MAX_SESSION_SYSTEM_PROMPT_CHARS)
     pinned: bool | None = None
     archived: bool | None = None
+    claude_permission_mode: Literal[
+        "default",
+        "acceptEdits",
+        "plan",
+        "bypassPermissions",
+        "dontAsk",
+        "auto",
+    ] | None = None
     codex_approval_policy: Literal["never", "on-request", "untrusted"] | None = None
     codex_sandbox_mode: Literal["read-only", "workspace-write", "danger-full-access"] | None = None
     codex_permission_profile: str | None = Field(default=None, max_length=240)
@@ -3012,6 +3045,7 @@ SESSION_LIFECYCLE_UPDATE_FIELDS = frozenset({
     "model",
     "effort",
     "system_prompt",
+    "claude_permission_mode",
     "codex_approval_policy",
     "codex_sandbox_mode",
     "codex_permission_profile",
@@ -3313,6 +3347,20 @@ def preview_session_runtime_update(
     return preview
 
 
+def effective_claude_permission_mode(sess: dict[str, Any]) -> str:
+    """Return one canonical SDK permission mode for persisted/legacy chats."""
+
+    value = str(
+        sess.get("claude_permission_mode")
+        or CLAUDE_DEFAULT_PERMISSION_MODE
+    ).strip()
+    return (
+        value
+        if value in CLAUDE_PERMISSION_MODES
+        else CLAUDE_DEFAULT_PERMISSION_MODE
+    )
+
+
 def clean_session_system_prompt(value: Any) -> str | None:
     clean = str(value or "").strip()
     if not clean:
@@ -3587,6 +3635,10 @@ class SessionStore:
             )
         for sess in self.sessions.values():
             backend = str(sess.get("backend") or DEFAULT_BACKEND).strip().lower()
+            claude_permission_mode = effective_claude_permission_mode(sess)
+            if sess.get("claude_permission_mode") != claude_permission_mode:
+                sess["claude_permission_mode"] = claude_permission_mode
+                runtime_changed = True
             for key, default in (
                 ("codex_approval_policy", CODEX_DEFAULT_APPROVAL_POLICY),
                 ("codex_sandbox_mode", CODEX_DEFAULT_SANDBOX_MODE),
@@ -3742,6 +3794,9 @@ class SessionStore:
             "session_id": active_provider_id,
             "claude_session_id": claude_session_id,
             "codex_thread_id": codex_thread_id,
+            "claude_permission_mode": (
+                req.claude_permission_mode or CLAUDE_DEFAULT_PERMISSION_MODE
+            ),
             "codex_approval_policy": (
                 req.codex_approval_policy or CODEX_DEFAULT_APPROVAL_POLICY
             ),
@@ -3859,6 +3914,11 @@ class SessionStore:
                 if key in patch and patch[key] is not None:
                     sess[key] = patch[key]
             for key, default, allowed in (
+                (
+                    "claude_permission_mode",
+                    CLAUDE_DEFAULT_PERMISSION_MODE,
+                    CLAUDE_PERMISSION_MODES,
+                ),
                 (
                     "codex_approval_policy",
                     CODEX_DEFAULT_APPROVAL_POLICY,
@@ -4067,6 +4127,7 @@ class SessionStore:
     ) -> None:
         if backend == BACKEND_CODEX:
             ensure_codex_thread_not_pending_fork_cleanup(provider_id)
+        usage_signal: dict[str, Any] | None = None
         async with self._lock:
             sess = self.sessions.get(sid)
             if not sess:
@@ -4074,6 +4135,20 @@ class SessionStore:
             previous_codex_thread_id = (
                 str(sess.get("codex_thread_id") or sess.get("session_id") or "")
                 if backend == BACKEND_CODEX
+                else ""
+            )
+            previous_claude_session_id = (
+                str(
+                    sess.get("fork_from")
+                    or sess.get("claude_session_id")
+                    or (
+                        sess.get("session_id")
+                        if sess.get("backend") == BACKEND_CLAUDE
+                        else ""
+                    )
+                    or ""
+                )
+                if backend == BACKEND_CLAUDE
                 else ""
             )
             sess["session_id"] = provider_id
@@ -4092,10 +4167,29 @@ class SessionStore:
                     "_codex_token_usage_terminal",
                 ):
                     sess.pop(key, None)
+                usage_signal = clear_provider_context_usage_locked(
+                    sess,
+                    BACKEND_CODEX,
+                    provider_session_id=provider_id,
+                    state="cleared",
+                )
+            if (
+                backend == BACKEND_CLAUDE
+                and previous_claude_session_id != provider_id
+            ):
+                sess.pop("claude_context_usage_snapshot", None)
+                usage_signal = clear_provider_context_usage_locked(
+                    sess,
+                    BACKEND_CLAUDE,
+                    provider_session_id=provider_id,
+                    state="cleared",
+                )
             if backend == BACKEND_CLAUDE and sess.get("fork_from") and provider_id != sess.get("fork_from"):
                 sess["fork_from"] = None
             sess["updated_at"] = now_iso()
             await self.save()
+        if usage_signal is not None:
+            await broadcast_provider_runtime_changed(sid, usage_signal)
         if backend == BACKEND_CODEX:
             if (
                 previous_codex_thread_id
@@ -15019,6 +15113,7 @@ async def rollover_codex_provider_session(
     snapshot = dict(current)
     memory = build_fork_memory(snapshot, session_id, reason=reason, exclude_run_id=run_id)
     quarantined_goal_thread = False
+    usage_signal: dict[str, Any] | None = None
     async with STORE._lock:
         current = STORE.sessions.get(session_id)
         if not current or session_provider_id(current) != provider_id:
@@ -15041,6 +15136,12 @@ async def rollover_codex_provider_session(
         current.pop("codex_token_usage_snapshot", None)
         current.pop("_codex_token_usage_checkpoint", None)
         current.pop("_codex_token_usage_terminal", None)
+        usage_signal = clear_provider_context_usage_locked(
+            current,
+            BACKEND_CODEX,
+            provider_session_id=None,
+            state="cleared",
+        )
         current["memory_seed"] = memory
         current["memory_seed_used"] = memory_seed_used
         current["memory_forked"] = True
@@ -15053,6 +15154,8 @@ async def rollover_codex_provider_session(
     CODEX_GOAL_SYNC_GENERATIONS.pop(session_id, None)
     if quarantined_goal_thread:
         CODEX_QUARANTINED_GOAL_THREADS[provider_id] = session_id
+    if usage_signal is not None:
+        await broadcast_provider_runtime_changed(session_id, usage_signal)
     await append_event(session_id, "provider_rollover", {
         "run_id": run_id,
         "backend": BACKEND_CODEX,
@@ -15066,6 +15169,7 @@ async def rollover_codex_provider_session(
 def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, Any]:
     detail_fields = () if summary else (
         "system_prompt", "session_id", "claude_session_id", "codex_thread_id",
+        "claude_permission_mode",
         "codex_approval_policy", "codex_sandbox_mode",
         "codex_permission_profile", "codex_approvals_reviewer",
         "codex_goal", "codex_goal_time_budget_seconds",
@@ -15382,6 +15486,484 @@ def bounded_codex_interaction_value(
 CODEX_TOKEN_USAGE_PERSIST_INTERVAL_SECONDS = 30.0
 
 
+def current_provider_context_usage_generation(session: dict[str, Any]) -> int:
+    value = session.get("_context_usage_generation")
+    return (
+        max(0, int(value))
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        )
+        else 0
+    )
+
+
+def next_provider_context_usage_generation(session: dict[str, Any]) -> int:
+    generation = current_provider_context_usage_generation(session) + 1
+    session["_context_usage_generation"] = generation
+    return generation
+
+
+def provider_context_usage_signal(
+    backend: str,
+    *,
+    state: str,
+    generation: int,
+    provider_session_id: str | None,
+    snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a bounded, non-timeline runtime invalidation packet."""
+
+    bounded_snapshot = (
+        bounded_codex_interaction_value(snapshot, remaining=4_000)
+        if isinstance(snapshot, dict)
+        else None
+    )
+    return {
+        "type": "provider_runtime_changed",
+        "runtime": "context_usage",
+        "ephemeral": True,
+        "backend": backend,
+        "context_usage_state": state,
+        "usage_generation": generation,
+        "provider_session_id": provider_session_id,
+        "context_usage_snapshot": bounded_snapshot,
+        "context_usage": bounded_snapshot,
+    }
+
+
+async def broadcast_provider_runtime_changed(
+    session_id: str,
+    signal: dict[str, Any],
+) -> None:
+    """Broadcast control state without allocating a durable event sequence."""
+
+    try:
+        await HUB.broadcast(session_id, {**signal, "session_id": session_id})
+    except Exception as exc:
+        logger.debug(
+            "provider runtime broadcast failed session=%s: %s",
+            session_id,
+            concise_error_message(exc),
+        )
+
+
+def clear_provider_context_usage_locked(
+    session: dict[str, Any],
+    backend: str,
+    *,
+    provider_session_id: str | None,
+    state: str,
+) -> dict[str, Any]:
+    generation = next_provider_context_usage_generation(session)
+    session["context_usage_state"] = state
+    session.pop("context_usage_snapshot", None)
+    if backend == BACKEND_CLAUDE:
+        session.pop("claude_context_usage_snapshot", None)
+    elif backend == BACKEND_CODEX:
+        # codex exec cannot produce authoritative app-server telemetry. Clear
+        # every legacy alias and attribution marker so an exec/fallback turn
+        # can never keep displaying, or later relabel, the previous native
+        # turn's context occupancy.
+        session.pop("codex_token_usage", None)
+        session.pop("codex_token_usage_snapshot", None)
+        session.pop("_codex_token_usage_checkpoint", None)
+        session.pop("_codex_token_usage_terminal", None)
+    return provider_context_usage_signal(
+        backend,
+        state=state,
+        generation=generation,
+        provider_session_id=provider_session_id,
+    )
+
+
+def context_usage_runtime_fields(
+    session: dict[str, Any],
+    *,
+    backend: str,
+) -> dict[str, Any]:
+    snapshot = session.get("context_usage_snapshot")
+    if not isinstance(snapshot, dict):
+        snapshot = (
+            session.get("claude_context_usage_snapshot")
+            if backend == BACKEND_CLAUDE
+            else session.get("codex_token_usage_snapshot")
+        )
+    if not isinstance(snapshot, dict):
+        snapshot = None
+    state = str(session.get("context_usage_state") or "")
+    if state not in {"available", "cleared", "unavailable"}:
+        state = "available" if snapshot is not None else "unavailable"
+    usage_generation = current_provider_context_usage_generation(session)
+    return {
+        "context_usage_state": state,
+        "context_usage_snapshot": dict(snapshot) if snapshot is not None else None,
+        "context_usage": dict(snapshot) if snapshot is not None else None,
+        "usage_generation": usage_generation,
+        "provider_session_id": str(session_provider_id(session) or "") or None,
+    }
+
+
+async def mark_provider_context_usage_unavailable(
+    session_id: str,
+    backend: str,
+) -> None:
+    signal: dict[str, Any] | None = None
+    async with STORE._lock:
+        session = STORE.sessions.get(session_id)
+        if (
+            session is None
+            or str(session.get("backend") or DEFAULT_BACKEND) != backend
+            or session_id in DELETING_SESSIONS
+            or session_id in DELETED_SESSION_TOMBSTONES
+        ):
+            return
+        legacy_snapshot = (
+            session.get("claude_context_usage_snapshot")
+            if backend == BACKEND_CLAUDE
+            else session.get("codex_token_usage_snapshot")
+            if backend == BACKEND_CODEX
+            else None
+        )
+        legacy_usage_present = isinstance(legacy_snapshot, dict) or (
+            backend == BACKEND_CODEX
+            and any(
+                key in session
+                for key in (
+                    "codex_token_usage",
+                    "_codex_token_usage_checkpoint",
+                    "_codex_token_usage_terminal",
+                )
+            )
+        )
+        if (
+            not isinstance(session.get("context_usage_snapshot"), dict)
+            and not legacy_usage_present
+            and str(session.get("context_usage_state") or "")
+            in {"", "unavailable"}
+        ):
+            return
+        provider_id = str(session_provider_id(session) or "") or None
+        signal = clear_provider_context_usage_locked(
+            session,
+            backend,
+            provider_session_id=provider_id,
+            state="unavailable",
+        )
+        await STORE.save()
+    if signal is not None:
+        await broadcast_provider_runtime_changed(session_id, signal)
+
+
+async def mark_codex_exec_context_usage_unavailable(session_id: str) -> None:
+    """Invalidate native context telemetry before any codex exec turn."""
+
+    await mark_provider_context_usage_unavailable(session_id, BACKEND_CODEX)
+
+
+def claude_context_usage_snapshot(
+    usage: Any,
+    *,
+    provider_session_id: str,
+    run_id: str,
+    provider_generation: int,
+    snapshot_at: str | None = None,
+) -> dict[str, Any] | None:
+    if not isinstance(usage, dict):
+        return None
+
+    def token_count(value: Any) -> int | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if not math.isfinite(float(value)):
+            return None
+        return max(0, int(value))
+
+    context_tokens = token_count(usage.get("totalTokens"))
+    effective_window = token_count(usage.get("maxTokens"))
+    raw_window = token_count(usage.get("rawMaxTokens"))
+    if context_tokens is None or not effective_window:
+        return None
+    percentage = usage.get("percentage")
+    if (
+        isinstance(percentage, bool)
+        or not isinstance(percentage, (int, float))
+        or not math.isfinite(float(percentage))
+    ):
+        context_percent = round(context_tokens * 100 / effective_window, 2)
+    else:
+        context_percent = round(max(0.0, min(100.0, float(percentage))), 2)
+    snapshot: dict[str, Any] = {
+        "totalTokens": context_tokens,
+        "maxTokens": effective_window,
+        "rawMaxTokens": raw_window or effective_window,
+        "percentage": context_percent,
+        "context_tokens": context_tokens,
+        "context_window": effective_window,
+        "effective_context_window": effective_window,
+        "raw_context_window": raw_window or effective_window,
+        "context_percent": context_percent,
+        "model": str(usage.get("model") or "")[:240] or None,
+        "snapshot_at": snapshot_at or now_iso(),
+        "provider_session_id": provider_session_id,
+        "run_id": run_id,
+        "provider_generation": max(0, int(provider_generation)),
+        "context_usage_state": "available",
+    }
+    return {key: value for key, value in snapshot.items() if value is not None}
+
+
+async def record_claude_context_usage(
+    session_id: str,
+    snapshot: dict[str, Any],
+    *,
+    ownership_token: str,
+) -> bool:
+    signal: dict[str, Any] | None = None
+    run_id = str(snapshot.get("run_id") or "")
+    provider_id = str(snapshot.get("provider_session_id") or "")
+    async with session_lifecycle_lock(session_id):
+        if (
+            session_id in DELETING_SESSIONS
+            or session_id in DELETED_SESSION_TOMBSTONES
+        ):
+            return False
+        async with ACTIVE_LOCK:
+            active = ACTIVE.get(session_id)
+            if (
+                not active
+                or str(active.get("run_id") or "") != run_id
+                or active.get("backend") != BACKEND_CLAUDE
+                or active.get("transport") != CLAUDE_TRANSPORT_AGENT_SDK
+                or bool(active.get("stop_requested"))
+                or str(active.get("claude_sdk_owner_token") or "")
+                != ownership_token
+            ):
+                return False
+        async with STORE._lock:
+            session = STORE.sessions.get(session_id)
+            if (
+                session is None
+                or str(session.get("backend") or DEFAULT_BACKEND)
+                != BACKEND_CLAUDE
+                or str(claude_provider_id_for_session(session) or "")
+                != provider_id
+            ):
+                return False
+            stored = dict(snapshot)
+            generation = next_provider_context_usage_generation(session)
+            stored["usage_generation"] = generation
+            session["context_usage_state"] = "available"
+            session["context_usage_snapshot"] = stored
+            session["claude_context_usage_snapshot"] = stored
+            await STORE.save()
+            signal = provider_context_usage_signal(
+                BACKEND_CLAUDE,
+                state="available",
+                generation=generation,
+                provider_session_id=provider_id,
+                snapshot=stored,
+            )
+    if signal is not None:
+        await broadcast_provider_runtime_changed(session_id, signal)
+    return signal is not None
+
+
+async def invalidate_failed_claude_context_usage_sample(
+    session_id: str,
+    run_id: str,
+    provider_session_id: str,
+    *,
+    ownership_token: str,
+    expected_usage_generation: int,
+) -> bool:
+    """Clear only the still-current snapshot rejected by one terminal sample."""
+
+    signal: dict[str, Any] | None = None
+    async with session_lifecycle_lock(session_id):
+        if (
+            session_id in DELETING_SESSIONS
+            or session_id in DELETED_SESSION_TOMBSTONES
+        ):
+            return False
+        async with ACTIVE_LOCK:
+            active = ACTIVE.get(session_id)
+            if (
+                not active
+                or str(active.get("run_id") or "") != run_id
+                or active.get("backend") != BACKEND_CLAUDE
+                or active.get("transport") != CLAUDE_TRANSPORT_AGENT_SDK
+                or str(active.get("claude_sdk_owner_token") or "")
+                != ownership_token
+            ):
+                return False
+        async with STORE._lock:
+            session = STORE.sessions.get(session_id)
+            if (
+                session is None
+                or str(session.get("backend") or DEFAULT_BACKEND)
+                != BACKEND_CLAUDE
+                or str(claude_provider_id_for_session(session) or "")
+                != provider_session_id
+                or current_provider_context_usage_generation(session)
+                != expected_usage_generation
+            ):
+                return False
+            signal = clear_provider_context_usage_locked(
+                session,
+                BACKEND_CLAUDE,
+                provider_session_id=provider_session_id,
+                state="unavailable",
+            )
+            await STORE.save()
+    if signal is not None:
+        await broadcast_provider_runtime_changed(session_id, signal)
+    return signal is not None
+
+
+async def sample_claude_context_usage(
+    session_id: str,
+    run_id: str,
+    provider_session_id: str,
+    manager: Any,
+) -> bool:
+    if not provider_session_id:
+        return False
+    async with ACTIVE_LOCK:
+        active = ACTIVE.get(session_id)
+        if (
+            not active
+            or str(active.get("run_id") or "") != run_id
+            or active.get("backend") != BACKEND_CLAUDE
+            or active.get("transport") != CLAUDE_TRANSPORT_AGENT_SDK
+        ):
+            return False
+        ownership_token = str(active.get("claude_sdk_owner_token") or "")
+        stop_requested = bool(active.get("stop_requested"))
+    if not ownership_token:
+        return False
+    async with STORE._lock:
+        session = STORE.sessions.get(session_id)
+        if (
+            session is None
+            or str(session.get("backend") or DEFAULT_BACKEND)
+            != BACKEND_CLAUDE
+            or str(claude_provider_id_for_session(session) or "")
+            != provider_session_id
+        ):
+            return False
+        expected_usage_generation = current_provider_context_usage_generation(
+            session
+        )
+
+    async def invalidate_failure() -> bool:
+        return await invalidate_failed_claude_context_usage_sample(
+            session_id,
+            run_id,
+            provider_session_id,
+            ownership_token=ownership_token,
+            expected_usage_generation=expected_usage_generation,
+        )
+
+    if stop_requested:
+        await invalidate_failure()
+        return False
+
+    getter = getattr(manager, "get_context_usage", None)
+    if not callable(getter):
+        await invalidate_failure()
+        return False
+    try:
+        task = asyncio.create_task(
+            getter(session_id, ownership_token=ownership_token)
+        )
+    except Exception:
+        await invalidate_failure()
+        return False
+    done, _pending = await asyncio.wait(
+        {task},
+        timeout=CLAUDE_CONTEXT_USAGE_TIMEOUT_SECONDS,
+    )
+    if task not in done:
+        task.cancel()
+        task.add_done_callback(
+            lambda completed: (
+                None
+                if completed.cancelled()
+                else completed.exception()
+            )
+        )
+        evict = getattr(manager, "evict", None)
+        if callable(evict):
+            eviction_task = asyncio.create_task(
+                evict(session_id, force=True)
+            )
+            evicted, _still_evicting = await asyncio.wait(
+                {eviction_task},
+                timeout=min(0.5, CLAUDE_CONTEXT_USAGE_TIMEOUT_SECONDS),
+            )
+            if eviction_task in evicted:
+                await asyncio.gather(eviction_task, return_exceptions=True)
+            else:
+                # Manager eviction removes this registry owner before awaiting
+                # bounded SDK teardown. Let that cleanup finish independently;
+                # telemetry must never delay turn finalization indefinitely.
+                eviction_task.add_done_callback(
+                    lambda completed: (
+                        None
+                        if completed.cancelled()
+                        else completed.exception()
+                    )
+                )
+        await invalidate_failure()
+        return False
+    try:
+        sampled = task.result()
+    except Exception as exc:
+        logger.debug(
+            "Claude context usage sampling failed session=%s: %s",
+            session_id,
+            concise_error_message(exc),
+        )
+        await invalidate_failure()
+        return False
+    if not sampled:
+        await invalidate_failure()
+        return False
+    if isinstance(sampled, tuple) and len(sampled) == 2:
+        usage, provider_generation = sampled
+    elif isinstance(sampled, dict):
+        # Compatibility for test/older manager adapters.
+        usage, provider_generation = sampled, 0
+    else:
+        await invalidate_failure()
+        return False
+    try:
+        snapshot = claude_context_usage_snapshot(
+            usage,
+            provider_session_id=provider_session_id,
+            run_id=run_id,
+            provider_generation=int(provider_generation),
+        )
+    except (TypeError, ValueError, OverflowError):
+        snapshot = None
+    if snapshot is None:
+        await invalidate_failure()
+        return False
+    recorded = await record_claude_context_usage(
+        session_id,
+        snapshot,
+        ownership_token=ownership_token,
+    )
+    if not recorded:
+        # Stop may win after the RPC returns but before its success can be
+        # stored. Clear only the pre-sample generation if this exact run still
+        # owns the chat; all newer-run/provider/generation races fail closed.
+        await invalidate_failure()
+    return recorded
+
+
 def codex_token_usage_snapshot(
     token_usage: Any,
     *,
@@ -15410,11 +15992,27 @@ def codex_token_usage_snapshot(
             return None
         return max(0, int(value))
 
-    context_tokens = token_count(last.get("totalTokens"))
-    context_window = token_count(bounded.get("modelContextWindow"))
+    raw_context_tokens = token_count(last.get("totalTokens"))
+    raw_context_window = token_count(bounded.get("modelContextWindow"))
+    effective_context_tokens = (
+        max(0, raw_context_tokens - CODEX_CONTEXT_WINDOW_RESERVE_TOKENS)
+        if raw_context_tokens is not None
+        else None
+    )
+    effective_context_window = (
+        max(1, raw_context_window - CODEX_CONTEXT_WINDOW_RESERVE_TOKENS)
+        if raw_context_window
+        else None
+    )
     context_percent = (
-        round(context_tokens * 100 / context_window, 2)
-        if context_tokens is not None and context_window
+        round(
+            min(
+                100.0,
+                effective_context_tokens * 100 / effective_context_window,
+            ),
+            2,
+        )
+        if effective_context_tokens is not None and effective_context_window
         else None
     )
     snapshot: dict[str, Any] = {
@@ -15434,9 +16032,17 @@ def codex_token_usage_snapshot(
         ),
         "total_tokens": token_count(last.get("totalTokens")),
         "cumulative_total_tokens": token_count(total.get("totalTokens")),
-        "context_tokens": context_tokens,
-        "context_window": context_window,
+        "raw_context_tokens": raw_context_tokens,
+        # Preserve the legacy/raw contract. New clients use the explicit
+        # reserve/effective fields below and must not subtract twice.
+        "context_tokens": raw_context_tokens,
+        "context_window": raw_context_window,
+        "baseline_tokens": CODEX_CONTEXT_WINDOW_RESERVE_TOKENS,
+        "effective_context_window": effective_context_window,
+        "raw_context_window": raw_context_window,
         "context_percent": context_percent,
+        "provider_session_id": thread_id,
+        "context_usage_state": "available",
     }
     return {key: value for key, value in snapshot.items() if value is not None}
 
@@ -15479,6 +16085,7 @@ async def record_codex_token_usage(
     """
     now_epoch = time.time()
     should_checkpoint = force_checkpoint
+    signal: dict[str, Any] | None = None
     async with STORE._lock:
         session = STORE.sessions.get(session_id)
         if not session:
@@ -15487,8 +16094,32 @@ async def record_codex_token_usage(
         current_thread_id = str(session_provider_id(session) or "").strip()
         if not snapshot_thread_id or snapshot_thread_id != current_thread_id:
             return False
+        stored_snapshot = dict(snapshot)
+        usage_generation = next_provider_context_usage_generation(session)
+        stored_snapshot["usage_generation"] = usage_generation
+        manager = globals().get("CODEX_APP_SERVER_MANAGER")
+        provider_generation = getattr(manager, "generation", None)
+        if (
+            isinstance(provider_generation, (int, float))
+            and not isinstance(provider_generation, bool)
+        ):
+            stored_snapshot["provider_generation"] = max(
+                0, int(provider_generation)
+            )
+        model = str(session.get("model") or "")[:240]
+        if model:
+            stored_snapshot["model"] = model
         session["codex_token_usage"] = dict(snapshot.get("token_usage") or {})
-        session["codex_token_usage_snapshot"] = dict(snapshot)
+        session["codex_token_usage_snapshot"] = stored_snapshot
+        session["context_usage_state"] = "available"
+        session["context_usage_snapshot"] = stored_snapshot
+        signal = provider_context_usage_signal(
+            BACKEND_CODEX,
+            state="available",
+            generation=usage_generation,
+            provider_session_id=snapshot_thread_id,
+            snapshot=stored_snapshot,
+        )
         previous = session.get("_codex_token_usage_checkpoint")
         previous_marker = previous if isinstance(previous, dict) else {}
         terminal = session.get("_codex_token_usage_terminal")
@@ -15527,6 +16158,8 @@ async def record_codex_token_usage(
             # The latest bounded checkpoint remains available after restart;
             # routine telemetry never changes chat ordering.
             await STORE.save()
+    if signal is not None:
+        await broadcast_provider_runtime_changed(session_id, signal)
     return should_checkpoint
 
 
@@ -15538,6 +16171,11 @@ async def codex_notification_run_id(
     async with ACTIVE_LOCK:
         active = ACTIVE.get(session_id)
         if not active:
+            return None
+        if (
+            active.get("backend") != BACKEND_CODEX
+            or active.get("transport") != CODEX_TRANSPORT_APP_SERVER
+        ):
             return None
         active_thread_id = str(active.get("provider_thread_id") or "")
         if active_thread_id and active_thread_id != thread_id:
@@ -16847,6 +17485,11 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
                     thread_id,
                     turn_id,
                 )
+        if run_id is None:
+            # Global app-server notifications can arrive after the chat has
+            # switched to codex exec. Never let an unattributed late sample
+            # repopulate telemetry that the compatibility transport invalidated.
+            return
         snapshot = codex_token_usage_snapshot(
             params.get("tokenUsage"),
             thread_id=thread_id,
@@ -16883,7 +17526,7 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
             thread_id,
             turn_id,
         )
-        if turn_id is not None:
+        if turn_id is not None and run_id is not None:
             async with STORE._lock:
                 session = STORE.sessions.get(session_id)
                 if session is not None:
@@ -19471,14 +20114,17 @@ def claude_sdk_configuration_key(
     """Hash only process configuration, not the evolving provider session ID."""
 
     payload = {
-        "version": 1,
+        "version": 4,
         "cwd": cwd,
         "cli_path": cli_path,
         "model": str(sess.get("model") or ""),
         "effort": str(sess.get("effort") or ""),
         "system_prompt": system_prompt,
-        "permission_mode": "default",
+        "permission_mode": effective_claude_permission_mode(sess),
         "setting_sources": ["user", "project", "local"],
+        "background_tracking_hooks": 1,
+        "allow_dangerously_skip_permissions": True,
+        "replay_user_messages": True,
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -19517,7 +20163,10 @@ def build_claude_sdk_options(
 
     setattr(can_use_tool, "_agentsdock_bind_owner", bind_permission_owner)
 
-    extra_args: dict[str, str | None] = {}
+    extra_args: dict[str, str | None] = {
+        "replay-user-messages": None,
+        "allow-dangerously-skip-permissions": None,
+    }
     if provider_id and sess.get("fork_from"):
         extra_args["name"] = f"Fork: {sess.get('title') or sess['id']}"
     options = create_claude_agent_options(
@@ -19526,9 +20175,9 @@ def build_claude_sdk_options(
             "preset": "claude_code",
             "append": system_prompt,
         },
-        permission_mode="default",
+        permission_mode=effective_claude_permission_mode(sess),
         can_use_tool=can_use_tool,
-        disallowed_tools=["EnterPlanMode", "ExitPlanMode"],
+        hooks=claude_background_tracking_hooks(),
         model=str(sess.get("model") or "").strip() or None,
         effort=str(sess.get("effort") or "").strip() or None,
         cwd=cwd,
@@ -21472,6 +22121,7 @@ async def run_claude_print(
     text_parts: list[str] = []
     provider_id: str | None = None
     current_tools: dict[str, dict[str, Any]] = {}
+    had_tool_activity = False
     changed_paths: set[str] = set()
     last_event = time.time()
     idle_killed = False
@@ -21526,6 +22176,7 @@ async def run_claude_print(
                     elif btype == "thinking" and block.get("thinking"):
                         await append_event(session_id, "reasoning_summary", {"run_id": run_id, "text": block["thinking"]})
                     elif btype in ("tool_use", "server_tool_use"):
+                        had_tool_activity = True
                         tid = block.get("id") or f"tool_{uuid.uuid4().hex[:8]}"
                         tool = {"id": tid, "name": block.get("name", "tool"), "input": block.get("input", {})}
                         current_tools[tid] = tool
@@ -21534,6 +22185,7 @@ async def run_claude_print(
             elif etype == "user":
                 for block in event.get("message", {}).get("content", []):
                     if block.get("type") == "tool_result":
+                        had_tool_activity = True
                         tid = block.get("tool_use_id")
                         content = event_output_text(block.get("content", ""))
                         await append_event(session_id, "tool_finished", {
@@ -21568,14 +22220,50 @@ async def run_claude_print(
     if proc.stderr:
         stderr = (await proc.stderr.read()).decode("utf-8", "replace").strip()
     stopped = run_id in STOPPED_RUNS
+    result_text = clean_assistant_text(
+        final_text or "\n\n".join(text_parts).strip()
+    )
+    empty_result_error = claude_empty_turn_failure_message(
+        prompt=prompt,
+        result_text=result_text,
+        had_tool_activity=had_tool_activity,
+        stopped=stopped,
+        terminal_result_received=True,
+        existing_error=bool(
+            result_error
+            or stream_error
+            or idle_killed
+            or proc.returncode not in (0, None)
+        ),
+    )
     if stream_error and not stopped:
         await append_event(session_id, "error", {"run_id": run_id, "message": f"Claude stream failed: {stream_error}", **run_event_metadata(run_id)})
     if idle_killed:
         await append_event(session_id, "error", {"run_id": run_id, "message": "killed after idle timeout", **run_event_metadata(run_id)})
     if not stopped and proc.returncode not in (0, None) and stderr:
         await append_event(session_id, "error", {"run_id": run_id, "message": stderr[:4000], "exit_code": proc.returncode, **run_event_metadata(run_id)})
-    if not stopped and (result_error or stream_error or proc.returncode not in (0, None)):
-        record_runtime_failure(BACKEND_CLAUDE, result_error or stream_error or stderr or f"exit {proc.returncode}")
+    if empty_result_error:
+        await append_event(session_id, "error", {
+            "run_id": run_id,
+            "backend": BACKEND_CLAUDE,
+            "transport": CLAUDE_TRANSPORT_PRINT,
+            "message": empty_result_error,
+            **run_event_metadata(run_id),
+        })
+    if not stopped and (
+        result_error
+        or stream_error
+        or proc.returncode not in (0, None)
+        or empty_result_error
+    ):
+        record_runtime_failure(
+            BACKEND_CLAUDE,
+            result_error
+            or stream_error
+            or stderr
+            or empty_result_error
+            or f"exit {proc.returncode}",
+        )
     elif not stopped:
         record_runtime_success(BACKEND_CLAUDE)
     if provider_id and not result_error:
@@ -21587,7 +22275,6 @@ async def run_claude_print(
             cwd=cwd,
             standalone_provider_context=standalone_provider_context,
         )
-    result_text = clean_assistant_text(final_text or "\n\n".join(text_parts).strip())
     await collect_manifest(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts, final=True)
     await collect_recent_leftover_manifests(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts)
     await publish_turn_code_diff(session_id, run_id, BACKEND_CLAUDE, cwd, diff_baseline, changed_paths)
@@ -21595,7 +22282,11 @@ async def run_claude_print(
         "run_id": run_id,
         "backend": BACKEND_CLAUDE,
         "transport": CLAUDE_TRANSPORT_PRINT,
-        "exit_code": proc.returncode,
+        "exit_code": (
+            1
+            if empty_result_error and proc.returncode in (0, None)
+            else proc.returncode
+        ),
         "result_text": result_text,
         "stopped": stopped,
         **run_event_metadata(run_id),
@@ -21808,6 +22499,35 @@ def claude_sdk_result_details(message: Any) -> dict[str, Any]:
     }
 
 
+CLAUDE_EMPTY_TURN_ERROR = (
+    "Claude returned no response for a non-empty prompt and did not run any "
+    "tools. The turn was marked failed; retry the message."
+)
+
+
+def claude_empty_turn_failure_message(
+    *,
+    prompt: str,
+    result_text: str,
+    had_tool_activity: bool,
+    stopped: bool,
+    terminal_result_received: bool,
+    existing_error: bool,
+) -> str:
+    """Return a visible failure for an otherwise silent Claude turn."""
+
+    if (
+        terminal_result_received
+        and str(prompt or "").strip()
+        and not clean_assistant_text(result_text)
+        and not had_tool_activity
+        and not stopped
+        and not existing_error
+    ):
+        return CLAUDE_EMPTY_TURN_ERROR
+    return ""
+
+
 async def project_claude_sdk_message(
     session_id: str,
     run_id: str,
@@ -21816,6 +22536,8 @@ async def project_claude_sdk_message(
     text_parts: list[str],
     current_tools: dict[str, dict[str, Any]],
     changed_paths: set[str],
+    tool_activity_run_ids: set[str] | None = None,
+    error_run_ids: set[str] | None = None,
 ) -> dict[str, Any] | None:
     """Project one typed SDK message into the existing durable timeline."""
 
@@ -21829,6 +22551,8 @@ async def project_claude_sdk_message(
         await mark_provider_turn_ready(session_id, run_id, provider_id)
 
     async def project_tool_result(block: Any) -> None:
+        if tool_activity_run_ids is not None:
+            tool_activity_run_ids.add(run_id)
         tool_id = str(claude_sdk_field(block, "tool_use_id") or "")
         await append_event(session_id, "tool_finished", {
             "run_id": run_id,
@@ -21853,6 +22577,8 @@ async def project_claude_sdk_message(
     if message_type == "AssistantMessage":
         assistant_error = str(claude_sdk_field(message, "error") or "")
         if assistant_error:
+            if error_run_ids is not None:
+                error_run_ids.add(run_id)
             await append_event(session_id, "error", {
                 "run_id": run_id,
                 "backend": BACKEND_CLAUDE,
@@ -21887,6 +22613,8 @@ async def project_claude_sdk_message(
                 "tool_use",
                 "server_tool_use",
             }:
+                if tool_activity_run_ids is not None:
+                    tool_activity_run_ids.add(run_id)
                 tool_id = str(
                     claude_sdk_field(block, "id")
                     or f"tool_{uuid.uuid4().hex[:8]}"
@@ -22056,7 +22784,12 @@ async def run_claude_sdk(
         "run_id": run_id,
         "backend": BACKEND_CLAUDE,
         "transport": CLAUDE_TRANSPORT_AGENT_SDK,
-        "argv": [cli_path, "<ClaudeSDKClient>", "--permission-mode", "default"],
+        "argv": [
+            cli_path,
+            "<ClaudeSDKClient>",
+            "--permission-mode",
+            effective_claude_permission_mode(sess),
+        ],
         "cwd": cwd,
     })
 
@@ -22148,6 +22881,11 @@ async def run_claude_sdk(
     except ClaudeSDKUnavailable:
         raise
     except ClaudeSDKQueryError as exc:
+        await evict_claude_sdk_chat(
+            session_id,
+            force=True,
+            manager=manager,
+        )
         await finish_claude_sdk_start_failure(
             session_id,
             run_id,
@@ -22210,8 +22948,11 @@ async def run_claude_sdk(
     current_run_id = run_id
     current_handle = handle
     current_diff_baseline = diff_baseline
+    current_prompt = prompt
     text_parts: list[str] = []
     current_tools: dict[str, dict[str, Any]] = {}
+    tool_activity_run_ids: set[str] = set()
+    projection_error_run_ids: set[str] = set()
     changed_paths: set[str] = set()
     seen_artifacts: set[str] = set()
     provider_id = str(resume_provider_id or "")
@@ -22385,6 +23126,8 @@ async def run_claude_sdk(
                 )
             except Exception as exc:
                 message_task = None
+                if bool(getattr(exc, "delivery_uncertain", False)):
+                    retire_supervisor = True
                 stream_error = concise_error_message(exc)
                 result_details = None
             else:
@@ -22417,6 +23160,8 @@ async def run_claude_sdk(
                     text_parts=text_parts,
                     current_tools=current_tools,
                     changed_paths=changed_paths,
+                    tool_activity_run_ids=tool_activity_run_ids,
+                    error_run_ids=projection_error_run_ids,
                 )
                 if projected_result is None:
                     continue
@@ -22424,6 +23169,26 @@ async def run_claude_sdk(
 
             if result_details and result_details.get("session_id"):
                 provider_id = str(result_details["session_id"])
+            if provider_id and provider_id != provider_persisted_id:
+                await persist_run_provider_session(
+                    session_id,
+                    current_run_id,
+                    BACKEND_CLAUDE,
+                    provider_id,
+                    cwd=cwd,
+                )
+                provider_persisted_id = provider_id
+            if result_details is not None and provider_id:
+                # The SDK's authoritative usage RPC is only sampled after its
+                # terminal ResultMessage and remains serialized through the
+                # chat-owned actor. Failure is telemetry-only and cannot hold
+                # up finalization beyond the short bounded timeout.
+                await sample_claude_context_usage(
+                    session_id,
+                    current_run_id,
+                    provider_id,
+                    manager,
+                )
             if pending_steer is None:
                 # Stop advertising native steering as soon as this provider
                 # result is terminal. A Force Send that raced the result is
@@ -22530,6 +23295,7 @@ async def run_claude_sdk(
             previous_artifacts = set(seen_artifacts)
             previous_result_details = dict(result_details or {})
             previous_text_parts = list(text_parts)
+            previous_prompt = current_prompt
             try:
                 await finish_outputs(
                     previous_run_id,
@@ -22662,6 +23428,8 @@ async def run_claude_sdk(
                         active["claude_permissions_open"] = False
                 await release_transition(transition_ready)
                 safe_to_requeue = bool(getattr(exc, "safe_to_requeue", False))
+                if bool(getattr(exc, "delivery_uncertain", False)):
+                    retire_supervisor = True
                 if isinstance(future, asyncio.Future) and not future.done():
                     future.set_exception(NativeSteerHandoffError(
                         concise_error_message(exc),
@@ -22702,6 +23470,7 @@ async def run_claude_sdk(
             current_run_id = candidate_run_id
             current_handle = candidate_handle
             current_diff_baseline = candidate_baseline
+            current_prompt = str(steer_state["request_prompt"])
             text_parts = []
             current_tools = {}
             changed_paths = candidate_paths
@@ -22744,15 +23513,50 @@ async def run_claude_sdk(
                     **previous_metadata,
                 })
             else:
+                previous_result_text = clean_assistant_text(
+                    str(previous_result_details.get("result_text") or "")
+                    or "\n\n".join(previous_text_parts).strip()
+                )
+                previous_projection_error = (
+                    previous_run_id in projection_error_run_ids
+                )
+                previous_empty_error = claude_empty_turn_failure_message(
+                    prompt=previous_prompt,
+                    result_text=previous_result_text,
+                    had_tool_activity=(
+                        previous_run_id in tool_activity_run_ids
+                    ),
+                    stopped=False,
+                    terminal_result_received=True,
+                    existing_error=bool(
+                        previous_result_details.get("error")
+                        or previous_result_details.get("is_error")
+                        or previous_projection_error
+                    ),
+                )
+                if previous_empty_error:
+                    await append_event(session_id, "error", {
+                        "run_id": previous_run_id,
+                        "backend": BACKEND_CLAUDE,
+                        "transport": CLAUDE_TRANSPORT_AGENT_SDK,
+                        "message": previous_empty_error,
+                        **previous_metadata,
+                    })
+                if previous_empty_error or previous_projection_error:
+                    record_runtime_failure(
+                        BACKEND_CLAUDE,
+                        previous_empty_error or "Claude assistant error",
+                    )
                 await append_turn_finished_event(session_id, {
                     "run_id": previous_run_id,
                     "backend": BACKEND_CLAUDE,
                     "transport": CLAUDE_TRANSPORT_AGENT_SDK,
-                    "exit_code": 0,
-                    "result_text": clean_assistant_text(
-                        str(previous_result_details.get("result_text") or "")
-                        or "\n\n".join(previous_text_parts).strip()
+                    "exit_code": (
+                        1
+                        if previous_empty_error or previous_projection_error
+                        else 0
                     ),
+                    "result_text": previous_result_text,
                     **previous_metadata,
                 })
             await append_event(session_id, "turn_queue_run_now", {
@@ -22941,7 +23745,25 @@ async def run_claude_sdk(
             or current_run_id in STOPPED_RUNS
             or (result_details or {}).get("aborted")
         )
+        result_text = clean_assistant_text(
+            str((result_details or {}).get("result_text") or "")
+            or "\n\n".join(text_parts).strip()
+        )
         result_error = str((result_details or {}).get("error") or "")
+        projection_error = current_run_id in projection_error_run_ids
+        empty_result_error = claude_empty_turn_failure_message(
+            prompt=current_prompt,
+            result_text=result_text,
+            had_tool_activity=current_run_id in tool_activity_run_ids,
+            stopped=stopped,
+            terminal_result_received=result_details is not None,
+            existing_error=bool(
+                stream_error
+                or result_error
+                or (result_details or {}).get("is_error")
+                or projection_error
+            ),
+        )
         if stream_error and not stopped:
             with suppress(Exception):
                 await append_event(session_id, "error", {
@@ -22960,11 +23782,28 @@ async def run_claude_sdk(
                     "message": result_error,
                     **run_event_metadata(current_run_id),
                 })
-        if stream_error or (result_details or {}).get("is_error"):
+        if empty_result_error and not stopped:
+            with suppress(Exception):
+                await append_event(session_id, "error", {
+                    "run_id": current_run_id,
+                    "backend": BACKEND_CLAUDE,
+                    "transport": CLAUDE_TRANSPORT_AGENT_SDK,
+                    "message": empty_result_error,
+                    **run_event_metadata(current_run_id),
+                })
+        if (
+            stream_error
+            or (result_details or {}).get("is_error")
+            or projection_error
+            or empty_result_error
+        ):
             if not stopped:
                 record_runtime_failure(
                     BACKEND_CLAUDE,
-                    stream_error or result_error or "Claude SDK run failed",
+                    stream_error
+                    or result_error
+                    or empty_result_error
+                    or "Claude assistant error",
                 )
         elif not stopped:
             record_runtime_success(BACKEND_CLAUDE)
@@ -22982,10 +23821,6 @@ async def run_claude_sdk(
                 manifest_path,
                 seen_artifacts=seen_artifacts,
             )
-        result_text = clean_assistant_text(
-            str((result_details or {}).get("result_text") or "")
-            or "\n\n".join(text_parts).strip()
-        )
         drain_queue = should_schedule_queue_after_finish(session_id, stopped)
         released = await release_turn_slot(
             session_id,
@@ -23001,7 +23836,12 @@ async def run_claude_sdk(
                     "exit_code": (
                         None
                         if stopped
-                        else 1 if stream_error or result_error else 0
+                        else 1 if (
+                            stream_error
+                            or result_error
+                            or projection_error
+                            or empty_result_error
+                        ) else 0
                     ),
                     "result_text": result_text,
                     "stopped": stopped,
@@ -23054,6 +23894,15 @@ async def run_claude(
                 ),
             )
             return
+        if not standalone_provider_context:
+            # The print transport advances the same Claude conversation but
+            # cannot provide an authoritative live context sample. Never keep
+            # advertising a stale SDK measurement after this compatibility
+            # path wins.
+            await mark_provider_context_usage_unavailable(
+                session_id,
+                BACKEND_CLAUDE,
+            )
         await run_claude_print(
             session_id,
             run_id,
@@ -23213,6 +24062,10 @@ async def run_codex_exec(
     diff_baseline: dict[str, str] | None = None,
     standalone_provider_context: bool = False,
 ) -> None:
+    if not standalone_provider_context:
+        # codex exec exposes no authoritative live context measurement. This
+        # also covers the automatic app-server -> exec compatibility fallback.
+        await mark_codex_exec_context_usage_unavailable(session_id)
     if standalone_provider_context:
         sess = standalone_provider_session(sess)
     resumed_provider_id = session_provider_id(sess)
@@ -23290,6 +24143,7 @@ async def run_codex_exec(
             "proc": proc,
             "run_id": run_id,
             "backend": BACKEND_CODEX,
+            "transport": CODEX_TRANSPORT_EXEC,
             "pid": proc.pid,
             "pgid": pgid,
             "cwd": cwd,
@@ -25149,6 +26003,8 @@ async def run_codex_app_server(
                     f"accepted; using codex exec. {concise_error_message(exc)}"
                 ),
             })
+            if not standalone_provider_context:
+                await mark_codex_exec_context_usage_unavailable(session_id)
             await run_codex_exec(
                 session_id,
                 current_run_id,
@@ -25335,6 +26191,8 @@ async def run_codex(
     standalone_provider_context: bool = False,
 ) -> None:
     if CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC:
+        if not standalone_provider_context:
+            await mark_codex_exec_context_usage_unavailable(session_id)
         await run_codex_exec(
             session_id,
             run_id,
@@ -25653,6 +26511,7 @@ def managed_server_restart_is_planned() -> bool:
 def server_update_work_message(
     active_session_ids: list[str],
     queued_turn_count: int,
+    provider_work_labels: list[str] | None = None,
 ) -> str:
     parts: list[str] = []
     if active_session_ids:
@@ -25661,6 +26520,20 @@ def server_update_work_message(
     if queued_turn_count:
         parts.append(
             f"{queued_turn_count} queued turn{'s' if queued_turn_count != 1 else ''}"
+        )
+    provider_labels = [
+        str(label).strip()[:200]
+        for label in (provider_work_labels or [])
+        if str(label).strip()
+    ]
+    if provider_labels:
+        count = len(provider_labels)
+        preview = ", ".join(provider_labels[:3])
+        if count > 3:
+            preview += f", and {count - 3} more"
+        parts.append(
+            f"{count} provider background task{'s' if count != 1 else ''} "
+            f"({preview})"
         )
     detail = " and ".join(parts) or "agent work"
     return (
@@ -26003,15 +26876,18 @@ async def health() -> dict[str, Any]:
                     if claude_sdk_dependency_available()
                     else "Install the server release with Claude Agent SDK support."
                 ),
-                "version": 1,
+                "version": 2,
                 "interactive_client_capability": (
                     CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY
                 ),
+                "permission_modes": list(CLAUDE_PERMISSION_MODE_OPTIONS),
                 "features": {
                     "native_steer": True,
                     "interrupt": True,
                     "approvals": True,
                     "questions": True,
+                    "permission_mode_control": True,
+                    "permission_modes": True,
                     "resume": True,
                     "fork": True,
                 },
@@ -26123,6 +26999,59 @@ def active_codex_work_labels() -> list[str]:
         if codex_subagent_has_live_owner(thread_id, state):
             labels.add(f"Codex subagent {thread_id}")
     return sorted(labels)
+
+
+SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT = 32
+
+
+def active_provider_background_work_labels() -> list[str]:
+    """Return bounded provider-owned work that survives its parent turn.
+
+    The managed updater already excludes active and queued parent turns. Codex
+    can additionally own native operations and live child threads, while a
+    loaded Claude SDK supervisor can retain background subagents after its
+    parent ResultMessage. Only loaded Claude supervisors are considered: event
+    history alone must never turn into a permanent update blocker after the
+    provider process has been evicted or the server has restarted.
+    """
+
+    labels = active_codex_work_labels()[:SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT]
+    remaining = SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT - len(labels)
+    manager = CLAUDE_SDK_MANAGER
+    if remaining <= 0 or manager is None:
+        return labels
+
+    for session_id, session in tuple(STORE.sessions.items()):
+        if remaining <= 0:
+            break
+        if (
+            str(session.get("backend") or DEFAULT_BACKEND).strip().lower()
+            != BACKEND_CLAUDE
+            or session_id in BUSY_SESSIONS
+            or session_id in SERVER_MAINTENANCE_SESSIONS
+        ):
+            continue
+        try:
+            loaded = manager.is_loaded(session_id)
+        except Exception:
+            # Failure to inspect a live supervisor is not proof that it is safe
+            # to terminate. Fail closed and require an explicit retry/update.
+            labels.append(f"Claude provider state unknown in {session_id}")
+            remaining -= 1
+            continue
+        if not loaded:
+            continue
+        try:
+            snapshot = build_claude_subagent_snapshot(session_id, limit=1)
+            active_count = max(0, int(snapshot.get("active_count") or 0))
+        except Exception:
+            # A loaded provider process whose child state cannot be inspected
+            # is not safe to terminate during a managed update.
+            active_count = 1
+        if active_count:
+            labels.append(f"Claude background work in {session_id}")
+            remaining -= 1
+    return labels
 
 
 async def reserve_codex_goals_reconfiguration() -> None:
@@ -26408,12 +27337,18 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                     len(queue)
                     for queue in QUEUED_TURNS.values()
                 ) + len(RUN_NOW_TURNS)
-                if active_session_ids or queued_turn_count:
+                provider_work_labels = (
+                    []
+                    if active_session_ids or queued_turn_count
+                    else active_provider_background_work_labels()
+                )
+                if active_session_ids or queued_turn_count or provider_work_labels:
                     raise HTTPException(
                         status_code=409,
                         detail=server_update_work_message(
                             active_session_ids,
                             queued_turn_count,
+                            provider_work_labels,
                         ),
                     )
                 status = write_server_update_status(
@@ -26771,6 +27706,31 @@ async def send_handoff_digest_background(session_id: str, req: HandoffDigestSend
     }
 
 
+async def ensure_claude_permission_mode_update_allowed(
+    session_id: str,
+    current: dict[str, Any],
+    patch: dict[str, Any],
+) -> None:
+    """Fence process policy changes without rejecting an idempotent save."""
+
+    if "claude_permission_mode" not in patch:
+        return
+    requested = effective_claude_permission_mode({
+        "claude_permission_mode": patch.get("claude_permission_mode"),
+    })
+    if requested == effective_claude_permission_mode(current):
+        return
+    async with ACTIVE_LOCK:
+        if session_id in BUSY_SESSIONS or ACTIVE.get(session_id) is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "wait for or stop the active Claude turn before changing "
+                    "its permission mode"
+                ),
+            )
+
+
 @app.patch("/api/sessions/{session_id}")
 async def update_session(session_id: str, req: UpdateSessionRequest) -> dict[str, Any]:
     ensure_session_not_initializing(session_id)
@@ -26784,6 +27744,11 @@ async def update_session(session_id: str, req: UpdateSessionRequest) -> dict[str
             # applies the saved selection through the next turn/start; it does
             # not currently expose a client RPC for mutating a loaded thread.
             preview_session_runtime_update(current, patch)
+            await ensure_claude_permission_mode_update_allowed(
+                session_id,
+                current,
+                patch,
+            )
             sess = await STORE.update(session_id, patch)
     else:
         # Title, folder, pin, and archive edits must remain lightweight. They
@@ -26857,6 +27822,7 @@ async def codex_runtime_snapshot(session_id: str) -> dict[str, Any]:
         "time_budget_exhausted": codex_goal_time_budget_is_exhausted(session),
         "token_usage": session.get("codex_token_usage"),
         "token_usage_snapshot": session.get("codex_token_usage_snapshot"),
+        **context_usage_runtime_fields(session, backend=BACKEND_CODEX),
         "pending_interactions": pending,
         "permission_profiles": permission_profiles,
         "background_terminals_supported": CODEX_BACKGROUND_TERMINALS_SUPPORTED,
@@ -27055,11 +28021,18 @@ async def claude_runtime_snapshot(session_id: str) -> dict[str, Any]:
         "session_loaded": loaded,
         "status": status,
         "pending_interactions": pending,
+        "policy": {
+            "permission_mode": effective_claude_permission_mode(session),
+        },
+        "permission_modes": list(CLAUDE_PERMISSION_MODE_OPTIONS),
+        **context_usage_runtime_fields(session, backend=BACKEND_CLAUDE),
         "features": {
             "native_steer": True,
             "interrupt": True,
             "approvals": True,
             "questions": True,
+            "permission_mode_control": True,
+            "permission_modes": True,
         },
         "fallback_transport": CLAUDE_TRANSPORT_PRINT,
     }
@@ -28231,6 +29204,7 @@ async def _fork_session_locked(
             model=parent.get("model"),
             effort=parent.get("effort"),
             system_prompt=parent.get("system_prompt"),
+            claude_permission_mode=effective_claude_permission_mode(parent),
             codex_approval_policy=parent.get("codex_approval_policy"),
             codex_sandbox_mode=parent.get("codex_sandbox_mode"),
             codex_permission_profile=parent.get("codex_permission_profile"),

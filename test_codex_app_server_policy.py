@@ -84,6 +84,9 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
         instructions = agent_server.CLAUDE_PROMPT_PRELUDE.format()
         self.assertIn("immediately retry the still-safe requested operation", instructions)
         self.assertIn("delegate bounded noisy exploration", instructions)
+        self.assertIn("Keep work needed for the current reply in foreground", instructions)
+        self.assertIn("tracked Agent/workflow", instructions)
+        self.assertIn("does not guarantee a completion wake-up", instructions)
         self.assertLessEqual(len(instructions.splitlines()), 15)
 
     async def test_new_thread_receives_policy_once_at_thread_start(self) -> None:

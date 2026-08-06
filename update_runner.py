@@ -235,14 +235,28 @@ def server_work_snapshot(
     else:
         raise RuntimeError("server health response is missing its active count")
 
-    queued = health.get("queued")
-    if not isinstance(queued, dict):
-        raise RuntimeError("server health response is missing its queued turns")
-    queued_count = 0
-    for value in queued.values():
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise RuntimeError("server health response has an invalid queued count")
-        queued_count += value
+    raw_blocking_queued_count = health.get("update_blocking_queued_count")
+    if raw_blocking_queued_count is not None:
+        if (
+            isinstance(raw_blocking_queued_count, bool)
+            or not isinstance(raw_blocking_queued_count, int)
+            or raw_blocking_queued_count < 0
+        ):
+            raise RuntimeError(
+                "server health response has an invalid update-blocking queued count"
+            )
+        queued_count = raw_blocking_queued_count
+    else:
+        # Older servers did not distinguish durable preserved messages from
+        # volatile queue state. Retain their fail-closed behavior.
+        queued = health.get("queued")
+        if not isinstance(queued, dict):
+            raise RuntimeError("server health response is missing its queued turns")
+        queued_count = 0
+        for value in queued.values():
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise RuntimeError("server health response has an invalid queued count")
+            queued_count += value
     return active_count, queued_count
 
 

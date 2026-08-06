@@ -66,6 +66,10 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertTrue(response["managed_updates"])
         self.assertEqual(
+            response["capabilities"]["server_updates"]["version"],
+            3,
+        )
+        self.assertEqual(
             response["capabilities"]["server_updates"]["tracks"],
             ["stable", "beta"],
         )
@@ -84,6 +88,22 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                 "default_context_mode": "chat",
             },
         )
+
+    async def test_health_reports_only_provisional_queue_as_update_blocking(self):
+        queued = {
+            "durable-chat": deque([{"queued_id": "kept", "_durable": True}]),
+            "provisional-chat": deque([{"queued_id": "wait", "_durable": False}]),
+        }
+        with patch.object(agent_server, "QUEUED_TURNS", queued), \
+             patch.object(agent_server, "RUN_NOW_TURNS", {}), \
+             patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"):
+            response = await agent_server.health()
+
+        self.assertEqual(response["queued"], {
+            "durable-chat": 1,
+            "provisional-chat": 1,
+        })
+        self.assertEqual(response["update_blocking_queued_count"], 1)
 
     async def test_check_reports_a_signed_newer_release(self):
         with tempfile.TemporaryDirectory() as temporary, \
@@ -404,7 +424,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1 active agent run", str(raised.exception.detail))
         run_tmux.assert_not_called()
 
-    async def test_start_rejects_update_while_turns_are_queued(self):
+    async def test_start_rejects_update_while_queued_turns_are_not_durable(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             runner = root / "update_runner.py"
@@ -414,8 +434,8 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
             queued = {
                 "chat": deque(
                     [
-                        {"queued_id": "one"},
-                        {"queued_id": "two"},
+                        {"queued_id": "one", "_durable": False},
+                        {"queued_id": "two", "_durable": False},
                     ]
                 )
             }
@@ -437,6 +457,42 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 409)
         self.assertIn("2 queued turns", str(raised.exception.detail))
         run_tmux.assert_not_called()
+
+    async def test_start_preserves_durable_queued_turns_and_launches_update(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "update_runner.py"
+            key = root / "release-public-key.pem"
+            runner.write_text("# runner\n")
+            key.write_text("public key\n")
+            queued = {
+                "chat": deque([
+                    {
+                        "queued_id": "kept",
+                        "prompt": "Keep this for later.",
+                        "_durable": True,
+                        "_paused_after_stop": True,
+                    },
+                ]),
+            }
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", root / "status.json"), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server, "BUSY_SESSIONS", set()), \
+                 patch.object(agent_server, "QUEUED_TURNS", queued), \
+                 patch.object(agent_server, "RUN_NOW_TURNS", {}), \
+                 patch.object(agent_server, "active_provider_background_work_labels", return_value=[]), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
+                 patch.object(agent_server, "run_tmux") as run_tmux:
+                status = await agent_server.start_server_update(
+                    agent_server.ServerUpdateRequest(version="1.1.0"),
+                )
+
+        self.assertEqual(status["phase"], "starting")
+        self.assertEqual(list(queued["chat"])[0]["queued_id"], "kept")
+        run_tmux.assert_called_once()
 
     async def test_start_rejects_update_while_a_codex_subagent_is_live(self):
         with tempfile.TemporaryDirectory() as temporary:

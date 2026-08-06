@@ -4934,6 +4934,10 @@ BUSY_SESSIONS: set[str] = set()
 # thread) participate in update admission without impersonating a user turn in
 # runtime/status responses.
 SERVER_MAINTENANCE_SESSIONS: set[str] = set()
+# A failed durable Claude Stop fence keeps the per-chat maintenance exclusion
+# owned until a later explicit Stop can complete the audit marker. This blocks
+# managed restart admission without pretending the evicted process is alive.
+CLAUDE_STOP_FENCE_SESSIONS: set[str] = set()
 CURRENT_TURNS: dict[str, dict[str, Any]] = {}
 STOP_REQUESTS: set[str] = set()
 STOPPED_RUNS: set[str] = set()
@@ -5493,6 +5497,20 @@ async def append_durable_event_batch(
         return await append_durable_event_batch_locked(session_id, event_specs)
 
 
+async def append_durable_event(
+    session_id: str,
+    event_type: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Append one fsynced event whose committed result survives cancellation."""
+
+    events = await append_durable_event_batch(
+        session_id,
+        [(event_type, dict(payload or {}))],
+    )
+    return events[0]
+
+
 def is_agent_visible_event(event_type: str, event: dict[str, Any]) -> bool:
     if event_type == "assistant_text":
         return bool(str(event.get("text") or "").strip())
@@ -5671,29 +5689,58 @@ async def enqueue_turn(session_id: str, req: TurnRequest, sess: dict[str, Any]) 
         "target_session_id": req.target_session_id,
         "client_capabilities": list(req.client_capabilities),
         "created_at": now_iso(),
+        # Managed replacement may preserve queued turns only after their
+        # durable event exists. This short false window closes the race where
+        # an update could otherwise be admitted between the in-memory append
+        # and append_event().
+        "_durable": False,
     }
+    display_prompt = req.display_prompt if req.display_prompt is not None else req.prompt
     async with QUEUE_LOCK:
+        update_blocker = managed_server_update_blocker()
+        if update_blocker:
+            raise HTTPException(status_code=503, detail=update_blocker)
         queue = QUEUED_TURNS.setdefault(session_id, deque())
         queue.append(item)
         position = len(queue)
-    display_prompt = req.display_prompt if req.display_prompt is not None else req.prompt
-    queued_event = await append_event(session_id, "turn_queued", {
-        "queued_id": queued_id,
-        "backend": req.backend or sess.get("backend") or DEFAULT_BACKEND,
-        "model": req.model,
-        "effort": req.effort,
-        "prompt": display_prompt,
-        "request_prompt": req.prompt,
-        "display_prompt": req.display_prompt,
-        "file_ids": list(req.file_ids),
-        "position": position,
-        "purpose": req.purpose,
-        "digest_job_id": req.digest_job_id,
-        "digest_detail": req.digest_detail,
-        "source_session_id": req.source_session_id,
-        "target_session_id": req.target_session_id,
-        "client_capabilities": list(req.client_capabilities),
-    })
+        try:
+            # Keep the queue lock through persistence. Stop, edit, remove,
+            # reorder, Run Now, and managed-update admission must never
+            # observe this item before its creation event exists.
+            queued_event = await append_durable_event(session_id, "turn_queued", {
+                "queued_id": queued_id,
+                "backend": req.backend or sess.get("backend") or DEFAULT_BACKEND,
+                "model": req.model,
+                "effort": req.effort,
+                "prompt": display_prompt,
+                "request_prompt": req.prompt,
+                "display_prompt": req.display_prompt,
+                "file_ids": list(req.file_ids),
+                "position": position,
+                "purpose": req.purpose,
+                "digest_job_id": req.digest_job_id,
+                "digest_detail": req.digest_detail,
+                "source_session_id": req.source_session_id,
+                "target_session_id": req.target_session_id,
+                "client_capabilities": list(req.client_capabilities),
+            })
+        except BaseException:
+            # A non-durable queue entry cannot survive restart. Roll back only
+            # this exact provisional object; concurrent additions keep their
+            # original order.
+            queue = QUEUED_TURNS.get(session_id)
+            if queue is not None:
+                kept = deque(candidate for candidate in queue if candidate is not item)
+                if kept:
+                    QUEUED_TURNS[session_id] = kept
+                else:
+                    QUEUED_TURNS.pop(session_id, None)
+            raise
+        item["_durable"] = True
+    async with ACTIVE_LOCK:
+        still_busy = session_id in BUSY_SESSIONS
+    if not still_busy:
+        schedule_next_queued_turn(session_id)
     return {
         "queued": True,
         "queued_id": queued_id,
@@ -5709,14 +5756,27 @@ async def unqueue_turn(session_id: str, queued_id: str) -> dict[str, Any]:
 
     removed: dict[str, Any] | None = None
     async with QUEUE_LOCK:
+        update_blocker = managed_server_update_blocker()
+        if update_blocker:
+            raise HTTPException(status_code=503, detail=update_blocker)
         queue = QUEUED_TURNS.get(session_id)
         if queue:
-            kept: deque[dict[str, Any]] = deque()
-            for item in queue:
-                if removed is None and item.get("queued_id") == queued_id:
-                    removed = item
-                    continue
-                kept.append(item)
+            original_items = list(queue)
+            removed_index = next(
+                (
+                    index
+                    for index, item in enumerate(original_items)
+                    if item.get("queued_id") == queued_id
+                ),
+                None,
+            )
+            if removed_index is not None:
+                removed = original_items[removed_index]
+            kept = deque(
+                item
+                for index, item in enumerate(original_items)
+                if index != removed_index
+            )
             if kept:
                 QUEUED_TURNS[session_id] = kept
                 remaining = len(kept)
@@ -5725,23 +5785,25 @@ async def unqueue_turn(session_id: str, queued_id: str) -> dict[str, Any]:
                 remaining = 0
         else:
             remaining = 0
-
-    if removed is None:
-        raise HTTPException(status_code=404, detail="queued turn not found")
-
-    await append_event(session_id, "turn_unqueued", {
-        "queued_id": queued_id,
-        "backend": removed.get("backend") or STORE.sessions[session_id].get("backend") or DEFAULT_BACKEND,
-        "prompt": removed.get("prompt") or "",
-        "file_ids": list(removed.get("file_ids") or []),
-        "message": "Removed queued message.",
-        "remaining": remaining,
-        "purpose": removed.get("purpose"),
-        "digest_job_id": removed.get("digest_job_id"),
-        "digest_detail": removed.get("digest_detail"),
-        "source_session_id": removed.get("source_session_id"),
-        "target_session_id": removed.get("target_session_id"),
-    })
+        if removed is None:
+            raise HTTPException(status_code=404, detail="queued turn not found")
+        try:
+            await append_durable_event(session_id, "turn_unqueued", {
+                "queued_id": queued_id,
+                "backend": removed.get("backend") or STORE.sessions[session_id].get("backend") or DEFAULT_BACKEND,
+                "prompt": removed.get("prompt") or "",
+                "file_ids": list(removed.get("file_ids") or []),
+                "message": "Removed queued message.",
+                "remaining": remaining,
+                "purpose": removed.get("purpose"),
+                "digest_job_id": removed.get("digest_job_id"),
+                "digest_detail": removed.get("digest_detail"),
+                "source_session_id": removed.get("source_session_id"),
+                "target_session_id": removed.get("target_session_id"),
+            })
+        except BaseException:
+            QUEUED_TURNS[session_id] = deque(original_items)
+            raise
     if removed.get("digest_job_id"):
         await finish_handoff_digest_queue_item(
             session_id,
@@ -6082,10 +6144,17 @@ async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedT
 
     updated: dict[str, Any] | None = None
     async with QUEUE_LOCK:
+        update_blocker = managed_server_update_blocker()
+        if update_blocker:
+            raise HTTPException(status_code=503, detail=update_blocker)
         queue = QUEUED_TURNS.get(session_id)
         if queue:
             for idx, item in enumerate(queue):
                 if item.get("queued_id") == queued_id:
+                    original = {
+                        **item,
+                        "file_ids": list(item.get("file_ids") or []),
+                    }
                     if req.prompt is not None:
                         prompt = req.prompt.strip()
                         if not prompt:
@@ -6096,17 +6165,20 @@ async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedT
                     updated = dict(item)
                     updated["position"] = idx + 1
                     break
-
-    if updated is None:
-        raise HTTPException(status_code=404, detail="queued turn not found")
-
-    await append_event(session_id, "turn_queue_updated", {
-        "queued_id": queued_id,
-        "backend": updated.get("backend") or STORE.sessions[session_id].get("backend") or DEFAULT_BACKEND,
-        "prompt": updated.get("prompt") or "",
-        "file_ids": list(updated.get("file_ids") or []),
-        "position": updated.get("position"),
-    })
+        if updated is None:
+            raise HTTPException(status_code=404, detail="queued turn not found")
+        try:
+            await append_durable_event(session_id, "turn_queue_updated", {
+                "queued_id": queued_id,
+                "backend": updated.get("backend") or STORE.sessions[session_id].get("backend") or DEFAULT_BACKEND,
+                "prompt": updated.get("prompt") or "",
+                "file_ids": list(updated.get("file_ids") or []),
+                "position": updated.get("position"),
+            })
+        except BaseException:
+            item.clear()
+            item.update(original)
+            raise
     return {"ok": True, "queued_id": queued_id, "item": updated}
 
 
@@ -6120,9 +6192,13 @@ async def move_queued_turn(session_id: str, queued_id: str, req: MoveQueuedTurnR
     moved: dict[str, Any] | None = None
     positions: list[dict[str, Any]] = []
     async with QUEUE_LOCK:
+        update_blocker = managed_server_update_blocker()
+        if update_blocker:
+            raise HTTPException(status_code=503, detail=update_blocker)
         queue = QUEUED_TURNS.get(session_id)
         if queue:
-            items = list(queue)
+            original_items = list(queue)
+            items = list(original_items)
             idx = next((i for i, item in enumerate(items) if item.get("queued_id") == queued_id), None)
             if idx is not None:
                 new_idx = idx - 1 if direction == "up" else idx + 1
@@ -6134,15 +6210,17 @@ async def move_queued_turn(session_id: str, queued_id: str, req: MoveQueuedTurnR
                 else:
                     moved = dict(items[idx])
                 positions = queue_positions(QUEUED_TURNS[session_id])
-
-    if moved is None:
-        raise HTTPException(status_code=404, detail="queued turn not found")
-
-    await append_event(session_id, "turn_queue_reordered", {
-        "queued_id": queued_id,
-        "direction": direction,
-        "positions": positions,
-    })
+        if moved is None:
+            raise HTTPException(status_code=404, detail="queued turn not found")
+        try:
+            await append_durable_event(session_id, "turn_queue_reordered", {
+                "queued_id": queued_id,
+                "direction": direction,
+                "positions": positions,
+            })
+        except BaseException:
+            QUEUED_TURNS[session_id] = deque(original_items)
+            raise
     return {"ok": True, "queued_id": queued_id, "positions": positions}
 
 
@@ -6201,6 +6279,10 @@ def queued_claude_runtime_matches_active(
         # happen to match.
         return False
     return configuration_key == str(active.get("configuration_key") or "")
+
+
+class NonNativeForceSendRequiresLifecycleLock(Exception):
+    """Internal retry signal emitted before a queued turn is mutated."""
 
 
 async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]:
@@ -6285,6 +6367,67 @@ async def deferred_force_send_outcome(
     }
 
 
+async def fence_native_steer_delivery(
+    session_id: str,
+    selected: dict[str, Any],
+    *,
+    backend: str,
+) -> None:
+    """Durably hold a queued message before it can reach a native provider.
+
+    The later run-now/turn-start batch consumes the original queue event. If
+    the process instead dies at the provider-delivery boundary, recovery sees
+    this fence and keeps the message paused rather than replaying a prompt that
+    may already have been accepted.
+    """
+
+    queued_id = selected.get("queued_id")
+    display_prompt = str(
+        selected.get("display_prompt")
+        if selected.get("display_prompt") is not None
+        else selected.get("prompt") or ""
+    )
+    # The standard tombstone makes rollback to an older server fail closed:
+    # beta.7 recovery understands turn_unqueued even though it does not know
+    # the additive delivery-fence marker. Beta.8 reconstructs the full queued
+    # item from the second event and keeps it paused.
+    await append_durable_event_batch(session_id, [
+        ("turn_unqueued", {
+            "queued_id": queued_id,
+            "reason": "native_delivery_fence",
+        }),
+        ("turn_queue_delivery_fenced", {
+            "queued_id": queued_id,
+            "backend": backend,
+            "prompt": display_prompt,
+            "request_prompt": str(selected.get("prompt") or ""),
+            "display_prompt": display_prompt,
+            "file_ids": list(selected.get("file_ids") or []),
+            "display_file_ids": list(
+                selected.get("display_file_ids")
+                if selected.get("display_file_ids") is not None
+                else selected.get("file_ids") or []
+            ),
+            "model": selected.get("model"),
+            "effort": selected.get("effort"),
+            "purpose": selected.get("purpose"),
+            "digest_job_id": selected.get("digest_job_id"),
+            "digest_detail": selected.get("digest_detail"),
+            "source_session_id": selected.get("source_session_id"),
+            "target_session_id": selected.get("target_session_id"),
+            "client_capabilities": list(
+                selected.get("client_capabilities") or []
+            ),
+            "message": (
+                "Force Send delivery started; keep this message paused until "
+                "its provider lifecycle is durably committed."
+            ),
+        }),
+    ])
+    selected["_paused_after_stop"] = True
+    selected["_native_delivery_fenced"] = True
+
+
 def deferred_force_send_response_for_client(
     result: dict[str, Any],
     request: RunQueuedTurnNowRequest | None,
@@ -6315,7 +6458,20 @@ async def _run_queued_turn_now_and_release(
     result: dict[str, Any] | None = None
     uncertain_error: dict[str, Any] | None = None
     try:
-        result = await _run_queued_turn_now_once(session_id, queued_id)
+        try:
+            # Native steering already has its own provider handoff fence and
+            # must remain able to complete without waiting behind a Stop that
+            # targets the same live provider turn.  A non-native Force Send,
+            # however, is a Stop-then-start lifecycle transition and must be
+            # serialized with the public Stop endpoint.
+            result = await _run_queued_turn_now_once(
+                session_id,
+                queued_id,
+                require_native=True,
+            )
+        except NonNativeForceSendRequiresLifecycleLock:
+            async with session_lifecycle_lock(session_id):
+                result = await _run_queued_turn_now_once(session_id, queued_id)
         return result
     except NativeSteerHandoffError as exc:
         if exc.safe_to_requeue:
@@ -6359,6 +6515,8 @@ async def _run_queued_turn_now_and_release(
 async def _run_queued_turn_now_once(
     session_id: str,
     queued_id: str,
+    *,
+    require_native: bool = False,
 ) -> dict[str, Any]:
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
@@ -6371,10 +6529,14 @@ async def _run_queued_turn_now_once(
     selected_index: int | None = None
     selected_predecessor_id: str | None = None
     selected_successor_id: str | None = None
+    selected_was_paused = False
     native_steer = False
     native_steer_queue = active_turn.get("native_steer_queue")
     remaining: int
     async with QUEUE_LOCK:
+        update_blocker = managed_server_update_blocker()
+        if update_blocker:
+            raise HTTPException(status_code=503, detail=update_blocker)
         if session_id in STEERING_SESSIONS or RUN_NOW_TURNS.get(session_id) is not None:
             raise HTTPException(
                 status_code=409,
@@ -6392,6 +6554,9 @@ async def _run_queued_turn_now_once(
             )
             if selected_index is not None:
                 selected = items[selected_index]
+                selected_was_paused = (
+                    selected.get("_paused_after_stop") is True
+                )
                 if selected_index > 0:
                     selected_predecessor_id = str(
                         items[selected_index - 1].get("queued_id") or ""
@@ -6431,6 +6596,12 @@ async def _run_queued_turn_now_once(
                         )
                     )
                 )
+                if require_native and not native_steer:
+                    # Probe before removing or marking the queue item.  The
+                    # caller will retry under the per-chat lifecycle lock so
+                    # explicit Stop cannot interleave between interruption and
+                    # promotion of this queued message.
+                    raise NonNativeForceSendRequiresLifecycleLock
                 kept = deque(
                     item
                     for idx, item in enumerate(items)
@@ -6449,10 +6620,17 @@ async def _run_queued_turn_now_once(
         if selected is not None:
             STEERING_SESSIONS.add(session_id)
             if not native_steer:
+                # The original queue event is durable, but its promotion is
+                # not restart-safe until turn_queue_run_now is persisted.
+                selected["_update_transitioning"] = True
                 RUN_NOW_TURNS[session_id] = selected
 
     if selected is None:
         raise HTTPException(status_code=404, detail="queued turn not found")
+    # Selecting Run Now is an explicit request to release a queue hold created
+    # by Stop. Native steering does not pass through start_next_queued_turn(),
+    # so clear it here for both transport paths.
+    selected["_paused_after_stop"] = False
 
     if native_steer:
         loop = asyncio.get_running_loop()
@@ -6537,6 +6715,7 @@ async def _run_queued_turn_now_once(
             if not still_busy:
                 schedule_next_queued_turn(session_id)
 
+    promotion_committed = False
     try:
         stop_result = await stop_turn(
             session_id,
@@ -6544,13 +6723,16 @@ async def _run_queued_turn_now_once(
             schedule_queue=False,
             require_provider_turn_ready=True,
             cascade_codex_subagents=False,
+            cascade_claude_subagents=False,
             hard_terminalize_on_timeout=False,
+            pause_queued_turns_on_stop=False,
         )
         interrupted = bool(stop_result.get("stopped") or stop_result.get("pending"))
         deferred = bool(stop_result.get("deferred"))
         if deferred:
             already_notified = bool(selected.get("_turn_deferred_notified"))
             selected["_turn_deferred_notified"] = True
+            selected.pop("_update_transitioning", None)
             async with QUEUE_LOCK:
                 RUN_NOW_TURNS.pop(session_id, None)
                 STEERING_SESSIONS.discard(session_id)
@@ -6590,7 +6772,7 @@ async def _run_queued_turn_now_once(
                 RUN_NOW_TURNS[session_id] = prepared
 
         display_prompt = str(prepared.get("display_prompt") or prepared.get("steering_prompt") or selected.get("prompt") or "")
-        await append_event(session_id, "turn_queue_run_now", {
+        await append_durable_event(session_id, "turn_queue_run_now", {
             "queued_id": queued_id,
             "backend": prepared.get("backend") or STORE.sessions[session_id].get("backend") or DEFAULT_BACKEND,
             "prompt": display_prompt,
@@ -6613,6 +6795,8 @@ async def _run_queued_turn_now_once(
             "remaining": remaining,
             "superseded_queued_ids": [],
         })
+        promotion_committed = True
+        prepared.pop("_update_transitioning", None)
         asyncio.create_task(wait_for_steered_turn_slot(session_id))
         return {
             "ok": True,
@@ -6622,8 +6806,51 @@ async def _run_queued_turn_now_once(
             "replays_interrupted_message": bool(prepared.get("replays_interrupted_message")),
             "superseded_queued_ids": [],
         }
-    except Exception:
+    except BaseException:
         async with QUEUE_LOCK:
+            if not promotion_committed:
+                current = RUN_NOW_TURNS.get(session_id)
+                if current is not None and current.get("queued_id") == queued_id:
+                    RUN_NOW_TURNS.pop(session_id, None)
+                selected.pop("_update_transitioning", None)
+                selected["_paused_after_stop"] = selected_was_paused
+                items = list(QUEUED_TURNS.get(session_id) or ())
+                if not any(
+                    item.get("queued_id") == queued_id
+                    for item in items
+                ):
+                    successor_index = (
+                        next(
+                            (
+                                idx
+                                for idx, item in enumerate(items)
+                                if item.get("queued_id") == selected_successor_id
+                            ),
+                            None,
+                        )
+                        if selected_successor_id is not None
+                        else None
+                    )
+                    predecessor_index = (
+                        next(
+                            (
+                                idx
+                                for idx, item in enumerate(items)
+                                if item.get("queued_id") == selected_predecessor_id
+                            ),
+                            None,
+                        )
+                        if selected_predecessor_id is not None
+                        else None
+                    )
+                    if successor_index is not None:
+                        insert_at = successor_index
+                    elif predecessor_index is not None:
+                        insert_at = predecessor_index + 1
+                    else:
+                        insert_at = min(int(selected_index or 0), len(items))
+                    items.insert(insert_at, selected)
+                    QUEUED_TURNS[session_id] = deque(items)
             STEERING_SESSIONS.discard(session_id)
         schedule_next_queued_turn(session_id)
         raise
@@ -6633,6 +6860,50 @@ async def requeue_turn_front(session_id: str, item: dict[str, Any]) -> None:
     async with QUEUE_LOCK:
         queue = QUEUED_TURNS.setdefault(session_id, deque())
         queue.appendleft(item)
+
+
+async def pause_queued_turns_after_explicit_stop(session_id: str) -> int:
+    """Durably hold queued successors after the user explicitly stops.
+
+    Stopping a parent turn must not silently delete its queued user messages,
+    but neither should a restart reinterpret those messages as permission to
+    run them. A later explicit Run Now operation clears the per-item hold.
+    """
+
+    async with QUEUE_LOCK:
+        items = list(QUEUED_TURNS.get(session_id) or ())
+        run_now = RUN_NOW_TURNS.get(session_id)
+        if run_now is not None:
+            items.insert(0, run_now)
+        queued_ids = [
+            str(item.get("queued_id") or "").strip()
+            for item in items
+            if str(item.get("queued_id") or "").strip()
+        ]
+        if not queued_ids:
+            return 0
+        # Persist before changing the in-memory scheduling state. If durable
+        # storage fails, mark the entries provisional so the managed updater
+        # remains fail-closed, while Stop can still terminate the parent.
+        durable = True
+        try:
+            await append_durable_event(session_id, "turn_queue_paused", {
+                "queued_ids": queued_ids,
+                "message": "Queued messages were kept after the parent turn stopped.",
+            })
+        except Exception as exc:
+            durable = False
+            logger.error(
+                "could not persist stopped queue hold session=%s error=%s",
+                session_id,
+                concise_error_message(exc),
+            )
+        for item in items:
+            if str(item.get("queued_id") or "").strip() in queued_ids:
+                item["_paused_after_stop"] = True
+                if not durable:
+                    item["_durable"] = False
+    return len(queued_ids)
 
 
 async def terminally_discard_queued_turn(
@@ -6692,8 +6963,16 @@ async def start_next_queued_turn(session_id: str) -> None:
         if session_id in STEERING_SESSIONS:
             return
         item = RUN_NOW_TURNS.pop(session_id, None)
+        if item is not None:
+            # Run Now is the explicit user action that releases a queue hold.
+            item["_paused_after_stop"] = False
         if item is None:
             queue = QUEUED_TURNS.get(session_id)
+            if queue and (
+                queue[0].get("_durable") is False
+                or queue[0].get("_paused_after_stop") is True
+            ):
+                return
             item = queue.popleft() if queue else None
             if queue is not None and not queue:
                 QUEUED_TURNS.pop(session_id, None)
@@ -6844,13 +7123,15 @@ def queued_turn_from_event(event: dict[str, Any], sess: dict[str, Any], position
         "client_capabilities": list(event.get("client_capabilities") or []),
         "created_at": event.get("ts") or now_iso(),
         "position": int(event.get("position") or position),
+        "_durable": True,
+        "_paused_after_stop": False,
     }
 
 
 def queued_event_lines(path: Path) -> Iterator[bytes]:
     with path.open("rb") as source:
         for raw_line in source:
-            if b'"queued_id"' in raw_line:
+            if b'"queued_id"' in raw_line or b'"turn_queue_paused"' in raw_line:
                 yield raw_line
 
 
@@ -6881,11 +7162,31 @@ def scan_queued_turns_from_events(
                     pending.pop(superseded_id, None)
                     if superseded_id in order:
                         order.remove(superseded_id)
+            if event_type == "turn_queue_paused":
+                for paused_id in event.get("queued_ids") or []:
+                    paused_id = str(paused_id or "")
+                    if paused_id in pending:
+                        pending[paused_id]["_paused_after_stop"] = True
+                continue
+            if event_type == "turn_queue_delivery_fenced" and queued_id:
+                if queued_id not in pending:
+                    pending[queued_id] = queued_turn_from_event(
+                        event,
+                        sess,
+                        len(order) + 1,
+                    )
+                    order.append(queued_id)
+                pending[queued_id]["_paused_after_stop"] = True
+                pending[queued_id]["_native_delivery_fenced"] = True
+                continue
             if event_type == "turn_queued" and queued_id:
                 pending[queued_id] = queued_turn_from_event(event, sess, len(order) + 1)
                 if queued_id not in order:
                     order.append(queued_id)
             elif event_type in {"turn_queue_updated", "turn_queue_run_now"} and queued_id in pending:
+                if event_type == "turn_queue_run_now":
+                    pending[queued_id]["_paused_after_stop"] = False
+                    pending[queued_id].pop("_native_delivery_fenced", None)
                 legacy_generated_replay = (
                     event_type == "turn_queue_run_now"
                     and event.get("replays_interrupted_message")
@@ -6980,7 +7281,8 @@ async def recover_queued_turns_after_start() -> tuple[int, int]:
                 continue
             QUEUED_TURNS[session_id] = deque([*restored, *existing_items])
             rebuilt += len(restored)
-            scheduled_session_ids.append(session_id)
+            if not QUEUED_TURNS[session_id][0].get("_paused_after_stop"):
+                scheduled_session_ids.append(session_id)
     for session_id in scheduled_session_ids:
         schedule_next_queued_turn(session_id)
     scheduled = len(scheduled_session_ids)
@@ -10163,6 +10465,30 @@ def build_claude_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str
                             continue
                         state["status"] = terminal_status
                         note(state, event, activity)
+                    continue
+
+                if event_type == "claude_subagents_stopped":
+                    target_run_ids = {
+                        str(value or "").strip()
+                        for value in event.get("run_ids") or []
+                        if str(value or "").strip()
+                    }
+                    target_task_ids = {
+                        str(value or "").strip()
+                        for value in event.get("subagent_ids") or []
+                        if str(value or "").strip()
+                    }
+                    stop_all = event.get("all") is True
+                    for state in list(states.values()):
+                        if state["status"] not in {"starting", "running"}:
+                            continue
+                        if not stop_all and (
+                            state["run_id"] not in target_run_ids
+                            and state["task_id"] not in target_task_ids
+                        ):
+                            continue
+                        state["status"] = "stopped"
+                        note(state, event, "Stopped with parent chat")
 
     active_statuses = {"starting", "running"}
     retained = list(states.values())
@@ -10204,6 +10530,8 @@ TIMELINE_INDEX_HIDDEN_TYPES = {
     "turn_queue_updated",
     "turn_queue_reordered",
     "turn_queue_run_now",
+    "turn_queue_paused",
+    "turn_queue_delivery_fenced",
     "queue_snapshot",
     "subagent_state",
     "job_updated",
@@ -10212,6 +10540,7 @@ TIMELINE_INDEX_HIDDEN_TYPES = {
     "codex_thread_status",
     "codex_goal_updated",
     "codex_goal_cleared",
+    "claude_subagents_stopped",
     # Legacy beta servers briefly emitted usage as timeline events. Keep those
     # old rows out of pagination even though current servers never emit them.
     "codex_token_usage",
@@ -18203,6 +18532,112 @@ async def evict_claude_sdk_chat(
         return False
 
 
+def empty_subagent_stop_result() -> dict[str, Any]:
+    return {
+        "descendants": 0,
+        "requested": [],
+        "interrupted": [],
+        "pending": [],
+        "errors": [],
+        "fence_committed": True,
+    }
+
+
+async def stop_idle_claude_background_subagents(
+    session_id: str,
+    *,
+    emit_event: bool,
+) -> dict[str, Any]:
+    """Retire one idle Claude supervisor when its children remain active.
+
+    A chat-scoped SDK process may legitimately stay connected after its parent
+    ResultMessage. Explicit Stop is stronger: if the durable snapshot still
+    has live background children, retire only this chat's supervisor and add
+    a durable fence so those historical child states cannot block a later
+    managed update.
+    """
+
+    result = empty_subagent_stop_result()
+    session = STORE.sessions.get(session_id) or {}
+    if str(session.get("backend") or DEFAULT_BACKEND) != BACKEND_CLAUDE:
+        return result
+    manager = CLAUDE_SDK_MANAGER
+    loaded = False
+    if manager is not None:
+        try:
+            loaded = manager.is_loaded(session_id)
+        except Exception as exc:
+            # Do not claim success or hide historical work when ownership of
+            # a potentially live process cannot be determined.
+            result["pending"] = ["claude-background-work"]
+            result["errors"].append(concise_error_message(exc))
+            return result
+    try:
+        snapshot = build_claude_subagent_snapshot(
+            session_id,
+            limit=SUBAGENT_SNAPSHOT_STATE_LIMIT,
+        )
+        active = [
+            item
+            for item in snapshot.get("subagents") or []
+            if isinstance(item, dict)
+            and str(item.get("subagent_status") or "") in {"starting", "running"}
+        ]
+        active_count = max(0, int(snapshot.get("active_count") or 0))
+    except Exception as exc:
+        # An explicit Stop must fail closed if a live chat process has
+        # unreadable child state. Evict the chat and fence all historical
+        # active children instead of leaving unknown work behind.
+        active = []
+        active_count = 1
+        result["errors"].append(concise_error_message(exc))
+    if not active_count:
+        return result
+
+    result["fence_committed"] = False
+
+    subagent_ids = sorted({
+        str(item.get("subagent_id") or "").strip()
+        for item in active
+        if str(item.get("subagent_id") or "").strip()
+    })
+    run_ids = sorted({
+        str(item.get("run_id") or "").strip()
+        for item in active
+        if str(item.get("run_id") or "").strip()
+    })
+    result["descendants"] = active_count
+    result["requested"] = subagent_ids
+    if loaded and not await evict_claude_sdk_chat(
+        session_id,
+        force=True,
+        manager=manager,
+    ):
+        result["pending"] = subagent_ids or ["claude-background-work"]
+        result["errors"].append("Claude SDK chat eviction did not complete")
+        return result
+
+    try:
+        # This is a recovery fence, not merely a visible timeline row. Commit
+        # it while managed-update admission is still excluded even when the
+        # caller suppresses ordinary Stop UI events.
+        await append_durable_event(session_id, "claude_subagents_stopped", {
+            "backend": BACKEND_CLAUDE,
+            "run_ids": run_ids,
+            "subagent_ids": subagent_ids,
+            "all": True,
+            "message": "Stopped background Claude agents with the parent chat.",
+        })
+        result["fence_committed"] = True
+    except Exception as exc:
+        # The process is already gone, so no child can continue. Keep update
+        # admission fenced until a later Stop durably records that fact.
+        result["pending"] = ["claude-stop-fence"]
+        result["errors"].append(concise_error_message(exc))
+    result["interrupted"] = subagent_ids
+    return result
+
+
 async def interrupt_claude_sdk_run_bounded(
     run: Any,
     *,
@@ -23741,6 +24176,39 @@ async def run_claude_sdk(
                     active["claude_permission_run_id"] = candidate_run_id
                     active["claude_permissions_open"] = True
             try:
+                try:
+                    await fence_native_steer_delivery(
+                        session_id,
+                        selected,
+                        backend=BACKEND_CLAUDE,
+                    )
+                except BaseException as exc:
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
+                    raise NativeSteerHandoffError(
+                        (
+                            "Claude steering was not sent because its durable "
+                            f"delivery fence failed: {concise_error_message(exc)}"
+                        ),
+                        safe_to_requeue=True,
+                    ) from exc
+                async with ACTIVE_LOCK:
+                    active = ACTIVE.get(session_id)
+                    delivery_still_allowed = bool(
+                        active
+                        and not active.get("stop_requested")
+                        and active.get("logical_transition_ready")
+                        is transition_ready
+                        and str(
+                            active.get("logical_transition_candidate_run_id")
+                            or ""
+                        ) == candidate_run_id
+                    )
+                if not delivery_still_allowed:
+                    raise NativeSteerHandoffError(
+                        "the active Claude turn stopped before steering delivery",
+                        safe_to_requeue=True,
+                    )
                 # Once manager.start_run is entered, cancellation cannot
                 # prove whether client.query accepted the prompt: the SDK
                 # actor deliberately shields its command response. Preserve
@@ -23929,30 +24397,32 @@ async def run_claude_sdk(
                     "result_text": previous_result_text,
                     **previous_metadata,
                 })
-            await append_event(session_id, "turn_queue_run_now", {
-                "queued_id": selected.get("queued_id"),
-                "backend": BACKEND_CLAUDE,
-                "prompt": display_prompt,
-                "request_prompt": str(selected.get("prompt") or ""),
-                "display_prompt": display_prompt,
-                "file_ids": list(selected.get("file_ids") or []),
-                "display_file_ids": display_file_ids,
-                "interrupted_run_id": previous_run_id,
-                "replays_interrupted_message": False,
-                "native_steer": True,
-                "message": "Steering message sent to the active Claude chat.",
-                "remaining": remaining,
-                "superseded_queued_ids": [],
-            })
-            await append_event(session_id, "turn_started", {
-                "run_id": candidate_run_id,
-                "backend": BACKEND_CLAUDE,
-                "prompt": display_prompt,
-                "file_ids": display_file_ids,
-                "queued_id": selected.get("queued_id"),
-                "native_steer": True,
-                **metadata,
-            })
+            await append_durable_event_batch(session_id, [
+                ("turn_queue_run_now", {
+                    "queued_id": selected.get("queued_id"),
+                    "backend": BACKEND_CLAUDE,
+                    "prompt": display_prompt,
+                    "request_prompt": str(selected.get("prompt") or ""),
+                    "display_prompt": display_prompt,
+                    "file_ids": list(selected.get("file_ids") or []),
+                    "display_file_ids": display_file_ids,
+                    "interrupted_run_id": previous_run_id,
+                    "replays_interrupted_message": False,
+                    "native_steer": True,
+                    "message": "Steering message sent to the active Claude chat.",
+                    "remaining": remaining,
+                    "superseded_queued_ids": [],
+                }),
+                ("turn_started", {
+                    "run_id": candidate_run_id,
+                    "backend": BACKEND_CLAUDE,
+                    "prompt": display_prompt,
+                    "file_ids": display_file_ids,
+                    "queued_id": selected.get("queued_id"),
+                    "native_steer": True,
+                    **metadata,
+                }),
+            ])
             await release_transition(transition_ready)
             if stopped_during_handoff:
                 with suppress(Exception):
@@ -25452,6 +25922,40 @@ async def run_codex_app_server(
             transition_reserved = True
 
         try:
+            try:
+                await fence_native_steer_delivery(
+                    session_id,
+                    selected,
+                    backend=BACKEND_CODEX,
+                )
+            except BaseException as exc:
+                await release_transition_boundary()
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                raise NativeSteerHandoffError(
+                    (
+                        "Codex steering was not sent because its durable "
+                        f"delivery fence failed: {concise_error_message(exc)}"
+                    ),
+                    safe_to_requeue=True,
+                ) from exc
+            async with ACTIVE_LOCK:
+                active = ACTIVE.get(session_id)
+                delivery_still_allowed = bool(
+                    active
+                    and not active.get("stop_requested")
+                    and active.get("logical_transition_ready")
+                    is transition_ready
+                    and str(
+                        active.get("logical_transition_candidate_run_id") or ""
+                    ) == candidate_run_id
+                )
+            if not delivery_still_allowed:
+                await release_transition_boundary()
+                raise NativeSteerHandoffError(
+                    "the active Codex turn stopped before steering delivery",
+                    safe_to_requeue=True,
+                )
             steer_with_watermark = getattr(
                 turn,
                 "steer_with_notification_watermark",
@@ -25476,6 +25980,16 @@ async def run_codex_app_server(
                     client_user_message_id=candidate_run_id,
                 )
                 notification_watermark = handled_notification_sequence
+        except asyncio.CancelledError:
+            # Once the durable delivery fence exists, cancellation at the RPC
+            # boundary cannot prove that Codex did not accept the steer. Retire
+            # projection of this turn and let the command waiter receive the
+            # conservative non-replay outcome below.
+            delivery_unknown = True
+            with suppress(Exception):
+                await turn.interrupt()
+            await release_transition_boundary()
+            raise
         except CodexAppServerRequestError as exc:
             await release_transition_boundary()
             raise NativeSteerHandoffError(
@@ -25487,7 +26001,7 @@ async def run_codex_app_server(
             # queue, and interrupt the provider turn so uncertain output cannot
             # be attributed to the preceding logical request.
             delivery_unknown = True
-            with suppress(CodexAppServerError):
+            with suppress(Exception):
                 await turn.interrupt()
             with suppress(Exception):
                 await append_event(session_id, "error", {
@@ -25509,9 +26023,15 @@ async def run_codex_app_server(
 
         try:
             await drain_notifications_through(int(notification_watermark))
+        except asyncio.CancelledError:
+            delivery_unknown = True
+            with suppress(Exception):
+                await turn.interrupt()
+            await release_transition_boundary()
+            raise
         except Exception as exc:
             delivery_unknown = True
-            with suppress(CodexAppServerError):
+            with suppress(Exception):
                 await turn.interrupt()
             with suppress(Exception):
                 await append_event(session_id, "error", {
@@ -25652,7 +26172,7 @@ async def run_codex_app_server(
                     seen_artifacts,
                 )
             )
-            for event_type, payload in (
+            event_specs = [
                 (
                     "turn_stopped",
                     {
@@ -25694,21 +26214,49 @@ async def run_codex_app_server(
                         **metadata,
                     },
                 ),
-            ):
-                try:
-                    await append_event(session_id, event_type, payload)
-                except Exception:
-                    logger.exception(
-                        "could not persist native steer event session=%s type=%s",
-                        session_id,
-                        event_type,
-                    )
-        except Exception:
+            ]
+            try:
+                await append_durable_event_batch(session_id, event_specs)
+            except Exception as exc:
+                # The provider already accepted this prompt. Keep the durable
+                # pre-delivery fence as a restart hold, terminate projection of
+                # the uncertain turn, and surface a non-retryable result to the
+                # Force Send caller instead of reporting false success.
+                delivery_unknown = True
+                with suppress(Exception):
+                    await turn.interrupt()
+                with suppress(Exception):
+                    await append_event(session_id, "error", {
+                        "run_id": candidate_run_id,
+                        "backend": BACKEND_CODEX,
+                        "transport": CODEX_TRANSPORT_APP_SERVER,
+                        "message": (
+                            "Force Send was accepted, but its durable lifecycle "
+                            "could not be committed. The message was not replayed."
+                        ),
+                        "delivery_unknown": True,
+                    })
+                raise NativeSteerHandoffError(
+                    concise_error_message(exc),
+                    safe_to_requeue=False,
+                    delivery_uncertain=True,
+                ) from exc
+        except NativeSteerHandoffError:
+            raise
+        except Exception as exc:
             logger.exception(
                 "could not finish native steer bookkeeping session=%s run=%s",
                 session_id,
                 candidate_run_id,
             )
+            delivery_unknown = True
+            with suppress(Exception):
+                await turn.interrupt()
+            raise NativeSteerHandoffError(
+                concise_error_message(exc),
+                safe_to_requeue=False,
+                delivery_uncertain=True,
+            ) from exc
         finally:
             await release_transition_boundary()
 
@@ -26285,14 +26833,32 @@ async def run_codex_app_server(
                         if steer_task in done:
                             command = steer_task.result()
                             future = command.get("future")
+                            selected_for_steer = dict(
+                                command.get("selected") or {}
+                            )
                             try:
                                 async with logical_state_lock:
                                     result = await switch_logical_run(
-                                        dict(command.get("selected") or {}),
+                                        selected_for_steer,
                                         int(command.get("remaining") or 0),
                                     )
                                 if future is not None and not future.done():
                                     future.set_result(result)
+                            except asyncio.CancelledError:
+                                if future is not None and not future.done():
+                                    fenced = bool(
+                                        selected_for_steer.get(
+                                            "_native_delivery_fenced"
+                                        )
+                                    )
+                                    future.set_exception(
+                                        NativeSteerHandoffError(
+                                            "Codex steering was interrupted at the delivery boundary",
+                                            safe_to_requeue=not fenced,
+                                            delivery_uncertain=fenced,
+                                        )
+                                    )
+                                raise
                             except Exception as exc:
                                 if future is not None and not future.done():
                                     # Do not transfer a traceback that still
@@ -26947,6 +27513,26 @@ def server_update_work_message(
     )
 
 
+def update_blocking_queued_turn_count_locked() -> int:
+    """Count only queue entries that are not yet restart-durable.
+
+    Callers hold QUEUE_LOCK. Durable turns are reconstructed from events after
+    replacement, so treating them as active work can defer an update forever
+    after their parent was explicitly stopped.
+    """
+
+    return sum(
+        item.get("_durable") is False
+        or item.get("_update_transitioning") is True
+        for queue in QUEUED_TURNS.values()
+        for item in queue
+    ) + sum(
+        item.get("_durable") is False
+        or item.get("_update_transitioning") is True
+        for item in RUN_NOW_TURNS.values()
+    )
+
+
 def server_release_is_newer(latest: str, current: str) -> bool:
     try:
         return version_key(latest) > version_key(current)
@@ -27176,6 +27762,7 @@ async def health() -> dict[str, Any]:
         active = sorted(BUSY_SESSIONS)
     async with QUEUE_LOCK:
         queued = {sid: len(queue) for sid, queue in QUEUED_TURNS.items() if queue}
+        update_blocking_queued_count = update_blocking_queued_turn_count_locked()
     pressure = host_pressure_snapshot()
     tmux = tmux_capability(use_cache=True)
     return {
@@ -27202,7 +27789,10 @@ async def health() -> dict[str, Any]:
                 "required": False,
                 "message": "Signed Stable and Beta AgentsServer channels are available.",
                 "action": None,
-                "version": 2,
+                # v3 guarantees durable queued turns are preserved across a
+                # managed restart and exposes update_blocking_queued_count for
+                # the detached runner's final admission check.
+                "version": 3,
                 "tracks": ["stable", "beta"],
             },
             "tmux": tmux,
@@ -27305,6 +27895,10 @@ async def health() -> dict[str, Any]:
         "active": active,
         "active_count": len(active),
         "queued": queued,
+        # Additive updater contract. Older clients continue to render the
+        # complete queue map, while beta.8+ detached runners distinguish
+        # durable preserved messages from restart-blocking provisional work.
+        "update_blocking_queued_count": update_blocking_queued_count,
         "jobs": len(JOBS.jobs),
         "job_guard": pressure,
         "host_health_log": str(HOST_HEALTH_FILE),
@@ -27739,10 +28333,7 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                 active_session_ids = sorted(
                     BUSY_SESSIONS | SERVER_MAINTENANCE_SESSIONS
                 )
-                queued_turn_count = sum(
-                    len(queue)
-                    for queue in QUEUED_TURNS.values()
-                ) + len(RUN_NOW_TURNS)
+                queued_turn_count = update_blocking_queued_turn_count_locked()
                 provider_work_labels = (
                     []
                     if active_session_ids or queued_turn_count
@@ -29958,7 +30549,14 @@ async def post_run_queued_turn_now(
 
 @app.post("/api/sessions/{session_id}/stop")
 async def stop_turn_endpoint(session_id: str) -> dict[str, Any]:
-    return await stop_turn(session_id)
+    # Serialize explicit Stop with turn admission. Without this fence, an idle
+    # Stop could snapshot an old Claude supervisor, a new turn could bind it,
+    # and the old Stop could then evict the replacement turn.
+    async with session_lifecycle_lock(session_id):
+        update_blocker = managed_server_update_blocker()
+        if update_blocker:
+            raise HTTPException(status_code=503, detail=update_blocker)
+        return await stop_turn(session_id)
 
 
 async def quarantine_codex_goal_thread(
@@ -30220,7 +30818,9 @@ async def stop_turn(
     schedule_queue: bool = True,
     require_provider_turn_ready: bool = False,
     cascade_codex_subagents: bool = True,
+    cascade_claude_subagents: bool = True,
     hard_terminalize_on_timeout: bool = True,
+    pause_queued_turns_on_stop: bool = True,
 ) -> dict[str, Any]:
     deferred = False
     native_interrupt_reserved = False
@@ -30298,14 +30898,52 @@ async def stop_turn(
                 and not task.done()
             )
         ]
-    subagent_stop = {
-        "descendants": 0,
-        "requested": [],
-        "interrupted": [],
-        "pending": [],
-        "errors": [],
-    }
+    subagent_stop = empty_subagent_stop_result()
     session = STORE.sessions.get(session_id) or {}
+
+    async def settle_stopped_claude_subagents() -> None:
+        """Fence surviving Claude children only after this parent is idle."""
+
+        nonlocal subagent_stop
+        if (
+            not cascade_claude_subagents
+            or str(session.get("backend") or DEFAULT_BACKEND) != BACKEND_CLAUDE
+        ):
+            return
+        owns_maintenance = False
+        async with ACTIVE_LOCK:
+            session_idle = (
+                session_id not in ACTIVE
+                and session_id not in BUSY_SESSIONS
+            )
+            if session_idle:
+                already_reserved = session_id in SERVER_MAINTENANCE_SESSIONS
+                owns_maintenance = (
+                    not already_reserved
+                    or session_id in CLAUDE_STOP_FENCE_SESSIONS
+                )
+                if owns_maintenance:
+                    SERVER_MAINTENANCE_SESSIONS.add(session_id)
+        if not session_idle or not owns_maintenance:
+            return
+        # Cancellation anywhere after this point must leave update admission
+        # excluded unless the durable child-stop marker confirms completion.
+        subagent_stop["fence_committed"] = False
+        try:
+            subagent_stop = await stop_idle_claude_background_subagents(
+                session_id,
+                emit_event=emit_event,
+            )
+        finally:
+            fence_committed = bool(subagent_stop.get("fence_committed", False))
+            async with ACTIVE_LOCK:
+                if fence_committed:
+                    CLAUDE_STOP_FENCE_SESSIONS.discard(session_id)
+                    SERVER_MAINTENANCE_SESSIONS.discard(session_id)
+                else:
+                    CLAUDE_STOP_FENCE_SESSIONS.add(session_id)
+                    SERVER_MAINTENANCE_SESSIONS.add(session_id)
+
     root_thread_id = str(
         (active or {}).get("provider_thread_id")
         or (active or {}).get("provider_session_id")
@@ -30331,6 +30969,10 @@ async def stop_turn(
             "deferred": True,
             "message": "The provider had not accepted the current turn yet, so it was left running.",
         }
+    if pause_queued_turns_on_stop:
+        await pause_queued_turns_after_explicit_stop(session_id)
+    if not active and not busy:
+        await settle_stopped_claude_subagents()
     # ACTIVE is now fenced with stop_requested under the same lock consulted
     # by provider permission callbacks. Cancel existing requests only after
     # that fence, so no callback can register in the old cancel-before-stop
@@ -30375,9 +31017,12 @@ async def stop_turn(
                         schedule_queue=schedule_queue,
                         require_provider_turn_ready=require_provider_turn_ready,
                         cascade_codex_subagents=cascade_codex_subagents,
+                        cascade_claude_subagents=cascade_claude_subagents,
                         hard_terminalize_on_timeout=hard_terminalize_on_timeout,
+                        pause_queued_turns_on_stop=False,
                     )
                 if not still_busy:
+                    await settle_stopped_claude_subagents()
                     goal_result = await settle_idle_codex_goal_for_stop(
                         session_id
                     )
@@ -30428,6 +31073,7 @@ async def stop_turn(
                         session_id,
                         expected_run_id=run_id,
                     )
+                    await settle_stopped_claude_subagents()
                     if emit_event:
                         await append_event(session_id, "turn_stopped", {
                             "run_id": run_id,
@@ -30470,6 +31116,7 @@ async def stop_turn(
             # period, so it is an orphan and can be safely released.
             run_id = str(current_turn.get("run_id") or "") or None
             await release_turn_slot(session_id)
+            await settle_stopped_claude_subagents()
             if run_id:
                 RUN_METADATA.pop(run_id, None)
             if emit_event:
@@ -30485,7 +31132,7 @@ async def stop_turn(
                 "subagents": subagent_stop,
                 **goal_result,
             }
-        if schedule_queue:
+        if schedule_queue and not pause_queued_turns_on_stop:
             schedule_next_queued_turn(session_id)
         # The requested terminal state is already satisfied. Returning
         # stopped=True also lets clients clear a stale local running marker.
@@ -30606,6 +31253,7 @@ async def stop_turn(
             session_id,
             expected_run_id=run_id,
         )
+        await settle_stopped_claude_subagents()
         active_run = (STORE.sessions.get(session_id) or {}).get("active_run")
         should_emit_terminal = bool(
             emit_event
@@ -30795,6 +31443,7 @@ async def stop_turn(
         if current is not active:
             if not goal_pause_ok:
                 return await terminal_goal_pause_failure_result(native_interrupt)
+            await settle_stopped_claude_subagents()
             return {
                 "ok": True,
                 "stopped": True,
@@ -30808,6 +31457,7 @@ async def stop_turn(
                 await release_turn_slot(session_id)
                 return await terminal_goal_pause_failure_result(native_interrupt)
             await release_turn_slot(session_id)
+            await settle_stopped_claude_subagents()
             return {
                 "ok": True,
                 "stopped": True,
@@ -30842,6 +31492,7 @@ async def stop_turn(
         # No request or runner still owns this ACTIVE record. It is stale and
         # safe to clear after the bounded confirmation window.
         await release_turn_slot(session_id)
+        await settle_stopped_claude_subagents()
         if emit_event:
             await append_event(session_id, "turn_stopped", {
                 "run_id": active.get("run_id"),

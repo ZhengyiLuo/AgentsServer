@@ -335,6 +335,16 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         async def wait_for_cancel(*_args: object, **_kwargs: object) -> None:
             await asyncio.Event().wait()
 
+        async def append_durable_batch(
+            session_id: str,
+            event_specs: list[tuple[str, dict[str, object]]],
+        ) -> list[dict[str, object]]:
+            committed: list[dict[str, object]] = []
+            for event_type, payload in event_specs:
+                await events(session_id, event_type, payload)
+                committed.append({"type": event_type, **payload})
+            return committed
+
         stack = ExitStack()
         stack.enter_context(
             patch.object(
@@ -361,6 +371,16 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             patch.object(agent_server, "watch_manifest_artifacts", wait_for_cancel)
         )
         stack.enter_context(patch.object(agent_server, "append_event", events))
+        stack.enter_context(
+            patch.object(agent_server, "append_durable_event", events)
+        )
+        stack.enter_context(
+            patch.object(
+                agent_server,
+                "append_durable_event_batch",
+                side_effect=append_durable_batch,
+            )
+        )
         stack.enter_context(
             patch.object(agent_server, "append_turn_finished_event", finished)
         )
@@ -2519,6 +2539,54 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(len(delivery_errors), 1)
 
+    async def test_runner_cancellation_during_steer_resolves_uncertain_waiter(
+        self,
+    ) -> None:
+        turn = GatedSteerTurn()
+        manager = FakeManager(turn)
+        agent_server.QUEUED_TURNS["chat-native"] = deque([{
+            "queued_id": "queued-cancel-boundary",
+            "prompt": "Never replay after cancellation.",
+            "file_ids": [],
+            "backend": agent_server.BACKEND_CODEX,
+        }])
+        stack, _events, _finished, _exec_fallback = self.runner_patches(manager)
+        with stack:
+            runner = asyncio.create_task(agent_server.run_codex_app_server(
+                "chat-native",
+                "run-original",
+                "Original request",
+                dict(self.session),
+                Path(self.cwd) / ".runner-test-manifest.json",
+                allow_exec_fallback=True,
+                allow_resume_rollover=False,
+            ))
+            for _ in range(100):
+                if (agent_server.ACTIVE.get("chat-native") or {}).get(
+                    "provider_turn_ready"
+                ):
+                    break
+                await asyncio.sleep(0)
+            force_send = asyncio.create_task(agent_server.run_queued_turn_now(
+                "chat-native",
+                "queued-cancel-boundary",
+            ))
+            await asyncio.wait_for(turn.steer_started.wait(), timeout=1)
+            runner.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await runner
+            try:
+                outcome = await asyncio.wait_for(force_send, timeout=1)
+            except agent_server.NativeSteerHandoffError as exc:
+                raised_error = exc
+            else:
+                self.fail(f"expected uncertain handoff, got {outcome!r}")
+
+        self.assertTrue(raised_error.delivery_uncertain)
+        self.assertFalse(raised_error.safe_to_requeue)
+        self.assertGreaterEqual(turn.interrupt_calls, 1)
+        self.assertNotIn("chat-native", agent_server.STEERING_SESSIONS)
+
     async def test_stop_during_steer_rpc_keeps_accepted_candidate_visible(
         self,
     ) -> None:
@@ -2684,6 +2752,78 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             and call.args[2].get("delivery_unknown")
         ]
         self.assertEqual(len(uncertain_errors), 1)
+
+    async def test_accepted_steer_lifecycle_failure_is_not_reported_as_success(
+        self,
+    ) -> None:
+        turn = FakeTurn()
+        manager = FakeManager(turn)
+        agent_server.QUEUED_TURNS["chat-native"] = deque([{
+            "queued_id": "queued-lifecycle-failure",
+            "prompt": "Deliver this at most once.",
+            "file_ids": [],
+            "backend": agent_server.BACKEND_CODEX,
+        }])
+        stack, events, _finished, _exec_fallback = self.runner_patches(manager)
+
+        async def fail_native_lifecycle(
+            _session_id: str,
+            event_specs: list[tuple[str, dict[str, object]]],
+        ) -> list[dict[str, object]]:
+            if any(kind == "turn_queue_run_now" for kind, _ in event_specs):
+                raise OSError("durable lifecycle write failed")
+            committed = []
+            for event_type, payload in event_specs:
+                await events(_session_id, event_type, payload)
+                committed.append({"type": event_type, **payload})
+            return committed
+
+        with stack, patch.object(
+            agent_server,
+            "append_durable_event_batch",
+            side_effect=fail_native_lifecycle,
+        ):
+            runner = asyncio.create_task(agent_server.run_codex_app_server(
+                "chat-native",
+                "run-original",
+                "Original request",
+                dict(self.session),
+                Path(self.cwd) / ".runner-test-manifest.json",
+                allow_exec_fallback=True,
+                allow_resume_rollover=False,
+            ))
+            for _ in range(100):
+                if (agent_server.ACTIVE.get("chat-native") or {}).get(
+                    "provider_turn_ready"
+                ):
+                    break
+                await asyncio.sleep(0)
+            else:
+                self.fail("native provider turn never became ready")
+
+            force_send = asyncio.create_task(agent_server.run_queued_turn_now(
+                "chat-native",
+                "queued-lifecycle-failure",
+            ))
+            with self.assertRaises(agent_server.NativeSteerHandoffError) as raised:
+                await asyncio.wait_for(force_send, timeout=2)
+            turn.feed(completed_notification("failed"))
+            await asyncio.wait_for(runner, timeout=2)
+
+        self.assertTrue(raised.exception.delivery_uncertain)
+        self.assertFalse(raised.exception.safe_to_requeue)
+        self.assertEqual(len(turn.steer_calls), 1)
+        self.assertEqual(turn.interrupt_calls, 1)
+        fenced = [
+            call.args[2]
+            for call in events.await_args_list
+            if call.args[1] == "turn_queue_delivery_fenced"
+        ]
+        self.assertEqual(len(fenced), 1)
+        self.assertEqual(
+            fenced[0]["queued_id"],
+            "queued-lifecycle-failure",
+        )
 
     async def test_explicit_steer_rejection_is_requeued(self) -> None:
         rejection = CodexAppServerRequestError(

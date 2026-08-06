@@ -336,6 +336,8 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.previous_lifecycle_locks = agent_server.SESSION_LIFECYCLE_LOCKS
         self.previous_deleting = agent_server.DELETING_SESSIONS
         self.previous_deleted = agent_server.DELETED_SESSION_TOMBSTONES
+        self.previous_maintenance = agent_server.SERVER_MAINTENANCE_SESSIONS
+        self.previous_stop_fences = agent_server.CLAUDE_STOP_FENCE_SESSIONS
 
         self.cwd = str(Path(__file__).resolve().parent.parent)
         self.session = {
@@ -369,8 +371,24 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         agent_server.SESSION_LIFECYCLE_LOCKS = {}
         agent_server.DELETING_SESSIONS = set()
         agent_server.DELETED_SESSION_TOMBSTONES = set()
+        agent_server.SERVER_MAINTENANCE_SESSIONS = set()
+        agent_server.CLAUDE_STOP_FENCE_SESSIONS = set()
+        self.durable_event_patcher = patch.object(
+            agent_server,
+            "append_durable_event",
+            AsyncMock(return_value={}),
+        )
+        self.append_durable_event = self.durable_event_patcher.start()
+        self.durable_batch_patcher = patch.object(
+            agent_server,
+            "append_durable_event_batch",
+            AsyncMock(return_value=[]),
+        )
+        self.append_durable_event_batch = self.durable_batch_patcher.start()
 
     async def asyncTearDown(self) -> None:
+        self.durable_batch_patcher.stop()
+        self.durable_event_patcher.stop()
         for tasks in agent_server.SESSION_TURN_TASKS.values():
             for task in tasks:
                 if not task.done():
@@ -400,6 +418,8 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         agent_server.SESSION_LIFECYCLE_LOCKS = self.previous_lifecycle_locks
         agent_server.DELETING_SESSIONS = self.previous_deleting
         agent_server.DELETED_SESSION_TOMBSTONES = self.previous_deleted
+        agent_server.SERVER_MAINTENANCE_SESSIONS = self.previous_maintenance
+        agent_server.CLAUDE_STOP_FENCE_SESSIONS = self.previous_stop_fences
 
     async def _run_sdk_terminal_case(
         self,
@@ -1801,6 +1821,52 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(handle.interrupt_calls, 1)
         self.assertTrue(runner.cancelled() or runner.done())
 
+    async def test_idle_stop_retires_only_chat_with_background_subagents(self) -> None:
+        manager = FakeClaudeManager()
+        agent_server.CLAUDE_SDK_MANAGER = manager
+        agent_server.ACTIVE = {}
+        agent_server.BUSY_SESSIONS = set()
+        agent_server.CURRENT_TURNS = {}
+        snapshot = {
+            "active_count": 1,
+            "subagents": [{
+                "run_id": "run-parent",
+                "subagent_id": "child-one",
+                "subagent_status": "running",
+            }],
+        }
+        append_event = AsyncMock(return_value={})
+
+        with patch.object(
+            agent_server,
+            "build_claude_subagent_snapshot",
+            return_value=snapshot,
+        ), patch.object(
+            agent_server,
+            "append_event",
+            append_event,
+        ), patch.object(
+            agent_server,
+            "cancel_codex_interactions",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "cancel_claude_interactions",
+            AsyncMock(),
+        ):
+            result = await agent_server.stop_turn("chat-claude")
+
+        self.assertTrue(result["stopped"])
+        self.assertEqual(manager.evict_calls, [("chat-claude", True)])
+        self.assertEqual(result["subagents"]["interrupted"], ["child-one"])
+        marker = next(
+            call
+            for call in self.append_durable_event.await_args_list
+            if call.args[1] == "claude_subagents_stopped"
+        )
+        self.assertEqual(marker.args[2]["run_ids"], ["run-parent"])
+        self.assertTrue(marker.args[2]["all"])
+
     async def test_startup_query_can_request_permission_before_handle_returns(self) -> None:
         handle = FakeClaudeRun([{
             "type": "result",
@@ -2968,15 +3034,18 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         manager = SequencedClaudeManager([first, second])
         handoff_bookkeeping = asyncio.Event()
 
-        async def append_event(
+        async def append_durable_event_batch(
             _session_id: str,
-            event_type: str,
-            _payload: dict[str, object],
-        ) -> dict[str, object]:
-            if event_type == "turn_queue_run_now":
+            event_specs: list[tuple[str, dict[str, object]]],
+        ) -> list[dict[str, object]]:
+            await self.append_durable_event_batch(_session_id, event_specs)
+            if any(
+                event_type == "turn_queue_run_now"
+                for event_type, _payload in event_specs
+            ):
                 handoff_bookkeeping.set()
                 await asyncio.Event().wait()
-            return {}
+            return []
 
         with patch.object(
             agent_server,
@@ -3000,8 +3069,12 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             wait_forever,
         ), patch.object(
             agent_server,
+            "append_durable_event_batch",
+            side_effect=append_durable_event_batch,
+        ), patch.object(
+            agent_server,
             "append_event",
-            side_effect=append_event,
+            AsyncMock(return_value={}),
         ), patch.object(
             agent_server,
             "append_turn_finished_event",
@@ -3085,6 +3158,14 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(raised.exception.delivery_uncertain)
         self.assertFalse(raised.exception.safe_to_requeue)
         self.assertEqual(manager.evict_calls, [("chat-claude", True)])
+        fences = [
+            payload
+            for call in self.append_durable_event_batch.await_args_list
+            for event_type, payload in call.args[1]
+            if event_type == "turn_queue_delivery_fenced"
+        ]
+        self.assertEqual(len(fences), 1)
+        self.assertEqual(fences[0]["queued_id"], "queued-next")
 
     async def test_cancellation_during_candidate_query_is_never_replayed(self) -> None:
         first = FakeClaudeRun()

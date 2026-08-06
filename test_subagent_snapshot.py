@@ -307,6 +307,35 @@ class ClaudeSubagentSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_run["run-stopped"]["subagent_status"], "stopped")
         self.assertEqual(snapshot["active_count"], 1)
 
+    def test_idle_stop_marker_terminalizes_prior_background_agents(self) -> None:
+        events = [
+            self.event(1, "tool_started", run_id="run-parent", tool={
+                "id": "agent-tool",
+                "name": "Agent",
+                "input": {
+                    "description": "Background worker",
+                    "run_in_background": True,
+                },
+            }),
+            self.event(2, "turn_finished", run_id="run-parent", exit_code=0),
+            self.event(
+                3,
+                "claude_subagents_stopped",
+                run_ids=["run-parent"],
+                subagent_ids=["agent-tool"],
+                **{"all": True},
+            ),
+        ]
+        self.write_events(events)
+
+        snapshot = agent_server.build_claude_subagent_snapshot(self.session_id)
+
+        self.assertEqual(snapshot["active_count"], 0)
+        self.assertEqual(
+            snapshot["subagents"][0]["subagent_status"],
+            "stopped",
+        )
+
     def test_snapshot_bounds_states_logs_and_endpoint_limit(self) -> None:
         events: list[dict[str, object]] = []
         seq = 0

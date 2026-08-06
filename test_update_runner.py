@@ -467,6 +467,51 @@ class UpdateRunnerTests(unittest.TestCase):
             ):
                 update_runner.assert_server_idle(7850, token="one-time-token")
 
+    def test_pre_restart_idle_check_ignores_server_declared_durable_queue(self):
+        payload = json.dumps({
+            "ok": True,
+            "active_count": 0,
+            "queued": {"chat": 4},
+            "update_blocking_queued_count": 0,
+        }).encode()
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                return payload
+
+        with patch.object(update_runner.urllib.request, "urlopen", return_value=Response()):
+            snapshot = update_runner.server_work_snapshot(7850)
+
+        self.assertEqual(snapshot, (0, 0))
+
+    def test_pre_restart_idle_check_keeps_legacy_queue_fail_closed(self):
+        payload = json.dumps({
+            "ok": True,
+            "active_count": 0,
+            "queued": {"chat": 2},
+        }).encode()
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                return payload
+
+        with patch.object(update_runner.urllib.request, "urlopen", return_value=Response()):
+            snapshot = update_runner.server_work_snapshot(7850)
+
+        self.assertEqual(snapshot, (0, 2))
+
     def test_one_time_health_credential_is_consumed(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "update-auth.json"

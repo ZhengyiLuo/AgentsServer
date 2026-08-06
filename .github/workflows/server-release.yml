@@ -30,7 +30,7 @@ jobs:
       - name: Lock and test
         run: |
           uv lock --check
-          uv run python -m unittest discover -p 'test_*.py'
+          PYTHONFAULTHANDLER=1 uv run python -X faulthandler -m unittest discover -v -p 'test_*.py'
       - name: Build release assets
         run: |
           rm -rf dist

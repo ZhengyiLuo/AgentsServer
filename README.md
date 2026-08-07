@@ -611,12 +611,14 @@ PATCH /api/sessions/{session_id}/workspace/entry
 DELETE /api/sessions/{session_id}/workspace/entry?path=src/old.ts&expected_revision=...&recursive=false
 ```
 
-Reads accept UTF-8 regular files up to 2 MiB by default. Writes are atomic,
+Reads accept complete UTF-8 regular files up to 32 MiB by default, replacing
+the legacy 2 MiB editor ceiling. Writes are atomic,
 require the SHA-256 revision returned by the read endpoint, and reject stale
 revisions, symlinks, special files, hard links, archived chats, and read-only
 targets. Directory traversal is descriptor-relative and fails closed when the
 host lacks secure no-follow file APIs. Configure the text limit with
-`AGENTSDOCK_WORKSPACE_TEXT_MAX_BYTES`.
+`AGENTSDOCK_WORKSPACE_TEXT_MAX_BYTES`; a positive value selects a bounded
+transport ceiling, while an explicit zero disables the AgentsServer ceiling.
 
 Workspace-files capability v2 adds an opaque `revision` to every explorer and
 search entry. Rename accepts `{path, new_name, expected_revision}`, is limited

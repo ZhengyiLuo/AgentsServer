@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import codecs
 import ctypes
 import errno
 import fcntl
@@ -429,11 +430,31 @@ HANDOFF_DIGEST_MODEL = agentsdock_setting("HANDOFF_DIGEST_MODEL", "sonnet").stri
 HANDOFF_DIGEST_EFFORT = agentsdock_setting("HANDOFF_DIGEST_EFFORT", "").strip()
 DEFAULT_SESSION_EVENT_LIMIT = int(agentsdock_setting("SESSION_EVENT_LIMIT", "100"))
 MAX_EVENT_RESPONSE_LIMIT = int(agentsdock_setting("MAX_EVENT_RESPONSE_LIMIT", "1000"))
-MAX_WORKSPACE_TEXT_BYTES = int(agentsdock_setting("WORKSPACE_TEXT_MAX_BYTES", str(2 * 1024 * 1024)))
 MAX_WORKSPACE_PREVIEW_BYTES = max(
     1,
     int(agentsdock_setting("WORKSPACE_PREVIEW_MAX_BYTES", str(100 * 1024 * 1024))),
 )
+DEFAULT_MAX_WORKSPACE_TEXT_BYTES = 32 * 1024 * 1024
+
+
+def parse_workspace_text_max_bytes(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise ValueError("AGENTSDOCK_WORKSPACE_TEXT_MAX_BYTES must be zero or a positive integer")
+    return parsed
+
+
+# The legacy 2 MiB ceiling rejected ordinary generated TSV/JSON files. Keep a
+# practical default bound because text is transported as JSON and held by both
+# the server and Electron editor; operators can explicitly set zero for no
+# AgentsServer-imposed ceiling.
+MAX_WORKSPACE_TEXT_BYTES = parse_workspace_text_max_bytes(
+    agentsdock_setting("WORKSPACE_TEXT_MAX_BYTES", str(DEFAULT_MAX_WORKSPACE_TEXT_BYTES))
+)
+# Released Electron clients expect a positive numeric capability and otherwise
+# fall back to their legacy 2 MiB default. Keep the unlimited sentinel exactly
+# representable by JavaScript numbers.
+WORKSPACE_UNLIMITED_TEXT_BYTES = (1 << 53) - 1
 MAX_WORKSPACE_PATH_CHARS = int(agentsdock_setting("WORKSPACE_PATH_MAX_CHARS", "4096"))
 MAX_WORKSPACE_SEARCH_SCAN = int(agentsdock_setting("WORKSPACE_SEARCH_MAX_ENTRIES", "20000"))
 MAX_WORKSPACE_SEARCH_SECONDS = max(
@@ -1156,6 +1177,76 @@ def workspace_revision(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def workspace_text_limit_exceeded(size: int) -> bool:
+    return MAX_WORKSPACE_TEXT_BYTES > 0 and size > MAX_WORKSPACE_TEXT_BYTES
+
+
+def workspace_text_bytes_capability() -> int:
+    return MAX_WORKSPACE_TEXT_BYTES or WORKSPACE_UNLIMITED_TEXT_BYTES
+
+
+def workspace_fd_revision(file_fd: int, max_bytes: int = 0) -> tuple[str, int]:
+    """Hash an open file descriptor without retaining its contents in memory."""
+    digest = hashlib.sha256()
+    size = 0
+    while True:
+        chunk = os.read(file_fd, 1024 * 1024)
+        if not chunk:
+            break
+        size += len(chunk)
+        if max_bytes > 0 and size > max_bytes:
+            raise OverflowError
+        digest.update(chunk)
+    return digest.hexdigest(), size
+
+
+def read_workspace_text_fd(
+    file_fd: int,
+    normalized: str,
+    error_prefix: Literal["workspace", "absolute"],
+) -> tuple[str, str, int]:
+    """Decode and hash a text file incrementally, retaining only text output."""
+    digest = hashlib.sha256()
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+    content_chunks: list[str] = []
+    size = 0
+    while True:
+        chunk = os.read(file_fd, 1024 * 1024)
+        if not chunk:
+            break
+        size += len(chunk)
+        if workspace_text_limit_exceeded(size):
+            raise workspace_http_error(
+                413,
+                f"{error_prefix}_file_too_large",
+                f"{normalized} exceeds the configured workspace text transfer limit.",
+            )
+        if b"\x00" in chunk:
+            raise workspace_http_error(
+                415,
+                f"{error_prefix}_binary_file",
+                f"{normalized} is binary and cannot be opened in the text editor.",
+            )
+        digest.update(chunk)
+        try:
+            content_chunks.append(decoder.decode(chunk, final=False))
+        except UnicodeDecodeError as exc:
+            raise workspace_http_error(
+                415,
+                f"{error_prefix}_encoding_unsupported",
+                f"{normalized} is not UTF-8 text.",
+            ) from exc
+    try:
+        content_chunks.append(decoder.decode(b"", final=True))
+    except UnicodeDecodeError as exc:
+        raise workspace_http_error(
+            415,
+            f"{error_prefix}_encoding_unsupported",
+            f"{normalized} is not UTF-8 text.",
+        ) from exc
+    return "".join(content_chunks), digest.hexdigest(), size
+
+
 def workspace_entry_revision(item_stat: os.stat_result) -> str:
     """Opaque revision for guarding metadata mutations against stale tree state."""
     identity = "\0".join(str(value) for value in (
@@ -1231,7 +1322,7 @@ def workspace_info_sync(session_id: str) -> dict[str, Any]:
         "name": root.name or str(root),
         "read_only": bool(sess.get("archived")),
         "capability_version": 6 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
-        "max_text_file_bytes": MAX_WORKSPACE_TEXT_BYTES,
+        "max_text_file_bytes": workspace_text_bytes_capability(),
         "max_preview_file_bytes": MAX_WORKSPACE_PREVIEW_BYTES,
         "preview_media_types": sorted(set(WORKSPACE_PREVIEW_MEDIA_TYPES.values())),
     }
@@ -1291,36 +1382,20 @@ def read_workspace_file_sync(session_id: str, relative_path: str) -> dict[str, A
         item_stat = os.fstat(file_fd)
         if not stat.S_ISREG(item_stat.st_mode):
             raise workspace_http_error(400, "workspace_not_regular_file", f"Not a regular workspace file: {normalized}")
-        if item_stat.st_size > MAX_WORKSPACE_TEXT_BYTES:
+        if workspace_text_limit_exceeded(item_stat.st_size):
             raise workspace_http_error(
                 413,
                 "workspace_file_too_large",
-                f"{normalized} is larger than the {MAX_WORKSPACE_TEXT_BYTES // (1024 * 1024)} MiB editor limit.",
+                f"{normalized} exceeds the configured workspace text transfer limit.",
             )
-        chunks: list[bytes] = []
-        remaining = MAX_WORKSPACE_TEXT_BYTES + 1
-        while remaining > 0:
-            chunk = os.read(file_fd, min(1024 * 1024, remaining))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        data = b"".join(chunks)
-        if len(data) > MAX_WORKSPACE_TEXT_BYTES:
-            raise workspace_http_error(413, "workspace_file_too_large", f"{normalized} exceeds the editor size limit.")
-        if b"\x00" in data:
-            raise workspace_http_error(415, "workspace_binary_file", f"{normalized} is binary and cannot be opened in the text editor.")
-        try:
-            content = data.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise workspace_http_error(415, "workspace_encoding_unsupported", f"{normalized} is not UTF-8 text.") from exc
+        content, revision, size = read_workspace_text_fd(file_fd, normalized, "workspace")
         return {
             "root": str(root),
             "path": normalized,
             "name": name,
             "content": content,
-            "revision": workspace_revision(data),
-            "size": len(data),
+            "revision": revision,
+            "size": size,
             "mtime_ns": int(item_stat.st_mtime_ns),
             "writable": not bool(sess.get("archived")) and bool(item_stat.st_mode & 0o222),
         }
@@ -1395,36 +1470,20 @@ def read_absolute_file_sync(session_id: str, absolute_path: str) -> dict[str, An
         item_stat = os.fstat(file_fd)
         if not stat.S_ISREG(item_stat.st_mode):
             raise workspace_http_error(400, "absolute_not_regular_file", f"Not a regular file: {normalized}")
-        if item_stat.st_size > MAX_WORKSPACE_TEXT_BYTES:
+        if workspace_text_limit_exceeded(item_stat.st_size):
             raise workspace_http_error(
                 413,
                 "absolute_file_too_large",
-                f"{normalized} is larger than the {MAX_WORKSPACE_TEXT_BYTES // (1024 * 1024)} MiB editor limit.",
+                f"{normalized} exceeds the configured workspace text transfer limit.",
             )
-        chunks: list[bytes] = []
-        remaining = MAX_WORKSPACE_TEXT_BYTES + 1
-        while remaining > 0:
-            chunk = os.read(file_fd, min(1024 * 1024, remaining))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        data = b"".join(chunks)
-        if len(data) > MAX_WORKSPACE_TEXT_BYTES:
-            raise workspace_http_error(413, "absolute_file_too_large", f"{normalized} exceeds the editor size limit.")
-        if b"\x00" in data:
-            raise workspace_http_error(415, "absolute_binary_file", f"{normalized} is binary and cannot be opened in the text editor.")
-        try:
-            content = data.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise workspace_http_error(415, "absolute_encoding_unsupported", f"{normalized} is not UTF-8 text.") from exc
+        content, revision, size = read_workspace_text_fd(file_fd, normalized, "absolute")
         return {
             "root": str(root),
             "path": normalized,
             "name": name,
             "content": content,
-            "revision": workspace_revision(data),
-            "size": len(data),
+            "revision": revision,
+            "size": size,
             "mtime_ns": int(item_stat.st_mtime_ns),
             "writable": (
                 WORKSPACE_MUTATIONS_AVAILABLE
@@ -1702,8 +1761,8 @@ def write_workspace_file_locked(
     data = content.encode("utf-8")
     if b"\x00" in data:
         raise workspace_http_error(415, "workspace_binary_file", "Edited content cannot contain NUL bytes.")
-    if len(data) > MAX_WORKSPACE_TEXT_BYTES:
-        raise workspace_http_error(413, "workspace_file_too_large", "Edited content exceeds the workspace editor size limit.")
+    if workspace_text_limit_exceeded(len(data)):
+        raise workspace_http_error(413, "workspace_file_too_large", "Edited content exceeds the configured workspace text transfer limit.")
     parent_fd, name = open_workspace_parent_fd(root, normalized)
     current_fd = -1
     temp_fd = -1
@@ -1724,20 +1783,20 @@ def write_workspace_file_locked(
             )
         if not bool(current_stat.st_mode & 0o222):
             raise workspace_http_error(403, "workspace_permission_denied", f"Workspace file is read-only: {normalized}")
-        if current_stat.st_size > MAX_WORKSPACE_TEXT_BYTES:
-            raise workspace_http_error(413, "workspace_file_too_large", f"{normalized} exceeds the editor size limit.")
-        current_chunks: list[bytes] = []
-        current_size = 0
-        while True:
-            chunk = os.read(current_fd, 1024 * 1024)
-            if not chunk:
-                break
-            current_chunks.append(chunk)
-            current_size += len(chunk)
-            if current_size > MAX_WORKSPACE_TEXT_BYTES:
-                raise workspace_http_error(413, "workspace_file_too_large", f"{normalized} exceeds the editor size limit.")
-        current_data = b"".join(current_chunks)
-        actual_revision = workspace_revision(current_data)
+        if workspace_text_limit_exceeded(current_stat.st_size):
+            raise workspace_http_error(
+                413,
+                "workspace_file_too_large",
+                f"{normalized} exceeds the workspace text transfer limit.",
+            )
+        try:
+            actual_revision, _ = workspace_fd_revision(current_fd, MAX_WORKSPACE_TEXT_BYTES)
+        except OverflowError:
+            raise workspace_http_error(
+                413,
+                "workspace_file_too_large",
+                f"{normalized} exceeds the workspace text transfer limit.",
+            ) from None
         if not hmac.compare_digest(actual_revision, expected_revision.lower()):
             raise workspace_http_error(
                 409,
@@ -1762,17 +1821,14 @@ def write_workspace_file_locked(
                 latest_stat = os.fstat(latest_fd)
                 if not stat.S_ISREG(latest_stat.st_mode):
                     raise workspace_http_error(409, "workspace_file_conflict", f"{normalized} changed while it was being saved.")
-                latest_chunks: list[bytes] = []
-                latest_size = 0
-                while True:
-                    chunk = os.read(latest_fd, 1024 * 1024)
-                    if not chunk:
-                        break
-                    latest_chunks.append(chunk)
-                    latest_size += len(chunk)
-                    if latest_size > MAX_WORKSPACE_TEXT_BYTES:
-                        raise workspace_http_error(409, "workspace_file_conflict", f"{normalized} changed while it was being saved.")
-                latest_data = b"".join(latest_chunks)
+                try:
+                    latest_revision, _ = workspace_fd_revision(latest_fd, MAX_WORKSPACE_TEXT_BYTES)
+                except OverflowError:
+                    raise workspace_http_error(
+                        409,
+                        "workspace_file_conflict",
+                        f"{normalized} changed while it was being saved.",
+                    ) from None
             finally:
                 if latest_fd >= 0:
                     os.close(latest_fd)
@@ -1783,7 +1839,7 @@ def write_workspace_file_locked(
                 or latest_stat.st_uid != current_stat.st_uid
                 or latest_stat.st_gid != current_stat.st_gid
                 or latest_stat.st_nlink != current_stat.st_nlink
-                or not hmac.compare_digest(workspace_revision(latest_data), actual_revision)
+                or not hmac.compare_digest(latest_revision, actual_revision)
             ):
                 raise workspace_http_error(
                     409,
@@ -3461,7 +3517,7 @@ class CodexBackgroundTerminalsCleanRequest(BaseModel):
 
 class WorkspaceWriteRequest(BaseModel):
     path: str = Field(min_length=1, max_length=MAX_WORKSPACE_PATH_CHARS)
-    content: str = Field(max_length=MAX_WORKSPACE_TEXT_BYTES)
+    content: str
     expected_revision: str = Field(min_length=64, max_length=64)
 
 
@@ -27868,7 +27924,7 @@ async def health() -> dict[str, Any]:
                 ),
                 "action": None if WORKSPACE_SECURE_OPEN_AVAILABLE else "Use a supported macOS or Linux host.",
                 "version": 6 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
-                "max_text_file_bytes": MAX_WORKSPACE_TEXT_BYTES,
+                "max_text_file_bytes": workspace_text_bytes_capability(),
                 "max_preview_file_bytes": MAX_WORKSPACE_PREVIEW_BYTES,
                 "preview_media_types": sorted(set(WORKSPACE_PREVIEW_MEDIA_TYPES.values())),
             },

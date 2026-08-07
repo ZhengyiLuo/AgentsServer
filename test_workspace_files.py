@@ -113,6 +113,28 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertEqual(searched["revision"], listed["revision"])
         self.assertNotEqual(changed["revision"], listed["revision"])
 
+    def test_text_limit_is_advertised_to_workspace_and_health_clients(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}), \
+                 patch.object(agent_server, "working_tmux_bin", return_value=None):
+                info = agent_server.workspace_info_sync("session-1")
+                health = asyncio.run(agent_server.health())
+
+        self.assertEqual(info["max_text_file_bytes"], 32 * 1024 * 1024)
+        self.assertEqual(health["capabilities"]["workspace_files"]["max_text_file_bytes"], 32 * 1024 * 1024)
+
+    def test_explicit_zero_text_limit_is_advertised_as_unlimited(self) -> None:
+        with patch.object(agent_server, "MAX_WORKSPACE_TEXT_BYTES", 0):
+            self.assertEqual(
+                agent_server.workspace_text_bytes_capability(),
+                agent_server.WORKSPACE_UNLIMITED_TEXT_BYTES,
+            )
+
+    def test_negative_text_limit_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be zero or a positive integer"):
+            agent_server.parse_workspace_text_max_bytes("-1")
+
     def test_create_file_and_directory_returns_editor_and_tree_shapes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -622,6 +644,29 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertEqual(result["revision"], agent_server.workspace_revision(data))
         self.assertEqual(result["size"], len(data))
 
+    def test_incremental_text_read_preserves_utf8_split_across_chunk_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data = (b"x" * (1024 * 1024 - 1)) + "é\n".encode("utf-8")
+            (root / "chunk-boundary.txt").write_bytes(data)
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
+                result = agent_server.read_workspace_file_sync("session-1", "chunk-boundary.txt")
+
+        self.assertEqual(result["content"].encode("utf-8"), data)
+        self.assertEqual(result["revision"], agent_server.workspace_revision(data))
+        self.assertEqual(result["size"], len(data))
+
+    def test_incremental_text_read_rejects_truncated_final_utf8_sequence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "truncated.txt").write_bytes((b"x" * (1024 * 1024)) + b"\xc3")
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
+                with self.assertRaises(HTTPException) as raised:
+                    agent_server.read_workspace_file_sync("session-1", "truncated.txt")
+
+        self.assertEqual(raised.exception.status_code, 415)
+        self.assertEqual(raised.exception.detail["code"], "workspace_encoding_unsupported")
+
     def test_explicit_absolute_read_is_canonical_nofollow_and_does_not_expand_workspace_mutations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()
@@ -812,6 +857,41 @@ class WorkspaceFilesTests(unittest.TestCase):
                     with self.assertRaises(HTTPException) as too_large:
                         agent_server.read_workspace_file_sync("session-1", "large.txt")
                     self.assertEqual(too_large.exception.status_code, 413)
+
+    def test_files_above_the_legacy_two_mib_limit_remain_editable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            path = root / "generated.tsv"
+            original = "a\tb\n" * (600 * 1024)
+            updated_content = original + "last\trow\n"
+            self.assertGreater(len(original.encode("utf-8")), 2 * 1024 * 1024)
+            self.assertFalse(agent_server.workspace_text_limit_exceeded(len(updated_content.encode("utf-8"))))
+            path.write_text(original)
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
+                opened = agent_server.read_workspace_file_sync("session-1", "generated.tsv")
+                updated = agent_server.write_workspace_file_sync(
+                    "session-1",
+                    "generated.tsv",
+                    updated_content,
+                    opened["revision"],
+                )
+                absolute_opened = agent_server.read_absolute_file_sync("session-1", str(path))
+                absolute_content = updated_content + "absolute\twrite\n"
+                absolute_updated = agent_server.write_absolute_file_sync(
+                    "session-1",
+                    str(path),
+                    absolute_content,
+                    absolute_opened["revision"],
+                )
+
+        self.assertTrue(opened["writable"])
+        self.assertEqual(opened["content"], original)
+        self.assertEqual(updated["content"], updated_content)
+        self.assertEqual(updated["size"], len(updated_content.encode("utf-8")))
+        self.assertTrue(absolute_opened["writable"])
+        self.assertEqual(absolute_opened["content"], updated_content)
+        self.assertEqual(absolute_updated["scope"], "absolute")
+        self.assertEqual(absolute_updated["content"], absolute_content)
 
     def test_preview_get_and_head_stream_safe_media_with_revision_and_ranges(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

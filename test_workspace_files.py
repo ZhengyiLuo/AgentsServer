@@ -688,6 +688,44 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertEqual(mutation.exception.detail["code"], "invalid_workspace_path")
         self.assertEqual(unchanged, "# outside\n")
 
+    def test_explicit_home_relative_path_expands_against_the_server_users_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            workspace = base / "workspace"
+            workspace.mkdir()
+            home = base / "remote-home"
+            settings_directory = home / ".claude"
+            settings_directory.mkdir(parents=True)
+            settings = settings_directory / "settings.local.json"
+            settings.write_text('{"permissions": {}}\n')
+            with (
+                patch.object(agent_server.STORE, "sessions", {"session-1": self.session(workspace)}),
+                patch.object(agent_server.Path, "home", return_value=home),
+            ):
+                original = agent_server.read_absolute_file_sync(
+                    "session-1",
+                    "~/.claude/settings.local.json",
+                )
+                updated = agent_server.write_absolute_file_sync(
+                    "session-1",
+                    "~/.claude/settings.local.json",
+                    '{"permissions": {"allow": []}}\n',
+                    original["revision"],
+                )
+                with self.assertRaises(HTTPException) as named_home:
+                    agent_server.read_absolute_file_sync("session-1", "~other/settings.json")
+                with self.assertRaises(HTTPException) as traversal:
+                    agent_server.read_absolute_file_sync("session-1", "~/.claude/../settings.json")
+
+            content = settings.read_text()
+
+        self.assertEqual(original["path"], str(settings))
+        self.assertEqual(original["content"], '{"permissions": {}}\n')
+        self.assertEqual(updated["path"], str(settings))
+        self.assertEqual(content, '{"permissions": {"allow": []}}\n')
+        self.assertEqual(named_home.exception.detail["code"], "invalid_absolute_file_path")
+        self.assertEqual(traversal.exception.detail["code"], "invalid_absolute_file_path")
+
     def test_explicit_absolute_write_is_revision_checked_atomic_and_nofollow(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()

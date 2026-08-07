@@ -87,6 +87,8 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Keep work needed for the current reply in foreground", instructions)
         self.assertIn("tracked Agent/workflow", instructions)
         self.assertIn("does not guarantee a completion wake-up", instructions)
+        self.assertIn("Never use Claude's `/loop` or `CronCreate`", instructions)
+        self.assertIn("durable AgentsDock jobs", instructions)
         self.assertLessEqual(len(instructions.splitlines()), 15)
 
     async def test_new_thread_receives_policy_once_at_thread_start(self) -> None:

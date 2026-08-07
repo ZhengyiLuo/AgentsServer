@@ -1635,7 +1635,11 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(captured_options["permission_mode"], "plan")
-        self.assertNotIn("disallowed_tools", captured_options)
+        self.assertEqual(captured_options["disallowed_tools"], ["CronCreate"])
+        self.assertEqual(
+            captured_options["thinking"],
+            {"type": "adaptive", "display": "summarized"},
+        )
         self.assertEqual(
             captured_options["extra_args"],
             {
@@ -1774,9 +1778,11 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("--permission-mode", command)
         disallowed_index = command.index("--disallowedTools")
         self.assertEqual(
-            command[disallowed_index + 1:disallowed_index + 4],
-            ["AskUserQuestion", "EnterPlanMode", "ExitPlanMode"],
+            command[disallowed_index + 1:disallowed_index + 5],
+            ["AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "CronCreate"],
         )
+        self.assertNotIn("CronList", command)
+        self.assertNotIn("CronDelete", command)
 
     async def test_sdk_stop_timeout_retires_only_chat_and_terminalizes(self) -> None:
         handle = FakeClaudeRun()
@@ -2320,6 +2326,45 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [payload["is_error"] for payload in finished],
             [False, False, True, False],
+        )
+
+    async def test_claude_thinking_summary_is_projected_to_reasoning(self) -> None:
+        from claude_agent_sdk.types import AssistantMessage, ThinkingBlock
+
+        append_event = AsyncMock(return_value={})
+
+        with patch.object(
+            agent_server,
+            "append_event",
+            append_event,
+        ), patch.object(
+            agent_server,
+            "mark_provider_turn_ready",
+            AsyncMock(),
+        ):
+            await agent_server.project_claude_sdk_message(
+                "chat-claude",
+                "run-claude",
+                AssistantMessage(
+                    content=[ThinkingBlock(
+                        thinking="Checking the failed jobs before submission.",
+                        signature="provider-summary",
+                    )],
+                    model="claude-test",
+                    session_id="provider",
+                ),
+                text_parts=[],
+                current_tools={},
+                changed_paths=set(),
+            )
+
+        append_event.assert_awaited_once_with(
+            "chat-claude",
+            "reasoning_summary",
+            {
+                "run_id": "run-claude",
+                "text": "Checking the failed jobs before submission.",
+            },
         )
 
     async def test_typed_task_lifecycle_projects_only_snapshot_fields(self) -> None:

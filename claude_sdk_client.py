@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import re
 import shlex
 import time
@@ -31,6 +32,9 @@ from typing import (
     Protocol,
     runtime_checkable,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 CLAUDE_AGENT_SDK_MIN_VERSION = "0.2.130"
@@ -1330,12 +1334,17 @@ class ClaudeSDKSupervisor:
             or active.correlation_id != command.correlation_id
         ):
             return
-        error = ClaudeSDKQueryError(
-            f"Claude SDK did not acknowledge query {command.run_id} for chat "
-            f"{self.chat_id}; delivery is uncertain"
+        # Replay acknowledgements are an ownership fence, not a provider SLA.
+        # Large resumed contexts can accept and persist the prompt immediately
+        # while delaying the replay frame beyond this diagnostic threshold. Keep
+        # waiting behind the exact-UUID gate; stream failure or an explicit
+        # pre-ack interrupt still retires the uncertain delivery.
+        logger.warning(
+            "Claude SDK replay acknowledgement delayed for query %s in chat %s; "
+            "continuing to wait",
+            command.run_id,
+            self.chat_id,
         )
-        self._fail_active(error)
-        await self._disconnect_current_client()
 
     async def _handle_receiver_stopped(self, command: _ReceiverStopped) -> None:
         if command.generation != self._generation:

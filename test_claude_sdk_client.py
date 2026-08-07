@@ -722,7 +722,7 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
             [("interrupt",)],
         )
 
-    async def test_ack_timeout_fails_disconnects_and_never_replays_query(self) -> None:
+    async def test_ack_timeout_warns_and_accepts_late_exact_replay(self) -> None:
         factory = FakeFactory()
         factory.auto_ack = False
         manager = ClaudeSDKSupervisorManager(
@@ -739,10 +739,19 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
         )
         client = factory.clients[0]
 
-        with self.assertRaises(ClaudeSDKQueryError) as raised:
-            await asyncio.wait_for(handle.wait_result(), 1)
-        self.assertTrue(raised.exception.delivery_uncertain)
-        self.assertTrue(client.disconnected)
+        with self.assertLogs("claude_sdk_client", level="WARNING") as captured:
+            await asyncio.sleep(0.03)
+        self.assertIn("continuing to wait", "\n".join(captured.output))
+        self.assertFalse(handle.done)
+        self.assertFalse(handle.acknowledged)
+        self.assertFalse(client.disconnected)
+
+        await client.emit(replay_ack(handle.correlation_id))
+        result = {"type": "result", "result": "late but valid"}
+        await client.emit(result)
+        self.assertEqual(await asyncio.wait_for(collect(handle), 1), [result])
+        self.assertEqual(await handle.wait_result(), result)
+        self.assertFalse(client.disconnected)
         self.assertEqual(
             [call for call in client.calls if call[0] == "query"],
             [("query", "Prompt", {})],

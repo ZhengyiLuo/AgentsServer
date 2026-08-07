@@ -514,7 +514,7 @@ You are operating through AgentsDock, backed by AgentsServer.
 - This is AgentsDock, not Slack; never use Slack file helpers.
 - Link editor-readable files with Markdown paths relative to the chat working directory, optionally with `#L42`; do not use `file://`.
 - Publish user-facing files with `"$AGENTSDOCK_PUBLISH_CLI" --chat-id "$AGENTSDOCK_CHAT_ID" /absolute/path.ext`; metadata uses `--entry-json '{{"path":"/absolute/video.mp4","title":"Demo","text":"Optional note"}}'`. Say “attached” only after a successful JSON receipt. Older-server fallback: write `{{"files":["/absolute/path.ext"]}}` to resolved `$AGENTSDOCK_MANIFEST_PATH` and say only “submitted for attachment.” Use absolute paths and playable `.mp4`/`.mov` videos.
-- Manage jobs only when explicitly asked; use `"$AGENTSDOCK_JOBS_CLI"` list/help, not API or prompt snapshots.
+- Never use Claude's `/loop` or `CronCreate`; manage durable AgentsDock jobs only when asked via `"$AGENTSDOCK_JOBS_CLI"` list/help.
 - Inspect `$AGENTSDOCK_TMUX_SESSION` read-only unless explicitly asked to operate it.
 - Check skills and project playbooks before claiming an environment or remote path is unavailable.
 - If optional cleanup makes a compound command fail, immediately retry the still-safe requested operation without it.
@@ -1335,13 +1335,24 @@ def normalize_absolute_file_path(value: str | None) -> tuple[Path, str, str]:
 
     This is deliberately separate from workspace normalization. It accepts no
     relative, dot-segment, or lexically non-canonical paths, so callers cannot
-    smuggle traversal semantics into a direct-read request.
+    smuggle traversal semantics into a direct-read request. A leading ``~/``
+    is the one supported shorthand: it expands on AgentsServer so it always
+    refers to the remote server account's home rather than Electron's host.
     """
     raw = str(value or "")
     if "\x00" in raw:
         raise workspace_http_error(400, "invalid_absolute_file_path", "Absolute file paths cannot contain NUL bytes.")
     if len(raw) > MAX_WORKSPACE_PATH_CHARS:
         raise workspace_http_error(400, "invalid_absolute_file_path", "Absolute file path is too long.")
+    if raw.startswith("~/"):
+        home = os.path.normpath(str(Path.home()))
+        if not os.path.isabs(home):
+            raise workspace_http_error(500, "workspace_home_unavailable", "The server user's home directory is unavailable.")
+        suffix = raw[2:].replace("/", os.sep) if os.name == "nt" else raw[2:]
+        trimmed_home = home.rstrip("/\\")
+        raw = f"{trimmed_home}{os.sep}{suffix}" if trimmed_home else f"{os.sep}{suffix}"
+        if len(raw) > MAX_WORKSPACE_PATH_CHARS:
+            raise workspace_http_error(400, "invalid_absolute_file_path", "Absolute file path is too long.")
     if not os.path.isabs(raw):
         raise workspace_http_error(400, "invalid_absolute_file_path", "An absolute file path is required.")
     if os.name != "nt" and raw.startswith("//"):
@@ -20875,7 +20886,7 @@ def build_claude_cmd(
         "--verbose",
         "--dangerously-skip-permissions",
         "--append-system-prompt", system_prompt,
-        "--disallowedTools", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
+        "--disallowedTools", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "CronCreate",
     ]
     if sess.get("model"):
         cmd.extend(["--model", str(sess["model"])])
@@ -20919,7 +20930,7 @@ def claude_sdk_configuration_key(
     """Hash only process configuration, not the evolving provider session ID."""
 
     payload = {
-        "version": 4,
+        "version": 6,
         "cwd": cwd,
         "cli_path": cli_path,
         "model": str(sess.get("model") or ""),
@@ -20930,6 +20941,8 @@ def claude_sdk_configuration_key(
         "background_tracking_hooks": 1,
         "allow_dangerously_skip_permissions": True,
         "replay_user_messages": True,
+        "disallowed_tools": ["CronCreate"],
+        "thinking": {"type": "adaptive", "display": "summarized"},
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -20983,6 +20996,7 @@ def build_claude_sdk_options(
         permission_mode=effective_claude_permission_mode(sess),
         can_use_tool=can_use_tool,
         hooks=claude_background_tracking_hooks(),
+        disallowed_tools=["CronCreate"],
         model=str(sess.get("model") or "").strip() or None,
         effort=str(sess.get("effort") or "").strip() or None,
         cwd=cwd,
@@ -20991,6 +21005,11 @@ def build_claude_sdk_options(
         resume=provider_id,
         fork_session=bool(provider_id and sess.get("fork_from")),
         setting_sources=["user", "project", "local"],
+        # Newer Claude models omit user-visible thinking text unless the SDK
+        # explicitly requests summaries. Keep adaptive thinking tied to the
+        # selected effort while exposing only Claude's provider-approved
+        # summaries, never raw hidden chain-of-thought.
+        thinking={"type": "adaptive", "display": "summarized"},
         include_partial_messages=False,
         max_buffer_size=PROCESS_STREAM_LIMIT,
         extra_args=extra_args,
@@ -28940,6 +28959,347 @@ async def codex_runtime_snapshot(session_id: str) -> dict[str, Any]:
             ),
         },
     }
+
+
+def session_registry_has_live_tasks(
+    registry: dict[Any, Any],
+    session_id: str,
+) -> bool:
+    """Return whether a task registry still owns work for one chat."""
+
+    direct = registry.get(session_id)
+    if isinstance(direct, (set, list, tuple)):
+        return any(
+            isinstance(task, asyncio.Task) and not task.done()
+            for task in tuple(direct)
+        )
+    return any(
+        isinstance(key, tuple)
+        and key
+        and str(key[0]) == session_id
+        and isinstance(task, asyncio.Task)
+        and not task.done()
+        for key, task in tuple(registry.items())
+    )
+
+
+async def clear_stale_provider_interactions(
+    session_id: str,
+    backend: str,
+) -> int:
+    """Retire orphaned cards only after their live handler has disappeared."""
+
+    if backend == BACKEND_CODEX:
+        registry = CODEX_INTERACTION_HANDLER_TASKS
+        pending_registry = CODEX_PENDING_INTERACTIONS
+        pending_lock = CODEX_PENDING_INTERACTIONS_LOCK
+        cancel = cancel_codex_interactions
+        update_metadata = update_codex_pending_session_metadata
+    else:
+        registry = CLAUDE_INTERACTION_HANDLER_TASKS
+        pending_registry = CLAUDE_PENDING_INTERACTIONS
+        pending_lock = CLAUDE_PENDING_INTERACTIONS_LOCK
+        cancel = cancel_claude_interactions
+        update_metadata = update_claude_pending_session_metadata
+
+    if session_registry_has_live_tasks(registry, session_id):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Resolve or cancel the pending {backend.title()} approval "
+                "or question before reloading the provider."
+            ),
+        )
+
+    async with pending_lock:
+        selected = [
+            (interaction_id, pending)
+            for interaction_id, pending in pending_registry.items()
+            if pending.get("session_id") == session_id
+        ]
+        unresolved = [
+            pending
+            for _interaction_id, pending in selected
+            if not pending.get("responded")
+        ]
+
+    # A pending Future without its registered request-handler task is an
+    # orphan from an already-finished provider lifecycle. Settle it with the
+    # existing least-privilege cancellation path before pruning the stale UI
+    # record. Live handler tasks were rejected above and are never killed.
+    if unresolved:
+        await cancel(session_id, resolution="provider_reloaded")
+
+    removed = 0
+    async with pending_lock:
+        for interaction_id, pending in tuple(pending_registry.items()):
+            if pending.get("session_id") != session_id:
+                continue
+            # With no handler task left, every record for this chat is
+            # process-orphaned, including malformed legacy rows without a
+            # Future. It is safe to remove after the least-privilege settle.
+            pending_registry.pop(interaction_id, None)
+            removed += 1
+    if selected:
+        await update_metadata(session_id)
+    return removed
+
+
+def codex_session_has_live_subagents(session_id: str) -> bool:
+    """Return whether this chat owns a child in the current app-server."""
+
+    with CODEX_SUBAGENT_INDEX_LOCK:
+        states = [
+            (thread_id, dict(state))
+            for thread_id, state in CODEX_SUBAGENT_STATE.items()
+            if str(state.get("session_id") or "") == session_id
+        ]
+    return any(
+        codex_subagent_has_live_owner(thread_id, state)
+        for thread_id, state in states
+    )
+
+
+def claude_manager_owns_chat(
+    manager: ClaudeSDKSupervisorManager,
+    session_id: str,
+) -> bool:
+    """Include idle/disconnected supervisors that ``is_loaded`` omits."""
+
+    snapshots = getattr(manager, "snapshots", None)
+    if not callable(snapshots):
+        return bool(manager.is_loaded(session_id))
+    return any(
+        str(getattr(snapshot, "chat_id", "")) == session_id
+        and not bool(getattr(snapshot, "closed", False))
+        for snapshot in snapshots()
+    )
+
+
+async def reload_session_provider(session_id: str) -> dict[str, Any]:
+    """Unload only one idle provider context; its next turn resumes it.
+
+    Provider identities and AgentsDock history remain untouched. This is an
+    intentionally fail-closed lifecycle operation: it never interrupts a
+    turn, prompt, child agent, or background terminal.
+    """
+
+    async with session_lifecycle_lock(session_id):
+        ensure_session_not_deleting(session_id)
+        session = STORE.sessions.get(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="session not found")
+        backend = str(
+            session.get("backend") or DEFAULT_BACKEND
+        ).strip().lower()
+        if backend not in {BACKEND_CODEX, BACKEND_CLAUDE}:
+            raise HTTPException(
+                status_code=409,
+                detail="Provider reload requires a Codex or Claude chat.",
+            )
+        if (
+            backend == BACKEND_CODEX
+            and CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail="Codex provider reload requires the app-server transport.",
+            )
+        if (
+            backend == BACKEND_CLAUDE
+            and CLAUDE_TRANSPORT == CLAUDE_TRANSPORT_PRINT
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail="Claude provider reload requires the Agent SDK transport.",
+            )
+
+        maintenance_reserved = False
+        try:
+            async with ACTIVE_LOCK:
+                provider_starting = session_registry_has_live_tasks(
+                    SESSION_TURN_TASKS,
+                    session_id,
+                )
+                native_action_active = (
+                    backend == BACKEND_CODEX
+                    and session_registry_has_live_tasks(
+                        CODEX_NATIVE_ACTION_TASKS,
+                        session_id,
+                    )
+                )
+                if (
+                    session_id in BUSY_SESSIONS
+                    or ACTIVE.get(session_id) is not None
+                    or session_id in SERVER_MAINTENANCE_SESSIONS
+                    or provider_starting
+                    or native_action_active
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Wait for or stop the active provider work before "
+                            "reloading this chat."
+                        ),
+                    )
+                SERVER_MAINTENANCE_SESSIONS.add(session_id)
+                maintenance_reserved = True
+
+            cleared_interactions = await clear_stale_provider_interactions(
+                session_id,
+                backend,
+            )
+            provider_id = str(session_provider_id(session) or "").strip()
+            was_loaded = False
+
+            if backend == BACKEND_CLAUDE:
+                manager = CLAUDE_SDK_MANAGER
+                if manager is not None:
+                    try:
+                        was_loaded = claude_manager_owns_chat(
+                            manager,
+                            session_id,
+                        )
+                    except Exception as exc:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "Claude provider state could not be inspected; "
+                                "reload was not attempted."
+                            ),
+                        ) from exc
+                    if was_loaded:
+                        try:
+                            active_children = max(
+                                0,
+                                int(
+                                    build_claude_subagent_snapshot(
+                                        session_id,
+                                        limit=1,
+                                    ).get("active_count")
+                                    or 0
+                                ),
+                            )
+                        except Exception as exc:
+                            raise HTTPException(
+                                status_code=409,
+                                detail=(
+                                    "Claude background-agent state could not be "
+                                    "inspected; reload was not attempted."
+                                ),
+                            ) from exc
+                        if active_children:
+                            raise HTTPException(
+                                status_code=409,
+                                detail=(
+                                    "Stop the Claude background agents before "
+                                    "reloading this chat."
+                                ),
+                            )
+                        evicted = await evict_claude_sdk_chat(
+                            session_id,
+                            force=False,
+                            manager=manager,
+                        )
+                        try:
+                            still_owned = claude_manager_owns_chat(
+                                manager,
+                                session_id,
+                            )
+                        except Exception as exc:
+                            raise HTTPException(
+                                status_code=409,
+                                detail=(
+                                    "Claude provider state could not be "
+                                    "verified after reload."
+                                ),
+                            ) from exc
+                        if not evicted or still_owned:
+                            raise HTTPException(
+                                status_code=409,
+                                detail=(
+                                    "Claude is still using this chat; wait for "
+                                    "its provider lifecycle to become idle."
+                                ),
+                            )
+                runtime = await claude_runtime_snapshot(session_id)
+            else:
+                manager = CODEX_APP_SERVER_MANAGER
+                if codex_session_has_live_subagents(session_id):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Stop the Codex subagents before reloading this chat."
+                        ),
+                    )
+                if provider_id and manager is not None:
+                    was_loaded = bool(manager.is_thread_loaded(provider_id))
+                    if was_loaded:
+                        try:
+                            terminals = await manager.list_background_terminals(
+                                provider_id
+                            )
+                        except CodexAppServerRequestError as exc:
+                            if exc.code not in {-32600, -32601}:
+                                raise HTTPException(
+                                    status_code=409,
+                                    detail=(
+                                        "Codex background-terminal state could "
+                                        "not be inspected; reload was not attempted."
+                                    ),
+                                ) from exc
+                            terminals = []
+                        except Exception as exc:
+                            raise HTTPException(
+                                status_code=409,
+                                detail=(
+                                    "Codex background-terminal state could not "
+                                    "be inspected; reload was not attempted."
+                                ),
+                            ) from exc
+                        if terminals:
+                            raise HTTPException(
+                                status_code=409,
+                                detail=(
+                                    "Stop the Codex background terminals before "
+                                    "reloading this chat."
+                                ),
+                            )
+                        evicted = await evict_codex_app_server_thread(
+                            manager,
+                            provider_id,
+                            reinsert_on_failure=True,
+                        )
+                        if not evicted and manager.is_thread_loaded(provider_id):
+                            raise HTTPException(
+                                status_code=409,
+                                detail=(
+                                    "Codex is still using this thread; wait for "
+                                    "its provider lifecycle to become idle."
+                                ),
+                            )
+                runtime = await codex_runtime_snapshot(session_id)
+
+            latest_session = STORE.sessions.get(session_id) or session
+            return {
+                "reloaded": True,
+                "backend": backend,
+                "provider_id": provider_id or None,
+                "was_loaded": was_loaded,
+                "action": "unloaded" if was_loaded else "already_unloaded",
+                "cleared_stale_interactions": cleared_interactions,
+                "session": public_session(latest_session),
+                "runtime": runtime,
+            }
+        finally:
+            if maintenance_reserved:
+                async with ACTIVE_LOCK:
+                    SERVER_MAINTENANCE_SESSIONS.discard(session_id)
+
+
+@app.post("/api/sessions/{session_id}/provider/reload")
+async def post_session_provider_reload(session_id: str) -> dict[str, Any]:
+    return await reload_session_provider(session_id)
 
 
 @app.get("/api/sessions/{session_id}/codex/runtime")

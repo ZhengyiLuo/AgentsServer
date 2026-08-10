@@ -13,6 +13,114 @@ from fastapi import HTTPException
 
 
 class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
+    def test_agents_server_systemd_cgroup_handles_unified_and_legacy_paths(self):
+        paths = (
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/agents-server.service",
+            "/unrelated",
+        )
+        with patch.object(agent_server, "process_cgroup_paths", return_value=paths):
+            cgroup = agent_server.agents_server_systemd_cgroup(123)
+
+        self.assertEqual(cgroup, paths[0])
+        self.assertTrue(agent_server.cgroup_is_within(f"{cgroup}/child", cgroup))
+        self.assertFalse(agent_server.cgroup_is_within("/agents-server.service-old", cgroup))
+
+    def test_managed_update_rejects_tmux_inside_service_cgroup_structurally(self):
+        cgroup = "/user.slice/user@1000.service/app.slice/agents-server.service"
+        with patch.object(agent_server, "agents_server_systemd_cgroup", return_value=cgroup), \
+             patch.object(agent_server, "tmux_server_pid", return_value=4242), \
+             patch.object(agent_server, "process_cgroup_paths", return_value=(cgroup,)):
+            with self.assertRaises(HTTPException) as raised:
+                agent_server.ensure_managed_update_tmux_isolated()
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.detail["code"], "unsafe_update_tmux_cgroup")
+        self.assertTrue(raised.exception.detail["retryable"])
+        self.assertIn("terminated by the restart", raised.exception.detail["message"])
+        self.assertIn("login shell", raised.exception.detail["action"])
+
+    def test_managed_update_preserves_non_systemd_and_macos_behavior(self):
+        with patch.object(agent_server, "agents_server_systemd_cgroup", return_value=None), \
+             patch.object(agent_server, "tmux_server_pid") as tmux_pid:
+            agent_server.ensure_managed_update_tmux_isolated()
+
+        tmux_pid.assert_not_called()
+
+    def test_missing_tmux_server_is_bootstrapped_in_a_user_scope(self):
+        cgroup = "/user.slice/user@1000.service/app.slice/agents-server.service"
+        completed = MagicMock(returncode=0, stdout="", stderr="")
+        with patch.object(agent_server, "agents_server_systemd_cgroup", return_value=cgroup), \
+             patch.object(agent_server, "tmux_server_pid", side_effect=[None, 4242]), \
+             patch.object(agent_server.shutil, "which", return_value="/usr/bin/systemd-run"), \
+             patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
+             patch.object(
+                 agent_server,
+                 "server_update_runner_environment",
+                 return_value={"XDG_RUNTIME_DIR": "/run/user/1000"},
+             ), \
+             patch.object(agent_server.subprocess, "run", return_value=completed) as run, \
+             patch.object(
+                 agent_server,
+                 "process_cgroup_paths",
+                 return_value=("/user.slice/user@1000.service/app.slice/agents-server-tmux.scope",),
+             ), \
+             patch.object(agent_server, "run_tmux") as run_tmux:
+            isolated = agent_server.bootstrap_isolated_tmux_server()
+
+        self.assertTrue(isolated)
+        command = run.call_args.args[0]
+        self.assertEqual(command[:4], [
+            "/usr/bin/systemd-run", "--user", "--scope", "--quiet",
+        ])
+        self.assertIn("--collect", command)
+        self.assertIn("/usr/bin/tmux", command)
+        self.assertIn("env", run.call_args.kwargs)
+        self.assertEqual(
+            run.call_args.kwargs["env"]["XDG_RUNTIME_DIR"],
+            "/run/user/1000",
+        )
+        self.assertEqual(run_tmux.call_args_list[0].args[0], [
+            "set-option", "-g", "exit-empty", "off",
+        ])
+        self.assertEqual(run_tmux.call_args_list[1].args[0][:3], [
+            "kill-session", "-t", command[-2],
+        ])
+
+    async def test_start_cgroup_guard_runs_before_drain_or_tmux_launch(self):
+        blocker = HTTPException(
+            status_code=409,
+            detail=agent_server.unsafe_update_tmux_detail(),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "update_runner.py"
+            key = root / "release-public-key.pem"
+            status_path = root / "status.json"
+            runner.write_text("# runner\n")
+            key.write_text("public key\n")
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", status_path), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
+                 patch.object(
+                     agent_server,
+                     "ensure_managed_update_tmux_isolated",
+                     side_effect=blocker,
+                 ) as guard, \
+                 patch.object(agent_server, "run_tmux") as run_tmux:
+                with self.assertRaises(HTTPException) as raised:
+                    await agent_server.start_server_update(
+                        agent_server.ServerUpdateRequest(version="1.1.0"),
+                    )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.detail["code"], "unsafe_update_tmux_cgroup")
+        guard.assert_called_once_with()
+        run_tmux.assert_not_called()
+        self.assertFalse(status_path.exists())
+
     def test_linux_runner_environment_restores_the_user_service_bus(self):
         with tempfile.TemporaryDirectory() as temporary:
             runtime = Path(temporary)

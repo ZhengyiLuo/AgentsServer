@@ -8008,6 +8008,137 @@ def tmux_session_exists(name: str) -> bool:
     return run_tmux(["has-session", "-t", name], check=False).returncode == 0
 
 
+AGENTS_SERVER_SYSTEMD_UNIT = "agents-server.service"
+
+
+def process_cgroup_paths(pid: int) -> tuple[str, ...]:
+    """Return Linux cgroup paths without assuming cgroup v1 or v2."""
+
+    if not sys.platform.startswith("linux"):
+        return ()
+    try:
+        lines = (Path("/proc") / str(pid) / "cgroup").read_text().splitlines()
+    except (OSError, ValueError):
+        return ()
+    paths: list[str] = []
+    for line in lines:
+        fields = line.split(":", 2)
+        if len(fields) != 3:
+            continue
+        path = fields[2].strip()
+        if path:
+            paths.append(path)
+    return tuple(dict.fromkeys(paths))
+
+
+def agents_server_systemd_cgroup(pid: int | None = None) -> str | None:
+    """Return this process's systemd-user service cgroup, when applicable."""
+
+    for path in process_cgroup_paths(os.getpid() if pid is None else pid):
+        parts = [part for part in path.split("/") if part]
+        if AGENTS_SERVER_SYSTEMD_UNIT not in parts:
+            continue
+        index = parts.index(AGENTS_SERVER_SYSTEMD_UNIT)
+        return "/" + "/".join(parts[: index + 1])
+    return None
+
+
+def cgroup_is_within(path: str, ancestor: str) -> bool:
+    clean_path = "/" + path.strip("/")
+    clean_ancestor = "/" + ancestor.strip("/")
+    return clean_path == clean_ancestor or clean_path.startswith(clean_ancestor + "/")
+
+
+def tmux_server_pid() -> int | None:
+    """Return the default tmux server PID without starting a missing server."""
+
+    result = run_tmux(["list-sessions", "-F", "#{pid}"], check=False)
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        try:
+            pid = int(line.strip())
+        except ValueError:
+            continue
+        if pid > 0:
+            return pid
+    return None
+
+
+def bootstrap_isolated_tmux_server() -> bool:
+    """Best-effort bootstrap of a missing tmux server outside our service.
+
+    A tmux daemon first spawned by AgentsServer inherits agents-server.service's
+    cgroup. systemd then kills that daemon (and a detached updater pane) when
+    the service restarts. A transient user scope gives the shared tmux daemon
+    an independent lifetime. Existing servers are never moved or replaced.
+    """
+
+    service_cgroup = agents_server_systemd_cgroup()
+    if service_cgroup is None or tmux_server_pid() is not None:
+        return False
+    systemd_run = shutil.which("systemd-run")
+    tmux = working_tmux_bin(use_cache=True)
+    if not systemd_run or not tmux:
+        return False
+    token = uuid.uuid4().hex[:12]
+    sentinel = f"agents_server_tmux_bootstrap_{token}"
+    unit = f"agents-server-tmux-bootstrap-{token}.scope"
+    environment = dict(os.environ)
+    environment.update(server_update_runner_environment())
+    try:
+        result = subprocess.run(
+            [
+                systemd_run,
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                f"--unit={unit}",
+                tmux,
+                "new-session",
+                "-d",
+                "-s",
+                sentinel,
+                "sleep 60",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        run_tmux(["kill-session", "-t", sentinel], check=False)
+        logger.warning("could not bootstrap isolated tmux server: %s", exc)
+        return False
+    if result.returncode != 0:
+        run_tmux(["kill-session", "-t", sentinel], check=False)
+        logger.warning(
+            "could not bootstrap isolated tmux server: %s",
+            (result.stderr or result.stdout or f"exit {result.returncode}").strip()[:500],
+        )
+        return False
+    pid = tmux_server_pid()
+    isolated = bool(
+        pid is not None
+        and not any(
+            cgroup_is_within(path, service_cgroup)
+            for path in process_cgroup_paths(pid)
+        )
+    )
+    if isolated:
+        # Keep the verified daemon alive after removing the temporary session.
+        run_tmux(["set-option", "-g", "exit-empty", "off"], check=False)
+    run_tmux(["kill-session", "-t", sentinel], check=False)
+    if not isolated:
+        logger.warning(
+            "tmux bootstrap did not escape %s; managed updates remain disabled",
+            service_cgroup,
+        )
+    return isolated
+
+
 TERMINAL_FALLBACK_SHELLS = ("/bin/bash", "/bin/zsh", "/bin/sh")
 TERMINAL_DISABLED_SHELL_NAMES = {"false", "nologin"}
 
@@ -8128,6 +8259,9 @@ def ensure_terminal_session(
     path = terminal_session_path()
     created = False
     if not tmux_session_exists(name):
+        # Keep the shared daemon outside agents-server.service when this is the
+        # first tmux use on a Linux systemd-user installation.
+        bootstrap_isolated_tmux_server()
         workdir = existing_cwd(cwd or sess.get("cwd") or DEFAULT_CWD)
         cols, lines = terminal_dimensions(columns, rows)
         run_tmux([
@@ -27777,6 +27911,71 @@ def server_update_runner_environment() -> dict[str, str]:
     return result
 
 
+def unsafe_update_tmux_detail(
+    *,
+    bootstrap_failed: bool = False,
+    verification_failed: bool = False,
+) -> dict[str, Any]:
+    if bootstrap_failed:
+        message = (
+            "Managed update cannot safely start because AgentsServer could not "
+            "create the default tmux server outside agents-server.service."
+        )
+        action = (
+            "From a login shell, start a detached tmux session outside the "
+            "AgentsServer service, then retry the update."
+        )
+    elif verification_failed:
+        message = (
+            "Managed update cannot safely start because AgentsServer could not "
+            "verify the detached tmux server's cgroup."
+        )
+        action = "Retry after confirming the tmux server is running from a login shell."
+    else:
+        message = (
+            "Managed update cannot start because the detached tmux server is "
+            "inside agents-server.service and would be terminated by the restart."
+        )
+        action = (
+            "Finish or record any required terminal and tunnel commands, stop "
+            "the tmux daemon from a login shell, then retry. AgentsServer will "
+            "recreate tmux in a separate user scope when systemd-run is available."
+        )
+    return {
+        "code": "unsafe_update_tmux_cgroup",
+        "message": message,
+        "action": action,
+        "retryable": True,
+    }
+
+
+def ensure_managed_update_tmux_isolated() -> None:
+    """Fail closed when systemd restart would also kill the updater."""
+
+    service_cgroup = agents_server_systemd_cgroup()
+    if service_cgroup is None:
+        return
+    pid = tmux_server_pid()
+    if pid is None:
+        if bootstrap_isolated_tmux_server():
+            return
+        raise HTTPException(
+            status_code=409,
+            detail=unsafe_update_tmux_detail(bootstrap_failed=True),
+        )
+    tmux_cgroups = process_cgroup_paths(pid)
+    if not tmux_cgroups:
+        raise HTTPException(
+            status_code=409,
+            detail=unsafe_update_tmux_detail(verification_failed=True),
+        )
+    if any(cgroup_is_within(path, service_cgroup) for path in tmux_cgroups):
+        raise HTTPException(
+            status_code=409,
+            detail=unsafe_update_tmux_detail(),
+        )
+
+
 async def signed_release_manifest(
     track: Literal["stable", "beta"] = "stable",
 ) -> dict[str, Any]:
@@ -28412,6 +28611,10 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
             raise HTTPException(status_code=503, detail=f"{tmux['message']} {tmux['action']}")
         if not SERVER_UPDATE_RUNNER.is_file() or not SERVER_UPDATE_PUBLIC_KEY.is_file():
             raise HTTPException(status_code=503, detail="this server installation predates managed updates; run the installer once")
+        # Check before closing admission or writing a durable drain phase. A
+        # detached updater in this service cgroup cannot survive install.sh's
+        # systemctl --user restart.
+        await asyncio.to_thread(ensure_managed_update_tmux_isolated)
 
         update_id = uuid.uuid4().hex
         tmux_name = server_update_tmux_name(update_id)

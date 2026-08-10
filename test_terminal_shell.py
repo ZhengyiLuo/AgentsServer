@@ -252,5 +252,111 @@ class TerminalShellInitializationTests(unittest.TestCase):
         self.assertIs(raised.exception, failure)
 
 
+class TerminalHistoryScrollingTests(unittest.TestCase):
+    session_id = "terminal-history-test"
+
+    def run_scroll(
+        self,
+        delta: int,
+        *,
+        initially_in_mode: bool,
+        hidden_entry_returncode: int = 0,
+        managed: bool = False,
+    ) -> tuple[bool, list[list[str]]]:
+        calls: list[list[str]] = []
+        in_mode = initially_in_mode
+
+        def fake_tmux(
+            args: list[str],
+            *,
+            check: bool = True,
+            timeout: float = 0,
+        ) -> subprocess.CompletedProcess[str]:
+            nonlocal in_mode
+            del check, timeout
+            calls.append(args)
+            if args[0] == "display-message":
+                return subprocess.CompletedProcess(args, 0, stdout=f"{int(in_mode)}\n", stderr="")
+            if args[:2] == ["copy-mode", "-eH"]:
+                if hidden_entry_returncode == 0:
+                    in_mode = True
+                return subprocess.CompletedProcess(args, hidden_entry_returncode, stdout="", stderr="")
+            if args[:2] == ["copy-mode", "-e"]:
+                in_mode = True
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        with patch.dict(
+            agent_server.STORE.sessions,
+            {self.session_id: {"id": self.session_id, "archived": False}},
+        ), patch.object(
+            agent_server,
+            "tmux_session_exists",
+            return_value=True,
+        ), patch.object(
+            agent_server,
+            "run_tmux",
+            side_effect=fake_tmux,
+        ):
+            result = agent_server.scroll_terminal_history(
+                self.session_id,
+                delta,
+                managed=managed,
+            )
+
+        return result, calls
+
+    def test_upward_scroll_enters_copy_mode_without_top_row_indicator(self) -> None:
+        result, calls = self.run_scroll(-6, initially_in_mode=False)
+        name = agent_server.terminal_session_name(self.session_id)
+
+        self.assertTrue(result)
+        self.assertIn(["copy-mode", "-eH", "-t", name], calls)
+        self.assertNotIn(["copy-mode", "-e", "-t", name], calls)
+        self.assertIn(["send-keys", "-X", "-N", "6", "-t", name, "scroll-up"], calls)
+
+    def test_upward_scroll_falls_back_for_tmux_without_hidden_indicator_support(self) -> None:
+        result, calls = self.run_scroll(
+            -6,
+            initially_in_mode=False,
+            hidden_entry_returncode=1,
+        )
+        name = agent_server.terminal_session_name(self.session_id)
+
+        self.assertTrue(result)
+        self.assertIn(["copy-mode", "-eH", "-t", name], calls)
+        self.assertIn(["copy-mode", "-e", "-t", name], calls)
+        self.assertIn(["send-keys", "-X", "-N", "6", "-t", name, "scroll-up"], calls)
+
+    def test_upward_scroll_reuses_existing_copy_mode(self) -> None:
+        result, calls = self.run_scroll(-3, initially_in_mode=True)
+
+        self.assertFalse(result)
+        self.assertFalse(any(args[0] == "copy-mode" for args in calls))
+        self.assertTrue(any(args[-1] == "scroll-up" for args in calls))
+
+    def test_repeated_scroll_preserves_app_owned_copy_mode(self) -> None:
+        result, calls = self.run_scroll(-3, initially_in_mode=True, managed=True)
+
+        self.assertTrue(result)
+        self.assertFalse(any(args[0] == "copy-mode" for args in calls))
+        self.assertTrue(any(args[-1] == "scroll-up" for args in calls))
+
+    def test_downward_scroll_only_moves_when_copy_mode_is_active(self) -> None:
+        active_result, active_calls = self.run_scroll(
+            4,
+            initially_in_mode=True,
+            managed=True,
+        )
+        user_mode_result, user_mode_calls = self.run_scroll(4, initially_in_mode=True)
+        inactive_result, inactive_calls = self.run_scroll(4, initially_in_mode=False)
+
+        self.assertTrue(active_result)
+        self.assertTrue(any(args[-1] == "scroll-down" for args in active_calls))
+        self.assertFalse(user_mode_result)
+        self.assertTrue(any(args[-1] == "scroll-down" for args in user_mode_calls))
+        self.assertFalse(inactive_result)
+        self.assertFalse(any(args[-1] == "scroll-down" for args in inactive_calls))
+
+
 if __name__ == "__main__":
     unittest.main()

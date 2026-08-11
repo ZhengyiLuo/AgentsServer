@@ -282,6 +282,9 @@ CLAUDE_PERMISSION_MODE_OPTIONS = (
 )
 CLAUDE_PERMISSION_MODES = set(CLAUDE_PERMISSION_MODE_OPTIONS)
 CLAUDE_DEFAULT_PERMISSION_MODE = "default"
+PROVIDER_JOBS_ACCESS_MODES = ("full", "read_only", "blocked")
+PROVIDER_JOBS_ACCESS_MODE_SET = set(PROVIDER_JOBS_ACCESS_MODES)
+PROVIDER_JOBS_ACCESS_DEFAULT = "full"
 CODEX_APPROVAL_POLICIES = {"never", "on-request", "untrusted"}
 CODEX_SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
 CODEX_APPROVAL_REVIEWERS = {"user", "auto_review", "guardian_subagent"}
@@ -522,7 +525,7 @@ PROVIDER_SECRET_ENV_NAMES = (
 )
 SERVER_BIND_ADDRESS = agentsdock_setting("AGENT_BIND", "0.0.0.0")
 SERVER_PORT = int(agentsdock_setting("AGENT_PORT", "7850"))
-API_CONTRACT_VERSION = 11
+API_CONTRACT_VERSION = 12
 SESSION_ORDER_STEP = 1000.0
 FORK_INTERNAL_PURPOSES = {
     "handoff_digest",
@@ -579,13 +582,15 @@ AGENTSDOCK_CONTEXT_END_MARKER = "[End AgentsDock context]"
 SCHEDULED_JOBS_PROMPT = """\
 
 Scheduled jobs:
-- The current-jobs snapshot below is context only. Create, update, or delete a
-  job only when the user explicitly asks to schedule or manage automation; do
-  not infer a schedule from requests to wait, monitor, or check again later.
+- The current-jobs snapshot below is context only. Manage a job only when the
+  user explicitly asks to schedule or manage automation; do not infer a
+  schedule from requests to wait, monitor, or check again later.
 - Use only the exact `--authority-file` Jobs command printed in the current
-  turn's AgentsDock provider-authority block. Query its list/help before
-  changes. Do not call the jobs API directly, pass alternate credentials,
-  expose authority, or attempt a run-now action.
+  turn's AgentsDock provider-authority block. Full access permits list, get,
+  runs, create, update, and delete. Read-only access permits only list, get,
+  and runs. If Jobs is blocked or omitted, do not invoke it. Do not call the
+  jobs API directly, pass alternate credentials, expose authority, or attempt
+  a run-now action.
 """
 
 
@@ -3081,6 +3086,7 @@ class CreateSessionRequest(BaseModel):
     codex_sandbox_mode: Literal["read-only", "workspace-write", "danger-full-access"] | None = None
     codex_permission_profile: str | None = Field(default=None, max_length=240)
     codex_approvals_reviewer: Literal["user", "auto_review", "guardian_subagent"] | None = None
+    provider_jobs_access: Literal["full", "read_only", "blocked"] | None = None
     import_history: bool | None = None
 
 
@@ -3106,6 +3112,7 @@ class UpdateSessionRequest(BaseModel):
     codex_sandbox_mode: Literal["read-only", "workspace-write", "danger-full-access"] | None = None
     codex_permission_profile: str | None = Field(default=None, max_length=240)
     codex_approvals_reviewer: Literal["user", "auto_review", "guardian_subagent"] | None = None
+    provider_jobs_access: Literal["full", "read_only", "blocked"] | None = None
 
 
 SESSION_LIFECYCLE_UPDATE_FIELDS = frozenset({
@@ -3119,6 +3126,7 @@ SESSION_LIFECYCLE_UPDATE_FIELDS = frozenset({
     "codex_sandbox_mode",
     "codex_permission_profile",
     "codex_approvals_reviewer",
+    "provider_jobs_access",
     "archived",
 })
 
@@ -3450,6 +3458,20 @@ def effective_claude_permission_mode(sess: dict[str, Any]) -> str:
     )
 
 
+def effective_provider_jobs_access(sess: dict[str, Any] | None) -> str:
+    """Return the durable agent Jobs policy for a persisted or legacy chat."""
+
+    value = str(
+        (sess or {}).get("provider_jobs_access")
+        or PROVIDER_JOBS_ACCESS_DEFAULT
+    ).strip().lower()
+    return (
+        value
+        if value in PROVIDER_JOBS_ACCESS_MODE_SET
+        else PROVIDER_JOBS_ACCESS_DEFAULT
+    )
+
+
 def clean_session_system_prompt(value: Any) -> str | None:
     clean = str(value or "").strip()
     if not clean:
@@ -3728,6 +3750,10 @@ class SessionStore:
             if sess.get("claude_permission_mode") != claude_permission_mode:
                 sess["claude_permission_mode"] = claude_permission_mode
                 runtime_changed = True
+            provider_jobs_access = effective_provider_jobs_access(sess)
+            if sess.get("provider_jobs_access") != provider_jobs_access:
+                sess["provider_jobs_access"] = provider_jobs_access
+                runtime_changed = True
             for key, default in (
                 ("codex_approval_policy", CODEX_DEFAULT_APPROVAL_POLICY),
                 ("codex_sandbox_mode", CODEX_DEFAULT_SANDBOX_MODE),
@@ -3908,6 +3934,9 @@ class SessionStore:
                 req.codex_approvals_reviewer
                 or CODEX_DEFAULT_APPROVALS_REVIEWER
             ),
+            "provider_jobs_access": (
+                req.provider_jobs_access or PROVIDER_JOBS_ACCESS_DEFAULT
+            ),
             "claude_pending_interaction_count": 0,
             "claude_needs_user_action": False,
             "parent_id": parent_id,
@@ -3964,6 +3993,11 @@ class SessionStore:
             sess = self.sessions.get(sid)
             if not sess:
                 raise HTTPException(status_code=404, detail="session not found")
+            missing_policy = object()
+            previous_provider_jobs_access = sess.get(
+                "provider_jobs_access",
+                missing_policy,
+            )
             runtime_preview = preview_session_runtime_update(sess, patch)
             current_backend = str(sess.get("backend") or DEFAULT_BACKEND).lower()
             prospective_backend = str(
@@ -4027,6 +4061,11 @@ class SessionStore:
                     CODEX_DEFAULT_APPROVALS_REVIEWER,
                     CODEX_APPROVAL_REVIEWERS,
                 ),
+                (
+                    "provider_jobs_access",
+                    PROVIDER_JOBS_ACCESS_DEFAULT,
+                    PROVIDER_JOBS_ACCESS_MODE_SET,
+                ),
             ):
                 if key not in patch:
                     continue
@@ -4083,7 +4122,20 @@ class SessionStore:
             if new_section != old_section:
                 sess["sort_order"] = self.top_order_for_section(new_section, excluding_id=sid)
             sess["updated_at"] = now_iso()
-            await self.save()
+            try:
+                await self.save()
+            except BaseException:
+                # This field is an agent authorization boundary. Never leave
+                # a failed durable PATCH applied only in memory—especially a
+                # failed expansion from blocked/read-only to full.
+                if "provider_jobs_access" in patch:
+                    if previous_provider_jobs_access is missing_policy:
+                        sess.pop("provider_jobs_access", None)
+                    else:
+                        sess["provider_jobs_access"] = (
+                            previous_provider_jobs_access
+                        )
+                raise
             HISTORY_SEARCH_DIRTY.add(sid)
             return sess
 
@@ -6589,7 +6641,12 @@ async def issue_cross_chat_capability(
         for reference in references
         if reference.action == "instruction"
     } if AGENT_TOKEN else set()
+    jobs_access = effective_provider_jobs_access(
+        STORE.sessions.get(source_session_id)
+    )
     effective_actions = set(actions or {"jobs", "publish", "cross_chat_instruction"})
+    if jobs_access == "blocked":
+        effective_actions.discard("jobs")
     if not AGENT_TOKEN:
         effective_actions.discard("cross_chat_instruction")
     token = secrets.token_urlsafe(48)
@@ -6608,6 +6665,7 @@ async def issue_cross_chat_capability(
         "provider_capability": token,
         # Compatibility for the first development CLI; never logged.
         "capability": token,
+        "provider_jobs_access": jobs_access,
         "expires_at": expires_at,
     }, separators=(",", ":")).encode("utf-8")
     descriptor = os.open(
@@ -6628,6 +6686,7 @@ async def issue_cross_chat_capability(
             "expires_at": expires_at,
             "grants": grants,
             "actions": effective_actions,
+            "provider_jobs_access": jobs_access,
             "consumed": {},
             "authority_path": str(authority_path),
         }
@@ -6656,6 +6715,7 @@ def cross_chat_provider_authority_block(
     authority_path: Path | None,
     source_session_id: str,
     actions: set[str],
+    provider_jobs_access: str = PROVIDER_JOBS_ACCESS_DEFAULT,
 ) -> str:
     if authority_path is None:
         return ""
@@ -6670,8 +6730,25 @@ def cross_chat_provider_authority_block(
         )
     helper_lines: list[str] = []
     if "jobs" in actions:
+        jobs_command = (
+            f"\"$AGENTSDOCK_JOBS_CLI\" --authority-file "
+            f"{shlex.quote(str(authority_path))} --chat-id "
+            f"{shlex.quote(source_session_id)}"
+        )
+        if provider_jobs_access == "read_only":
+            helper_lines.extend((
+                "- Jobs access is read-only. Creation, update, enable/disable, and deletion are forbidden for this turn.",
+                f"- Jobs list: `{jobs_command} list`",
+                f"- Jobs detail: `{jobs_command} get JOB_ID`",
+                f"- Jobs run status: `{jobs_command} runs JOB_ID`",
+            ))
+        else:
+            helper_lines.append(
+                f"- Jobs (full access): `{jobs_command} COMMAND` where COMMAND is list, get, runs, create, update, or delete."
+            )
+    elif provider_jobs_access == "blocked":
         helper_lines.append(
-            f"- Jobs: `\"$AGENTSDOCK_JOBS_CLI\" --authority-file {shlex.quote(str(authority_path))} --chat-id {shlex.quote(source_session_id)} COMMAND`"
+            "- Jobs access is blocked for this chat. No Jobs helper command is authorized."
         )
     if "publish" in actions:
         helper_lines.append(
@@ -17166,6 +17243,41 @@ async def authorize_provider_action(
         return dict(capability)
 
 
+async def authorize_provider_jobs_operation(
+    request: Request,
+    *,
+    session_id: str,
+    operation: Literal["read", "write"],
+) -> dict[str, Any]:
+    """Intersect the turn's issued Jobs ceiling with the chat's live policy."""
+
+    capability = await authorize_provider_action(
+        request,
+        action="jobs",
+        session_id=session_id,
+    )
+    session = STORE.sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="session not found")
+    issued_access = effective_provider_jobs_access({
+        "provider_jobs_access": capability.get("provider_jobs_access"),
+    })
+    live_access = effective_provider_jobs_access(session)
+    if issued_access == "blocked" or live_access == "blocked":
+        raise HTTPException(
+            status_code=403,
+            detail="agent scheduled-jobs access is blocked for this chat",
+        )
+    if operation == "write" and (
+        issued_access != "full" or live_access != "full"
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="agent scheduled-jobs access is read-only for this chat",
+        )
+    return capability
+
+
 def public_cross_chat_envelope(
     record: dict[str, Any],
     *,
@@ -18448,6 +18560,7 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
         "claude_permission_mode",
         "codex_approval_policy", "codex_sandbox_mode",
         "codex_permission_profile", "codex_approvals_reviewer",
+        "provider_jobs_access",
         "codex_goal", "codex_goal_time_budget_seconds",
     )
     public = {
@@ -18469,6 +18582,7 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
     # UI still needs the authoritative first-turn backend fence.
     public["backend_locked"] = session_backend_locked(sess)
     if not summary:
+        public["provider_jobs_access"] = effective_provider_jobs_access(sess)
         public["codex_goal_time_budget_exhausted"] = (
             codex_goal_time_budget_is_exhausted(sess)
         )
@@ -30350,11 +30464,17 @@ async def _start_turn_locked(
                 run_id,
                 req.chat_references,
             )
+        provider_jobs_access = effective_provider_jobs_access(sess)
         provider_actions = (
             {"publish"}
             if req.purpose == "cross_chat_handoff_delivery"
-            else {"jobs", "publish", "cross_chat_instruction"}
+            else {"publish", "cross_chat_instruction"}
         )
+        if (
+            req.purpose != "cross_chat_handoff_delivery"
+            and provider_jobs_access != "blocked"
+        ):
+            provider_actions.add("jobs")
         authority_path = await issue_cross_chat_capability(
             session_id,
             run_id,
@@ -30366,6 +30486,7 @@ async def _start_turn_locked(
             authority_path,
             session_id,
             provider_actions,
+            provider_jobs_access,
         )
         if turn_obligation_ids:
             prompt += (
@@ -31019,6 +31140,12 @@ async def health() -> dict[str, Any]:
                 "version": 2,
                 "context_modes": ["chat", "standalone"],
                 "default_context_mode": "chat",
+            },
+            "provider_jobs_access_control_v1": {
+                "available": True,
+                "version": 1,
+                "modes": list(PROVIDER_JOBS_ACCESS_MODES),
+                "default": PROVIDER_JOBS_ACCESS_DEFAULT,
             },
             "cross_chat_handoffs_v1": cross_chat_handoffs_capability(),
             "codex_controls": {
@@ -33823,6 +33950,7 @@ async def _fork_session_locked(
             codex_sandbox_mode=parent.get("codex_sandbox_mode"),
             codex_permission_profile=parent.get("codex_permission_profile"),
             codex_approvals_reviewer=parent.get("codex_approvals_reviewer"),
+            provider_jobs_access=effective_provider_jobs_access(parent),
             pinned=bool(parent.get("pinned")),
             archived=bool(parent.get("archived")),
             # Bind a native Codex fork only after the child session ID
@@ -35260,8 +35388,13 @@ async def list_session_jobs(session_id: str) -> dict[str, Any]:
 
 @app.get("/api/agent/sessions/{session_id}/jobs")
 async def list_agent_session_jobs(request: Request, session_id: str) -> dict[str, Any]:
-    await authorize_provider_action(request, action="jobs", session_id=session_id)
-    return await list_session_jobs(session_id)
+    async with session_lifecycle_lock(session_id):
+        await authorize_provider_jobs_operation(
+            request,
+            session_id=session_id,
+            operation="read",
+        )
+        return await list_session_jobs(session_id)
 
 
 @app.get("/api/sessions/{session_id}/jobs/{job_id}/runs")
@@ -35293,13 +35426,18 @@ async def get_agent_session_job_runs(
     before_seq: int | None = Query(default=None, ge=1),
     limit: int = Query(default=20, ge=1, le=100),
 ) -> dict[str, Any]:
-    await authorize_provider_action(request, action="jobs", session_id=session_id)
-    return await get_session_job_runs(
-        session_id,
-        job_id,
-        before_seq=before_seq,
-        limit=limit,
-    )
+    async with session_lifecycle_lock(session_id):
+        await authorize_provider_jobs_operation(
+            request,
+            session_id=session_id,
+            operation="read",
+        )
+        return await get_session_job_runs(
+            session_id,
+            job_id,
+            before_seq=before_seq,
+            limit=limit,
+        )
 
 
 @app.get("/api/sessions/{session_id}/runs/{run_id}/trace")
@@ -35348,8 +35486,13 @@ async def create_agent_session_job(
     session_id: str,
     req: CreateScopedJobRequest,
 ) -> dict[str, Any]:
-    await authorize_provider_action(request, action="jobs", session_id=session_id)
-    return await create_session_job(session_id, req)
+    async with session_lifecycle_lock(session_id):
+        await authorize_provider_jobs_operation(
+            request,
+            session_id=session_id,
+            operation="write",
+        )
+        return await create_session_job(session_id, req)
 
 
 @app.patch("/api/jobs/{job_id}")
@@ -35375,8 +35518,13 @@ async def update_agent_session_job(
     job_id: str,
     req: UpdateJobRequest,
 ) -> dict[str, Any]:
-    await authorize_provider_action(request, action="jobs", session_id=session_id)
-    return await update_session_job(session_id, job_id, req)
+    async with session_lifecycle_lock(session_id):
+        await authorize_provider_jobs_operation(
+            request,
+            session_id=session_id,
+            operation="write",
+        )
+        return await update_session_job(session_id, job_id, req)
 
 
 @app.delete("/api/jobs/{job_id}")
@@ -35397,8 +35545,13 @@ async def delete_agent_session_job(
     session_id: str,
     job_id: str,
 ) -> dict[str, Any]:
-    await authorize_provider_action(request, action="jobs", session_id=session_id)
-    return await delete_session_job(session_id, job_id)
+    async with session_lifecycle_lock(session_id):
+        await authorize_provider_jobs_operation(
+            request,
+            session_id=session_id,
+            operation="write",
+        )
+        return await delete_session_job(session_id, job_id)
 
 
 @app.post("/api/jobs/{job_id}/run")

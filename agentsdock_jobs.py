@@ -147,6 +147,40 @@ def command_list(_args: argparse.Namespace) -> Any:
     return {"jobs": scoped_jobs()}
 
 
+def command_get(args: argparse.Namespace) -> Any:
+    return {"job": owned_job(args.job_id)}
+
+
+def command_runs(args: argparse.Namespace) -> Any:
+    _server_url, chat_id, _token = required_environment()
+    owned_job(args.job_id)
+    encoded_chat_id = urllib.parse.quote(chat_id, safe="")
+    job_id = urllib.parse.quote(args.job_id, safe="")
+    query = urllib.parse.urlencode({
+        key: value
+        for key, value in (
+            ("before_seq", args.before_seq),
+            ("limit", args.limit),
+        )
+        if value is not None
+    })
+    path = f"/api/agent/sessions/{encoded_chat_id}/jobs/{job_id}/runs"
+    if query:
+        path += f"?{query}"
+    response = api_request("GET", path)
+    runs = response.get("runs")
+    if not isinstance(runs, list) or not all(
+        isinstance(run, dict) for run in runs
+    ):
+        raise JobsCLIError("AgentsServer returned invalid job history")
+    if (
+        response.get("session_id") != chat_id
+        or response.get("job_id") != args.job_id
+    ):
+        raise JobsCLIError("AgentsServer returned history outside the active chat scope")
+    return response
+
+
 def command_create(args: argparse.Namespace) -> Any:
     _server_url, chat_id, _token = required_environment()
     if args.interval_seconds is None and args.cron is None and args.rrule is None and args.first_run_at is None:
@@ -256,6 +290,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     list_parser = subparsers.add_parser("list", help="list jobs in the active chat")
     list_parser.set_defaults(handler=command_list)
+
+    get_parser = subparsers.add_parser("get", help="get one job in the active chat")
+    get_parser.add_argument("job_id")
+    get_parser.set_defaults(handler=command_get)
+
+    runs_parser = subparsers.add_parser("runs", help="show recent run status for one job")
+    runs_parser.add_argument("job_id")
+    runs_parser.add_argument("--before-seq", type=int)
+    runs_parser.add_argument("--limit", type=int, default=20)
+    runs_parser.set_defaults(handler=command_runs)
 
     create_parser = subparsers.add_parser("create", help="create a job in the active chat")
     create_parser.add_argument("--title", required=True)

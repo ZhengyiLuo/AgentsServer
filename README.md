@@ -558,13 +558,15 @@ The installed `agentsdock_jobs.py` helper is the authoritative interface from
 an agent turn. Every live turn receives a private, run-scoped authority file
 and exact helper command in its provider-authority block. The helper accepts
 that file and the bound chat ID explicitly, then uses server-enforced
-agent-only routes for `list`, `create`, `update`, and `delete`. It deliberately
-provides no run-now command. The main server bearer is never inherited by a
-provider process. For example, using the literal authority path and chat ID
-shown in the current turn:
+agent-only routes for `list`, `get`, `runs`, `create`, `update`, and `delete`.
+It deliberately provides no run-now command. The main server bearer is never
+inherited by a provider process. For example, using the literal authority path
+and chat ID shown in the current turn:
 
 ```bash
 "$AGENTSDOCK_JOBS_CLI" --authority-file /path/from/turn.json --chat-id sess_from_turn list
+"$AGENTSDOCK_JOBS_CLI" --authority-file /path/from/turn.json --chat-id sess_from_turn get JOB_ID
+"$AGENTSDOCK_JOBS_CLI" --authority-file /path/from/turn.json --chat-id sess_from_turn runs JOB_ID --limit 20
 "$AGENTSDOCK_JOBS_CLI" --authority-file /path/from/turn.json --chat-id sess_from_turn create --title "Daily status" \
   --prompt "Summarize the current project status." \
   --interval-seconds 86400 --loop
@@ -576,6 +578,16 @@ shown in the current turn:
   --timezone Europe/London
 "$AGENTSDOCK_JOBS_CLI" --authority-file /path/from/turn.json --chat-id sess_from_turn delete JOB_ID
 ```
+
+API contract v12 adds the durable per-chat `provider_jobs_access` setting.
+Its default `full` mode exposes the existing helper surface, `read_only`
+permits only `list`, `get`, and `runs`, and `blocked` permits no agent Jobs
+calls. Capability issuance records the mode at turn start and every agent Jobs
+route also checks the live session setting, so a human can tighten access while
+a provider turn is running. Restoring broader access beyond the turn's issued
+ceiling takes effect on the next turn. Authenticated app/human Jobs endpoints
+are unaffected. Clients can detect the contract through
+`capabilities.provider_jobs_access_control_v1` in `/api/health`.
 
 Cron accepts Vixie five-field expressions, aliases such as `@daily`, and
 seconds-first six- or seven-field expressions (the seventh field is year).

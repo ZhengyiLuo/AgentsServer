@@ -2913,7 +2913,7 @@ FORK_INTERNAL_RUN_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 FORK_INTERNAL_RUN_LOCKS: dict[str, threading.Lock] = {}
 HISTORY_SEARCH_DB = STATE_DIR / "history_search.sqlite3"
 HISTORY_SEARCH_LOCK = threading.Lock()
-HISTORY_SEARCH_INDEX_VERSION = "3"
+HISTORY_SEARCH_INDEX_VERSION = "4"
 HISTORY_SEARCH_DIRTY: set[str] = set()
 HISTORY_SEARCH_SYNC_INTERVAL_SECONDS = max(
     0.25, float(agentsdock_setting("HISTORY_SEARCH_SYNC_INTERVAL_SECONDS", "1.0"))
@@ -10555,6 +10555,7 @@ def is_client_visible_event(event: dict[str, Any]) -> bool:
 
     return not (
         str(event.get("cross_chat_envelope_id") or "").strip()
+        and event.get("purpose") == "cross_chat_handoff_delivery"
         and str(event.get("type") or "") in CROSS_CHAT_CLIENT_INTERNAL_EVENT_TYPES
     )
 
@@ -10774,6 +10775,56 @@ def read_events(
     return list(tail_out) if tail_out is not None else out
 
 
+def read_client_events_page(
+    session_id: str,
+    after: int = 0,
+    before: int | None = None,
+    limit: int = 500,
+    *,
+    tail: bool = False,
+) -> tuple[list[dict[str, Any]], int, int, int, int]:
+    """Read raw client events while excluding server-only admission records."""
+    path = events_path(session_id)
+    if not path.exists():
+        return [], 0, 0, 0, 0
+    limit = max(1, min(int(limit or 500), MAX_EVENT_RESPONSE_LIMIT))
+    out: list[dict[str, Any]] = []
+    tail_out: deque[dict[str, Any]] | None = deque(maxlen=limit) if tail else None
+    latest_seq = 0
+    client_count = 0
+    with path.open("r", encoding="utf-8", errors="ignore") as source:
+        for line in source:
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except Exception:
+                continue
+            seq = int(event.get("seq", 0))
+            if seq > 0:
+                latest_seq = seq
+            if seq <= after or (before is not None and seq >= before):
+                continue
+            if not event_files_belong_to_session(event, session_id):
+                continue
+            if not is_client_visible_event(event):
+                continue
+            client_count += 1
+            safe_event = client_safe_event(event)
+            if tail_out is not None:
+                tail_out.append(safe_event)
+            elif len(out) < limit:
+                out.append(safe_event)
+    events = list(tail_out) if tail_out is not None else out
+    if tail:
+        omitted_before = max(0, client_count - len(events))
+        omitted_after = 0
+    else:
+        omitted_before = 0
+        omitted_after = max(0, client_count - len(events))
+    return events, latest_seq, client_count, omitted_before, omitted_after
+
+
 def read_event_catchup_batch(
     session_id: str,
     *,
@@ -10921,6 +10972,8 @@ def read_visible_events_page(
                 continue
             if not event_files_belong_to_session(event, session_id):
                 continue
+            if not is_client_visible_event(event):
+                continue
             event = client_safe_event(event)
             if not is_visible_timeline_event(
                 event,
@@ -10979,6 +11032,8 @@ def read_visible_events_after_page(
                 if seq <= after:
                     break
                 if not event_files_belong_to_session(event, session_id):
+                    continue
+                if not is_client_visible_event(event):
                     continue
                 if not is_visible_timeline_event(
                     event,
@@ -12887,6 +12942,8 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
             if not event_files_belong_to_session(event, session_id):
                 continue
             latest_seq = max(latest_seq, seq)
+            if not is_client_visible_event(event):
+                continue
             if (
                 event_type == "subagent_state"
                 and str(event.get("backend") or "") == BACKEND_CODEX
@@ -14102,6 +14159,8 @@ def collect_semantic_timeline_events(
             seq = int(event.get("seq") or 0)
             if seq <= 0 or is_fork_internal_event(event, fork_internal_run_ids):
                 continue
+            if not is_client_visible_event(event):
+                continue
             event_type = str(event.get("type") or "")
             run_id = str(event.get("run_id") or "").strip()
             job_payload = (
@@ -14667,6 +14726,8 @@ def history_search_event_record(
     internal_run_ids: set[str] | None = None,
 ) -> tuple[str, str] | None:
     if is_fork_internal_event(event, internal_run_ids):
+        return None
+    if not is_client_visible_event(event):
         return None
     event_type = str(event.get("type") or "")
     if event_type not in HISTORY_SEARCH_EVENT_TYPES and not event_type.endswith("_error"):
@@ -30105,6 +30166,11 @@ async def _start_turn_locked(
         ):
             raise HTTPException(status_code=400, detail="cross-chat delivery runtime is immutable")
     else:
+        if req.cross_chat_envelope_id is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="cross-chat envelope field is reserved for internal delivery",
+            )
         if req.purpose and req.chat_references:
             raise HTTPException(
                 status_code=400,
@@ -31745,26 +31811,15 @@ async def get_session(
                 tail=page_tail,
                 compact=compact,
             )
-    elif after > 0 and before is None:
-        events = read_events(session_id, after=after, before=before, limit=limit, tail=page_tail)
-        _, latest_seq, event_count = event_seq_bounds(session_id)
-        omitted_before = 0
-        if events:
-            omitted_after = max(0, latest_seq - int(events[-1].get("seq", 0)))
-        else:
-            omitted_after = max(0, latest_seq - after)
     else:
-        events = read_events(session_id, after=after, before=before, limit=limit, tail=page_tail)
-        latest_seq = int(events[-1].get("seq", 0)) if events else 0
-        event_count = 0
-        omitted_before = max(0, int(events[0].get("seq", 1)) - 1) if page_tail and events else 0
-        if events:
-            omitted_after = max(0, latest_seq - int(events[-1].get("seq", 0)))
-        elif after > 0:
-            omitted_after = max(0, latest_seq - after)
-        else:
-            omitted_after = 0
-    events = [event for event in events if is_client_visible_event(event)]
+        events, latest_seq, event_count, omitted_before, omitted_after = await asyncio.to_thread(
+            read_client_events_page,
+            session_id,
+            after=after,
+            before=before,
+            limit=limit,
+            tail=page_tail,
+        )
     response = {
         "session": public_session(sess),
         "events": events,

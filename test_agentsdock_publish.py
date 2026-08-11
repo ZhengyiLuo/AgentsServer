@@ -19,13 +19,11 @@ import agentsdock_publish
 def request_for(
     host: str = "127.0.0.1",
     *,
-    api_token: str = "api-secret",
-    publish_token: str = "publish-secret",
+    provider_token: str = "provider-secret",
     retry: bool = False,
 ) -> Request:
     headers = [
-        (b"authorization", f"Bearer {api_token}".encode()),
-        (b"x-agentsdock-publish-token", publish_token.encode()),
+        (b"x-agentsdock-provider-capability", provider_token.encode()),
     ]
     if retry:
         headers.append((b"x-agentsdock-publication-retry", b"1"))
@@ -61,6 +59,28 @@ class FakeRawResponse(FakeResponse):
 
 
 class ArtifactPublisherCLITests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def authority_file(self, chat_id: str) -> str:
+        path = Path(self.temporary.name) / f"authority-{len(list(Path(self.temporary.name).iterdir()))}.json"
+        path.write_text(json.dumps({
+            "provider_capability": "provider-secret",
+            "source_session_id": chat_id,
+        }))
+        path.chmod(0o600)
+        return str(path)
+
+    def environment(self, chat_id: str, *, url: str = "http://127.0.0.1:7850") -> dict[str, str]:
+        return {
+            "AGENTSDOCK_SERVER_URL": url,
+            "AGENTSDOCK_CHAT_ID": chat_id,
+            "AGENTSDOCK_PROVIDER_AUTHORITY_FILE": self.authority_file(chat_id),
+        }
+
     def test_loopback_hosts_include_ipv4_mapped_ipv6(self) -> None:
         urls = (
             "http://127.0.0.1:7850",
@@ -74,12 +94,10 @@ class ArtifactPublisherCLITests(unittest.TestCase):
                 "os.environ",
                 {
                     "AGENTSDOCK_SERVER_URL": url,
-                    "AGENTSDOCK_PUBLISH_TOKEN": "secret",
-                    "AGENTSDOCK_AGENT_TOKEN": "api-secret",
                 },
                 clear=True,
             ):
-                self.assertEqual(agentsdock_publish.loopback_server_url(), (url, "secret"))
+                self.assertEqual(agentsdock_publish.loopback_server_url(), url)
 
         for host in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"):
             with self.subTest(server_host=host):
@@ -90,8 +108,6 @@ class ArtifactPublisherCLITests(unittest.TestCase):
             "os.environ",
             {
                 "AGENTSDOCK_SERVER_URL": "http://10.0.0.8:7850",
-                "AGENTSDOCK_PUBLISH_TOKEN": "secret",
-                "AGENTSDOCK_AGENT_TOKEN": "api-secret",
             },
             clear=True,
         ):
@@ -101,21 +117,19 @@ class ArtifactPublisherCLITests(unittest.TestCase):
             ):
                 agentsdock_publish.loopback_server_url()
 
-    def test_empty_token_is_rejected(self) -> None:
+    def test_missing_authority_is_rejected(self) -> None:
         with patch.dict(
             "os.environ",
             {
                 "AGENTSDOCK_SERVER_URL": "http://127.0.0.1:7850",
-                "AGENTSDOCK_PUBLISH_TOKEN": "",
-                "AGENTSDOCK_AGENT_TOKEN": "api-secret",
             },
             clear=True,
         ):
             with self.assertRaisesRegex(
                 agentsdock_publish.PublishCLIError,
-                "must not be empty",
+                "authority-file is required",
             ):
-                agentsdock_publish.loopback_server_url()
+                agentsdock_publish.provider_authority(None)
 
     def test_lost_response_retries_same_publication_id_and_checks_receipts(self) -> None:
         files = ["/tmp/demo.mov"]
@@ -144,9 +158,7 @@ class ArtifactPublisherCLITests(unittest.TestCase):
             patch.dict(
                 "os.environ",
                 {
-                    "AGENTSDOCK_SERVER_URL": "http://127.0.0.1:7850",
-                    "AGENTSDOCK_PUBLISH_TOKEN": "secret",
-                    "AGENTSDOCK_AGENT_TOKEN": "api-secret",
+                    **self.environment("sess/demo"),
                     "HTTP_PROXY": "http://proxy.invalid:8888",
                     "NO_PROXY": "",
                 },
@@ -171,10 +183,11 @@ class ArtifactPublisherCLITests(unittest.TestCase):
         self.assertEqual(bodies[0]["publication_id"], "pub_retry")
         self.assertIsNone(requests[0].get_header("X-agentsdock-publication-retry"))
         self.assertEqual(requests[1].get_header("X-agentsdock-publication-retry"), "1")
-        self.assertEqual(requests[0].get_header("Authorization"), "Bearer api-secret")
+        self.assertIsNone(requests[0].get_header("Authorization"))
+        self.assertIsNone(requests[0].get_header("X-agentsdock-publish-token"))
         self.assertEqual(
-            requests[0].get_header("X-agentsdock-publish-token"),
-            "secret",
+            requests[0].get_header("X-agentsdock-provider-capability"),
+            "provider-secret",
         )
         handlers = build_opener.call_args.args
         self.assertIsInstance(handlers[0], urllib.request.ProxyHandler)
@@ -207,9 +220,7 @@ class ArtifactPublisherCLITests(unittest.TestCase):
             patch.dict(
                 "os.environ",
                 {
-                    "AGENTSDOCK_SERVER_URL": "http://127.0.0.1:7850",
-                    "AGENTSDOCK_PUBLISH_TOKEN": "secret",
-                    "AGENTSDOCK_AGENT_TOKEN": "api-secret",
+                    **self.environment("sess"),
                     "HTTP_PROXY": "http://proxy.invalid:8888",
                     "NO_PROXY": "",
                 },
@@ -235,12 +246,7 @@ class ArtifactPublisherCLITests(unittest.TestCase):
         with (
             patch.dict(
                 "os.environ",
-                {
-                    "AGENTSDOCK_SERVER_URL": "http://127.0.0.1:7850",
-                    "AGENTSDOCK_PUBLISH_TOKEN": "secret",
-                    "AGENTSDOCK_AGENT_TOKEN": "api-secret",
-                    "AGENTSDOCK_CHAT_ID": "sess",
-                },
+                self.environment("sess"),
                 clear=True,
             ),
             patch.object(
@@ -280,7 +286,15 @@ class ArtifactPublisherServerTests(unittest.IsolatedAsyncioTestCase):
         stack = ExitStack()
         stack.enter_context(patch.object(agent_server, "STATE_DIR", root / "state"))
         stack.enter_context(patch.object(agent_server, "FILES_ROOT", root / "files"))
-        stack.enter_context(patch.object(agent_server, "ARTIFACT_PUBLISH_TOKEN", "publish-secret"))
+        stack.enter_context(patch.object(
+            agent_server,
+            "authorize_provider_action",
+            AsyncMock(return_value={
+                "source_session_id": session_id,
+                "source_run_id": run_id,
+                "actions": {"publish"},
+            }),
+        ))
         stack.enter_context(patch.object(agent_server, "EVENT_SEQ_CACHE", {}))
         stack.enter_context(patch.object(agent_server, "EVENT_DELIVERY_LOCKS", {}))
         stack.enter_context(patch.object(
@@ -467,7 +481,19 @@ class ArtifactPublisherServerTests(unittest.IsolatedAsyncioTestCase):
                 publication_id="pub_reject",
                 files=[str(source)],
             )
-            with self.runtime_patches(root, active=False):
+            async def authorize(request, *, action, session_id):
+                del action, session_id
+                if not agent_server.request_client_is_loopback(request):
+                    raise agent_server.HTTPException(status_code=403, detail="loopback required")
+                if agent_server.provider_capability_header(request) != "provider-secret":
+                    raise agent_server.HTTPException(status_code=403, detail="bad provider capability")
+                return {"source_session_id": "sess", "source_run_id": "run_active"}
+
+            with self.runtime_patches(root, active=False), patch.object(
+                agent_server,
+                "authorize_provider_action",
+                side_effect=authorize,
+            ):
                 with self.assertRaises(agent_server.HTTPException) as remote:
                     await agent_server.publish_agent_artifacts(
                         request_for("10.0.0.8"),
@@ -478,11 +504,11 @@ class ArtifactPublisherServerTests(unittest.IsolatedAsyncioTestCase):
 
                 with self.assertRaises(agent_server.HTTPException) as unauthorized:
                     await agent_server.publish_agent_artifacts(
-                        request_for(publish_token="wrong"),
+                        request_for(provider_token="wrong"),
                         "sess",
                         model,
                     )
-                self.assertEqual(unauthorized.exception.status_code, 401)
+                self.assertEqual(unauthorized.exception.status_code, 403)
 
                 with self.assertRaises(agent_server.HTTPException) as inactive:
                     await agent_server.publish_agent_artifacts(
@@ -493,7 +519,7 @@ class ArtifactPublisherServerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(inactive.exception.status_code, 409)
                 self.assertIn("no active agent turn", inactive.exception.detail)
 
-    async def test_global_auth_and_publisher_auth_are_both_enforced(self) -> None:
+    async def test_helper_route_bypasses_admin_but_unknown_agent_route_does_not(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "secured.txt"
@@ -529,18 +555,22 @@ class ArtifactPublisherServerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(accepted.status_code, 200)
 
                 blocked_dispatch = AsyncMock()
-                wrong_api = await agent_server.require_agent_token(
-                    request_for(api_token="wrong"),
+                unknown = Request({
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/api/agent/future-unprotected-route",
+                    "headers": [],
+                    "query_string": b"",
+                    "scheme": "http",
+                    "server": ("127.0.0.1", 7850),
+                    "client": ("127.0.0.1", 43210),
+                })
+                rejected = await agent_server.require_agent_token(
+                    unknown,
                     blocked_dispatch,
                 )
-                self.assertEqual(wrong_api.status_code, 401)
+                self.assertEqual(rejected.status_code, 401)
                 blocked_dispatch.assert_not_awaited()
-
-                wrong_publisher = await agent_server.require_agent_token(
-                    request_for(publish_token="wrong"),
-                    dispatch,
-                )
-                self.assertEqual(wrong_publisher.status_code, 401)
 
     async def test_invalid_batch_creates_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

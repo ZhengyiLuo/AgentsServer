@@ -1134,7 +1134,11 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             release_eviction.set()
             with self.assertRaises(asyncio.CancelledError):
                 await refresh
-            started = await asyncio.wait_for(replacement, 0.2)
+            # Provider admission now scrubs a pre-existing tmux daemon's
+            # global and per-session environments before launch. Keep this
+            # lifecycle assertion bounded without assuming that external
+            # tmux I/O completes inside 200 ms on a busy host.
+            started = await asyncio.wait_for(replacement, 1.0)
             await asyncio.wait_for(replacement_running.wait(), 0.2)
 
         self.assertEqual(manager.evict_calls, [("chat-claude", True)])

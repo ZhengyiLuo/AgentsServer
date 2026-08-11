@@ -56,6 +56,7 @@ class InstallerContractTests(unittest.TestCase):
     def test_direct_deploy_includes_scheduler_runtime(self):
         source = DEPLOYER.read_text()
         self.assertIn('"$SCRIPT_DIR/agentsdock_jobs.py"', source)
+        self.assertIn('"$SCRIPT_DIR/agentsdock_chats.py"', source)
         self.assertIn('"$SCRIPT_DIR/agentsdock_publish.py"', source)
         self.assertIn('"$SCRIPT_DIR/claude_sdk_client.py"', source)
         self.assertIn('"$SCRIPT_DIR/codex_app_server.py"', source)
@@ -72,14 +73,16 @@ class InstallerContractTests(unittest.TestCase):
         installer_source = INSTALLER.read_text()
         packager_source = PACKAGER.read_text()
         self.assertIn(
-            "RELEASE_FILES=(agent_server.py agentsdock_jobs.py agentsdock_publish.py claude_sdk_client.py codex_app_server.py",
+            "RELEASE_FILES=(agent_server.py agentsdock_jobs.py agentsdock_chats.py agentsdock_publish.py claude_sdk_client.py codex_app_server.py",
             installer_source,
         )
+        self.assertIn('"$STAGE_DIR/agentsdock_chats.py"', installer_source)
         self.assertIn('"$STAGE_DIR/agentsdock_publish.py"', installer_source)
         self.assertIn('"$STAGE_DIR/claude_sdk_client.py"', installer_source)
         self.assertIn('"$STAGE_DIR/codex_app_server.py"', installer_source)
         self.assertIn('"$STAGE_DIR/uninstall.sh"', installer_source)
         self.assertIn('"agentsdock_publish.py"', packager_source)
+        self.assertIn('"agentsdock_chats.py"', packager_source)
         self.assertIn('"claude_sdk_client.py"', packager_source)
         self.assertIn('"codex_app_server.py"', packager_source)
         self.assertIn('"uninstall.sh"', packager_source)

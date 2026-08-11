@@ -10,16 +10,25 @@ class TerminalArchiveTests(unittest.IsolatedAsyncioTestCase):
     async def test_archiving_a_chat_kills_its_terminal_session(self) -> None:
         session = {"id": "archive-test", "title": "Archive test", "backend": "codex", "archived": True}
         update = AsyncMock(return_value=session)
-        to_thread = AsyncMock(return_value={"killed": True})
+        def threaded(callback, *args):
+            if callback is agent_server.kill_terminal_session:
+                return {"killed": True}
+            return callback(*args)
+        to_thread = AsyncMock(side_effect=threaded)
 
-        with patch.object(agent_server.STORE, "update", update), patch.object(agent_server.asyncio, "to_thread", to_thread):
+        with patch.dict(agent_server.STORE.sessions, {"archive-test": session}), \
+             patch.object(agent_server.STORE, "update", update), \
+             patch.object(agent_server.asyncio, "to_thread", to_thread):
             response = await agent_server.update_session(
                 "archive-test",
                 agent_server.UpdateSessionRequest(archived=True),
             )
 
         self.assertTrue(response["session"]["archived"])
-        to_thread.assert_awaited_once_with(agent_server.kill_terminal_session, "archive-test")
+        self.assertIn(
+            unittest.mock.call(agent_server.kill_terminal_session, "archive-test"),
+            to_thread.await_args_list,
+        )
 
     async def test_archiving_succeeds_when_tmux_is_not_installed(self) -> None:
         session_id = "archive-without-tmux"
@@ -43,9 +52,14 @@ class TerminalArchiveTests(unittest.IsolatedAsyncioTestCase):
         session = {"id": session_id, "title": "Archive test", "backend": "codex", "archived": True}
         update = AsyncMock(return_value=session)
         cleanup_error = HTTPException(status_code=500, detail="tmux server failed")
-        to_thread = AsyncMock(side_effect=cleanup_error)
+        def threaded(callback, *args):
+            if callback is agent_server.kill_terminal_session:
+                raise cleanup_error
+            return callback(*args)
+        to_thread = AsyncMock(side_effect=threaded)
 
-        with patch.object(agent_server.STORE, "update", update), \
+        with patch.dict(agent_server.STORE.sessions, {session_id: session}), \
+             patch.object(agent_server.STORE, "update", update), \
              patch.object(agent_server.asyncio, "to_thread", to_thread), \
              patch.object(agent_server.logger, "warning") as warning:
             response = await agent_server.update_session(
@@ -55,7 +69,10 @@ class TerminalArchiveTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(response["session"]["archived"])
         update.assert_awaited_once()
-        to_thread.assert_awaited_once_with(agent_server.kill_terminal_session, session_id)
+        self.assertIn(
+            unittest.mock.call(agent_server.kill_terminal_session, session_id),
+            to_thread.await_args_list,
+        )
         warning.assert_called_once()
         self.assertIn(session_id, warning.call_args.args)
 

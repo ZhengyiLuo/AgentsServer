@@ -555,24 +555,26 @@ The helper's `list` command returns the complete current set. Agents are
 instructed to change jobs only after an explicit scheduling request.
 
 The installed `agentsdock_jobs.py` helper is the authoritative interface from
-an agent turn. AgentsServer supplies its URL, bearer token, executable path,
-and active chat ID through the child-process environment. Those values cannot
-be overridden with CLI flags. The helper uses server-enforced chat-scoped
-routes for `list`, `create`, `update`, and `delete`, and deliberately provides
-no run-now command. For example, from an active agent process:
+an agent turn. Every live turn receives a private, run-scoped authority file
+and exact helper command in its provider-authority block. The helper accepts
+that file and the bound chat ID explicitly, then uses server-enforced
+agent-only routes for `list`, `create`, `update`, and `delete`. It deliberately
+provides no run-now command. The main server bearer is never inherited by a
+provider process. For example, using the literal authority path and chat ID
+shown in the current turn:
 
 ```bash
-"$AGENTSDOCK_JOBS_CLI" list
-"$AGENTSDOCK_JOBS_CLI" create --title "Daily status" \
+"$AGENTSDOCK_JOBS_CLI" --authority-file /path/from/turn.json --chat-id sess_from_turn list
+"$AGENTSDOCK_JOBS_CLI" --authority-file /path/from/turn.json --chat-id sess_from_turn create --title "Daily status" \
   --prompt "Summarize the current project status." \
   --interval-seconds 86400 --loop
-"$AGENTSDOCK_JOBS_CLI" create --title "Weekday status" \
+"$AGENTSDOCK_JOBS_CLI" --authority-file /path/from/turn.json --chat-id sess_from_turn create --title "Weekday status" \
   --prompt "Summarize the current project status." \
   --cron "0 9 * * MON-FRI" --timezone America/Los_Angeles
-"$AGENTSDOCK_JOBS_CLI" update JOB_ID \
+"$AGENTSDOCK_JOBS_CLI" --authority-file /path/from/turn.json --chat-id sess_from_turn update JOB_ID \
   --rrule "FREQ=WEEKLY;BYDAY=MO,WE,FR;BYHOUR=8;BYMINUTE=0;BYSECOND=0" \
   --timezone Europe/London
-"$AGENTSDOCK_JOBS_CLI" delete JOB_ID
+"$AGENTSDOCK_JOBS_CLI" --authority-file /path/from/turn.json --chat-id sess_from_turn delete JOB_ID
 ```
 
 Cron accepts Vixie five-field expressions, aliases such as `@daily`, and
@@ -587,6 +589,29 @@ skipped, and ambiguous fall-back times run once.
 Interval schedules are capped at ten years. RRULE `COUNT` is capped at 10,000,
 and leap-second `BYSECOND=60` is rejected because the runtime clock cannot
 represent second 60.
+
+## Cross-chat handoffs
+
+API contract v11 adds durable, same-server handoffs selected by the user in
+the AgentsDock composer. Structured references authorize either one exact
+instruction route or one automatic final-result delivery; plain `@Title` text
+never grants routing authority. Self, archived, deleted, legacy-transport, and
+cross-server targets fail closed.
+
+For an instruction grant, the current turn's provider-authority block lists
+the exact target and the one-use command shape:
+
+```bash
+"$AGENTSDOCK_CHATS_CLI" --authority-file /path/from/turn.json \
+  send --target sess_authorized_target --message "Verify the API contract."
+```
+
+The helper accepts only loopback AgentsServer URLs, disables redirects and
+proxies, and sends the per-run capability to an agent-only endpoint. Delivery
+is a normal durable target turn using the target chat's own provider,
+permission policy, queue, and timeline. A server restart reconciles the ledger
+and lifecycle outbox without silently duplicating a handoff. The desktop
+bearer remains required to inspect or cancel handoffs.
 
 Agent-created jobs use the same job store as the desktop and mobile clients,
 so they immediately appear in the Jobs panel. The scoped helper routes are:
@@ -691,6 +716,8 @@ The server exposes JSON endpoints under `/api`.
 - `POST /api/sessions/{session_id}/jobs`
 - `PATCH /api/sessions/{session_id}/jobs/{job_id}`
 - `DELETE /api/sessions/{session_id}/jobs/{job_id}`
+- `GET /api/cross-chat/handoffs/{envelope_id}`
+- `POST /api/cross-chat/handoffs/{envelope_id}/cancel`
 - `GET /api/sessions/{session_id}/processes`
 - `GET /api/sessions/{session_id}/tmux`
 - `GET /api/runtime/catalog`
@@ -710,7 +737,7 @@ tool-result output, commands, or output-file paths.
 Before publishing:
 
 ```bash
-python3 -m py_compile agent_server.py agentsdock_jobs.py codex_app_server.py update_runner.py
+python3 -m py_compile agent_server.py agentsdock_jobs.py agentsdock_chats.py agentsdock_publish.py claude_sdk_client.py codex_app_server.py update_runner.py
 rg -n 'private-host|/home/<name>|/Users/<name>|token-value' .
 ```
 

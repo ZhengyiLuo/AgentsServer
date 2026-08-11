@@ -74,11 +74,12 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Scheduled jobs", instructions)
         self.assertNotIn("Current jobs for this chat", instructions)
         self.assertIn(str(agent_server.codex_manifest_path("chat-1")), instructions)
-        self.assertIn("--chat-id chat-1", instructions)
+        self.assertIn("current turn's provider-authority block", instructions)
+        self.assertNotIn("--chat-id chat-1", instructions)
         self.assertIn(agent_server.terminal_session_name("chat-1"), instructions)
         self.assertIn("immediately retry the still-safe requested operation", instructions)
         self.assertIn("delegate bounded noisy exploration", instructions)
-        self.assertLessEqual(len(instructions.splitlines()), 15)
+        self.assertLessEqual(len(instructions.splitlines()), 16)
 
     def test_claude_policy_has_the_same_retry_and_context_hygiene_rules(self) -> None:
         instructions = agent_server.CLAUDE_PROMPT_PRELUDE.format()
@@ -89,7 +90,7 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("does not guarantee a completion wake-up", instructions)
         self.assertIn("Never use Claude's `/loop` or `CronCreate`", instructions)
         self.assertIn("durable AgentsDock jobs", instructions)
-        self.assertLessEqual(len(instructions.splitlines()), 15)
+        self.assertLessEqual(len(instructions.splitlines()), 16)
 
     async def test_new_thread_receives_policy_once_at_thread_start(self) -> None:
         manager = FakeCodexAppServerManager()
@@ -258,7 +259,8 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(manager.resume_calls), 1)
         policy = manager.resume_calls[0][1]["developerInstructions"]
         self.assertIn("sessions/chat-child/manifests/current.json", policy)
-        self.assertIn("--chat-id chat-child", policy)
+        self.assertIn("current turn's provider-authority block", policy)
+        self.assertNotIn("--chat-id chat-child", policy)
         self.assertIn("zd_chat_child", policy)
         self.assertTrue(manager.resume_calls[0][1]["excludeTurns"])
         self.assertEqual(manager.inject_calls[0][0], "thread-fork")

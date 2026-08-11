@@ -62,6 +62,89 @@ class AgentsDockJobsCLITests(unittest.TestCase):
         self.assertEqual(calls, [("GET", "/api/agent/sessions/sess%2Fchat/jobs", None)])
         self.assertIn('"job_1"', output.getvalue())
 
+    def test_get_returns_one_owned_job_without_a_mutation(self) -> None:
+        calls: list[tuple[str, str, object]] = []
+
+        def request(method: str, path: str, payload=None):
+            calls.append((method, path, payload))
+            return {"jobs": [{"id": "job_1", "session_id": "sess/chat"}]}
+
+        parser = agentsdock_jobs.build_parser()
+        with (
+            patch.dict(os.environ, self.environment(), clear=True),
+            patch.object(agentsdock_jobs, "api_request", request),
+        ):
+            result = agentsdock_jobs.command_get(
+                parser.parse_args(["get", "job_1"]),
+            )
+
+        self.assertEqual(result["job"]["id"], "job_1")
+        self.assertEqual(
+            calls,
+            [("GET", "/api/agent/sessions/sess%2Fchat/jobs", None)],
+        )
+
+    def test_runs_reads_scoped_status_history(self) -> None:
+        calls: list[tuple[str, str, object]] = []
+
+        def request(method: str, path: str, payload=None):
+            calls.append((method, path, payload))
+            if path.endswith("/jobs"):
+                return {"jobs": [{"id": "job 1", "session_id": "sess/chat"}]}
+            return {
+                "session_id": "sess/chat",
+                "job_id": "job 1",
+                "runs": [{"job_status": "completed"}],
+                "total": 1,
+            }
+
+        parser = agentsdock_jobs.build_parser()
+        with (
+            patch.dict(os.environ, self.environment(), clear=True),
+            patch.object(agentsdock_jobs, "api_request", request),
+        ):
+            result = agentsdock_jobs.command_runs(
+                parser.parse_args([
+                    "runs",
+                    "job 1",
+                    "--before-seq",
+                    "42",
+                    "--limit",
+                    "5",
+                ]),
+            )
+
+        self.assertEqual(result["runs"][0]["job_status"], "completed")
+        self.assertEqual(calls, [
+            ("GET", "/api/agent/sessions/sess%2Fchat/jobs", None),
+            (
+                "GET",
+                "/api/agent/sessions/sess%2Fchat/jobs/job%201/runs?before_seq=42&limit=5",
+                None,
+            ),
+        ])
+
+    def test_runs_rejects_foreign_history_response(self) -> None:
+        def request(_method: str, path: str, payload=None):
+            if path.endswith("/jobs"):
+                return {"jobs": [{"id": "job_1", "session_id": "sess/chat"}]}
+            return {
+                "session_id": "other/chat",
+                "job_id": "job_1",
+                "runs": [],
+            }
+
+        parser = agentsdock_jobs.build_parser()
+        with (
+            patch.dict(os.environ, self.environment(), clear=True),
+            patch.object(agentsdock_jobs, "api_request", request),
+            self.assertRaisesRegex(
+                agentsdock_jobs.JobsCLIError,
+                "outside the active chat scope",
+            ),
+        ):
+            agentsdock_jobs.command_runs(parser.parse_args(["runs", "job_1"]))
+
     def test_global_chat_id_cannot_override_authority_scope(self) -> None:
         calls: list[tuple[str, str, object]] = []
         environment = self.environment()

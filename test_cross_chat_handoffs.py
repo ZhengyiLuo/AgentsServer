@@ -348,7 +348,13 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             await release.wait()
             return await original_create(**kwargs)
 
-        submit = AsyncMock(side_effect=lambda record: record)
+        submitted = asyncio.Event()
+
+        async def record_submit(record):
+            submitted.set()
+            return record
+
+        submit = AsyncMock(side_effect=record_submit)
         with patch.object(
             agent_server.CROSS_CHAT,
             "create_instruction",
@@ -377,10 +383,7 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await task
             release.set()
-            for _ in range(40):
-                if submit.await_count:
-                    break
-                await asyncio.sleep(0)
+            await asyncio.wait_for(submitted.wait(), timeout=2)
         submit.assert_awaited_once()
         records = await agent_server.CROSS_CHAT.for_source_run("run_create_cancel")
         self.assertEqual(len(records), 1)

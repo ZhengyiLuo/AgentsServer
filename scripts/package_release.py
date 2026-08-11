@@ -68,7 +68,7 @@ def main() -> int:
         "version": version,
         "track": "beta" if "-" in version.split("+", 1)[0] else "stable",
         "prerelease": "-" in version.split("+", 1)[0],
-        "api_contract_version": 12,
+        "api_contract_version": 13,
         "commit": commit,
         "archive": {
             "name": archive_name,

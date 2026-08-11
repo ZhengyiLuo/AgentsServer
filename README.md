@@ -579,7 +579,7 @@ and chat ID shown in the current turn:
 "$AGENTSDOCK_JOBS_CLI" --authority-file /path/from/turn.json --chat-id sess_from_turn delete JOB_ID
 ```
 
-API contract v12 adds the durable per-chat `provider_jobs_access` setting.
+API contract v13 includes the durable per-chat `provider_jobs_access` setting.
 Its default `full` mode exposes the existing helper surface, `read_only`
 permits only `list`, `get`, and `runs`, and `blocked` permits no agent Jobs
 calls. Capability issuance records the mode at turn start and every agent Jobs
@@ -604,11 +604,13 @@ represent second 60.
 
 ## Cross-chat handoffs
 
-API contract v11 adds durable, same-server handoffs selected by the user in
-the AgentsDock composer. Structured references authorize either one exact
-instruction route or one automatic final-result delivery; plain `@Title` text
-never grants routing authority. Self, archived, deleted, legacy-transport, and
-cross-server targets fail closed.
+API contract v11 added durable, same-server handoffs selected by the user in
+the AgentsDock composer. API contract v13 upgrades
+`capabilities.cross_chat_handoffs_v1` to version 2 and adds bounded
+request/reply exchanges. Structured references authorize one exact exchange,
+one instruction route, or one automatic final-result delivery; plain
+`@Title` text never grants routing authority. Self, archived, deleted,
+legacy-transport, and cross-server targets fail closed.
 
 For an instruction grant, the current turn's provider-authority block lists
 the exact target and the one-use command shape:
@@ -624,6 +626,29 @@ is a normal durable target turn using the target chat's own provider,
 permission policy, queue, and timeline. A server restart reconciles the ledger
 and lifecycle outbox without silently duplicating a handoff. The desktop
 bearer remains required to inspect or cancel handoffs.
+
+Request/reply grants use the exact exchange ID reserved when the source turn
+is admitted. The source agent starts it with `ask`; a recipient may answer or
+ask a clarification with the exact `respond` command printed in that delivery
+turn's provider-authority block:
+
+```bash
+"$AGENTSDOCK_CHATS_CLI" --authority-file /path/from/turn.json \
+  ask --target sess_authorized_target --message "Which rollout is blocked?"
+"$AGENTSDOCK_CHATS_CLI" --authority-file /path/from/turn.json \
+  respond --exchange exchange_exact --inbound-leg leg_exact \
+  --message "Do you mean the desktop or server rollout?" --request-response
+```
+
+An exchange is limited to six directed conversational legs (three rounds) and
+expires after 72 hours. A successful non-empty recipient final automatically
+returns one terminal answer when the inbound leg expects a reply and no
+explicit response won the one-use CAS.
+Failures, stops, expiry, participant deletion/archive, and queue-owner loss are
+durable visible outcomes; non-user failures also create one bounded native
+status wake for the waiting sender. Exchange turns reuse the existing hidden
+`cross_chat_handoff_delivery` purpose so older clients do not expose synthetic
+prompts or queue controls.
 
 Agent-created jobs use the same job store as the desktop and mobile clients,
 so they immediately appear in the Jobs panel. The scoped helper routes are:

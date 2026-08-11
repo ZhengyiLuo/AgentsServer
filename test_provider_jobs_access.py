@@ -197,11 +197,14 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
             },
         ):
             response = await agent_server.health()
-        self.assertEqual(response["api_contract_version"], 12)
+        self.assertEqual(response["api_contract_version"], 13)
         self.assertEqual(
             response["capabilities"]["provider_jobs_access_control_v1"],
             {
                 "available": True,
+                "required": False,
+                "message": "Per-chat provider scheduled-jobs access control is available.",
+                "action": None,
                 "version": 1,
                 "modes": ["full", "read_only", "blocked"],
                 "default": "full",
@@ -220,6 +223,54 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
         _blocked_token, blocked = await self.issue("blocked", "run_blocked")
         self.assertNotIn("jobs", blocked["actions"])
         self.assertEqual(blocked["provider_jobs_access"], "blocked")
+
+    async def test_provider_capability_cannot_authorize_human_jobs_or_run_now(self) -> None:
+        token, _capability = await self.issue("full", "run_human_bypass")
+        for method, path in (
+            ("GET", "/api/jobs"),
+            ("POST", "/api/jobs/job_one/run"),
+        ):
+            request = Request({
+                "type": "http",
+                "method": method,
+                "path": path,
+                "headers": [
+                    (b"x-agentsdock-provider-capability", token.encode("utf-8")),
+                ],
+                "query_string": b"",
+                "scheme": "http",
+                "server": ("127.0.0.1", 7850),
+                "client": ("127.0.0.1", 41000),
+            })
+            call_next = AsyncMock()
+            response = await agent_server.require_agent_token(request, call_next)
+            self.assertEqual(response.status_code, 401)
+            call_next.assert_not_awaited()
+
+    async def test_no_auth_mode_advertises_policy_unavailable_and_omits_jobs_authority(self) -> None:
+        agent_server.AGENT_TOKEN = ""
+        with patch.object(
+            agent_server,
+            "tmux_capability",
+            return_value={
+                "available": False,
+                "required": False,
+                "message": "tmux unavailable",
+                "action": None,
+            },
+        ):
+            response = await agent_server.health()
+        capability = response["capabilities"]["provider_jobs_access_control_v1"]
+        self.assertFalse(capability["available"])
+        self.assertIn("authenticated", capability["message"])
+        authority_path = await agent_server.issue_cross_chat_capability(
+            "source", "run_no_auth", []
+        )
+        payload = json.loads(authority_path.read_text(encoding="utf-8"))
+        token_hash = agent_server.hashlib.sha256(
+            payload["provider_capability"].encode("utf-8")
+        ).hexdigest()
+        self.assertNotIn("jobs", agent_server.CROSS_CHAT_CAPABILITIES[token_hash]["actions"])
 
     async def test_policy_tightening_is_immediate_during_live_turn(self) -> None:
         token, _capability = await self.issue("full", "run_live")

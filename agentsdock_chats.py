@@ -60,22 +60,12 @@ def authority(path: str) -> str:
     return token
 
 
-def send(args: argparse.Namespace) -> dict[str, Any]:
+def post_json(
+    path: str,
+    payload: dict[str, Any],
+    capability: str,
+) -> dict[str, Any]:
     server_url = environment()
-    capability = authority(args.authority_file)
-    message = str(args.message or "").strip()
-    if not message:
-        raise ChatsCLIError("--message must not be empty")
-    stable_key = "cli_" + hashlib.sha256(
-        f"{capability}\0{args.target}\0{message}".encode("utf-8")
-    ).hexdigest()
-    payload = {
-        "target_session_id": args.target,
-        "action": "instruction",
-        "body": message,
-        "idempotency_key": args.idempotency_key or stable_key,
-        "artifact_grants": [],
-    }
     body = json.dumps(payload).encode("utf-8")
     headers = {
         "Accept": "application/json",
@@ -84,7 +74,7 @@ def send(args: argparse.Namespace) -> dict[str, Any]:
         "X-AgentsDock-Provider-Capability": capability,
     }
     request = urllib.request.Request(
-        f"{server_url}/api/agent/cross-chat/handoffs",
+        f"{server_url}{path}",
         data=body,
         headers=headers,
         method="POST",
@@ -105,8 +95,70 @@ def send(args: argparse.Namespace) -> dict[str, Any]:
         raise ChatsCLIError(f"server rejected handoff ({exc.code}): {detail or exc.reason}") from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise ChatsCLIError(f"could not reach AgentsServer: {getattr(exc, 'reason', exc)}") from exc
-    if not isinstance(result, dict) or not isinstance(result.get("handoff"), dict):
-        raise ChatsCLIError("AgentsServer returned an invalid handoff response")
+    if not isinstance(result, dict):
+        raise ChatsCLIError("AgentsServer returned an invalid response")
+    return result
+
+
+def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
+    capability = authority(args.authority_file)
+    message = str(args.message or "").strip()
+    if not message:
+        raise ChatsCLIError("--message must not be empty")
+    stable_key = "cli_" + hashlib.sha256(
+        f"{capability}\0{action}\0{args.target}\0{message}".encode("utf-8")
+    ).hexdigest()
+    result = post_json(
+        "/api/agent/cross-chat/handoffs",
+        {
+            "target_session_id": args.target,
+            "action": action,
+            "body": message,
+            "idempotency_key": args.idempotency_key or stable_key,
+            "artifact_grants": [],
+        },
+        capability,
+    )
+    expected = "exchange" if action == "request_reply" else "handoff"
+    if not isinstance(result.get(expected), dict):
+        raise ChatsCLIError(f"AgentsServer returned an invalid {expected} response")
+    if action == "request_reply" and not isinstance(result.get("leg"), dict):
+        raise ChatsCLIError("AgentsServer returned an invalid exchange leg response")
+    return result
+
+
+def send(args: argparse.Namespace) -> dict[str, Any]:
+    return send_action(args, "instruction")
+
+
+def ask(args: argparse.Namespace) -> dict[str, Any]:
+    return send_action(args, "request_reply")
+
+
+def respond(args: argparse.Namespace) -> dict[str, Any]:
+    capability = authority(args.authority_file)
+    message = str(args.message or "").strip()
+    if not message:
+        raise ChatsCLIError("--message must not be empty")
+    stable_key = "cli_" + hashlib.sha256(
+        (
+            f"{capability}\0respond\0{args.exchange}\0{args.inbound_leg}\0"
+            f"{int(bool(args.request_response))}\0{message}"
+        ).encode("utf-8")
+    ).hexdigest()
+    result = post_json(
+        f"/api/agent/cross-chat/exchanges/{urllib.parse.quote(args.exchange, safe='')}/responses",
+        {
+            "inbound_leg_id": args.inbound_leg,
+            "body": message,
+            "request_response": bool(args.request_response),
+            "idempotency_key": args.idempotency_key or stable_key,
+            "artifact_grants": [],
+        },
+        capability,
+    )
+    if not isinstance(result.get("exchange"), dict) or not isinstance(result.get("leg"), dict):
+        raise ChatsCLIError("AgentsServer returned an invalid exchange response")
     return result
 
 
@@ -119,6 +171,18 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--message", required=True)
     command.add_argument("--idempotency-key")
     command.set_defaults(handler=send)
+    ask_command = commands.add_parser("ask", help="start one bounded request/reply exchange")
+    ask_command.add_argument("--target", required=True)
+    ask_command.add_argument("--message", required=True)
+    ask_command.add_argument("--idempotency-key")
+    ask_command.set_defaults(handler=ask)
+    response_command = commands.add_parser("respond", help="respond to the exact inbound exchange leg")
+    response_command.add_argument("--exchange", required=True)
+    response_command.add_argument("--inbound-leg", required=True)
+    response_command.add_argument("--message", required=True)
+    response_command.add_argument("--request-response", action="store_true")
+    response_command.add_argument("--idempotency-key")
+    response_command.set_defaults(handler=respond)
     return root
 
 

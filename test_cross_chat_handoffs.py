@@ -1247,6 +1247,36 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             agent_server.is_agent_helper_route("POST", "/api/agent/future-route")
         )
 
+    async def test_internal_target_admission_is_hidden_from_all_client_generations(self) -> None:
+        internal = {
+            "type": "turn_started",
+            "purpose": "cross_chat_handoff_delivery",
+            "cross_chat_envelope_id": "handoff_hidden",
+            "prompt": "Handoff from Source",
+        }
+        self.assertFalse(agent_server.is_client_visible_event(internal))
+        self.assertTrue(agent_server.is_client_visible_event({
+            **internal,
+            "type": "assistant_text",
+            "text": "Target answer",
+        }))
+        async with agent_server.QUEUE_LOCK:
+            agent_server.QUEUED_TURNS["target"] = agent_server.deque([
+                {
+                    "queued_id": "queued_internal",
+                    "prompt": "internal",
+                    "purpose": "cross_chat_handoff_delivery",
+                    "cross_chat_envelope_id": "handoff_hidden",
+                },
+                {
+                    "queued_id": "queued_user",
+                    "prompt": "visible",
+                    "purpose": None,
+                },
+            ])
+        snapshot = await agent_server.queued_turns_snapshot("target")
+        self.assertEqual([item["queued_id"] for item in snapshot], ["queued_user"])
+
     def test_unauthenticated_server_rejects_cross_chat_references(self) -> None:
         reference = agent_server.ChatReference(
             session_id="target", display_title_snapshot="Target",

@@ -5717,7 +5717,7 @@ async def append_event(
             f.write(json.dumps(event, separators=(",", ":")) + "\n")
         HISTORY_SEARCH_DIRTY.add(session_id)
         await update_session_event_metadata(session_id, event)
-        if event_files_belong_to_session(event, session_id):
+        if event_files_belong_to_session(event, session_id) and is_client_visible_event(event):
             await HUB.broadcast(session_id, client_safe_event(event))
     # Terminal cross-chat cleanup may append lifecycle rows to this same chat;
     # run it only after releasing the per-chat event delivery lock.
@@ -5922,7 +5922,7 @@ async def append_durable_event_batch_locked(
                     concise_error_message(exc),
                 )
             try:
-                if event_files_belong_to_session(event, session_id):
+                if event_files_belong_to_session(event, session_id) and is_client_visible_event(event):
                     await HUB.broadcast(session_id, client_safe_event(event))
             except BaseException as exc:
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
@@ -6960,6 +6960,7 @@ async def queued_turns_snapshot(session_id: str) -> list[dict[str, Any]]:
         public_queued_turn(session_id, item, idx + 1)
         for idx, item in enumerate(items)
         if str(item.get("queued_id") or "").strip()
+        and item.get("purpose") != "cross_chat_handoff_delivery"
     ]
 
 
@@ -10531,6 +10532,33 @@ def client_safe_event(event: dict[str, Any]) -> dict[str, Any]:
     return safe
 
 
+CROSS_CHAT_CLIENT_INTERNAL_EVENT_TYPES = {
+    "turn_started",
+    "turn_queued",
+    "turn_unqueued",
+    "turn_queue_updated",
+    "turn_queue_reordered",
+    "turn_queue_run_now",
+    "turn_queue_paused",
+    "turn_queue_delivery_fenced",
+}
+
+
+def is_client_visible_event(event: dict[str, Any]) -> bool:
+    """Keep internal handoff admission rows out of every client generation.
+
+    The durable queue/start events remain authoritative for server recovery,
+    but old clients would otherwise label the server-generated target prompt
+    as user-authored. Lifecycle cards expose the handoff itself; target agent
+    reasoning, tools, artifacts, and assistant output remain visible.
+    """
+
+    return not (
+        str(event.get("cross_chat_envelope_id") or "").strip()
+        and str(event.get("type") or "") in CROSS_CHAT_CLIENT_INTERNAL_EVENT_TYPES
+    )
+
+
 async def release_turn_slot(
     session_id: str,
     *,
@@ -10781,6 +10809,8 @@ def read_event_catchup_batch(
             if seq > through:
                 break
             if not event_files_belong_to_session(event, session_id):
+                continue
+            if not is_client_visible_event(event):
                 continue
             event = client_safe_event(event)
             if visible and not is_visible_timeline_event(
@@ -31734,6 +31764,7 @@ async def get_session(
             omitted_after = max(0, latest_seq - after)
         else:
             omitted_after = 0
+    events = [event for event in events if is_client_visible_event(event)]
     response = {
         "session": public_session(sess),
         "events": events,
@@ -35463,6 +35494,8 @@ async def session_events(
                     after=cursor,
                 )
                 for event in legacy_events:
+                    if not is_client_visible_event(event):
+                        continue
                     await asyncio.wait_for(
                         ws.send_json(event),
                         timeout=WEBSOCKET_SEND_TIMEOUT_SECONDS,

@@ -1249,12 +1249,20 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_internal_target_admission_is_hidden_from_all_client_generations(self) -> None:
         internal = {
+            "id": "internal-start",
+            "seq": 2,
+            "session_id": "target",
             "type": "turn_started",
             "purpose": "cross_chat_handoff_delivery",
             "cross_chat_envelope_id": "handoff_hidden",
             "prompt": "Handoff from Source",
         }
         self.assertFalse(agent_server.is_client_visible_event(internal))
+        self.assertTrue(agent_server.is_client_visible_event({
+            **internal,
+            "purpose": None,
+        }))
+        self.assertIsNone(agent_server.history_search_event_record(internal))
         self.assertTrue(agent_server.is_client_visible_event({
             **internal,
             "type": "assistant_text",
@@ -1276,6 +1284,100 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             ])
         snapshot = await agent_server.queued_turns_snapshot("target")
         self.assertEqual([item["queued_id"] for item in snapshot], ["queued_user"])
+
+        event_file = self.root / "client-events.jsonl"
+        events = [
+            {
+                "id": "normal-start",
+                "seq": 1,
+                "session_id": "target",
+                "type": "turn_started",
+                "prompt": "Visible user prompt",
+            },
+            internal,
+            {
+                "id": "internal-reasoning",
+                "seq": 3,
+                "session_id": "target",
+                "type": "reasoning_summary",
+                "purpose": "cross_chat_handoff_delivery",
+                "cross_chat_envelope_id": "handoff_hidden",
+                "text": "Visible target reasoning",
+            },
+            {
+                "id": "internal-answer",
+                "seq": 4,
+                "session_id": "target",
+                "type": "assistant_text",
+                "purpose": "cross_chat_handoff_delivery",
+                "cross_chat_envelope_id": "handoff_hidden",
+                "text": "Visible target answer",
+            },
+            {
+                **internal,
+                "id": "hidden-newest-start",
+                "seq": 5,
+            },
+        ]
+        event_file.write_text(
+            "".join(json.dumps(event, separators=(",", ":")) + "\n" for event in events),
+            encoding="utf-8",
+        )
+        with patch.object(agent_server, "events_path", return_value=event_file):
+            page = agent_server.read_client_events_page("target", limit=2)
+            self.assertEqual([event["seq"] for event in page[0]], [1, 3])
+            self.assertEqual(page[1], 5)
+            self.assertEqual(page[2:], (3, 0, 1))
+            tail = agent_server.read_client_events_page("target", limit=2, tail=True)
+            self.assertEqual([event["seq"] for event in tail[0]], [3, 4])
+            self.assertEqual(tail[1], 5)
+            self.assertEqual(tail[2:], (3, 1, 0))
+            visible = agent_server.read_visible_events_page("target", limit=10)
+            self.assertEqual([event["seq"] for event in visible[0]], [1, 3, 4])
+            self.assertEqual(visible[2:], (3, 0, 0))
+            catchup = agent_server.read_event_catchup_batch(
+                "target", after=0, through=5, limit=10
+            )
+            self.assertEqual([event["seq"] for event in catchup[0]], [1, 3, 4])
+            response = await agent_server.get_session(
+                "target", limit=2, tail=False
+            )
+            self.assertEqual([event["seq"] for event in response["events"]], [1, 3])
+            self.assertEqual(response["latest_seq"], 5)
+            self.assertEqual(response["event_count"], 3)
+            self.assertEqual(response["events_omitted_after"], 1)
+
+        broadcast = AsyncMock()
+        with (
+            patch.object(agent_server, "ensure_dirs"),
+            patch.object(agent_server, "events_path", return_value=self.root / "live.jsonl"),
+            patch.object(agent_server, "next_event_seq", AsyncMock(side_effect=[1, 2])),
+            patch.object(agent_server, "update_session_event_metadata", AsyncMock()),
+            patch.object(agent_server.HUB, "broadcast", broadcast),
+        ):
+            await agent_server.append_event("target", "turn_started", {
+                key: value for key, value in internal.items()
+                if key not in {"id", "seq", "session_id", "type"}
+            })
+            await agent_server.append_event("target", "assistant_text", {
+                "purpose": "cross_chat_handoff_delivery",
+                "cross_chat_envelope_id": "handoff_hidden",
+                "text": "Visible target answer",
+            })
+        broadcast.assert_awaited_once()
+        self.assertEqual(broadcast.await_args.args[1]["type"], "assistant_text")
+
+    async def test_ordinary_turn_rejects_reserved_cross_chat_envelope(self) -> None:
+        with self.assertRaises(HTTPException) as raised:
+            await agent_server._start_turn_locked(
+                "target",
+                agent_server.TurnRequest(
+                    prompt="Ordinary prompt",
+                    cross_chat_envelope_id="forged-envelope",
+                ),
+                queue_if_busy=False,
+            )
+        self.assertEqual(raised.exception.status_code, 400)
 
     def test_unauthenticated_server_rejects_cross_chat_references(self) -> None:
         reference = agent_server.ChatReference(
@@ -1305,6 +1407,17 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page["semantic_item_count"], 1)
         self.assertNotIn("turn_started", [event["type"] for event in page["events"]])
         self.assertIn("cross_chat_handoff_delivered", [event["type"] for event in page["events"]])
+
+        event_file.write_text(json.dumps(events[2]) + "\n")
+        with (
+            patch.object(agent_server, "events_path", return_value=event_file),
+            patch.object(agent_server, "TIMELINE_INDEX_CACHE", agent_server.OrderedDict()),
+        ):
+            orphan_page = agent_server.read_semantic_timeline_page(
+                "target", limit=10, tail=True
+            )
+        self.assertEqual(orphan_page["semantic_item_count"], 0)
+        self.assertEqual(orphan_page["events"], [])
 
     def test_source_handoff_lifecycle_does_not_hijack_source_run(self) -> None:
         event_file = self.root / "source-timeline.jsonl"

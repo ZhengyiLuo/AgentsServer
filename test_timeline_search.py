@@ -25,6 +25,14 @@ class TimelineSearchForkTests(unittest.TestCase):
             self.event(3, "assistant_text", run_id="digest-run", forked=True, text="Private digest body"),
             self.event(4, "turn_started", run_id="normal-run", forked=True, prompt="Retained searchable question"),
             self.event(5, "assistant_text", run_id="normal-run", forked=True, text="Retained searchable answer"),
+            self.event(
+                6,
+                "turn_started",
+                run_id="handoff-run",
+                purpose="cross_chat_handoff_delivery",
+                cross_chat_envelope_id="handoff-hidden",
+                prompt="Hidden relay needle",
+            ),
         ]
         path.write_text(
             "".join(json.dumps(event, separators=(",", ":")) + "\n" for event in events),
@@ -57,6 +65,11 @@ class TimelineSearchForkTests(unittest.TestCase):
         })
         retained = agent_server.search_timeline_index(self.session_id, "searchable")
         self.assertEqual([result["seq"] for result in retained["results"]], [5, 4])
+        self.assertEqual(agent_server.search_timeline_index(self.session_id, "relay"), {
+            "session_id": self.session_id,
+            "query": "relay",
+            "results": [],
+        })
 
     def test_search_index_version_change_removes_legacy_rows_before_rebuild(self) -> None:
         connection = agent_server.history_search_connection()

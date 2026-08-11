@@ -4,17 +4,34 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 
 class JobsCLIError(RuntimeError):
     """A safe, user-facing CLI failure."""
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+def host_is_loopback(host: str) -> bool:
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host.lower() == "localhost"
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    return address.is_loopback
 
 
 def nonempty_chat_id(value: str) -> str:
@@ -24,24 +41,44 @@ def nonempty_chat_id(value: str) -> str:
     return chat_id
 
 
+def provider_authority() -> tuple[str, str]:
+    raw_path = os.environ.get("AGENTSDOCK_PROVIDER_AUTHORITY_FILE", "").strip()
+    if not raw_path:
+        raise JobsCLIError("--authority-file is required")
+    path = Path(raw_path).expanduser()
+    try:
+        if path.stat().st_mode & 0o077:
+            raise JobsCLIError("authority file permissions are unsafe")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise JobsCLIError(f"could not read authority file: {exc}") from exc
+    capability = str(payload.get("provider_capability") or payload.get("capability") or "")
+    source_session_id = str(payload.get("source_session_id") or "").strip()
+    if not capability or not source_session_id:
+        raise JobsCLIError("authority file is invalid")
+    return capability, source_session_id
+
+
 def required_environment() -> tuple[str, str, str]:
     server_url = os.environ.get("AGENTSDOCK_SERVER_URL", "").strip().rstrip("/")
-    chat_id = os.environ.get("AGENTSDOCK_CHAT_ID", "").strip()
-    token = os.environ.get("AGENTSDOCK_AGENT_TOKEN")
+    explicit_chat_id = os.environ.get("AGENTSDOCK_CHAT_ID", "").strip()
+    token, authority_chat_id = provider_authority()
+    if explicit_chat_id and explicit_chat_id != authority_chat_id:
+        raise JobsCLIError("--chat-id does not match the authority file")
+    chat_id = explicit_chat_id or authority_chat_id
     missing = [
         name
         for name, value in (
             ("AGENTSDOCK_SERVER_URL", server_url),
-            ("AGENTSDOCK_CHAT_ID", chat_id),
-            ("AGENTSDOCK_AGENT_TOKEN", token),
         )
-        if value is None or (name != "AGENTSDOCK_AGENT_TOKEN" and not value)
+        if value is None or not value
     ]
     if missing:
         raise JobsCLIError(f"missing agent environment: {', '.join(missing)}")
-    if not server_url.startswith(("http://", "https://")):
-        raise JobsCLIError("AGENTSDOCK_SERVER_URL must be an HTTP(S) URL")
-    return server_url, chat_id, token or ""
+    parsed = urllib.parse.urlsplit(server_url)
+    if parsed.scheme != "http" or not parsed.hostname or not host_is_loopback(parsed.hostname):
+        raise JobsCLIError("AGENTSDOCK_SERVER_URL must be a loopback HTTP URL")
+    return server_url, chat_id, token
 
 
 def api_request(method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -50,11 +87,14 @@ def api_request(method: str, path: str, payload: dict[str, Any] | None = None) -
     headers = {"Accept": "application/json"}
     if body is not None:
         headers["Content-Type"] = "application/json"
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    headers["X-AgentsDock-Provider-Capability"] = token
     request = urllib.request.Request(f"{server_url}{path}", data=body, headers=headers, method=method)
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        NoRedirectHandler(),
+    )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with opener.open(request, timeout=30) as response:
             decoded = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
@@ -76,7 +116,7 @@ def api_request(method: str, path: str, payload: dict[str, Any] | None = None) -
 def scoped_jobs() -> list[dict[str, Any]]:
     _server_url, chat_id, _token = required_environment()
     encoded_chat_id = urllib.parse.quote(chat_id, safe="")
-    response = api_request("GET", f"/api/sessions/{encoded_chat_id}/jobs")
+    response = api_request("GET", f"/api/agent/sessions/{encoded_chat_id}/jobs")
     jobs = response.get("jobs")
     if not isinstance(jobs, list) or not all(isinstance(job, dict) for job in jobs):
         raise JobsCLIError("AgentsServer returned an invalid jobs list")
@@ -131,7 +171,7 @@ def command_create(args: argparse.Namespace) -> Any:
         "context_mode": args.context_mode,
     }
     encoded_chat_id = urllib.parse.quote(chat_id, safe="")
-    return {"job": checked_job(api_request("POST", f"/api/sessions/{encoded_chat_id}/jobs", payload))}
+    return {"job": checked_job(api_request("POST", f"/api/agent/sessions/{encoded_chat_id}/jobs", payload))}
 
 
 def command_update(args: argparse.Namespace) -> Any:
@@ -183,7 +223,7 @@ def command_update(args: argparse.Namespace) -> Any:
     job_id = urllib.parse.quote(args.job_id, safe="")
     return {
         "job": checked_job(
-            api_request("PATCH", f"/api/sessions/{encoded_chat_id}/jobs/{job_id}", patch)
+            api_request("PATCH", f"/api/agent/sessions/{encoded_chat_id}/jobs/{job_id}", patch)
         )
     }
 
@@ -193,7 +233,7 @@ def command_delete(args: argparse.Namespace) -> Any:
     owned_job(args.job_id)
     encoded_chat_id = urllib.parse.quote(chat_id, safe="")
     job_id = urllib.parse.quote(args.job_id, safe="")
-    response = api_request("DELETE", f"/api/sessions/{encoded_chat_id}/jobs/{job_id}")
+    response = api_request("DELETE", f"/api/agent/sessions/{encoded_chat_id}/jobs/{job_id}")
     if response.get("deleted") is not True:
         raise JobsCLIError(f"job {args.job_id!r} was not deleted")
     return {"ok": True, "deleted": True, "job_id": args.job_id}
@@ -202,6 +242,10 @@ def command_delete(args: argparse.Namespace) -> Any:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Manage scheduled jobs for the current AgentsDock chat.",
+    )
+    parser.add_argument(
+        "--authority-file",
+        help="mode-0600 per-run AgentsDock provider authority file",
     )
     parser.add_argument(
         "--chat-id",
@@ -269,6 +313,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.authority_file:
+        os.environ["AGENTSDOCK_PROVIDER_AUTHORITY_FILE"] = args.authority_file
     previous_chat_id = os.environ.get("AGENTSDOCK_CHAT_ID")
     if args.chat_id is not None:
         os.environ["AGENTSDOCK_CHAT_ID"] = args.chat_id

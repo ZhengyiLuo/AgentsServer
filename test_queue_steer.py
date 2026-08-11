@@ -897,7 +897,7 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
                         patch.object(
                             agent_server,
                             "requeue_turn_front",
-                            new_callable=AsyncMock,
+                            wraps=agent_server.requeue_turn_front,
                         ) as requeue,
                         patch.object(
                             agent_server,
@@ -913,8 +913,15 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
                         await start_next_queued_turn("chat-1")
                         await asyncio.sleep(0)
 
-                    self.assertNotIn("chat-1", agent_server.QUEUED_TURNS)
-                    requeue.assert_not_awaited()
+                    if case in {"deleting", "deleting_race"}:
+                        self.assertEqual(
+                            [item["queued_id"] for item in agent_server.QUEUED_TURNS["chat-1"]],
+                            ["queued-terminal"],
+                        )
+                        requeue.assert_awaited_once()
+                    else:
+                        self.assertNotIn("chat-1", agent_server.QUEUED_TURNS)
+                        requeue.assert_not_awaited()
                     retry.assert_not_awaited()
                     append_event.assert_not_awaited()
                     if case in {"not_found", "deleting_race"}:

@@ -31,12 +31,16 @@ class AgentTerminalContextTests(unittest.TestCase):
             env["AGENTSDOCK_PUBLISH_CLI"],
             str(agent_server.SERVER_ROOT / "agentsdock_publish.py"),
         )
-        self.assertEqual(env["AGENTSDOCK_AGENT_TOKEN"], agent_server.AGENT_TOKEN)
-        self.assertEqual(env["AGENTSDOCK_PUBLISH_TOKEN"], agent_server.ARTIFACT_PUBLISH_TOKEN)
-        self.assertNotEqual(
-            env["AGENTSDOCK_PUBLISH_TOKEN"],
-            env["AGENTSDOCK_AGENT_TOKEN"],
+        self.assertEqual(
+            env["AGENTSDOCK_JOBS_CLI"],
+            str(agent_server.SERVER_ROOT / "agentsdock_jobs.py"),
         )
+        self.assertEqual(
+            env["AGENTSDOCK_CHATS_CLI"],
+            str(agent_server.SERVER_ROOT / "agentsdock_chats.py"),
+        )
+        for name in agent_server.PROVIDER_SECRET_ENV_NAMES:
+            self.assertNotIn(name, env)
 
     def test_codex_app_server_environment_exports_publisher(self) -> None:
         env = agent_server.codex_app_server_env()
@@ -45,8 +49,8 @@ class AgentTerminalContextTests(unittest.TestCase):
             env["AGENTSDOCK_PUBLISH_CLI"],
             str(agent_server.SERVER_ROOT / "agentsdock_publish.py"),
         )
-        self.assertEqual(env["AGENTSDOCK_AGENT_TOKEN"], agent_server.AGENT_TOKEN)
-        self.assertEqual(env["AGENTSDOCK_PUBLISH_TOKEN"], agent_server.ARTIFACT_PUBLISH_TOKEN)
+        for name in agent_server.PROVIDER_SECRET_ENV_NAMES:
+            self.assertNotIn(name, env)
 
     def test_claude_prompt_uses_stable_terminal_indirection(self) -> None:
         command = agent_server.build_claude_cmd(
@@ -78,7 +82,7 @@ class AgentTerminalContextTests(unittest.TestCase):
         self.assertEqual(first_prompt, second_prompt)
         self.assertNotIn("Current jobs for this chat", first_prompt)
         self.assertNotIn("turn-start snapshot", first_prompt)
-        self.assertLess(len(first_prompt), 2_000)
+        self.assertLess(len(first_prompt), 2_400)
 
     def test_claude_transcript_suppression_flag_only_affects_fresh_command(self) -> None:
         standalone = agent_server.build_claude_cmd(
@@ -147,7 +151,8 @@ class AgentTerminalContextTests(unittest.TestCase):
         developer_prompt = codex_developer_instructions(command)
 
         self.assertIn("`zd_sess_123`", developer_prompt)
-        self.assertIn("--chat-id sess-123", developer_prompt)
+        self.assertIn("current turn's provider-authority block", developer_prompt)
+        self.assertNotIn("--chat-id sess-123", developer_prompt)
         self.assertIn("manifests/current.json", developer_prompt)
         self.assertEqual(command[-1], "Inspect the terminal state.")
         self.assertNotIn("[AgentsDock context]", command[-1])
@@ -448,10 +453,8 @@ class AgentTerminalContextTests(unittest.TestCase):
             compact = " ".join(prompt.split())
             self.assertIn("Publish user-facing files", compact)
             self.assertIn('"files":["/absolute/path.ext"', compact)
-            self.assertIn('"title":"Demo"', compact)
-            self.assertIn('"text":"Optional note"', compact)
+            self.assertIn("exact `--authority-file` command", compact)
             self.assertIn("playable `.mp4`/`.mov` videos", compact)
-            self.assertIn("AGENTSDOCK_PUBLISH_CLI", compact)
             self.assertIn("successful JSON receipt", compact)
             self.assertIn("submitted for attachment", compact)
             self.assertIn("not Slack", compact)

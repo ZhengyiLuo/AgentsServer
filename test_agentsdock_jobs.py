@@ -1,19 +1,34 @@
 import argparse
 import io
+import json
 import os
+import tempfile
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest.mock import patch
 
 import agentsdock_jobs
 
 
 class AgentsDockJobsCLITests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.authority_path = Path(self.temporary.name) / "authority.json"
+        self.authority_path.write_text(json.dumps({
+            "provider_capability": "provider-token",
+            "source_session_id": "sess/chat",
+        }))
+        self.authority_path.chmod(0o600)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
     def environment(self) -> dict[str, str]:
         return {
             "AGENTSDOCK_SERVER_URL": "http://127.0.0.1:17850",
             "AGENTSDOCK_CHAT_ID": "sess/chat",
-            "AGENTSDOCK_AGENT_TOKEN": "token",
+            "AGENTSDOCK_PROVIDER_AUTHORITY_FILE": str(self.authority_path),
         }
 
     def test_list_uses_chat_scoped_endpoint_and_returns_current_jobs(self) -> None:
@@ -26,7 +41,7 @@ class AgentsDockJobsCLITests(unittest.TestCase):
         with patch.dict(os.environ, self.environment(), clear=True), patch.object(agentsdock_jobs, "api_request", request):
             result = agentsdock_jobs.command_list(argparse.Namespace())
 
-        self.assertEqual(calls, [("GET", "/api/sessions/sess%2Fchat/jobs", None)])
+        self.assertEqual(calls, [("GET", "/api/agent/sessions/sess%2Fchat/jobs", None)])
         self.assertEqual(result["jobs"][0]["id"], "job_1")
 
     def test_main_without_chat_id_preserves_environment_fallback(self) -> None:
@@ -44,16 +59,16 @@ class AgentsDockJobsCLITests(unittest.TestCase):
             result = agentsdock_jobs.main(["list"])
 
         self.assertEqual(result, 0)
-        self.assertEqual(calls, [("GET", "/api/sessions/sess%2Fchat/jobs", None)])
+        self.assertEqual(calls, [("GET", "/api/agent/sessions/sess%2Fchat/jobs", None)])
         self.assertIn('"job_1"', output.getvalue())
 
-    def test_global_chat_id_overrides_environment_for_one_invocation(self) -> None:
+    def test_global_chat_id_cannot_override_authority_scope(self) -> None:
         calls: list[tuple[str, str, object]] = []
         environment = self.environment()
 
         def request(method: str, path: str, payload=None):
             calls.append((method, path, payload))
-            return {"jobs": [{"id": "job_2", "session_id": "other/chat"}]}
+            return {"jobs": [{"id": "job_2", "session_id": "sess/chat"}]}
 
         with (
             patch.dict(os.environ, environment, clear=True),
@@ -63,8 +78,8 @@ class AgentsDockJobsCLITests(unittest.TestCase):
             result = agentsdock_jobs.main(["--chat-id", " other/chat ", "list"])
             self.assertEqual(os.environ["AGENTSDOCK_CHAT_ID"], "sess/chat")
 
-        self.assertEqual(result, 0)
-        self.assertEqual(calls, [("GET", "/api/sessions/other%2Fchat/jobs", None)])
+        self.assertEqual(result, 1)
+        self.assertEqual(calls, [])
 
     def test_global_chat_id_supplies_missing_environment_scope(self) -> None:
         calls: list[tuple[str, str, object]] = []
@@ -73,18 +88,18 @@ class AgentsDockJobsCLITests(unittest.TestCase):
 
         def request(method: str, path: str, payload=None):
             calls.append((method, path, payload))
-            return {"jobs": [{"id": "job_2", "session_id": "other/chat"}]}
+            return {"jobs": [{"id": "job_2", "session_id": "sess/chat"}]}
 
         with (
             patch.dict(os.environ, environment, clear=True),
             patch.object(agentsdock_jobs, "api_request", request),
             redirect_stdout(io.StringIO()),
         ):
-            result = agentsdock_jobs.main(["--chat-id", "other/chat", "list"])
+            result = agentsdock_jobs.main(["--chat-id", "sess/chat", "list"])
             self.assertNotIn("AGENTSDOCK_CHAT_ID", os.environ)
 
         self.assertEqual(result, 0)
-        self.assertEqual(calls, [("GET", "/api/sessions/other%2Fchat/jobs", None)])
+        self.assertEqual(calls, [("GET", "/api/agent/sessions/sess%2Fchat/jobs", None)])
 
     def test_global_chat_id_rejects_empty_values(self) -> None:
         parser = agentsdock_jobs.build_parser()
@@ -110,7 +125,7 @@ class AgentsDockJobsCLITests(unittest.TestCase):
             result = args.handler(args)
 
         self.assertEqual(seen["method"], "POST")
-        self.assertEqual(seen["path"], "/api/sessions/sess%2Fchat/jobs")
+        self.assertEqual(seen["path"], "/api/agent/sessions/sess%2Fchat/jobs")
         payload = seen["payload"]
         self.assertNotIn("session_id", payload)
         self.assertEqual(payload["schedule_kind"], "cron")
@@ -175,7 +190,7 @@ class AgentsDockJobsCLITests(unittest.TestCase):
 
         method, path, payload = calls[-1]
         self.assertEqual(method, "PATCH")
-        self.assertEqual(path, "/api/sessions/sess%2Fchat/jobs/job_1")
+        self.assertEqual(path, "/api/agent/sessions/sess%2Fchat/jobs/job_1")
         self.assertEqual(payload["schedule_kind"], "rrule")
         self.assertEqual(payload["rrule"], "FREQ=WEEKLY;BYDAY=MO,WE,FR;BYHOUR=8")
         self.assertEqual(payload["timezone"], "Europe/London")

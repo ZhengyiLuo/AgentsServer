@@ -7,6 +7,91 @@ import agent_server
 
 
 class TerminalShellInitializationTests(unittest.TestCase):
+    def test_tmux_bootstrap_environment_allowlists_and_drops_server_secrets(self) -> None:
+        with patch.dict(
+            agent_server.os.environ,
+            {
+                "HOME": "/home/user",
+                "USER": "user",
+                "PATH": "/usr/bin:/bin",
+                "LANG": "C.UTF-8",
+                "AGENTSDOCK_AGENT_TOKEN": "admin-a",
+                "ZENITHDOCK_AGENT_TOKEN": "admin-b",
+                "ZENITHBOT_AGENT_TOKEN": "admin-c",
+                "AGENTSDOCK_PUBLISH_TOKEN": "publish",
+                "AGENTSDOCK_PROVIDER_AUTHORITY_FILE": "/tmp/authority",
+                "HTTPS_PROXY": "https://secret-proxy.invalid",
+            },
+            clear=True,
+        ), patch.object(
+            agent_server,
+            "server_update_runner_environment",
+            return_value={"XDG_RUNTIME_DIR": "/run/user/1000"},
+        ):
+            environment = agent_server.tmux_bootstrap_environment()
+
+        self.assertEqual(environment["HOME"], "/home/user")
+        self.assertEqual(environment["XDG_RUNTIME_DIR"], "/run/user/1000")
+        for name in (*agent_server.PROVIDER_SECRET_ENV_NAMES, "HTTPS_PROXY"):
+            self.assertNotIn(name, environment)
+
+    def test_existing_tmux_daemon_global_environment_is_scrubbed(self) -> None:
+        with patch.object(
+            agent_server,
+            "tmux_server_pid",
+            return_value=4321,
+        ), patch.object(
+            agent_server,
+            "run_tmux",
+            side_effect=lambda args, **_kwargs: subprocess.CompletedProcess(
+                args,
+                0,
+                stdout="zd_one\nother\n" if args[0] == "list-sessions" else "",
+                stderr="",
+            ),
+        ) as run_tmux:
+            agent_server.scrub_tmux_global_secret_environment()
+
+        commands = [call.args[0] for call in run_tmux.call_args_list]
+        rendered = " ; ".join(" ".join(command) for command in commands)
+        for name in agent_server.PROVIDER_SECRET_ENV_NAMES:
+            self.assertIn(f"set-environment -gu {name}", rendered)
+            self.assertIn(f"set-environment -t zd_one -u {name}", rendered)
+            self.assertIn(f"set-environment -t other -u {name}", rendered)
+
+    def test_terminal_attach_client_does_not_inherit_server_secrets(self) -> None:
+        inherited = {
+            name: f"secret-{index}"
+            for index, name in enumerate(agent_server.PROVIDER_SECRET_ENV_NAMES)
+        }
+        captured: dict[str, str] = {}
+
+        def popen(*_args, env: dict[str, str], **_kwargs):
+            captured.update(env)
+            return SimpleNamespace(pid=1234)
+
+        with (
+            patch.dict(agent_server.os.environ, inherited, clear=False),
+            patch.dict(
+                agent_server.STORE.sessions,
+                {"chat": {"id": "chat", "cwd": "/tmp"}},
+            ),
+            patch.object(
+                agent_server,
+                "ensure_terminal_session",
+                return_value={"name": "zd_chat", "cwd": "/tmp"},
+            ),
+            patch.object(agent_server.pty, "openpty", return_value=(10, 11)),
+            patch.object(agent_server, "set_pty_dimensions"),
+            patch.object(agent_server.subprocess, "Popen", side_effect=popen),
+            patch.object(agent_server.os, "close"),
+            patch.object(agent_server, "tmux_bin", return_value="tmux"),
+        ):
+            agent_server.spawn_terminal_client("chat", "/tmp", 80, 24)
+
+        for name in agent_server.PROVIDER_SECRET_ENV_NAMES:
+            self.assertNotIn(name, captured)
+
     def test_shell_validation_rejects_disabled_relative_directory_and_null_paths(self) -> None:
         self.assertIsNone(agent_server.valid_terminal_login_shell("/usr/sbin/nologin"))
         self.assertIsNone(agent_server.valid_terminal_login_shell("relative/bash"))

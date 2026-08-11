@@ -44,34 +44,34 @@ def host_is_loopback(host: str) -> bool:
     return address.is_loopback
 
 
-def loopback_server_url() -> tuple[str, str]:
+def loopback_server_url() -> str:
     server_url = os.environ.get("AGENTSDOCK_SERVER_URL", "").strip().rstrip("/")
-    token = os.environ.get("AGENTSDOCK_PUBLISH_TOKEN")
-    missing = [
-        name
-        for name, value in (
-            ("AGENTSDOCK_SERVER_URL", server_url),
-            ("AGENTSDOCK_PUBLISH_TOKEN", token),
-        )
-        if value is None or (name == "AGENTSDOCK_SERVER_URL" and not value)
-    ]
-    if missing:
-        raise PublishCLIError(f"missing agent environment: {', '.join(missing)}")
+    if not server_url:
+        raise PublishCLIError("missing agent environment: AGENTSDOCK_SERVER_URL")
     parsed = urllib.parse.urlsplit(server_url)
     if parsed.scheme != "http" or not parsed.hostname:
         raise PublishCLIError("AGENTSDOCK_SERVER_URL must be a loopback HTTP URL")
     if not host_is_loopback(parsed.hostname):
-        raise PublishCLIError("refusing to send the agent token to a non-loopback server")
-    if not token:
-        raise PublishCLIError("AGENTSDOCK_PUBLISH_TOKEN must not be empty")
-    return server_url, token
+        raise PublishCLIError("refusing to send provider authority to a non-loopback server")
+    return server_url
 
 
-def active_chat_id(explicit: str | None) -> str:
-    chat_id = str(explicit or os.environ.get("AGENTSDOCK_CHAT_ID") or "").strip()
-    if not chat_id:
-        raise PublishCLIError("provide --chat-id or set AGENTSDOCK_CHAT_ID")
-    return chat_id
+def provider_authority(authority_file: str | None) -> tuple[str, str]:
+    raw_path = str(authority_file or os.environ.get("AGENTSDOCK_PROVIDER_AUTHORITY_FILE") or "").strip()
+    if not raw_path:
+        raise PublishCLIError("--authority-file is required")
+    path = Path(raw_path).expanduser()
+    try:
+        if path.stat().st_mode & 0o077:
+            raise PublishCLIError("authority file permissions are unsafe")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PublishCLIError(f"could not read authority file: {exc}") from exc
+    capability = str(payload.get("provider_capability") or payload.get("capability") or "")
+    source_session_id = str(payload.get("source_session_id") or "").strip()
+    if not capability or not source_session_id:
+        raise PublishCLIError("authority file is invalid")
+    return capability, source_session_id
 
 
 def load_manifest(path: str) -> list[Any]:
@@ -119,13 +119,18 @@ def http_error_detail(raw: str) -> str:
 
 
 def publish(
-    chat_id: str,
+    chat_id: str | None,
     files: list[Any],
     *,
     publication_id: str | None = None,
+    authority_file: str | None = None,
 ) -> dict[str, Any]:
-    server_url, publish_token = loopback_server_url()
-    api_token = os.environ.get("AGENTSDOCK_AGENT_TOKEN", "")
+    server_url = loopback_server_url()
+    capability, authority_chat_id = provider_authority(authority_file)
+    requested_chat_id = str(chat_id or os.environ.get("AGENTSDOCK_CHAT_ID") or "").strip()
+    if requested_chat_id and requested_chat_id != authority_chat_id:
+        raise PublishCLIError("--chat-id does not match the authority file")
+    chat_id = requested_chat_id or authority_chat_id
     publication_id = publication_id or f"pub_{uuid.uuid4().hex}"
     encoded_chat_id = urllib.parse.quote(chat_id, safe="")
     body = json.dumps({
@@ -135,10 +140,8 @@ def publish(
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "X-AgentsDock-Publish-Token": publish_token,
+        "X-AgentsDock-Provider-Capability": capability,
     }
-    if api_token:
-        headers["Authorization"] = f"Bearer {api_token}"
     decoded: Any = None
     ambiguous_error: BaseException | None = None
     # urllib honors HTTP_PROXY even for loopback addresses on some hosts.
@@ -230,6 +233,10 @@ def build_parser() -> argparse.ArgumentParser:
         description="Attach files to the currently active AgentsDock chat turn.",
     )
     parser.add_argument(
+        "--authority-file",
+        help="mode-0600 per-run AgentsDock provider authority file",
+    )
+    parser.add_argument(
         "--chat-id",
         type=nonempty_chat_id,
         help="explicit chat scope (defaults to AGENTSDOCK_CHAT_ID)",
@@ -258,11 +265,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        chat_id = active_chat_id(args.chat_id)
         result = publish(
-            chat_id,
+            args.chat_id,
             requested_files(args),
             publication_id=args.publication_id,
+            authority_file=args.authority_file,
         )
     except PublishCLIError as exc:
         print(f"error: {exc}", file=sys.stderr)

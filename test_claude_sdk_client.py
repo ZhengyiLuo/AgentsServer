@@ -365,6 +365,78 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(await handle.wait_result(), final_result)
 
+    async def test_multiple_delegated_milestones_do_not_finish_top_level_run(self) -> None:
+        handle = await self.manager.start_run(
+            "chat-milestones",
+            "Complete both milestones",
+            run_id="run-milestones",
+            options={},
+            configuration_key="same",
+        )
+        client = self.factory.clients[0]
+        first_started = {
+            "type": "system",
+            "subtype": "task_started",
+            "task_id": "agent-1",
+            "task_type": "local_agent",
+        }
+        first_finished = {
+            "type": "system",
+            "subtype": "task_notification",
+            "task_id": "agent-1",
+            "status": "completed",
+        }
+        second_started = {
+            "type": "system",
+            "subtype": "task_started",
+            "task_id": "workflow-2",
+            "task_type": "local_workflow",
+        }
+        second_finished = {
+            "type": "system",
+            "subtype": "task_notification",
+            "task_id": "workflow-2",
+            "status": "completed",
+        }
+        first_progress = {"type": "assistant", "text": "First milestone complete"}
+        second_progress = {"type": "assistant", "text": "Second milestone complete"}
+        final_result = {"type": "result", "is_error": False, "result": "all done"}
+
+        for message in (
+            first_started,
+            {"type": "result", "is_error": False, "result": "first done"},
+        ):
+            await client.emit(message)
+        await asyncio.sleep(0)
+        self.assertFalse(handle.done)
+
+        for message in (
+            first_finished,
+            first_progress,
+            second_started,
+            {"type": "result", "is_error": False, "result": "second done"},
+        ):
+            await client.emit(message)
+        await asyncio.sleep(0)
+        self.assertFalse(handle.done)
+
+        for message in (second_finished, second_progress, final_result):
+            await client.emit(message)
+
+        self.assertEqual(
+            await asyncio.wait_for(collect(handle), 1),
+            [
+                first_started,
+                first_finished,
+                first_progress,
+                second_started,
+                second_finished,
+                second_progress,
+                final_result,
+            ],
+        )
+        self.assertEqual(await handle.wait_result(), final_result)
+
     async def test_terminal_task_update_allows_followup_result(self) -> None:
         from claude_agent_sdk.types import TaskUpdatedMessage
 

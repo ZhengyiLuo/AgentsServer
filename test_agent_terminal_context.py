@@ -140,6 +140,8 @@ class AgentTerminalContextTests(unittest.TestCase):
         )
 
         self.assertEqual(legacy, agent_server.CLAUDE_PROMPT_PRELUDE.format())
+        self.assertIn("Treat milestone completion as progress", legacy)
+        self.assertIn("every requested milestone and acceptance check", legacy)
 
     def test_codex_prompt_names_terminal_and_preserves_user_prompt(self) -> None:
         command = agent_server.build_codex_cmd(

@@ -544,7 +544,7 @@ You are operating through AgentsDock, backed by AgentsServer.
 - Keep final answers concise; the UI separates tools, output, reasoning, and artifacts.
 - Render inline math as `$...$` and display math as `$$...$$`.
 - Continue through ordinary inspection errors when a safe retry or narrow fix is available.
-- Before finishing, join child tasks you started; automate only when explicitly asked.
+- Treat milestone completion as progress, not completion of the user's whole request. Before finishing, join child tasks you started and wait for every requested milestone and acceptance check; automate only when explicitly asked.
 - Never detach required work with `nohup`, `disown`, `setsid`, shell `&`, or Bash `run_in_background`. Keep work needed for the current reply in foreground. Async completion that must wake chat requires a tracked Agent/workflow; background Bash does not guarantee a completion wake-up.
 - This is AgentsDock, not Slack; never use Slack file helpers.
 - Link editor-readable files with Markdown paths relative to the chat working directory, optionally with `#L42`; do not use `file://`.
@@ -20661,19 +20661,79 @@ def path_if_jsonl(value: str) -> Path | None:
 
 
 def find_claude_history(provider_id: str) -> Path | None:
+    candidates = claude_history_candidates(provider_id)
+    return candidates[0] if candidates else None
+
+
+def claude_history_candidates(provider_id: str) -> list[Path]:
     direct = path_if_jsonl(provider_id)
     if direct:
-        return direct
+        return [direct]
     if not CLAUDE_PROJECTS_ROOT.exists():
-        return None
+        return []
     matches = [p for p in CLAUDE_PROJECTS_ROOT.rglob("*.jsonl") if p.stem == provider_id]
-    if not matches:
-        return None
-    return max(matches, key=lambda p: p.stat().st_mtime)
+
+    def modified_at(path: Path) -> float:
+        with suppress(OSError):
+            return path.stat().st_mtime
+        return 0.0
+
+    return sorted(matches, key=modified_at, reverse=True)
+
+
+CLAUDE_TRANSCRIPT_CWD_SCAN_BYTES = 4 * 1024 * 1024
+CLAUDE_TRANSCRIPT_CWD_LINE_BYTES = 4 * 1024 * 1024
+
+
+def bounded_claude_transcript_regions(path: Path) -> Iterator[bytes]:
+    """Yield complete JSONL regions near both ends without loading a huge transcript."""
+
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            prefix = handle.read(CLAUDE_TRANSCRIPT_CWD_SCAN_BYTES)
+            if size > len(prefix) and not prefix.endswith(b"\n"):
+                prefix = prefix.rsplit(b"\n", 1)[0] if b"\n" in prefix else b""
+            if prefix:
+                yield prefix
+
+            if size <= CLAUDE_TRANSCRIPT_CWD_SCAN_BYTES:
+                return
+            start = max(0, size - CLAUDE_TRANSCRIPT_CWD_SCAN_BYTES)
+            handle.seek(max(0, start - 1))
+            suffix = handle.read()
+            if start > 0:
+                previous = suffix[:1]
+                suffix = suffix[1:]
+                if previous != b"\n":
+                    suffix = suffix.split(b"\n", 1)[1] if b"\n" in suffix else b""
+            if suffix:
+                yield suffix
+    except OSError:
+        return
+
+
+def claude_transcript_matches_cwd(path: Path, cwd: str) -> bool:
+    """Validate a provider transcript using Claude's recorded cwd metadata."""
+
+    expected_cwd = str(Path(cwd).expanduser())
+    for region in bounded_claude_transcript_regions(path):
+        for raw_line in region.splitlines():
+            if not raw_line or len(raw_line) > CLAUDE_TRANSCRIPT_CWD_LINE_BYTES:
+                continue
+            try:
+                event = json.loads(raw_line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            recorded_cwd = event.get("cwd") if isinstance(event, dict) else None
+            if recorded_cwd and str(Path(str(recorded_cwd)).expanduser()) == expected_cwd:
+                return True
+    return False
 
 
 def claude_project_dir_for_cwd(cwd: str) -> Path:
-    # Claude Code stores transcript JSONL files under a cwd-derived project name.
+    # Historical fast path. Current Claude versions apply additional private
+    # sanitization, so resume also validates UUID candidates by transcript cwd.
     project_name = str(Path(cwd).expanduser()).replace("/", "-")
     return CLAUDE_PROJECTS_ROOT / project_name
 
@@ -20705,8 +20765,10 @@ def resolve_claude_resume_provider(sess: dict[str, Any], cwd: str) -> tuple[str 
     if expected.exists():
         return provider_id, None
 
-    found_elsewhere = find_claude_history(provider_id)
-    if found_elsewhere:
+    candidates = claude_history_candidates(provider_id)
+    if any(claude_transcript_matches_cwd(candidate, cwd) for candidate in candidates):
+        return provider_id, None
+    if candidates:
         return None, f"Claude resume skipped: provider session {provider_id} is not available for cwd {cwd}."
 
     return None, f"Claude resume skipped: provider session {provider_id} has no local transcript for cwd {cwd}."

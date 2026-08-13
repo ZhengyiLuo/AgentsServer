@@ -372,6 +372,80 @@ class ForkHistoryCloneTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
+    def test_claude_resume_finds_transcript_when_cli_sanitizes_underscore(self) -> None:
+        provider_id = "claude-provider-sanitized"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cwd = root / "code" / "gr00t_ws"
+            cwd.mkdir(parents=True)
+            projects_root = root / "claude-projects"
+            current_cli_name = str(cwd).replace("/", "-").replace("_", "-")
+            transcript = projects_root / current_cli_name / f"{provider_id}.jsonl"
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text(
+                "\n".join(
+                    (
+                        json.dumps({"type": "system", "sessionId": provider_id}),
+                        json.dumps(
+                            {
+                                "type": "user",
+                                "sessionId": provider_id,
+                                "cwd": str(cwd),
+                                "message": {"role": "user", "content": "Continue"},
+                            }
+                        ),
+                    )
+                )
+                + "\n"
+            )
+            session = {
+                "backend": agent_server.BACKEND_CLAUDE,
+                "claude_session_id": provider_id,
+                "claude_session_cwd": str(cwd),
+            }
+
+            with patch.object(agent_server, "CLAUDE_PROJECTS_ROOT", projects_root):
+                expected = agent_server.claude_resume_file_for_cwd(provider_id, str(cwd))
+                self.assertNotEqual(expected, transcript)
+                self.assertFalse(expected.exists())
+                resolved = agent_server.resolve_claude_resume_provider(session, str(cwd))
+
+        self.assertEqual(resolved, (provider_id, None))
+
+    def test_claude_resume_rejects_transcript_recorded_for_another_cwd(self) -> None:
+        provider_id = "claude-provider-wrong-cwd"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cwd = root / "code" / "gr00t_ws"
+            other_cwd = root / "code" / "another_workspace"
+            cwd.mkdir(parents=True)
+            other_cwd.mkdir(parents=True)
+            projects_root = root / "claude-projects"
+            transcript = projects_root / "-unexpected-project-name" / f"{provider_id}.jsonl"
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "sessionId": provider_id,
+                        "cwd": str(other_cwd),
+                        "message": {"role": "user", "content": "Different chat"},
+                    }
+                )
+                + "\n"
+            )
+            session = {
+                "backend": agent_server.BACKEND_CLAUDE,
+                "claude_session_id": provider_id,
+                "claude_session_cwd": str(cwd),
+            }
+
+            with patch.object(agent_server, "CLAUDE_PROJECTS_ROOT", projects_root):
+                resolved, warning = agent_server.resolve_claude_resume_provider(session, str(cwd))
+
+        self.assertIsNone(resolved)
+        self.assertIn("is not available for cwd", warning or "")
+
     def test_validated_claude_fork_identity_drives_sdk_and_print_fork_flags(
         self,
     ) -> None:

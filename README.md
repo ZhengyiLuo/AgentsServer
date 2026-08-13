@@ -656,6 +656,20 @@ so they immediately appear in the Jobs panel. The scoped helper routes are:
 - `GET/POST /api/sessions/{session_id}/jobs`
 - `PATCH/DELETE /api/sessions/{session_id}/jobs/{job_id}`
 
+## Working-directory completion
+
+AgentsDock can complete New Chat working-directory paths against the active
+AgentsServer host (including remote hosts) when
+`capabilities.working_directory_completion` is advertised:
+
+```text
+GET /api/working-directories/complete?path=/srv/pro&limit=24
+```
+
+The authenticated endpoint performs one bounded, shallow scan and returns
+directories only. Older clients and servers continue to use the ordinary path
+field without a global API compatibility failure.
+
 ## Workspace Files
 
 The optional `workspace_files` health capability exposes a chat-scoped text

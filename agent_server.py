@@ -463,6 +463,8 @@ MAX_WORKSPACE_TEXT_BYTES = parse_workspace_text_max_bytes(
 # representable by JavaScript numbers.
 WORKSPACE_UNLIMITED_TEXT_BYTES = (1 << 53) - 1
 MAX_WORKSPACE_PATH_CHARS = int(agentsdock_setting("WORKSPACE_PATH_MAX_CHARS", "4096"))
+MAX_WORKING_DIRECTORY_COMPLETIONS = 50
+MAX_WORKING_DIRECTORY_SCAN_ENTRIES = 5_000
 MAX_WORKSPACE_SEARCH_SCAN = int(agentsdock_setting("WORKSPACE_SEARCH_MAX_ENTRIES", "20000"))
 MAX_WORKSPACE_SEARCH_SECONDS = max(
     0.1, float(agentsdock_setting("WORKSPACE_SEARCH_MAX_SECONDS", "2.0"))
@@ -1047,6 +1049,78 @@ def existing_cwd(requested: str | None) -> str:
         if path.is_dir():
             return str(path)
     return "/tmp"
+
+
+def complete_working_directory_sync(requested: str | None, limit: int = 24) -> dict[str, Any]:
+    """Return bounded directory-only completions from the AgentsServer host.
+
+    Electron may be connected to a remote server, so resolving this field on
+    the desktop host would offer paths that the agent cannot use.  This helper
+    intentionally performs one shallow scan and returns no file names.
+    """
+    raw = str(requested or "").strip()
+    if "\x00" in raw:
+        raise HTTPException(status_code=400, detail="working directory paths cannot contain NUL bytes")
+    if len(raw) > MAX_WORKSPACE_PATH_CHARS:
+        raise HTTPException(status_code=400, detail="working directory path is too long")
+    bounded_limit = max(1, min(int(limit), MAX_WORKING_DIRECTORY_COMPLETIONS))
+    source = raw or existing_cwd(DEFAULT_CWD)
+    expanded = os.path.expanduser(source)
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(existing_cwd(DEFAULT_CWD), expanded)
+    normalized = os.path.normpath(expanded)
+    exact = os.path.isdir(normalized)
+    scan_path = normalized if exact else os.path.dirname(normalized)
+    prefix = "" if exact else os.path.basename(normalized)
+    if not scan_path:
+        scan_path = os.path.abspath(os.sep)
+
+    suggestions: list[dict[str, Any]] = []
+    truncated = False
+    scan_error: str | None = None
+    try:
+        with os.scandir(scan_path) as entries:
+            candidates: list[tuple[str, bool]] = []
+            for scanned, entry in enumerate(entries):
+                if scanned >= MAX_WORKING_DIRECTORY_SCAN_ENTRIES:
+                    truncated = True
+                    break
+                name = entry.name
+                if not prefix.startswith(".") and name.startswith("."):
+                    continue
+                if prefix and not name.casefold().startswith(prefix.casefold()):
+                    continue
+                try:
+                    if not entry.is_dir(follow_symlinks=True):
+                        continue
+                    candidates.append((name, entry.is_symlink()))
+                except OSError:
+                    continue
+        candidates.sort(key=lambda item: (item[0].casefold(), item[0]))
+        truncated = truncated or len(candidates) > bounded_limit
+        for name, is_symlink in candidates[:bounded_limit]:
+            completed = os.path.join(scan_path, name)
+            if not completed.endswith(os.sep):
+                completed += os.sep
+            suggestions.append({"name": name, "path": completed, "symlink": is_symlink})
+    except FileNotFoundError:
+        scan_error = "Parent directory not found."
+    except NotADirectoryError:
+        scan_error = "Parent path is not a directory."
+    except PermissionError:
+        scan_error = "Permission denied while reading this directory."
+    except OSError:
+        scan_error = "This directory could not be read."
+
+    return {
+        "input": raw,
+        "resolved_path": normalized,
+        "exists": exact,
+        "base_path": scan_path,
+        "suggestions": suggestions,
+        "truncated": truncated,
+        "message": scan_error,
+    }
 
 
 def validated_fork_cwd(session: dict[str, Any]) -> str:
@@ -34515,6 +34589,14 @@ async def health() -> dict[str, Any]:
                 "max_preview_file_bytes": MAX_WORKSPACE_PREVIEW_BYTES,
                 "preview_media_types": sorted(set(WORKSPACE_PREVIEW_MEDIA_TYPES.values())),
             },
+            "working_directory_completion": {
+                "available": True,
+                "required": False,
+                "message": "Working-directory suggestions are available from this server.",
+                "action": None,
+                "version": 1,
+                "max_results": MAX_WORKING_DIRECTORY_COMPLETIONS,
+            },
             "scheduled_jobs": {
                 "available": True,
                 "required": False,
@@ -35225,6 +35307,14 @@ async def search_all_session_timelines(
         limit,
         eligible_session_ids,
     )
+
+
+@app.get("/api/working-directories/complete")
+async def complete_working_directory(
+    path: str = Query(default="", max_length=MAX_WORKSPACE_PATH_CHARS),
+    limit: int = Query(default=24, ge=1, le=MAX_WORKING_DIRECTORY_COMPLETIONS),
+) -> dict[str, Any]:
+    return await asyncio.to_thread(complete_working_directory_sync, path, limit)
 
 
 @app.post("/api/sessions")

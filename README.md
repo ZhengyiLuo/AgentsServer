@@ -1,7 +1,9 @@
 # AgentsServer
 
+![AgentsDock in action](assets/agentsdock-preview.png)
+
 **AgentsServer is the self-hosted execution backend for
-[AgentsDock](https://github.com/ZhengyiLuo/AgentsDock).** AgentsDock provides
+[AgentsDock](https://agentsdock.net).** AgentsDock provides
 the polished desktop and mobile chat experience; AgentsServer runs on the
 machine that owns your workspaces, Claude Code installation, and Codex CLI.
 Together they provide persistent agent chats without routing private project
@@ -96,10 +98,10 @@ and folders, queues and scheduled jobs, rich Markdown/code rendering, inline
 media, downloads and drag-out, code review, search, notifications, and
 persistent per-chat terminals.
 
-Get the client and current installation instructions from the
-[AgentsDock repository](https://github.com/ZhengyiLuo/AgentsDock). The macOS
-desktop app is available as a Developer ID-signed and Apple-notarized build;
-Apple-platform test builds are also distributed through TestFlight.
+Get the client and current installation instructions from
+[agentsdock.net](https://agentsdock.net). The macOS desktop app is available
+as a Developer ID-signed and Apple-notarized build; Apple-platform test
+builds are also distributed through TestFlight.
 
 ## Guided Setup
 

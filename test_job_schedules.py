@@ -189,6 +189,448 @@ class JobOccurrenceTests(unittest.TestCase):
 
 
 class JobStoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pause_for_session_disables_enabled_jobs_and_emits_updates(
+        self,
+    ) -> None:
+        store = agent_server.JobStore()
+        store.jobs = {
+            "job_interval": {
+                "id": "job_interval",
+                "session_id": "sess_archived",
+                "title": "Interval target",
+                "prompt": "Do not include this in events",
+                "schedule_kind": "interval",
+                "interval_seconds": 60,
+                "enabled": True,
+                "next_run_at": 120.0,
+                "scheduled_run_at": 120.0,
+                "run_count": 7,
+            },
+            "job_cron": {
+                "id": "job_cron",
+                "session_id": "sess_archived",
+                "title": "Cron target",
+                "schedule_kind": "cron",
+                "cron_expression": "0 9 * * *",
+                "timezone": "UTC",
+                "enabled": True,
+                "next_run_at": 130.0,
+                "scheduled_run_at": 130.0,
+            },
+            "job_rrule": {
+                "id": "job_rrule",
+                "session_id": "sess_archived",
+                "title": "RRULE target",
+                "schedule_kind": "rrule",
+                "rrule": "FREQ=DAILY;COUNT=3",
+                "enabled": True,
+                "next_run_at": 140.0,
+                "scheduled_run_at": 140.0,
+            },
+            "job_already_paused": {
+                "id": "job_already_paused",
+                "session_id": "sess_archived",
+                "title": "Already paused",
+                "enabled": False,
+                "next_run_at": None,
+                "scheduled_run_at": None,
+            },
+            "job_other_chat": {
+                "id": "job_other_chat",
+                "session_id": "sess_active",
+                "title": "Other chat",
+                "enabled": True,
+                "next_run_at": 180.0,
+                "scheduled_run_at": 180.0,
+            },
+        }
+        events = AsyncMock()
+
+        with (
+            patch.object(store, "save", new_callable=AsyncMock) as save,
+            patch.object(agent_server, "append_event", events),
+        ):
+            paused = await store.pause_for_session("sess_archived")
+
+        self.assertEqual(paused, 3)
+        for job_id in ("job_interval", "job_cron", "job_rrule"):
+            self.assertFalse(store.jobs[job_id]["enabled"])
+            self.assertIsNone(store.jobs[job_id]["next_run_at"])
+            self.assertIsNone(store.jobs[job_id]["scheduled_run_at"])
+        self.assertEqual(store.jobs["job_interval"]["interval_seconds"], 60)
+        self.assertEqual(store.jobs["job_interval"]["run_count"], 7)
+        self.assertEqual(store.jobs["job_cron"]["cron_expression"], "0 9 * * *")
+        self.assertEqual(store.jobs["job_rrule"]["rrule"], "FREQ=DAILY;COUNT=3")
+        self.assertFalse(store.jobs["job_already_paused"]["enabled"])
+        self.assertTrue(store.jobs["job_other_chat"]["enabled"])
+        self.assertEqual(store.jobs["job_other_chat"]["next_run_at"], 180.0)
+        save.assert_awaited_once()
+        self.assertEqual(events.await_count, 3)
+        self.assertEqual(
+            {call.args[2]["job_id"] for call in events.await_args_list},
+            {"job_interval", "job_cron", "job_rrule"},
+        )
+        for call in events.await_args_list:
+            self.assertEqual(call.args[0], "sess_archived")
+            self.assertEqual(call.args[1], "job_updated")
+            self.assertFalse(call.args[2]["job"]["enabled"])
+            self.assertNotIn("prompt", call.args[2]["job"])
+
+        events.reset_mock()
+        save.reset_mock()
+        self.assertEqual(await store.pause_for_session("sess_archived"), 0)
+        save.assert_not_awaited()
+        events.assert_not_awaited()
+
+    async def test_pause_for_session_save_failure_stays_safe_in_memory(
+        self,
+    ) -> None:
+        store = agent_server.JobStore()
+        store.jobs["job_target"] = {
+            "id": "job_target",
+            "session_id": "sess_archived",
+            "title": "Target",
+            "enabled": True,
+            "next_run_at": 120.0,
+            "scheduled_run_at": 120.0,
+        }
+        events = AsyncMock()
+
+        with (
+            patch.object(
+                store,
+                "save",
+                AsyncMock(side_effect=OSError("disk full")),
+            ),
+            patch.object(agent_server, "append_event", events),
+        ):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                await store.pause_for_session("sess_archived")
+
+        self.assertFalse(store.jobs["job_target"]["enabled"])
+        self.assertIsNone(store.jobs["job_target"]["next_run_at"])
+        self.assertIsNone(store.jobs["job_target"]["scheduled_run_at"])
+        events.assert_not_awaited()
+
+    async def test_load_pauses_enabled_jobs_for_archived_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs_file = root / "jobs.json"
+            jobs_file.write_text(json.dumps({
+                "job_archived": {
+                    "id": "job_archived",
+                    "session_id": "sess_archived",
+                    "title": "Archived job",
+                    "prompt": "Do not run",
+                    "schedule_kind": "interval",
+                    "interval_seconds": 60,
+                    "timezone": "UTC",
+                    "schedule_start_at": 120.0,
+                    "scheduled_run_at": 120.0,
+                    "next_run_at": 120.0,
+                    "enabled": True,
+                    "context_mode": "chat",
+                    "run_count": 0,
+                },
+                "job_active": {
+                    "id": "job_active",
+                    "session_id": "sess_active",
+                    "title": "Active job",
+                    "prompt": "Still run",
+                    "schedule_kind": "interval",
+                    "interval_seconds": 60,
+                    "timezone": "UTC",
+                    "schedule_start_at": 180.0,
+                    "scheduled_run_at": 180.0,
+                    "next_run_at": 180.0,
+                    "enabled": True,
+                    "context_mode": "chat",
+                    "run_count": 0,
+                },
+            }))
+            store = agent_server.JobStore()
+            sessions = {
+                "sess_archived": {"id": "sess_archived", "archived": True},
+                "sess_active": {"id": "sess_active", "archived": False},
+            }
+
+            with (
+                patch.object(agent_server, "STATE_DIR", root),
+                patch.object(agent_server, "JOBS_FILE", jobs_file),
+                patch.object(agent_server.STORE, "sessions", sessions),
+            ):
+                await store.load()
+
+            self.assertFalse(store.jobs["job_archived"]["enabled"])
+            self.assertIsNone(store.jobs["job_archived"]["next_run_at"])
+            self.assertIsNone(store.jobs["job_archived"]["scheduled_run_at"])
+            self.assertTrue(store.jobs["job_active"]["enabled"])
+            persisted = json.loads(jobs_file.read_text())
+            self.assertFalse(persisted["job_archived"]["enabled"])
+            self.assertIsNone(persisted["job_archived"]["next_run_at"])
+            self.assertIsNone(persisted["job_archived"]["scheduled_run_at"])
+
+    async def test_create_rejects_an_archived_parent_session(self) -> None:
+        store = agent_server.JobStore()
+        session_id = "sess_archived_create"
+        request = agent_server.CreateJobRequest(
+            session_id=session_id,
+            title="Should not exist",
+            prompt="Do not schedule",
+        )
+
+        with patch.object(agent_server.STORE, "sessions", {
+            session_id: {"id": session_id, "archived": True},
+        }):
+            with self.assertRaises(HTTPException) as raised:
+                await store.create(request)
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("unarchive", str(raised.exception.detail).lower())
+        self.assertEqual(store.jobs, {})
+
+    async def test_archived_session_job_cannot_be_enabled_but_can_be_edited(
+        self,
+    ) -> None:
+        store = agent_server.JobStore()
+        session_id = "sess_archived_update"
+        store.jobs["job_paused"] = {
+            "id": "job_paused",
+            "session_id": session_id,
+            "title": "Paused",
+            "prompt": "Do not run",
+            "schedule_kind": "interval",
+            "interval_seconds": 60,
+            "cron_expression": None,
+            "rrule": None,
+            "timezone": "UTC",
+            "schedule_start_at": 1000.0,
+            "scheduled_run_at": None,
+            "next_run_at": None,
+            "enabled": False,
+            "loop": True,
+            "max_runs": None,
+            "run_count": 0,
+        }
+        original = dict(store.jobs["job_paused"])
+        save = AsyncMock()
+        events = AsyncMock()
+
+        with (
+            patch.object(agent_server.STORE, "sessions", {
+                session_id: {"id": session_id, "archived": True},
+            }),
+            patch.object(store, "save", save),
+            patch.object(agent_server, "append_event", events),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await store.update("job_paused", {"enabled": True})
+            self.assertEqual(store.jobs["job_paused"], original)
+            save.assert_not_awaited()
+            events.assert_not_awaited()
+
+            updated = await store.update(
+                "job_paused",
+                {"title": "Renamed while paused", "enabled": False},
+            )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("unarchive", str(raised.exception.detail).lower())
+        self.assertEqual(updated["title"], "Renamed while paused")
+        self.assertFalse(updated["enabled"])
+        self.assertIsNone(updated["next_run_at"])
+        save.assert_awaited_once()
+        events.assert_awaited_once()
+
+    async def test_scheduler_pauses_due_archived_jobs_without_running_or_deferring(
+        self,
+    ) -> None:
+        store = agent_server.JobStore()
+        session_id = "sess_archived_due"
+        store.jobs["job_due"] = {
+            "id": "job_due",
+            "session_id": session_id,
+            "title": "Due but archived",
+            "prompt": "Do not run",
+            "enabled": True,
+            "next_run_at": 1.0,
+            "scheduled_run_at": 1.0,
+        }
+        sleep_count = 0
+
+        async def one_scheduler_iteration(_delay: float) -> None:
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count > 1:
+                raise asyncio.CancelledError
+
+        blocker = AsyncMock(return_value=None)
+        events = AsyncMock()
+        with (
+            patch.object(agent_server.STORE, "sessions", {
+                session_id: {"id": session_id, "archived": True},
+            }),
+            patch.object(agent_server.time, "time", return_value=2.0),
+            patch.object(
+                agent_server.asyncio,
+                "sleep",
+                side_effect=one_scheduler_iteration,
+            ),
+            patch.object(store, "save", new_callable=AsyncMock),
+            patch.object(store, "run_job", new_callable=AsyncMock) as run_job,
+            patch.object(store, "defer", new_callable=AsyncMock) as defer,
+            patch.object(agent_server, "scheduled_job_blocker", blocker),
+            patch.object(agent_server, "append_event", events),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await store.scheduler_loop()
+
+        self.assertFalse(store.jobs["job_due"]["enabled"])
+        self.assertIsNone(store.jobs["job_due"]["next_run_at"])
+        self.assertIsNone(store.jobs["job_due"]["scheduled_run_at"])
+        blocker.assert_not_awaited()
+        run_job.assert_not_awaited()
+        defer.assert_not_awaited()
+        events.assert_awaited_once()
+        self.assertEqual(events.await_args.args[1], "job_updated")
+
+    async def test_scheduler_does_not_dispatch_a_job_paused_during_blocker_check(
+        self,
+    ) -> None:
+        store = agent_server.JobStore()
+        session_id = "sess_pause_race"
+        store.jobs["job_due"] = {
+            "id": "job_due",
+            "session_id": session_id,
+            "title": "Due before pause",
+            "prompt": "Do not run",
+            "enabled": True,
+            "next_run_at": 1.0,
+            "scheduled_run_at": 1.0,
+        }
+        sleep_count = 0
+
+        async def one_scheduler_iteration(_delay: float) -> None:
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count > 1:
+                raise asyncio.CancelledError
+
+        async def pause_while_checking(_session_id: str) -> None:
+            store.jobs["job_due"]["enabled"] = False
+            store.jobs["job_due"]["next_run_at"] = None
+            store.jobs["job_due"]["scheduled_run_at"] = None
+            return None
+
+        with (
+            patch.object(agent_server.STORE, "sessions", {
+                session_id: {"id": session_id, "archived": False},
+            }),
+            patch.object(agent_server.time, "time", return_value=2.0),
+            patch.object(
+                agent_server.asyncio,
+                "sleep",
+                side_effect=one_scheduler_iteration,
+            ),
+            patch.object(
+                agent_server,
+                "scheduled_job_blocker",
+                side_effect=pause_while_checking,
+            ),
+            patch.object(store, "run_job", new_callable=AsyncMock) as run_job,
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await store.scheduler_loop()
+
+        run_job.assert_not_awaited()
+
+    async def test_scheduler_treats_a_late_archive_rejection_as_a_pause(
+        self,
+    ) -> None:
+        store = agent_server.JobStore()
+        session_id = "sess_archive_during_dispatch"
+        session = {"id": session_id, "archived": False}
+        store.jobs["job_due"] = {
+            "id": "job_due",
+            "session_id": session_id,
+            "title": "Archive race",
+            "prompt": "Do not retry",
+            "enabled": True,
+            "next_run_at": 1.0,
+            "scheduled_run_at": 1.0,
+            "run_count": 0,
+        }
+        sleep_count = 0
+
+        async def one_scheduler_iteration(_delay: float) -> None:
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count > 1:
+                raise asyncio.CancelledError
+
+        async def reject_after_archive(_job_id: str) -> None:
+            session["archived"] = True
+            raise HTTPException(
+                status_code=409,
+                detail="archived chats cannot start turns",
+            )
+
+        pause = AsyncMock(return_value=1)
+        events = AsyncMock()
+        with (
+            patch.object(agent_server.STORE, "sessions", {session_id: session}),
+            patch.object(agent_server.time, "time", return_value=2.0),
+            patch.object(
+                agent_server.asyncio,
+                "sleep",
+                side_effect=one_scheduler_iteration,
+            ),
+            patch.object(
+                agent_server,
+                "scheduled_job_blocker",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch.object(store, "run_job", side_effect=reject_after_archive),
+            patch.object(store, "pause_for_session", pause),
+            patch.object(agent_server, "append_event", events),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await store.scheduler_loop()
+
+        pause.assert_awaited_once_with(session_id)
+        events.assert_not_awaited()
+        self.assertEqual(store.jobs["job_due"]["run_count"], 0)
+
+    async def test_run_now_rejects_an_archived_session_and_pauses_its_jobs(
+        self,
+    ) -> None:
+        store = agent_server.JobStore()
+        session_id = "sess_archived_run"
+        store.jobs["job_run"] = {
+            "id": "job_run",
+            "session_id": session_id,
+            "title": "Run now",
+            "prompt": "Do not run",
+            "enabled": True,
+            "next_run_at": 1.0,
+            "scheduled_run_at": 1.0,
+        }
+
+        with (
+            patch.object(agent_server.STORE, "sessions", {
+                session_id: {"id": session_id, "archived": True},
+            }),
+            patch.object(store, "pause_for_session", new_callable=AsyncMock) as pause,
+            patch.object(agent_server, "start_turn", new_callable=AsyncMock) as start,
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await store.run_job("job_run")
+
+        self.assertEqual(raised.exception.status_code, 409)
+        pause.assert_awaited_once_with(session_id)
+        start.assert_not_awaited()
+
     async def test_delete_for_session_restores_jobs_when_persistence_fails(
         self,
     ) -> None:
@@ -338,12 +780,23 @@ class JobStoreTests(unittest.IsolatedAsyncioTestCase):
             await store.defer("job_1", "busy", delay_seconds=300)
         self.assertEqual(store.jobs["job_1"]["next_run_at"], 1365.0)
         self.assertEqual(store.jobs["job_1"]["scheduled_run_at"], 1060.0)
+        self.assertEqual(store.jobs["job_1"]["run_count"], 0)
+
+        # Repeated busy checks replace the one retry deadline. They must not
+        # enqueue multiple catch-up executions for the missed intervals.
+        with patch.object(store, "save", new_callable=AsyncMock), \
+                patch.object(agent_server.time, "time", return_value=1100.0):
+            await store.defer("job_1", "still busy", delay_seconds=300)
+        self.assertEqual(store.jobs["job_1"]["next_run_at"], 1400.0)
+        self.assertEqual(store.jobs["job_1"]["scheduled_run_at"], 1060.0)
+        self.assertEqual(store.jobs["job_1"]["run_count"], 0)
 
         with patch.object(store, "save", new_callable=AsyncMock), \
-                patch.object(agent_server.time, "time", return_value=1370.0):
+                patch.object(agent_server.time, "time", return_value=1405.0):
             await store.mark_ran("job_1")
         self.assertEqual(store.jobs["job_1"]["next_run_at"], 1420.0)
         self.assertEqual(store.jobs["job_1"]["scheduled_run_at"], 1420.0)
+        self.assertEqual(store.jobs["job_1"]["run_count"], 1)
 
     async def test_scoped_update_delete_enforce_ownership_and_emit_events(self) -> None:
         store = agent_server.JobStore()

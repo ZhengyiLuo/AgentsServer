@@ -4571,6 +4571,20 @@ class JobStore:
                 # provider ran independently.
                 job["context_mode"] = normalized_context_mode
                 changed = True
+            parent_session = STORE.sessions.get(str(job.get("session_id") or ""))
+            if (
+                job.get("enabled")
+                and parent_session
+                and parent_session.get("archived")
+            ):
+                # Archiving is a durable pause boundary. Reconcile legacy job
+                # files written before that invariant existed before the
+                # scheduler starts.
+                job["enabled"] = False
+                job["next_run_at"] = None
+                job["scheduled_run_at"] = None
+                job["updated_at"] = now_iso()
+                changed = True
         if changed:
             await self.save()
 
@@ -4584,6 +4598,11 @@ class JobStore:
         parent_session = STORE.sessions.get(req.session_id)
         if not parent_session:
             raise HTTPException(status_code=404, detail="session not found")
+        if parent_session.get("archived"):
+            raise HTTPException(
+                status_code=409,
+                detail="unarchive this chat before scheduling jobs",
+            )
         context_mode, backend = resolve_job_context_contract(
             parent_session,
             req.context_mode,
@@ -4658,6 +4677,17 @@ class JobStore:
             if next_run_at is None and schedule_kind in {"cron", "rrule"}:
                 job["enabled"] = False
         async with self._lock:
+            # Recheck inside the job lock. If archive won the race, its durable
+            # session state is already visible; if create won, archive waits
+            # for this lock and pauses the newly inserted job immediately.
+            current_parent = STORE.sessions.get(req.session_id)
+            if not current_parent:
+                raise HTTPException(status_code=404, detail="session not found")
+            if current_parent.get("archived"):
+                raise HTTPException(
+                    status_code=409,
+                    detail="unarchive this chat before scheduling jobs",
+                )
             self.jobs[jid] = job
             await self.save()
         await append_event(req.session_id, "job_created", {
@@ -4680,6 +4710,17 @@ class JobStore:
             if not stored_job or (expected_session_id is not None and stored_job.get("session_id") != expected_session_id):
                 raise HTTPException(status_code=404, detail="job not found")
             job = dict(stored_job)
+            parent_session = STORE.sessions.get(str(job.get("session_id") or ""))
+            if parent_session and parent_session.get("archived"):
+                if patch.get("enabled") is True:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="unarchive this chat before enabling scheduled jobs",
+                    )
+                # A metadata edit must not preserve a legacy enabled state for
+                # an archived chat.
+                patch = dict(patch)
+                patch["enabled"] = False
             was_enabled = bool(job.get("enabled"))
             if "backend" in patch and patch["backend"] is not None and patch["backend"] not in VALID_BACKENDS:
                 raise HTTPException(status_code=400, detail=f"backend must be one of {sorted(VALID_BACKENDS)}")
@@ -4920,6 +4961,51 @@ class JobStore:
                 raise
             return len(doomed)
 
+    async def pause_for_session(
+        self,
+        session_id: str,
+        *,
+        persist_unchanged: bool = False,
+    ) -> int:
+        paused_jobs: list[dict[str, Any]] = []
+        async with self._lock:
+            updated_at = now_iso()
+            for job in self.jobs.values():
+                if job.get("session_id") != session_id or not job.get("enabled"):
+                    continue
+                job["enabled"] = False
+                job["next_run_at"] = None
+                job["scheduled_run_at"] = None
+                job["updated_at"] = updated_at
+                paused_jobs.append(dict(job))
+            if not paused_jobs and not persist_unchanged:
+                return 0
+            # Deliberately keep the in-memory jobs paused if persistence fails.
+            # The live scheduler must fail safe, and load() will retry the
+            # durable reconciliation from the archived session on restart.
+            await self.save()
+
+        for job in paused_jobs:
+            try:
+                await append_event(session_id, "job_updated", {
+                    "job": event_job(job),
+                    "job_id": job.get("id"),
+                    "message": (
+                        "Scheduled job paused because chat was archived: "
+                        f"{job.get('title') or job.get('id')}"
+                    ),
+                })
+            except Exception as exc:
+                # The pause is already durable. A timeline/audit projection
+                # failure must never reactivate a schedule.
+                logger.warning(
+                    "could not append archived job pause event session=%s job=%s: %s",
+                    session_id,
+                    job.get("id"),
+                    concise_error_message(exc),
+                )
+        return len(paused_jobs)
+
     async def mark_ran(self, jid: str) -> None:
         async with self._lock:
             job = self.jobs.get(jid)
@@ -4965,7 +5051,7 @@ class JobStore:
         event_job: dict[str, Any] | None = None
         async with self._lock:
             job = self.jobs.get(jid)
-            if not job:
+            if not job or not job.get("enabled"):
                 return
             now = time.time()
             job["next_run_at"] = now + max(delay, 5)
@@ -4989,6 +5075,14 @@ class JobStore:
         job = self.jobs.get(jid)
         if not job:
             raise HTTPException(status_code=404, detail="job not found")
+        session_id = str(job.get("session_id") or "")
+        parent_session = STORE.sessions.get(session_id)
+        if parent_session and parent_session.get("archived"):
+            await self.pause_for_session(session_id)
+            raise HTTPException(
+                status_code=409,
+                detail="unarchive this chat before running scheduled jobs",
+            )
         scheduled_run_at = float(
             job.get("scheduled_run_at")
             or job.get("next_run_at")
@@ -5005,14 +5099,14 @@ class JobStore:
         )
         context_mode = job_context_mode(job)
         result = await start_turn(
-            job["session_id"],
+            session_id,
             req,
             queue_if_busy=False,
             provider_context_mode=context_mode,
         )
         await self.mark_ran(jid)
         ran_job = public_job(self.jobs[jid])
-        await append_event(job["session_id"], "job_ran", {
+        await append_event(session_id, "job_ran", {
             "job": ran_job,
             "job_id": jid,
             "run_id": result["run_id"],
@@ -5055,13 +5149,58 @@ class JobStore:
                             concise_error_message(exc),
                         )
                     continue
+                if STORE.sessions[job_session_id].get("archived"):
+                    try:
+                        await self.pause_for_session(job_session_id)
+                    except Exception as exc:
+                        logger.warning(
+                            "could not persist archived job pause session=%s: %s",
+                            job_session_id,
+                            concise_error_message(exc),
+                        )
+                    continue
                 blocker = await scheduled_job_blocker(job_session_id)
                 if blocker:
                     await self.defer(jid, blocker, JOB_BUSY_RETRY_SECONDS)
                     continue
+                # The blocker check yields. Archive/pause or a user edit may
+                # have changed this due item while it was in flight; never
+                # dispatch from the stale due-list snapshot.
+                job = self.jobs.get(jid)
+                if not job or not job.get("enabled"):
+                    continue
+                if STORE.sessions[job_session_id].get("archived"):
+                    try:
+                        await self.pause_for_session(job_session_id)
+                    except Exception as exc:
+                        logger.warning(
+                            "could not persist archived job pause session=%s: %s",
+                            job_session_id,
+                            concise_error_message(exc),
+                        )
+                    continue
                 try:
                     await self.run_job(jid)
                 except Exception as e:
+                    parent_session = STORE.sessions.get(job_session_id)
+                    archived_rejection = (
+                        isinstance(e, HTTPException)
+                        and e.status_code == 409
+                        and "archiv" in str(e.detail).lower()
+                    )
+                    if (
+                        (parent_session and parent_session.get("archived"))
+                        or archived_rejection
+                    ):
+                        try:
+                            await self.pause_for_session(job_session_id)
+                        except Exception as exc:
+                            logger.warning(
+                                "could not persist archived job pause session=%s: %s",
+                                job_session_id,
+                                concise_error_message(exc),
+                            )
+                        continue
                     logger.warning("scheduled job %s failed: %s", jid, e)
                     if job.get("session_id"):
                         await append_event(job["session_id"], "job_error", {
@@ -35581,6 +35720,24 @@ async def update_session(session_id: str, req: UpdateSessionRequest) -> dict[str
             current = STORE.sessions.get(session_id)
             if not current:
                 raise HTTPException(status_code=404, detail="session not found")
+            if req.archived is False and current.get("archived"):
+                try:
+                    # An earlier archive may have failed to save jobs.json
+                    # after disabling jobs in memory. Force a durable write
+                    # before clearing the archived session bit so restart can
+                    # never resurrect them.
+                    await JOBS.pause_for_session(
+                        session_id,
+                        persist_unchanged=True,
+                    )
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "scheduled jobs could not be durably paused; "
+                            "retry unarchiving this chat"
+                        ),
+                    ) from exc
             # Validate the complete model/effort pair atomically. App-server
             # applies the saved selection through the next turn/start; it does
             # not currently expose a client RPC for mutating a loaded thread.
@@ -35596,10 +35753,24 @@ async def update_session(session_id: str, req: UpdateSessionRequest) -> dict[str
                 patch,
             )
             sess = await STORE.update(session_id, patch)
+            if req.archived is True:
+                try:
+                    # Keep archive and its scheduling boundary serialized with
+                    # unarchive and turn admission. Job create/enable also
+                    # rechecks the durable archived bit under the job lock.
+                    await JOBS.pause_for_session(session_id)
+                except Exception as exc:
+                    # The archived session is already durable and the
+                    # in-memory job store fails safe. A later unarchive forces
+                    # this state to disk before clearing the archive bit.
+                    logger.warning(
+                        "could not persist scheduled-job pause for archived session %s: %s",
+                        session_id,
+                        concise_error_message(exc),
+                    )
     else:
-        # Title, folder, pin, and archive edits must remain lightweight. They
-        # do not interact with provider runtime state and should not queue
-        # behind a long Codex lifecycle operation.
+        # Title, folder, and pin edits remain lightweight. Archive changes are
+        # serialized above because they form a turn/job admission boundary.
         sess = await STORE.update(session_id, patch)
     if req.archived is True:
         try:

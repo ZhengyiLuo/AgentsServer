@@ -103,6 +103,9 @@ Get the client and current installation instructions from
 as a Developer ID-signed and Apple-notarized build; Apple-platform test
 builds are also distributed through TestFlight.
 
+Questions or issues? Join the
+[Discord](https://discord.gg/ZGDrhEWqPt).
+
 ## Guided Setup
 
 The recommended first install is **AgentsDock > Set up AgentsServer**. The

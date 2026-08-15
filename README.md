@@ -42,6 +42,8 @@ machine paths.
 - Creates handoff digests with an actual LLM summarizer; the raw transcript/file
   pack is only internal source material.
 - Runs recurring/loop jobs per chat with host load/memory guardrails.
+  Archiving a chat pauses every interval, cron, and RRULE job attached to it;
+  unarchiving leaves those jobs paused until the user explicitly enables them.
 - Provides optional live process and tmux-pane inspection for active work.
 - Hosts one persistent interactive tmux terminal per chat. Clients attach over
   an authenticated PTY WebSocket; disconnecting a client does not stop the

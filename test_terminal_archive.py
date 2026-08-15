@@ -7,6 +7,119 @@ import agent_server
 
 
 class TerminalArchiveTests(unittest.IsolatedAsyncioTestCase):
+    async def test_only_archiving_pauses_the_chats_scheduled_jobs(self) -> None:
+        session_id = "archive-pauses-jobs"
+        archived = {
+            "id": session_id,
+            "title": "Archived",
+            "backend": "codex",
+            "archived": True,
+        }
+        active = {**archived, "archived": False}
+        update = AsyncMock(side_effect=[archived, active, active])
+        pause_for_session = AsyncMock(return_value=2)
+
+        with (
+            patch.object(agent_server.STORE, "sessions", {
+                session_id: active,
+            }),
+            patch.object(agent_server.STORE, "update", update),
+            patch.object(
+                agent_server.JOBS,
+                "pause_for_session",
+                pause_for_session,
+            ),
+            patch.object(
+                agent_server,
+                "terminalize_archived_cross_chat_session",
+                new_callable=AsyncMock,
+            ),
+            patch.object(agent_server.asyncio, "to_thread", new_callable=AsyncMock),
+        ):
+            archive_response = await agent_server.update_session(
+                session_id,
+                agent_server.UpdateSessionRequest(archived=True),
+            )
+            unarchive_response = await agent_server.update_session(
+                session_id,
+                agent_server.UpdateSessionRequest(archived=False),
+            )
+            rename_response = await agent_server.update_session(
+                session_id,
+                agent_server.UpdateSessionRequest(title="Renamed"),
+            )
+
+        self.assertTrue(archive_response["session"]["archived"])
+        self.assertFalse(unarchive_response["session"]["archived"])
+        self.assertFalse(rename_response["session"]["archived"])
+        pause_for_session.assert_awaited_once_with(session_id)
+
+    async def test_archiving_stays_successful_when_job_pause_persistence_fails(
+        self,
+    ) -> None:
+        session_id = "archive-job-pause-failure"
+        session = {
+            "id": session_id,
+            "title": "Archived",
+            "backend": "codex",
+            "archived": True,
+        }
+
+        async def update(_session_id: str, values: dict) -> dict:
+            session.update(values)
+            return dict(session)
+
+        pause_for_session = AsyncMock(
+            side_effect=[OSError("disk full"), OSError("disk full"), 0],
+        )
+        with (
+            patch.object(agent_server.STORE, "sessions", {session_id: session}),
+            patch.object(
+                agent_server.STORE,
+                "update",
+                side_effect=update,
+            ),
+            patch.object(
+                agent_server.JOBS,
+                "pause_for_session",
+                pause_for_session,
+            ),
+            patch.object(
+                agent_server,
+                "terminalize_archived_cross_chat_session",
+                new_callable=AsyncMock,
+            ),
+            patch.object(agent_server.asyncio, "to_thread", new_callable=AsyncMock),
+            patch.object(agent_server.logger, "warning") as warning,
+        ):
+            response = await agent_server.update_session(
+                session_id,
+                agent_server.UpdateSessionRequest(archived=True),
+            )
+            with self.assertRaises(HTTPException) as blocked:
+                await agent_server.update_session(
+                    session_id,
+                    agent_server.UpdateSessionRequest(archived=False),
+                )
+            unarchived = await agent_server.update_session(
+                session_id,
+                agent_server.UpdateSessionRequest(archived=False),
+            )
+
+        self.assertTrue(response["session"]["archived"])
+        self.assertEqual(blocked.exception.status_code, 503)
+        self.assertFalse(unarchived["session"]["archived"])
+        self.assertEqual(
+            pause_for_session.await_args_list,
+            [
+                unittest.mock.call(session_id),
+                unittest.mock.call(session_id, persist_unchanged=True),
+                unittest.mock.call(session_id, persist_unchanged=True),
+            ],
+        )
+        warning.assert_called_once()
+        self.assertIn(session_id, warning.call_args.args)
+
     async def test_archiving_a_chat_kills_its_terminal_session(self) -> None:
         session = {"id": "archive-test", "title": "Archive test", "backend": "codex", "archived": True}
         update = AsyncMock(return_value=session)

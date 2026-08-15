@@ -14181,7 +14181,7 @@ def scheduled_job_run_status(event: dict[str, Any]) -> str | None:
     event_type = str(event.get("type") or "")
     if timeline_index_is_error(event):
         return "failed"
-    if event_type == "turn_stopped":
+    if event_type == "turn_stopped" or event.get("stopped") is True:
         return "stopped"
     if event_type == "job_deferred":
         return "deferred"

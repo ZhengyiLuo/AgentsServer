@@ -226,6 +226,59 @@ class JobRunHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stopped["job_run_status"], "stopped")
         self.assertTrue(stopped["stopped"])
 
+    def test_runner_finished_event_with_stopped_flag_remains_cancelled(self) -> None:
+        common = {
+            "run_id": "cancelled-run",
+            "purpose": "scheduled_job",
+            "job_id": "job-1",
+            "job_title": "Capacity monitor",
+        }
+        self.write_events([
+            self.event(
+                1,
+                "job_created",
+                job_id="job-1",
+                job={"id": "job-1", "title": "Capacity monitor"},
+            ),
+            self.event(2, "turn_started", prompt="Poll", **common),
+            self.event(3, "assistant_text", text="Stopping the check.", **common),
+            self.event(
+                4,
+                "turn_finished",
+                stopped=True,
+                exit_code=None,
+                result_text='{"status":"PENDING"}',
+                **common,
+            ),
+            self.event(5, "job_ran", **common),
+        ])
+
+        history = agent_server.read_scheduled_job_runs(
+            self.session_id,
+            "job-1",
+            limit=10,
+        )
+        run = history["runs"][0]
+        self.assertEqual(run["type"], "turn_finished")
+        self.assertEqual(run["result_text"], '{"status":"PENDING"}')
+        self.assertEqual(run["job_run_status"], "stopped")
+        self.assertEqual(run["job_status"], "stopped")
+        self.assertTrue(run["stopped"])
+
+        page = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            limit=1,
+            tail=True,
+        )
+        summary = next(
+            event for event in page["events"] if event["type"] == "job_summary"
+        )
+        self.assertEqual(summary["job_latest_status"], "stopped")
+        self.assertEqual(summary["job_latest_status_type"], "turn_finished")
+        self.assertEqual(summary["job_status"], "stopped")
+        self.assertEqual(summary["job_status_type"], "turn_finished")
+        self.assertTrue(summary["stopped"])
+
     def test_includes_runless_scheduler_deferrals_and_failures(self) -> None:
         self.write_events([
             self.event(
@@ -263,6 +316,172 @@ class JobRunHistoryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(page["runs"][0]["is_error"])
         self.assertNotIn("run_id", page["runs"][0])
+
+    def test_coalesces_retries_for_one_pending_occurrence(self) -> None:
+        occurrence = {
+            "id": "job-1",
+            "title": "Capacity monitor",
+            "scheduled_run_at": 1_775_000_000.0,
+        }
+        next_occurrence = {
+            **occurrence,
+            "scheduled_run_at": 1_775_003_600.0,
+        }
+        completed = {
+            "purpose": "scheduled_job",
+            "job_id": "job-1",
+            "job_title": "Capacity monitor",
+        }
+        events = [
+            self.event(1, "job_created", job_id="job-1", job=occurrence),
+            self.event(
+                2,
+                "job_deferred",
+                job_id="job-1",
+                job=occurrence,
+                message="Busy",
+            ),
+            self.event(
+                3,
+                "job_deferred",
+                job_id="job-1",
+                job=occurrence,
+                message="Still busy",
+            ),
+            self.event(
+                4,
+                "turn_started",
+                run_id="completed-1",
+                prompt="Poll",
+                **completed,
+            ),
+            self.event(
+                5,
+                "turn_finished",
+                run_id="completed-1",
+                result_text="No changes",
+                **completed,
+            ),
+            self.event(
+                6,
+                "turn_started",
+                run_id="completed-2",
+                prompt="Poll",
+                **completed,
+            ),
+            self.event(
+                7,
+                "turn_finished",
+                run_id="completed-2",
+                result_text="No changes",
+                **completed,
+            ),
+            self.event(
+                8,
+                "job_deferred",
+                job_id="job-1",
+                job=next_occurrence,
+                message="Busy again",
+            ),
+        ]
+        self.write_events(events[:2])
+        first = agent_server.read_scheduled_job_runs(
+            self.session_id,
+            "job-1",
+            limit=10,
+        )
+        with agent_server.events_path(self.session_id).open(
+            "a",
+            encoding="utf-8",
+        ) as output:
+            output.write(
+                "".join(json.dumps(event) + "\n" for event in events[2:])
+            )
+
+        page = agent_server.read_scheduled_job_runs(
+            self.session_id,
+            "job-1",
+            limit=10,
+        )
+
+        self.assertEqual(first["total"], 1)
+        self.assertEqual(page["total"], 4)
+        self.assertEqual(
+            [event["job_run_status"] for event in page["runs"]],
+            ["deferred", "completed", "completed", "deferred"],
+        )
+        self.assertEqual(page["runs"][-1]["seq"], 3)
+        self.assertEqual(page["runs"][-1]["message"], "Still busy")
+        self.assertEqual(
+            [
+                event.get("run_id")
+                for event in page["runs"]
+                if event["job_run_status"] == "completed"
+            ],
+            ["completed-2", "completed-1"],
+        )
+
+    def test_eventual_run_replaces_deferred_row_for_same_occurrence(self) -> None:
+        scheduled_run_at = 1_775_000_000.0
+        occurrence = {
+            "id": "job-1",
+            "title": "Capacity monitor",
+            "scheduled_run_at": scheduled_run_at,
+        }
+        self.write_events([
+            self.event(1, "job_created", job_id="job-1", job=occurrence),
+            self.event(
+                2,
+                "job_deferred",
+                job_id="job-1",
+                job=occurrence,
+                message="Busy",
+            ),
+        ])
+        deferred = agent_server.read_scheduled_job_runs(
+            self.session_id,
+            "job-1",
+            limit=10,
+        )
+        with agent_server.events_path(self.session_id).open(
+            "a",
+            encoding="utf-8",
+        ) as output:
+            output.write("".join(json.dumps(event) + "\n" for event in [
+                self.event(
+                    3,
+                    "turn_started",
+                    run_id="eventual-run",
+                    purpose="scheduled_job",
+                    job_id="job-1",
+                    job_title="Capacity monitor",
+                    job_scheduled_run_at=scheduled_run_at,
+                    prompt="Poll",
+                ),
+                self.event(
+                    4,
+                    "turn_finished",
+                    run_id="eventual-run",
+                    purpose="scheduled_job",
+                    job_id="job-1",
+                    job_title="Capacity monitor",
+                    job_scheduled_run_at=scheduled_run_at,
+                    result_text="Finished",
+                ),
+            ]))
+
+        completed = agent_server.read_scheduled_job_runs(
+            self.session_id,
+            "job-1",
+            limit=10,
+        )
+
+        self.assertEqual(deferred["total"], 1)
+        self.assertEqual(deferred["runs"][0]["job_run_status"], "deferred")
+        self.assertEqual(completed["total"], 1)
+        self.assertEqual(completed["runs"][0]["run_id"], "eventual-run")
+        self.assertEqual(completed["runs"][0]["job_run_status"], "completed")
+        self.assertEqual(completed["runs"][0]["result_text"], "Finished")
 
     def test_history_pages_by_latest_event_when_run_finishes_after_defer(self) -> None:
         common = {

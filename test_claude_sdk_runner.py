@@ -96,6 +96,56 @@ class FakeClaudePrintProcess:
         self.stderr = FakeClaudePrintStream([])
 
 
+class CancellationHostileClaudePrintStream:
+    """A transport read that keeps waiting after its wrapper is cancelled."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancellations = 0
+
+    async def readline(self) -> bytes:
+        self.started.set()
+        while not self.release.is_set():
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancellations += 1
+        return b""
+
+    async def read(self) -> bytes:
+        return b""
+
+
+class CancellationHostileClaudePrintProcess:
+    def __init__(self) -> None:
+        self.pid = 4243
+        self.returncode: int | None = None
+        self.stdin = FakeClaudePrintStdin()
+        self.stdout = CancellationHostileClaudePrintStream()
+        self.stderr = FakeClaudePrintStream([])
+
+
+class NeverSettlingProcess:
+    def __init__(self) -> None:
+        self.pid = 4244
+        self.returncode: int | None = None
+        self.wait_calls = 0
+        self.terminate_calls = 0
+        self.kill_calls = 0
+
+    async def wait(self) -> int:
+        self.wait_calls += 1
+        await asyncio.Event().wait()
+        return 0
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+
+
 class FakeClaudeManager:
     def __init__(self, handle: FakeClaudeRun | None = None) -> None:
         self.handle = handle or FakeClaudeRun()
@@ -133,7 +183,18 @@ class FakeClaudeManager:
             await on_supervisor_ready(self.owner_token)  # type: ignore[operator]
         return self.handle
 
-    async def evict(self, chat_id: str, *, force: bool = False) -> bool:
+    async def evict(
+        self,
+        chat_id: str,
+        *,
+        force: bool = False,
+        ownership_token: str | None = None,
+    ) -> bool:
+        if (
+            ownership_token is not None
+            and ownership_token != self.owner_token
+        ):
+            return False
         self.evict_calls.append((chat_id, force))
         self.active_run_id = None
         self.loaded = False
@@ -1788,9 +1849,432 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("CronList", command)
         self.assertNotIn("CronDelete", command)
 
+    async def test_process_tree_kill_does_not_wait_forever_after_sigkill(
+        self,
+    ) -> None:
+        process = NeverSettlingProcess()
+        with patch.object(
+            agent_server.os,
+            "getpgid",
+            side_effect=ProcessLookupError,
+        ):
+            result = await asyncio.wait_for(
+                agent_server.terminate_process_tree(process, grace=0.01),
+                timeout=0.3,
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(process.wait_calls, 2)
+        self.assertEqual(process.terminate_calls, 1)
+        self.assertEqual(process.kill_calls, 1)
+
+    async def test_stale_sdk_cleanup_cancels_only_its_owner_generation(
+        self,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        old_future: asyncio.Future[dict[str, object]] = loop.create_future()
+        new_future: asyncio.Future[dict[str, object]] = loop.create_future()
+        pending = {
+            "old": {
+                "session_id": "chat-claude",
+                "turn_id": "run-old",
+                "owner_token": "owner-old",
+                "future": old_future,
+                "responded": False,
+            },
+            "new": {
+                "session_id": "chat-claude",
+                "turn_id": "run-new",
+                "owner_token": "owner-new",
+                "future": new_future,
+                "responded": False,
+            },
+        }
+        with patch.object(
+            agent_server,
+            "CLAUDE_PENDING_INTERACTIONS",
+            pending,
+        ), patch.object(
+            agent_server,
+            "update_claude_pending_session_metadata",
+            AsyncMock(),
+        ):
+            await agent_server.cancel_claude_interactions(
+                "chat-claude",
+                resolution="turn_stopped",
+                expected_run_id="run-old",
+                ownership_token="owner-old",
+            )
+
+        self.assertTrue(old_future.done())
+        self.assertEqual(old_future.result(), {"decision": "cancel"})
+        self.assertTrue(pending["old"]["responded"])
+        self.assertFalse(new_future.done())
+        self.assertFalse(pending["new"]["responded"])
+
+    async def test_hung_print_stop_terminalizes_and_preserves_promoted_turn(
+        self,
+    ) -> None:
+        process = CancellationHostileClaudePrintProcess()
+        human_turn = {
+            "queued_id": "queued-human",
+            "prompt": "Continue after the scheduled print run.",
+            "file_ids": [],
+            "backend": agent_server.BACKEND_CLAUDE,
+            "_durable": True,
+        }
+        self.session["active_run"] = {"run_id": "run-claude"}
+        agent_server.CURRENT_TURNS["chat-claude"]["purpose"] = "scheduled_job"
+        agent_server.RUN_METADATA = {
+            "run-claude": {"purpose": "scheduled_job"},
+        }
+        agent_server.QUEUED_TURNS = {
+            "chat-claude": deque([human_turn]),
+        }
+        queue_start_tasks: dict[str, asyncio.Task[object]] = {}
+        launch_started = asyncio.Event()
+        finish_launch = asyncio.Event()
+        launch_calls: list[
+            tuple[str, agent_server.TurnRequest, dict[str, object]]
+        ] = []
+
+        async def terminate(
+            selected: CancellationHostileClaudePrintProcess,
+            **_kwargs: object,
+        ) -> bool:
+            selected.returncode = -15
+            return True
+
+        async def gated_start_turn(
+            session_id: str,
+            request: agent_server.TurnRequest,
+            **kwargs: object,
+        ) -> dict[str, object]:
+            launch_calls.append((session_id, request, kwargs))
+            async with agent_server.ACTIVE_LOCK:
+                agent_server.ACTIVE[session_id] = {
+                    "run_id": "run-human",
+                    "backend": agent_server.BACKEND_CLAUDE,
+                    "transport": agent_server.CLAUDE_TRANSPORT_PRINT,
+                }
+                agent_server.BUSY_SESSIONS.add(session_id)
+                agent_server.CURRENT_TURNS[session_id] = {
+                    "run_id": "run-human",
+                    "backend": agent_server.BACKEND_CLAUDE,
+                }
+                self.session["active_run"] = {"run_id": "run-human"}
+            launch_started.set()
+            await finish_launch.wait()
+            return {"run_id": "run-human", "queued": False}
+
+        append_event = AsyncMock(return_value={})
+        append_finished = AsyncMock(return_value={})
+        quarantine = AsyncMock(return_value=True)
+        with patch.multiple(
+            agent_server,
+            QUEUE_START_TASKS=queue_start_tasks,
+            STOP_CONFIRM_TIMEOUT_SECONDS=0.01,
+            resolve_claude_resume_provider=Mock(return_value=(None, None)),
+            capture_git_baseline=AsyncMock(return_value={"head": "base"}),
+            build_claude_cmd=Mock(return_value=["claude", "-p"]),
+            process_group_for_pid=Mock(return_value=4243),
+            watch_manifest_artifacts=wait_forever,
+            append_event=append_event,
+            append_turn_finished_event=append_finished,
+            append_active_stdout=AsyncMock(),
+            mark_provider_turn_ready=AsyncMock(),
+            persist_run_provider_session=AsyncMock(return_value=True),
+            collect_manifest=AsyncMock(),
+            collect_recent_leftover_manifests=AsyncMock(),
+            publish_turn_code_diff=AsyncMock(),
+            terminate_process_tree=AsyncMock(side_effect=terminate),
+            revoke_cross_chat_capability=AsyncMock(),
+            cancel_codex_interactions=AsyncMock(),
+            cancel_claude_interactions=AsyncMock(),
+            quarantine_codex_goal_thread=quarantine,
+            _start_turn_locked=AsyncMock(side_effect=gated_start_turn),
+        ), patch.object(
+            agent_server.asyncio,
+            "create_subprocess_exec",
+            AsyncMock(return_value=process),
+        ):
+            provider_task = asyncio.create_task(
+                agent_server.supervise_provider_turn_task(
+                    "chat-claude",
+                    "run-claude",
+                    agent_server.BACKEND_CLAUDE,
+                    agent_server.run_claude_print(
+                        "chat-claude",
+                        "run-claude",
+                        "Scheduled prompt",
+                        dict(self.session),
+                        Path(self.cwd) / ".manifest.json",
+                    ),
+                )
+            )
+            agent_server.SESSION_TURN_TASKS = {
+                "chat-claude": {provider_task},
+            }
+            promotion_task: asyncio.Task[object] | None = None
+            try:
+                await asyncio.wait_for(process.stdout.started.wait(), 0.5)
+                result = await asyncio.wait_for(
+                    agent_server.stop_turn(
+                        "chat-claude",
+                        cascade_claude_subagents=False,
+                    ),
+                    timeout=0.5,
+                )
+                await asyncio.wait_for(launch_started.wait(), 0.5)
+                promotion_task = queue_start_tasks.get("chat-claude")
+                self.assertIsNotNone(promotion_task)
+
+                process.stdout.release.set()
+                await asyncio.wait_for(
+                    asyncio.gather(provider_task, return_exceptions=True),
+                    timeout=0.5,
+                )
+
+                self.assertTrue(result["stopped"])
+                self.assertTrue(result["hard_stop"])
+                self.assertEqual(len(launch_calls), 1)
+                self.assertEqual(
+                    agent_server.ACTIVE["chat-claude"]["run_id"],
+                    "run-human",
+                )
+                self.assertIn("chat-claude", agent_server.BUSY_SESSIONS)
+                self.assertEqual(
+                    agent_server.CURRENT_TURNS["chat-claude"]["run_id"],
+                    "run-human",
+                )
+                terminal_calls = [
+                    call
+                    for call in append_event.await_args_list
+                    if call.args[1] == "turn_stopped"
+                ]
+                self.assertEqual(len(terminal_calls), 1)
+                append_finished.assert_not_awaited()
+                quarantine.assert_not_awaited()
+            finally:
+                process.stdout.release.set()
+                finish_launch.set()
+                if not provider_task.done():
+                    provider_task.cancel()
+                await asyncio.gather(provider_task, return_exceptions=True)
+                if promotion_task is not None:
+                    await asyncio.gather(
+                        promotion_task,
+                        return_exceptions=True,
+                    )
+
+        self.assertFalse(queue_start_tasks)
+
+    async def test_delayed_sdk_finalizer_cannot_touch_promoted_generation(
+        self,
+    ) -> None:
+        handle = FakeClaudeRun()
+        manager = FakeClaudeManager(handle)
+        manager.owner_token = "owner-old"
+        agent_server.CLAUDE_SDK_MANAGER = manager
+        human_turn = {
+            "queued_id": "queued-human",
+            "prompt": "Continue on the replacement SDK client.",
+            "file_ids": [],
+            "backend": agent_server.BACKEND_CLAUDE,
+            "_durable": True,
+        }
+        self.session.update({
+            "active_run": {"run_id": "run-claude"},
+            "session_id": "provider-old",
+            "claude_session_id": "provider-old",
+            "claude_session_cwd": self.cwd,
+        })
+        agent_server.CURRENT_TURNS["chat-claude"]["purpose"] = "scheduled_job"
+        agent_server.RUN_METADATA = {
+            "run-claude": {"purpose": "scheduled_job"},
+        }
+        agent_server.QUEUED_TURNS = {
+            "chat-claude": deque([human_turn]),
+        }
+        queue_start_tasks: dict[str, asyncio.Task[object]] = {}
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        launch_started = asyncio.Event()
+        finish_launch = asyncio.Event()
+        new_permission: asyncio.Future[dict[str, object]] | None = None
+        real_cancel_interactions = agent_server.cancel_claude_interactions
+
+        async def gated_cancel_interactions(
+            session_id: str | None = None,
+            **kwargs: object,
+        ) -> None:
+            if kwargs.get("expected_run_id") == "run-claude":
+                cleanup_started.set()
+                await release_cleanup.wait()
+            await real_cancel_interactions(session_id, **kwargs)
+
+        async def gated_start_turn(
+            session_id: str,
+            _request: agent_server.TurnRequest,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            nonlocal new_permission
+            manager.owner_token = "owner-new"
+            manager.active_run_id = "run-human"
+            manager.loaded = True
+            new_permission = asyncio.get_running_loop().create_future()
+            async with agent_server.CLAUDE_PENDING_INTERACTIONS_LOCK:
+                agent_server.CLAUDE_PENDING_INTERACTIONS["new-card"] = {
+                    "id": "new-card",
+                    "session_id": session_id,
+                    "turn_id": "run-human",
+                    "owner_token": "owner-new",
+                    "future": new_permission,
+                    "responded": False,
+                }
+            async with agent_server.ACTIVE_LOCK:
+                agent_server.ACTIVE[session_id] = {
+                    "run_id": "run-human",
+                    "backend": agent_server.BACKEND_CLAUDE,
+                    "transport": agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+                    "claude_sdk_owner_token": "owner-new",
+                }
+                agent_server.BUSY_SESSIONS.add(session_id)
+                agent_server.CURRENT_TURNS[session_id] = {
+                    "run_id": "run-human",
+                    "backend": agent_server.BACKEND_CLAUDE,
+                }
+                self.session.update({
+                    "active_run": {"run_id": "run-human"},
+                    "session_id": "provider-new",
+                    "claude_session_id": "provider-new",
+                })
+            launch_started.set()
+            await finish_launch.wait()
+            return {"run_id": "run-human", "queued": False}
+
+        append_event = AsyncMock(return_value={})
+        append_finished = AsyncMock(return_value={})
+        save_provider = AsyncMock(wraps=agent_server.STORE.save_provider_session)
+        with patch.multiple(
+            agent_server,
+            QUEUE_START_TASKS=queue_start_tasks,
+            STOP_CONFIRM_TIMEOUT_SECONDS=0.01,
+            resolve_claude_resume_provider=Mock(
+                return_value=("provider-old", None)
+            ),
+            capture_git_baseline=AsyncMock(return_value={"head": "base"}),
+            build_claude_sdk_options=Mock(
+                return_value=(object(), "config", "/usr/bin/claude")
+            ),
+            claude_sdk_manager=AsyncMock(return_value=manager),
+            watch_manifest_artifacts=wait_forever,
+            append_event=append_event,
+            append_turn_finished_event=append_finished,
+            collect_manifest=AsyncMock(),
+            collect_recent_leftover_manifests=AsyncMock(),
+            publish_turn_code_diff=AsyncMock(),
+            revoke_cross_chat_capability=AsyncMock(),
+            cancel_codex_interactions=AsyncMock(),
+            cancel_claude_interactions=AsyncMock(
+                side_effect=gated_cancel_interactions
+            ),
+            update_claude_pending_session_metadata=AsyncMock(),
+            _start_turn_locked=AsyncMock(side_effect=gated_start_turn),
+        ), patch.object(
+            agent_server.STORE,
+            "save_provider_session",
+            save_provider,
+        ):
+            provider_task = asyncio.create_task(
+                agent_server.supervise_provider_turn_task(
+                    "chat-claude",
+                    "run-claude",
+                    agent_server.BACKEND_CLAUDE,
+                    agent_server.run_claude_sdk(
+                        "chat-claude",
+                        "run-claude",
+                        "Scheduled prompt",
+                        dict(self.session),
+                        Path(self.cwd) / ".manifest.json",
+                    ),
+                )
+            )
+            agent_server.SESSION_TURN_TASKS = {
+                "chat-claude": {provider_task},
+            }
+            promotion_task: asyncio.Task[object] | None = None
+            try:
+                for _ in range(100):
+                    active = agent_server.ACTIVE.get("chat-claude") or {}
+                    if active.get("claude_sdk_run") is handle:
+                        break
+                    await asyncio.sleep(0)
+                else:
+                    self.fail("old SDK handle did not attach")
+
+                result = await asyncio.wait_for(
+                    agent_server.stop_turn(
+                        "chat-claude",
+                        cascade_claude_subagents=False,
+                    ),
+                    timeout=0.5,
+                )
+                await asyncio.wait_for(cleanup_started.wait(), 0.5)
+                await asyncio.wait_for(launch_started.wait(), 0.5)
+                promotion_task = queue_start_tasks.get("chat-claude")
+                self.assertIsNotNone(promotion_task)
+
+                release_cleanup.set()
+                await asyncio.wait_for(
+                    asyncio.gather(provider_task, return_exceptions=True),
+                    timeout=0.5,
+                )
+
+                self.assertTrue(result["hard_stop"])
+                self.assertEqual(manager.evict_calls, [("chat-claude", True)])
+                self.assertEqual(manager.active_run_id, "run-human")
+                self.assertTrue(manager.loaded)
+                self.assertIsNotNone(new_permission)
+                self.assertFalse(new_permission.done())
+                self.assertEqual(self.session["claude_session_id"], "provider-new")
+                self.assertEqual(
+                    agent_server.ACTIVE["chat-claude"]["run_id"],
+                    "run-human",
+                )
+                self.assertIn("chat-claude", agent_server.BUSY_SESSIONS)
+                self.assertEqual(
+                    agent_server.CURRENT_TURNS["chat-claude"]["run_id"],
+                    "run-human",
+                )
+                save_provider.assert_not_awaited()
+                append_finished.assert_not_awaited()
+                terminal_calls = [
+                    call
+                    for call in append_event.await_args_list
+                    if call.args[1] == "turn_stopped"
+                ]
+                self.assertEqual(len(terminal_calls), 1)
+            finally:
+                release_cleanup.set()
+                finish_launch.set()
+                if new_permission is not None and not new_permission.done():
+                    new_permission.set_result({"decision": "cancel"})
+                if not provider_task.done():
+                    provider_task.cancel()
+                await asyncio.gather(provider_task, return_exceptions=True)
+                if promotion_task is not None:
+                    await asyncio.gather(
+                        promotion_task,
+                        return_exceptions=True,
+                    )
+
+        self.assertFalse(queue_start_tasks)
+
     async def test_sdk_stop_timeout_retires_only_chat_and_terminalizes(self) -> None:
         handle = FakeClaudeRun()
         manager = FakeClaudeManager(handle)
+        manager.active_run_id = "run-claude"
         runner = asyncio.create_task(wait_forever())
         agent_server.CLAUDE_SDK_MANAGER = manager
         agent_server.ACTIVE = {
@@ -1800,6 +2284,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                 "backend": agent_server.BACKEND_CLAUDE,
                 "transport": agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
                 "claude_sdk_run": handle,
+                "claude_sdk_owner_token": manager.owner_token,
                 "provider_turn_ready": True,
                 "stop_requested": False,
             }
@@ -1876,6 +2361,120 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(marker.args[2]["run_ids"], ["run-parent"])
         self.assertTrue(marker.args[2]["all"])
+
+    async def test_cancelled_sdk_start_drains_scheduled_job_successor_once(self) -> None:
+        manager = FakeClaudeManager()
+
+        async def cancel_during_start(
+            *_args: object,
+            **kwargs: object,
+        ) -> FakeClaudeRun:
+            on_supervisor_ready = kwargs.get("on_supervisor_ready")
+            if callable(on_supervisor_ready):
+                await on_supervisor_ready(manager.owner_token)
+            raise asyncio.CancelledError
+
+        manager.start_run = AsyncMock(side_effect=cancel_during_start)  # type: ignore[method-assign]
+        human_turn = {
+            "queued_id": "queued-human",
+            "prompt": "Run after the cancelled scheduled job.",
+            "file_ids": [],
+            "backend": agent_server.BACKEND_CLAUDE,
+            "_durable": True,
+        }
+        agent_server.QUEUED_TURNS = {
+            "chat-claude": deque([human_turn]),
+        }
+        agent_server.CURRENT_TURNS["chat-claude"]["purpose"] = "scheduled_job"
+        agent_server.RUN_METADATA = {
+            "run-claude": {"purpose": "scheduled_job"},
+        }
+        queue_start_tasks: dict[str, asyncio.Task[object]] = {}
+        launch_started = asyncio.Event()
+        finish_launch = asyncio.Event()
+        launch_calls: list[
+            tuple[str, agent_server.TurnRequest, dict[str, object]]
+        ] = []
+
+        async def gated_start_turn(
+            session_id: str,
+            request: agent_server.TurnRequest,
+            **kwargs: object,
+        ) -> dict[str, object]:
+            launch_calls.append((session_id, request, kwargs))
+            launch_started.set()
+            await finish_launch.wait()
+            return {"run_id": "run-human", "queued": False}
+
+        append_event = AsyncMock(return_value={})
+        evict = AsyncMock(return_value=True)
+        cancel_interactions = AsyncMock()
+        with patch.multiple(
+            agent_server,
+            QUEUE_START_TASKS=queue_start_tasks,
+            resolve_claude_resume_provider=Mock(return_value=(None, None)),
+            capture_git_baseline=AsyncMock(return_value={"head": "base"}),
+            build_claude_sdk_options=Mock(
+                return_value=(object(), "config", "/usr/bin/claude")
+            ),
+            claude_sdk_manager=AsyncMock(return_value=manager),
+            append_event=append_event,
+            evict_claude_sdk_chat=evict,
+            cancel_claude_interactions=cancel_interactions,
+            _start_turn_locked=AsyncMock(side_effect=gated_start_turn),
+        ):
+            runner = asyncio.create_task(agent_server.supervise_provider_turn_task(
+                "chat-claude",
+                "run-claude",
+                agent_server.BACKEND_CLAUDE,
+                agent_server.run_claude_sdk(
+                    "chat-claude",
+                    "run-claude",
+                    "Scheduled prompt",
+                    dict(self.session),
+                    Path(self.cwd) / ".manifest.json",
+                ),
+            ))
+            promotion_task: asyncio.Task[object] | None = None
+            try:
+                with self.assertRaises(asyncio.CancelledError):
+                    await runner
+                await asyncio.wait_for(launch_started.wait(), timeout=0.5)
+                promotion_task = queue_start_tasks.get("chat-claude")
+                self.assertIsNotNone(promotion_task)
+                await asyncio.sleep(0)
+
+                self.assertNotIn("chat-claude", agent_server.ACTIVE)
+                self.assertNotIn("chat-claude", agent_server.BUSY_SESSIONS)
+                self.assertNotIn("chat-claude", agent_server.CURRENT_TURNS)
+                self.assertNotIn("chat-claude", agent_server.QUEUED_TURNS)
+                self.assertEqual(len(launch_calls), 1)
+                launched_session, launched_request, launched_kwargs = launch_calls[0]
+                self.assertEqual(launched_session, "chat-claude")
+                self.assertEqual(
+                    launched_request.prompt,
+                    "Run after the cancelled scheduled job.",
+                )
+                self.assertEqual(launched_kwargs["queued_id"], "queued-human")
+                terminal_calls = [
+                    call
+                    for call in append_event.await_args_list
+                    if call.args[1] == "turn_stopped"
+                ]
+                self.assertEqual(len(terminal_calls), 1)
+                evict.assert_awaited_once()
+                cancel_interactions.assert_awaited_once_with(
+                    "chat-claude",
+                    resolution="turn_stopped",
+                    expected_run_id="run-claude",
+                    ownership_token=manager.owner_token,
+                )
+            finally:
+                finish_launch.set()
+                if promotion_task is not None:
+                    await asyncio.gather(promotion_task, return_exceptions=True)
+
+        self.assertFalse(queue_start_tasks)
 
     async def test_startup_query_can_request_permission_before_handle_returns(self) -> None:
         handle = FakeClaudeRun([{

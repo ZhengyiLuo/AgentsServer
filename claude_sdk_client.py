@@ -1725,7 +1725,13 @@ class ClaudeSDKSupervisorManager:
             and not supervisor.closed
         )
 
-    async def evict(self, chat_id: str, *, force: bool = False) -> bool:
+    async def evict(
+        self,
+        chat_id: str,
+        *,
+        force: bool = False,
+        ownership_token: str | None = None,
+    ) -> bool:
         """Disconnect one idle chat, or an active chat only when ``force`` is true."""
 
         self._bind_loop()
@@ -1739,6 +1745,13 @@ class ClaudeSDKSupervisorManager:
             elif supervisor is None:
                 return False
             else:
+                if (
+                    ownership_token is not None
+                    and supervisor.ownership_token != str(ownership_token)
+                ):
+                    # A delayed finalizer from an older generation must not
+                    # evict the replacement client now registered for chat.
+                    return False
                 if not force and (
                     supervisor.is_active or self._pins.get(clean_chat_id, 0)
                 ):

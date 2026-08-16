@@ -1803,6 +1803,12 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.previous_busy = agent_server.BUSY_SESSIONS
         self.previous_current = agent_server.CURRENT_TURNS
         self.previous_tasks = agent_server.CODEX_NATIVE_ACTION_TASKS
+        self.previous_terminal_fences = (
+            agent_server.CODEX_CONTROL_TERMINAL_FENCES
+        )
+        self.previous_maintenance = (
+            agent_server.SERVER_MAINTENANCE_SESSIONS
+        )
         self.previous_pins = agent_server.CODEX_APP_SERVER_PINNED_THREADS
         self.previous_pin_counts = (
             agent_server.CODEX_APP_SERVER_THREAD_PIN_COUNTS
@@ -1831,11 +1837,21 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 "provider_turn_id": None,
                 "provider_turn_ready": False,
                 "codex_native_operation": True,
+                "codex_control_reservation_id": "control-operation",
             }
         }
         agent_server.BUSY_SESSIONS = {"chat"}
-        agent_server.CURRENT_TURNS = {}
+        agent_server.CURRENT_TURNS = {
+            "chat": {
+                "run_id": None,
+                "backend": agent_server.BACKEND_CODEX,
+                "purpose": "codex_native_control",
+                "codex_control_reservation_id": "control-operation",
+            }
+        }
         agent_server.CODEX_NATIVE_ACTION_TASKS = {}
+        agent_server.CODEX_CONTROL_TERMINAL_FENCES = {}
+        agent_server.SERVER_MAINTENANCE_SESSIONS = set()
         agent_server.CODEX_APP_SERVER_PINNED_THREADS = set()
         agent_server.CODEX_APP_SERVER_THREAD_PIN_COUNTS = {}
         agent_server.CODEX_INTERACTIVE_CONTROL_THREADS = set()
@@ -1850,6 +1866,12 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
         agent_server.BUSY_SESSIONS = self.previous_busy
         agent_server.CURRENT_TURNS = self.previous_current
         agent_server.CODEX_NATIVE_ACTION_TASKS = self.previous_tasks
+        agent_server.CODEX_CONTROL_TERMINAL_FENCES = (
+            self.previous_terminal_fences
+        )
+        agent_server.SERVER_MAINTENANCE_SESSIONS = (
+            self.previous_maintenance
+        )
         agent_server.CODEX_APP_SERVER_PINNED_THREADS = self.previous_pins
         agent_server.CODEX_APP_SERVER_THREAD_PIN_COUNTS = (
             self.previous_pin_counts
@@ -1939,6 +1961,7 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     "compaction",
                     manager,
                     "thread",
+                    "control-operation",
                     subscription,
                 )
             )
@@ -2040,15 +2063,24 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
             thread_id: str,
             *,
             reserved_session: bool = False,
+            reservation_id: str = "",
+            lease_already_released: bool = False,
             schedule_queue: bool = True,
         ) -> None:
             del schedule_queue
             self.assertTrue(reserved_session)
+            self.assertEqual(reservation_id, "control-operation")
+            self.assertTrue(lease_already_released)
             released = await agent_server.release_codex_control_slot(
                 session_id,
                 expected_thread_id=thread_id,
+                expected_reservation_id=reservation_id,
             )
-            self.assertTrue(released)
+            self.assertFalse(released)
+            self.assertNotIn(
+                session_id,
+                agent_server.SERVER_MAINTENANCE_SESSIONS,
+            )
 
         manager = AsyncMock()
         with (
@@ -2068,6 +2100,7 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 "compaction",
                 manager,
                 "thread",
+                "control-operation",
                 subscription,
             )
             self.assertNotIn("chat", agent_server.ACTIVE)
@@ -2204,6 +2237,7 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     "compaction",
                     manager,
                     "thread",
+                    "control-operation",
                     subscription,
                 )
             )
@@ -2217,6 +2251,293 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
             )
             subscription.release.set()
             await task
+
+    async def test_delayed_cancelled_native_finalizer_cannot_terminalize_replacement(
+        self,
+    ) -> None:
+        subscription = GatedNativeSubscription(
+            [
+                {
+                    "method": "error",
+                    "params": {"message": "old native failure"},
+                },
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread",
+                        "turn": {
+                            "id": "turn-old",
+                            "status": "interrupted",
+                        },
+                    },
+                },
+            ],
+            gate_at=1,
+        )
+        handler_started = asyncio.Event()
+        finish_handler = asyncio.Event()
+
+        async def gated_handler(*_args: object, **_kwargs: object) -> None:
+            handler_started.set()
+            await finish_handler.wait()
+
+        manager = AsyncMock()
+        manager.wait_for_notification_handler.side_effect = gated_handler
+        append = AsyncMock(return_value={})
+        record_usage = AsyncMock()
+        schedule = Mock()
+        agent_server.STOPPED_RUNS.add("operation")
+        with (
+            patch.object(agent_server, "append_event", append),
+            patch.object(
+                agent_server,
+                "record_codex_token_usage",
+                record_usage,
+            ),
+            patch.object(
+                agent_server,
+                "unpin_codex_app_server_thread",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "release_codex_interactive_control_lease",
+            ),
+            patch.object(
+                agent_server,
+                "schedule_next_queued_turn",
+                schedule,
+            ),
+        ):
+            old_consumer = asyncio.create_task(
+                agent_server.consume_codex_native_turn(
+                    "chat",
+                    "operation",
+                    "shell",
+                    manager,
+                    "thread",
+                    "control-operation",
+                    subscription,
+                )
+            )
+            await asyncio.wait_for(subscription.waiting.wait(), timeout=1)
+            old_consumer.cancel()
+            await asyncio.wait_for(handler_started.wait(), timeout=1)
+
+            released = await agent_server.release_codex_control_slot(
+                "chat",
+                expected_thread_id="thread",
+                expected_reservation_id="control-operation",
+            )
+            self.assertTrue(released)
+            agent_server.BUSY_SESSIONS.add("chat")
+            agent_server.CURRENT_TURNS["chat"] = {
+                "run_id": "run-replacement",
+                "backend": agent_server.BACKEND_CODEX,
+            }
+            agent_server.ACTIVE["chat"] = {
+                "run_id": "run-replacement",
+                "backend": agent_server.BACKEND_CODEX,
+                "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
+                "provider_thread_id": "thread-new",
+            }
+            agent_server.STORE.sessions["chat"]["active_run"] = {
+                "run_id": "run-replacement"
+            }
+            finish_handler.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await old_consumer
+
+        append.assert_not_awaited()
+        record_usage.assert_not_awaited()
+        schedule.assert_not_called()
+        self.assertEqual(
+            agent_server.ACTIVE["chat"]["run_id"],
+            "run-replacement",
+        )
+        self.assertEqual(
+            agent_server.CURRENT_TURNS["chat"]["run_id"],
+            "run-replacement",
+        )
+        self.assertIn("chat", agent_server.BUSY_SESSIONS)
+        self.assertNotIn("chat", agent_server.SERVER_MAINTENANCE_SESSIONS)
+        self.assertNotIn("chat", agent_server.CODEX_CONTROL_TERMINAL_FENCES)
+        self.assertNotIn("operation", agent_server.STOPPED_RUNS)
+
+    async def test_native_terminal_fence_releases_before_delayed_unpin(self) -> None:
+        subscription = GatedNativeSubscription(
+            [{
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread",
+                    "turn": {
+                        "id": "turn-old",
+                        "status": "completed",
+                    },
+                },
+            }],
+            gate_at=99,
+        )
+        unpin_started = asyncio.Event()
+        finish_unpin = asyncio.Event()
+
+        async def delayed_unpin(*_args: object, **_kwargs: object) -> None:
+            unpin_started.set()
+            await finish_unpin.wait()
+
+        manager = AsyncMock()
+        schedule = Mock()
+        with (
+            patch.object(
+                agent_server,
+                "append_event",
+                AsyncMock(return_value={}),
+            ),
+            patch.object(
+                agent_server,
+                "unpin_codex_app_server_thread",
+                side_effect=delayed_unpin,
+            ),
+            patch.object(
+                agent_server,
+                "release_codex_interactive_control_lease",
+            ),
+            patch.object(
+                agent_server,
+                "schedule_next_queued_turn",
+                schedule,
+            ),
+        ):
+            old_consumer = asyncio.create_task(
+                agent_server.consume_codex_native_turn(
+                    "chat",
+                    "operation",
+                    "shell",
+                    manager,
+                    "thread",
+                    "control-operation",
+                    subscription,
+                )
+            )
+            await asyncio.wait_for(unpin_started.wait(), timeout=1)
+            self.assertNotIn(
+                "chat",
+                agent_server.SERVER_MAINTENANCE_SESSIONS,
+            )
+            self.assertNotIn(
+                "chat",
+                agent_server.CODEX_CONTROL_TERMINAL_FENCES,
+            )
+            schedule.assert_called_once_with("chat")
+
+            agent_server.BUSY_SESSIONS.add("chat")
+            agent_server.CURRENT_TURNS["chat"] = {
+                "run_id": "run-replacement",
+                "backend": agent_server.BACKEND_CODEX,
+            }
+            agent_server.ACTIVE["chat"] = {
+                "run_id": "run-replacement",
+                "backend": agent_server.BACKEND_CODEX,
+                "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
+                "provider_thread_id": "thread-new",
+            }
+            finish_unpin.set()
+            await old_consumer
+
+        self.assertEqual(
+            agent_server.ACTIVE["chat"]["run_id"],
+            "run-replacement",
+        )
+        self.assertEqual(
+            agent_server.CURRENT_TURNS["chat"]["run_id"],
+            "run-replacement",
+        )
+        self.assertIn("chat", agent_server.BUSY_SESSIONS)
+
+    async def test_native_terminal_publication_fence_blocks_replacement_admission(
+        self,
+    ) -> None:
+        subscription = GatedNativeSubscription(
+            [{
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread",
+                    "turn": {
+                        "id": "turn-old",
+                        "status": "completed",
+                    },
+                },
+            }],
+            gate_at=99,
+        )
+        terminal_append_started = asyncio.Event()
+        finish_terminal_append = asyncio.Event()
+
+        async def gated_append(
+            _session_id: str,
+            event_type: str,
+            _payload: dict[str, object],
+        ) -> dict[str, object]:
+            if event_type == "codex_shell_finished":
+                terminal_append_started.set()
+                await finish_terminal_append.wait()
+            return {}
+
+        manager = AsyncMock()
+        schedule = Mock()
+        with (
+            patch.object(agent_server, "append_event", side_effect=gated_append),
+            patch.object(
+                agent_server,
+                "unpin_codex_app_server_thread",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "release_codex_interactive_control_lease",
+            ),
+            patch.object(
+                agent_server,
+                "schedule_next_queued_turn",
+                schedule,
+            ),
+        ):
+            old_consumer = asyncio.create_task(
+                agent_server.consume_codex_native_turn(
+                    "chat",
+                    "operation",
+                    "shell",
+                    manager,
+                    "thread",
+                    "control-operation",
+                    subscription,
+                )
+            )
+            await asyncio.wait_for(terminal_append_started.wait(), timeout=1)
+            self.assertNotIn("chat", agent_server.ACTIVE)
+            self.assertNotIn("chat", agent_server.BUSY_SESSIONS)
+            self.assertNotIn("chat", agent_server.CURRENT_TURNS)
+            self.assertIn("chat", agent_server.SERVER_MAINTENANCE_SESSIONS)
+            self.assertEqual(
+                agent_server.CODEX_CONTROL_TERMINAL_FENCES.get("chat"),
+                "control-operation",
+            )
+            with self.assertRaises(agent_server.HTTPException) as raised:
+                await agent_server._start_turn_locked(
+                    "chat",
+                    agent_server.TurnRequest(prompt="replacement"),
+                    queue_if_busy=False,
+                    admission_backend=agent_server.BACKEND_CODEX,
+                )
+            self.assertEqual(raised.exception.status_code, 409)
+            self.assertIn("maintenance", str(raised.exception.detail))
+
+            finish_terminal_append.set()
+            await old_consumer
+
+        self.assertNotIn("chat", agent_server.SERVER_MAINTENANCE_SESSIONS)
+        self.assertNotIn("chat", agent_server.CODEX_CONTROL_TERMINAL_FENCES)
+        schedule.assert_called_once_with("chat")
 
     async def test_shell_retains_native_slot_until_turn_completed(self) -> None:
         subscription = GatedNativeSubscription(
@@ -3250,6 +3571,7 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 "shell",
                 AsyncMock(),
                 "thread",
+                "control-operation",
                 subscription,
             )
         append.assert_not_awaited()

@@ -685,7 +685,7 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
 
         agent_server.QUEUED_TURNS = {"source": deque([recovered])}
         start = AsyncMock(return_value={"ok": True})
-        with patch.object(agent_server, "start_turn", start):
+        with patch.object(agent_server, "_start_turn_locked", start):
             await agent_server.start_next_queued_turn("source")
         promoted_request = start.await_args.args[1]
         self.assertIn(
@@ -2781,7 +2781,7 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(
                 agent_server,
-                "start_turn",
+                "_start_turn_locked",
                 AsyncMock(side_effect=HTTPException(status_code=409, detail="chat is archived")),
             ),
             patch.object(agent_server, "terminally_discard_queued_turn", discard),

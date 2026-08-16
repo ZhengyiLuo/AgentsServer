@@ -273,6 +273,12 @@ CROSS_CHAT_HANDOFFS_V2_CLIENT_CAPABILITY = "cross_chat_handoffs_v2"
 CLAUDE_TRANSPORT_AUTO = "auto"
 CLAUDE_TRANSPORT_AGENT_SDK = "agent-sdk"
 CLAUDE_TRANSPORT_PRINT = "print"
+HARD_TERMINALIZABLE_TURN_TRANSPORTS = {
+    CODEX_TRANSPORT_APP_SERVER,
+    CODEX_TRANSPORT_EXEC,
+    CLAUDE_TRANSPORT_AGENT_SDK,
+    CLAUDE_TRANSPORT_PRINT,
+}
 CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY = "claude_sdk_interactive_v1"
 CLAUDE_PERMISSION_MODE_OPTIONS = (
     "default",
@@ -4386,7 +4392,8 @@ class SessionStore:
         *,
         cwd: str | None = None,
         codex_instruction_hash: str | None = None,
-    ) -> None:
+        defer_runtime_broadcast: bool = False,
+    ) -> dict[str, Any] | None:
         if backend == BACKEND_CODEX:
             ensure_codex_thread_not_pending_fork_cleanup(provider_id)
         usage_signal: dict[str, Any] | None = None
@@ -4451,7 +4458,7 @@ class SessionStore:
                 sess["fork_from"] = None
             sess["updated_at"] = now_iso()
             await self.save()
-        if usage_signal is not None:
+        if usage_signal is not None and not defer_runtime_broadcast:
             await broadcast_provider_runtime_changed(sid, usage_signal)
         if backend == BACKEND_CODEX:
             if (
@@ -4461,6 +4468,7 @@ class SessionStore:
             ):
                 CODEX_THREAD_SESSION_INDEX.pop(previous_codex_thread_id, None)
             CODEX_THREAD_SESSION_INDEX[provider_id] = sid
+        return usage_signal if defer_runtime_broadcast else None
 
 
 STORE = SessionStore()
@@ -5376,6 +5384,9 @@ CODEX_APPROVAL_ITEM_CACHE: OrderedDict[
 CODEX_INTERACTIVE_CONTROL_THREADS: set[str] = set()
 CODEX_INTERACTIVE_CONTROL_THREAD_COUNTS: dict[str, int] = {}
 CODEX_NATIVE_ACTION_TASKS: dict[tuple[str, str], asyncio.Task[Any]] = {}
+# Exact reservation owner for a native-control terminal row that has released
+# BUSY but still blocks new admission until publication cleanup completes.
+CODEX_CONTROL_TERMINAL_FENCES: dict[str, str] = {}
 SESSION_TURN_TASKS: dict[str, set[asyncio.Task[Any]]] = {}
 CODEX_INTERACTION_HANDLER_TASKS: dict[str, set[asyncio.Task[Any]]] = {}
 CLAUDE_INTERACTION_HANDLER_TASKS: dict[str, set[asyncio.Task[Any]]] = {}
@@ -8391,6 +8402,8 @@ def prepare_steered_turn(selected: dict[str, Any], interrupted: dict[str, Any] |
 def public_queued_turn(session_id: str, item: dict[str, Any], position: int) -> dict[str, Any]:
     display_file_ids = item.get("display_file_ids")
     display_prompt = item.get("display_prompt")
+    delivery_uncertain = item.get("_native_delivery_fenced") is True
+    paused = item.get("_paused_after_stop") is True or delivery_uncertain
     return {
         "queued_id": str(item.get("queued_id") or ""),
         "session_id": session_id,
@@ -8418,6 +8431,12 @@ def public_queued_turn(session_id: str, item: dict[str, Any], position: int) -> 
         "cross_chat_exchange_ids": list(item.get("cross_chat_exchange_ids") or []),
         "created_at": item.get("created_at"),
         "position": position,
+        "paused": paused,
+        "pause_reason": (
+            "delivery_uncertain"
+            if delivery_uncertain
+            else "stopped" if paused else None
+        ),
     }
 
 
@@ -9579,9 +9598,12 @@ async def terminally_discard_queued_turn(
                     f"Cross-chat exchange failed before target execution: {reason}",
                 )
                 if str(failed_leg.get("status") or "") != "delivered":
-                    await maybe_deliver_cross_chat_exchange_failure_status(
+                    schedule_cross_chat_exchange_failure_status_after_unlock(
                         failed_exchange,
-                        failed_session_id=str(failed_leg.get("target_session_id") or ""),
+                        failed_session_id=str(
+                            failed_leg.get("target_session_id")
+                            or session_id
+                        ),
                         failed_leg=failed_leg,
                     )
     for source_exchange_id in list(item.get("cross_chat_exchange_ids") or []):
@@ -9631,6 +9653,45 @@ async def start_next_queued_turn(session_id: str) -> None:
                     QUEUE_START_TASKS.pop(session_id, None)
 
             promotion_task.add_done_callback(release_queue_start_owner)
+
+    admission_session = STORE.sessions.get(session_id)
+    admission_backend = (
+        str(admission_session.get("backend") or DEFAULT_BACKEND)
+        .strip()
+        .lower()
+        if admission_session is not None
+        else None
+    )
+    if promotion_task is not None:
+        register_session_task(
+            SESSION_TURN_TASKS,
+            session_id,
+            promotion_task,
+        )
+    try:
+        # Stop and promotion use the same lifecycle -> queue lock order. The
+        # queued item therefore remains visible until promotion owns admission;
+        # a Stop that wins can pause it durably before this task removes it.
+        async with session_lifecycle_lock(session_id):
+            await _start_next_queued_turn_locked(
+                session_id,
+                admission_backend=admission_backend,
+            )
+    finally:
+        if promotion_task is not None:
+            tasks = SESSION_TURN_TASKS.get(session_id)
+            if tasks is not None:
+                tasks.discard(promotion_task)
+                if not tasks:
+                    SESSION_TURN_TASKS.pop(session_id, None)
+
+
+async def _start_next_queued_turn_locked(
+    session_id: str,
+    *,
+    admission_backend: str | None,
+) -> None:
+    async with QUEUE_LOCK:
         if session_id in STEERING_SESSIONS:
             return
         item = RUN_NOW_TURNS.get(session_id)
@@ -9703,14 +9764,16 @@ async def start_next_queued_turn(session_id: str) -> None:
         client_capabilities=list(item.get("client_capabilities") or []),
     )
     try:
+        ensure_session_not_deleting(session_id)
         display_file_ids = item.get("display_file_ids")
-        await start_turn(
+        await _start_turn_locked(
             session_id,
             req,
             queue_if_busy=False,
             queued_id=str(item["queued_id"]),
             display_file_ids=list(display_file_ids) if display_file_ids is not None else None,
             steering_lineage=normalize_steering_lineage(item.get("steering_lineage")) or None,
+            admission_backend=admission_backend,
             accepted_obligation_ids=list(item.get("cross_chat_obligation_ids") or []),
             accepted_exchange_ids=list(item.get("cross_chat_exchange_ids") or []),
         )
@@ -9816,9 +9879,12 @@ def should_schedule_queue_after_finish(session_id: str, stopped: bool) -> bool:
     # A steering handoff has one owner: wait_for_steered_turn_slot. Scheduling
     # here as well races that waiter and can pop a second queued item, including
     # when the interrupted provider finishes naturally just before stop_turn.
+    # Explicit Stop holds ordinary successors on each queue item, so a stopped
+    # runner may still attempt a drain. This is required for unpaused messages
+    # queued behind scheduled jobs and for provider-side interruptions; a held
+    # head remains fail-closed in start_next_queued_turn.
     return (
-        not stopped
-        and session_id not in STEERING_SESSIONS
+        session_id not in STEERING_SESSIONS
         and session_id not in RUN_NOW_TURNS
     )
 
@@ -10432,7 +10498,19 @@ async def terminate_process_tree(proc: asyncio.subprocess.Process, *, grace: flo
         with suppress(ProcessLookupError):
             proc.kill()
             killed = True
-    await proc.wait()
+    try:
+        await asyncio.wait_for(
+            proc.wait(),
+            timeout=max(float(grace), 0.05),
+        )
+    except asyncio.TimeoutError:
+        # Some asyncio transports fail to resolve Process.wait() even after
+        # the OS process has been killed. Process teardown is best-effort; the
+        # caller must be allowed to continue into task/slot reconciliation.
+        logger.warning(
+            "process wait did not settle after SIGKILL pid=%s",
+            getattr(proc, "pid", None),
+        )
     return sent or killed
 
 
@@ -12275,7 +12353,9 @@ async def release_turn_slot(
     A forcibly cancelled app-server consumer can finish its cleanup after the
     user has already started another turn.  Callers that own a concrete run
     must provide it so that delayed cleanup from the old task cannot erase the
-    replacement turn's ACTIVE/BUSY bookkeeping.
+    replacement turn's ACTIVE/BUSY bookkeeping. An expected run also must
+    still own either ACTIVE or CURRENT; an already-released run returns False
+    so fallback finalizers cannot emit or schedule twice.
     """
 
     async with ACTIVE_LOCK:
@@ -12290,10 +12370,12 @@ async def release_turn_slot(
                 if isinstance(current_turn, dict)
                 else ""
             )
-            if (
-                (active_run_id and active_run_id != expected_run_id)
-                or (current_run_id and current_run_id != expected_run_id)
-            ):
+            owns_slot = expected_run_id in {active_run_id, current_run_id}
+            conflicting_owner = any(
+                owner_id not in {"", expected_run_id}
+                for owner_id in (active_run_id, current_run_id)
+            )
+            if not owns_slot or conflicting_owner:
                 return False
         ACTIVE.pop(session_id, None)
         BUSY_SESSIONS.discard(session_id)
@@ -12302,9 +12384,239 @@ async def release_turn_slot(
         return True
 
 
-async def clear_active_process(session_id: str) -> None:
+async def bind_active_turn(
+    session_id: str,
+    run_id: str,
+    record: dict[str, Any],
+) -> tuple[bool, bool]:
+    """Install a provider ACTIVE record only while its reservation is owned.
+
+    Provider startup awaits can outlive a hard Stop. By the time a subprocess
+    or shared transport becomes ready, the old reservation may be gone and a
+    queued successor may already own the chat. Never recreate BUSY or replace
+    that successor from the delayed startup path.
+    """
+
     async with ACTIVE_LOCK:
+        current_turn = CURRENT_TURNS.get(session_id)
+        current_run_id = (
+            str(current_turn.get("run_id") or "")
+            if isinstance(current_turn, dict)
+            else ""
+        )
+        active = ACTIVE.get(session_id)
+        active_run_id = (
+            str(active.get("run_id") or "")
+            if isinstance(active, dict)
+            else ""
+        )
+        if (
+            session_id not in BUSY_SESSIONS
+            or current_run_id != run_id
+            or active_run_id not in {"", run_id}
+        ):
+            return False, False
+        stop_requested = (
+            session_id in STOP_REQUESTS or run_id in STOPPED_RUNS
+        )
+        if stop_requested:
+            STOP_REQUESTS.discard(session_id)
+            STOPPED_RUNS.add(run_id)
+        record["stop_requested"] = stop_requested
+        ACTIVE[session_id] = record
+        return True, stop_requested
+
+
+async def turn_slot_is_owned(session_id: str, run_id: str) -> bool:
+    """Return whether ``run_id`` still owns this chat's admitted turn slot."""
+
+    async with ACTIVE_LOCK:
+        if session_id not in BUSY_SESSIONS:
+            return False
+        active = ACTIVE.get(session_id)
+        current_turn = CURRENT_TURNS.get(session_id)
+        active_run_id = (
+            str(active.get("run_id") or "")
+            if isinstance(active, dict)
+            else ""
+        )
+        current_run_id = (
+            str(current_turn.get("run_id") or "")
+            if isinstance(current_turn, dict)
+            else ""
+        )
+        return (
+            run_id in {active_run_id, current_run_id}
+            and all(
+                owner_id in {"", run_id}
+                for owner_id in (active_run_id, current_run_id)
+            )
+        )
+
+
+async def bind_codex_control_reservation(
+    session_id: str,
+    reservation_id: str,
+    record: dict[str, Any],
+) -> tuple[bool, bool]:
+    """Bind only the exact run-less native-control reservation.
+
+    Native control startup uses ``run_id=None`` until the provider operation
+    is accepted, so normal run-id fencing cannot distinguish an old delayed
+    startup from a newer reservation. The private reservation id supplies the
+    missing compare-and-swap identity.
+    """
+
+    expected = str(reservation_id or "").strip()
+    async with ACTIVE_LOCK:
+        current = CURRENT_TURNS.get(session_id)
+        current_reservation = (
+            str(current.get("codex_control_reservation_id") or "")
+            if isinstance(current, dict)
+            else ""
+        )
+        owns_reservation = bool(
+            expected
+            and session_id in BUSY_SESSIONS
+            and isinstance(current, dict)
+            and current.get("purpose") == "codex_native_control"
+            and current_reservation == expected
+            and session_id not in ACTIVE
+        )
+        if not owns_reservation:
+            return False, False
+        stop_requested = session_id in STOP_REQUESTS
+        if stop_requested:
+            return False, True
+        record["codex_control_reservation_id"] = expected
+        ACTIVE[session_id] = record
+        return True, False
+
+
+async def reconcile_provider_task_exit(
+    session_id: str,
+    run_id: str,
+    backend: str,
+) -> bool:
+    """Recover an owned slot when a provider task exits before its cleanup.
+
+    Legacy subprocess runners can be cancelled at any await, including after
+    their terminal event is durable but before BUSY/CURRENT are released. The
+    task supervisor calls this from a shielded finalizer. Ownership matching
+    prevents delayed cleanup from touching a replacement turn.
+    """
+
+    persisted_active = (STORE.sessions.get(session_id) or {}).get("active_run")
+    terminal_missing = bool(
+        isinstance(persisted_active, dict)
+        and str(persisted_active.get("run_id") or "") == run_id
+    )
+    released = await release_turn_slot(
+        session_id,
+        expected_run_id=run_id,
+    )
+    if not released:
+        RUN_METADATA.pop(run_id, None)
+        STOPPED_RUNS.discard(run_id)
+        return False
+    try:
+        if terminal_missing:
+            try:
+                await append_event(session_id, "turn_stopped", {
+                    "run_id": run_id,
+                    "backend": backend,
+                    "stopped": True,
+                    "message": (
+                        "The provider task ended before terminal cleanup "
+                        "completed. Its session slot was recovered."
+                    ),
+                    **run_event_metadata(run_id),
+                })
+            except BaseException as exc:
+                if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                    raise
+                logger.exception(
+                    "could not persist recovered provider terminal "
+                    "session=%s run=%s error=%s",
+                    session_id,
+                    run_id,
+                    concise_error_message(exc),
+                )
+    finally:
+        RUN_METADATA.pop(run_id, None)
+        STOPPED_RUNS.discard(run_id)
+        if should_schedule_queue_after_finish(session_id, stopped=True):
+            schedule_next_queued_turn(session_id)
+    return True
+
+
+async def supervise_provider_turn_task(
+    session_id: str,
+    run_id: str,
+    backend: str,
+    runner: Any,
+) -> None:
+    """Run one provider coroutine with cancellation-safe slot reconciliation."""
+
+    try:
+        await runner
+    finally:
+        cleanup_task = asyncio.create_task(
+            reconcile_provider_task_exit(session_id, run_id, backend)
+        )
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            await join_task_despite_caller_cancellation(cleanup_task)
+            raise
+
+
+async def finalize_owned_turn_finished(
+    session_id: str,
+    run_id: str,
+    *,
+    stopped: bool,
+    payload: dict[str, Any],
+) -> bool:
+    """Publish one terminal event and drain only for the releasing run owner."""
+
+    drain_queue = should_schedule_queue_after_finish(session_id, stopped)
+    released = await release_turn_slot(
+        session_id,
+        expected_run_id=run_id,
+    )
+    try:
+        if released:
+            await append_turn_finished_event(session_id, payload)
+    finally:
+        RUN_METADATA.pop(run_id, None)
+        STOPPED_RUNS.discard(run_id)
+        if released and drain_queue:
+            schedule_next_queued_turn(session_id)
+    return released
+
+
+async def clear_active_process(
+    session_id: str,
+    *,
+    expected_run_id: str,
+) -> bool:
+    """Clear only the process record still owned by ``expected_run_id``.
+
+    A hard Stop can release the old slot and promote a successor while the
+    cancelled subprocess runner is still unwinding. Its delayed ``finally``
+    must not erase the successor's ACTIVE record.
+    """
+
+    async with ACTIVE_LOCK:
+        active = ACTIVE.get(session_id)
+        if (
+            not isinstance(active, dict)
+            or str(active.get("run_id") or "") != expected_run_id
+        ):
+            return False
         ACTIVE.pop(session_id, None)
+        return True
 
 
 async def mark_provider_turn_ready(
@@ -23805,11 +24117,23 @@ async def cancel_claude_interactions(
     session_id: str | None = None,
     *,
     resolution: str = "dismissed",
+    expected_run_id: str | None = None,
+    ownership_token: str | None = None,
 ) -> None:
     affected: set[str] = set()
     async with CLAUDE_PENDING_INTERACTIONS_LOCK:
         for pending in CLAUDE_PENDING_INTERACTIONS.values():
             if session_id is not None and pending.get("session_id") != session_id:
+                continue
+            if (
+                expected_run_id is not None
+                and str(pending.get("turn_id") or "") != expected_run_id
+            ):
+                continue
+            if (
+                ownership_token is not None
+                and str(pending.get("owner_token") or "") != ownership_token
+            ):
                 continue
             future = pending.get("future")
             if (
@@ -24005,6 +24329,7 @@ async def handle_claude_tool_permission(
                     or session_id
                 ),
                 "turn_id": run_id or None,
+                "owner_token": owner_token,
                 "item_id": tool_use_id,
                 "method": method,
                 "params": params,
@@ -24906,6 +25231,7 @@ async def evict_claude_sdk_chat(
     *,
     force: bool,
     manager: ClaudeSDKSupervisorManager | None = None,
+    ownership_token: str | None = None,
 ) -> bool:
     """Return when one chat is absent/closed, without touching other clients."""
 
@@ -24913,8 +25239,11 @@ async def evict_claude_sdk_chat(
     if selected_manager is None:
         return True
     try:
+        evict_kwargs: dict[str, Any] = {"force": force}
+        if ownership_token is not None:
+            evict_kwargs["ownership_token"] = ownership_token
         await asyncio.wait_for(
-            selected_manager.evict(session_id, force=force),
+            selected_manager.evict(session_id, **evict_kwargs),
             timeout=STOP_CONFIRM_TIMEOUT_SECONDS,
         )
         # ``False`` means there was no supervisor, which is already the
@@ -25187,6 +25516,9 @@ async def acquire_codex_control_thread(
         )
 
     reserved = False
+    reservation_id = (
+        f"codexcontrol_{uuid.uuid4().hex[:16]}" if reserve_session else ""
+    )
     maintenance_reserved = False
     active_thread_id = ""
     async with ACTIVE_LOCK:
@@ -25227,6 +25559,7 @@ async def acquire_codex_control_thread(
                 "backend": BACKEND_CODEX,
                 "purpose": "codex_native_control",
                 "interactive_app_server": True,
+                "codex_control_reservation_id": reservation_id,
             }
             reserved = True
         if not reserve_session:
@@ -25289,39 +25622,47 @@ async def acquire_codex_control_thread(
         acquire_codex_interactive_control_lease(thread_id)
         control_lease_acquired = True
         if reserved:
-            stop_before_bind = False
-            async with ACTIVE_LOCK:
-                stop_before_bind = session_id in STOP_REQUESTS
-                if not stop_before_bind:
-                    ACTIVE[session_id] = {
-                        "proc": None,
-                        "run_id": None,
-                        "backend": BACKEND_CODEX,
-                        "transport": CODEX_TRANSPORT_APP_SERVER,
-                        "provider_thread_id": thread_id,
-                        "provider_session_id": thread_id,
-                        "provider_turn_id": None,
-                        "provider_turn_ready": False,
-                        "interactive_app_server": True,
-                        "codex_native_operation": True,
-                        "codex_native_operation_kind": None,
-                        "owner_task": reservation_task,
-                        "started_at": time.time(),
-                        "started_at_iso": now_iso(),
-                        "stop_requested": False,
-                    }
-            if stop_before_bind:
+            bound, stop_before_bind = await bind_codex_control_reservation(
+                session_id,
+                reservation_id,
+                {
+                    "proc": None,
+                    "run_id": None,
+                    "backend": BACKEND_CODEX,
+                    "transport": CODEX_TRANSPORT_APP_SERVER,
+                    "provider_thread_id": thread_id,
+                    "provider_session_id": thread_id,
+                    "provider_turn_id": None,
+                    "provider_turn_ready": False,
+                    "interactive_app_server": True,
+                    "codex_native_operation": True,
+                    "codex_native_operation_kind": None,
+                    "owner_task": reservation_task,
+                    "started_at": time.time(),
+                    "started_at_iso": now_iso(),
+                    "stop_requested": False,
+                },
+            )
+            if not bound:
                 with suppress(Exception):
-                    await append_event(session_id, "turn_stopped", {
-                        "run_id": None,
-                        "backend": BACKEND_CODEX,
-                        "message": "Codex control stopped before it started.",
-                    })
+                    if stop_before_bind:
+                        await append_event(session_id, "turn_stopped", {
+                            "run_id": None,
+                            "backend": BACKEND_CODEX,
+                            "message": "Codex control stopped before it started.",
+                        })
                 raise HTTPException(
                     status_code=409,
-                    detail="Codex control stopped before it started",
+                    detail=(
+                        "Codex control stopped before it started"
+                        if stop_before_bind
+                        else "the Codex control reservation changed; retry"
+                    ),
                 )
-        return manager, thread_id, dict(STORE.sessions.get(session_id) or session)
+        selected_session = dict(STORE.sessions.get(session_id) or session)
+        if reserved:
+            selected_session["_codex_control_reservation_id"] = reservation_id
+        return manager, thread_id, selected_session
     except BaseException as exc:
         if control_lease_acquired:
             release_codex_interactive_control_lease(thread_id)
@@ -25332,6 +25673,7 @@ async def acquire_codex_control_thread(
             await release_codex_control_slot(
                 session_id,
                 expected_thread_id=thread_id,
+                expected_reservation_id=reservation_id,
                 allow_prebind=True,
             )
         if maintenance_reserved:
@@ -25359,42 +25701,54 @@ async def release_codex_control_thread(
     thread_id: str,
     *,
     reserved_session: bool = False,
+    reservation_id: str = "",
+    lease_already_released: bool = False,
     schedule_queue: bool = True,
-) -> None:
-    release_codex_interactive_control_lease(thread_id)
-    with suppress(Exception):
-        await unpin_codex_app_server_thread(manager, thread_id)
-    if reserved_session:
-        released = await release_codex_control_slot(
-            session_id,
-            expected_thread_id=thread_id,
-            allow_prebind=False,
-        )
-        if schedule_queue and released:
-            schedule_next_queued_turn(session_id)
-    else:
-        async with ACTIVE_LOCK:
-            SERVER_MAINTENANCE_SESSIONS.discard(session_id)
-            session_idle = session_id not in BUSY_SESSIONS
-        if schedule_queue and session_idle:
-            schedule_next_queued_turn(session_id)
+) -> bool:
+    released = False
+    session_idle = False
+    if not lease_already_released:
+        release_codex_interactive_control_lease(thread_id)
+    try:
+        with suppress(Exception):
+            await unpin_codex_app_server_thread(manager, thread_id)
+    finally:
+        if reserved_session:
+            released = await release_codex_control_slot(
+                session_id,
+                expected_thread_id=thread_id,
+                expected_reservation_id=reservation_id,
+                allow_prebind=False,
+            )
+            if schedule_queue and released:
+                schedule_next_queued_turn(session_id)
+        else:
+            async with ACTIVE_LOCK:
+                SERVER_MAINTENANCE_SESSIONS.discard(session_id)
+                session_idle = session_id not in BUSY_SESSIONS
+            if schedule_queue and session_idle:
+                schedule_next_queued_turn(session_id)
+    return released if reserved_session else session_idle
 
 
 async def release_codex_control_slot(
     session_id: str,
     *,
     expected_thread_id: str,
+    expected_reservation_id: str,
     allow_prebind: bool = False,
 ) -> bool:
-    """Release only the native-control reservation owned by this thread.
+    """Release only the exact native-control reservation.
 
     Native controls do not necessarily have a run id before their provider
     turn starts.  A cancelled control may also remain blocked while unpinning
     its thread; if a replacement turn starts meanwhile, its late cleanup must
-    not clear the replacement's ACTIVE/BUSY state.
+    not clear the replacement's ACTIVE/BUSY state. Thread identity alone is
+    insufficient because two controls can reuse the same provider thread.
     """
 
-    expected = str(expected_thread_id or "").strip()
+    expected_thread = str(expected_thread_id or "").strip()
+    expected_reservation = str(expected_reservation_id or "").strip()
     async with ACTIVE_LOCK:
         active = ACTIVE.get(session_id)
         current = CURRENT_TURNS.get(session_id)
@@ -25404,16 +25758,30 @@ async def release_codex_control_slot(
                 or active.get("provider_session_id")
                 or ""
             ).strip()
+            active_reservation = str(
+                active.get("codex_control_reservation_id") or ""
+            ).strip()
             owns_slot = bool(
                 active.get("codex_native_operation")
-                and expected
-                and active_thread == expected
+                and expected_reservation
+                and active_reservation == expected_reservation
+                and (
+                    not expected_thread
+                    or active_thread == expected_thread
+                )
             )
         else:
+            current_reservation = (
+                str(current.get("codex_control_reservation_id") or "").strip()
+                if isinstance(current, dict)
+                else ""
+            )
             owns_slot = bool(
                 allow_prebind
                 and isinstance(current, dict)
                 and current.get("purpose") == "codex_native_control"
+                and expected_reservation
+                and current_reservation == expected_reservation
             )
         if not owns_slot:
             return False
@@ -25422,6 +25790,82 @@ async def release_codex_control_slot(
         CURRENT_TURNS.pop(session_id, None)
         STOP_REQUESTS.discard(session_id)
         return True
+
+
+async def claim_codex_control_terminal_publication(
+    session_id: str,
+    operation_id: str,
+    thread_id: str,
+    reservation_id: str,
+) -> bool:
+    """Atomically release one native operation into a publication fence.
+
+    The short maintenance reservation blocks every new turn admission while
+    terminal/error rows are persisted. A delayed finalizer that already lost
+    its reservation cannot claim the fence and therefore emits nothing for a
+    replacement turn.
+    """
+
+    expected_operation = str(operation_id or "").strip()
+    expected_thread = str(thread_id or "").strip()
+    expected_reservation = str(reservation_id or "").strip()
+    async with ACTIVE_LOCK:
+        active = ACTIVE.get(session_id)
+        current = CURRENT_TURNS.get(session_id)
+        if not isinstance(active, dict) or not isinstance(current, dict):
+            return False
+        active_thread = str(
+            active.get("provider_thread_id")
+            or active.get("provider_session_id")
+            or ""
+        ).strip()
+        owns_operation = bool(
+            expected_operation
+            and expected_reservation
+            and session_id in BUSY_SESSIONS
+            and session_id not in SERVER_MAINTENANCE_SESSIONS
+            and active.get("codex_native_operation")
+            and str(active.get("run_id") or "") == expected_operation
+            and str(active.get("codex_control_reservation_id") or "").strip()
+            == expected_reservation
+            and str(current.get("codex_control_reservation_id") or "").strip()
+            == expected_reservation
+            and (
+                not expected_thread
+                or active_thread == expected_thread
+            )
+        )
+        if not owns_operation:
+            return False
+        ACTIVE.pop(session_id, None)
+        BUSY_SESSIONS.discard(session_id)
+        CURRENT_TURNS.pop(session_id, None)
+        STOP_REQUESTS.discard(session_id)
+        SERVER_MAINTENANCE_SESSIONS.add(session_id)
+        CODEX_CONTROL_TERMINAL_FENCES[session_id] = expected_reservation
+        return True
+
+
+async def finish_codex_control_terminal_publication(
+    session_id: str,
+    *,
+    reservation_id: str,
+    schedule_queue: bool,
+) -> None:
+    """Release a claimed native terminal fence and optionally drain queue."""
+
+    expected_reservation = str(reservation_id or "").strip()
+    async with ACTIVE_LOCK:
+        if (
+            not expected_reservation
+            or CODEX_CONTROL_TERMINAL_FENCES.get(session_id)
+            != expected_reservation
+        ):
+            return
+        CODEX_CONTROL_TERMINAL_FENCES.pop(session_id, None)
+        SERVER_MAINTENANCE_SESSIONS.discard(session_id)
+    if schedule_queue:
+        schedule_next_queued_turn(session_id)
 
 
 def register_codex_native_action(
@@ -25544,6 +25988,7 @@ async def consume_codex_native_turn(
     operation: str,
     manager: CodexAppServerManager,
     thread_id: str,
+    reservation_id: str,
     subscription: Any,
     *,
     turn_id: str | None = None,
@@ -25756,26 +26201,69 @@ async def consume_codex_native_turn(
         terminal_error = concise_error_message(exc)
     finally:
         subscription.close()
+        terminal_claimed = False
         try:
             # The subscription is intentionally low-latency and can observe
             # terminal delivery before async projection finishes. Drain the
             # per-thread projection tail before reading usage state or
-            # releasing ACTIVE so terminal attribution cannot race.
+            # claiming terminal publication so attribution cannot race.
             await manager.wait_for_notification_handler(
                 project_codex_notification,
                 thread_id,
             )
-            if session_id in STORE.sessions and terminal_error:
-                await append_event(
-                    session_id,
-                    "error",
-                    {
-                        "run_id": operation_id,
-                        "message": terminal_error,
-                        "purpose": f"codex_{operation}",
-                    },
-                )
-            if session_id in STORE.sessions:
+            compaction_usage: dict[str, Any] = {}
+            if operation == "compaction":
+                async with ACTIVE_LOCK:
+                    active = ACTIVE.get(session_id)
+                    if (
+                        active
+                        and str(active.get("run_id") or "") == operation_id
+                        and str(
+                            active.get("codex_control_reservation_id") or ""
+                        ).strip() == str(reservation_id or "").strip()
+                    ):
+                        before = active.get(
+                            "codex_compaction_token_usage_before"
+                        )
+                        after = active.get(
+                            "codex_compaction_token_usage_after"
+                        )
+                        compaction_usage = {
+                            "token_usage_before": (
+                                dict(before)
+                                if isinstance(before, dict)
+                                else None
+                            ),
+                            "token_usage_after": (
+                                dict(after)
+                                if isinstance(after, dict)
+                                else None
+                            ),
+                        }
+            terminal_claimed = await claim_codex_control_terminal_publication(
+                session_id,
+                operation_id,
+                thread_id,
+                reservation_id,
+            )
+            if terminal_claimed and session_id in STORE.sessions:
+                after_snapshot = compaction_usage.get("token_usage_after")
+                if isinstance(after_snapshot, dict):
+                    await record_codex_token_usage(
+                        session_id,
+                        after_snapshot,
+                        force_checkpoint=True,
+                    )
+                if terminal_error:
+                    await append_event(
+                        session_id,
+                        "error",
+                        {
+                            "run_id": operation_id,
+                            "message": terminal_error,
+                            "purpose": f"codex_{operation}",
+                        },
+                    )
                 terminal_event_type = (
                     "codex_compaction_completed"
                     if operation == "compaction"
@@ -25791,40 +26279,6 @@ async def consume_codex_native_turn(
                     if terminal_status == "completed"
                     else f"{operation_label} {terminal_status}."
                 )
-                compaction_usage: dict[str, Any] = {}
-                if operation == "compaction":
-                    async with ACTIVE_LOCK:
-                        active = ACTIVE.get(session_id)
-                        if (
-                            active
-                            and str(active.get("run_id") or "")
-                            == operation_id
-                        ):
-                            before = active.get(
-                                "codex_compaction_token_usage_before"
-                            )
-                            after = active.get(
-                                "codex_compaction_token_usage_after"
-                            )
-                            compaction_usage = {
-                                "token_usage_before": (
-                                    dict(before)
-                                    if isinstance(before, dict)
-                                    else None
-                                ),
-                                "token_usage_after": (
-                                    dict(after)
-                                    if isinstance(after, dict)
-                                    else None
-                                ),
-                            }
-                    after_snapshot = compaction_usage.get("token_usage_after")
-                    if isinstance(after_snapshot, dict):
-                        await record_codex_token_usage(
-                            session_id,
-                            after_snapshot,
-                            force_checkpoint=True,
-                        )
                 await append_event(
                     session_id,
                     terminal_event_type,
@@ -25839,13 +26293,46 @@ async def consume_codex_native_turn(
                     },
                 )
         finally:
-            await release_codex_control_thread(
-                session_id,
-                manager,
-                thread_id,
-                reserved_session=True,
-                schedule_queue=schedule_queue,
-            )
+            STOPPED_RUNS.discard(operation_id)
+            if terminal_claimed:
+                # The slot is already exactly released. Remove the admission
+                # fence before touching shared-thread LRU state: unpin can be
+                # slow or cancellation-hostile, but must never park the chat.
+                release_codex_interactive_control_lease(thread_id)
+                try:
+                    publication_cleanup = asyncio.create_task(
+                        finish_codex_control_terminal_publication(
+                            session_id,
+                            reservation_id=reservation_id,
+                            schedule_queue=schedule_queue,
+                        )
+                    )
+                    try:
+                        await asyncio.shield(publication_cleanup)
+                    except asyncio.CancelledError:
+                        await join_task_despite_caller_cancellation(
+                            publication_cleanup
+                        )
+                        raise
+                finally:
+                    await release_codex_control_thread(
+                        session_id,
+                        manager,
+                        thread_id,
+                        reserved_session=True,
+                        reservation_id=reservation_id,
+                        lease_already_released=True,
+                        schedule_queue=False,
+                    )
+            else:
+                await release_codex_control_thread(
+                    session_id,
+                    manager,
+                    thread_id,
+                    reserved_session=True,
+                    reservation_id=reservation_id,
+                    schedule_queue=schedule_queue,
+                )
 
 
 async def pin_codex_app_server_thread(thread_id: str) -> None:
@@ -27039,6 +27526,8 @@ async def ensure_codex_app_server_thread(
     session_id: str,
     sess: dict[str, Any],
     cwd: str,
+    *,
+    expected_run_id: str | None = None,
 ) -> tuple[str, str]:
     """Load/create and lease a provider thread, applying changed policy once."""
     provider_id = str(session_provider_id(sess) or "")
@@ -27144,12 +27633,22 @@ async def ensure_codex_app_server_thread(
             or not str(sess.get("backend") or "").strip()
         )
         if provider_state_changed or policy_changed:
-            await STORE.save_provider_session(
-                session_id,
-                provider_id,
-                BACKEND_CODEX,
-                codex_instruction_hash=instruction_hash,
-            )
+            if expected_run_id is None:
+                await STORE.save_provider_session(
+                    session_id,
+                    provider_id,
+                    BACKEND_CODEX,
+                    codex_instruction_hash=instruction_hash,
+                )
+            else:
+                await persist_run_provider_session(
+                    session_id,
+                    expected_run_id,
+                    BACKEND_CODEX,
+                    provider_id,
+                    codex_instruction_hash=instruction_hash,
+                    emit_event=False,
+                )
         if original_provider_id and original_provider_id != provider_id:
             if CODEX_THREAD_SESSION_INDEX.get(original_provider_id) == session_id:
                 CODEX_THREAD_SESSION_INDEX.pop(original_provider_id, None)
@@ -27194,6 +27693,7 @@ async def acquire_codex_run_thread(
     cwd: str,
     *,
     standalone_provider_context: bool,
+    expected_run_id: str | None = None,
 ) -> str:
     """Acquire a pinned thread without binding standalone runs to the chat."""
 
@@ -27206,11 +27706,15 @@ async def acquire_codex_run_thread(
         )
         await pin_codex_app_server_thread(provider_id)
         return provider_id
+    ensure_kwargs: dict[str, Any] = {}
+    if expected_run_id is not None:
+        ensure_kwargs["expected_run_id"] = expected_run_id
     provider_id, _instruction_hash = await ensure_codex_app_server_thread(
         manager,
         session_id,
         sess,
         cwd,
+        **ensure_kwargs,
     )
     return provider_id
 
@@ -29168,7 +29672,9 @@ async def persist_run_provider_session(
     provider_id: str,
     *,
     cwd: str | None = None,
+    codex_instruction_hash: str | None = None,
     standalone_provider_context: bool = False,
+    emit_event: bool = True,
 ) -> bool:
     """Bind a provider thread only for chat-context runs.
 
@@ -29178,17 +29684,56 @@ async def persist_run_provider_session(
 
     if standalone_provider_context or not provider_id:
         return False
-    await STORE.save_provider_session(
-        session_id,
-        provider_id,
-        backend,
-        **({"cwd": cwd} if cwd is not None else {}),
-    )
-    await append_event(session_id, "provider_session", {
-        "run_id": run_id,
-        "backend": backend,
-        "provider_session_id": provider_id,
-    })
+    # Keep the exact owner stable through the durable provider binding. Stop
+    # waits for provider cleanup while holding the lifecycle lock, so this
+    # deliberately uses the established ACTIVE -> STORE lock order instead of
+    # trying to acquire the lifecycle lock from a runner.
+    async with ACTIVE_LOCK:
+        active = ACTIVE.get(session_id)
+        current_turn = CURRENT_TURNS.get(session_id)
+        active_run_id = (
+            str(active.get("run_id") or "")
+            if isinstance(active, dict)
+            else ""
+        )
+        current_run_id = (
+            str(current_turn.get("run_id") or "")
+            if isinstance(current_turn, dict)
+            else ""
+        )
+        if (
+            session_id not in BUSY_SESSIONS
+            or run_id not in {active_run_id, current_run_id}
+            or any(
+                owner_id not in {"", run_id}
+                for owner_id in (active_run_id, current_run_id)
+            )
+        ):
+            return False
+        save_kwargs: dict[str, Any] = {}
+        if cwd is not None:
+            save_kwargs["cwd"] = cwd
+        if codex_instruction_hash is not None:
+            save_kwargs["codex_instruction_hash"] = codex_instruction_hash
+        usage_signal = await STORE.save_provider_session(
+            session_id,
+            provider_id,
+            backend,
+            defer_runtime_broadcast=True,
+            **save_kwargs,
+        )
+    # Do not hold the global ACTIVE lock through event disk I/O/broadcast. A
+    # second exact-owner check prevents a delayed old trace from appearing
+    # after a replacement has bound.
+    still_owned = await turn_slot_is_owned(session_id, run_id)
+    if isinstance(usage_signal, dict) and still_owned:
+        await broadcast_provider_runtime_changed(session_id, usage_signal)
+    if emit_event and still_owned:
+        await append_event(session_id, "provider_session", {
+            "run_id": run_id,
+            "backend": backend,
+            "provider_session_id": provider_id,
+        })
     return True
 
 
@@ -29248,29 +29793,32 @@ async def run_claude_print(
             start_new_session=True,
         )
     except Exception as e:
-        record_runtime_failure(BACKEND_CLAUDE, e, spawn_failure=True)
-        await append_event(session_id, "error", {"run_id": run_id, "backend": BACKEND_CLAUDE, "message": f"failed to start Claude: {e}", **run_event_metadata(run_id)})
-        await append_turn_finished_event(session_id, {
-            "run_id": run_id,
-            "backend": BACKEND_CLAUDE,
-            "exit_code": None,
-            "result_text": "",
-            **run_event_metadata(run_id),
-        })
-        RUN_METADATA.pop(run_id, None)
-        await release_turn_slot(session_id, expected_run_id=run_id)
-        schedule_next_queued_turn(session_id)
-        return
-    async with ACTIVE_LOCK:
-        BUSY_SESSIONS.add(session_id)
-        stop_requested = (
-            session_id in STOP_REQUESTS or run_id in STOPPED_RUNS
+        released = await release_turn_slot(
+            session_id,
+            expected_run_id=run_id,
         )
-        if stop_requested:
-            STOP_REQUESTS.discard(session_id)
-            STOPPED_RUNS.add(run_id)
-        pgid = process_group_for_pid(proc.pid)
-        ACTIVE[session_id] = {
+        try:
+            if released:
+                record_runtime_failure(BACKEND_CLAUDE, e, spawn_failure=True)
+                await append_event(session_id, "error", {"run_id": run_id, "backend": BACKEND_CLAUDE, "message": f"failed to start Claude: {e}", **run_event_metadata(run_id)})
+                await append_turn_finished_event(session_id, {
+                    "run_id": run_id,
+                    "backend": BACKEND_CLAUDE,
+                    "exit_code": None,
+                    "result_text": "",
+                    **run_event_metadata(run_id),
+                })
+        finally:
+            RUN_METADATA.pop(run_id, None)
+            STOPPED_RUNS.discard(run_id)
+            if released:
+                schedule_next_queued_turn(session_id)
+        return
+    pgid = process_group_for_pid(proc.pid)
+    bound, stop_requested = await bind_active_turn(
+        session_id,
+        run_id,
+        {
             "proc": proc,
             "run_id": run_id,
             "backend": BACKEND_CLAUDE,
@@ -29281,12 +29829,15 @@ async def run_claude_print(
             "argv": public_cmd,
             "started_at": time.time(),
             "started_at_iso": now_iso(),
-            "stop_requested": stop_requested,
             "provider_turn_ready": False,
             "stdout_tail": deque(maxlen=LIVE_STDOUT_MAX_LINES),
             "stdout_total_lines": 0,
             "stdout_updated_at": None,
-        }
+        },
+    )
+    if not bound:
+        await terminate_process_tree(proc, grace=0.5)
+        return
     if stop_requested:
         await terminate_process_tree(proc)
     if not stop_requested and proc.stdin:
@@ -29391,7 +29942,7 @@ async def run_claude_print(
         with suppress(asyncio.CancelledError):
             await manifest_watch_task
         await terminate_process_tree(proc, grace=0.5)
-        await clear_active_process(session_id)
+        await clear_active_process(session_id, expected_run_id=run_id)
 
     stderr = ""
     if proc.stderr:
@@ -29455,7 +30006,7 @@ async def run_claude_print(
     await collect_manifest(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts, final=True)
     await collect_recent_leftover_manifests(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts)
     await publish_turn_code_diff(session_id, run_id, BACKEND_CLAUDE, cwd, diff_baseline, changed_paths)
-    await append_turn_finished_event(session_id, {
+    terminal_payload = {
         "run_id": run_id,
         "backend": BACKEND_CLAUDE,
         "transport": CLAUDE_TRANSPORT_PRINT,
@@ -29467,13 +30018,18 @@ async def run_claude_print(
         "result_text": result_text,
         "stopped": stopped,
         **run_event_metadata(run_id),
-    })
-    RUN_METADATA.pop(run_id, None)
-    await release_turn_slot(session_id, expected_run_id=run_id)
-    drain_queue = should_schedule_queue_after_finish(session_id, stopped)
-    STOPPED_RUNS.discard(run_id)
-    if drain_queue:
-        schedule_next_queued_turn(session_id)
+    }
+    finalize_task = asyncio.create_task(finalize_owned_turn_finished(
+        session_id,
+        run_id,
+        stopped=stopped,
+        payload=terminal_payload,
+    ))
+    try:
+        await asyncio.shield(finalize_task)
+    except asyncio.CancelledError:
+        await join_task_despite_caller_cancellation(finalize_task)
+        raise
 
 
 def claude_sdk_field(value: Any, name: str, default: Any = None) -> Any:
@@ -29846,6 +30402,7 @@ async def finish_claude_sdk_start_failure(
     message: str,
     *,
     delivery_uncertain: bool = False,
+    ownership_token: str | None = None,
 ) -> None:
     async with ACTIVE_LOCK:
         active = ACTIVE.get(session_id)
@@ -29853,64 +30410,94 @@ async def finish_claude_sdk_start_failure(
             active["provider_turn_ready"] = False
             active["native_steer_queue"] = None
             active["claude_permissions_open"] = False
-    await cancel_claude_interactions(
+    released = await release_turn_slot(
         session_id,
-        resolution="turn_failed",
+        expected_run_id=run_id,
     )
-    record_runtime_failure(BACKEND_CLAUDE, message, spawn_failure=True)
-    await append_event(session_id, "error", {
-        "run_id": run_id,
-        "backend": BACKEND_CLAUDE,
-        "transport": CLAUDE_TRANSPORT_AGENT_SDK,
-        "message": message,
-        "delivery_unknown": delivery_uncertain,
-        **run_event_metadata(run_id),
-    })
-    await append_turn_finished_event(session_id, {
-        "run_id": run_id,
-        "backend": BACKEND_CLAUDE,
-        "transport": CLAUDE_TRANSPORT_AGENT_SDK,
-        "exit_code": None,
-        "result_text": "",
-        "delivery_unknown": delivery_uncertain,
-        **run_event_metadata(run_id),
-    })
-    RUN_METADATA.pop(run_id, None)
-    await release_turn_slot(session_id, expected_run_id=run_id)
-    schedule_next_queued_turn(session_id)
+    try:
+        if not released:
+            return
+        await cancel_claude_interactions(
+            session_id,
+            resolution="turn_failed",
+            expected_run_id=run_id,
+            ownership_token=ownership_token,
+        )
+        record_runtime_failure(BACKEND_CLAUDE, message, spawn_failure=True)
+        await append_event(session_id, "error", {
+            "run_id": run_id,
+            "backend": BACKEND_CLAUDE,
+            "transport": CLAUDE_TRANSPORT_AGENT_SDK,
+            "message": message,
+            "delivery_unknown": delivery_uncertain,
+            **run_event_metadata(run_id),
+        })
+        await append_turn_finished_event(session_id, {
+            "run_id": run_id,
+            "backend": BACKEND_CLAUDE,
+            "transport": CLAUDE_TRANSPORT_AGENT_SDK,
+            "exit_code": None,
+            "result_text": "",
+            "delivery_unknown": delivery_uncertain,
+            **run_event_metadata(run_id),
+        })
+    finally:
+        RUN_METADATA.pop(run_id, None)
+        STOPPED_RUNS.discard(run_id)
+        if released:
+            schedule_next_queued_turn(session_id)
 
 
 async def finish_cancelled_claude_sdk_start(
     session_id: str,
     run_id: str,
     manager: ClaudeSDKSupervisorManager,
+    *,
+    ownership_token: str | None = None,
 ) -> None:
     """Retire a possibly accepted query and clear its reservation safely."""
 
     STOPPED_RUNS.add(run_id)
-    await evict_claude_sdk_chat(
+    if await turn_slot_is_owned(session_id, run_id):
+        if ownership_token:
+            await evict_claude_sdk_chat(
+                session_id,
+                force=True,
+                manager=manager,
+                ownership_token=ownership_token,
+            )
+        await cancel_claude_interactions(
+            session_id,
+            resolution="turn_stopped",
+            expected_run_id=run_id,
+            ownership_token=ownership_token,
+        )
+    drain_queue = should_schedule_queue_after_finish(
         session_id,
-        force=True,
-        manager=manager,
-    )
-    await cancel_claude_interactions(
-        session_id,
-        resolution="turn_stopped",
+        stopped=True,
     )
     released = await release_turn_slot(
         session_id,
         expected_run_id=run_id,
     )
-    if released:
-        await append_event(session_id, "turn_stopped", {
-            "run_id": run_id,
-            "backend": BACKEND_CLAUDE,
-            "transport": CLAUDE_TRANSPORT_AGENT_SDK,
-            "message": "Claude was stopped while the SDK turn was starting.",
-            **run_event_metadata(run_id),
-        })
-    RUN_METADATA.pop(run_id, None)
-    STOPPED_RUNS.discard(run_id)
+    try:
+        if released:
+            await append_event(session_id, "turn_stopped", {
+                "run_id": run_id,
+                "backend": BACKEND_CLAUDE,
+                "transport": CLAUDE_TRANSPORT_AGENT_SDK,
+                "message": "Claude was stopped while the SDK turn was starting.",
+                **run_event_metadata(run_id),
+            })
+    finally:
+        RUN_METADATA.pop(run_id, None)
+        STOPPED_RUNS.discard(run_id)
+        # This cleanup owns the successful release. The outer task supervisor
+        # deliberately sees no remaining owner, so the drain must happen here.
+        # A concurrent Stop may request the same drain; QUEUE_START_TASKS keeps
+        # promotion single-owner and prevents a double launch.
+        if released and drain_queue:
+            schedule_next_queued_turn(session_id)
 
 
 async def run_claude_sdk(
@@ -30002,14 +30589,13 @@ async def run_claude_sdk(
         "stdout_total_lines": 0,
         "stdout_updated_at": None,
     }
-    async with ACTIVE_LOCK:
-        BUSY_SESSIONS.add(session_id)
-        stop_requested = session_id in STOP_REQUESTS or run_id in STOPPED_RUNS
-        if stop_requested:
-            STOP_REQUESTS.discard(session_id)
-            STOPPED_RUNS.add(run_id)
-        startup_active["stop_requested"] = stop_requested
-        ACTIVE[session_id] = startup_active
+    bound, stop_requested = await bind_active_turn(
+        session_id,
+        run_id,
+        startup_active,
+    )
+    if not bound:
+        return
     if stop_requested:
         # Stop won before provider delivery. Do not submit the prompt merely
         # to acquire a handle that would immediately be interrupted.
@@ -30017,6 +30603,10 @@ async def run_claude_sdk(
             session_id,
             run_id,
             manager,
+            ownership_token=(
+                str(startup_active.get("claude_sdk_owner_token") or "")
+                or None
+            ),
         )
         return
 
@@ -30051,6 +30641,10 @@ async def run_claude_sdk(
                 session_id,
                 run_id,
                 manager,
+                ownership_token=(
+                    str(startup_active.get("claude_sdk_owner_token") or "")
+                    or None
+                ),
             )
         )
         await join_task_despite_caller_cancellation(cleanup_task)
@@ -30058,11 +30652,19 @@ async def run_claude_sdk(
     except ClaudeSDKUnavailable:
         raise
     except ClaudeSDKQueryError as exc:
-        await evict_claude_sdk_chat(
-            session_id,
-            force=True,
-            manager=manager,
+        startup_ownership_token = str(
+            startup_active.get("claude_sdk_owner_token") or ""
         )
+        if startup_ownership_token and await turn_slot_is_owned(
+            session_id,
+            run_id,
+        ):
+            await evict_claude_sdk_chat(
+                session_id,
+                force=True,
+                manager=manager,
+                ownership_token=startup_ownership_token,
+            )
         await finish_claude_sdk_start_failure(
             session_id,
             run_id,
@@ -30071,6 +30673,7 @@ async def run_claude_sdk(
                 "was not replayed through the fallback transport."
             ),
             delivery_uncertain=True,
+            ownership_token=startup_ownership_token or None,
         )
         logger.warning(
             "Claude SDK query delivery uncertain session=%s run=%s: %s",
@@ -30084,6 +30687,10 @@ async def run_claude_sdk(
             session_id,
             run_id,
             f"Claude SDK could not start: {concise_error_message(exc)}",
+            ownership_token=(
+                str(startup_active.get("claude_sdk_owner_token") or "")
+                or None
+            ),
         )
         return
 
@@ -30123,9 +30730,16 @@ async def run_claude_sdk(
                 session_id,
                 run_id,
                 manager,
+                ownership_token=(
+                    str(startup_active.get("claude_sdk_owner_token") or "")
+                    or None
+                ),
             )
             return
 
+    sdk_ownership_token = str(
+        startup_active.get("claude_sdk_owner_token") or ""
+    )
     current_run_id = run_id
     current_handle = handle
     current_diff_baseline = diff_baseline
@@ -30969,6 +31583,8 @@ async def run_claude_sdk(
                 if cancelled_error is not None
                 else "turn_finished"
             ),
+            expected_run_id=current_run_id,
+            ownership_token=sdk_ownership_token or None,
         )
 
     cleanup_task = asyncio.create_task(cleanup_live_sdk_state())
@@ -30984,11 +31600,16 @@ async def run_claude_sdk(
         if retire_supervisor:
             with suppress(Exception):
                 await interrupt_claude_sdk_run_bounded(current_handle)
-            await evict_claude_sdk_chat(
-                session_id,
-                force=True,
-                manager=manager,
-            )
+            # Token-qualified eviction cannot target a newer SDK generation.
+            # Without a supervisor token, fail closed: interrupting the exact
+            # handle above is safe, while chat-wide eviction is not.
+            if sdk_ownership_token:
+                await evict_claude_sdk_chat(
+                    session_id,
+                    force=True,
+                    manager=manager,
+                    ownership_token=sdk_ownership_token or None,
+                )
         if provider_id:
             with suppress(Exception):
                 await persist_run_provider_session(
@@ -31376,29 +31997,32 @@ async def run_codex_exec(
             start_new_session=True,
         )
     except Exception as e:
-        record_runtime_failure(BACKEND_CODEX, e, spawn_failure=True)
-        await append_event(session_id, "error", {"run_id": run_id, "backend": BACKEND_CODEX, "message": f"failed to start Codex: {e}", **run_event_metadata(run_id)})
-        await append_turn_finished_event(session_id, {
-            "run_id": run_id,
-            "backend": BACKEND_CODEX,
-            "exit_code": None,
-            "result_text": "",
-            **run_event_metadata(run_id),
-        })
-        RUN_METADATA.pop(run_id, None)
-        await release_turn_slot(session_id, expected_run_id=run_id)
-        schedule_next_queued_turn(session_id)
-        return
-    async with ACTIVE_LOCK:
-        BUSY_SESSIONS.add(session_id)
-        stop_requested = (
-            session_id in STOP_REQUESTS or run_id in STOPPED_RUNS
+        released = await release_turn_slot(
+            session_id,
+            expected_run_id=run_id,
         )
-        if stop_requested:
-            STOP_REQUESTS.discard(session_id)
-            STOPPED_RUNS.add(run_id)
-        pgid = process_group_for_pid(proc.pid)
-        ACTIVE[session_id] = {
+        try:
+            if released:
+                record_runtime_failure(BACKEND_CODEX, e, spawn_failure=True)
+                await append_event(session_id, "error", {"run_id": run_id, "backend": BACKEND_CODEX, "message": f"failed to start Codex: {e}", **run_event_metadata(run_id)})
+                await append_turn_finished_event(session_id, {
+                    "run_id": run_id,
+                    "backend": BACKEND_CODEX,
+                    "exit_code": None,
+                    "result_text": "",
+                    **run_event_metadata(run_id),
+                })
+        finally:
+            RUN_METADATA.pop(run_id, None)
+            STOPPED_RUNS.discard(run_id)
+            if released:
+                schedule_next_queued_turn(session_id)
+        return
+    pgid = process_group_for_pid(proc.pid)
+    bound, stop_requested = await bind_active_turn(
+        session_id,
+        run_id,
+        {
             "proc": proc,
             "run_id": run_id,
             "backend": BACKEND_CODEX,
@@ -31409,12 +32033,15 @@ async def run_codex_exec(
             "argv": public_cmd,
             "started_at": time.time(),
             "started_at_iso": now_iso(),
-            "stop_requested": stop_requested,
             "provider_turn_ready": False,
             "stdout_tail": deque(maxlen=LIVE_STDOUT_MAX_LINES),
             "stdout_total_lines": 0,
             "stdout_updated_at": None,
-        }
+        },
+    )
+    if not bound:
+        await terminate_process_tree(proc, grace=0.5)
+        return
     if stop_requested:
         await terminate_process_tree(proc)
 
@@ -31692,7 +32319,7 @@ async def run_codex_exec(
         with suppress(asyncio.CancelledError):
             await manifest_watch_task
         await terminate_process_tree(proc, grace=0.5)
-        await clear_active_process(session_id)
+        await clear_active_process(session_id, expected_run_id=run_id)
 
     stderr = ""
     if proc.stderr:
@@ -31811,24 +32438,34 @@ async def run_codex_exec(
     elif not stopped:
         record_runtime_success(BACKEND_CODEX)
     if provider_id and not standalone_provider_context:
-        await STORE.save_provider_session(session_id, provider_id, BACKEND_CODEX)
+        await persist_run_provider_session(
+            session_id,
+            run_id,
+            BACKEND_CODEX,
+            provider_id,
+        )
     await collect_manifest(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts, final=True)
     await collect_recent_leftover_manifests(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts)
     await publish_turn_code_diff(session_id, run_id, BACKEND_CODEX, cwd, diff_baseline, changed_paths)
-    await append_turn_finished_event(session_id, {
+    terminal_payload = {
         "run_id": run_id,
         "backend": BACKEND_CODEX,
         "exit_code": proc.returncode,
         "result_text": clean_assistant_text("\n\n".join(text_parts).strip()),
         "stopped": stopped,
         **run_event_metadata(run_id),
-    })
-    RUN_METADATA.pop(run_id, None)
-    await release_turn_slot(session_id, expected_run_id=run_id)
-    drain_queue = should_schedule_queue_after_finish(session_id, stopped)
-    STOPPED_RUNS.discard(run_id)
-    if drain_queue:
-        schedule_next_queued_turn(session_id)
+    }
+    finalize_task = asyncio.create_task(finalize_owned_turn_finished(
+        session_id,
+        run_id,
+        stopped=stopped,
+        payload=terminal_payload,
+    ))
+    try:
+        await asyncio.shield(finalize_task)
+    except asyncio.CancelledError:
+        await join_task_despite_caller_cancellation(finalize_task)
+        raise
 
 
 def queued_turn_run_metadata(item: dict[str, Any]) -> dict[str, Any]:
@@ -32709,7 +33346,15 @@ async def run_codex_app_server(
         should_interrupt = False
         async with ACTIVE_LOCK:
             active = ACTIVE.get(session_id)
-            if active:
+            active_owned = bool(
+                active
+                and str(active.get("run_id") or "") == current_run_id
+                and session_id in BUSY_SESSIONS
+                and str(
+                    (CURRENT_TURNS.get(session_id) or {}).get("run_id") or ""
+                ) == current_run_id
+            )
+            if active_owned:
                 active["provider_turn_ready"] = True
                 active["provider_turn_id"] = turn.turn_id
                 if (
@@ -32724,7 +33369,11 @@ async def run_codex_app_server(
             except Exception:
                 async with ACTIVE_LOCK:
                     active = ACTIVE.get(session_id)
-                    if active and active.get("provider_turn_id") == turn.turn_id:
+                    if (
+                        active
+                        and str(active.get("run_id") or "") == current_run_id
+                        and active.get("provider_turn_id") == turn.turn_id
+                    ):
                         active["native_interrupt_sent"] = False
                 logger.warning(
                     "Codex app-server late interrupt failed session=%s turn=%s",
@@ -32736,7 +33385,11 @@ async def run_codex_app_server(
         if current_run_id in STOPPED_RUNS:
             return True
         active = ACTIVE.get(session_id)
-        return bool(active and active.get("stop_requested"))
+        return bool(
+            active
+            and str(active.get("run_id") or "") == current_run_id
+            and active.get("stop_requested")
+        )
 
     async def handle_notification(notification: dict[str, Any]) -> bool:
         nonlocal terminal_status, terminal_error, turn_completed
@@ -33001,14 +33654,10 @@ async def run_codex_app_server(
 
     try:
         await manager.start()
-        async with ACTIVE_LOCK:
-            stop_requested = (
-                session_id in STOP_REQUESTS or current_run_id in STOPPED_RUNS
-            )
-            if stop_requested:
-                STOP_REQUESTS.discard(session_id)
-                STOPPED_RUNS.add(current_run_id)
-            ACTIVE[session_id] = {
+        bound, stop_requested = await bind_active_turn(
+            session_id,
+            current_run_id,
+            {
                 "proc": None,
                 "run_id": current_run_id,
                 "backend": BACKEND_CODEX,
@@ -33019,7 +33668,6 @@ async def run_codex_app_server(
                 "argv": public_cmd,
                 "started_at": time.time(),
                 "started_at_iso": now_iso(),
-                "stop_requested": stop_requested,
                 "provider_turn_ready": False,
                 "provider_thread_id": provider_id or None,
                 "provider_turn_id": None,
@@ -33033,7 +33681,10 @@ async def run_codex_app_server(
                 "stdout_tail": deque(maxlen=LIVE_STDOUT_MAX_LINES),
                 "stdout_total_lines": 0,
                 "stdout_updated_at": None,
-            }
+            },
+        )
+        if not bound:
+            return
         if stop_requested:
             terminal_status = "interrupted"
         else:
@@ -33043,21 +33694,38 @@ async def run_codex_app_server(
                 sess,
                 cwd,
                 standalone_provider_context=standalone_provider_context,
+                expected_run_id=current_run_id,
             )
             thread_pinned = True
+            if not await turn_slot_is_owned(session_id, current_run_id):
+                return
             if not standalone_provider_context:
-                await append_event(session_id, "provider_session", {
-                    "run_id": current_run_id,
-                    "backend": BACKEND_CODEX,
-                    "provider_session_id": provider_id,
-                    "transport": CODEX_TRANSPORT_APP_SERVER,
-                })
+                persisted_provider = await persist_run_provider_session(
+                    session_id,
+                    current_run_id,
+                    BACKEND_CODEX,
+                    provider_id,
+                )
+                if not persisted_provider:
+                    return
             async with ACTIVE_LOCK:
                 active = ACTIVE.get(session_id)
-                stop_requested = bool(active and active.get("stop_requested"))
-                if active:
+                active_owned = bool(
+                    active
+                    and str(active.get("run_id") or "") == current_run_id
+                    and session_id in BUSY_SESSIONS
+                    and str(
+                        (CURRENT_TURNS.get(session_id) or {}).get("run_id") or ""
+                    ) == current_run_id
+                )
+                stop_requested = bool(
+                    active_owned and active.get("stop_requested")
+                )
+                if active_owned:
                     active["provider_thread_id"] = provider_id
                     active["provider_session_id"] = provider_id
+            if not active_owned:
+                return
 
             if stop_requested:
                 STOPPED_RUNS.add(current_run_id)
@@ -33158,13 +33826,27 @@ async def run_codex_app_server(
 
                 async with ACTIVE_LOCK:
                     active = ACTIVE.get(session_id)
-                    if active:
+                    active_owned = bool(
+                        active
+                        and str(active.get("run_id") or "") == current_run_id
+                        and session_id in BUSY_SESSIONS
+                        and str(
+                            (CURRENT_TURNS.get(session_id) or {}).get("run_id")
+                            or ""
+                        ) == current_run_id
+                    )
+                    if active_owned:
                         active["codex_app_server_turn"] = turn
                         active["provider_thread_id"] = provider_id
                         active["provider_session_id"] = provider_id
                         active["provider_turn_id"] = turn.turn_id or None
                         active["provider_turn_ready"] = bool(turn.turn_id)
                         stop_requested = bool(active.get("stop_requested"))
+                if not active_owned:
+                    if turn is not None and turn.turn_id:
+                        with suppress(CodexAppServerError):
+                            await turn.interrupt()
+                    return
                 await bind_active_turn_and_reconcile_stop()
 
                 if codex_goal_time_budget_remaining(sess) is not None:
@@ -33348,7 +34030,12 @@ async def run_codex_app_server(
             if thread_pinned and provider_id:
                 await unpin_codex_app_server_thread(manager, provider_id)
                 thread_pinned = False
-            await clear_active_process(session_id)
+            cleared = await clear_active_process(
+                session_id,
+                expected_run_id=current_run_id,
+            )
+            if not cleared:
+                return
             await append_event(session_id, "codex_transport_fallback", {
                 "run_id": current_run_id,
                 "from": CODEX_TRANSPORT_APP_SERVER,
@@ -33521,18 +34208,27 @@ async def run_codex_app_server(
         })
     finally:
         RUN_METADATA.pop(current_run_id, None)
+        released = False
         try:
-            await release_turn_slot(
+            released = await release_turn_slot(
                 session_id,
                 expected_run_id=current_run_id,
             )
         finally:
-            if thread_pinned and provider_id:
-                await unpin_codex_app_server_thread(manager, provider_id)
-            drain_queue = should_schedule_queue_after_finish(session_id, stopped)
-            STOPPED_RUNS.discard(current_run_id)
-            if drain_queue:
-                schedule_next_queued_turn(session_id)
+            try:
+                if thread_pinned and provider_id:
+                    await unpin_codex_app_server_thread(manager, provider_id)
+            finally:
+                drain_queue = should_schedule_queue_after_finish(
+                    session_id,
+                    stopped,
+                )
+                STOPPED_RUNS.discard(current_run_id)
+                # Unpinning is provider-cache hygiene after the chat slot has
+                # already been released. It must not strand an admitted queue
+                # successor if unpin raises or this runner is cancelled.
+                if released and drain_queue:
+                    schedule_next_queued_turn(session_id)
 
 
 async def run_codex(
@@ -34167,7 +34863,12 @@ async def _start_turn_locked(
                 ),
             )
         )
-        turn_task = asyncio.create_task(task)
+        turn_task = asyncio.create_task(supervise_provider_turn_task(
+            session_id,
+            run_id,
+            str(backend),
+            task,
+        ))
         register_session_task(SESSION_TURN_TASKS, session_id, turn_task)
         provider_task_committed = True
         current_title = str(sess.get("title") or "").strip()
@@ -36758,9 +37459,12 @@ async def post_codex_compact(session_id: str) -> dict[str, Any]:
 
 
 async def _post_codex_compact_locked(session_id: str) -> dict[str, Any]:
-    manager, thread_id, _session = await acquire_codex_control_thread(
+    manager, thread_id, control_session = await acquire_codex_control_thread(
         session_id,
         reserve_session=True,
+    )
+    reservation_id = str(
+        control_session.get("_codex_control_reservation_id") or ""
     )
     operation_id = f"codexop_{uuid.uuid4().hex[:16]}"
     subscription = manager.subscribe_thread(thread_id)
@@ -36788,6 +37492,7 @@ async def _post_codex_compact_locked(session_id: str) -> dict[str, Any]:
                 "compaction",
                 manager,
                 thread_id,
+                reservation_id,
                 subscription,
             )
         )
@@ -36820,6 +37525,7 @@ async def _post_codex_compact_locked(session_id: str) -> dict[str, Any]:
             manager,
             thread_id,
             reserved_session=True,
+            reservation_id=reservation_id,
         )
         raise codex_control_http_error(exc) from exc
 
@@ -36846,9 +37552,12 @@ async def _post_codex_rollback_locked(
                 "requires explicit confirmed=true"
             ),
         )
-    manager, thread_id, _session = await acquire_codex_control_thread(
+    manager, thread_id, control_session = await acquire_codex_control_thread(
         session_id,
         reserve_session=True,
+    )
+    reservation_id = str(
+        control_session.get("_codex_control_reservation_id") or ""
     )
     try:
         thread = await manager.rollback_thread(thread_id, num_turns=req.num_turns)
@@ -36872,6 +37581,7 @@ async def _post_codex_rollback_locked(
             manager,
             thread_id,
             reserved_session=True,
+            reservation_id=reservation_id,
         )
 
 
@@ -36894,9 +37604,12 @@ async def _post_codex_review_locked(
             status_code=501,
             detail="Detached review requires a mapped child chat; use inline review for now",
         )
-    manager, thread_id, _session = await acquire_codex_control_thread(
+    manager, thread_id, control_session = await acquire_codex_control_thread(
         session_id,
         reserve_session=True,
+    )
+    reservation_id = str(
+        control_session.get("_codex_control_reservation_id") or ""
     )
     operation_id = f"codexop_{uuid.uuid4().hex[:16]}"
     subscription = manager.subscribe_thread(thread_id)
@@ -36920,6 +37633,7 @@ async def _post_codex_review_locked(
                 "review",
                 manager,
                 thread_id,
+                reservation_id,
                 subscription,
                 turn_id=turn_id or None,
             )
@@ -36962,6 +37676,7 @@ async def _post_codex_review_locked(
             manager,
             thread_id,
             reserved_session=True,
+            reservation_id=reservation_id,
         )
         raise codex_control_http_error(exc) from exc
 
@@ -36988,9 +37703,12 @@ async def _post_codex_shell_command_locked(
                 "confirmed=true"
             ),
         )
-    manager, thread_id, _session = await acquire_codex_control_thread(
+    manager, thread_id, control_session = await acquire_codex_control_thread(
         session_id,
         reserve_session=True,
+    )
+    reservation_id = str(
+        control_session.get("_codex_control_reservation_id") or ""
     )
     operation_id = f"codexop_{uuid.uuid4().hex[:16]}"
     subscription = manager.subscribe_thread(thread_id)
@@ -37010,6 +37728,7 @@ async def _post_codex_shell_command_locked(
                 "shell",
                 manager,
                 thread_id,
+                reservation_id,
                 subscription,
             )
         )
@@ -37041,6 +37760,7 @@ async def _post_codex_shell_command_locked(
             manager,
             thread_id,
             reserved_session=True,
+            reservation_id=reservation_id,
         )
         raise codex_control_http_error(exc) from exc
 
@@ -38392,6 +39112,9 @@ async def stop_turn(
     transition_ready: asyncio.Event | None = None
     owned_tasks: list[asyncio.Task[Any]] = []
     stopping_run_id: str | None = None
+    stopping_purpose = ""
+    stopping_control_reservation_id = ""
+    stopping_control_thread_id = ""
     async with ACTIVE_LOCK:
         active = ACTIVE.get(session_id)
         busy = session_id in BUSY_SESSIONS
@@ -38447,6 +39170,22 @@ async def stop_turn(
                 stopping_run_id = str(
                     (CURRENT_TURNS.get(session_id) or {}).get("run_id") or ""
                 ) or None
+        current_turn = CURRENT_TURNS.get(session_id) or {}
+        stopping_control_reservation_id = str(
+            (active or {}).get("codex_control_reservation_id")
+            or current_turn.get("codex_control_reservation_id")
+            or ""
+        ).strip()
+        stopping_control_thread_id = str(
+            (active or {}).get("provider_thread_id")
+            or (active or {}).get("provider_session_id")
+            or ""
+        ).strip()
+        stopping_purpose = str(
+            current_turn.get("purpose")
+            or (RUN_METADATA.get(stopping_run_id or "") or {}).get("purpose")
+            or ""
+        )
         current_task = asyncio.current_task()
         owned_tasks = [
             task
@@ -38472,6 +39211,33 @@ async def stop_turn(
         await revoke_cross_chat_capability(stopping_run_id)
     subagent_stop = empty_subagent_stop_result()
     session = STORE.sessions.get(session_id) or {}
+    pause_queued_successors = bool(
+        pause_queued_turns_on_stop
+        and stopping_purpose != "scheduled_job"
+    )
+
+    def schedule_unpaused_queue_after_release(released: bool = True) -> None:
+        if released and schedule_queue and not pause_queued_successors:
+            schedule_next_queued_turn(session_id)
+
+    async def release_stopping_slot(
+        expected_run_id: str | None,
+        *,
+        allow_prebind: bool = False,
+    ) -> bool:
+        """Release only the owner Stop observed at admission time."""
+
+        if stopping_control_reservation_id:
+            return await release_codex_control_slot(
+                session_id,
+                expected_thread_id=stopping_control_thread_id,
+                expected_reservation_id=stopping_control_reservation_id,
+                allow_prebind=allow_prebind,
+            )
+        return await release_turn_slot(
+            session_id,
+            expected_run_id=expected_run_id,
+        )
 
     async def settle_stopped_claude_subagents() -> None:
         """Fence surviving Claude children only after this parent is idle."""
@@ -38541,7 +39307,7 @@ async def stop_turn(
             "deferred": True,
             "message": "The provider had not accepted the current turn yet, so it was left running.",
         }
-    if pause_queued_turns_on_stop:
+    if pause_queued_successors:
         await pause_queued_turns_after_explicit_stop(session_id)
     if not active and not busy:
         await settle_stopped_claude_subagents()
@@ -38641,12 +39407,23 @@ async def stop_turn(
                             session_id,
                             force=True,
                         )
-                    await release_turn_slot(
-                        session_id,
-                        expected_run_id=run_id,
+                    released = await release_stopping_slot(
+                        run_id,
+                        allow_prebind=True,
                     )
+                    if not released and stopping_control_reservation_id:
+                        # The cancelled acquisition may have released its own
+                        # exact reservation while Stop was joining the task.
+                        # Count that as this Stop's release only if the chat is
+                        # still idle; a promoted replacement must remain owned.
+                        async with ACTIVE_LOCK:
+                            released = bool(
+                                session_id not in BUSY_SESSIONS
+                                and session_id not in ACTIVE
+                                and session_id not in CURRENT_TURNS
+                            )
                     await settle_stopped_claude_subagents()
-                    if emit_event:
+                    if emit_event and released:
                         await append_event(session_id, "turn_stopped", {
                             "run_id": run_id,
                             "backend": backend,
@@ -38659,6 +39436,7 @@ async def stop_turn(
                     RUN_METADATA.pop(run_id, None) if run_id else None
                     if run_id and all(task.done() for task in pending):
                         STOPPED_RUNS.discard(run_id)
+                    schedule_unpaused_queue_after_release(released)
                     goal_result = (
                         await settle_idle_codex_goal_for_stop(session_id)
                         if backend == BACKEND_CODEX
@@ -38687,15 +39465,19 @@ async def stop_turn(
             # No request or runner owns this BUSY reservation after the grace
             # period, so it is an orphan and can be safely released.
             run_id = str(current_turn.get("run_id") or "") or None
-            await release_turn_slot(session_id)
+            released = await release_stopping_slot(
+                run_id,
+                allow_prebind=True,
+            )
             await settle_stopped_claude_subagents()
             if run_id:
                 RUN_METADATA.pop(run_id, None)
-            if emit_event:
+            if emit_event and released:
                 await append_event(session_id, "turn_stopped", {
                     "run_id": run_id,
                     "message": "Stopped before the agent process was ready.",
                 })
+            schedule_unpaused_queue_after_release(released)
             goal_result = await settle_idle_codex_goal_for_stop(session_id)
             return {
                 "ok": True,
@@ -38704,8 +39486,7 @@ async def stop_turn(
                 "subagents": subagent_stop,
                 **goal_result,
             }
-        if schedule_queue and not pause_queued_turns_on_stop:
-            schedule_next_queued_turn(session_id)
+        schedule_unpaused_queue_after_release()
         # The requested terminal state is already satisfied. Returning
         # stopped=True also lets clients clear a stale local running marker.
         goal_result = await settle_idle_codex_goal_for_stop(session_id)
@@ -38718,6 +39499,7 @@ async def stop_turn(
         }
     proc = active.get("proc") if active else None
     native_turn = active.get("codex_app_server_turn") if active else None
+    active_run_id = str(active.get("run_id") or "") or None
     goal_pause_ok, goal_paused, goal_pause_error = (
         await pause_active_codex_goal_for_stop(session_id, active)
     )
@@ -38779,14 +39561,10 @@ async def stop_turn(
         is_claude_sdk = (
             active.get("transport") == CLAUDE_TRANSPORT_AGENT_SDK
         )
-        if is_claude_sdk:
-            # Force teardown is scoped to this chat's actor/CLI. Other Claude
-            # chats remain untouched even when this consumer is wedged.
-            await evict_claude_sdk_chat(
-                session_id,
-                force=True,
-            )
-
+        is_codex_app_server = bool(
+            active.get("backend") == BACKEND_CODEX
+            and active.get("transport") == CODEX_TRANSPORT_APP_SERVER
+        )
         # A natural terminal notification may have won the race with local
         # cancellation. In that case its runner already emitted the terminal
         # row and released the reservation, so do not manufacture a duplicate.
@@ -38807,8 +39585,22 @@ async def stop_turn(
                 "subagents": subagent_stop,
             }
 
+        if is_claude_sdk:
+            # Scope force teardown to the exact supervisor generation. A
+            # delayed Stop must not evict a replacement that bound while its
+            # old runner was unwinding.
+            ownership_token = str(
+                active.get("claude_sdk_owner_token") or ""
+            )
+            if ownership_token:
+                await evict_claude_sdk_chat(
+                    session_id,
+                    force=True,
+                    ownership_token=ownership_token,
+                )
+
         fenced = False
-        if not is_claude_sdk:
+        if is_codex_app_server:
             thread_id = str(
                 active.get("provider_thread_id")
                 or active.get("provider_session_id")
@@ -38821,9 +39613,8 @@ async def stop_turn(
                 run_id=run_id,
                 reason=reason,
             )
-        released = await release_turn_slot(
-            session_id,
-            expected_run_id=run_id,
+        released = await release_stopping_slot(
+            run_id,
         )
         await settle_stopped_claude_subagents()
         active_run = (STORE.sessions.get(session_id) or {}).get("active_run")
@@ -38853,6 +39644,7 @@ async def stop_turn(
             RUN_METADATA.pop(run_id, None)
             if all(task.done() for task in owned):
                 STOPPED_RUNS.discard(run_id)
+        schedule_unpaused_queue_after_release(released)
         return {
             "ok": True,
             "stopped": True,
@@ -38863,14 +39655,13 @@ async def stop_turn(
             "goal_fenced": fenced,
             "subagents": subagent_stop,
             "message": (
-                (
-                    "Turn stopped. The unresponsive Claude chat process was "
-                    "retired and will reconnect on the next turn."
-                )
-                if is_claude_sdk
+                "Turn stopped. The unresponsive Claude runner was retired."
+                if active.get("backend") == BACKEND_CLAUDE
                 else (
                     "Turn stopped. The stale Codex thread was fenced and will "
                     "not be reused."
+                    if is_codex_app_server
+                    else "Turn stopped. The unresponsive Codex runner was retired."
                 )
             ),
         }
@@ -38956,10 +39747,8 @@ async def stop_turn(
                     current["native_interrupt_sent"] = False
             if (
                 hard_terminalize_on_timeout
-                and active.get("transport") in {
-                    CODEX_TRANSPORT_APP_SERVER,
-                    CLAUDE_TRANSPORT_AGENT_SDK,
-                }
+                and active.get("transport")
+                in HARD_TERMINALIZABLE_TURN_TRANSPORTS
             ):
                 return await hard_terminalize_active_stop(
                     native_interrupt=native_interrupt,
@@ -39026,10 +39815,16 @@ async def stop_turn(
             }
         if not still_busy:
             if not goal_pause_ok:
-                await release_turn_slot(session_id)
+                released = await release_stopping_slot(
+                    active_run_id,
+                )
+                schedule_unpaused_queue_after_release(released)
                 return await terminal_goal_pause_failure_result(native_interrupt)
-            await release_turn_slot(session_id)
+            released = await release_stopping_slot(
+                active_run_id,
+            )
             await settle_stopped_claude_subagents()
+            schedule_unpaused_queue_after_release(released)
             return {
                 "ok": True,
                 "stopped": True,
@@ -39052,25 +39847,31 @@ async def stop_turn(
 
     if not dynamic_tasks:
         if not goal_pause_ok:
-            await release_turn_slot(session_id)
-            if emit_event:
+            released = await release_stopping_slot(
+                active_run_id,
+            )
+            if emit_event and released:
                 await append_event(session_id, "turn_stopped", {
                     "run_id": active.get("run_id"),
                     "backend": active.get("backend"),
                     "native_interrupt": native_interrupt,
                     "goal_fenced": True,
                 })
+            schedule_unpaused_queue_after_release(released)
             return await terminal_goal_pause_failure_result(native_interrupt)
         # No request or runner still owns this ACTIVE record. It is stale and
         # safe to clear after the bounded confirmation window.
-        await release_turn_slot(session_id)
+        released = await release_stopping_slot(
+            active_run_id,
+        )
         await settle_stopped_claude_subagents()
-        if emit_event:
+        if emit_event and released:
             await append_event(session_id, "turn_stopped", {
                 "run_id": active.get("run_id"),
                 "backend": active.get("backend"),
                 "native_interrupt": native_interrupt,
             })
+        schedule_unpaused_queue_after_release(released)
         return {
             "ok": True,
             "stopped": True,
@@ -39089,10 +39890,7 @@ async def stop_turn(
             current["native_interrupt_sent"] = False
     if (
         hard_terminalize_on_timeout
-        and active.get("transport") in {
-            CODEX_TRANSPORT_APP_SERVER,
-            CLAUDE_TRANSPORT_AGENT_SDK,
-        }
+        and active.get("transport") in HARD_TERMINALIZABLE_TURN_TRANSPORTS
     ):
         return await hard_terminalize_active_stop(
             native_interrupt=native_interrupt,

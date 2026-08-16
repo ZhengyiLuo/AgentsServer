@@ -1197,6 +1197,56 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(Exception, "closed"):
             await run.wait_result()
 
+    async def test_stale_owner_token_cannot_evict_replacement(self) -> None:
+        owner_tokens: list[str] = []
+
+        async def capture_owner(token: str) -> None:
+            owner_tokens.append(token)
+
+        old_run = await self.manager.start_run(
+            "chat-1",
+            "Old prompt",
+            run_id="run-old",
+            options={},
+            configuration_key="a",
+            on_supervisor_ready=capture_owner,
+        )
+        old_token = owner_tokens[-1]
+        self.assertTrue(await self.manager.evict("chat-1", force=True))
+        with self.assertRaisesRegex(Exception, "closed"):
+            await old_run.wait_result()
+
+        new_run = await self.manager.start_run(
+            "chat-1",
+            "New prompt",
+            run_id="run-new",
+            options={},
+            configuration_key="a",
+            on_supervisor_ready=capture_owner,
+        )
+        new_token = owner_tokens[-1]
+        self.assertNotEqual(old_token, new_token)
+
+        self.assertFalse(await self.manager.evict(
+            "chat-1",
+            force=True,
+            ownership_token=old_token,
+        ))
+        self.assertTrue(self.manager.is_loaded("chat-1"))
+        self.assertTrue(self.manager.owns_active_run(
+            "chat-1",
+            new_token,
+            "run-new",
+        ))
+        await self.factory.clients[-1].emit({
+            "type": "result",
+            "result": "new done",
+        })
+        self.assertEqual(
+            (await new_run.wait_result())["result"],
+            "new done",
+        )
+
     async def test_force_evict_aborts_a_query_stuck_before_acceptance(self) -> None:
         factory = BlockingQueryFactory()
         manager = ClaudeSDKSupervisorManager(

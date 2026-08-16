@@ -130,6 +130,21 @@ class StandaloneProviderContextTests(unittest.IsolatedAsyncioTestCase):
         events = AsyncMock()
         with (
             patch.object(
+                agent_server,
+                "ACTIVE",
+                {"sess_parent": {"run_id": "run_chat"}},
+            ),
+            patch.object(
+                agent_server,
+                "BUSY_SESSIONS",
+                {"sess_parent"},
+            ),
+            patch.object(
+                agent_server,
+                "CURRENT_TURNS",
+                {"sess_parent": {"run_id": "run_chat"}},
+            ),
+            patch.object(
                 agent_server.STORE,
                 "save_provider_session",
                 save_provider,
@@ -160,6 +175,7 @@ class StandaloneProviderContextTests(unittest.IsolatedAsyncioTestCase):
             "claude_parent",
             agent_server.BACKEND_CLAUDE,
             cwd="/tmp/work",
+            defer_runtime_broadcast=True,
         )
         events.assert_awaited_once()
         self.assertEqual(

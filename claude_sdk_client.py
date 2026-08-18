@@ -14,11 +14,13 @@ therefore retain its ``claude -p`` fallback when the package is unavailable.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import logging
 import re
 import shlex
 import time
+import unicodedata
 import uuid
 from collections import OrderedDict
 from contextlib import suppress
@@ -38,6 +40,35 @@ logger = logging.getLogger(__name__)
 
 
 CLAUDE_AGENT_SDK_MIN_VERSION = "0.2.130"
+CLAUDE_SDK_MCP_STATUS_SCAN_LIMIT = 500
+CLAUDE_SDK_MCP_STATUS_TRUNCATED_KEY = "_agentsdock_mcp_status_truncated"
+
+
+def canonical_claude_mcp_identifier(value: Any, max_chars: int) -> str | None:
+    """Return an exact, display-safe NFC identifier or ``None``.
+
+    MCP names are both shown to people and passed back to native SDK controls,
+    so normalization or trimming would make the displayed identifier differ
+    from the controlled one. Keep join controls used by ordinary scripts while
+    rejecting invisible/spoofing controls and non-scalar/private characters.
+    """
+
+    if not isinstance(value, str):
+        return None
+    if (
+        not value
+        or len(value) > max_chars
+        or value != value.strip()
+        or unicodedata.normalize("NFC", value) != value
+    ):
+        return None
+    for character in value:
+        category = unicodedata.category(character)
+        if category in {"Cc", "Cs", "Co", "Cn", "Zl", "Zp"}:
+            return None
+        if category == "Cf" and character not in {"\u200c", "\u200d"}:
+            return None
+    return value
 
 
 class ClaudeSDKSupervisorError(RuntimeError):
@@ -81,6 +112,18 @@ class ClaudeSDKConfigurationConflict(ClaudeSDKSupervisorError):
     safe_to_requeue = True
 
 
+class ClaudeSDKControlTimeout(ClaudeSDKSupervisorError):
+    """A bounded native control did not settle and its supervisor was retired."""
+
+
+class ClaudeSDKGenerationChanged(ClaudeSDKSupervisorError):
+    """A stale control request targeted a replaced SDK connection/profile."""
+
+
+class ClaudeSDKMCPServerNotFound(ClaudeSDKSupervisorError):
+    """The named MCP server is absent from the exact connected SDK profile."""
+
+
 @runtime_checkable
 class ClaudeSDKClientProtocol(Protocol):
     async def connect(self) -> None: ...
@@ -96,6 +139,12 @@ class ClaudeSDKClientProtocol(Protocol):
     async def interrupt(self) -> None: ...
 
     async def get_context_usage(self) -> dict[str, Any]: ...
+
+    async def get_mcp_status(self) -> dict[str, Any]: ...
+
+    async def reconnect_mcp_server(self, server_name: str) -> None: ...
+
+    async def toggle_mcp_server(self, server_name: str, enabled: bool) -> None: ...
 
     async def disconnect(self) -> None: ...
 
@@ -659,6 +708,21 @@ class _GetContextUsage:
 
 
 @dataclass
+class _GetMCPStatus:
+    response: asyncio.Future[tuple[dict[str, Any], str]]
+    cancelled: bool = False
+
+
+@dataclass
+class _MutateMCPServer:
+    action: str
+    server_name: str | None
+    expected_generation: str
+    response: asyncio.Future[tuple[dict[str, Any], str]]
+    cancelled: bool = False
+
+
+@dataclass
 class _Close:
     response: asyncio.Future[None]
 
@@ -696,6 +760,7 @@ class ClaudeSDKSupervisor:
         disconnect_timeout_seconds: float = 2.0,
         ack_timeout_seconds: float = 60.0,
         query_delivery_timeout_seconds: float = 10.0,
+        control_timeout_seconds: float = 15.0,
     ) -> None:
         clean_chat_id = str(chat_id or "").strip()
         if not clean_chat_id:
@@ -716,6 +781,9 @@ class ClaudeSDKSupervisor:
         if query_delivery_timeout_seconds <= 0:
             raise ValueError("query_delivery_timeout_seconds must be positive")
         self._query_delivery_timeout_seconds = float(query_delivery_timeout_seconds)
+        if control_timeout_seconds <= 0:
+            raise ValueError("control_timeout_seconds must be positive")
+        self._control_timeout_seconds = float(control_timeout_seconds)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._commands: asyncio.Queue[Any] | None = None
         self._actor_task: asyncio.Task[None] | None = None
@@ -779,6 +847,23 @@ class ClaudeSDKSupervisor:
     def last_used_at(self) -> float:
         return self._last_used_at
 
+    @property
+    def control_generation(self) -> str | None:
+        """Return an opaque revision bound to this supervisor and connection.
+
+        The SDK's integer generation restarts when a supervisor is replaced.
+        Hashing it with the random ownership token makes stale UI snapshots
+        unable to target a different process/profile that also happens to be
+        generation 1.
+        """
+
+        if not self._connected or self._generation < 1:
+            return None
+        digest = hashlib.sha256(
+            f"{self.ownership_token}:{self._generation}".encode()
+        ).hexdigest()[:24]
+        return f"claudemcp_{digest}"
+
     def snapshot(self) -> ClaudeSDKSupervisorSnapshot:
         return ClaudeSDKSupervisorSnapshot(
             chat_id=self.chat_id,
@@ -837,6 +922,50 @@ class ClaudeSDKSupervisor:
         assert self._commands is not None
         await self._commands.put(_GetContextUsage(response=response))
         return await asyncio.shield(response)
+
+    async def get_mcp_status(self) -> tuple[dict[str, Any], str]:
+        """Connect lazily and query MCP state on this chat-owned SDK actor."""
+
+        loop = self._ensure_actor()
+        response: asyncio.Future[tuple[dict[str, Any], str]] = loop.create_future()
+        command = _GetMCPStatus(response=response)
+        assert self._commands is not None
+        await self._commands.put(command)
+        try:
+            return await asyncio.shield(response)
+        except asyncio.CancelledError:
+            # The manager retires this exact supervisor before allowing a
+            # replacement. Marking the queued command also prevents a control
+            # that has not started yet from running after its HTTP caller left.
+            command.cancelled = True
+            response.cancel()
+            raise
+
+    async def mutate_mcp_server(
+        self,
+        *,
+        action: str,
+        server_name: str | None,
+        expected_generation: str,
+    ) -> tuple[dict[str, Any], str]:
+        """Run one generation-fenced MCP mutation on the owning SDK actor."""
+
+        loop = self._ensure_actor()
+        response: asyncio.Future[tuple[dict[str, Any], str]] = loop.create_future()
+        command = _MutateMCPServer(
+            action=str(action),
+            server_name=(str(server_name) if server_name is not None else None),
+            expected_generation=str(expected_generation),
+            response=response,
+        )
+        assert self._commands is not None
+        await self._commands.put(command)
+        try:
+            return await asyncio.shield(response)
+        except asyncio.CancelledError:
+            command.cancelled = True
+            response.cancel()
+            raise
 
     async def close(self) -> None:
         """Interrupt any active run and disconnect this chat's SDK process."""
@@ -1263,6 +1392,256 @@ class ClaudeSDKSupervisor:
         if not command.response.done():
             command.response.set_result(dict(value) if isinstance(value, dict) else None)
 
+    async def _mcp_control_bounded(
+        self,
+        operation: Awaitable[Any],
+        *,
+        label: str,
+        retire_on_timeout: bool,
+    ) -> Any:
+        """Bound one native SDK control without leaving it on the actor queue."""
+
+        task = asyncio.create_task(
+            operation,
+            name=f"claude-sdk-{label}:{self.chat_id}:{self._generation}",
+        )
+
+        def consume_result(completed: asyncio.Task[Any]) -> None:
+            if not completed.cancelled():
+                with suppress(BaseException):
+                    completed.exception()
+
+        try:
+            done, _pending = await asyncio.wait(
+                {task},
+                timeout=self._control_timeout_seconds,
+            )
+        except BaseException:
+            task.cancel()
+            task.add_done_callback(consume_result)
+            raise
+        if task in done:
+            return await task
+
+        await self._cancel_task_bounded(task)
+        if retire_on_timeout:
+            # A timed-out mutation has uncertain provider delivery. Close this
+            # actor before reporting failure so it can never be mistaken for a
+            # later replacement with the same chat/profile.
+            self._closed = True
+            await self._disconnect_current_client()
+            connecting = self._connecting_client
+            self._connecting_client = None
+            if connecting is not None:
+                await self._disconnect_client(connecting)
+        raise ClaudeSDKControlTimeout(
+            f"Claude SDK {label} timed out for chat {self.chat_id}"
+        )
+
+    @staticmethod
+    def _mcp_servers_from_status(value: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        if not isinstance(value, dict):
+            raise ClaudeSDKSupervisorError("Claude SDK returned invalid MCP status")
+        raw_servers = value.get("mcpServers")
+        if not isinstance(raw_servers, list):
+            raise ClaudeSDKSupervisorError("Claude SDK returned invalid MCP server list")
+        servers: list[dict[str, Any]] = []
+        scan_count = min(len(raw_servers), CLAUDE_SDK_MCP_STATUS_SCAN_LIMIT)
+        for index in range(scan_count):
+            item = raw_servers[index]
+            if isinstance(item, dict):
+                servers.append(item)
+        status = {
+            "mcpServers": servers,
+            CLAUDE_SDK_MCP_STATUS_TRUNCATED_KEY: bool(
+                value.get(CLAUDE_SDK_MCP_STATUS_TRUNCATED_KEY)
+                or len(raw_servers) > scan_count
+                or len(servers) < scan_count
+            ),
+        }
+        return status, servers
+
+    async def _read_mcp_status(self, client: ClaudeSDKClientProtocol) -> dict[str, Any]:
+        getter = getattr(client, "get_mcp_status", None)
+        if not callable(getter):
+            raise ClaudeSDKUnavailable(
+                "installed claude-agent-sdk does not support MCP status controls"
+            )
+        value = await getter()
+        status, _servers = self._mcp_servers_from_status(value)
+        return status
+
+    async def _mcp_status_operation(self) -> tuple[dict[str, Any], str]:
+        client = await self._ensure_client()
+        value = await self._read_mcp_status(client)
+        generation = self.control_generation
+        if generation is None:
+            raise ClaudeSDKSupervisorError(
+                f"Claude SDK client for {self.chat_id} changed during MCP status"
+            )
+        return value, generation
+
+    async def _handle_get_mcp_status(self, command: _GetMCPStatus) -> None:
+        if command.cancelled:
+            if not command.response.done():
+                command.response.cancel()
+            return
+        if self.is_active:
+            if not command.response.done():
+                command.response.set_exception(
+                    ClaudeSDKRunActive(
+                        f"Claude SDK chat {self.chat_id} has an active run"
+                    )
+                )
+            return
+        try:
+            value, generation = await self._mcp_control_bounded(
+                self._mcp_status_operation(),
+                label="mcp-status",
+                retire_on_timeout=True,
+            )
+        except (
+            ClaudeSDKUnavailable,
+            ClaudeSDKControlTimeout,
+            ClaudeSDKRunActive,
+        ) as exc:
+            if not command.response.done():
+                command.response.set_exception(exc)
+            return
+        except Exception as exc:
+            if not command.response.done():
+                command.response.set_exception(
+                    ClaudeSDKSupervisorError(
+                        f"Claude SDK MCP status failed for {self.chat_id}: {exc}"
+                    )
+                )
+            return
+        self._last_used_at = time.monotonic()
+        if not command.response.done():
+            command.response.set_result((value, generation))
+
+    async def _apply_mcp_mutation(
+        self,
+        client: ClaudeSDKClientProtocol,
+        *,
+        action: str,
+        server_name: str | None,
+    ) -> dict[str, Any]:
+        current = await self._read_mcp_status(client)
+        _value, servers = self._mcp_servers_from_status(current)
+        by_name: dict[str, dict[str, Any]] = {}
+        for item in servers:
+            name = canonical_claude_mcp_identifier(item.get("name"), 512)
+            if name is not None:
+                by_name.setdefault(name, item)
+        if action == "reconnect_all":
+            reconnect = getattr(client, "reconnect_mcp_server", None)
+            if not callable(reconnect):
+                raise ClaudeSDKUnavailable(
+                    "installed claude-agent-sdk does not support MCP reconnect"
+                )
+            for name, item in by_name.items():
+                if str(item.get("status") or "") not in {"failed", "needs-auth"}:
+                    continue
+                # Reconnect-all is deliberately best effort. One unavailable
+                # server must not prevent independent failed servers from
+                # receiving their serialized native retry.
+                with suppress(Exception):
+                    await reconnect(name)
+        else:
+            clean_name = str(server_name or "")
+            if clean_name not in by_name:
+                raise ClaudeSDKMCPServerNotFound(
+                    f"MCP server {clean_name!r} is not in the connected Claude profile"
+                )
+            if action == "reconnect":
+                reconnect = getattr(client, "reconnect_mcp_server", None)
+                if not callable(reconnect):
+                    raise ClaudeSDKUnavailable(
+                        "installed claude-agent-sdk does not support MCP reconnect"
+                    )
+                await reconnect(clean_name)
+            elif action in {"enable", "disable"}:
+                toggle = getattr(client, "toggle_mcp_server", None)
+                if not callable(toggle):
+                    raise ClaudeSDKUnavailable(
+                        "installed claude-agent-sdk does not support MCP enable/disable"
+                    )
+                await toggle(clean_name, enabled=action == "enable")
+            else:
+                raise ValueError(f"unsupported MCP action: {action}")
+        return await self._read_mcp_status(client)
+
+    async def _mcp_mutation_operation(
+        self,
+        *,
+        action: str,
+        server_name: str | None,
+        expected_generation: str,
+    ) -> tuple[dict[str, Any], str]:
+        client = await self._ensure_client()
+        generation = self.control_generation
+        if generation != expected_generation:
+            raise ClaudeSDKGenerationChanged(
+                f"Claude SDK MCP generation changed for chat {self.chat_id}"
+            )
+        value = await self._apply_mcp_mutation(
+            client,
+            action=action,
+            server_name=server_name,
+        )
+        if self.control_generation != generation:
+            raise ClaudeSDKGenerationChanged(
+                f"Claude SDK MCP generation changed for chat {self.chat_id}"
+            )
+        return value, generation
+
+    async def _handle_mutate_mcp_server(self, command: _MutateMCPServer) -> None:
+        if command.cancelled:
+            if not command.response.done():
+                command.response.cancel()
+            return
+        if self.is_active:
+            if not command.response.done():
+                command.response.set_exception(
+                    ClaudeSDKRunActive(
+                        f"Claude SDK chat {self.chat_id} has an active run"
+                    )
+                )
+            return
+        try:
+            value, generation = await self._mcp_control_bounded(
+                self._mcp_mutation_operation(
+                    action=command.action,
+                    server_name=command.server_name,
+                    expected_generation=command.expected_generation,
+                ),
+                label=f"mcp-{command.action}",
+                retire_on_timeout=True,
+            )
+        except (
+            ClaudeSDKControlTimeout,
+            ClaudeSDKGenerationChanged,
+            ClaudeSDKMCPServerNotFound,
+            ClaudeSDKRunActive,
+            ClaudeSDKUnavailable,
+            ValueError,
+        ) as exc:
+            if not command.response.done():
+                command.response.set_exception(exc)
+            return
+        except Exception as exc:
+            if not command.response.done():
+                command.response.set_exception(
+                    ClaudeSDKSupervisorError(
+                        f"Claude SDK MCP control failed for {self.chat_id}: {exc}"
+                    )
+                )
+            return
+        self._last_used_at = time.monotonic()
+        if not command.response.done():
+            command.response.set_result((value, generation))
+
     async def _handle_received(self, command: _ReceivedMessage) -> None:
         if command.generation != self._generation:
             return
@@ -1394,6 +1773,10 @@ class ClaudeSDKSupervisor:
                     await self._handle_interrupt(command)
                 elif isinstance(command, _GetContextUsage):
                     await self._handle_get_context_usage(command)
+                elif isinstance(command, _GetMCPStatus):
+                    await self._handle_get_mcp_status(command)
+                elif isinstance(command, _MutateMCPServer):
+                    await self._handle_mutate_mcp_server(command)
                 elif isinstance(command, _ReceivedMessage):
                     await self._handle_received(command)
                 elif isinstance(command, _AckTimeout):
@@ -1449,6 +1832,7 @@ class ClaudeSDKSupervisorManager:
         disconnect_timeout_seconds: float = 2.0,
         ack_timeout_seconds: float = 60.0,
         query_delivery_timeout_seconds: float = 10.0,
+        control_timeout_seconds: float = 15.0,
     ) -> None:
         if max_clients < 1:
             raise ValueError("max_clients must be positive")
@@ -1467,6 +1851,9 @@ class ClaudeSDKSupervisorManager:
         if query_delivery_timeout_seconds <= 0:
             raise ValueError("query_delivery_timeout_seconds must be positive")
         self._query_delivery_timeout_seconds = float(query_delivery_timeout_seconds)
+        if control_timeout_seconds <= 0:
+            raise ValueError("control_timeout_seconds must be positive")
+        self._control_timeout_seconds = float(control_timeout_seconds)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._lock: asyncio.Lock | None = None
         self._supervisors: OrderedDict[str, ClaudeSDKSupervisor] = OrderedDict()
@@ -1533,6 +1920,14 @@ class ClaudeSDKSupervisorManager:
     ) -> tuple[ClaudeSDKSupervisor, ClaudeSDKSupervisor | None]:
         old_to_close: ClaudeSDKSupervisor | None = None
         supervisor = self._supervisors.get(chat_id)
+        if supervisor is not None and supervisor.closed:
+            if self._pins.get(chat_id, 0):
+                raise ClaudeSDKSupervisorClosed(
+                    f"Claude SDK chat {chat_id} is retiring"
+                )
+            self._supervisors.pop(chat_id, None)
+            old_to_close = supervisor
+            supervisor = None
         if supervisor is not None and supervisor.configuration_key != configuration_key:
             if supervisor.is_active or self._pins.get(chat_id, 0):
                 raise ClaudeSDKConfigurationConflict(
@@ -1551,6 +1946,7 @@ class ClaudeSDKSupervisorManager:
                 disconnect_timeout_seconds=self._disconnect_timeout_seconds,
                 ack_timeout_seconds=self._ack_timeout_seconds,
                 query_delivery_timeout_seconds=self._query_delivery_timeout_seconds,
+                control_timeout_seconds=self._control_timeout_seconds,
             )
             self._supervisors[chat_id] = supervisor
         else:
@@ -1714,6 +2110,186 @@ class ClaudeSDKSupervisorManager:
                     self._pins[clean_chat_id] = count
                 else:
                     self._pins.pop(clean_chat_id, None)
+
+    async def _pin_mcp_supervisor(
+        self,
+        chat_id: str,
+        *,
+        options: Any,
+        configuration_key: str,
+    ) -> ClaudeSDKSupervisor:
+        """Return and pin the exact supervisor used by one MCP HTTP request."""
+
+        self._bind_loop()
+        assert self._lock is not None
+        clean_chat_id = str(chat_id or "").strip()
+        if not clean_chat_id:
+            raise ValueError("chat_id is required")
+        await self._wait_for_eviction(clean_chat_id)
+        async with self._lock:
+            supervisor, old_to_close = await self._get_locked(
+                clean_chat_id,
+                options=options,
+                configuration_key=str(configuration_key),
+            )
+            self._pins[clean_chat_id] = self._pins.get(clean_chat_id, 0) + 1
+        if old_to_close is not None:
+            try:
+                await old_to_close.close()
+            except BaseException:
+                await self._unpin_mcp_supervisor(clean_chat_id, supervisor)
+                raise
+        return supervisor
+
+    async def _unpin_mcp_supervisor(
+        self,
+        chat_id: str,
+        supervisor: ClaudeSDKSupervisor,
+    ) -> None:
+        assert self._lock is not None
+        clean_chat_id = str(chat_id)
+        async with self._lock:
+            if self._supervisors.get(clean_chat_id) is not supervisor:
+                # Exact-owner retirement already removed this pin. Never let
+                # an old request decrement a replacement owner's count.
+                return
+            count = self._pins.get(clean_chat_id, 0) - 1
+            if count > 0:
+                self._pins[clean_chat_id] = count
+            else:
+                self._pins.pop(clean_chat_id, None)
+            self._supervisors.move_to_end(clean_chat_id)
+
+    async def _retire_exact_mcp_supervisor(
+        self,
+        chat_id: str,
+        supervisor: ClaudeSDKSupervisor,
+    ) -> None:
+        """Remove and abort only the owner involved in a failed MCP request."""
+
+        assert self._lock is not None
+        clean_chat_id = str(chat_id)
+        async with self._lock:
+            if self._supervisors.get(clean_chat_id) is not supervisor:
+                return
+            self._supervisors.pop(clean_chat_id, None)
+            self._pins.pop(clean_chat_id, None)
+            close_task = asyncio.create_task(
+                supervisor.abort(),
+                name=f"claude-sdk-mcp-retire:{clean_chat_id}",
+            )
+            self._evicting[clean_chat_id] = close_task
+        try:
+            await asyncio.shield(close_task)
+        finally:
+            if close_task.done():
+                async with self._lock:
+                    if self._evicting.get(clean_chat_id) is close_task:
+                        self._evicting.pop(clean_chat_id, None)
+
+    async def get_mcp_status(
+        self,
+        chat_id: str,
+        *,
+        options: Any,
+        configuration_key: str,
+    ) -> tuple[dict[str, Any], str]:
+        """Query MCP state through an exact, pinned chat/profile owner."""
+
+        clean_chat_id = str(chat_id)
+        supervisor = await self._pin_mcp_supervisor(
+            clean_chat_id,
+            options=options,
+            configuration_key=configuration_key,
+        )
+        retire = False
+        try:
+            if supervisor.is_active:
+                raise ClaudeSDKRunActive(
+                    f"Claude SDK chat {clean_chat_id} has an active run"
+                )
+            try:
+                status, generation = await supervisor.get_mcp_status()
+            except ClaudeSDKControlTimeout:
+                retire = True
+                raise
+            except asyncio.CancelledError:
+                retire = True
+                raise
+            assert self._lock is not None
+            async with self._lock:
+                if (
+                    self._supervisors.get(clean_chat_id) is not supervisor
+                    or supervisor.closed
+                    or supervisor.control_generation != generation
+                ):
+                    raise ClaudeSDKGenerationChanged(
+                        f"Claude SDK MCP generation changed for chat {clean_chat_id}"
+                    )
+                self._supervisors.move_to_end(clean_chat_id)
+            return dict(status), str(generation)
+        finally:
+            if retire:
+                await self._retire_exact_mcp_supervisor(
+                    clean_chat_id,
+                    supervisor,
+                )
+            await self._unpin_mcp_supervisor(clean_chat_id, supervisor)
+
+    async def mutate_mcp_server(
+        self,
+        chat_id: str,
+        *,
+        action: str,
+        server_name: str | None,
+        expected_generation: str,
+        options: Any,
+        configuration_key: str,
+    ) -> tuple[dict[str, Any], str]:
+        """Apply one exact-generation MCP mutation and return refreshed state."""
+
+        clean_chat_id = str(chat_id)
+        supervisor = await self._pin_mcp_supervisor(
+            clean_chat_id,
+            options=options,
+            configuration_key=configuration_key,
+        )
+        retire = False
+        try:
+            if supervisor.is_active:
+                raise ClaudeSDKRunActive(
+                    f"Claude SDK chat {clean_chat_id} has an active run"
+                )
+            try:
+                status, generation = await supervisor.mutate_mcp_server(
+                    action=action,
+                    server_name=server_name,
+                    expected_generation=expected_generation,
+                )
+            except (ClaudeSDKControlTimeout, asyncio.CancelledError):
+                # Mutation delivery is uncertain at this boundary. Remove the
+                # exact owner before a replacement can be created.
+                retire = True
+                raise
+            assert self._lock is not None
+            async with self._lock:
+                if (
+                    self._supervisors.get(clean_chat_id) is not supervisor
+                    or supervisor.closed
+                    or supervisor.control_generation != generation
+                ):
+                    raise ClaudeSDKGenerationChanged(
+                        f"Claude SDK MCP generation changed for chat {clean_chat_id}"
+                    )
+                self._supervisors.move_to_end(clean_chat_id)
+            return dict(status), str(generation)
+        finally:
+            if retire:
+                await self._retire_exact_mcp_supervisor(
+                    clean_chat_id,
+                    supervisor,
+                )
+            await self._unpin_mcp_supervisor(clean_chat_id, supervisor)
 
     def is_loaded(self, chat_id: str) -> bool:
         """Return whether this manager currently owns a connected SDK client."""

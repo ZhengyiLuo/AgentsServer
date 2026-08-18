@@ -507,6 +507,28 @@ Idle SDK clients are retained for at most five minutes by default, with up to
 four chat processes loaded. Active chats are never evicted to enforce the idle
 limit.
 
+Claude-controls capability v3 adds authenticated MCP management without
+changing global API contract v13. Clients gate on
+`capabilities.claude_controls.features.mcp_management` and use the additive
+v1 endpoints:
+
+```text
+GET  /api/sessions/{session_id}/claude/mcp
+POST /api/sessions/{session_id}/claude/mcp
+```
+
+GET lazily connects an idle chat's Agent SDK client and returns an opaque
+generation string plus at most 100 exact-name-deduplicated, sorted, allowlisted
+server rows; `truncated` marks an incomplete list. POST requires that exact
+generation and supports `reconnect`, `reconnect_all`, `enable`, and `disable`.
+Both operations reject active/provider-starting turns, are lifecycle-serialized
+with managed-update admission, and have a bounded native-control timeout.
+Responses never expose MCP commands, environment, headers, configuration URLs,
+raw provider errors, or tool metadata. Print transport and SDK-unavailable
+hosts return an explicit unavailable snapshot; older servers continue to
+return 404. Tune the default 15-second bound with
+`AGENTSDOCK_CLAUDE_MCP_CONTROL_TIMEOUT_SECONDS`.
+
 ## Backend CLI Notes
 
 The backend selection in AgentsDock only chooses which CLI the server invokes.

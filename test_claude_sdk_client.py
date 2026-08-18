@@ -1,11 +1,18 @@
 import asyncio
+import gc
 import unittest
 from collections.abc import AsyncIterable, AsyncIterator
+from importlib.metadata import version
 from typing import Any
 
 from claude_sdk_client import (
+    CLAUDE_SDK_MCP_STATUS_SCAN_LIMIT,
+    CLAUDE_SDK_MCP_STATUS_TRUNCATED_KEY,
     ClaudeSDKConfigurationConflict,
+    ClaudeSDKControlTimeout,
+    ClaudeSDKGenerationChanged,
     ClaudeSDKLoopError,
+    ClaudeSDKMCPServerNotFound,
     ClaudeSDKQueryError,
     ClaudeSDKRunActive,
     ClaudeSDKSupervisorClosed,
@@ -45,6 +52,17 @@ class FakeClaudeClient:
             "percentage": 6.86,
             "model": "claude-sonnet-4-5",
         }
+        self.mcp_servers: list[dict[str, Any]] = [
+            {
+                "name": "calendar",
+                "status": "connected",
+                "scope": "user",
+                "tools": [{"name": "events"}],
+            },
+            {"name": "dayone", "status": "failed", "error": "private"},
+            {"name": "login", "status": "needs-auth"},
+            {"name": "disabled", "status": "disabled"},
+        ]
 
     def _record(self, *call: Any) -> None:
         loop = asyncio.get_running_loop()
@@ -92,6 +110,22 @@ class FakeClaudeClient:
         self._record("get_context_usage")
         return dict(self.context_usage)
 
+    async def get_mcp_status(self) -> dict[str, Any]:
+        self._record("get_mcp_status")
+        return {"mcpServers": [dict(item) for item in self.mcp_servers]}
+
+    async def reconnect_mcp_server(self, server_name: str) -> None:
+        self._record("reconnect_mcp_server", server_name)
+        for server in self.mcp_servers:
+            if server.get("name") == server_name:
+                server["status"] = "connected"
+
+    async def toggle_mcp_server(self, server_name: str, enabled: bool) -> None:
+        self._record("toggle_mcp_server", server_name, enabled)
+        for server in self.mcp_servers:
+            if server.get("name") == server_name:
+                server["status"] = "connected" if enabled else "disabled"
+
     async def disconnect(self) -> None:
         self._record("disconnect")
         self.disconnected = True
@@ -117,6 +151,50 @@ class FakeFactory:
             auto_ack=self.auto_ack,
             query_prefix_messages=self.query_prefix_messages,
         )
+        self.clients.append(client)
+        return client
+
+
+class GuardedMCPServerList(list[dict[str, Any]]):
+    """Raise if a status consumer touches the first row past the scan bound."""
+
+    def __init__(self) -> None:
+        super().__init__([
+            {"name": f"server-{index:03d}", "status": "failed"}
+            for index in range(CLAUDE_SDK_MCP_STATUS_SCAN_LIMIT)
+        ] + [{"name": "beyond-limit", "status": "failed"}])
+        self.beyond_limit_accesses = 0
+
+    def __getitem__(self, index: Any) -> Any:
+        if isinstance(index, int) and index >= CLAUDE_SDK_MCP_STATUS_SCAN_LIMIT:
+            self.beyond_limit_accesses += 1
+            raise AssertionError("MCP status scan crossed its bound")
+        return super().__getitem__(index)
+
+    def __iter__(self):
+        for index in range(len(self)):
+            yield self[index]
+
+
+class GuardedMCPStatusClient(FakeClaudeClient):
+    def __init__(self, options: Any) -> None:
+        super().__init__(options)
+        self.guarded_servers = GuardedMCPServerList()
+
+    async def get_mcp_status(self) -> dict[str, Any]:
+        self._record("get_mcp_status")
+        return {
+            "mcpServers": self.guarded_servers,
+            "providerSecret": "must not survive the actor projection",
+        }
+
+
+class GuardedMCPFactory:
+    def __init__(self) -> None:
+        self.clients: list[GuardedMCPStatusClient] = []
+
+    def __call__(self, options: Any) -> GuardedMCPStatusClient:
+        client = GuardedMCPStatusClient(options)
         self.clients.append(client)
         return client
 
@@ -239,6 +317,109 @@ class HostileThenNormalFactory:
             client = FakeClaudeClient(options)
         else:
             client = CancellationHostileReceiverClient(options)
+        self.clients.append(client)
+        return client
+
+
+class BlockingMCPStatusClient(FakeClaudeClient):
+    def __init__(self, options: Any) -> None:
+        super().__init__(options)
+        self.status_started = asyncio.Event()
+        self.release_status = asyncio.Event()
+
+    async def get_mcp_status(self) -> dict[str, Any]:
+        self._record("get_mcp_status")
+        self.status_started.set()
+        await self.release_status.wait()
+        return {"mcpServers": [dict(item) for item in self.mcp_servers]}
+
+
+class BlockingMCPFactory:
+    def __init__(self) -> None:
+        self.clients: list[BlockingMCPStatusClient] = []
+
+    def __call__(self, options: Any) -> BlockingMCPStatusClient:
+        client = BlockingMCPStatusClient(options)
+        self.clients.append(client)
+        return client
+
+
+class CancellationHostileMCPStatusClient(FakeClaudeClient):
+    def __init__(self, options: Any) -> None:
+        super().__init__(options)
+        self.status_started = asyncio.Event()
+        self.release_status = asyncio.Event()
+        self.late_completions = 0
+
+    async def get_mcp_status(self) -> dict[str, Any]:
+        self._record("get_mcp_status")
+        self.status_started.set()
+        while not self.release_status.is_set():
+            try:
+                await self.release_status.wait()
+            except asyncio.CancelledError:
+                continue
+        self.late_completions += 1
+        return {"mcpServers": [dict(item) for item in self.mcp_servers]}
+
+
+class HostileMCPThenNormalFactory:
+    def __init__(self) -> None:
+        self.clients: list[FakeClaudeClient] = []
+
+    def __call__(self, options: Any) -> FakeClaudeClient:
+        client: FakeClaudeClient
+        if self.clients:
+            client = FakeClaudeClient(options)
+        else:
+            client = CancellationHostileMCPStatusClient(options)
+        self.clients.append(client)
+        return client
+
+
+class CancellationHostileMCPToggleClient(FakeClaudeClient):
+    def __init__(self, options: Any) -> None:
+        super().__init__(options)
+        self.toggle_started = asyncio.Event()
+        self.release_toggle = asyncio.Event()
+        self.late_completions = 0
+
+    async def toggle_mcp_server(self, server_name: str, enabled: bool) -> None:
+        self._record("toggle_mcp_server", server_name, enabled)
+        self.toggle_started.set()
+        while not self.release_toggle.is_set():
+            try:
+                await self.release_toggle.wait()
+            except asyncio.CancelledError:
+                continue
+        self.late_completions += 1
+        await super().toggle_mcp_server(server_name, enabled)
+
+
+class HostileToggleThenNormalFactory:
+    def __init__(self) -> None:
+        self.clients: list[FakeClaudeClient] = []
+
+    def __call__(self, options: Any) -> FakeClaudeClient:
+        client: FakeClaudeClient
+        if self.clients:
+            client = FakeClaudeClient(options)
+        else:
+            client = CancellationHostileMCPToggleClient(options)
+        self.clients.append(client)
+        return client
+
+
+class HostileToggleThenBlockingFactory:
+    def __init__(self) -> None:
+        self.clients: list[FakeClaudeClient] = []
+
+    def __call__(self, options: Any) -> FakeClaudeClient:
+        client: FakeClaudeClient
+        if self.clients:
+            client = BlockingMCPStatusClient(options)
+        else:
+            client = CancellationHostileMCPToggleClient(options)
         self.clients.append(client)
         return client
 
@@ -1396,6 +1577,525 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(hook_called.is_set())
         self.assertFalse(any(call[0] == "query" for call in client.calls))
         await manager.close_all()
+
+
+class ClaudeSDKMCPControlTests(unittest.IsolatedAsyncioTestCase):
+    def test_pinned_sdk_exposes_native_mcp_controls(self) -> None:
+        from claude_agent_sdk import ClaudeSDKClient
+
+        self.assertEqual(version("claude-agent-sdk"), "0.2.130")
+        for method in (
+            "get_mcp_status",
+            "reconnect_mcp_server",
+            "toggle_mcp_server",
+        ):
+            self.assertTrue(callable(getattr(ClaudeSDKClient, method, None)))
+
+    async def test_status_is_lazy_and_mutations_return_same_opaque_generation(self) -> None:
+        factory = FakeFactory()
+        manager = ClaudeSDKSupervisorManager(
+            client_factory=factory,
+            idle_ttl_seconds=None,
+        )
+        try:
+            status, generation = await manager.get_mcp_status(
+                "mcp-chat",
+                options={"cwd": "/tmp"},
+                configuration_key="profile-a",
+            )
+
+            self.assertTrue(generation.startswith("claudemcp_"))
+            self.assertEqual(len(generation), 34)
+            self.assertEqual(status["mcpServers"][0]["name"], "calendar")
+            client = factory.clients[0]
+            self.assertEqual(client.calls[0], ("connect",))
+            self.assertIn(("receive_messages",), client.calls)
+            self.assertIn(("get_mcp_status",), client.calls)
+
+            updated, settled_generation = await manager.mutate_mcp_server(
+                "mcp-chat",
+                action="disable",
+                server_name="calendar",
+                expected_generation=generation,
+                options={"cwd": "/tmp"},
+                configuration_key="profile-a",
+            )
+
+            self.assertEqual(settled_generation, generation)
+            self.assertEqual(updated["mcpServers"][0]["status"], "disabled")
+            self.assertIn(("toggle_mcp_server", "calendar", False), client.calls)
+        finally:
+            await manager.close_all()
+
+    async def test_stale_generation_and_unknown_server_never_mutate(self) -> None:
+        factory = FakeFactory()
+        manager = ClaudeSDKSupervisorManager(
+            client_factory=factory,
+            idle_ttl_seconds=None,
+        )
+        try:
+            _status, generation = await manager.get_mcp_status(
+                "mcp-chat",
+                options={},
+                configuration_key="profile-a",
+            )
+            client = factory.clients[0]
+
+            with self.assertRaises(ClaudeSDKGenerationChanged):
+                await manager.mutate_mcp_server(
+                    "mcp-chat",
+                    action="disable",
+                    server_name="calendar",
+                    expected_generation="claudemcp_stale",
+                    options={},
+                    configuration_key="profile-a",
+                )
+            with self.assertRaises(ClaudeSDKMCPServerNotFound):
+                await manager.mutate_mcp_server(
+                    "mcp-chat",
+                    action="reconnect",
+                    server_name="missing",
+                    expected_generation=generation,
+                    options={},
+                    configuration_key="profile-a",
+                )
+
+            self.assertNotIn(
+                ("toggle_mcp_server", "calendar", False),
+                client.calls,
+            )
+            self.assertNotIn(
+                ("reconnect_mcp_server", "missing"),
+                client.calls,
+            )
+        finally:
+            await manager.close_all()
+
+    async def test_noncanonical_provider_name_cannot_alias_control_name(self) -> None:
+        factory = FakeFactory()
+        manager = ClaudeSDKSupervisorManager(
+            client_factory=factory,
+            idle_ttl_seconds=None,
+        )
+        try:
+            _status, generation = await manager.get_mcp_status(
+                "mcp-chat",
+                options={},
+                configuration_key="profile-a",
+            )
+            client = factory.clients[0]
+            client.mcp_servers = [
+                {"name": " calendar ", "status": "connected"},
+                {"name": "spoof\u202e", "status": "failed"},
+            ]
+
+            for server_name in ("calendar", "spoof\u202e"):
+                with self.subTest(server_name=server_name):
+                    with self.assertRaises(ClaudeSDKMCPServerNotFound):
+                        await manager.mutate_mcp_server(
+                            "mcp-chat",
+                            action="disable",
+                            server_name=server_name,
+                            expected_generation=generation,
+                            options={},
+                            configuration_key="profile-a",
+                        )
+
+            self.assertFalse(any(
+                call[0] == "toggle_mcp_server" for call in client.calls
+            ))
+        finally:
+            await manager.close_all()
+
+    async def test_actor_bounds_status_scan_and_never_controls_past_limit(self) -> None:
+        factory = GuardedMCPFactory()
+        manager = ClaudeSDKSupervisorManager(
+            client_factory=factory,
+            idle_ttl_seconds=None,
+        )
+        try:
+            status, generation = await manager.get_mcp_status(
+                "mcp-chat",
+                options={},
+                configuration_key="profile-a",
+            )
+            client = factory.clients[0]
+
+            self.assertEqual(
+                len(status["mcpServers"]),
+                CLAUDE_SDK_MCP_STATUS_SCAN_LIMIT,
+            )
+            self.assertTrue(status[CLAUDE_SDK_MCP_STATUS_TRUNCATED_KEY])
+            self.assertNotIn("providerSecret", status)
+            self.assertEqual(client.guarded_servers.beyond_limit_accesses, 0)
+
+            with self.assertRaises(ClaudeSDKMCPServerNotFound):
+                await manager.mutate_mcp_server(
+                    "mcp-chat",
+                    action="disable",
+                    server_name="beyond-limit",
+                    expected_generation=generation,
+                    options={},
+                    configuration_key="profile-a",
+                )
+            self.assertEqual(client.guarded_servers.beyond_limit_accesses, 0)
+            self.assertNotIn(
+                ("toggle_mcp_server", "beyond-limit", False),
+                client.calls,
+            )
+        finally:
+            await manager.close_all()
+
+    async def test_reconnect_all_is_serial_and_respects_disabled_servers(self) -> None:
+        factory = FakeFactory()
+        manager = ClaudeSDKSupervisorManager(
+            client_factory=factory,
+            idle_ttl_seconds=None,
+        )
+        try:
+            _status, generation = await manager.get_mcp_status(
+                "mcp-chat",
+                options={},
+                configuration_key="profile-a",
+            )
+            updated, _generation = await manager.mutate_mcp_server(
+                "mcp-chat",
+                action="reconnect_all",
+                server_name=None,
+                expected_generation=generation,
+                options={},
+                configuration_key="profile-a",
+            )
+
+            client = factory.clients[0]
+            reconnects = [call for call in client.calls if call[0] == "reconnect_mcp_server"]
+            self.assertEqual(reconnects, [
+                ("reconnect_mcp_server", "dayone"),
+                ("reconnect_mcp_server", "login"),
+            ])
+            statuses = {
+                item["name"]: item["status"]
+                for item in updated["mcpServers"]
+            }
+            self.assertEqual(statuses["dayone"], "connected")
+            self.assertEqual(statuses["login"], "connected")
+            self.assertEqual(statuses["disabled"], "disabled")
+        finally:
+            await manager.close_all()
+
+    async def test_status_and_mutation_fail_closed_during_active_run(self) -> None:
+        factory = FakeFactory()
+        manager = ClaudeSDKSupervisorManager(
+            client_factory=factory,
+            idle_ttl_seconds=None,
+        )
+        try:
+            handle = await manager.start_run(
+                "mcp-chat",
+                "keep working",
+                run_id="run-active",
+                options={},
+                configuration_key="profile-a",
+            )
+            with self.assertRaises(ClaudeSDKRunActive):
+                await manager.get_mcp_status(
+                    "mcp-chat",
+                    options={},
+                    configuration_key="profile-a",
+                )
+            with self.assertRaises(ClaudeSDKRunActive):
+                await manager.mutate_mcp_server(
+                    "mcp-chat",
+                    action="reconnect_all",
+                    server_name=None,
+                    expected_generation="claudemcp_stale",
+                    options={},
+                    configuration_key="profile-a",
+                )
+            self.assertFalse(any(call[0] == "get_mcp_status" for call in factory.clients[0].calls))
+            await factory.clients[0].emit({"type": "result", "result": "done"})
+            await handle.wait_result()
+        finally:
+            await manager.close_all()
+
+    async def test_mcp_status_pin_blocks_idle_eviction(self) -> None:
+        factory = BlockingMCPFactory()
+        manager = ClaudeSDKSupervisorManager(
+            client_factory=factory,
+            idle_ttl_seconds=None,
+            control_timeout_seconds=1,
+        )
+        try:
+            status_task = asyncio.create_task(manager.get_mcp_status(
+                "mcp-chat",
+                options={},
+                configuration_key="profile-a",
+            ))
+            while not factory.clients:
+                await asyncio.sleep(0)
+            client = factory.clients[0]
+            await asyncio.wait_for(client.status_started.wait(), 1)
+
+            self.assertFalse(await manager.evict("mcp-chat", force=False))
+            client.release_status.set()
+            status, generation = await asyncio.wait_for(status_task, 1)
+            self.assertTrue(status["mcpServers"])
+            self.assertTrue(generation.startswith("claudemcp_"))
+        finally:
+            await manager.close_all()
+
+    async def test_replacement_never_reuses_opaque_generation(self) -> None:
+        factory = FakeFactory()
+        manager = ClaudeSDKSupervisorManager(
+            client_factory=factory,
+            idle_ttl_seconds=None,
+        )
+        try:
+            _status, first_generation = await manager.get_mcp_status(
+                "mcp-chat",
+                options={},
+                configuration_key="profile-a",
+            )
+            self.assertTrue(await manager.evict("mcp-chat"))
+            _status, second_generation = await manager.get_mcp_status(
+                "mcp-chat",
+                options={},
+                configuration_key="profile-a",
+            )
+
+            self.assertNotEqual(first_generation, second_generation)
+            with self.assertRaises(ClaudeSDKGenerationChanged):
+                await manager.mutate_mcp_server(
+                    "mcp-chat",
+                    action="disable",
+                    server_name="calendar",
+                    expected_generation=first_generation,
+                    options={},
+                    configuration_key="profile-a",
+                )
+        finally:
+            await manager.close_all()
+
+    async def test_closed_registry_owner_is_replaced_before_next_status(self) -> None:
+        factory = FakeFactory()
+        manager = ClaudeSDKSupervisorManager(
+            client_factory=factory,
+            idle_ttl_seconds=None,
+        )
+        try:
+            _status, first_generation = await manager.get_mcp_status(
+                "mcp-chat",
+                options={},
+                configuration_key="profile-a",
+            )
+            first = manager._supervisors["mcp-chat"]
+            await first.close()
+
+            status, second_generation = await manager.get_mcp_status(
+                "mcp-chat",
+                options={},
+                configuration_key="profile-a",
+            )
+
+            self.assertIsNot(manager._supervisors["mcp-chat"], first)
+            self.assertNotEqual(first_generation, second_generation)
+            self.assertEqual(status["mcpServers"][0]["name"], "calendar")
+            self.assertEqual(len(factory.clients), 2)
+        finally:
+            await manager.close_all()
+
+    async def test_timed_out_mutation_retires_exact_owner_before_replacement(self) -> None:
+        factory = HostileToggleThenNormalFactory()
+        manager = ClaudeSDKSupervisorManager(
+            client_factory=factory,
+            idle_ttl_seconds=None,
+            disconnect_timeout_seconds=0.01,
+            control_timeout_seconds=0.01,
+        )
+        try:
+            _status, first_generation = await manager.get_mcp_status(
+                "mcp-chat",
+                options={},
+                configuration_key="profile-a",
+            )
+            first = factory.clients[0]
+            assert isinstance(first, CancellationHostileMCPToggleClient)
+
+            with self.assertRaises(ClaudeSDKControlTimeout):
+                await manager.mutate_mcp_server(
+                    "mcp-chat",
+                    action="disable",
+                    server_name="calendar",
+                    expected_generation=first_generation,
+                    options={},
+                    configuration_key="profile-a",
+                )
+            self.assertFalse(manager.snapshots())
+
+            status, second_generation = await manager.get_mcp_status(
+                "mcp-chat",
+                options={},
+                configuration_key="profile-a",
+            )
+            second = factory.clients[1]
+            self.assertNotEqual(first_generation, second_generation)
+            self.assertEqual(status["mcpServers"][0]["status"], "connected")
+
+            first.release_toggle.set()
+            await asyncio.sleep(0.02)
+            self.assertEqual(first.late_completions, 1)
+            self.assertEqual(second.mcp_servers[0]["status"], "connected")
+        finally:
+            for client in factory.clients:
+                if isinstance(client, CancellationHostileMCPToggleClient):
+                    client.release_toggle.set()
+            await manager.close_all()
+
+    async def test_old_timeout_unpin_cannot_remove_replacement_pin(self) -> None:
+        factory = HostileToggleThenBlockingFactory()
+        manager = ClaudeSDKSupervisorManager(
+            client_factory=factory,
+            idle_ttl_seconds=None,
+            disconnect_timeout_seconds=0.01,
+            control_timeout_seconds=0.01,
+        )
+        old_unpin_entered = asyncio.Event()
+        allow_old_unpin = asyncio.Event()
+        mutation: asyncio.Task[Any] | None = None
+        replacement: asyncio.Task[Any] | None = None
+        try:
+            _status, first_generation = await manager.get_mcp_status(
+                "mcp-chat",
+                options={},
+                configuration_key="profile-a",
+            )
+            old_supervisor = manager._supervisors["mcp-chat"]
+            original_unpin = manager._unpin_mcp_supervisor
+            pause_old_unpin = True
+
+            async def gated_unpin(chat_id: str, supervisor: Any) -> None:
+                if pause_old_unpin and supervisor is old_supervisor:
+                    old_unpin_entered.set()
+                    await allow_old_unpin.wait()
+                await original_unpin(chat_id, supervisor)
+
+            manager._unpin_mcp_supervisor = gated_unpin  # type: ignore[method-assign]
+            mutation = asyncio.create_task(manager.mutate_mcp_server(
+                "mcp-chat",
+                action="disable",
+                server_name="calendar",
+                expected_generation=first_generation,
+                options={},
+                configuration_key="profile-a",
+            ))
+            await asyncio.wait_for(old_unpin_entered.wait(), 1)
+
+            replacement = asyncio.create_task(manager.get_mcp_status(
+                "mcp-chat",
+                options={},
+                configuration_key="profile-a",
+            ))
+            while len(factory.clients) < 2:
+                await asyncio.sleep(0)
+            second = factory.clients[1]
+            assert isinstance(second, BlockingMCPStatusClient)
+            await asyncio.wait_for(second.status_started.wait(), 1)
+            self.assertEqual(manager._pins.get("mcp-chat"), 1)
+
+            allow_old_unpin.set()
+            with self.assertRaises(ClaudeSDKControlTimeout):
+                await mutation
+            self.assertEqual(manager._pins.get("mcp-chat"), 1)
+            self.assertFalse(await manager.evict("mcp-chat", force=False))
+
+            second.release_status.set()
+            await asyncio.wait_for(replacement, 1)
+        finally:
+            allow_old_unpin.set()
+            for client in factory.clients:
+                if isinstance(client, CancellationHostileMCPToggleClient):
+                    client.release_toggle.set()
+                if isinstance(client, BlockingMCPStatusClient):
+                    client.release_status.set()
+            for task in (mutation, replacement):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (mutation, replacement) if task is not None),
+                return_exceptions=True,
+            )
+            await manager.close_all()
+
+    async def test_cancelled_status_settles_response_without_future_warning(self) -> None:
+        factory = BlockingMCPFactory()
+        manager = ClaudeSDKSupervisorManager(
+            client_factory=factory,
+            idle_ttl_seconds=None,
+            disconnect_timeout_seconds=0.05,
+            control_timeout_seconds=1,
+        )
+        loop = asyncio.get_running_loop()
+        contexts: list[dict[str, Any]] = []
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+        try:
+            status_task = asyncio.create_task(manager.get_mcp_status(
+                "mcp-chat",
+                options={},
+                configuration_key="profile-a",
+            ))
+            while not factory.clients:
+                await asyncio.sleep(0)
+            client = factory.clients[0]
+            await asyncio.wait_for(client.status_started.wait(), 1)
+
+            status_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await status_task
+            gc.collect()
+            await asyncio.sleep(0)
+
+            self.assertFalse(manager.snapshots())
+            self.assertFalse([
+                task
+                for task in asyncio.all_tasks()
+                if task is not asyncio.current_task()
+                and not task.done()
+                and "claude-sdk-mcp-status:mcp-chat" in task.get_name()
+            ])
+            self.assertFalse([
+                context
+                for context in contexts
+                if "Future exception was never retrieved"
+                in str(context.get("message") or "")
+            ])
+        finally:
+            for client in factory.clients:
+                client.release_status.set()
+            loop.set_exception_handler(previous_handler)
+            await manager.close_all()
+
+    async def test_lazy_connect_is_covered_by_control_timeout(self) -> None:
+        factory = HostileConnectFactory()
+        manager = ClaudeSDKSupervisorManager(
+            client_factory=factory,
+            idle_ttl_seconds=None,
+            disconnect_timeout_seconds=0.01,
+            control_timeout_seconds=0.01,
+        )
+        try:
+            with self.assertRaises(ClaudeSDKControlTimeout):
+                await manager.get_mcp_status(
+                    "mcp-chat",
+                    options={},
+                    configuration_key="profile-a",
+                )
+            self.assertFalse(manager.snapshots())
+        finally:
+            for client in factory.clients:
+                client.release_connect.set()
+            await asyncio.sleep(0)
+            await manager.close_all()
 
 
 class ClaudeSDKLoopOwnershipTests(unittest.TestCase):

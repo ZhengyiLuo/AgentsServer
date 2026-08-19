@@ -100,30 +100,98 @@ def post_json(
     return result
 
 
+def get_json(path: str, capability: str) -> dict[str, Any]:
+    server_url = environment()
+    request = urllib.request.Request(
+        f"{server_url}{path}",
+        headers={
+            "Accept": "application/json",
+            "X-AgentsDock-Cross-Chat-Capability": capability,
+            "X-AgentsDock-Provider-Capability": capability,
+        },
+        method="GET",
+    )
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        NoRedirectHandler(),
+    )
+    try:
+        with opener.open(request, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            detail = json.loads(raw).get("detail") or raw
+        except json.JSONDecodeError:
+            detail = raw
+        raise ChatsCLIError(
+            f"server rejected route listing ({exc.code}): {detail or exc.reason}"
+        ) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise ChatsCLIError(
+            f"could not reach AgentsServer: {getattr(exc, 'reason', exc)}"
+        ) from exc
+    if not isinstance(result, dict):
+        raise ChatsCLIError("AgentsServer returned an invalid response")
+    return result
+
+
+def list_routes(args: argparse.Namespace) -> dict[str, Any]:
+    capability = authority(args.authority_file)
+    result = get_json("/api/agent/cross-chat/routes", capability)
+    routes = result.get("routes")
+    if not isinstance(routes, list) or any(
+        not isinstance(route, dict) for route in routes
+    ):
+        raise ChatsCLIError("AgentsServer returned an invalid route list")
+    return result
+
+
 def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
     capability = authority(args.authority_file)
     message = str(args.message or "").strip()
     if not message:
         raise ChatsCLIError("--message must not be empty")
+    route = str(getattr(args, "route", None) or "")
+    target = str(getattr(args, "target", None) or "")
+    if bool(route) == bool(target):
+        raise ChatsCLIError("provide exactly one of --route or --target")
+    destination = route if route else target
     stable_key = "cli_" + hashlib.sha256(
-        f"{capability}\0{action}\0{args.target}\0{message}".encode("utf-8")
+        (
+            f"{capability}\0{action}\0"
+            f"{'route' if route else 'target'}\0{destination}\0{message}"
+        ).encode("utf-8")
     ).hexdigest()
-    result = post_json(
-        "/api/agent/cross-chat/handoffs",
-        {
-            "target_session_id": args.target,
-            "action": action,
-            "body": message,
-            "idempotency_key": args.idempotency_key or stable_key,
-            "artifact_grants": [],
-        },
-        capability,
-    )
-    expected = "exchange" if action == "request_reply" else "handoff"
-    if not isinstance(result.get(expected), dict):
-        raise ChatsCLIError(f"AgentsServer returned an invalid {expected} response")
-    if action == "request_reply" and not isinstance(result.get("leg"), dict):
-        raise ChatsCLIError("AgentsServer returned an invalid exchange leg response")
+    payload: dict[str, Any] = {
+        "action": action,
+        "body": message,
+        "idempotency_key": args.idempotency_key or stable_key,
+        "artifact_grants": [],
+    }
+    if route:
+        path = (
+            "/api/agent/cross-chat/routes/"
+            f"{urllib.parse.quote(route, safe='')}/handoffs"
+        )
+    else:
+        path = "/api/agent/cross-chat/handoffs"
+        payload["target_session_id"] = target
+    result = post_json(path, payload, capability)
+    if route:
+        if (
+            result.get("ok") is not True
+            or result.get("route_id") != route
+            or result.get("action") != action
+            or result.get("accepted") is not True
+        ):
+            raise ChatsCLIError("AgentsServer returned an invalid route handoff response")
+    else:
+        expected = "exchange" if action == "request_reply" else "handoff"
+        if not isinstance(result.get(expected), dict):
+            raise ChatsCLIError(f"AgentsServer returned an invalid {expected} response")
+        if action == "request_reply" and not isinstance(result.get("leg"), dict):
+            raise ChatsCLIError("AgentsServer returned an invalid exchange leg response")
     return result
 
 
@@ -157,6 +225,16 @@ def respond(args: argparse.Namespace) -> dict[str, Any]:
         },
         capability,
     )
+    if result.get("action") == "response":
+        if (
+            set(result) != {"ok", "action", "accepted"}
+            or result.get("ok") is not True
+            or result.get("accepted") is not True
+        ):
+            raise ChatsCLIError(
+                "AgentsServer returned an invalid configured-route response"
+            )
+        return result
     if not isinstance(result.get("exchange"), dict) or not isinstance(result.get("leg"), dict):
         raise ChatsCLIError("AgentsServer returned an invalid exchange response")
     return result
@@ -166,13 +244,22 @@ def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Send a user-authorized message to another AgentsDock chat.")
     root.add_argument("--authority-file", required=True)
     commands = root.add_subparsers(dest="command", required=True)
+    list_command = commands.add_parser(
+        "list",
+        help="list configured routes issued to this live turn",
+    )
+    list_command.set_defaults(handler=list_routes)
     command = commands.add_parser("send", help="send one authorized instruction")
-    command.add_argument("--target", required=True)
+    send_destination = command.add_mutually_exclusive_group(required=True)
+    send_destination.add_argument("--route")
+    send_destination.add_argument("--target")
     command.add_argument("--message", required=True)
     command.add_argument("--idempotency-key")
     command.set_defaults(handler=send)
     ask_command = commands.add_parser("ask", help="start one bounded request/reply exchange")
-    ask_command.add_argument("--target", required=True)
+    ask_destination = ask_command.add_mutually_exclusive_group(required=True)
+    ask_destination.add_argument("--route")
+    ask_destination.add_argument("--target")
     ask_command.add_argument("--message", required=True)
     ask_command.add_argument("--idempotency-key")
     ask_command.set_defaults(handler=ask)

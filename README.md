@@ -676,6 +676,57 @@ status wake for the waiting sender. Exchange turns reuse the existing hidden
 `cross_chat_handoff_delivery` purpose so older clients do not expose synthetic
 prompts or queue controls.
 
+### Configured agent handoff routes (v3)
+
+Global API contract v13 is unchanged. Version 3 of
+`capabilities.cross_chat_handoffs_v1` adds a default-empty, per-source-chat
+allowlist for agent-initiated handoffs. Authenticated desktop clients manage
+it through:
+
+```text
+GET    /api/sessions/{source_session_id}/agent-handoff-routes
+POST   /api/sessions/{source_session_id}/agent-handoff-routes
+PATCH  /api/sessions/{source_session_id}/agent-handoff-routes/{route_id}
+DELETE /api/sessions/{source_session_id}/agent-handoff-routes/{route_id}
+```
+
+`PATCH` uses the route revision as a compare-and-swap precondition. A chat can
+hold at most 16 routes, aliases and targets are unique, routes cannot point to
+their source chat, and forks inherit neither routes nor their private mutation
+journal. Only an ordinary direct user turn whose client opts into
+`agent_cross_chat_routes_v1` receives an admission-time route snapshot.
+Scheduled, internal, digest, standalone, and cross-chat delivery turns receive
+none. Every helper call intersects that snapshot with the exact live route
+revision and allowed actions, so a removal or policy edit blocks future
+acceptance immediately; an already accepted ledger item remains visible and
+cancelable through the authenticated desktop APIs.
+
+The turn-scoped helper surface accepts only opaque issued route IDs:
+
+```bash
+"$AGENTSDOCK_CHATS_CLI" --authority-file /path/from/turn.json list
+"$AGENTSDOCK_CHATS_CLI" --authority-file /path/from/turn.json \
+  send --route route_opaque --message "Apply the corresponding mobile change."
+"$AGENTSDOCK_CHATS_CLI" --authority-file /path/from/turn.json \
+  ask --route route_opaque --message "Which mobile behavior must match?"
+```
+
+`list` is capability-scoped; there is no provider chat search or arbitrary
+target parameter. `Ask` is not transcript access: it creates a normal target
+turn containing only the bounded relayed message, then returns one asynchronous
+terminal answer to the source chat. Configured-route Ask is limited to two
+legs and 24 hours, with no follow-up. Route bodies and answers are limited to
+16,000 characters and 64 KiB UTF-8. A live run can accept at most one effect
+per route and four route handoffs total; durable source and target limits are
+12 accepted route effects per rolling hour.
+
+Provider projections contain only the opaque route ID, safe alias, sanitized
+bounded title, backend, allowed actions, and generic availability. They never
+expose target/session IDs, folders, working directories, models, provider IDs,
+transcripts, rate counts, or route mutation history. Configured delivery
+prompts likewise omit route and ledger identifiers; a returning answer may
+include only the target's sanitized, explicitly untrusted display label.
+
 Agent-created jobs use the same job store as the desktop and mobile clients,
 so they immediately appear in the Jobs panel. The scoped helper routes are:
 

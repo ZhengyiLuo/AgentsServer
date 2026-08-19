@@ -6,6 +6,23 @@ import agentsdock_chats
 
 
 class AgentsDockChatsCLITests(unittest.TestCase):
+    def test_list_uses_capability_scoped_route_endpoint(self) -> None:
+        args = argparse.Namespace(authority_file="authority.json")
+        with (
+            patch.object(agentsdock_chats, "authority", return_value="capability"),
+            patch.object(
+                agentsdock_chats,
+                "get_json",
+                return_value={"routes": [], "max_handoffs_per_run": 4},
+            ) as get,
+        ):
+            result = agentsdock_chats.list_routes(args)
+        self.assertEqual(result["routes"], [])
+        get.assert_called_once_with(
+            "/api/agent/cross-chat/routes",
+            "capability",
+        )
+
     def test_ask_uses_request_reply_wire_and_stable_retry_key(self) -> None:
         args = argparse.Namespace(
             authority_file="authority.json",
@@ -56,6 +73,78 @@ class AgentsDockChatsCLITests(unittest.TestCase):
         self.assertFalse(payloads[0]["request_response"])
         self.assertTrue(payloads[1]["request_response"])
         self.assertNotEqual(payloads[0]["idempotency_key"], payloads[1]["idempotency_key"])
+
+    def test_respond_accepts_only_strict_configured_route_receipt(self) -> None:
+        args = argparse.Namespace(
+            authority_file="authority.json",
+            exchange="exchange_private",
+            inbound_leg="leg_private",
+            message="answer",
+            request_response=False,
+            idempotency_key="configured-response-key",
+        )
+        receipt = {"ok": True, "action": "response", "accepted": True}
+        with (
+            patch.object(agentsdock_chats, "authority", return_value="capability"),
+            patch.object(agentsdock_chats, "post_json", return_value=receipt),
+        ):
+            self.assertEqual(agentsdock_chats.respond(args), receipt)
+
+        with (
+            patch.object(agentsdock_chats, "authority", return_value="capability"),
+            patch.object(
+                agentsdock_chats,
+                "post_json",
+                return_value={**receipt, "exchange": {"id": "must-not-leak"}},
+            ),
+        ):
+            with self.assertRaises(agentsdock_chats.ChatsCLIError):
+                agentsdock_chats.respond(args)
+
+    def test_route_send_uses_opaque_route_path_and_no_target(self) -> None:
+        args = argparse.Namespace(
+            authority_file="authority.json",
+            route="route_0123456789abcdef0123456789abcdef",
+            target=None,
+            message="update mobile",
+            idempotency_key=None,
+        )
+        calls = []
+
+        def post(path, payload, capability):
+            calls.append((path, payload, capability))
+            return {
+                "ok": True,
+                "route_id": args.route,
+                "action": "instruction",
+                "accepted": True,
+            }
+
+        with (
+            patch.object(agentsdock_chats, "authority", return_value="capability"),
+            patch.object(agentsdock_chats, "post_json", side_effect=post),
+        ):
+            result = agentsdock_chats.send(args)
+        self.assertTrue(result["accepted"])
+        self.assertEqual(
+            calls[0][0],
+            f"/api/agent/cross-chat/routes/{args.route}/handoffs",
+        )
+        self.assertNotIn("target_session_id", calls[0][1])
+
+    def test_send_parser_requires_exactly_one_route_or_target(self) -> None:
+        cli = agentsdock_chats.parser()
+        with self.assertRaises(SystemExit):
+            cli.parse_args([
+                "--authority-file", "authority.json", "send",
+                "--message", "hello",
+            ])
+        with self.assertRaises(SystemExit):
+            cli.parse_args([
+                "--authority-file", "authority.json", "send",
+                "--route", "route_one", "--target", "sess_one",
+                "--message", "hello",
+            ])
 
     def test_ask_and_respond_reject_whitespace_messages(self) -> None:
         for handler, args in (

@@ -1436,7 +1436,14 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
                 continue
             for method in set(getattr(route, "methods", set())) - {"HEAD", "OPTIONS"}:
                 registered.append((method, path))
-                sample = path.replace("{session_id}", "sess").replace("{job_id}", "job")
+                sample = (
+                    path.replace("{session_id}", "sess")
+                    .replace("{job_id}", "job")
+                    .replace(
+                        "{route_id}",
+                        "route_0123456789abcdef0123456789abcdef",
+                    )
+                )
                 self.assertTrue(agent_server.is_agent_helper_route(method, sample))
         self.assertTrue(registered)
         self.assertFalse(
@@ -2365,14 +2372,14 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             if lock.locked():
                 lock.release()
 
-    def test_exchange_capability_v2_contract_is_exact(self) -> None:
+    def test_exchange_capability_v3_contract_is_exact(self) -> None:
         with (
             patch.object(agent_server, "CODEX_TRANSPORT", agent_server.CODEX_TRANSPORT_APP_SERVER),
             patch.object(agent_server, "CLAUDE_TRANSPORT", agent_server.CLAUDE_TRANSPORT_AGENT_SDK),
         ):
             capability = agent_server.cross_chat_handoffs_capability()
         self.assertTrue(capability["available"])
-        self.assertEqual(capability["version"], 2)
+        self.assertEqual(capability["version"], 3)
         self.assertEqual(
             capability["actions"],
             ["request_reply", "instruction", "final_result"],
@@ -2380,6 +2387,13 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(capability["default_action"], "request_reply")
         self.assertEqual(capability["max_exchange_legs"], 6)
         self.assertEqual(capability["default_exchange_ttl_seconds"], 72 * 60 * 60)
+        self.assertTrue(capability["features"]["agent_cross_chat_routes"])
+        self.assertEqual(
+            capability["agent_routes"]["client_capability"],
+            agent_server.AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY,
+        )
+        self.assertEqual(capability["agent_routes"]["max_routes_per_chat"], 16)
+        self.assertFalse(capability["agent_routes"]["transcript_access"])
 
     async def test_request_reply_capability_uses_exact_exchange_generation(self) -> None:
         reference = agent_server.ChatReference(

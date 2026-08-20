@@ -293,6 +293,32 @@ again later without reinstalling anything:
 
 This only reads the existing configuration and exits; it makes no changes.
 
+## Managed server restart
+
+Authenticated clients can discover restart support through the additive
+`capabilities.server_restart` v1 health capability and the top-level
+`server_instance_id`. Restart is available only when AgentsServer proves that
+the running process belongs to the supported launchd or systemd user service
+and is executing from the installer's resolved `current` release.
+
+```text
+GET  /api/admin/restart
+POST /api/admin/restart
+```
+
+Both endpoints require the access token in an authorization header; URL token
+parameters and browser-originated requests are rejected. POST accepts a small
+JSON body containing a UUID `request_id`, the exact
+`expected_server_identity`, the exact `expected_server_instance_id`, and
+`confirmed: true`. It returns `202` before signaling the managed process.
+Replaying the same request ID is idempotent; another pending or recently
+completed request is rejected.
+
+Restart admission is fail-closed while an update, active turn, provisional
+queue write, provider background task, lifecycle operation, or HTTP mutation
+is in flight. Durable queued turns remain queued for recovery after relaunch.
+There is no force mode and unmanaged processes cannot use this control.
+
 ## Remote Access With Tailscale
 
 Remote access is expected to go through Tailscale. This keeps the server

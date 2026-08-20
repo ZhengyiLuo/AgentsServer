@@ -56,10 +56,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from croniter import CroniterBadDateError, CroniterError, croniter
 from dateutil.rrule import rrulestr
 from dateutil.tz import datetime_exists
-from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 import uvicorn
 import websockets
 
@@ -162,6 +162,7 @@ HOST_HEALTH_FILE = STATE_DIR / "host_health.jsonl"
 SERVER_ADMIN_ROOT = STATE_DIR / "admin"
 SERVER_UPDATE_STATUS_FILE = SERVER_ADMIN_ROOT / "server-update.json"
 SERVER_UPDATE_LOG_FILE = SERVER_ADMIN_ROOT / "server-update.log"
+SERVER_RESTART_STATUS_FILE = SERVER_ADMIN_ROOT / "server-restart.json"
 CODEX_SETTINGS_FILE = SERVER_ADMIN_ROOT / "codex-settings.json"
 ABANDONED_FORK_THREADS_FILE = SERVER_ADMIN_ROOT / "abandoned-fork-threads.json"
 SERVER_UPDATE_PUBLIC_KEY = SERVER_ROOT / "release-public-key.pem"
@@ -568,6 +569,7 @@ PROVIDER_SECRET_ENV_NAMES = (
 )
 SERVER_BIND_ADDRESS = agentsdock_setting("AGENT_BIND", "0.0.0.0")
 SERVER_PORT = int(agentsdock_setting("AGENT_PORT", "7850"))
+SERVER_INSTANCE_ID = uuid.uuid4().hex
 API_CONTRACT_VERSION = 13
 SESSION_ORDER_STEP = 1000.0
 FORK_INTERNAL_PURPOSES = {
@@ -3147,6 +3149,18 @@ def request_authorized(request: Request) -> bool:
     )
 
 
+def request_header_authorized(request: Request) -> bool:
+    """Authorize privileged controls without accepting credentials in URLs."""
+
+    if not AGENT_TOKEN:
+        return False
+    return (
+        token_matches(bearer_token(request.headers.get("authorization")))
+        or token_matches(request.headers.get("x-agentsdock-token"))
+        or token_matches(request.headers.get("x-zenithdock-token"))
+    )
+
+
 def network_host_is_loopback(host: str) -> bool:
     try:
         address = ipaddress.ip_address(host)
@@ -3836,6 +3850,22 @@ class ServerUpdateRequest(BaseModel):
 
 class ServerUpdateCheckRequest(BaseModel):
     track: Literal["stable", "beta"] | None = None
+
+
+class ServerRestartRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    request_id: uuid.UUID
+    expected_server_identity: str = Field(min_length=1, max_length=128)
+    expected_server_instance_id: str = Field(min_length=1, max_length=128)
+    confirmed: Literal[True]
+
+    @field_validator("confirmed", mode="before")
+    @classmethod
+    def require_literal_boolean_true(cls, value: Any) -> Any:
+        if value is not True:
+            raise ValueError("confirmed must be the JSON boolean true")
+        return value
 
 
 class CodexGoalsAdminRequest(BaseModel):
@@ -36328,6 +36358,17 @@ async def _start_turn_locked(
 SERVER_UPDATE_ACTIVE_PHASES = {"starting", "checking", "downloading", "verifying", "installing", "restarting"}
 SERVER_UPDATE_OPERATION_LOCK = asyncio.Lock()
 SERVER_UPDATE_START_GRACE_SECONDS = 45.0
+SERVER_RESTART_PHASES = {"idle", "accepted", "signaling", "complete", "failed"}
+SERVER_RESTART_ACTIVE_PHASES = {"accepted", "signaling"}
+SERVER_RESTART_SIGNAL_DELAY_SECONDS = 0.5
+SERVER_RESTART_ACCEPTED_STALE_SECONDS = 10.0
+SERVER_RESTART_COOLDOWN_SECONDS = 30.0
+SERVER_RESTART_MAX_BODY_BYTES = 2_048
+UNSAFE_HTTP_MUTATION_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+UNSAFE_HTTP_MUTATION_ADMISSION_LOCK = asyncio.Lock()
+UNSAFE_HTTP_MUTATIONS_IN_FLIGHT = 0
+MANAGED_SERVER_SERVICE_KIND_CACHE: str | None = None
+SERVER_RESTART_SIGNAL_LOCK = threading.Lock()
 
 
 def managed_server_update_blocks_work(
@@ -36340,14 +36381,348 @@ def managed_server_update_blocks_work(
 
 
 def managed_server_update_blocker() -> str | None:
-    if not managed_server_update_blocks_work():
-        return None
-    return "AgentsServer is preparing a managed update"
+    if managed_server_update_blocks_work():
+        return "AgentsServer is preparing a managed update"
+    if managed_server_restart_blocks_work():
+        return "AgentsServer is restarting"
+    return None
 
 
 def managed_server_restart_is_planned() -> bool:
     status = read_server_update_status()
-    return str(status.get("phase") or "") in {"installing", "restarting"}
+    return (
+        str(status.get("phase") or "") in {"installing", "restarting"}
+        or managed_server_restart_blocks_work()
+    )
+
+
+def official_server_release_tree() -> bool:
+    """Return whether this process is running from the installer's current link."""
+
+    configured = str(os.environ.get("AGENTS_SERVER_INSTALL_DIR") or "").strip()
+    if not configured:
+        return False
+    try:
+        current = (Path(configured).expanduser() / "current").resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    return current == SERVER_ROOT
+
+
+def macos_launchd_owns_current_process() -> bool:
+    """Prove that the official launchd job owns this exact process."""
+
+    if sys.platform != "darwin" or not Path("/bin/launchctl").is_file():
+        return False
+    try:
+        result = subprocess.run(
+            [
+                "/bin/launchctl",
+                "print",
+                f"gui/{os.getuid()}/com.agentsdock.server",
+            ],
+            stdin=subprocess.DEVNULL,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0:
+        return False
+    launchd_pids = re.findall(
+        r"(?m)^\s*pid\s*=\s*([0-9]+)\s*$",
+        str(result.stdout or ""),
+    )
+    return launchd_pids == [str(os.getpid())]
+
+
+def detect_managed_server_service_kind() -> str | None:
+    """Prove that an official user service will relaunch this process."""
+
+    if not official_server_release_tree():
+        return None
+    if sys.platform.startswith("linux"):
+        return "systemd-user" if agents_server_systemd_cgroup() else None
+    if sys.platform == "darwin":
+        return "launch-agent" if macos_launchd_owns_current_process() else None
+    return None
+
+
+def managed_server_service_kind() -> str | None:
+    """Cache only positive ownership proofs for this immutable process PID."""
+
+    global MANAGED_SERVER_SERVICE_KIND_CACHE
+    if MANAGED_SERVER_SERVICE_KIND_CACHE is not None:
+        return MANAGED_SERVER_SERVICE_KIND_CACHE
+    detected = detect_managed_server_service_kind()
+    if detected is not None:
+        MANAGED_SERVER_SERVICE_KIND_CACHE = detected
+    return detected
+
+
+def server_restart_capability() -> dict[str, Any]:
+    reconcile_stale_server_restart_acceptance()
+    if not AGENT_TOKEN:
+        return {
+            "available": False,
+            "required": False,
+            "message": "Server restart requires authenticated AgentsServer mode.",
+            "action": "Install or configure AgentsServer with an access token.",
+            "version": 1,
+        }
+    if managed_server_service_kind() is None:
+        return {
+            "available": False,
+            "required": False,
+            "message": "Server restart is unavailable for an unmanaged server process.",
+            "action": "Install AgentsServer as its supported user service, then reconnect.",
+            "version": 1,
+        }
+    return {
+        "available": True,
+        "required": False,
+        "message": "Authenticated managed server restart is available.",
+        "action": None,
+        "version": 1,
+    }
+
+
+def read_server_restart_status() -> dict[str, Any]:
+    try:
+        value = json.loads(SERVER_RESTART_STATUS_FILE.read_text())
+        if not isinstance(value, dict):
+            value = {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        value = {}
+    phase = str(value.get("phase") or "idle")
+    value["phase"] = phase if phase in SERVER_RESTART_PHASES else "idle"
+    return value
+
+
+def write_server_restart_status(**changes: Any) -> dict[str, Any]:
+    value = read_server_restart_status()
+    value.update(changes)
+    value["updated_at"] = update_utc_now()
+    atomic_update_json(SERVER_RESTART_STATUS_FILE, value)
+    return value
+
+
+def public_server_restart_status(
+    status: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    current = (
+        status
+        if status is not None
+        else reconcile_stale_server_restart_acceptance()
+    )
+    phase = str(current.get("phase") or "idle")
+    if phase not in SERVER_RESTART_PHASES:
+        phase = "idle"
+    result: dict[str, Any] = {
+        "phase": phase,
+        "current_version": SERVER_VERSION,
+        "server_identity": server_identity(),
+        "server_instance_id": SERVER_INSTANCE_ID,
+        "message": str(current.get("message") or (
+            "AgentsServer is ready."
+            if phase == "idle"
+            else "AgentsServer restart status is available."
+        ))[:500],
+    }
+    for name in (
+        "request_id",
+        "requested_at",
+        "updated_at",
+        "completed_at",
+        "failed_at",
+    ):
+        value = str(current.get(name) or "").strip()
+        if value:
+            result[name] = value[:128]
+    return result
+
+
+def managed_server_restart_blocks_work(
+    status: dict[str, Any] | None = None,
+) -> bool:
+    current = (
+        status
+        if status is not None
+        else reconcile_stale_server_restart_acceptance()
+    )
+    return str(current.get("phase") or "") in SERVER_RESTART_ACTIVE_PHASES
+
+
+def server_restart_status_age_seconds(status: dict[str, Any]) -> float:
+    timestamp: datetime | None = None
+    for name in ("completed_at", "failed_at", "updated_at", "requested_at"):
+        try:
+            candidate = datetime.fromisoformat(
+                str(status.get(name) or "").replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError):
+            continue
+        timestamp = (
+            candidate
+            if candidate.tzinfo is not None
+            else candidate.replace(tzinfo=timezone.utc)
+        )
+        break
+    if timestamp is None:
+        return float("inf")
+    return max(
+        0.0,
+        (datetime.now(timezone.utc) - timestamp).total_seconds(),
+    )
+
+
+def reconcile_stale_server_restart_acceptance() -> dict[str, Any]:
+    """Fail a same-process acceptance whose response worker never started."""
+
+    status = read_server_restart_status()
+    if (
+        str(status.get("phase") or "") != "accepted"
+        or str(status.get("_source_instance_id") or "") != SERVER_INSTANCE_ID
+        or server_restart_status_age_seconds(status)
+        < SERVER_RESTART_ACCEPTED_STALE_SECONDS
+    ):
+        return status
+    with SERVER_RESTART_SIGNAL_LOCK:
+        status = read_server_restart_status()
+        if (
+            str(status.get("phase") or "") == "accepted"
+            and str(status.get("_source_instance_id") or "")
+            == SERVER_INSTANCE_ID
+            and server_restart_status_age_seconds(status)
+            >= SERVER_RESTART_ACCEPTED_STALE_SECONDS
+        ):
+            status = write_server_restart_status(
+                phase="failed",
+                message=(
+                    "AgentsServer could not begin the accepted restart. "
+                    "Retry after refreshing the server connection."
+                ),
+                failed_at=update_utc_now(),
+            )
+    return status
+
+
+def reconcile_server_restart_status_after_startup() -> dict[str, Any]:
+    """Complete an accepted restart only after a different process starts."""
+
+    status = read_server_restart_status()
+    if str(status.get("phase") or "") not in SERVER_RESTART_ACTIVE_PHASES:
+        return status
+    source_instance_id = str(status.get("_source_instance_id") or "")
+    if not source_instance_id:
+        return write_server_restart_status(
+            phase="failed",
+            message="The previous server restart record was incomplete.",
+            failed_at=update_utc_now(),
+        )
+    if source_instance_id == SERVER_INSTANCE_ID:
+        return status
+    return write_server_restart_status(
+        phase="complete",
+        message="AgentsServer restarted successfully.",
+        completed_at=update_utc_now(),
+    )
+
+
+def server_restart_error_detail(
+    code: str,
+    message: str,
+    *,
+    action: str | None = None,
+    retryable: bool = False,
+    **details: Any,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "code": code,
+        "message": message[:500],
+        "retryable": retryable,
+    }
+    if action:
+        result["action"] = action[:500]
+    result.update(details)
+    return result
+
+
+def server_restart_work_message(
+    active_count: int,
+    queued_count: int,
+    provider_work_count: int,
+    mutation_count: int,
+    *,
+    deleting_count: int = 0,
+    codex_goals_reconfiguring: bool = False,
+) -> str:
+    parts: list[str] = []
+    if active_count:
+        parts.append(
+            f"{active_count} active agent run{'s' if active_count != 1 else ''}"
+        )
+    if queued_count:
+        parts.append(
+            f"{queued_count} restart-blocking queued turn{'s' if queued_count != 1 else ''}"
+        )
+    if provider_work_count:
+        parts.append(
+            f"{provider_work_count} provider background task{'s' if provider_work_count != 1 else ''}"
+        )
+    if mutation_count:
+        parts.append(
+            f"{mutation_count} in-flight server change{'s' if mutation_count != 1 else ''}"
+        )
+    if deleting_count:
+        parts.append(
+            f"{deleting_count} session deletion{'s' if deleting_count != 1 else ''}"
+        )
+    if codex_goals_reconfiguring:
+        parts.append("Codex goals reconfiguration")
+    detail = " and ".join(parts) or "server work"
+    return f"AgentsServer cannot restart while {detail} remains active."
+
+
+def signal_managed_server_restart(request_id: str) -> None:
+    """Signal this process only after FastAPI has sent the accepted response."""
+
+    time.sleep(SERVER_RESTART_SIGNAL_DELAY_SECONDS)
+    with SERVER_RESTART_SIGNAL_LOCK:
+        status = read_server_restart_status()
+        if (
+            str(status.get("request_id") or "") != request_id
+            or str(status.get("phase") or "") != "accepted"
+            or str(status.get("_source_instance_id") or "")
+            != SERVER_INSTANCE_ID
+        ):
+            return
+        if detect_managed_server_service_kind() is None:
+            write_server_restart_status(
+                phase="failed",
+                message="Managed service ownership changed before restart.",
+                failed_at=update_utc_now(),
+            )
+            return
+        write_server_restart_status(
+            phase="signaling",
+            message=(
+                "AgentsServer is restarting; reconnecting clients may briefly "
+                "go offline."
+            ),
+        )
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+        except Exception:
+            write_server_restart_status(
+                phase="failed",
+                message=(
+                    "AgentsServer could not signal its managed process to restart."
+                ),
+                failed_at=update_utc_now(),
+            )
 
 
 def server_update_work_message(
@@ -36620,6 +36995,7 @@ async def lifespan(app: FastAPI):
     for stale_authority in CROSS_CHAT_AUTHORITY_ROOT.glob("run_*.json"):
         with suppress(OSError):
             stale_authority.unlink()
+    reconcile_server_restart_status_after_startup()
     await reconcile_server_update_status_after_startup()
     abandoned_compaction_count = (
         await recover_abandoned_codex_compactions_after_start()
@@ -36723,20 +37099,136 @@ def is_agent_helper_route(method: str, path: str) -> bool:
     )
 
 
+def server_restart_browser_request_forbidden(request: Request) -> bool:
+    """Reject browser ambient-authority requests to the restart control."""
+
+    if str(request.headers.get("origin") or "").strip():
+        return True
+    fetch_site = str(request.headers.get("sec-fetch-site") or "").strip().lower()
+    return bool(fetch_site and fetch_site != "none")
+
+
+def server_restart_post_transport_error(request: Request) -> tuple[int, str] | None:
+    """Validate bounded JSON transport metadata before route body parsing."""
+
+    media_type = str(request.headers.get("content-type") or "").partition(";")[0]
+    if media_type.strip().lower() != "application/json":
+        return 415, "restart requests require application/json"
+
+    raw_headers = request.scope.get("headers", [])
+    if any(
+        bytes(name).lower() == b"transfer-encoding"
+        for name, _value in raw_headers
+    ):
+        return 400, "restart requests do not accept transfer encoding"
+    content_lengths = [
+        value.decode("latin-1").strip()
+        for name, value in raw_headers
+        if bytes(name).lower() == b"content-length"
+    ]
+    if not content_lengths:
+        return 411, "restart request content length is required"
+    if len(content_lengths) != 1:
+        return 400, "restart request content length is invalid"
+    content_length = content_lengths[0]
+    if re.fullmatch(r"[0-9]+", content_length) is None:
+        return 400, "restart request content length is invalid"
+    size = int(content_length, 10)
+    if size <= 0:
+        return 400, "restart request content length is invalid"
+    if size > SERVER_RESTART_MAX_BODY_BYTES:
+        return 413, "restart request body is too large"
+    return None
+
+
 @app.middleware("http")
 async def require_agent_token(request: Request, call_next):
+    global UNSAFE_HTTP_MUTATIONS_IN_FLIGHT
     if request.method == "OPTIONS" or not request.url.path.startswith("/api/"):
         return await call_next(request)
     # Agent helper routes use a per-run provider capability and perform their
     # own loopback + action/session validation in-route. They never accept the
     # client/admin bearer as a substitute for that capability.
-    if is_agent_helper_route(request.method, request.url.path):
-        return await call_next(request)
-    authorized = request_authorized(request)
-    if not authorized:
+    agent_helper_route = is_agent_helper_route(
+        request.method,
+        request.url.path,
+    )
+    if agent_helper_route and not request_client_is_loopback(request):
+        return JSONResponse(
+            {"detail": "agent helper route is restricted to loopback clients"},
+            status_code=403,
+        )
+    if not agent_helper_route and not request_authorized(request):
         logger.warning("unauthorized request method=%s path=%s host=%s", request.method, request.url.path, request.client.host if request.client else "-")
         return JSONResponse({"detail": "unauthorized"}, status_code=401)
-    return await call_next(request)
+
+    if request.url.path == "/api/admin/restart":
+        if server_restart_browser_request_forbidden(request):
+            return JSONResponse({"detail": "forbidden"}, status_code=403)
+        # Enforce the privileged route's header-only authentication before
+        # FastAPI parses a request body. The route repeats these checks for
+        # direct invocation safety and performs the managed-service proof.
+        if not AGENT_TOKEN:
+            return JSONResponse(
+                {
+                    "detail": server_restart_error_detail(
+                        "server_restart_auth_required",
+                        "Server restart requires authenticated AgentsServer mode.",
+                        action=(
+                            "Install or configure AgentsServer with an access token."
+                        ),
+                    )
+                },
+                status_code=503,
+            )
+        if not request_header_authorized(request):
+            return JSONResponse(
+                {
+                    "detail": server_restart_error_detail(
+                        "server_restart_unauthorized",
+                        (
+                            "Server restart requires an access token in an "
+                            "authorization header."
+                        ),
+                    )
+                },
+                status_code=401,
+            )
+        if request.method.upper() == "POST":
+            transport_error = server_restart_post_transport_error(request)
+            if transport_error is not None:
+                status_code, detail = transport_error
+                return JSONResponse({"detail": detail}, status_code=status_code)
+
+    unsafe_mutation = (
+        request.method.upper() in UNSAFE_HTTP_MUTATION_METHODS
+        and request.url.path != "/api/admin/restart"
+    )
+    if not unsafe_mutation:
+        return await call_next(request)
+
+    async with UNSAFE_HTTP_MUTATION_ADMISSION_LOCK:
+        if managed_server_restart_blocks_work():
+            return JSONResponse(
+                {
+                    "detail": server_restart_error_detail(
+                        "server_restarting",
+                        "AgentsServer is restarting and is not accepting server changes.",
+                        action="Wait for the server to reconnect, then retry.",
+                        retryable=True,
+                    )
+                },
+                status_code=409,
+            )
+        UNSAFE_HTTP_MUTATIONS_IN_FLIGHT += 1
+    try:
+        return await call_next(request)
+    finally:
+        async with UNSAFE_HTTP_MUTATION_ADMISSION_LOCK:
+            UNSAFE_HTTP_MUTATIONS_IN_FLIGHT = max(
+                0,
+                UNSAFE_HTTP_MUTATIONS_IN_FLIGHT - 1,
+            )
 
 
 @app.get("/api/health")
@@ -36753,6 +37245,7 @@ async def health() -> dict[str, Any]:
         "server_version": SERVER_VERSION,
         "api_contract_version": API_CONTRACT_VERSION,
         "server_identity": server_identity(),
+        "server_instance_id": SERVER_INSTANCE_ID,
         "state_dir": str(STATE_DIR),
         "default_backend": DEFAULT_BACKEND,
         "default_cwd": existing_cwd(DEFAULT_CWD),
@@ -36763,6 +37256,7 @@ async def health() -> dict[str, Any]:
             and bool(tmux["available"])
         ),
         "capabilities": {
+            "server_restart": server_restart_capability(),
             "server_updates": {
                 "available": (
                     SERVER_UPDATE_RUNNER.is_file()
@@ -37197,6 +37691,233 @@ async def put_codex_goals_admin(
         return {**codex_goals_admin_status(), **transition}
 
 
+def require_server_restart_control(request: Request) -> None:
+    if server_restart_browser_request_forbidden(request):
+        raise HTTPException(status_code=403, detail="forbidden")
+    if not AGENT_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail=server_restart_error_detail(
+                "server_restart_auth_required",
+                "Server restart requires authenticated AgentsServer mode.",
+                action="Install or configure AgentsServer with an access token.",
+            ),
+        )
+    if not request_header_authorized(request):
+        raise HTTPException(
+            status_code=401,
+            detail=server_restart_error_detail(
+                "server_restart_unauthorized",
+                "Server restart requires an access token in an authorization header.",
+            ),
+        )
+    if detect_managed_server_service_kind() is None:
+        raise HTTPException(
+            status_code=503,
+            detail=server_restart_error_detail(
+                "server_restart_unmanaged",
+                "Server restart is unavailable for an unmanaged server process.",
+                action="Install AgentsServer as its supported user service, then reconnect.",
+            ),
+        )
+
+
+@app.get("/api/admin/restart")
+async def server_restart_status_endpoint(request: Request) -> dict[str, Any]:
+    require_server_restart_control(request)
+    return public_server_restart_status()
+
+
+@app.post("/api/admin/restart", status_code=202)
+async def restart_server_endpoint(
+    body: ServerRestartRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> dict[str, Any]:
+    global UNSAFE_HTTP_MUTATIONS_IN_FLIGHT
+    require_server_restart_control(request)
+    request_id = str(body.request_id)
+
+    async with SERVER_UPDATE_OPERATION_LOCK:
+        restart_status = reconcile_stale_server_restart_acceptance()
+        if str(restart_status.get("request_id") or "") == request_id:
+            if (
+                str(restart_status.get("phase") or "") == "accepted"
+                and str(restart_status.get("_source_instance_id") or "")
+                == SERVER_INSTANCE_ID
+            ):
+                background_tasks.add_task(
+                    signal_managed_server_restart,
+                    request_id,
+                )
+            return public_server_restart_status(restart_status)
+        if managed_server_restart_blocks_work(restart_status):
+            raise HTTPException(
+                status_code=409,
+                detail=server_restart_error_detail(
+                    "server_restart_in_progress",
+                    "Another AgentsServer restart is already in progress.",
+                    action="Wait for the server to reconnect before retrying.",
+                    retryable=True,
+                ),
+            )
+        terminal_restart = str(restart_status.get("phase") or "") in {
+            "complete",
+            "failed",
+        }
+        cooldown_remaining = (
+            max(
+                0,
+                math.ceil(
+                    SERVER_RESTART_COOLDOWN_SECONDS
+                    - server_restart_status_age_seconds(restart_status)
+                ),
+            )
+            if terminal_restart
+            else 0
+        )
+        if terminal_restart and cooldown_remaining > 0:
+            raise HTTPException(
+                status_code=409,
+                detail=server_restart_error_detail(
+                    "server_restart_cooldown",
+                    "AgentsServer was restarted recently.",
+                    action="Wait briefly before requesting another restart.",
+                    retryable=True,
+                    retry_after_seconds=cooldown_remaining,
+                ),
+            )
+
+        current_server_identity = server_identity()
+        if (
+            body.expected_server_identity != current_server_identity
+            or body.expected_server_instance_id != SERVER_INSTANCE_ID
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=server_restart_error_detail(
+                    "server_restart_target_changed",
+                    "The connected AgentsServer instance changed before restart confirmation.",
+                    action="Refresh the server connection and confirm the restart again.",
+                    retryable=True,
+                ),
+            )
+        if detect_managed_server_service_kind() is None:
+            raise HTTPException(
+                status_code=503,
+                detail=server_restart_error_detail(
+                    "server_restart_unmanaged",
+                    "Managed service ownership changed before restart acceptance.",
+                    action="Reconnect or reinstall the supported AgentsServer user service.",
+                ),
+            )
+        if managed_server_update_blocks_work():
+            raise HTTPException(
+                status_code=409,
+                detail=server_restart_error_detail(
+                    "server_update_in_progress",
+                    "AgentsServer cannot restart while a managed update is in progress.",
+                    action="Wait for the update to finish, then retry.",
+                    retryable=True,
+                ),
+            )
+
+        async with ACTIVE_LOCK:
+            async with QUEUE_LOCK:
+                async with UNSAFE_HTTP_MUTATION_ADMISSION_LOCK:
+                    # Recheck every fence while holding the same locks used by
+                    # turn/queue and HTTP-mutation admission. Once the journal
+                    # is accepted, no new work can enter before SIGTERM.
+                    restart_status = reconcile_stale_server_restart_acceptance()
+                    if managed_server_restart_blocks_work(restart_status):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=server_restart_error_detail(
+                                "server_restart_in_progress",
+                                "Another AgentsServer restart is already in progress.",
+                                action="Wait for the server to reconnect before retrying.",
+                                retryable=True,
+                            ),
+                        )
+                    if managed_server_update_blocks_work():
+                        raise HTTPException(
+                            status_code=409,
+                            detail=server_restart_error_detail(
+                                "server_update_in_progress",
+                                "AgentsServer cannot restart while a managed update is in progress.",
+                                action="Wait for the update to finish, then retry.",
+                                retryable=True,
+                            ),
+                        )
+                    active_count = len(
+                        BUSY_SESSIONS | SERVER_MAINTENANCE_SESSIONS
+                    )
+                    queued_count = update_blocking_queued_turn_count_locked()
+                    deleting_count = len(DELETING_SESSIONS)
+                    codex_goals_reconfiguring = bool(CODEX_GOALS_RECONFIGURING)
+                    provider_work_labels = (
+                        []
+                        if (
+                            active_count
+                            or queued_count
+                            or deleting_count
+                            or codex_goals_reconfiguring
+                        )
+                        else active_provider_background_work_labels()
+                    )
+                    mutation_count = UNSAFE_HTTP_MUTATIONS_IN_FLIGHT
+                    if (
+                        active_count
+                        or queued_count
+                        or deleting_count
+                        or codex_goals_reconfiguring
+                        or provider_work_labels
+                        or mutation_count
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=server_restart_error_detail(
+                                "server_restart_busy",
+                                server_restart_work_message(
+                                    active_count,
+                                    queued_count,
+                                    len(provider_work_labels),
+                                    mutation_count,
+                                    deleting_count=deleting_count,
+                                    codex_goals_reconfiguring=(
+                                        codex_goals_reconfiguring
+                                    ),
+                                ),
+                                action="Wait for current work to finish, then retry.",
+                                retryable=True,
+                                active_count=active_count,
+                                restart_blocking_queued_count=queued_count,
+                                provider_background_count=len(provider_work_labels),
+                                mutation_count=mutation_count,
+                                deleting_session_count=deleting_count,
+                                codex_goals_reconfiguring=(
+                                    codex_goals_reconfiguring
+                                ),
+                            ),
+                        )
+                    now = update_utc_now()
+                    restart_status = write_server_restart_status(
+                        phase="accepted",
+                        request_id=request_id,
+                        _source_instance_id=SERVER_INSTANCE_ID,
+                        message=(
+                            "AgentsServer accepted the restart and will briefly "
+                            "disconnect while its user service relaunches."
+                        ),
+                        requested_at=now,
+                        completed_at=None,
+                        failed_at=None,
+                    )
+
+        background_tasks.add_task(signal_managed_server_restart, request_id)
+        return public_server_restart_status(restart_status)
+
+
 @app.get("/api/admin/update")
 async def server_update_status() -> dict[str, Any]:
     status = read_server_update_status()
@@ -37218,6 +37939,11 @@ async def check_server_update(
     body: ServerUpdateCheckRequest | None = None,
 ) -> dict[str, Any]:
     async with SERVER_UPDATE_OPERATION_LOCK:
+        if managed_server_restart_blocks_work():
+            raise HTTPException(
+                status_code=409,
+                detail="AgentsServer is restarting",
+            )
         status = read_server_update_status()
         if await asyncio.to_thread(server_update_is_active, status):
             raise HTTPException(status_code=409, detail="a server update is already running")
@@ -37269,6 +37995,11 @@ async def check_server_update(
 @app.post("/api/admin/update/start")
 async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
     async with SERVER_UPDATE_OPERATION_LOCK:
+        if managed_server_restart_blocks_work():
+            raise HTTPException(
+                status_code=409,
+                detail="AgentsServer is restarting",
+            )
         status = read_server_update_status()
         if await asyncio.to_thread(server_update_is_active, status):
             raise HTTPException(status_code=409, detail="a server update is already running")

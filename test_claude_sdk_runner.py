@@ -1829,7 +1829,11 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(captured_options["permission_mode"], "plan")
-        self.assertEqual(captured_options["disallowed_tools"], ["CronCreate"])
+        self.assertEqual(agent_server.CLAUDE_SDK_CONFIGURATION_VERSION, 7)
+        self.assertEqual(
+            captured_options["disallowed_tools"],
+            ["CronCreate", "Monitor", "ScheduleWakeup"],
+        )
         self.assertEqual(
             captured_options["thinking"],
             {"type": "adaptive", "display": "summarized"},
@@ -1842,7 +1846,10 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         hooks = captured_options["hooks"]
-        self.assertEqual(hooks["PreToolUse"][0].matcher, "Bash")
+        self.assertEqual(
+            [matcher.matcher for matcher in hooks["PreToolUse"]],
+            ["Bash", "CronCreate", "Monitor", "ScheduleWakeup"],
+        )
         self.assertEqual(result, {"behavior": "allow"})
         permission.assert_awaited_once_with(
             "chat-claude",
@@ -1862,6 +1869,60 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         self.assertNotEqual(config_key, default_key)
+        system_prompt = agent_server.session_system_prompt(
+            "chat-claude",
+            session,
+            Path(self.cwd) / ".manifest.json",
+        )
+        with patch.object(agent_server, "CLAUDE_SDK_CONFIGURATION_VERSION", 6):
+            previous_version_key = agent_server.claude_sdk_configuration_key(
+                session,
+                self.cwd,
+                "/usr/bin/claude",
+                system_prompt,
+            )
+        with patch.object(
+            agent_server,
+            "CLAUDE_NON_DURABLE_SCHEDULER_TOOLS",
+            ("CronCreate",),
+        ):
+            previous_tools_key = agent_server.claude_sdk_configuration_key(
+                session,
+                self.cwd,
+                "/usr/bin/claude",
+                system_prompt,
+            )
+        self.assertNotEqual(config_key, previous_version_key)
+        self.assertNotEqual(config_key, previous_tools_key)
+
+    async def test_nondurable_scheduler_permission_never_creates_interaction(self) -> None:
+        append_event = AsyncMock(return_value={})
+        update_metadata = AsyncMock()
+        with patch.dict(sys.modules, fake_claude_sdk_modules()), patch.object(
+            agent_server,
+            "append_event",
+            append_event,
+        ), patch.object(
+            agent_server,
+            "update_claude_pending_session_metadata",
+            update_metadata,
+        ):
+            for tool_name in ("CronCreate", "Monitor", "ScheduleWakeup"):
+                with self.subTest(tool_name=tool_name):
+                    result = await agent_server.handle_claude_tool_permission(
+                        "chat-claude",
+                        tool_name,
+                        {},
+                        {"tool_use_id": f"tool-{tool_name}"},
+                    )
+                    self.assertIsInstance(result, FakePermissionResultDeny)
+                    self.assertFalse(getattr(result, "interrupt", True))
+                    self.assertIn("AgentsDock Jobs CLI", result.message)
+                    self.assertIn("provider-authority block", result.message)
+
+        self.assertFalse(agent_server.CLAUDE_PENDING_INTERACTIONS)
+        append_event.assert_not_awaited()
+        update_metadata.assert_not_awaited()
 
     async def test_permission_mode_runtime_contract_and_public_session(self) -> None:
         self.session["claude_permission_mode"] = "acceptEdits"
@@ -1972,8 +2033,15 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("--permission-mode", command)
         disallowed_index = command.index("--disallowedTools")
         self.assertEqual(
-            command[disallowed_index + 1:disallowed_index + 5],
-            ["AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "CronCreate"],
+            command[disallowed_index + 1:disallowed_index + 7],
+            [
+                "AskUserQuestion",
+                "EnterPlanMode",
+                "ExitPlanMode",
+                "CronCreate",
+                "Monitor",
+                "ScheduleWakeup",
+            ],
         )
         self.assertNotIn("CronList", command)
         self.assertNotIn("CronDelete", command)

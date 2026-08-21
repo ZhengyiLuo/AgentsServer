@@ -5,19 +5,49 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+import re
 import threading
+import time
 from typing import Any
+from urllib.parse import urlsplit
 
+from fastapi import Request
 from starlette.responses import JSONResponse
 
-from agentsdock_team_hub.service import create_app
-from agentsdock_team_hub.store import HubStore
+from agentsdock_team_hub.service import (
+    ManagedTransportIdentity,
+    classify_managed_transport,
+    create_app,
+)
+from agentsdock_team_hub.store import HubError, HubStore
 
 
 TEAM_HUB_MOUNT_PATH = "/api/team-hub"
 TEAM_HUB_CAPABILITY_VERSION = 1
 TEAM_HUB_MODE_DISABLED = "disabled"
 TEAM_HUB_MODE_HOST = "host"
+TEAM_HUB_TRANSPORT_LOOPBACK = "loopback"
+TEAM_HUB_TRANSPORT_TAILSCALE_SERVE = "tailscale_serve"
+TEAM_HUB_TAILSCALE_SERVE_PORT = 8444
+TEAM_HUB_TAILNET_LABEL_PATTERN = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
+)
+
+
+def _canonical_tailnet_hostname(value: str) -> bool:
+    labels = value.split(".")
+    return (
+        value == value.lower()
+        and not value.endswith(".")
+        and len(labels) >= 4
+        and labels[-2:] == ["ts", "net"]
+        and all(
+            1 <= len(label) <= 63
+            and not label.startswith("xn--")
+            and TEAM_HUB_TAILNET_LABEL_PATTERN.fullmatch(label) is not None
+            for label in labels
+        )
+    )
 
 
 def configured_team_hub_mode(value: str | None) -> tuple[str, str | None]:
@@ -44,6 +74,50 @@ def configured_team_hub_hosts(
     return hosts
 
 
+def configured_team_hub_endpoint(
+    mode: str,
+    configured_url: str | None,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """Return transport, public Hub URL, public hostname, and config error."""
+
+    if mode != TEAM_HUB_MODE_HOST:
+        return None, None, None, None
+    value = str(configured_url or "").strip()
+    if not value:
+        return TEAM_HUB_TRANSPORT_LOOPBACK, None, None, None
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return None, None, None, "AGENTSDOCK_TEAM_HUB_URL is invalid"
+    hostname = parsed.hostname
+    canonical = (
+        f"https://{hostname}:{TEAM_HUB_TAILSCALE_SERVE_PORT}{TEAM_HUB_MOUNT_PATH}"
+        if hostname is not None
+        else ""
+    )
+    if (
+        parsed.scheme != "https"
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or port != TEAM_HUB_TAILSCALE_SERVE_PORT
+        or parsed.path != TEAM_HUB_MOUNT_PATH
+        or parsed.query
+        or parsed.fragment
+        or not _canonical_tailnet_hostname(hostname)
+        or value != canonical
+    ):
+        return (
+            None,
+            None,
+            None,
+            "AGENTSDOCK_TEAM_HUB_URL must be the canonical private "
+            "https://<host>.ts.net:8444/api/team-hub URL",
+        )
+    return TEAM_HUB_TRANSPORT_TAILSCALE_SERVE, canonical, hostname, None
+
+
 class ManagedTeamHubHost:
     """An unavailable-first ASGI mount whose credential realm is Hub-only."""
 
@@ -53,14 +127,20 @@ class ManagedTeamHubHost:
         mode: str,
         data_dir: Path,
         server_identity: str,
+        server_instance_id: str = "server-instance-local-preview",
         allowed_hosts: set[str],
+        transport: str = TEAM_HUB_TRANSPORT_LOOPBACK,
+        hub_url: str | None = None,
         config_error: str | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self.mode = mode
         self.data_dir = Path(data_dir)
         self.server_identity = str(server_identity)
+        self.server_instance_id = str(server_instance_id)
         self.allowed_hosts = set(allowed_hosts)
+        self.transport = transport
+        self.hub_url = hub_url
         self.config_error = config_error
         self.logger = logger or logging.getLogger("agents-server.team-hub")
         self._guard = threading.RLock()
@@ -71,6 +151,8 @@ class ManagedTeamHubHost:
         self._runtime_lease_fd: int | None = None
         self._accepting = False
         self._startup_failed = False
+        self._bootstrap_rate_guard = threading.Lock()
+        self._bootstrap_rate_buckets: dict[str, tuple[int, int]] = {}
 
     @property
     def designated_host(self) -> bool:
@@ -86,6 +168,12 @@ class ManagedTeamHubHost:
             if self.config_error:
                 self.logger.error("Team Hub is disabled: %s", self.config_error)
             return
+        if self.config_error:
+            with self._guard:
+                self._startup_failed = True
+                self._accepting = False
+            self.logger.error("Team Hub host configuration is invalid: %s", self.config_error)
+            return
         lease: int | None = None
         try:
             lease = HubStore.acquire_managed_runtime_lease(self.data_dir)
@@ -93,7 +181,12 @@ class ManagedTeamHubHost:
                 self.data_dir,
                 allowed_hosts=self.allowed_hosts,
                 managed_host_identity=self.server_identity,
-                require_loopback_transport=True,
+                managed_server_instance_id=self.server_instance_id,
+                managed_transport=self.transport,
+                managed_hub_url=(
+                    self.hub_url
+                    or f"http://127.0.0.1{TEAM_HUB_MOUNT_PATH}"
+                ),
             )
         except Exception as exc:
             HubStore.release_managed_runtime_lease(lease)
@@ -130,6 +223,8 @@ class ManagedTeamHubHost:
                 "designated_host": False,
                 "version": TEAM_HUB_CAPABILITY_VERSION,
                 "base_path": None,
+                "transport": None,
+                "hub_url": None,
                 "hub_id": None,
                 "host_server_identity": None,
                 "message": message,
@@ -144,10 +239,14 @@ class ManagedTeamHubHost:
             "designated_host": True,
             "version": TEAM_HUB_CAPABILITY_VERSION,
             "base_path": TEAM_HUB_MOUNT_PATH,
+            "transport": self.transport,
+            "hub_url": self.hub_url,
             "hub_id": hub_id,
             "host_server_identity": self.server_identity,
             "message": (
-                "This AgentsServer hosts the local-only Team Hub preview."
+                "This AgentsServer hosts Team Hub over private Tailscale Serve."
+                if available and self.transport == TEAM_HUB_TRANSPORT_TAILSCALE_SERVE
+                else "This AgentsServer hosts the local Team Hub preview."
                 if available
                 else "The designated Team Hub is unavailable."
             ),
@@ -159,6 +258,103 @@ class ManagedTeamHubHost:
                 else "Wait for the designated Team Hub to finish starting."
             ),
         }
+
+    def tailscale_serve_identity(
+        self,
+        request: Request,
+    ) -> ManagedTransportIdentity | None:
+        if (
+            self.transport != TEAM_HUB_TRANSPORT_TAILSCALE_SERVE
+            or self.hub_url is None
+        ):
+            return None
+        identity = classify_managed_transport(
+            request,
+            managed_transport=self.transport,
+            managed_hub_url=self.hub_url,
+        )
+        if identity is None or identity.kind != TEAM_HUB_TRANSPORT_TAILSCALE_SERVE:
+            return None
+        return identity
+
+    async def issue_tailnet_bootstrap_proof(
+        self,
+        *,
+        request_id: str,
+        server_identity: str,
+        server_instance_id: str,
+        hub_url: str,
+        tailnet_login: str,
+        recipient_email: str,
+        display_name: str,
+        device_label: str,
+    ) -> dict[str, Any]:
+        """Admit one delegated proof mutation into the Hub drain boundary."""
+
+        async with self._admission:
+            with self._guard:
+                store = self._store if self._accepting else None
+            if store is not None:
+                self._in_flight += 1
+        if store is None:
+            raise HubError("hub_unavailable", "Team Hub is unavailable", 503)
+
+        window = int(time.monotonic() // 60)
+        normalized_login = str(tailnet_login).strip().lower()
+        with self._bootstrap_rate_guard:
+            allowed = True
+            for key, limit in ((normalized_login, 8), ("*", 200)):
+                prior_window, count = self._bootstrap_rate_buckets.get(
+                    key, (window, 0)
+                )
+                if prior_window != window:
+                    count = 0
+                count += 1
+                self._bootstrap_rate_buckets[key] = (window, count)
+                allowed = allowed and count <= limit
+            if len(self._bootstrap_rate_buckets) > 4096:
+                self._bootstrap_rate_buckets = {
+                    key: value
+                    for key, value in self._bootstrap_rate_buckets.items()
+                    if value[0] >= window - 1
+                }
+                while len(self._bootstrap_rate_buckets) > 4096:
+                    self._bootstrap_rate_buckets.pop(
+                        next(iter(self._bootstrap_rate_buckets))
+                    )
+        if not allowed:
+            async with self._admission:
+                self._in_flight = max(0, self._in_flight - 1)
+                if self._in_flight == 0:
+                    self._admission.notify_all()
+            raise HubError("rate_limited", "Too many bootstrap proof requests", 429)
+
+        def issue() -> dict[str, Any]:
+            with HubStore.maintenance_control_lock(self.data_dir):
+                if store.maintenance_fence() is not None:
+                    raise HubError(
+                        "hub_maintenance",
+                        "Team Hub is unavailable during server maintenance",
+                        503,
+                    )
+                return store.issue_tailnet_bootstrap_proof(
+                    request_id=request_id,
+                    server_identity=server_identity,
+                    server_instance_id=server_instance_id,
+                    hub_url=hub_url,
+                    tailnet_login=tailnet_login,
+                    recipient_email=recipient_email,
+                    display_name=display_name,
+                    device_label=device_label,
+                )
+
+        try:
+            return await asyncio.to_thread(issue)
+        finally:
+            async with self._admission:
+                self._in_flight = max(0, self._in_flight - 1)
+                if self._in_flight == 0:
+                    self._admission.notify_all()
 
     async def _close_and_drain(self) -> None:
         async with self._admission:

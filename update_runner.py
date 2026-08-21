@@ -47,6 +47,9 @@ INSTALLER_LOG_TAIL_BYTES = 64 * 1024
 INSTALLER_LOG_TAIL_LINES = 12
 INSTALLER_ERROR_MAX_CHARS = 4_000
 INSTALLER_ENVIRONMENT_SELECTORS = (
+    "AGENTSDOCK_AGENT_TOKEN",
+    "AGENTSDOCK_PROVIDER_AUTHORITY_FILE",
+    "AGENTSDOCK_PUBLISH_TOKEN",
     "CONDA_PREFIX",
     "PYTHONHOME",
     "PYTHONPATH",
@@ -57,6 +60,8 @@ INSTALLER_ENVIRONMENT_SELECTORS = (
     "UV_PYTHON",
     "UV_WORKING_DIR",
     "VIRTUAL_ENV",
+    "ZENITHBOT_AGENT_TOKEN",
+    "ZENITHDOCK_AGENT_TOKEN",
 )
 RELEASE_TRACKS = {"stable", "beta"}
 RUNNER_OWNED_ACTIVE_PHASES = {
@@ -160,11 +165,37 @@ def installer_log_tail(log_path: Path) -> str:
         with log_path.open("rb") as stream:
             stream.seek(0, os.SEEK_END)
             size = stream.tell()
+            truncated = size > INSTALLER_LOG_TAIL_BYTES
             stream.seek(max(0, size - INSTALLER_LOG_TAIL_BYTES))
             content = stream.read(INSTALLER_LOG_TAIL_BYTES)
     except OSError:
         return ""
-    tail = "\n".join(content.decode("utf-8", "replace").splitlines()[-INSTALLER_LOG_TAIL_LINES:])
+    lines = content.decode("utf-8", "replace").splitlines()
+    if truncated and lines:
+        # The bounded read may begin inside a secret whose identifying key was
+        # before the cutoff. Never surface that unclassifiable partial line.
+        lines = lines[1:]
+    safe_lines: list[str] = []
+    for line in lines:
+        if "AGENTSDOCK_SETUP_RESULT=" in line:
+            continue
+        line = re.sub(
+            r"(?i)(Authorization\s*:\s*Bearer\s+)\S+",
+            r"\1[REDACTED]",
+            line,
+        )
+        line = re.sub(
+            r"(?i)(\bBearer\s+)\S+",
+            r"\1[REDACTED]",
+            line,
+        )
+        line = re.sub(
+            r"(?i)([\"']?(?:AGENTSDOCK_AGENT_TOKEN|ZENITHDOCK_AGENT_TOKEN|ZENITHBOT_AGENT_TOKEN|AGENTSDOCK_PUBLISH_TOKEN|AGENTSDOCK_PROVIDER_AUTHORITY_FILE|access_token)[\"']?\s*[=:]\s*).*$",
+            r"\1[REDACTED]",
+            line,
+        )
+        safe_lines.append(line)
+    tail = "\n".join(safe_lines[-INSTALLER_LOG_TAIL_LINES:])
     return tail[-INSTALLER_ERROR_MAX_CHARS:].strip()
 
 
@@ -359,6 +390,8 @@ def assert_post_update_identity(
     token: str | None,
     expected_server_identity: str,
     expected_team_hub_id: str | None = None,
+    expected_team_hub_transport: str | None = None,
+    expected_team_hub_url: str | None = None,
 ) -> None:
     """Fence a replacement by stable server and managed Hub identities."""
 
@@ -366,6 +399,8 @@ def assert_post_update_identity(
     if str(health.get("server_identity") or "") != expected_server_identity:
         raise RuntimeError("updated AgentsServer stable identity does not match")
     if expected_team_hub_id is None:
+        if expected_team_hub_transport is not None or expected_team_hub_url is not None:
+            raise RuntimeError("managed Team Hub transport has no bound Hub identity")
         return
     capabilities = health.get("capabilities")
     capability = (
@@ -386,6 +421,16 @@ def assert_post_update_identity(
         for name, value in expected_capability.items()
     ):
         raise RuntimeError("updated AgentsServer lost or changed its Team Hub identity")
+    actual_transport = capability.get("transport")
+    actual_hub_url = capability.get("hub_url")
+    if expected_team_hub_transport is None:
+        if actual_transport not in {None, "loopback"} or actual_hub_url is not None:
+            raise RuntimeError("updated AgentsServer changed its legacy Team Hub transport")
+    elif (
+        actual_transport != expected_team_hub_transport
+        or actual_hub_url != expected_team_hub_url
+    ):
+        raise RuntimeError("updated AgentsServer changed its Team Hub transport")
 
 
 def assert_server_idle(port: int, *, token: str | None = None) -> None:
@@ -712,6 +757,18 @@ def run_update(args: argparse.Namespace) -> None:
     expected_team_hub_id = str(
         getattr(args, "expected_team_hub_id", "") or ""
     ).strip() or None
+    raw_team_hub_transport = getattr(args, "expected_team_hub_transport", None)
+    expected_team_hub_transport = (
+        str(raw_team_hub_transport).strip()
+        if raw_team_hub_transport is not None
+        else None
+    )
+    raw_team_hub_url = getattr(args, "expected_team_hub_url", None)
+    expected_team_hub_url = (
+        str(raw_team_hub_url).strip()
+        if raw_team_hub_url is not None
+        else None
+    )
     team_hub_snapshot = str(
         getattr(args, "team_hub_snapshot", "") or ""
     ).strip() or None
@@ -722,6 +779,41 @@ def run_update(args: argparse.Namespace) -> None:
         (expected_team_hub_id, team_hub_snapshot, team_hub_data_dir)
     ):
         raise RuntimeError("managed Team Hub rollback arguments must be complete")
+    if expected_team_hub_id is None:
+        if expected_team_hub_transport is not None or expected_team_hub_url is not None:
+            raise RuntimeError("managed Team Hub transport arguments require a Hub identity")
+    elif expected_team_hub_transport is None:
+        if raw_team_hub_url is not None:
+            raise RuntimeError("legacy loopback Team Hub cannot have a remote URL")
+    elif expected_team_hub_transport == "loopback":
+        if raw_team_hub_url is None or expected_team_hub_url != "":
+            raise RuntimeError("loopback Team Hub cannot have a remote URL")
+        expected_team_hub_url = None
+    elif expected_team_hub_transport == "tailscale_serve":
+        if expected_team_hub_url is None:
+            raise RuntimeError("Tailscale Serve Team Hub requires its exact URL")
+        try:
+            from team_hub_host import (  # Imported only for the managed-Hub path.
+                TEAM_HUB_MODE_HOST,
+                configured_team_hub_endpoint,
+            )
+
+            resolved_transport, resolved_url, _host, config_error = (
+                configured_team_hub_endpoint(
+                    TEAM_HUB_MODE_HOST,
+                    expected_team_hub_url,
+                )
+            )
+        except Exception as exc:
+            raise RuntimeError("could not validate the expected Team Hub URL") from exc
+        if (
+            config_error is not None
+            or resolved_transport != expected_team_hub_transport
+            or resolved_url != expected_team_hub_url
+        ):
+            raise RuntimeError("expected Team Hub URL is invalid")
+    else:
+        raise RuntimeError("managed Team Hub transport is invalid")
     update_status(
         status_path,
         expected_update_id=update_id,
@@ -782,6 +874,15 @@ def run_update(args: argparse.Namespace) -> None:
                     "--team-hub-operation-id", update_id,
                 ]
             )
+            if expected_team_hub_transport is not None:
+                command.extend(
+                    [
+                        "--expected-team-hub-transport",
+                        expected_team_hub_transport,
+                        "--expected-team-hub-url",
+                        expected_team_hub_url or "",
+                    ]
+                )
         assert_server_idle(args.port, token=auth_token)
         update_status(
             status_path,
@@ -798,12 +899,18 @@ def run_update(args: argparse.Namespace) -> None:
             version=version,
             expected_update_id=update_id,
         )
-        assert_post_update_identity(
-            args.port,
-            token=auth_token,
-            expected_server_identity=expected_server_identity,
-            expected_team_hub_id=expected_team_hub_id,
-        )
+        identity_arguments: dict[str, Any] = {
+            "token": auth_token,
+            "expected_server_identity": expected_server_identity,
+            "expected_team_hub_id": expected_team_hub_id,
+        }
+        if expected_team_hub_transport is not None:
+            identity_arguments["expected_team_hub_transport"] = (
+                expected_team_hub_transport
+            )
+        if expected_team_hub_url is not None:
+            identity_arguments["expected_team_hub_url"] = expected_team_hub_url
+        assert_post_update_identity(args.port, **identity_arguments)
         # install.sh owns the success clear while it can still stop the
         # candidate, restore the verified snapshot, and restart the old
         # release. The runner clears only failures before install starts.
@@ -832,6 +939,8 @@ def main() -> int:
     parser.add_argument("--expected-server-identity", required=True)
     parser.add_argument("--update-id", required=True)
     parser.add_argument("--expected-team-hub-id")
+    parser.add_argument("--expected-team-hub-transport")
+    parser.add_argument("--expected-team-hub-url")
     parser.add_argument("--team-hub-snapshot")
     parser.add_argument("--team-hub-data-dir")
     args = parser.parse_args()

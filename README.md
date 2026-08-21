@@ -174,44 +174,79 @@ manifest and the archive SHA-256, installs into a versioned directory, restarts
 the user service, and accepts the release only after authenticated health
 passes. The previous healthy release remains available for automatic rollback.
 
-### Local Team Hub preview
+### Team Hub preview
 
-AgentsServer `0.1.25-beta.2` can designate one installed server as the Team Hub
+AgentsServer `0.1.25-beta.3` can designate one installed server as the Team Hub
 host. Team Hub runs inside that AgentsServer process and listener; there is no
-second service or separate `uv` command to keep running. Enable it on exactly
-one local development server with:
+second service or separate `uv` command to keep running. For same-machine use,
+enable it on exactly one development server with:
 
 ```bash
 ./install.sh --team-hub-host
 ```
 
-The choice is preserved by later installs and managed updates. A fresh server
-with no Hub database may be designated with `--team-hub-host`. Direct adoption
-or reactivation of existing Hub state is refused because it cannot provide the
-snapshot-bound rollback contract. `--no-team-hub-host` stops serving an
-existing Hub but preserves its data; this beta has no direct reactivation path,
-so use it only when you intend to keep the Hub offline pending a signed managed
-recovery or support-assisted restoration. This beta preview is intentionally
-local-host-only: connect the desktop preview through the loopback AgentsServer
-profile on the same Mac. Remote Team Hub transport and multi-host enrollment
-are deferred; ordinary AgentsServer chat access can still use the existing
-private-network setup described below. Do not expose or reverse-proxy
-`/api/team-hub`: non-loopback Team Hub requests are rejected even when the
-ordinary AgentsServer listener is bound to `0.0.0.0` or a Tailscale interface.
+For private remote access, expose only the existing listener through a
+tailnet-only Tailscale Serve HTTPS port that Tailscale Funnel cannot use, then
+bind the exact canonical URL during the host install. For example:
 
-An existing beta.1 installation first updates to beta.2 with Team Hub disabled.
-While the server is idle and before any Hub database exists, designate only the
-chosen local host by running:
+```bash
+tailscale serve --bg --https=8444 http://127.0.0.1:7850
+
+./install.sh --non-interactive \
+  --team-hub-tailscale-serve-url \
+  https://my-server.my-tailnet.ts.net:8444/api/team-hub
+```
+
+The installer persists and verifies the exact Team Hub transport and URL but
+does not alter Tailscale configuration. Confirm separately that the exact 8444
+mapping appears under `Web` in `tailscale serve status --json`, and run
+`tailscale funnel status` to confirm Team Hub's `:8444` mapping is not public;
+unrelated mappings may remain untouched. Do not use Funnel, a direct
+`100.x:7850` URL, a generic reverse proxy, or one of Funnel's supported ports
+(`443`, `8443`, or `10000`).
+The ordinary AgentsServer endpoint and any unrelated Serve/Funnel mappings are
+unchanged.
+
+If the host install fails or you abandon this setup, remove only that listener:
+
+```bash
+tailscale serve --https=8444 off
+```
+
+The host choice and transport are preserved by later installs and managed
+updates. A fresh server with no Hub database may be designated directly.
+Direct adoption or reactivation of existing Hub state is refused unless the
+operation has the snapshot-bound rollback contract. `--no-team-hub-host`
+stops serving an existing Hub but preserves its data; use it only when you
+intend to keep the Hub offline pending a signed managed recovery or
+support-assisted restoration.
+
+An existing beta.2 host remains loopback-only during a normal managed update;
+an origin change is never inferred from mutable environment state. The remote
+command above is for a fresh, disabled server with no Hub database. Do not use
+it to re-home existing Team Hub state: changing the origin of an existing Hub
+requires a separate signed, snapshot-protected migration. Leave every other
+server disabled.
+
+The desktop discovers the separate Hub URL through authenticated AgentsServer
+health. `Start Teamspace` asks the active AgentsServer for a short-lived,
+one-time enrollment grant and redeems it directly with Team Hub over the
+verified Serve origin. The AgentsServer bearer authorizes that one narrow
+parent bootstrap-grant endpoint, but it is never accepted as a Team Hub
+credential; Team Hub credentials likewise never authorize ordinary
+AgentsServer routes. Grant issuance additionally requires the exact configured
+private Serve origin and its verified Tailnet identity. Remote clients must
+select the designated host's server profile; switching profiles closes
+Teamspace instead of carrying its state to another server.
+
+For a loopback host, the equivalent installed command is:
 
 ```bash
 ~/.local/share/agents-server/current/install.sh \
   --non-interactive --team-hub-host
 ```
 
-Leave every other server disabled; do not preseed or enable host mode on a
-client node.
-
-The installed release also provides the local operator controls; no repository
+The installed release also provides host operator controls; no repository
 checkout or separate service is needed. These commands print the path to an
 owner-only proof file, never the proof secret itself:
 

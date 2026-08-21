@@ -1,10 +1,12 @@
 import asyncio
 import hashlib
+import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import threading
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -12,12 +14,23 @@ from fastapi.testclient import TestClient
 from team_hub_host import (
     TEAM_HUB_MODE_DISABLED,
     TEAM_HUB_MODE_HOST,
+    TEAM_HUB_TRANSPORT_TAILSCALE_SERVE,
     ManagedTeamHubHost,
+    configured_team_hub_endpoint,
 )
 from agentsdock_team_hub.store import HubStore
 
 
 HOST_ID = "server-managed-host-12345678"
+TAILNET_HOST = "sonic.example.ts.net"
+TAILNET_HUB_URL = f"https://{TAILNET_HOST}:8444/api/team-hub"
+TAILNET_HEADERS = {
+    "X-Forwarded-Host": f"{TAILNET_HOST}:8444",
+    "X-Forwarded-Proto": "https",
+    "Tailscale-Headers-Info": "https://tailscale.com/s/serve-headers",
+    "Tailscale-User-Login": "owner@example.com",
+    "Tailscale-User-Name": "Owner",
+}
 
 
 def host(root: Path) -> ManagedTeamHubHost:
@@ -29,7 +42,47 @@ def host(root: Path) -> ManagedTeamHubHost:
     )
 
 
+def tailnet_host(root: Path, instance_id: str) -> ManagedTeamHubHost:
+    return ManagedTeamHubHost(
+        mode=TEAM_HUB_MODE_HOST,
+        data_dir=root,
+        server_identity=HOST_ID,
+        server_instance_id=instance_id,
+        allowed_hosts={"localhost", "127.0.0.1", TAILNET_HOST},
+        transport=TEAM_HUB_TRANSPORT_TAILSCALE_SERVE,
+        hub_url=TAILNET_HUB_URL,
+    )
+
+
 class ManagedTeamHubHostTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tailnet_endpoint_configuration_is_exact_and_fail_closed(self) -> None:
+        self.assertEqual(
+            configured_team_hub_endpoint(TEAM_HUB_MODE_HOST, TAILNET_HUB_URL),
+            ("tailscale_serve", TAILNET_HUB_URL, TAILNET_HOST, None),
+        )
+        for invalid in (
+            "http://sonic.example.ts.net:8444/api/team-hub",
+            "https://sonic.example.ts.net/api/team-hub",
+            "https://sonic.example.ts.net:443/api/team-hub",
+            "https://100.73.184.23:8444/api/team-hub",
+            "https://a.ts.net:8444/api/team-hub",
+            "https://xn--sonic.example.ts.net:8444/api/team-hub",
+            "https://SONIC.example.ts.net:8444/api/team-hub",
+            "https://sonic.example.ts.net.:8444/api/team-hub",
+            "https://user:secret@sonic.example.ts.net:8444/api/team-hub",
+            "https://sonic.example.ts.net:8444/api/team-hub/",
+            "https://sonic.example.ts.net:8444/api/team-hub?token=secret",
+            "https://sonic.example.ts.net:8444/api/team-hub#fragment",
+        ):
+            transport, hub_url, host_name, error = configured_team_hub_endpoint(
+                TEAM_HUB_MODE_HOST,
+                invalid,
+            )
+            self.assertIsNone(transport, invalid)
+            self.assertIsNone(hub_url, invalid)
+            self.assertIsNone(host_name, invalid)
+            self.assertIsNotNone(error, invalid)
+
     async def test_disabled_host_creates_no_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "hub"
@@ -185,6 +238,328 @@ class ManagedTeamHubHostTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(server_bearer.status_code, 401)
             await runtime.shutdown()
 
+    async def test_tailnet_serve_transport_is_exact_and_direct_listener_is_denied(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = tailnet_host(Path(temporary) / "hub", "server-instance-one")
+            runtime.initialize()
+            application = FastAPI()
+            application.mount("/api/team-hub", runtime)
+
+            serve = TestClient(
+                application,
+                base_url=f"http://{TAILNET_HOST}:8444",
+                client=("127.0.0.1", 41000),
+            )
+            health = serve.get("/api/team-hub/v1/health", headers=TAILNET_HEADERS)
+            self.assertEqual(health.status_code, 200, health.text)
+
+            local = TestClient(
+                application,
+                base_url="http://localhost",
+                client=("127.0.0.1", 41001),
+            )
+            self.assertEqual(local.get("/api/team-hub/v1/health").status_code, 200)
+
+            direct = TestClient(
+                application,
+                base_url=f"http://{TAILNET_HOST}:7850",
+                client=("100.73.184.23", 41002),
+            )
+            forged = direct.get(
+                "/api/team-hub/v1/health",
+                headers={**TAILNET_HEADERS, "Host": f"{TAILNET_HOST}:8444"},
+            )
+            self.assertEqual(forged.status_code, 403)
+
+            missing_identity = serve.get(
+                "/api/team-hub/v1/health",
+                headers={
+                    key: value
+                    for key, value in TAILNET_HEADERS.items()
+                    if key != "Tailscale-User-Login"
+                },
+            )
+            self.assertEqual(missing_identity.status_code, 403)
+            funnel = serve.get(
+                "/api/team-hub/v1/health",
+                headers={**TAILNET_HEADERS, "Tailscale-Funnel-Request": "?1"},
+            )
+            self.assertEqual(funnel.status_code, 403)
+            duplicate_xfh = serve.get(
+                "/api/team-hub/v1/health",
+                headers=[
+                    *TAILNET_HEADERS.items(),
+                    ("X-Forwarded-Host", f"{TAILNET_HOST}:8444"),
+                ],
+            )
+            self.assertEqual(duplicate_xfh.status_code, 403)
+            await runtime.shutdown()
+
+    async def test_tailnet_rate_limits_aggregate_by_login_not_proxy_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = tailnet_host(Path(temporary) / "hub", "server-instance-limits")
+            runtime.initialize()
+            application = FastAPI()
+            application.mount("/api/team-hub", runtime)
+            serve = TestClient(
+                application,
+                base_url=f"http://{TAILNET_HOST}:8444",
+                client=("127.0.0.1", 41010),
+            )
+            for _index in range(30):
+                response = serve.post(
+                    "/api/team-hub/v1/sessions/refresh",
+                    headers=TAILNET_HEADERS,
+                    json={"refresh_token": "invalid-refresh-token-long-enough"},
+                )
+                self.assertEqual(response.status_code, 401, response.text)
+            other_login = serve.post(
+                "/api/team-hub/v1/sessions/refresh",
+                headers={
+                    **TAILNET_HEADERS,
+                    "Tailscale-User-Login": "other@example.com",
+                    "Tailscale-User-Name": "Other",
+                },
+                json={"refresh_token": "invalid-refresh-token-long-enough"},
+            )
+            self.assertEqual(other_login.status_code, 401, other_login.text)
+            same_login = serve.post(
+                "/api/team-hub/v1/sessions/refresh",
+                headers={**TAILNET_HEADERS, "Tailscale-User-Name": "Renamed Owner"},
+                json={"refresh_token": "invalid-refresh-token-long-enough"},
+            )
+            self.assertEqual(same_login.status_code, 429, same_login.text)
+            await runtime.shutdown()
+
+    async def test_remote_bootstrap_is_bound_idempotent_and_restart_invalidated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "hub"
+            first = tailnet_host(root, "server-instance-one")
+            first.initialize()
+            request_id = "f0d9a2d4-2e0f-43d8-bab6-f4934ef74677"
+            grant = await first.issue_tailnet_bootstrap_proof(
+                request_id=request_id,
+                server_identity=HOST_ID,
+                server_instance_id="server-instance-one",
+                hub_url=TAILNET_HUB_URL,
+                tailnet_login="owner@example.com",
+                recipient_email="OWNER@example.com",
+                display_name="Owner",
+                device_label="Owner Mac",
+            )
+            repeated = await first.issue_tailnet_bootstrap_proof(
+                request_id=request_id,
+                server_identity=HOST_ID,
+                server_instance_id="server-instance-one",
+                hub_url=TAILNET_HUB_URL,
+                tailnet_login="owner@example.com",
+                recipient_email="owner@example.com",
+                display_name="Owner",
+                device_label="Owner Mac",
+            )
+            self.assertEqual(repeated, grant)
+            self.assertTrue(grant["bootstrap_proof"].startswith("bootstrap_remote."))
+            self.assertFalse((root / "bootstrap-owner.proof").exists())
+            connection = first.store.connect()  # type: ignore[union-attr]
+            try:
+                row = connection.execute(
+                    """
+                    SELECT c.token_hash, d.request_id
+                    FROM bootstrap_claims AS c
+                    JOIN bootstrap_delegations AS d ON d.bootstrap_claim_id = c.id
+                    WHERE c.revoked_at IS NULL
+                    """
+                ).fetchone()
+                self.assertEqual(row["request_id"], request_id)
+                self.assertIsInstance(row["token_hash"], bytes)
+                self.assertNotIn(grant["bootstrap_proof"], str(dict(row)))
+            finally:
+                connection.close()
+
+            await first.shutdown()
+            second = tailnet_host(root, "server-instance-two")
+            second.initialize()
+            application = FastAPI()
+            application.mount("/api/team-hub", second)
+            serve = TestClient(
+                application,
+                base_url=f"http://{TAILNET_HOST}:8444",
+                client=("127.0.0.1", 41003),
+            )
+            stale = serve.post(
+                "/api/team-hub/v1/bootstrap/redeem",
+                headers={
+                    **TAILNET_HEADERS,
+                    "X-Team-Hub-Bootstrap-Proof": grant["bootstrap_proof"],
+                    "X-Team-Hub-Bootstrap-Request-Id": request_id,
+                },
+                json={
+                    "email": "owner@example.com",
+                    "display_name": "Owner",
+                    "device_label": "Owner Mac",
+                },
+            )
+            self.assertEqual(stale.status_code, 403, stale.text)
+            self.assertTrue((root / "bootstrap-owner.proof").is_file())
+            await second.shutdown()
+
+    async def test_remote_bootstrap_issuance_is_rate_limited_per_tailnet_login(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = tailnet_host(Path(temporary) / "hub", "server-instance-rate")
+            runtime.initialize()
+            arguments = {
+                "request_id": "b62c156c-ffbf-413b-82fc-02bc63a27c70",
+                "server_identity": HOST_ID,
+                "server_instance_id": "server-instance-rate",
+                "hub_url": TAILNET_HUB_URL,
+                "tailnet_login": "owner@example.com",
+                "recipient_email": "owner@example.com",
+                "display_name": "Owner",
+                "device_label": "Owner Mac",
+            }
+            for _index in range(8):
+                await runtime.issue_tailnet_bootstrap_proof(**arguments)
+            with self.assertRaisesRegex(Exception, "Too many bootstrap proof requests"):
+                await runtime.issue_tailnet_bootstrap_proof(**arguments)
+            self.assertLessEqual(len(runtime._bootstrap_rate_buckets), 4096)
+            await runtime.shutdown()
+
+    async def test_remote_bootstrap_ledger_has_a_hard_durable_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = tailnet_host(Path(temporary) / "hub", "server-instance-cap")
+            runtime.initialize()
+            arguments = {
+                "request_id": "d4280d43-8ddd-498f-8bc8-bbf23491ec24",
+                "server_identity": HOST_ID,
+                "server_instance_id": "server-instance-cap",
+                "hub_url": TAILNET_HUB_URL,
+                "tailnet_login": "owner@example.com",
+                "recipient_email": "owner@example.com",
+                "display_name": "Owner",
+                "device_label": "Owner Mac",
+            }
+            with patch("agentsdock_team_hub.store.MAX_BOOTSTRAP_DELEGATION_LEDGER_ROWS", 1):
+                await runtime.issue_tailnet_bootstrap_proof(**arguments)
+                connection = runtime.store.connect()  # type: ignore[union-attr]
+                try:
+                    connection.execute(
+                        """
+                        UPDATE bootstrap_claims SET revoked_at = created_at
+                        WHERE revoked_at IS NULL AND consumed_at IS NULL
+                        """
+                    )
+                finally:
+                    connection.close()
+                with self.assertRaisesRegex(Exception, "issuance is exhausted"):
+                    await runtime.issue_tailnet_bootstrap_proof(
+                        **{
+                            **arguments,
+                            "request_id": "8705a415-7f91-43a7-a591-14302d98c6d2",
+                        }
+                    )
+            await runtime.shutdown()
+
+    async def test_remote_bootstrap_mutation_participates_in_maintenance_drain(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = tailnet_host(Path(temporary) / "hub", "server-instance-drain")
+            runtime.initialize()
+            expected_hub_id = str(runtime.capability()["hub_id"])
+            started = threading.Event()
+            release = threading.Event()
+            original = runtime.store.issue_tailnet_bootstrap_proof  # type: ignore[union-attr]
+
+            def delayed(**kwargs):
+                started.set()
+                if not release.wait(timeout=5):
+                    raise RuntimeError("test grant release timed out")
+                return original(**kwargs)
+
+            runtime.store.issue_tailnet_bootstrap_proof = delayed  # type: ignore[method-assign,union-attr]
+            issuance = asyncio.create_task(
+                runtime.issue_tailnet_bootstrap_proof(
+                    request_id="05e5c547-9bd5-4571-ac5c-b69834b40a6e",
+                    server_identity=HOST_ID,
+                    server_instance_id="server-instance-drain",
+                    hub_url=TAILNET_HUB_URL,
+                    tailnet_login="owner@example.com",
+                    recipient_email="owner@example.com",
+                    display_name="Owner",
+                    device_label="Owner Mac",
+                )
+            )
+            self.assertTrue(await asyncio.to_thread(started.wait, 5))
+            maintenance = asyncio.create_task(
+                runtime.prepare_maintenance(
+                    "server-update",
+                    operation_id="bootstrap-drain-test",
+                )
+            )
+            await asyncio.sleep(0.05)
+            self.assertFalse(maintenance.done())
+            release.set()
+            grant = await issuance
+            snapshot = await maintenance
+            self.assertIsNotNone(snapshot)
+            self.assertTrue(snapshot.is_dir())  # type: ignore[union-attr]
+            manifest = json.loads((snapshot / "manifest.json").read_text())  # type: ignore[operator]
+            self.assertEqual(manifest["proofs"], [])
+            copied = sqlite3.connect(snapshot / "team-hub.sqlite3")  # type: ignore[operator]
+            try:
+                copied.row_factory = sqlite3.Row
+                claim = copied.execute(
+                    """
+                    SELECT c.revoked_at
+                    FROM bootstrap_claims AS c
+                    JOIN bootstrap_delegations AS d
+                      ON d.bootstrap_claim_id = c.id
+                    WHERE d.request_id = ?
+                    """,
+                    (grant["request_id"],),
+                ).fetchone()
+                self.assertIsNotNone(claim["revoked_at"])
+            finally:
+                copied.close()
+            HubStore.verify_maintenance_snapshot(
+                runtime.data_dir,
+                snapshot,  # type: ignore[arg-type]
+                expected_host_identity=HOST_ID,
+                expected_hub_id=expected_hub_id,
+                expected_operation_id="bootstrap-drain-test",
+            )
+            await runtime.shutdown()
+            HubStore.restore_maintenance_snapshot(
+                runtime.data_dir,
+                snapshot,  # type: ignore[arg-type]
+                expected_host_identity=HOST_ID,
+                expected_hub_id=expected_hub_id,
+                expected_operation_id="bootstrap-drain-test",
+            )
+            restored = tailnet_host(runtime.data_dir, "server-instance-restored")
+            restored.initialize()
+            application = FastAPI()
+            application.mount("/api/team-hub", restored)
+            serve = TestClient(
+                application,
+                base_url=f"http://{TAILNET_HOST}:8444",
+                client=("127.0.0.1", 41011),
+            )
+            stale = serve.post(
+                "/api/team-hub/v1/bootstrap/redeem",
+                headers={
+                    **TAILNET_HEADERS,
+                    "X-Team-Hub-Bootstrap-Proof": grant["bootstrap_proof"],
+                    "X-Team-Hub-Bootstrap-Request-Id": grant["request_id"],
+                },
+                json={
+                    "email": "owner@example.com",
+                    "display_name": "Owner",
+                    "device_label": "Owner Mac",
+                },
+            )
+            self.assertEqual(stale.status_code, 403, stale.text)
+            self.assertTrue((runtime.data_dir / "bootstrap-owner.proof").is_file())
+            await restored.shutdown()
+
     async def test_same_operation_terminal_fence_blocks_posts_across_host_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "hub"
@@ -224,7 +599,7 @@ class ManagedTeamHubHostTests(unittest.IsolatedAsyncioTestCase):
             await second.shutdown()
 
 class VendoredTeamHubParityTests(unittest.TestCase):
-    def test_vendored_runtime_matches_canonical_source_without_generated_files(self) -> None:
+    def test_vendored_runtime_matches_frozen_source_manifest_without_generated_files(self) -> None:
         server_root = Path(__file__).parent
         vendored = server_root / "agentsdock_team_hub"
         expected = {
@@ -236,17 +611,30 @@ class VendoredTeamHubParityTests(unittest.TestCase):
             "migrations/0002_teamspace_ledger.sql": "9681100d3d6eb3986e133d761ce9d000dbcf10b5e50954c96bd168391ecacbf3",
             "migrations/0003_service_runtime.sql": "e7668e2748a581a07aeaea78e78db3a62c6c28040881ab2b696b5d5de5ab34cc",
             "migrations/0004_managed_host_binding.sql": "6984cc095f23059c38c68092217254eb1419bae45287b4e3ab1217c60eb78696",
+            "migrations/0005_tailnet_bootstrap_delegations.sql": "e47d25ea16353d023355cf875d008808cd3742cd038569abfb9607556cdbd09b",
             "migrations/__init__.py": "aaf340c45c8d39c2939814977ba4cef8eb6b3bd0671b0f7542ebe06f5431d6ec",
             "security.py": "0c1895c7443e7be07a2f53c7e4c4228e3ee04c65d6cd36f039b7bbba1813e4fa",
-            "service.py": "5869d77ca3dc8c7c8a1e3ccc70cad1306c5dd633a3cbd035934e12503792d66d",
-            "store.py": "16face427a63ca8289007c9f738d7473c237b71a3c64f5945192e947dded1b1f",
+            "service.py": "6932497ce860c4abdbef63e97dd9bda85199e6a3d0c4b40d0ee67140608e6f20",
+            "store.py": "82cf921360cc643e84dcbd2221fd8c85574b2d58cb70c7fc50590cdfb52d4fd3",
         }
+        entries = list(vendored.rglob("*"))
+        for path in entries:
+            self.assertFalse(path.is_symlink(), path)
+            self.assertTrue(path.is_file() or path.is_dir(), path)
+        self.assertEqual(
+            {path.relative_to(vendored).as_posix() for path in entries if path.is_dir()},
+            {"migrations"},
+        )
+        files = [path for path in entries if path.is_file()]
+        self.assertEqual(
+            {path.relative_to(vendored).as_posix() for path in files},
+            set(expected),
+        )
         actual = {
             path.relative_to(vendored).as_posix(): hashlib.sha256(
                 path.read_bytes()
             ).hexdigest()
-            for path in vendored.rglob("*")
-            if path.is_file() and "__pycache__" not in path.parts
+            for path in files
         }
         self.assertEqual(actual, expected)
 

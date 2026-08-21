@@ -98,9 +98,11 @@ from team_hub_host import (
     TEAM_HUB_MODE_HOST,
     TEAM_HUB_MOUNT_PATH,
     ManagedTeamHubHost,
+    configured_team_hub_endpoint,
     configured_team_hub_hosts,
     configured_team_hub_mode,
 )
+from agentsdock_team_hub.store import HubError
 
 try:
     import tomllib
@@ -3174,6 +3176,42 @@ def request_header_authorized(request: Request) -> bool:
     )
 
 
+def request_exact_bearer_authorized(request: Request) -> bool:
+    """Accept exactly one canonical Agent bearer and no alternate realm."""
+
+    if not AGENT_TOKEN or "token" in request.query_params:
+        return False
+    raw_headers = request.scope.get("headers", [])
+    names = [bytes(name).lower() for name, _value in raw_headers]
+    if (
+        b"x-agentsdock-token" in names
+        or b"x-zenithdock-token" in names
+        or b"cookie" in names
+    ):
+        return False
+    values = [
+        value
+        for name, value in raw_headers
+        if bytes(name).lower() == b"authorization"
+    ]
+    if len(values) != 1:
+        return False
+    try:
+        authorization = values[0].decode("ascii")
+    except UnicodeDecodeError:
+        return False
+    if not authorization.startswith("Bearer "):
+        return False
+    candidate = authorization[7:]
+    if (
+        not candidate
+        or candidate != candidate.strip()
+        or any(char.isspace() for char in candidate)
+    ):
+        return False
+    return hmac.compare_digest(candidate, AGENT_TOKEN)
+
+
 def network_host_is_loopback(host: str) -> bool:
     try:
         address = ipaddress.ip_address(host)
@@ -3872,6 +3910,40 @@ class ServerRestartRequest(BaseModel):
     expected_server_identity: str = Field(min_length=1, max_length=128)
     expected_server_instance_id: str = Field(min_length=1, max_length=128)
     confirmed: Literal[True]
+
+    @field_validator("confirmed", mode="before")
+    @classmethod
+    def require_literal_boolean_true(cls, value: Any) -> Any:
+        if value is not True:
+            raise ValueError("confirmed must be the JSON boolean true")
+        return value
+
+
+class TeamHubBootstrapProofRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    request_id: uuid.UUID
+    expected_server_identity: str = Field(min_length=8, max_length=240)
+    expected_server_instance_id: str = Field(min_length=8, max_length=240)
+    expected_hub_id: str = Field(min_length=8, max_length=240)
+    expected_hub_url: str = Field(min_length=16, max_length=2048)
+    confirmed: Literal[True]
+    recipient_email: str = Field(min_length=3, max_length=320)
+    display_name: str = Field(min_length=1, max_length=160)
+    device_label: str = Field(min_length=1, max_length=160)
+
+    @field_validator("request_id", mode="before")
+    @classmethod
+    def require_canonical_uuid_v4(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            raise ValueError("request_id must be a canonical UUIDv4 string")
+        try:
+            parsed = uuid.UUID(value)
+        except (ValueError, AttributeError) as exc:
+            raise ValueError("request_id must be a canonical UUIDv4 string") from exc
+        if parsed.version != 4 or str(parsed) != value:
+            raise ValueError("request_id must be a canonical UUIDv4 string")
+        return value
 
     @field_validator("confirmed", mode="before")
     @classmethod
@@ -36377,6 +36449,7 @@ SERVER_RESTART_SIGNAL_DELAY_SECONDS = 0.5
 SERVER_RESTART_ACCEPTED_STALE_SECONDS = 10.0
 SERVER_RESTART_COOLDOWN_SECONDS = 30.0
 SERVER_RESTART_MAX_BODY_BYTES = 2_048
+TEAM_HUB_BOOTSTRAP_MAX_BODY_BYTES = 4_096
 UNSAFE_HTTP_MUTATION_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 UNSAFE_HTTP_MUTATION_ADMISSION_LOCK = asyncio.Lock()
 UNSAFE_HTTP_MUTATIONS_IN_FLIGHT = 0
@@ -36896,8 +36969,36 @@ def _verify_server_update_team_hub_identity(status: dict[str, Any]) -> None:
     expected_host_identity = str(
         status.get("team_hub_host_server_identity") or ""
     ).strip()
+    expected_transport = str(status.get("team_hub_transport") or "").strip()
+    expected_hub_url_value = status.get("team_hub_url")
+    expected_hub_url = (
+        str(expected_hub_url_value).strip()
+        if expected_hub_url_value is not None
+        else None
+    )
     snapshot = _server_update_team_hub_snapshot(status)
     capability = TEAM_HUB_RUNTIME.capability()
+    actual_transport = str(capability.get("transport") or "").strip()
+    actual_hub_url = capability.get("hub_url")
+    # Records written before transport binding are accepted only for the old
+    # loopback realm. A remote Hub can never be adopted through legacy status.
+    transport_matches = (
+        actual_transport in {"", "loopback"} and actual_hub_url is None
+        if not expected_transport
+        else actual_transport == expected_transport
+        and (
+            (
+                expected_transport == "loopback"
+                and actual_hub_url is None
+                and expected_hub_url is None
+            )
+            or (
+                expected_transport == "tailscale_serve"
+                and expected_hub_url
+                and actual_hub_url == expected_hub_url
+            )
+        )
+    )
     if (
         snapshot is None
         or not expected_host_identity
@@ -36906,6 +37007,7 @@ def _verify_server_update_team_hub_identity(status: dict[str, Any]) -> None:
         or capability.get("hub_id") != expected_hub_id
         or capability.get("host_server_identity") != expected_host_identity
         or expected_host_identity != server_identity()
+        or not transport_matches
     ):
         raise RuntimeError("updated server lost its designated Team Hub identity")
 
@@ -37130,15 +37232,32 @@ async def signed_release_manifest(
 TEAM_HUB_MODE, TEAM_HUB_CONFIG_ERROR = configured_team_hub_mode(
     os.environ.get("AGENTSDOCK_TEAM_HUB_MODE")
 )
+(
+    TEAM_HUB_TRANSPORT,
+    TEAM_HUB_URL,
+    TEAM_HUB_PUBLIC_HOST,
+    TEAM_HUB_ENDPOINT_CONFIG_ERROR,
+) = configured_team_hub_endpoint(
+    TEAM_HUB_MODE,
+    os.environ.get("AGENTSDOCK_TEAM_HUB_URL"),
+)
+if TEAM_HUB_ENDPOINT_CONFIG_ERROR is not None:
+    TEAM_HUB_CONFIG_ERROR = TEAM_HUB_ENDPOINT_CONFIG_ERROR
 TEAM_HUB_DATA_DIR = STATE_DIR / "team-hub"
+TEAM_HUB_ALLOWED_HOSTS = configured_team_hub_hosts(
+    SERVER_BIND_ADDRESS,
+    os.environ.get("AGENTSDOCK_TEAM_HUB_ALLOWED_HOSTS"),
+)
+if TEAM_HUB_PUBLIC_HOST is not None:
+    TEAM_HUB_ALLOWED_HOSTS.add(TEAM_HUB_PUBLIC_HOST)
 TEAM_HUB_RUNTIME = ManagedTeamHubHost(
     mode=TEAM_HUB_MODE,
     data_dir=TEAM_HUB_DATA_DIR,
     server_identity=server_identity(),
-    allowed_hosts=configured_team_hub_hosts(
-        SERVER_BIND_ADDRESS,
-        os.environ.get("AGENTSDOCK_TEAM_HUB_ALLOWED_HOSTS"),
-    ),
+    server_instance_id=SERVER_INSTANCE_ID,
+    allowed_hosts=TEAM_HUB_ALLOWED_HOSTS,
+    transport=TEAM_HUB_TRANSPORT or "loopback",
+    hub_url=TEAM_HUB_URL,
     config_error=TEAM_HUB_CONFIG_ERROR,
     logger=logger,
 )
@@ -37281,6 +37400,63 @@ def server_restart_browser_request_forbidden(request: Request) -> bool:
     return bool(fetch_site and fetch_site != "none")
 
 
+def team_hub_bootstrap_browser_request_forbidden(request: Request) -> bool:
+    raw_headers = request.scope.get("headers", [])
+    mode_values = [
+        value
+        for name, value in raw_headers
+        if bytes(name).lower() == b"sec-fetch-mode"
+    ]
+    if mode_values not in ([], [b"cors"]):
+        return True
+    return any(
+        bytes(name).lower() == b"origin"
+        or (
+            bytes(name).lower().startswith(b"sec-fetch-")
+            and bytes(name).lower() != b"sec-fetch-mode"
+        )
+        for name, _value in raw_headers
+    )
+
+
+def team_hub_bootstrap_post_transport_error(
+    request: Request,
+) -> tuple[int, str] | None:
+    raw_headers = request.scope.get("headers", [])
+    content_types = [
+        value
+        for name, value in raw_headers
+        if bytes(name).lower() == b"content-type"
+    ]
+    if content_types != [b"application/json"]:
+        return 415, "bootstrap proof requests require application/json"
+    if any(
+        bytes(name).lower() == b"transfer-encoding"
+        for name, _value in raw_headers
+    ):
+        return 400, "bootstrap proof requests do not accept transfer encoding"
+    content_lengths = [
+        value
+        for name, value in raw_headers
+        if bytes(name).lower() == b"content-length"
+    ]
+    if len(content_lengths) != 1:
+        return (
+            411 if not content_lengths else 400,
+            "bootstrap proof request content length is invalid",
+        )
+    try:
+        raw_length = content_lengths[0].decode("ascii")
+        size = int(raw_length, 10)
+    except (UnicodeDecodeError, ValueError):
+        return 400, "bootstrap proof request content length is invalid"
+    if raw_length != str(size) or size <= 0:
+        return 400, "bootstrap proof request content length is invalid"
+    if size > TEAM_HUB_BOOTSTRAP_MAX_BODY_BYTES:
+        return 413, "bootstrap proof request body is too large"
+    return None
+
+
 def server_restart_post_transport_error(request: Request) -> tuple[int, str] | None:
     """Validate bounded JSON transport metadata before route body parsing."""
 
@@ -37330,6 +37506,11 @@ async def require_agent_token(request: Request, call_next):
             },
             status_code=404,
         )
+    team_hub_bootstrap_route = (
+        request.url.path == "/api/admin/team-hub/bootstrap-proof"
+    )
+    if request.method == "OPTIONS" and team_hub_bootstrap_route:
+        return JSONResponse({"detail": "forbidden"}, status_code=403)
     if request.method == "OPTIONS" or not request.url.path.startswith("/api/"):
         return await call_next(request)
     team_hub_route = (
@@ -37348,7 +37529,34 @@ async def require_agent_token(request: Request, call_next):
             {"detail": "agent helper route is restricted to loopback clients"},
             status_code=403,
         )
-    if not team_hub_route and not agent_helper_route and not request_authorized(request):
+    if team_hub_bootstrap_route:
+        if team_hub_bootstrap_browser_request_forbidden(request):
+            return JSONResponse({"detail": "forbidden"}, status_code=403)
+        if not AGENT_TOKEN:
+            return JSONResponse(
+                {"detail": "Team Hub bootstrap proof issuance requires authenticated AgentsServer mode"},
+                status_code=503,
+            )
+        if not request_exact_bearer_authorized(request):
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+        serve_identity = TEAM_HUB_RUNTIME.tailscale_serve_identity(request)
+        if serve_identity is None:
+            return JSONResponse(
+                {"detail": "Team Hub bootstrap proof issuance requires verified private Tailscale Serve transport"},
+                status_code=403,
+            )
+        request.state.team_hub_tailnet_login = serve_identity.tailnet_login
+        if request.method.upper() == "POST":
+            transport_error = team_hub_bootstrap_post_transport_error(request)
+            if transport_error is not None:
+                status_code, detail = transport_error
+                return JSONResponse({"detail": detail}, status_code=status_code)
+    if (
+        not team_hub_route
+        and not agent_helper_route
+        and not team_hub_bootstrap_route
+        and not request_authorized(request)
+    ):
         logger.warning("unauthorized request method=%s path=%s host=%s", request.method, request.url.path, request.client.host if request.client else "-")
         return JSONResponse({"detail": "unauthorized"}, status_code=401)
 
@@ -37402,7 +37610,7 @@ async def require_agent_token(request: Request, call_next):
 
     async with UNSAFE_HTTP_MUTATION_ADMISSION_LOCK:
         if managed_server_restart_blocks_work():
-            if team_hub_route:
+            if team_hub_route or team_hub_bootstrap_route:
                 return JSONResponse(
                     {
                         "error": {
@@ -37424,7 +37632,7 @@ async def require_agent_token(request: Request, call_next):
                 status_code=409,
             )
         if managed_server_update_blocks_work():
-            if team_hub_route:
+            if team_hub_route or team_hub_bootstrap_route:
                 return JSONResponse(
                     {
                         "error": {
@@ -37908,6 +38116,71 @@ async def put_codex_goals_admin(
         finally:
             await release_codex_goals_reconfiguration()
         return {**codex_goals_admin_status(), **transition}
+
+
+def require_team_hub_bootstrap_control(request: Request) -> str:
+    if team_hub_bootstrap_browser_request_forbidden(request):
+        raise HTTPException(status_code=403, detail="forbidden")
+    if not AGENT_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="Team Hub bootstrap proof issuance requires authenticated AgentsServer mode",
+        )
+    if not request_exact_bearer_authorized(request):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    identity = TEAM_HUB_RUNTIME.tailscale_serve_identity(request)
+    if identity is None or identity.tailnet_login is None:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Team Hub bootstrap proof issuance requires verified private "
+                "Tailscale Serve transport"
+            ),
+        )
+    return identity.tailnet_login
+
+
+@app.post("/api/admin/team-hub/bootstrap-proof")
+async def team_hub_bootstrap_proof_endpoint(
+    body: TeamHubBootstrapProofRequest,
+    request: Request,
+) -> Response:
+    tailnet_login = require_team_hub_bootstrap_control(request)
+    capability = TEAM_HUB_RUNTIME.capability()
+    if (
+        not capability.get("available")
+        or capability.get("transport") != "tailscale_serve"
+        or str(capability.get("host_server_identity") or "")
+        != body.expected_server_identity
+        or SERVER_INSTANCE_ID != body.expected_server_instance_id
+        or str(capability.get("hub_id") or "") != body.expected_hub_id
+        or str(capability.get("hub_url") or "") != body.expected_hub_url
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="The designated Team Hub host changed before confirmation",
+        )
+    try:
+        result = await TEAM_HUB_RUNTIME.issue_tailnet_bootstrap_proof(
+            request_id=str(body.request_id),
+            server_identity=body.expected_server_identity,
+            server_instance_id=body.expected_server_instance_id,
+            hub_url=body.expected_hub_url,
+            tailnet_login=tailnet_login,
+            recipient_email=body.recipient_email,
+            display_name=body.display_name,
+            device_label=body.device_label,
+        )
+    except HubError as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": {"code": exc.code, "message": exc.message}},
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
+    return JSONResponse(
+        content=result,
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
 
 
 def require_server_restart_control(request: Request) -> None:
@@ -38402,12 +38675,31 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                         ["--expected-server-identity", expected_server_identity]
                     )
                     expected_hub_id: str | None = None
+                    expected_hub_transport: str | None = None
+                    expected_hub_url: str | None = None
                     if hub_snapshot is not None:
                         expected_hub_id = str(hub_capability.get("hub_id") or "")
+                        expected_hub_transport = str(
+                            hub_capability.get("transport") or ""
+                        )
+                        raw_hub_url = hub_capability.get("hub_url")
+                        expected_hub_url = (
+                            str(raw_hub_url) if raw_hub_url is not None else None
+                        )
                         if (
                             hub_capability.get("available") is not True
                             or hub_capability.get("designated_host") is not True
                             or not expected_hub_id
+                            or expected_hub_transport
+                            not in {"loopback", "tailscale_serve"}
+                            or (
+                                expected_hub_transport == "loopback"
+                                and expected_hub_url is not None
+                            )
+                            or (
+                                expected_hub_transport == "tailscale_serve"
+                                and not expected_hub_url
+                            )
                         ):
                             try:
                                 await TEAM_HUB_RUNTIME.clear_maintenance(
@@ -38425,6 +38717,10 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                             [
                                 "--expected-team-hub-id",
                                 expected_hub_id,
+                                "--expected-team-hub-transport",
+                                expected_hub_transport,
+                                "--expected-team-hub-url",
+                                expected_hub_url or "",
                                 "--team-hub-snapshot",
                                 str(hub_snapshot),
                                 "--team-hub-data-dir",
@@ -38450,6 +38746,8 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                             team_hub_snapshot_generation=(
                                 hub_snapshot.name if hub_snapshot is not None else None
                             ),
+                            team_hub_transport=expected_hub_transport,
+                            team_hub_url=expected_hub_url,
                             message=(
                                 f"Starting switch to {track} AgentsServer {requested}."
                                 if channel_switch

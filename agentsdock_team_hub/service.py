@@ -1,6 +1,8 @@
 """Strict loopback-first HTTP boundary for AgentsDock Team Hub V1."""
 
 import asyncio
+from dataclasses import dataclass
+import hashlib
 import ipaddress
 import json
 from pathlib import Path
@@ -8,6 +10,7 @@ import re
 import threading
 import time
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -21,6 +24,14 @@ from .store import AccessClaims, HubError, HubStore
 MAX_JSON_BODY_BYTES = 65_536
 BODY_READ_TIMEOUT_SECONDS = 10.0
 HOSTNAME_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+TAILSCALE_SERVE_HEADERS_INFO = "https://tailscale.com/s/serve-headers"
+
+
+@dataclass(frozen=True)
+class ManagedTransportIdentity:
+    kind: Literal["loopback", "tailscale_serve"]
+    tailnet_login: str | None = None
+    tailnet_user_name: str | None = None
 
 
 class _RateLimiter:
@@ -202,6 +213,74 @@ def _exact_ascii_header(request: Request, name: bytes) -> str | None:
         return None
 
 
+def classify_managed_transport(
+    request: Request,
+    *,
+    managed_transport: str,
+    managed_hub_url: str,
+) -> ManagedTransportIdentity | None:
+    """Classify only a direct loopback call or the configured Serve proxy.
+
+    Uvicorn deliberately runs with ``proxy_headers=False``. Therefore the
+    socket peer and ASGI scheme remain the local Serve proxy and ``http``;
+    forwarded values are evidence only when every Serve-owned header exactly
+    matches the one configured public origin.
+    """
+
+    if not _is_loopback_peer(request) or request.url.scheme != "http":
+        return None
+    raw_names = [key.lower() for key, _value in request.scope.get("headers", [])]
+    forwarded_names = {
+        b"forwarded",
+        b"x-forwarded-host",
+        b"x-forwarded-proto",
+        b"tailscale-user-login",
+        b"tailscale-user-name",
+        b"tailscale-headers-info",
+        b"tailscale-funnel-request",
+    }
+    if _has_loopback_authority(request):
+        if any(name in forwarded_names for name in raw_names):
+            return None
+        return ManagedTransportIdentity("loopback")
+    if managed_transport != "tailscale_serve":
+        return None
+    try:
+        parsed = urlsplit(managed_hub_url)
+    except ValueError:
+        return None
+    expected_authority = parsed.netloc
+    if (
+        parsed.scheme != "https"
+        or not expected_authority
+        or _exact_ascii_header(request, b"host") != expected_authority
+        or _exact_ascii_header(request, b"x-forwarded-host") != expected_authority
+        or _exact_ascii_header(request, b"x-forwarded-proto") != "https"
+        or _exact_ascii_header(request, b"tailscale-headers-info")
+        != TAILSCALE_SERVE_HEADERS_INFO
+        or b"tailscale-funnel-request" in raw_names
+        or b"forwarded" in raw_names
+    ):
+        return None
+    login = _exact_ascii_header(request, b"tailscale-user-login")
+    user_name = _exact_ascii_header(request, b"tailscale-user-name")
+    if (
+        login is None
+        or user_name is None
+        or login != login.strip().lower()
+        or not 3 <= len(login) <= 320
+        or "@" not in login
+        or not 1 <= len(user_name.strip()) <= 160
+        or any(ord(char) < 32 or ord(char) > 126 for char in login + user_name)
+    ):
+        return None
+    return ManagedTransportIdentity(
+        "tailscale_serve",
+        tailnet_login=login,
+        tailnet_user_name=user_name.strip(),
+    )
+
+
 def _mounted_route_path(request: Request) -> str:
     """Return the route-local path for standalone and mounted deployments."""
 
@@ -218,11 +297,16 @@ def create_app(
     allowed_hosts: set[str] | None = None,
     allowed_origins: set[str] | None = None,
     managed_host_identity: str | None = None,
+    managed_server_instance_id: str | None = None,
+    managed_transport: str | None = None,
+    managed_hub_url: str | None = None,
     require_https_for_non_loopback: bool = False,
     require_loopback_transport: bool = False,
 ) -> FastAPI:
     store = HubStore(
-        Path(data_dir), managed_host_identity=managed_host_identity
+        Path(data_dir),
+        managed_host_identity=managed_host_identity,
+        managed_server_instance_id=managed_server_instance_id,
     )
     hosts = allowed_hosts or {"127.0.0.1", "localhost", "[::1]", "::1"}
     origins = allowed_origins or set()
@@ -253,6 +337,23 @@ def create_app(
         host_name = _host_name(host_header)
         if host_name is None or host_name not in {item.lower() for item in hosts}:
             return _error("invalid_request", "Invalid Host header", 400)
+        managed_identity: ManagedTransportIdentity | None = None
+        if managed_transport is not None:
+            if managed_hub_url is None:
+                return _error("transport_configuration_invalid", "Transport is unavailable", 503)
+            managed_identity = classify_managed_transport(
+                request,
+                managed_transport=managed_transport,
+                managed_hub_url=managed_hub_url,
+            )
+            if managed_identity is None:
+                return _error(
+                    "local_preview_only",
+                    "Embedded Team Hub transport is not permitted",
+                    403,
+                )
+            request.state.team_hub_transport = managed_identity.kind
+            request.state.tailnet_login = managed_identity.tailnet_login
         origin_values = values.get(b"origin", [])
         if len(origin_values) > 1:
             return _error("origin_forbidden", "Origin is not permitted", 403)
@@ -301,6 +402,7 @@ def create_app(
                     "authorization",
                     "content-type",
                     "x-team-hub-bootstrap-proof",
+                    "x-team-hub-bootstrap-request-id",
                     "x-team-hub-device-recovery-proof",
                     "x-team-hub-owner-recovery-proof",
                 }
@@ -326,7 +428,16 @@ def create_app(
                     "Team Hub is unavailable during server maintenance",
                     503,
                 )
-            peer = request.client.host if request.client is not None else "unknown"
+            if (
+                managed_identity is not None
+                and managed_identity.kind == "tailscale_serve"
+                and managed_identity.tailnet_login is not None
+            ):
+                peer = "tailnet:" + hashlib.sha256(
+                    managed_identity.tailnet_login.encode("utf-8")
+                ).hexdigest()
+            else:
+                peer = request.client.host if request.client is not None else "unknown"
             route_path = _mounted_route_path(request)
             sensitive_limits = {
                 "/v1/bootstrap/redeem": 8,
@@ -437,12 +548,46 @@ def create_app(
 
     @app.post("/v1/bootstrap/redeem")
     def bootstrap(request: Request, body: BootstrapRequest) -> dict[str, Any]:
-        if not _is_loopback_peer(request) or not _has_loopback_authority(request):
-            raise HubError("bootstrap_unavailable", "Bootstrap is unavailable", 403)
         proof = _exact_ascii_header(request, b"x-team-hub-bootstrap-proof")
         if proof is None:
             raise HubError("bootstrap_unavailable", "Bootstrap is unavailable", 403)
-        return store.bootstrap(proof, body.email, body.display_name, body.device_label)
+        transport = getattr(request.state, "team_hub_transport", None)
+        if transport is None:
+            transport = (
+                "loopback"
+                if _is_loopback_peer(request) and _has_loopback_authority(request)
+                else None
+            )
+        if transport == "loopback":
+            if _exact_ascii_header(
+                request, b"x-team-hub-bootstrap-request-id"
+            ) is not None:
+                raise HubError("bootstrap_unavailable", "Bootstrap is unavailable", 403)
+            return store.bootstrap(
+                proof,
+                body.email,
+                body.display_name,
+                body.device_label,
+                transport="loopback",
+            )
+        if transport == "tailscale_serve":
+            request_id = _exact_ascii_header(
+                request, b"x-team-hub-bootstrap-request-id"
+            )
+            tailnet_login = getattr(request.state, "tailnet_login", None)
+            if request_id is None or tailnet_login is None or managed_hub_url is None:
+                raise HubError("bootstrap_unavailable", "Bootstrap is unavailable", 403)
+            return store.bootstrap(
+                proof,
+                body.email,
+                body.display_name,
+                body.device_label,
+                transport="tailscale_serve",
+                request_id=request_id,
+                tailnet_login=tailnet_login,
+                hub_url=managed_hub_url,
+            )
+        raise HubError("bootstrap_unavailable", "Bootstrap is unavailable", 403)
 
     @app.post("/v1/owner-recovery/redeem")
     def owner_recovery(request: Request, body: RedeemRecoveryRequest) -> dict[str, Any]:
@@ -455,8 +600,9 @@ def create_app(
 
     @app.post("/v1/device-recovery/redeem")
     def device_recovery(request: Request, body: RedeemRecoveryRequest) -> dict[str, Any]:
+        classified = getattr(request.state, "team_hub_transport", None)
         loopback_peer = _is_loopback_peer(request)
-        if (
+        if classified not in {"loopback", "tailscale_serve"} and (
             (loopback_peer and not _has_loopback_authority(request))
             or (not loopback_peer and request.url.scheme != "https")
         ):

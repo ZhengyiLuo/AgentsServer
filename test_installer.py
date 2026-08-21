@@ -1,7 +1,9 @@
+import hashlib
 import json
 import os
 import shutil
 import socket
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -13,6 +15,7 @@ import re
 import tomllib
 from pathlib import Path
 
+from agentsdock_team_hub.store import HubStore
 from scripts import package_release
 
 
@@ -1533,6 +1536,278 @@ chmod 755 "$project/.venv/bin/python"
             self.assertIn("--expected-operation-id", restore_event)
             self.assertIn(operation_id, restore_event)
             self.assertTrue(any(value.startswith("verify-snapshot:") for value in events))
+
+    def test_beta2_schema4_managed_host_upgrades_with_exact_identity_and_secrets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            event_log = root / "events.log"
+            migration_sentinel = root / "candidate-hub-opened"
+            self.write_exact_health_uv(fake_bin)
+            self.write_json_health_curl(fake_bin)
+            self.write_event_systemctl(fake_bin)
+            server_identity = "server_beta2_schema4_success_12345678"
+            operation_id = "update_beta2_schema4_success_12345678"
+            hub_data = root / "state" / "team-hub"
+            store, snapshot = self.prepare_real_managed_hub_fixture(
+                install_root,
+                hub_data,
+                operation_id=operation_id,
+                server_identity=server_identity,
+                schema_version=4,
+            )
+            hub_id = store.hub_id
+            expected_key = store.signing_key_path.read_bytes()
+            expected_proof = store.bootstrap_proof_path.read_bytes()
+            config_root = root / "config"
+            config_root.mkdir()
+            (config_root / "env").write_text(
+                "AGENTSDOCK_AGENT_TOKEN=preserved_token_abcdefghijklmnopqrstuvwxyz0123456789\n"
+                "AGENTSDOCK_AGENT_PORT=7850\n"
+                "AGENTSDOCK_TEAM_HUB_MODE=host\n"
+            )
+            environment.update(
+                {
+                    "FAKE_EVENT_LOG": str(event_log),
+                    "FAKE_REAL_CANDIDATE_TEAM_HUB_CONTROL": "true",
+                    "FAKE_MIGRATE_CANDIDATE_TEAM_HUB": "true",
+                    "FAKE_CANDIDATE_MIGRATION_SENTINEL": str(migration_sentinel),
+                    "FAKE_HEALTH_VERSION": self.release_version(),
+                    "FAKE_SERVER_IDENTITY": server_identity,
+                    "FAKE_TEAM_HUB_ID": hub_id,
+                    "FAKE_TEAM_HUB_MODE": "host",
+                    "FAKE_TEAM_HUB_TRANSPORT": "loopback",
+                    "REAL_PYTHON": sys.executable,
+                    "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                }
+            )
+
+            result = subprocess.run(
+                self.managed_installer_command(
+                    server_identity,
+                    hub_id,
+                    snapshot,
+                    hub_data,
+                    operation_id,
+                ),
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                (install_root / "current" / "VERSION").read_text().strip(),
+                self.release_version(),
+            )
+            self.assertEqual(store.signing_key_path.read_bytes(), expected_key)
+            self.assertEqual(store.bootstrap_proof_path.read_bytes(), expected_proof)
+            self.assertFalse(store.maintenance_fence_path.exists())
+            connection = sqlite3.connect(store.database_path)
+            try:
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 5)
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT hub_id, server_identity FROM managed_host_bindings"
+                    ).fetchone(),
+                    (hub_id, server_identity),
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT count(*) FROM bootstrap_delegations"
+                    ).fetchone()[0],
+                    0,
+                )
+            finally:
+                connection.close()
+            installed_env = (config_root / "env").read_text()
+            self.assertIn("AGENTSDOCK_TEAM_HUB_TRANSPORT=loopback\n", installed_env)
+            self.assertIn("AGENTSDOCK_TEAM_HUB_URL=\n", installed_env)
+            events = event_log.read_text().splitlines()
+            self.assertIn("candidate-hub-opened", events)
+            self.assertGreaterEqual(
+                sum(value.startswith("verify-snapshot:") for value in events),
+                3,
+            )
+            self.assertFalse(any(value.startswith("restore:") for value in events))
+
+    def test_beta2_schema4_candidate_failure_restores_exact_legacy_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            event_log = root / "events.log"
+            migration_sentinel = root / "candidate-hub-opened"
+            self.write_exact_health_uv(fake_bin)
+            self.write_json_health_curl(fake_bin)
+            self.write_event_systemctl(fake_bin)
+            server_identity = "server_beta2_schema4_rollback_12345678"
+            operation_id = "update_beta2_schema4_rollback_12345678"
+            hub_data = root / "state" / "team-hub"
+            store, snapshot = self.prepare_real_managed_hub_fixture(
+                install_root,
+                hub_data,
+                operation_id=operation_id,
+                server_identity=server_identity,
+                schema_version=4,
+            )
+            hub_id = store.hub_id
+            expected_database = (snapshot / "team-hub.sqlite3").read_bytes()
+            expected_key = (snapshot / "access-token-signing.key").read_bytes()
+            expected_proof = (
+                snapshot / "proofs" / "bootstrap-owner.proof"
+            ).read_bytes()
+            config_root = root / "config"
+            config_root.mkdir()
+            (config_root / "env").write_text(
+                "AGENTSDOCK_AGENT_TOKEN=preserved_token_abcdefghijklmnopqrstuvwxyz0123456789\n"
+                "AGENTSDOCK_AGENT_PORT=7850\n"
+                "AGENTSDOCK_TEAM_HUB_MODE=host\n"
+            )
+            environment.update(
+                {
+                    "FAKE_EVENT_LOG": str(event_log),
+                    "FAKE_REAL_CANDIDATE_TEAM_HUB_CONTROL": "true",
+                    "FAKE_MIGRATE_CANDIDATE_TEAM_HUB": "true",
+                    "FAKE_CANDIDATE_MIGRATION_SENTINEL": str(migration_sentinel),
+                    "FAKE_HEALTH_VERSION": "9.9.9-wrong",
+                    "FAKE_HEALTH_VERSION_AFTER_RESTORE": "0.1.25-beta.2",
+                    "FAKE_SERVER_IDENTITY": server_identity,
+                    "FAKE_TEAM_HUB_ID": hub_id,
+                    "FAKE_TEAM_HUB_MODE": "host",
+                    "FAKE_TEAM_HUB_TRANSPORT": "loopback",
+                    "FAKE_TEAM_HUB_TRANSPORT_AFTER_RESTORE": "loopback",
+                    "FAKE_TEAM_HUB_URL_AFTER_RESTORE": "",
+                    "REAL_PYTHON": sys.executable,
+                    "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                }
+            )
+
+            result = subprocess.run(
+                self.managed_installer_command(
+                    server_identity,
+                    hub_id,
+                    snapshot,
+                    hub_data,
+                    operation_id,
+                ),
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("The previous release was restored.", result.stderr)
+            self.assertTrue((install_root / "current" / "runtime-marker").is_file())
+            self.assertEqual(store.database_path.read_bytes(), expected_database)
+            self.assertEqual(store.signing_key_path.read_bytes(), expected_key)
+            self.assertEqual(store.bootstrap_proof_path.read_bytes(), expected_proof)
+            self.assertFalse(store.maintenance_fence_path.exists())
+            restored = sqlite3.connect(
+                f"file:{store.database_path}?mode=ro&immutable=1",
+                uri=True,
+            )
+            try:
+                self.assertEqual(restored.execute("PRAGMA user_version").fetchone()[0], 4)
+                self.assertEqual(
+                    restored.execute(
+                        "SELECT hub_id, server_identity FROM managed_host_bindings"
+                    ).fetchone(),
+                    (hub_id, server_identity),
+                )
+                self.assertIsNone(
+                    restored.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'bootstrap_delegations'"
+                    ).fetchone()
+                )
+            finally:
+                restored.close()
+            events = event_log.read_text().splitlines()
+            self.assertIn("candidate-hub-opened", events)
+            self.assertTrue(any(value.startswith("restore:") for value in events))
+
+    def test_schema5_sonic_update_preserves_exact_transport_url_and_hub_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            event_log = root / "events.log"
+            self.write_exact_health_uv(fake_bin)
+            self.write_json_health_curl(fake_bin)
+            self.write_event_systemctl(fake_bin)
+            server_identity = "server_sonic_schema5_12345678"
+            operation_id = "update_sonic_schema5_12345678"
+            hub_url = "https://supersonic00.tail3fb297.ts.net:8444/api/team-hub"
+            hub_data = root / "state" / "team-hub"
+            store, snapshot = self.prepare_real_managed_hub_fixture(
+                install_root,
+                hub_data,
+                operation_id=operation_id,
+                server_identity=server_identity,
+                schema_version=5,
+            )
+            hub_id = store.hub_id
+            expected_database = store.database_path.read_bytes()
+            expected_key = store.signing_key_path.read_bytes()
+            expected_proof = store.bootstrap_proof_path.read_bytes()
+            (install_root / "current" / "VERSION").write_text("0.1.25-beta.3\n")
+            config_root = root / "config"
+            config_root.mkdir()
+            (config_root / "env").write_text(
+                "AGENTSDOCK_AGENT_TOKEN=preserved_token_abcdefghijklmnopqrstuvwxyz0123456789\n"
+                "AGENTSDOCK_AGENT_PORT=7850\n"
+                "AGENTSDOCK_TEAM_HUB_MODE=host\n"
+                "AGENTSDOCK_TEAM_HUB_TRANSPORT=tailscale_serve\n"
+                f"AGENTSDOCK_TEAM_HUB_URL={hub_url}\n"
+            )
+            environment.update(
+                {
+                    "FAKE_EVENT_LOG": str(event_log),
+                    "FAKE_REAL_CANDIDATE_TEAM_HUB_CONTROL": "true",
+                    "FAKE_HEALTH_VERSION": self.release_version(),
+                    "FAKE_SERVER_IDENTITY": server_identity,
+                    "FAKE_TEAM_HUB_ID": hub_id,
+                    "FAKE_TEAM_HUB_MODE": "host",
+                    "FAKE_TEAM_HUB_TRANSPORT": "tailscale_serve",
+                    "FAKE_TEAM_HUB_URL": hub_url,
+                    "REAL_PYTHON": sys.executable,
+                    "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                }
+            )
+
+            result = subprocess.run(
+                self.managed_installer_command(
+                    server_identity,
+                    hub_id,
+                    snapshot,
+                    hub_data,
+                    operation_id,
+                    expected_transport="tailscale_serve",
+                    expected_hub_url=hub_url,
+                    configure_hub_url=hub_url,
+                ),
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(store.database_path.read_bytes(), expected_database)
+            self.assertEqual(store.signing_key_path.read_bytes(), expected_key)
+            self.assertEqual(store.bootstrap_proof_path.read_bytes(), expected_proof)
+            self.assertFalse(store.maintenance_fence_path.exists())
+            installed_env = (config_root / "env").read_text()
+            self.assertIn("AGENTSDOCK_TEAM_HUB_TRANSPORT=tailscale_serve\n", installed_env)
+            self.assertIn(f"AGENTSDOCK_TEAM_HUB_URL={hub_url}\n", installed_env)
+            self.assertIn(f"Teamspace host {hub_url}", result.stdout)
+            events = event_log.read_text().splitlines()
+            self.assertGreaterEqual(
+                sum(value.startswith("verify-snapshot:") for value in events),
+                3,
+            )
+            self.assertFalse(any(value.startswith("restore:") for value in events))
 
     def test_failed_snapshot_verification_does_not_start_old_service(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3325,11 +3600,17 @@ fi
 case "$*" in
   *"maintenance_fence_matches_control"*)
     printf 'verify-fence\n' >> "$FAKE_EVENT_LOG"
+    if [ "${FAKE_REAL_CANDIDATE_TEAM_HUB_CONTROL:-false}" = "true" ]; then
+      exec "$REAL_PYTHON" "$@"
+    fi
     [ "${FAKE_FENCE_VERIFY_FAILURE:-false}" != "true" ]
     exit $?
     ;;
   *"clear_maintenance_fence_control"*)
     printf 'clear-fence\n' >> "$FAKE_EVENT_LOG"
+    if [ "${FAKE_REAL_CANDIDATE_TEAM_HUB_CONTROL:-false}" = "true" ]; then
+      exec "$REAL_PYTHON" "$@"
+    fi
     [ "${FAKE_CLEAR_FAILURE:-false}" != "true" ] || exit $?
     if [ "${FAKE_SIGNAL_AFTER_CLEAR:-false}" = "true" ]; then
       kill -TERM "$PPID"
@@ -3338,11 +3619,17 @@ case "$*" in
     ;;
   *"-m agentsdock_team_hub.cli verify-snapshot"*)
     printf 'verify-snapshot:%s\n' "$*" >> "$FAKE_EVENT_LOG"
+    if [ "${FAKE_REAL_CANDIDATE_TEAM_HUB_CONTROL:-false}" = "true" ]; then
+      exec "$REAL_PYTHON" "$@"
+    fi
     [ "${FAKE_CANDIDATE_SNAPSHOT_VERIFY_FAILURE:-${FAKE_SNAPSHOT_VERIFY_FAILURE:-false}}" != "true" ]
     exit $?
     ;;
   *"-m agentsdock_team_hub.cli restore-snapshot"*)
     printf 'restore:%s\n' "$*" >> "$FAKE_EVENT_LOG"
+    if [ "${FAKE_REAL_CANDIDATE_TEAM_HUB_CONTROL:-false}" = "true" ]; then
+      exec "$REAL_PYTHON" "$@"
+    fi
     [ "${FAKE_RESTORE_FAILURE:-false}" != "true" ] || exit $?
     if [ "${FAKE_SIGNAL_AFTER_RESTORE:-false}" = "true" ]; then
       kill -TERM "$PPID"
@@ -3417,6 +3704,25 @@ exit 0
             fake_bin / "systemctl",
             """#!/bin/sh
 printf 'systemctl:%s\n' "$*" >> "$FAKE_EVENT_LOG"
+if [ "$*" = "--user restart agents-server.service" ] \
+  && [ "${FAKE_MIGRATE_CANDIDATE_TEAM_HUB:-false}" = "true" ] \
+  && [ ! -e "$FAKE_CANDIDATE_MIGRATION_SENTINEL" ]; then
+  PYTHONPATH="$AGENTS_SERVER_INSTALL_DIR/current" "$REAL_PYTHON" - \
+    "$AGENTSDOCK_STATE_DIR/team-hub" "$FAKE_SERVER_IDENTITY" \
+    "$FAKE_TEAM_HUB_ID" <<'PYTHON'
+from pathlib import Path
+import sys
+from agentsdock_team_hub.store import HubStore
+
+store = HubStore(Path(sys.argv[1]), managed_host_identity=sys.argv[2])
+if store.hub_id != sys.argv[3]:
+    raise SystemExit(1)
+PYTHON
+  status=$?
+  [ "$status" -eq 0 ] || exit "$status"
+  : > "$FAKE_CANDIDATE_MIGRATION_SENTINEL"
+  printf 'candidate-hub-opened\n' >> "$FAKE_EVENT_LOG"
+fi
 exit 0
 """,
         )
@@ -3450,8 +3756,19 @@ exit 0
             )
             + "\n"
         )
+        self.prepare_managed_runtime_fixture(
+            install_root,
+            old_version="0.1.25-beta.1",
+        )
+
+    def prepare_managed_runtime_fixture(
+        self,
+        install_root: Path,
+        *,
+        old_version: str,
+    ) -> None:
         old_release = (install_root / "current").resolve()
-        (old_release / "VERSION").write_text("0.1.25-beta.1\n")
+        (old_release / "VERSION").write_text(old_version + "\n")
         package = old_release / "agentsdock_team_hub"
         package.mkdir()
         (package / "store.py").write_text("# fake managed Hub control package\n")
@@ -3483,6 +3800,63 @@ esac
 exit 0
 """,
         )
+
+    @staticmethod
+    def downgrade_database_to_schema4(database_path: Path) -> None:
+        connection = sqlite3.connect(database_path, isolation_level=None)
+        try:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            connection.execute("BEGIN IMMEDIATE")
+            for trigger in (
+                "bootstrap_delegation_is_immutable",
+                "bootstrap_delegations_cannot_be_deleted",
+                "bootstrap_delegation_matches_claim_expiry",
+                "bootstrap_delegation_matches_hub",
+            ):
+                connection.execute(f"DROP TRIGGER {trigger}")
+            connection.execute("DROP TABLE bootstrap_delegations")
+            connection.execute("DELETE FROM schema_migrations WHERE version = 5")
+            connection.execute("PRAGMA user_version = 4")
+            connection.execute("COMMIT")
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            connection.close()
+
+    def prepare_real_managed_hub_fixture(
+        self,
+        install_root: Path,
+        hub_data: Path,
+        *,
+        operation_id: str,
+        server_identity: str,
+        schema_version: int,
+    ) -> tuple[HubStore, Path]:
+        store = HubStore(hub_data, managed_host_identity=server_identity)
+        snapshot = store.maintenance_snapshot_and_fence(
+            "server-update",
+            operation_id=operation_id,
+        )
+        if schema_version == 4:
+            snapshot_database = snapshot / "team-hub.sqlite3"
+            self.downgrade_database_to_schema4(snapshot_database)
+            manifest_path = snapshot / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["schema_version"] = 4
+            manifest["database_sha256"] = hashlib.sha256(
+                snapshot_database.read_bytes()
+            ).hexdigest()
+            manifest_path.write_text(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+            )
+            self.downgrade_database_to_schema4(store.database_path)
+        elif schema_version != 5:
+            raise ValueError("test fixture schema must be 4 or 5")
+        self.prepare_managed_runtime_fixture(
+            install_root,
+            old_version="0.1.25-beta.2",
+        )
+        return store, snapshot
 
     def write_health_curl(self, fake_bin: Path, *, conflict_port: int, healthy_port: int):
         self.write_executable(fake_bin / "curl", f"""#!/bin/sh

@@ -20,6 +20,58 @@ HOST_B = "server-host-b-12345678"
 
 
 class ManagedHostTests(unittest.TestCase):
+    @staticmethod
+    def downgrade_database_to_schema4(
+        database_path: Path,
+        *,
+        update_version_ledger: bool = True,
+    ) -> None:
+        connection = sqlite3.connect(database_path, isolation_level=None)
+        try:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            connection.execute("BEGIN IMMEDIATE")
+            for trigger in (
+                "bootstrap_delegation_is_immutable",
+                "bootstrap_delegations_cannot_be_deleted",
+                "bootstrap_delegation_matches_claim_expiry",
+                "bootstrap_delegation_matches_hub",
+            ):
+                connection.execute(f"DROP TRIGGER {trigger}")
+            connection.execute("DROP TABLE bootstrap_delegations")
+            if update_version_ledger:
+                connection.execute("DELETE FROM schema_migrations WHERE version = 5")
+                connection.execute("PRAGMA user_version = 4")
+            connection.execute("COMMIT")
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            connection.close()
+
+    @classmethod
+    def make_schema4_snapshot(
+        cls,
+        store: HubStore,
+        *,
+        operation_id: str,
+    ) -> Path:
+        snapshot = store.maintenance_snapshot_and_fence(
+            "server-update",
+            operation_id=operation_id,
+        )
+        snapshot_database = snapshot / "team-hub.sqlite3"
+        cls.downgrade_database_to_schema4(snapshot_database)
+        manifest_path = snapshot / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["schema_version"] = 4
+        manifest["database_sha256"] = hashlib.sha256(
+            snapshot_database.read_bytes()
+        ).hexdigest()
+        manifest_path.write_text(
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+        cls.downgrade_database_to_schema4(store.database_path)
+        return snapshot
+
     def test_concurrent_first_bind_has_one_winner_and_foreign_copy_is_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             data_dir = Path(temporary) / "hub"
@@ -231,6 +283,117 @@ class ManagedHostTests(unittest.TestCase):
             restored = HubStore(data_dir, managed_host_identity=HOST_A)
             self.assertEqual(restored.hub_id, hub_id)
             self.assertTrue(restored.health()["bootstrap_required"])
+
+    def test_schema4_snapshot_verifies_restores_exactly_then_migrates_safely(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "hub"
+            store = HubStore(data_dir, managed_host_identity=HOST_A)
+            hub_id = store.hub_id
+            operation_id = "update-schema4-restore"
+            snapshot = self.make_schema4_snapshot(
+                store,
+                operation_id=operation_id,
+            )
+            expected_database = (snapshot / "team-hub.sqlite3").read_bytes()
+            expected_key = (snapshot / "access-token-signing.key").read_bytes()
+            expected_proof = (
+                snapshot / "proofs" / "bootstrap-owner.proof"
+            ).read_bytes()
+
+            HubStore.verify_maintenance_snapshot(
+                data_dir,
+                snapshot,
+                expected_host_identity=HOST_A,
+                expected_hub_id=hub_id,
+                expected_operation_id=operation_id,
+            )
+            store.database_path.write_bytes(b"candidate-mutated database\n")
+            store.signing_key_path.write_bytes(b"candidate-mutated signing key\n")
+            store.bootstrap_proof_path.write_bytes(b"candidate-mutated proof\n")
+
+            HubStore.restore_maintenance_snapshot(
+                data_dir,
+                snapshot,
+                expected_host_identity=HOST_A,
+                expected_hub_id=hub_id,
+                expected_operation_id=operation_id,
+            )
+            self.assertEqual(store.database_path.read_bytes(), expected_database)
+            self.assertEqual(store.signing_key_path.read_bytes(), expected_key)
+            self.assertEqual(store.bootstrap_proof_path.read_bytes(), expected_proof)
+            self.assertFalse(store.maintenance_fence_path.exists())
+
+            legacy = sqlite3.connect(
+                f"file:{store.database_path}?mode=ro&immutable=1",
+                uri=True,
+            )
+            try:
+                self.assertEqual(legacy.execute("PRAGMA user_version").fetchone()[0], 4)
+                self.assertEqual(
+                    legacy.execute(
+                        "SELECT hub_id, server_identity FROM managed_host_bindings"
+                    ).fetchone(),
+                    (hub_id, HOST_A),
+                )
+                self.assertIsNone(
+                    legacy.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'bootstrap_delegations'"
+                    ).fetchone()
+                )
+            finally:
+                legacy.close()
+
+            migrated = HubStore(data_dir, managed_host_identity=HOST_A)
+            self.assertEqual(migrated.hub_id, hub_id)
+            self.assertEqual(migrated.signing_key_path.read_bytes(), expected_key)
+            self.assertEqual(migrated.bootstrap_proof_path.read_bytes(), expected_proof)
+            connection = migrated.connect()
+            try:
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 5)
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT count(*) FROM bootstrap_delegations"
+                    ).fetchone()[0],
+                    0,
+                )
+            finally:
+                connection.close()
+
+    def test_schema5_snapshot_does_not_fall_back_when_delegation_schema_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "hub"
+            store = HubStore(data_dir, managed_host_identity=HOST_A)
+            operation_id = "update-schema5-strict"
+            snapshot = store.maintenance_snapshot_and_fence(
+                "server-update",
+                operation_id=operation_id,
+            )
+            snapshot_database = snapshot / "team-hub.sqlite3"
+            self.downgrade_database_to_schema4(
+                snapshot_database,
+                update_version_ledger=False,
+            )
+            manifest_path = snapshot / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["database_sha256"] = hashlib.sha256(
+                snapshot_database.read_bytes()
+            ).hexdigest()
+            manifest_path.write_text(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "snapshot bootstrap proof schema is invalid",
+            ):
+                HubStore.verify_maintenance_snapshot(
+                    data_dir,
+                    snapshot,
+                    expected_host_identity=HOST_A,
+                    expected_hub_id=store.hub_id,
+                    expected_operation_id=operation_id,
+                )
 
     def test_preflight_sees_a_binding_present_only_in_live_wal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

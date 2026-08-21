@@ -1335,16 +1335,35 @@ class HubStore:
                 raise RuntimeError("Team Hub snapshot host binding is invalid")
 
             database_proofs: dict[str, tuple[str, bytes, int]] = {}
-            for row in connection.execute(
-                """
-                SELECT c.id, c.token_hash, c.expires_at
-                FROM bootstrap_claims AS c
-                LEFT JOIN bootstrap_delegations AS d
-                  ON d.bootstrap_claim_id = c.id
-                WHERE c.consumed_at IS NULL AND c.revoked_at IS NULL
-                  AND d.bootstrap_claim_id IS NULL
-                """
-            ):
+            try:
+                if schema_version >= 5:
+                    # Delegated bootstrap claims were introduced by migration
+                    # 0005. They never have a local proof file and must remain
+                    # excluded from schema-5 snapshots. Schema 4 predates that
+                    # table, so its active claim is necessarily the local proof.
+                    bootstrap_proofs = connection.execute(
+                        """
+                        SELECT c.id, c.token_hash, c.expires_at
+                        FROM bootstrap_claims AS c
+                        LEFT JOIN bootstrap_delegations AS d
+                          ON d.bootstrap_claim_id = c.id
+                        WHERE c.consumed_at IS NULL AND c.revoked_at IS NULL
+                          AND d.bootstrap_claim_id IS NULL
+                        """
+                    ).fetchall()
+                else:
+                    bootstrap_proofs = connection.execute(
+                        """
+                        SELECT id, token_hash, expires_at
+                        FROM bootstrap_claims
+                        WHERE consumed_at IS NULL AND revoked_at IS NULL
+                        """
+                    ).fetchall()
+            except sqlite3.DatabaseError as exc:
+                raise RuntimeError(
+                    "Team Hub snapshot bootstrap proof schema is invalid"
+                ) from exc
+            for row in bootstrap_proofs:
                 database_proofs["bootstrap-owner.proof"] = (
                     str(row["id"]), bytes(row["token_hash"]), int(row["expires_at"])
                 )

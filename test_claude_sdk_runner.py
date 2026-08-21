@@ -1,11 +1,17 @@
 import asyncio
+import json
 import sys
+import tempfile
 import types
 import unittest
-from collections import deque
+from collections import OrderedDict, deque
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
+
+from fastapi import HTTPException
+from starlette.requests import Request
 
 import agent_server
 from claude_sdk_client import ClaudeSDKQueryError, ClaudeSDKUnavailable
@@ -265,11 +271,16 @@ class PermissionDuringStartManager(SequencedClaudeManager):
         handles: list[FakeClaudeRun],
         *,
         permission_on_calls: set[int],
+        jobs_authorization_on_calls: set[int] | None = None,
     ) -> None:
         super().__init__(handles)
         self.permission_on_calls = set(permission_on_calls)
+        self.jobs_authorization_on_calls = set(
+            jobs_authorization_on_calls or set()
+        )
         self.permission_results: list[object] = []
         self.permission_requested = asyncio.Event()
+        self.jobs_authorization_results: list[dict[str, Any]] = []
 
     async def start_run(
         self,
@@ -298,6 +309,38 @@ class PermissionDuringStartManager(SequencedClaudeManager):
             await on_supervisor_ready(self.owner_token)  # type: ignore[operator]
         # A real supervisor sets _active_run immediately before client.query;
         # can_use_tool can then fire while query/start_run is still awaiting.
+        if call_number in self.jobs_authorization_on_calls:
+            matching = [
+                capability
+                for capability in agent_server.CROSS_CHAT_CAPABILITIES.values()
+                if capability.get("source_run_id") == run_id
+            ]
+            if len(matching) != 1:
+                raise AssertionError("candidate authority was not uniquely issued")
+            authority_path = Path(str(matching[0]["authority_path"]))
+            token = json.loads(
+                authority_path.read_text(encoding="utf-8")
+            )["provider_capability"]
+            request = Request({
+                "type": "http",
+                "method": "GET",
+                "path": f"/api/agent/sessions/{chat_id}/jobs",
+                "headers": [(
+                    b"x-agentsdock-provider-capability",
+                    token.encode("utf-8"),
+                )],
+                "query_string": b"",
+                "scheme": "http",
+                "server": ("127.0.0.1", 7850),
+                "client": ("127.0.0.1", 43103),
+            })
+            self.jobs_authorization_results.append(
+                await agent_server.authorize_provider_jobs_operation(
+                    request,
+                    session_id=chat_id,
+                    operation="read",
+                )
+            )
         if call_number in self.permission_on_calls:
             callback = (
                 options.get("can_use_tool")
@@ -352,6 +395,54 @@ class BlockingCandidateStartManager(SequencedClaudeManager):
         return self.handles.popleft()
 
 
+class SafeFailingCandidateStartManager(SequencedClaudeManager):
+    """Reject the replacement before query delivery with a retryable result."""
+
+    def __init__(self, handles: list[FakeClaudeRun]) -> None:
+        super().__init__(handles)
+        self.candidate_authority_path: Path | None = None
+
+    async def start_run(
+        self,
+        chat_id: str,
+        prompt: str,
+        *,
+        run_id: str,
+        options: object,
+        configuration_key: str,
+        query_session_id: str | None = None,
+        on_supervisor_ready: object | None = None,
+    ) -> FakeClaudeRun:
+        call_number = len(self.start_calls) + 1
+        self.start_calls.append((
+            chat_id,
+            prompt,
+            run_id,
+            options,
+            configuration_key,
+            query_session_id,
+        ))
+        self.active_run_id = run_id
+        if on_supervisor_ready is not None:
+            await on_supervisor_ready(self.owner_token)  # type: ignore[operator]
+        if call_number == 2:
+            matching = [
+                capability
+                for capability in agent_server.CROSS_CHAT_CAPABILITIES.values()
+                if capability.get("source_run_id") == run_id
+            ]
+            if len(matching) != 1:
+                raise AssertionError("candidate authority was not uniquely issued")
+            self.candidate_authority_path = Path(str(
+                matching[0]["authority_path"]
+            ))
+            raise agent_server.NativeSteerHandoffError(
+                "candidate query was rejected before delivery",
+                safe_to_requeue=True,
+            )
+        return self.handles.popleft()
+
+
 class FakePermissionResultAllow:
     def __init__(self, **kwargs: object) -> None:
         self.__dict__.update(kwargs)
@@ -391,6 +482,8 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.previous_run_metadata = agent_server.RUN_METADATA
         self.previous_queue = agent_server.QUEUED_TURNS
         self.previous_run_now = agent_server.RUN_NOW_TURNS
+        self.previous_run_now_requests = agent_server.RUN_NOW_REQUESTS
+        self.previous_run_now_completed = agent_server.RUN_NOW_COMPLETED_RESULTS
         self.previous_steering = agent_server.STEERING_SESSIONS
         self.previous_pending_interactions = agent_server.CLAUDE_PENDING_INTERACTIONS
         self.previous_interaction_tasks = agent_server.CLAUDE_INTERACTION_HANDLER_TASKS
@@ -399,6 +492,10 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.previous_deleted = agent_server.DELETED_SESSION_TOMBSTONES
         self.previous_maintenance = agent_server.SERVER_MAINTENANCE_SESSIONS
         self.previous_stop_fences = agent_server.CLAUDE_STOP_FENCE_SESSIONS
+        self.previous_capabilities = agent_server.CROSS_CHAT_CAPABILITIES
+        self.previous_authority_root = agent_server.CROSS_CHAT_AUTHORITY_ROOT
+        self.previous_agent_token = agent_server.AGENT_TOKEN
+        self.authority_temporary = tempfile.TemporaryDirectory()
 
         self.cwd = str(Path(__file__).resolve().parent.parent)
         self.session = {
@@ -407,6 +504,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             "cwd": self.cwd,
             "model": "claude-opus",
             "effort": "high",
+            "provider_jobs_access": "full",
         }
         agent_server.STORE.sessions = {"chat-claude": self.session}
         agent_server.ACTIVE = {}
@@ -426,6 +524,8 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         agent_server.RUN_METADATA = {}
         agent_server.QUEUED_TURNS = {}
         agent_server.RUN_NOW_TURNS = {}
+        agent_server.RUN_NOW_REQUESTS = {}
+        agent_server.RUN_NOW_COMPLETED_RESULTS = OrderedDict()
         agent_server.STEERING_SESSIONS = set()
         agent_server.CLAUDE_PENDING_INTERACTIONS = {}
         agent_server.CLAUDE_INTERACTION_HANDLER_TASKS = {}
@@ -434,6 +534,11 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         agent_server.DELETED_SESSION_TOMBSTONES = set()
         agent_server.SERVER_MAINTENANCE_SESSIONS = set()
         agent_server.CLAUDE_STOP_FENCE_SESSIONS = set()
+        agent_server.CROSS_CHAT_CAPABILITIES = {}
+        agent_server.CROSS_CHAT_AUTHORITY_ROOT = (
+            Path(self.authority_temporary.name) / "authority"
+        )
+        agent_server.AGENT_TOKEN = "test-agent-token"
         self.durable_event_patcher = patch.object(
             agent_server,
             "append_durable_event",
@@ -473,6 +578,8 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         agent_server.RUN_METADATA = self.previous_run_metadata
         agent_server.QUEUED_TURNS = self.previous_queue
         agent_server.RUN_NOW_TURNS = self.previous_run_now
+        agent_server.RUN_NOW_REQUESTS = self.previous_run_now_requests
+        agent_server.RUN_NOW_COMPLETED_RESULTS = self.previous_run_now_completed
         agent_server.STEERING_SESSIONS = self.previous_steering
         agent_server.CLAUDE_PENDING_INTERACTIONS = self.previous_pending_interactions
         agent_server.CLAUDE_INTERACTION_HANDLER_TASKS = self.previous_interaction_tasks
@@ -481,6 +588,28 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         agent_server.DELETED_SESSION_TOMBSTONES = self.previous_deleted
         agent_server.SERVER_MAINTENANCE_SESSIONS = self.previous_maintenance
         agent_server.CLAUDE_STOP_FENCE_SESSIONS = self.previous_stop_fences
+        agent_server.CROSS_CHAT_CAPABILITIES = self.previous_capabilities
+        agent_server.CROSS_CHAT_AUTHORITY_ROOT = self.previous_authority_root
+        agent_server.AGENT_TOKEN = self.previous_agent_token
+        self.authority_temporary.cleanup()
+
+    @staticmethod
+    def provider_request(token: str) -> Request:
+        return Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/api/agent/sessions/chat-claude/jobs",
+            "headers": [
+                (
+                    b"x-agentsdock-provider-capability",
+                    token.encode("utf-8"),
+                ),
+            ],
+            "query_string": b"",
+            "scheme": "http",
+            "server": ("127.0.0.1", 7850),
+            "client": ("127.0.0.1", 43102),
+        })
 
     async def _run_sdk_terminal_case(
         self,
@@ -2613,17 +2742,56 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_steered_query_routes_permission_to_candidate_before_handle_returns(self) -> None:
         first = FakeClaudeRun()
-        second = FakeClaudeRun([{
+        second_terminal = {
             "type": "result",
             "result": "steered done",
             "session_id": "provider",
             "terminal_reason": "end_turn",
-        }])
+        }
+        second = FakeClaudeRun()
         manager = PermissionDuringStartManager(
             [first, second],
             permission_on_calls={2},
+            jobs_authorization_on_calls={2},
         )
         agent_server.CLAUDE_SDK_MANAGER = manager
+        predecessor_run_id = "run_claude"
+        agent_server.CURRENT_TURNS["chat-claude"]["run_id"] = predecessor_run_id
+        predecessor_path = await agent_server.issue_cross_chat_capability(
+            "chat-claude",
+            predecessor_run_id,
+            [],
+            actions={"jobs", "publish"},
+        )
+        predecessor_token = json.loads(
+            predecessor_path.read_text(encoding="utf-8")
+        )["provider_capability"]
+        real_revoke = agent_server.revoke_cross_chat_capability
+        predecessor_revoke_observations: list[tuple[bool, str]] = []
+
+        async def recording_revoke(run_id: str) -> None:
+            if run_id == predecessor_run_id:
+                candidate_records = [
+                    capability
+                    for capability in agent_server.CROSS_CHAT_CAPABILITIES.values()
+                    if capability.get("source_run_id") != predecessor_run_id
+                ]
+                candidate_path_value = (
+                    str(candidate_records[0].get("authority_path") or "")
+                    if len(candidate_records) == 1
+                    else ""
+                )
+                predecessor_revoke_observations.append((
+                    bool(candidate_path_value)
+                    and Path(candidate_path_value).is_file(),
+                    str(
+                        agent_server.CURRENT_TURNS.get("chat-claude", {}).get(
+                            "run_id"
+                        )
+                        or ""
+                    ),
+                ))
+            await real_revoke(run_id)
 
         async def permission_callback(
             tool_name: str,
@@ -2658,6 +2826,62 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                     "error": "",
                 }
             return None
+
+        commit_authority_checks: list[str] = []
+
+        async def inspect_authority_before_commit(
+            session_id: str,
+            event_specs: list[tuple[str, dict[str, object]]],
+        ) -> list[dict[str, object]]:
+            if any(
+                event_type == "turn_queue_run_now"
+                for event_type, _payload in event_specs
+            ):
+                candidate_records = [
+                    capability
+                    for capability in agent_server.CROSS_CHAT_CAPABILITIES.values()
+                    if capability.get("source_run_id") != predecessor_run_id
+                ]
+                self.assertEqual(len(candidate_records), 1)
+                candidate_path = Path(str(
+                    candidate_records[0]["authority_path"]
+                ))
+                candidate_token = json.loads(
+                    candidate_path.read_text(encoding="utf-8")
+                )["provider_capability"]
+                candidate_run_id = str(
+                    candidate_records[0]["source_run_id"]
+                )
+                authorized = await agent_server.authorize_provider_jobs_operation(
+                    self.provider_request(candidate_token),
+                    session_id="chat-claude",
+                    operation="read",
+                )
+                self.assertEqual(
+                    authorized["source_run_id"],
+                    candidate_run_id,
+                )
+                with self.assertRaises(HTTPException) as publish_denied:
+                    await agent_server.authorize_provider_action(
+                        self.provider_request(candidate_token),
+                        action="publish",
+                        session_id="chat-claude",
+                    )
+                self.assertEqual(publish_denied.exception.status_code, 403)
+                commit_authority_checks.append(candidate_run_id)
+            return []
+
+        self.append_durable_event_batch.side_effect = (
+            inspect_authority_before_commit
+        )
+
+        revoke_patcher = patch.object(
+            agent_server,
+            "revoke_cross_chat_capability",
+            side_effect=recording_revoke,
+        )
+        revoke_patcher.start()
+        self.addCleanup(revoke_patcher.stop)
 
         with patch.dict(sys.modules, fake_claude_sdk_modules()), patch.object(
             agent_server,
@@ -2738,7 +2962,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         ):
             runner = asyncio.create_task(agent_server.run_claude_sdk(
                 "chat-claude",
-                "run-claude",
+                predecessor_run_id,
                 "Prompt",
                 dict(self.session),
                 Path(self.cwd) / ".manifest.json",
@@ -2769,6 +2993,11 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                 "terminal_reason": "aborted_streaming",
             })
             await asyncio.wait_for(manager.permission_requested.wait(), 0.5)
+            self.assertEqual(len(manager.jobs_authorization_results), 1)
+            self.assertEqual(
+                manager.jobs_authorization_results[0]["source_run_id"],
+                str(manager.start_calls[1][2]),
+            )
             for _ in range(100):
                 if agent_server.CLAUDE_PENDING_INTERACTIONS:
                     break
@@ -2777,7 +3006,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                 agent_server.CLAUDE_PENDING_INTERACTIONS.items()
             ))
             candidate_run_id = str(interaction["turn_id"])
-            self.assertNotEqual(candidate_run_id, "run-claude")
+            self.assertNotEqual(candidate_run_id, predecessor_run_id)
             self.assertEqual(
                 agent_server.ACTIVE["chat-claude"][
                     "claude_permission_run_id"
@@ -2790,6 +3019,44 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                 {"decision": "accept"},
             )
             steer_result = await asyncio.wait_for(steer_future, 0.5)
+            candidate_records = [
+                capability
+                for capability in agent_server.CROSS_CHAT_CAPABILITIES.values()
+                if capability.get("source_run_id") == candidate_run_id
+            ]
+            self.assertEqual(len(candidate_records), 1)
+            candidate_path = Path(str(
+                candidate_records[0]["authority_path"]
+            ))
+            candidate_token = json.loads(
+                candidate_path.read_text(encoding="utf-8")
+            )["provider_capability"]
+            authorized = await agent_server.authorize_provider_jobs_operation(
+                self.provider_request(candidate_token),
+                session_id="chat-claude",
+                operation="write",
+            )
+            self.assertEqual(authorized["source_run_id"], candidate_run_id)
+            published = await agent_server.authorize_provider_action(
+                self.provider_request(candidate_token),
+                action="publish",
+                session_id="chat-claude",
+            )
+            self.assertEqual(published["source_run_id"], candidate_run_id)
+            with self.assertRaises(HTTPException) as stale:
+                await agent_server.authorize_provider_action(
+                    self.provider_request(predecessor_token),
+                    action="jobs",
+                    session_id="chat-claude",
+                )
+            self.assertEqual(stale.exception.status_code, 403)
+            self.assertFalse(predecessor_path.exists())
+            self.assertTrue(
+                str(manager.start_calls[1][1]).startswith(
+                    "Steered prompt\n\n[AgentsDock provider authority]"
+                )
+            )
+            await second.messages.put(second_terminal)
             await asyncio.wait_for(runner, 0.5)
 
         self.assertEqual(steer_result["run_id"], candidate_run_id)
@@ -2798,6 +3065,264 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             manager.permission_results[0],
             FakePermissionResultAllow,
         )
+        self.assertEqual(
+            predecessor_revoke_observations,
+            [(True, candidate_run_id)],
+        )
+        self.assertEqual(commit_authority_checks, [candidate_run_id])
+
+    async def test_consecutive_native_steers_rotate_to_only_latest_authority(
+        self,
+    ) -> None:
+        first_handle = FakeClaudeRun()
+        second_handle = FakeClaudeRun()
+        third_handle = FakeClaudeRun()
+        manager = SequencedClaudeManager([
+            first_handle,
+            second_handle,
+            third_handle,
+        ])
+        original_run_id = "run_claude"
+        agent_server.CURRENT_TURNS["chat-claude"]["run_id"] = original_run_id
+        original_path = await agent_server.issue_cross_chat_capability(
+            "chat-claude",
+            original_run_id,
+            [],
+            actions={"jobs", "publish"},
+        )
+        original_token = json.loads(
+            original_path.read_text(encoding="utf-8")
+        )["provider_capability"]
+
+        async def project_message(
+            _session_id: str,
+            _run_id: str,
+            message: object,
+            **_kwargs: object,
+        ) -> dict[str, object] | None:
+            if isinstance(message, dict) and message.get("type") == "result":
+                return {
+                    "session_id": str(message.get("session_id") or ""),
+                    "result_text": str(message.get("result") or ""),
+                    "terminal_reason": str(
+                        message.get("terminal_reason") or ""
+                    ),
+                    "is_error": False,
+                    "aborted": (
+                        message.get("terminal_reason") == "aborted_streaming"
+                    ),
+                    "error": "",
+                }
+            return None
+
+        stack = ExitStack()
+        stack.enter_context(patch.object(
+            agent_server,
+            "resolve_claude_resume_provider",
+            return_value=(None, None),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "capture_git_baseline",
+            AsyncMock(return_value={"head": "base"}),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "build_claude_sdk_options",
+            return_value=(object(), "config", "/usr/bin/claude"),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "claude_sdk_manager",
+            AsyncMock(return_value=manager),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "watch_manifest_artifacts",
+            wait_forever,
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "append_event",
+            AsyncMock(return_value={}),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "append_turn_finished_event",
+            AsyncMock(return_value={}),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "project_claude_sdk_message",
+            side_effect=project_message,
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "mark_provider_turn_ready",
+            AsyncMock(),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "build_user_provider_prompt",
+            return_value="Steered prompt",
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "persist_run_provider_session",
+            AsyncMock(),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "cancel_claude_interactions",
+            AsyncMock(),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "collect_manifest",
+            AsyncMock(),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "publish_turn_code_diff",
+            AsyncMock(),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "collect_recent_leftover_manifests",
+            AsyncMock(),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "release_turn_slot",
+            AsyncMock(return_value=True),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "should_schedule_queue_after_finish",
+            return_value=False,
+        ))
+
+        async def steer_once(
+            native_queue: asyncio.Queue[dict[str, object]],
+            handle: FakeClaudeRun,
+            queued_id: str,
+        ) -> dict[str, object]:
+            future = asyncio.get_running_loop().create_future()
+            native_queue.put_nowait({
+                "selected": {
+                    "queued_id": queued_id,
+                    "prompt": f"Prompt for {queued_id}",
+                    "file_ids": [],
+                    "backend": agent_server.BACKEND_CLAUDE,
+                },
+                "remaining": 0,
+                "future": future,
+            })
+            for _ in range(100):
+                if handle.interrupt_calls:
+                    break
+                await asyncio.sleep(0)
+            self.assertEqual(handle.interrupt_calls, 1)
+            await handle.messages.put({
+                "type": "result",
+                "result": "interrupted",
+                "session_id": "provider",
+                "terminal_reason": "aborted_streaming",
+            })
+            return await asyncio.wait_for(future, 0.5)
+
+        with stack:
+            runner = asyncio.create_task(agent_server.run_claude_sdk(
+                "chat-claude",
+                original_run_id,
+                "Prompt",
+                dict(self.session),
+                Path(self.cwd) / ".manifest.json",
+            ))
+            for _ in range(100):
+                active = agent_server.ACTIVE.get("chat-claude") or {}
+                if active.get("native_steer_queue") is not None:
+                    break
+                await asyncio.sleep(0)
+            native_queue = agent_server.ACTIVE["chat-claude"][
+                "native_steer_queue"
+            ]
+
+            first = await steer_once(
+                native_queue,
+                first_handle,
+                "queued-first",
+            )
+            first_record = next(
+                capability
+                for capability in agent_server.CROSS_CHAT_CAPABILITIES.values()
+                if capability.get("source_run_id") == first["run_id"]
+            )
+            first_path = Path(str(first_record["authority_path"]))
+            first_token = json.loads(
+                first_path.read_text(encoding="utf-8")
+            )["provider_capability"]
+
+            second = await steer_once(
+                native_queue,
+                second_handle,
+                "queued-second",
+            )
+            second_record = next(
+                capability
+                for capability in agent_server.CROSS_CHAT_CAPABILITIES.values()
+                if capability.get("source_run_id") == second["run_id"]
+            )
+            second_path = Path(str(second_record["authority_path"]))
+            second_token = json.loads(
+                second_path.read_text(encoding="utf-8")
+            )["provider_capability"]
+
+            self.assertNotEqual(first["run_id"], second["run_id"])
+            self.assertFalse(original_path.exists())
+            self.assertFalse(first_path.exists())
+            self.assertTrue(second_path.exists())
+            self.assertEqual(
+                {
+                    str(capability.get("source_run_id") or "")
+                    for capability in agent_server.CROSS_CHAT_CAPABILITIES.values()
+                },
+                {second["run_id"]},
+            )
+            self.assertEqual(
+                list(agent_server.CROSS_CHAT_AUTHORITY_ROOT.glob("*.json")),
+                [second_path],
+            )
+            for stale_token in (original_token, first_token):
+                with self.assertRaises(HTTPException) as stale:
+                    await agent_server.authorize_provider_action(
+                        self.provider_request(stale_token),
+                        action="jobs",
+                        session_id="chat-claude",
+                    )
+                self.assertEqual(stale.exception.status_code, 403)
+            latest = await agent_server.authorize_provider_action(
+                self.provider_request(second_token),
+                action="publish",
+                session_id="chat-claude",
+            )
+            self.assertEqual(latest["source_run_id"], second["run_id"])
+
+            await third_handle.messages.put({
+                "type": "result",
+                "result": "done",
+                "session_id": "provider",
+                "terminal_reason": "end_turn",
+            })
+            await asyncio.wait_for(runner, 0.5)
+
+        self.assertTrue(second_path.exists())
+        self.assertEqual(
+            list(agent_server.CROSS_CHAT_AUTHORITY_ROOT.glob("*.json")),
+            [second_path],
+        )
+        await agent_server.revoke_cross_chat_capability(second["run_id"])
+        self.assertFalse(second_path.exists())
 
     async def test_typed_tool_results_finish_from_assistant_and_user_messages(self) -> None:
         from claude_agent_sdk.types import (
@@ -3815,10 +4340,268 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(fences), 1)
         self.assertEqual(fences[0]["queued_id"], "queued-next")
 
+    async def test_safe_candidate_rejection_restores_only_predecessor_authority(
+        self,
+    ) -> None:
+        first = FakeClaudeRun()
+        manager = SafeFailingCandidateStartManager([first])
+        predecessor_run_id = "run_claude"
+        agent_server.CURRENT_TURNS["chat-claude"]["run_id"] = predecessor_run_id
+        predecessor_path = await agent_server.issue_cross_chat_capability(
+            "chat-claude",
+            predecessor_run_id,
+            [],
+            actions={"jobs", "publish"},
+        )
+        predecessor_token = json.loads(
+            predecessor_path.read_text(encoding="utf-8")
+        )["provider_capability"]
+        agent_server.QUEUED_TURNS["chat-claude"] = deque([{
+            "queued_id": "queued-safe-rejection",
+            "prompt": "Steer",
+            "file_ids": [],
+            "backend": agent_server.BACKEND_CLAUDE,
+            "client_capabilities": [
+                agent_server.CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY
+            ],
+            "_durable": True,
+        }])
+        cleanup_entered = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def gated_cancel_interactions(*_args: object, **_kwargs: object) -> None:
+            if _kwargs.get("resolution") == "turn_steered":
+                return
+            cleanup_entered.set()
+            await release_cleanup.wait()
+
+        stack = ExitStack()
+        stack.enter_context(patch.object(
+            agent_server,
+            "resolve_claude_resume_provider",
+            return_value=(None, None),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "capture_git_baseline",
+            AsyncMock(side_effect=[{"head": "old"}, {"head": "candidate"}]),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "build_claude_sdk_options",
+            return_value=(object(), "config", "/usr/bin/claude"),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "claude_sdk_manager",
+            AsyncMock(return_value=manager),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "watch_manifest_artifacts",
+            wait_forever,
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "append_event",
+            AsyncMock(return_value={}),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "append_turn_finished_event",
+            AsyncMock(return_value={}),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "project_claude_sdk_message",
+            AsyncMock(return_value={
+                "session_id": "provider",
+                "result_text": "interrupted",
+                "terminal_reason": "aborted_streaming",
+                "is_error": False,
+                "aborted": True,
+                "error": "",
+            }),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "mark_provider_turn_ready",
+            AsyncMock(),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "build_user_provider_prompt",
+            return_value="Steered prompt",
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "queued_claude_runtime_matches_active",
+            return_value=True,
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "persist_run_provider_session",
+            AsyncMock(),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "cancel_claude_interactions",
+            side_effect=gated_cancel_interactions,
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "collect_manifest",
+            AsyncMock(),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "publish_turn_code_diff",
+            AsyncMock(),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "collect_recent_leftover_manifests",
+            AsyncMock(),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "release_turn_slot",
+            AsyncMock(return_value=True),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "should_schedule_queue_after_finish",
+            return_value=False,
+        ))
+
+        with stack:
+            runner = asyncio.create_task(agent_server.run_claude_sdk(
+                "chat-claude",
+                predecessor_run_id,
+                "Prompt",
+                dict(self.session),
+                Path(self.cwd) / ".manifest.json",
+            ))
+            try:
+                for _ in range(100):
+                    active = agent_server.ACTIVE.get("chat-claude") or {}
+                    if active.get("native_steer_queue") is not None:
+                        break
+                    await asyncio.sleep(0)
+                force_send = asyncio.create_task(
+                    agent_server.run_queued_turn_now(
+                        "chat-claude",
+                        "queued-safe-rejection",
+                    )
+                )
+                for _ in range(100):
+                    if first.interrupt_calls:
+                        break
+                    await asyncio.sleep(0)
+                await first.messages.put({
+                    "type": "result",
+                    "result": "interrupted",
+                    "session_id": "provider",
+                    "terminal_reason": "aborted_streaming",
+                })
+                result = await asyncio.wait_for(force_send, 0.5)
+                await asyncio.wait_for(cleanup_entered.wait(), 0.5)
+
+                self.assertFalse(result["ok"])
+                self.assertTrue(result["deferred"])
+                self.assertTrue(result["retryable"])
+                self.assertFalse(result["delivery_uncertain"])
+                self.assertIsNotNone(manager.candidate_authority_path)
+                self.assertFalse(manager.candidate_authority_path.exists())
+                self.assertTrue(predecessor_path.exists())
+                self.assertEqual(
+                    {
+                        str(capability.get("source_run_id") or "")
+                        for capability in agent_server.CROSS_CHAT_CAPABILITIES.values()
+                    },
+                    {predecessor_run_id},
+                )
+                authorized = await agent_server.authorize_provider_jobs_operation(
+                    self.provider_request(predecessor_token),
+                    session_id="chat-claude",
+                    operation="read",
+                )
+                self.assertEqual(
+                    authorized["source_run_id"],
+                    predecessor_run_id,
+                )
+                restored = agent_server.QUEUED_TURNS["chat-claude"][0]
+                self.assertFalse(restored["_paused_after_stop"])
+                self.assertNotIn("_native_delivery_fenced", restored)
+                public = await agent_server.queued_turns_snapshot("chat-claude")
+                self.assertFalse(public[0]["paused"])
+                queue_lifecycle = [
+                    event_type
+                    for call in self.append_durable_event_batch.await_args_list
+                    for event_type, _payload in call.args[1]
+                    if event_type in {
+                        "turn_queue_delivery_fenced",
+                        "turn_queued",
+                        "turn_queue_reordered",
+                    }
+                ]
+                self.assertEqual(
+                    queue_lifecycle,
+                    [
+                        "turn_queue_delivery_fenced",
+                        "turn_queued",
+                        "turn_queue_reordered",
+                    ],
+                )
+            finally:
+                release_cleanup.set()
+                await asyncio.wait_for(runner, 0.5)
+
+        self.assertTrue(predecessor_path.exists())
+        self.assertEqual(
+            {
+                str(capability.get("source_run_id") or "")
+                for capability in agent_server.CROSS_CHAT_CAPABILITIES.values()
+            },
+            {predecessor_run_id},
+        )
+        await agent_server.revoke_cross_chat_capability(predecessor_run_id)
+        self.assertFalse(predecessor_path.exists())
+
     async def test_cancellation_during_candidate_query_is_never_replayed(self) -> None:
         first = FakeClaudeRun()
         manager = BlockingCandidateStartManager([first])
         collect_manifest = AsyncMock()
+        predecessor_run_id = "run_claude"
+        agent_server.CURRENT_TURNS["chat-claude"]["run_id"] = predecessor_run_id
+        predecessor_path = await agent_server.issue_cross_chat_capability(
+            "chat-claude",
+            predecessor_run_id,
+            [],
+            actions={"jobs", "publish"},
+        )
+        real_revoke = agent_server.revoke_cross_chat_capability
+        revoke_observations: list[tuple[str, bool]] = []
+
+        async def record_ordered_revoke(run_id: str) -> None:
+            active = agent_server.ACTIVE.get("chat-claude") or {}
+            transition_ready = active.get("logical_transition_ready")
+            revoke_observations.append((
+                run_id,
+                bool(
+                    isinstance(transition_ready, asyncio.Event)
+                    and transition_ready.is_set()
+                ),
+            ))
+            await real_revoke(run_id)
+
+        revoke_patcher = patch.object(
+            agent_server,
+            "revoke_cross_chat_capability",
+            side_effect=record_ordered_revoke,
+        )
+        revoke_patcher.start()
+        self.addCleanup(revoke_patcher.stop)
 
         with patch.object(
             agent_server,
@@ -3887,7 +4670,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         ):
             runner = asyncio.create_task(agent_server.run_claude_sdk(
                 "chat-claude",
-                "run-claude",
+                predecessor_run_id,
                 "Prompt",
                 dict(self.session),
                 Path(self.cwd) / ".manifest.json",
@@ -3922,6 +4705,16 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                 0.5,
             )
             candidate_run_id = str(manager.start_calls[1][2])
+            candidate_records = [
+                capability
+                for capability in agent_server.CROSS_CHAT_CAPABILITIES.values()
+                if capability.get("source_run_id") == candidate_run_id
+            ]
+            self.assertEqual(len(candidate_records), 1)
+            candidate_path = Path(str(
+                candidate_records[0]["authority_path"]
+            ))
+            self.assertTrue(candidate_path.exists())
             runner.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await runner
@@ -3932,6 +4725,11 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(raised.exception.delivery_uncertain)
         self.assertFalse(raised.exception.safe_to_requeue)
+        self.assertFalse(predecessor_path.exists())
+        self.assertFalse(candidate_path.exists())
+        self.assertFalse(agent_server.CROSS_CHAT_CAPABILITIES)
+        self.assertIn((candidate_run_id, False), revoke_observations)
+        self.assertIn((predecessor_run_id, False), revoke_observations)
         self.assertEqual(manager.evict_calls, [("chat-claude", True)])
         self.assertTrue(any(
             call.args[:2] == ("chat-claude", candidate_run_id)
@@ -4121,6 +4919,8 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             "client_capabilities": [
                 agent_server.CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY
             ],
+            "_durable": True,
+            "_paused_after_stop": True,
         }
         agent_server.QUEUED_TURNS = {
             "chat-claude": deque([selected]),
@@ -4164,7 +4964,27 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             ],
             ["queued-race"],
         )
+        self.assertFalse(selected["_paused_after_stop"])
+        self.assertNotIn("_native_delivery_fenced", selected)
+        lifecycle = self.append_durable_event_batch.await_args.args[1]
+        self.assertEqual(
+            [event_type for event_type, _payload in lifecycle],
+            ["turn_queued", "turn_queue_reordered"],
+        )
+        public = await agent_server.queued_turns_snapshot("chat-claude")
+        self.assertFalse(public[0]["paused"])
         self.assertTrue(native_queue.empty())
+
+        agent_server.ACTIVE = {}
+        agent_server.BUSY_SESSIONS.discard("chat-claude")
+        start = AsyncMock(return_value={"run_id": "run-retry"})
+        with patch.object(agent_server, "_start_turn_locked", start):
+            await agent_server._start_next_queued_turn_locked(
+                "chat-claude",
+                admission_backend=agent_server.BACKEND_CLAUDE,
+            )
+        start.assert_awaited_once()
+        self.assertEqual(start.await_args.args[1].prompt, selected["prompt"])
 
     async def test_force_send_defers_until_exact_claude_replay_ack(self) -> None:
         handle = FakeClaudeRun(acknowledged=False)

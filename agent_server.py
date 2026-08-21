@@ -59,7 +59,7 @@ from dateutil.tz import datetime_exists
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 import uvicorn
 import websockets
 
@@ -97,6 +97,7 @@ from update_runner import (
 from team_hub_host import (
     TEAM_HUB_MODE_HOST,
     TEAM_HUB_MOUNT_PATH,
+    TEAM_HUB_TRANSPORT_DIRECT_IP,
     ManagedTeamHubHost,
     configured_team_hub_endpoint,
     configured_team_hub_hosts,
@@ -3910,6 +3911,14 @@ class ServerRestartRequest(BaseModel):
     expected_server_identity: str = Field(min_length=1, max_length=128)
     expected_server_instance_id: str = Field(min_length=1, max_length=128)
     confirmed: Literal[True]
+    force: Literal[True] | None = None
+    force_confirmed: Literal[True] | None = None
+    expected_blocker_revision: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
     @field_validator("confirmed", mode="before")
     @classmethod
@@ -3917,6 +3926,25 @@ class ServerRestartRequest(BaseModel):
         if value is not True:
             raise ValueError("confirmed must be the JSON boolean true")
         return value
+
+    @field_validator("force", "force_confirmed", mode="before")
+    @classmethod
+    def require_optional_literal_boolean_true(cls, value: Any) -> Any:
+        if value is not None and value is not True:
+            raise ValueError("force controls must be omitted or the JSON boolean true")
+        return value
+
+    @model_validator(mode="after")
+    def require_explicit_force_confirmation(self) -> "ServerRestartRequest":
+        if (self.force is True) != (self.force_confirmed is True):
+            raise ValueError(
+                "force and force_confirmed must both be the JSON boolean true"
+            )
+        if (self.force is True) != (self.expected_blocker_revision is not None):
+            raise ValueError(
+                "forced restart requires exactly one expected blocker revision"
+            )
+        return self
 
 
 class TeamHubBootstrapProofRequest(BaseModel):
@@ -3927,7 +3955,9 @@ class TeamHubBootstrapProofRequest(BaseModel):
     expected_server_instance_id: str = Field(min_length=8, max_length=240)
     expected_hub_id: str = Field(min_length=8, max_length=240)
     expected_hub_url: str = Field(min_length=16, max_length=2048)
+    expected_transport: Literal["tailscale_serve", "direct_ip"] | None = None
     confirmed: Literal[True]
+    unsafe_direct_ip_confirmed: Literal[True] | None = None
     recipient_email: str = Field(min_length=3, max_length=320)
     display_name: str = Field(min_length=1, max_length=160)
     device_label: str = Field(min_length=1, max_length=160)
@@ -3950,6 +3980,15 @@ class TeamHubBootstrapProofRequest(BaseModel):
     def require_literal_boolean_true(cls, value: Any) -> Any:
         if value is not True:
             raise ValueError("confirmed must be the JSON boolean true")
+        return value
+
+    @field_validator("unsafe_direct_ip_confirmed", mode="before")
+    @classmethod
+    def require_literal_direct_ip_confirmation(cls, value: Any) -> Any:
+        if value is not None and value is not True:
+            raise ValueError(
+                "unsafe_direct_ip_confirmed must be omitted or the JSON boolean true"
+            )
         return value
 
 
@@ -11734,7 +11773,10 @@ def abandoned_turn_after_restart(
     )
 
 
-async def recover_abandoned_turns_after_start() -> int:
+async def recover_abandoned_turns_after_start(
+    *,
+    forced_restart_request_id: str | None = None,
+) -> int:
     """Close runs orphaned by a crash without replaying accepted user input."""
 
     session_items = [
@@ -11775,6 +11817,15 @@ async def recover_abandoned_turns_after_start() -> int:
                 "Its accepted user message was not replayed."
             ),
         }
+        if forced_restart_request_id:
+            payload.update({
+                "forced_restart": True,
+                "restart_request_id": forced_restart_request_id,
+                "message": (
+                    "This agent turn was forcibly interrupted when AgentsServer "
+                    "restarted. Its accepted user message was not replayed."
+                ),
+            })
         for key in (
             "purpose",
             "job_id",
@@ -11805,7 +11856,10 @@ async def recover_abandoned_turns_after_start() -> int:
     return recovered
 
 
-async def recover_abandoned_codex_compactions_after_start() -> int:
+async def recover_abandoned_codex_compactions_after_start(
+    *,
+    forced_restart_request_id: str | None = None,
+) -> int:
     """Close compaction rows whose provider process vanished mid-operation.
 
     The bounded pending index lives in sessions.json, so startup does not scan
@@ -11845,6 +11899,15 @@ async def recover_abandoned_codex_compactions_after_start() -> int:
                 "Context compaction was interrupted when AgentsServer restarted."
             ),
         })
+        if forced_restart_request_id:
+            payload.update({
+                "forced_restart": True,
+                "restart_request_id": forced_restart_request_id,
+                "message": (
+                    "Context compaction was forcibly interrupted when "
+                    "AgentsServer restarted."
+                ),
+            })
         try:
             await append_event(
                 session_id,
@@ -12319,6 +12382,90 @@ def tmux_server_pid() -> int | None:
         if pid > 0:
             return pid
     return None
+
+
+def server_restart_tmux_cgroup_state() -> dict[str, Any]:
+    """Inspect whether systemd would terminate the shared tmux daemon.
+
+    This probe is deliberately read-only.  Private PID/cgroup values are used
+    only to bind a force confirmation to the exact inspected process state;
+    callers must never return them through the API.
+    """
+
+    state: dict[str, Any] = {
+        "tmux_server_in_service_cgroup": False,
+        "tmux_server_cgroup_unknown": False,
+        "_tmux_server_pid": None,
+        "_tmux_server_cgroup_paths": (),
+        "_server_service_cgroup": None,
+        "_tmux_server_inspection": "not-systemd-managed",
+    }
+    if not sys.platform.startswith("linux"):
+        return state
+    try:
+        probe = run_tmux(
+            ["list-sessions", "-F", "#{pid}"],
+            check=False,
+        )
+    except Exception as exc:
+        state["tmux_server_cgroup_unknown"] = True
+        state["_server_service_cgroup"] = agents_server_systemd_cgroup()
+        state["_tmux_server_inspection"] = (
+            f"lookup-failed:{type(exc).__name__}"[:160]
+        )
+        return state
+    probe_fingerprint = hashlib.sha256(json.dumps({
+        "returncode": int(probe.returncode),
+        "stdout": str(probe.stdout or "")[:4_096],
+        "stderr": str(probe.stderr or "")[:4_096],
+    }, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode(
+        "utf-8"
+    )).hexdigest()
+    state["_tmux_server_probe_revision"] = probe_fingerprint
+    if probe.returncode != 0:
+        socket_path = Path("/tmp") / f"tmux-{os.getuid()}" / "default"
+        try:
+            socket_present = stat.S_ISSOCK(socket_path.lstat().st_mode)
+        except OSError:
+            socket_present = False
+        if socket_present:
+            state["tmux_server_cgroup_unknown"] = True
+            state["_server_service_cgroup"] = agents_server_systemd_cgroup()
+            state["_tmux_server_inspection"] = "lookup-failed-with-socket"
+        else:
+            state["_tmux_server_inspection"] = "not-running"
+        return state
+
+    pids = {
+        int(line.strip())
+        for line in str(probe.stdout or "").splitlines()
+        if line.strip().isdigit() and int(line.strip()) > 0
+    }
+    if len(pids) != 1:
+        state["tmux_server_cgroup_unknown"] = True
+        state["_server_service_cgroup"] = agents_server_systemd_cgroup()
+        state["_tmux_server_inspection"] = "pid-unavailable"
+        return state
+    pid = next(iter(pids))
+
+    service_cgroup = agents_server_systemd_cgroup()
+    state["_server_service_cgroup"] = service_cgroup
+    state["_tmux_server_pid"] = pid
+    if service_cgroup is None:
+        state["tmux_server_cgroup_unknown"] = True
+        state["_tmux_server_inspection"] = "server-cgroup-unavailable"
+        return state
+    paths = tuple(sorted(process_cgroup_paths(pid)))
+    state["_tmux_server_cgroup_paths"] = paths
+    if not paths:
+        state["tmux_server_cgroup_unknown"] = True
+        state["_tmux_server_inspection"] = "cgroup-unavailable"
+        return state
+    state["tmux_server_in_service_cgroup"] = any(
+        cgroup_is_within(path, service_cgroup) for path in paths
+    )
+    state["_tmux_server_inspection"] = "verified"
+    return state
 
 
 def bootstrap_isolated_tmux_server() -> bool:
@@ -36597,6 +36744,11 @@ async def _start_turn_locked(
             BUSY_SESSIONS.add(session_id)
             CURRENT_TURNS[session_id] = {
                 "run_id": None,
+                # Private per-admission identity for restart confirmation. A
+                # run id is assigned only after several awaited startup
+                # checks, so the blocker revision needs its own token to
+                # distinguish a replacement reservation in that interval.
+                "_server_restart_admission_id": uuid.uuid4().hex,
                 "prompt": req.prompt,
                 "display_prompt": req.display_prompt,
                 "file_ids": list(req.file_ids),
@@ -37042,9 +37194,12 @@ SERVER_UPDATE_START_GRACE_SECONDS = 45.0
 SERVER_RESTART_PHASES = {"idle", "accepted", "signaling", "complete", "failed"}
 SERVER_RESTART_ACTIVE_PHASES = {"accepted", "signaling"}
 SERVER_RESTART_SIGNAL_DELAY_SECONDS = 0.5
+SERVER_RESTART_FORCE_KILL_DELAY_SECONDS = 3.0
 SERVER_RESTART_ACCEPTED_STALE_SECONDS = 10.0
 SERVER_RESTART_COOLDOWN_SECONDS = 30.0
 SERVER_RESTART_MAX_BODY_BYTES = 2_048
+SERVER_RESTART_BLOCKER_SNAPSHOT_VERSION = 2
+SERVER_RESTART_COUNT_LIMIT = 1_000_000
 TEAM_HUB_BOOTSTRAP_MAX_BODY_BYTES = 4_096
 UNSAFE_HTTP_MUTATION_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 UNSAFE_HTTP_MUTATION_ADMISSION_LOCK = asyncio.Lock()
@@ -37144,31 +37299,46 @@ def managed_server_service_kind() -> str | None:
     return detected
 
 
-def server_restart_capability() -> dict[str, Any]:
+def server_restart_capability(
+    blocker_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     reconcile_stale_server_restart_acceptance()
     if not AGENT_TOKEN:
-        return {
+        capability = {
             "available": False,
             "required": False,
             "message": "Server restart requires authenticated AgentsServer mode.",
             "action": "Install or configure AgentsServer with an access token.",
-            "version": 1,
+            "version": 2,
+            "force_restart": False,
         }
+        if blocker_snapshot is not None:
+            capability["blocker_snapshot"] = blocker_snapshot
+        return capability
     if managed_server_service_kind() is None:
-        return {
+        capability = {
             "available": False,
             "required": False,
             "message": "Server restart is unavailable for an unmanaged server process.",
             "action": "Install AgentsServer as its supported user service, then reconnect.",
-            "version": 1,
+            "version": 2,
+            "force_restart": False,
         }
-    return {
+        if blocker_snapshot is not None:
+            capability["blocker_snapshot"] = blocker_snapshot
+        return capability
+    capability = {
         "available": True,
         "required": False,
         "message": "Authenticated managed server restart is available.",
         "action": None,
-        "version": 1,
+        "version": 2,
+        "force_restart": True,
+        "force_confirmation_required": True,
     }
+    if blocker_snapshot is not None:
+        capability["blocker_snapshot"] = blocker_snapshot
+    return capability
 
 
 def read_server_restart_status() -> dict[str, Any]:
@@ -37193,6 +37363,8 @@ def write_server_restart_status(**changes: Any) -> dict[str, Any]:
 
 def public_server_restart_status(
     status: dict[str, Any] | None = None,
+    *,
+    blocker_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     current = (
         status
@@ -37212,7 +37384,14 @@ def public_server_restart_status(
             if phase == "idle"
             else "AgentsServer restart status is available."
         ))[:500],
+        "forced": current.get("_forced") is True,
     }
+    if result["forced"]:
+        raw_snapshot = current.get("_forced_work_snapshot")
+        snapshot = raw_snapshot if isinstance(raw_snapshot, dict) else {}
+        result["interrupted_work"] = public_server_restart_work_counts(snapshot)
+    if blocker_snapshot is not None:
+        result["blocker_snapshot"] = blocker_snapshot
     for name in (
         "request_id",
         "requested_at",
@@ -37332,6 +37511,228 @@ def server_restart_error_detail(
     return result
 
 
+def public_server_restart_work_counts(snapshot: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "codex_goals_reconfiguring": (
+            snapshot.get("codex_goals_reconfiguring") is True
+        ),
+        "tmux_server_in_service_cgroup": (
+            snapshot.get("tmux_server_in_service_cgroup") is True
+        ),
+        "tmux_server_cgroup_unknown": (
+            snapshot.get("tmux_server_cgroup_unknown") is True
+        ),
+    }
+    for name in (
+        "active_count",
+        "restart_blocking_queued_count",
+        "provider_background_count",
+        "server_maintenance_count",
+        "mutation_count",
+        "deleting_session_count",
+    ):
+        value = snapshot.get(name)
+        result[name] = (
+            min(SERVER_RESTART_COUNT_LIMIT, max(0, value))
+            if isinstance(value, int) and not isinstance(value, bool)
+            else 0
+        )
+    return result
+
+
+def server_restart_blocker_snapshot_locked(
+    *,
+    tmux_cgroup_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Snapshot restart blockers while admission locks are held by the caller."""
+
+    maintenance_session_ids = sorted(
+        str(session_id) for session_id in SERVER_MAINTENANCE_SESSIONS
+    )
+    active_session_ids = sorted(
+        str(session_id)
+        for session_id in BUSY_SESSIONS - SERVER_MAINTENANCE_SESSIONS
+    )
+    deleting_session_ids = sorted(str(session_id) for session_id in DELETING_SESSIONS)
+    queued_tokens: list[tuple[str, str, int, str, bool, bool]] = []
+    queued_count = 0
+    for session_id, queue in sorted(
+        QUEUED_TURNS.items(),
+        key=lambda entry: str(entry[0]),
+    ):
+        for index, item in enumerate(queue):
+            durable = item.get("_durable") is True
+            transitioning = item.get("_update_transitioning") is True
+            if durable and not transitioning:
+                continue
+            queued_count += 1
+            queued_tokens.append((
+                "queued",
+                str(session_id)[:240],
+                index,
+                str(item.get("queued_id") or "")[:240],
+                durable,
+                transitioning,
+            ))
+    for session_id, item in sorted(
+        RUN_NOW_TURNS.items(),
+        key=lambda entry: str(entry[0]),
+    ):
+        durable = item.get("_durable") is True
+        transitioning = item.get("_update_transitioning") is True
+        if durable and not transitioning:
+            continue
+        queued_count += 1
+        queued_tokens.append((
+            "run_now",
+            str(session_id)[:240],
+            0,
+            str(item.get("queued_id") or "")[:240],
+            durable,
+            transitioning,
+        ))
+    duplicate_provider_labels = {
+        *(f"active chat {session_id}" for session_id in active_session_ids),
+        *(
+            f"Codex maintenance for {session_id}"
+            for session_id in maintenance_session_ids
+        ),
+    }
+    provider_work_labels = [
+        str(label)[:200]
+        for label in active_provider_background_work_labels()
+        if str(label) not in duplicate_provider_labels
+    ][:SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT]
+    mutation_count = max(0, int(UNSAFE_HTTP_MUTATIONS_IN_FLIGHT))
+    codex_goals_reconfiguring = bool(CODEX_GOALS_RECONFIGURING)
+    tmux_state = (
+        tmux_cgroup_state
+        if isinstance(tmux_cgroup_state, dict)
+        else server_restart_tmux_cgroup_state()
+    )
+    tmux_server_in_service_cgroup = (
+        tmux_state.get("tmux_server_in_service_cgroup") is True
+    )
+    tmux_server_cgroup_unknown = (
+        tmux_state.get("tmux_server_cgroup_unknown") is True
+    )
+    active_work_tokens: list[tuple[str, str, str, str, str]] = []
+    for session_id in active_session_ids:
+        current = CURRENT_TURNS.get(session_id) or {}
+        active = ACTIVE.get(session_id) or {}
+        active_work_tokens.append((
+            session_id,
+            str(current.get("_server_restart_admission_id") or "")[:128],
+            str(
+                current.get("codex_control_reservation_id")
+                or active.get("codex_control_reservation_id")
+                or ""
+            )[:128],
+            str(current.get("run_id") or "")[:240],
+            str(active.get("run_id") or "")[:240],
+        ))
+    digest_payload = {
+        "version": SERVER_RESTART_BLOCKER_SNAPSHOT_VERSION,
+        "active_session_ids": active_session_ids,
+        # These private tokens make a force confirmation stale when different
+        # work replaces the reviewed run in the same chat. They are hashed into
+        # the revision only and are never returned by the public snapshot.
+        "active_work_tokens": active_work_tokens,
+        "maintenance_session_ids": maintenance_session_ids,
+        "queued_tokens": queued_tokens,
+        "provider_work_labels": provider_work_labels,
+        "mutation_count": mutation_count,
+        "deleting_session_ids": deleting_session_ids,
+        "codex_goals_reconfiguring": codex_goals_reconfiguring,
+        "tmux_server": {
+            "in_service_cgroup": tmux_server_in_service_cgroup,
+            "cgroup_unknown": tmux_server_cgroup_unknown,
+            "pid": tmux_state.get("_tmux_server_pid"),
+            "cgroup_paths": list(
+                tmux_state.get("_tmux_server_cgroup_paths") or ()
+            ),
+            "service_cgroup": tmux_state.get("_server_service_cgroup"),
+            "inspection": str(
+                tmux_state.get("_tmux_server_inspection") or "unknown"
+            )[:160],
+            "probe_revision": tmux_state.get("_tmux_server_probe_revision"),
+        },
+    }
+    revision = hashlib.sha256(json.dumps(
+        digest_payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")).hexdigest()
+    counts = public_server_restart_work_counts({
+        "active_count": len(active_session_ids),
+        "restart_blocking_queued_count": queued_count,
+        "provider_background_count": len(provider_work_labels),
+        "server_maintenance_count": len(maintenance_session_ids),
+        "mutation_count": mutation_count,
+        "deleting_session_count": len(deleting_session_ids),
+        "codex_goals_reconfiguring": codex_goals_reconfiguring,
+        "tmux_server_in_service_cgroup": tmux_server_in_service_cgroup,
+        "tmux_server_cgroup_unknown": tmux_server_cgroup_unknown,
+    })
+    forceable_blockers = any(
+        counts[name] > 0
+        for name in (
+            "active_count",
+            "restart_blocking_queued_count",
+            "provider_background_count",
+        )
+    ) or counts["tmux_server_in_service_cgroup"] is True or (
+        counts["tmux_server_cgroup_unknown"] is True
+    )
+    safety_blockers = any(
+        counts[name] > 0
+        for name in (
+            "server_maintenance_count",
+            "mutation_count",
+            "deleting_session_count",
+        )
+    ) or counts["codex_goals_reconfiguring"] is True
+    return {
+        "version": SERVER_RESTART_BLOCKER_SNAPSHOT_VERSION,
+        "revision": revision,
+        **counts,
+        "has_forceable_blockers": forceable_blockers,
+        "has_safety_blockers": safety_blockers,
+        "has_blockers": forceable_blockers or safety_blockers,
+    }
+
+
+async def current_server_restart_blocker_snapshot() -> dict[str, Any]:
+    async with ACTIVE_LOCK:
+        async with QUEUE_LOCK:
+            async with UNSAFE_HTTP_MUTATION_ADMISSION_LOCK:
+                tmux_cgroup_state = await asyncio.to_thread(
+                    server_restart_tmux_cgroup_state
+                )
+                return server_restart_blocker_snapshot_locked(
+                    tmux_cgroup_state=tmux_cgroup_state,
+                )
+
+
+def server_restart_request_fingerprint(body: ServerRestartRequest) -> str:
+    """Bind an idempotency key to one exact restart target and force mode."""
+
+    canonical = json.dumps(
+        {
+            "contract": 2,
+            "expected_server_identity": body.expected_server_identity,
+            "expected_server_instance_id": body.expected_server_instance_id,
+            "forced": body.force is True and body.force_confirmed is True,
+            "expected_blocker_revision": body.expected_blocker_revision,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def server_restart_work_message(
     active_count: int,
     queued_count: int,
@@ -37340,6 +37741,8 @@ def server_restart_work_message(
     *,
     deleting_count: int = 0,
     codex_goals_reconfiguring: bool = False,
+    tmux_server_in_service_cgroup: bool = False,
+    tmux_server_cgroup_unknown: bool = False,
 ) -> str:
     parts: list[str] = []
     if active_count:
@@ -37364,8 +37767,66 @@ def server_restart_work_message(
         )
     if codex_goals_reconfiguring:
         parts.append("Codex goals reconfiguration")
+    if tmux_server_in_service_cgroup:
+        parts.append(
+            "a persistent tmux server inside agents-server.service"
+        )
+    if tmux_server_cgroup_unknown:
+        parts.append("an unverified persistent tmux server cgroup")
     detail = " and ".join(parts) or "server work"
     return f"AgentsServer cannot restart while {detail} remains active."
+
+
+def server_restart_safety_work_message(
+    maintenance_count: int,
+    mutation_count: int,
+    deleting_count: int,
+    codex_goals_reconfiguring: bool,
+) -> str:
+    parts: list[str] = []
+    if maintenance_count:
+        parts.append(
+            f"{maintenance_count} server maintenance operation"
+            f"{'s' if maintenance_count != 1 else ''}"
+        )
+    if mutation_count:
+        parts.append(
+            f"{mutation_count} in-flight server change"
+            f"{'s' if mutation_count != 1 else ''}"
+        )
+    if deleting_count:
+        parts.append(
+            f"{deleting_count} session deletion"
+            f"{'s' if deleting_count != 1 else ''}"
+        )
+    if codex_goals_reconfiguring:
+        parts.append("Codex goals reconfiguration")
+    detail = " and ".join(parts) or "safety-critical server work"
+    return (
+        f"AgentsServer cannot restart while {detail} remains active; "
+        "force restart cannot override this safety fence."
+    )
+
+
+def force_kill_managed_server_after_deadline(
+    request_id: str,
+    pid: int,
+) -> None:
+    """Guarantee an explicitly forced managed restart cannot drain forever."""
+
+    time.sleep(SERVER_RESTART_FORCE_KILL_DELAY_SECONDS)
+    with SERVER_RESTART_SIGNAL_LOCK:
+        status = read_server_restart_status()
+        if (
+            str(status.get("request_id") or "") != request_id
+            or str(status.get("phase") or "") != "signaling"
+            or str(status.get("_source_instance_id") or "")
+            != SERVER_INSTANCE_ID
+            or status.get("_forced") is not True
+        ):
+            return
+        with suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
 
 
 def signal_managed_server_restart(request_id: str) -> None:
@@ -37397,7 +37858,15 @@ def signal_managed_server_restart(request_id: str) -> None:
             ),
         )
         try:
-            os.kill(os.getpid(), signal.SIGTERM)
+            pid = os.getpid()
+            if status.get("_forced") is True:
+                threading.Thread(
+                    target=force_kill_managed_server_after_deadline,
+                    args=(request_id, pid),
+                    daemon=True,
+                    name="agents-server-force-restart",
+                ).start()
+            os.kill(pid, signal.SIGTERM)
         except Exception:
             write_server_restart_status(
                 phase="failed",
@@ -37576,6 +38045,49 @@ def _verify_server_update_team_hub_identity(status: dict[str, Any]) -> None:
     capability = TEAM_HUB_RUNTIME.capability()
     actual_transport = str(capability.get("transport") or "").strip()
     actual_hub_url = capability.get("hub_url")
+    expected_routes_value = status.get("team_hub_routes")
+    actual_routes_value = capability.get("routes")
+    expected_direct_ip_url_value = status.get("team_hub_direct_ip_url")
+    expected_routes: list[tuple[str, str | None]] | None = None
+    actual_routes: list[tuple[str, str | None]] | None = None
+    if isinstance(expected_routes_value, list):
+        if not all(
+            isinstance(route, dict)
+            and set(route) == {"transport", "hub_url"}
+            for route in expected_routes_value
+        ):
+            raise RuntimeError("server update Team Hub route binding is invalid")
+        expected_routes = [
+            (str(route.get("transport") or ""), route.get("hub_url"))
+            for route in expected_routes_value
+        ]
+        if len(set(expected_routes)) != len(expected_routes):
+            raise RuntimeError("server update Team Hub route binding is invalid")
+        expected_direct_from_routes = next(
+            (
+                str(route_url or "")
+                for route_transport, route_url in expected_routes
+                if route_transport == "direct_ip"
+            ),
+            "",
+        )
+        if (
+            expected_direct_ip_url_value is not None
+            and str(expected_direct_ip_url_value) != expected_direct_from_routes
+        ):
+            raise RuntimeError("server update Team Hub route binding is invalid")
+    if isinstance(actual_routes_value, list):
+        if all(
+            isinstance(route, dict)
+            and set(route) == {"transport", "hub_url"}
+            for route in actual_routes_value
+        ):
+            actual_routes = [
+                (str(route.get("transport") or ""), route.get("hub_url"))
+                for route in actual_routes_value
+            ]
+            if len(set(actual_routes)) != len(actual_routes):
+                actual_routes = None
     # Records written before transport binding are accepted only for the old
     # loopback realm. A remote Hub can never be adopted through legacy status.
     transport_matches = (
@@ -37589,7 +38101,7 @@ def _verify_server_update_team_hub_identity(status: dict[str, Any]) -> None:
                 and expected_hub_url is None
             )
             or (
-                expected_transport == "tailscale_serve"
+                expected_transport in {"tailscale_serve", "direct_ip"}
                 and expected_hub_url
                 and actual_hub_url == expected_hub_url
             )
@@ -37604,6 +38116,10 @@ def _verify_server_update_team_hub_identity(status: dict[str, Any]) -> None:
         or capability.get("host_server_identity") != expected_host_identity
         or expected_host_identity != server_identity()
         or not transport_matches
+        or (
+            expected_routes is not None
+            and actual_routes != expected_routes
+        )
     ):
         raise RuntimeError("updated server lost its designated Team Hub identity")
 
@@ -37836,9 +38352,34 @@ TEAM_HUB_MODE, TEAM_HUB_CONFIG_ERROR = configured_team_hub_mode(
 ) = configured_team_hub_endpoint(
     TEAM_HUB_MODE,
     os.environ.get("AGENTSDOCK_TEAM_HUB_URL"),
+    os.environ.get("AGENTSDOCK_TEAM_HUB_TRANSPORT"),
+    SERVER_PORT,
 )
 if TEAM_HUB_ENDPOINT_CONFIG_ERROR is not None:
     TEAM_HUB_CONFIG_ERROR = TEAM_HUB_ENDPOINT_CONFIG_ERROR
+TEAM_HUB_ROUTES: dict[str, str | None] = {}
+if TEAM_HUB_TRANSPORT is not None:
+    TEAM_HUB_ROUTES[TEAM_HUB_TRANSPORT] = TEAM_HUB_URL
+TEAM_HUB_DIRECT_IP_URL = str(
+    os.environ.get("AGENTSDOCK_TEAM_HUB_DIRECT_IP_URL") or ""
+).strip()
+TEAM_HUB_DIRECT_IP_PUBLIC_HOST: str | None = None
+if TEAM_HUB_MODE == TEAM_HUB_MODE_HOST and TEAM_HUB_DIRECT_IP_URL:
+    (
+        direct_transport,
+        direct_url,
+        TEAM_HUB_DIRECT_IP_PUBLIC_HOST,
+        direct_error,
+    ) = configured_team_hub_endpoint(
+        TEAM_HUB_MODE,
+        TEAM_HUB_DIRECT_IP_URL,
+        TEAM_HUB_TRANSPORT_DIRECT_IP,
+        SERVER_PORT,
+    )
+    if direct_error is not None:
+        TEAM_HUB_CONFIG_ERROR = direct_error
+    elif direct_transport is not None:
+        TEAM_HUB_ROUTES[direct_transport] = direct_url
 TEAM_HUB_DATA_DIR = STATE_DIR / "team-hub"
 TEAM_HUB_ALLOWED_HOSTS = configured_team_hub_hosts(
     SERVER_BIND_ADDRESS,
@@ -37846,6 +38387,8 @@ TEAM_HUB_ALLOWED_HOSTS = configured_team_hub_hosts(
 )
 if TEAM_HUB_PUBLIC_HOST is not None:
     TEAM_HUB_ALLOWED_HOSTS.add(TEAM_HUB_PUBLIC_HOST)
+if TEAM_HUB_DIRECT_IP_PUBLIC_HOST is not None:
+    TEAM_HUB_ALLOWED_HOSTS.add(TEAM_HUB_DIRECT_IP_PUBLIC_HOST)
 TEAM_HUB_RUNTIME = ManagedTeamHubHost(
     mode=TEAM_HUB_MODE,
     data_dir=TEAM_HUB_DATA_DIR,
@@ -37854,6 +38397,7 @@ TEAM_HUB_RUNTIME = ManagedTeamHubHost(
     allowed_hosts=TEAM_HUB_ALLOWED_HOSTS,
     transport=TEAM_HUB_TRANSPORT or "loopback",
     hub_url=TEAM_HUB_URL,
+    routes=TEAM_HUB_ROUTES,
     config_error=TEAM_HUB_CONFIG_ERROR,
     logger=logger,
 )
@@ -37867,12 +38411,28 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(TEAM_HUB_RUNTIME.initialize)
     await asyncio.to_thread(scrub_tmux_global_secret_environment)
     await CROSS_CHAT.initialize()
+    startup_restart_status = read_server_restart_status()
+    forced_restart_request_id = (
+        str(startup_restart_status.get("request_id") or "")[:128]
+        if (
+            str(startup_restart_status.get("phase") or "")
+            in SERVER_RESTART_ACTIVE_PHASES
+            and startup_restart_status.get("_forced") is True
+            and str(startup_restart_status.get("_source_instance_id") or "")
+            not in {"", SERVER_INSTANCE_ID}
+        )
+        else ""
+    )
     reconcile_server_restart_status_after_startup()
     await reconcile_server_update_status_after_startup()
     abandoned_compaction_count = (
-        await recover_abandoned_codex_compactions_after_start()
+        await recover_abandoned_codex_compactions_after_start(
+            forced_restart_request_id=(forced_restart_request_id or None),
+        )
     )
-    abandoned_turn_count = await recover_abandoned_turns_after_start()
+    abandoned_turn_count = await recover_abandoned_turns_after_start(
+        forced_restart_request_id=(forced_restart_request_id or None),
+    )
     removed_authority_files = (
         await purge_cross_chat_authority_files_after_restart()
     )
@@ -38008,6 +38568,7 @@ def team_hub_bootstrap_browser_request_forbidden(request: Request) -> bool:
         return True
     return any(
         bytes(name).lower() == b"origin"
+        or bytes(name).lower() == b"cookie"
         or (
             bytes(name).lower().startswith(b"sec-fetch-")
             and bytes(name).lower() != b"sec-fetch-mode"
@@ -38136,13 +38697,17 @@ async def require_agent_token(request: Request, call_next):
             )
         if not request_exact_bearer_authorized(request):
             return JSONResponse({"detail": "unauthorized"}, status_code=401)
-        serve_identity = TEAM_HUB_RUNTIME.tailscale_serve_identity(request)
-        if serve_identity is None:
+        route_identity = (
+            TEAM_HUB_RUNTIME.tailscale_serve_identity(request)
+            or TEAM_HUB_RUNTIME.direct_ip_identity(request)
+        )
+        if route_identity is None:
             return JSONResponse(
-                {"detail": "Team Hub bootstrap proof issuance requires verified private Tailscale Serve transport"},
+                {"detail": "Team Hub bootstrap proof issuance requires an exact configured remote Teamspace transport"},
                 status_code=403,
             )
-        request.state.team_hub_tailnet_login = serve_identity.tailnet_login
+        request.state.team_hub_remote_transport = route_identity.kind
+        request.state.team_hub_tailnet_login = route_identity.tailnet_login
         if request.method.upper() == "POST":
             transport_error = team_hub_bootstrap_post_transport_error(request)
             if transport_error is not None:
@@ -38261,6 +38826,7 @@ async def health() -> dict[str, Any]:
     async with QUEUE_LOCK:
         queued = {sid: len(queue) for sid, queue in QUEUED_TURNS.items() if queue}
         update_blocking_queued_count = update_blocking_queued_turn_count_locked()
+    restart_blocker_snapshot = await current_server_restart_blocker_snapshot()
     pressure = host_pressure_snapshot()
     tmux = tmux_capability(use_cache=True)
     return {
@@ -38280,7 +38846,9 @@ async def health() -> dict[str, Any]:
         ),
         "capabilities": {
             "team_hub_v1": TEAM_HUB_RUNTIME.capability(),
-            "server_restart": server_restart_capability(),
+            "server_restart": server_restart_capability(
+                restart_blocker_snapshot
+            ),
             "server_updates": {
                 "available": (
                     SERVER_UPDATE_RUNNER.is_file()
@@ -38715,7 +39283,9 @@ async def put_codex_goals_admin(
         return {**codex_goals_admin_status(), **transition}
 
 
-def require_team_hub_bootstrap_control(request: Request) -> str:
+def require_team_hub_bootstrap_control(
+    request: Request,
+) -> tuple[str, str | None]:
     if team_hub_bootstrap_browser_request_forbidden(request):
         raise HTTPException(status_code=403, detail="forbidden")
     if not AGENT_TOKEN:
@@ -38726,15 +39296,37 @@ def require_team_hub_bootstrap_control(request: Request) -> str:
     if not request_exact_bearer_authorized(request):
         raise HTTPException(status_code=401, detail="unauthorized")
     identity = TEAM_HUB_RUNTIME.tailscale_serve_identity(request)
-    if identity is None or identity.tailnet_login is None:
+    if identity is not None and identity.tailnet_login is not None:
+        return "tailscale_serve", identity.tailnet_login
+    identity = TEAM_HUB_RUNTIME.direct_ip_identity(request)
+    if identity is None:
         raise HTTPException(
             status_code=403,
             detail=(
-                "Team Hub bootstrap proof issuance requires verified private "
-                "Tailscale Serve transport"
+                "Team Hub bootstrap proof issuance requires an exact configured "
+                "remote Teamspace transport"
             ),
         )
-    return identity.tailnet_login
+    return "direct_ip", None
+
+
+def team_hub_capability_has_route(
+    capability: dict[str, Any],
+    transport: str,
+    hub_url: str,
+) -> bool:
+    routes = capability.get("routes")
+    if isinstance(routes, list):
+        return any(
+            isinstance(route, dict)
+            and route.get("transport") == transport
+            and route.get("hub_url") == hub_url
+            for route in routes
+        )
+    return (
+        capability.get("transport") == transport
+        and capability.get("hub_url") == hub_url
+    )
 
 
 @app.post("/api/admin/team-hub/bootstrap-proof")
@@ -38742,16 +39334,29 @@ async def team_hub_bootstrap_proof_endpoint(
     body: TeamHubBootstrapProofRequest,
     request: Request,
 ) -> Response:
-    tailnet_login = require_team_hub_bootstrap_control(request)
+    request_transport, tailnet_login = require_team_hub_bootstrap_control(request)
     capability = TEAM_HUB_RUNTIME.capability()
+    expected_transport = body.expected_transport or "tailscale_serve"
     if (
         not capability.get("available")
-        or capability.get("transport") != "tailscale_serve"
+        or request_transport != expected_transport
+        or not team_hub_capability_has_route(
+            capability,
+            expected_transport,
+            body.expected_hub_url,
+        )
+        or (
+            expected_transport == "direct_ip"
+            and body.unsafe_direct_ip_confirmed is not True
+        )
+        or (
+            expected_transport == "tailscale_serve"
+            and body.unsafe_direct_ip_confirmed is not None
+        )
         or str(capability.get("host_server_identity") or "")
         != body.expected_server_identity
         or SERVER_INSTANCE_ID != body.expected_server_instance_id
         or str(capability.get("hub_id") or "") != body.expected_hub_id
-        or str(capability.get("hub_url") or "") != body.expected_hub_url
     ):
         raise HTTPException(
             status_code=409,
@@ -38763,10 +39368,15 @@ async def team_hub_bootstrap_proof_endpoint(
             server_identity=body.expected_server_identity,
             server_instance_id=body.expected_server_instance_id,
             hub_url=body.expected_hub_url,
-            tailnet_login=tailnet_login,
+            tailnet_login=(
+                tailnet_login
+                if expected_transport == "tailscale_serve"
+                else body.recipient_email
+            ),
             recipient_email=body.recipient_email,
             display_name=body.display_name,
             device_label=body.device_label,
+            transport=expected_transport,
         )
     except HubError as exc:
         return JSONResponse(
@@ -38814,7 +39424,10 @@ def require_server_restart_control(request: Request) -> None:
 @app.get("/api/admin/restart")
 async def server_restart_status_endpoint(request: Request) -> dict[str, Any]:
     require_server_restart_control(request)
-    return public_server_restart_status()
+    blocker_snapshot = await current_server_restart_blocker_snapshot()
+    return public_server_restart_status(
+        blocker_snapshot=blocker_snapshot,
+    )
 
 
 @app.post("/api/admin/restart", status_code=202)
@@ -38826,10 +39439,30 @@ async def restart_server_endpoint(
     global UNSAFE_HTTP_MUTATIONS_IN_FLIGHT
     require_server_restart_control(request)
     request_id = str(body.request_id)
+    forced = body.force is True and body.force_confirmed is True
+    request_fingerprint = server_restart_request_fingerprint(body)
 
     async with SERVER_UPDATE_OPERATION_LOCK:
         restart_status = reconcile_stale_server_restart_acceptance()
         if str(restart_status.get("request_id") or "") == request_id:
+            accepted_fingerprint = str(
+                restart_status.get("_request_fingerprint") or ""
+            )
+            if not accepted_fingerprint or not hmac.compare_digest(
+                accepted_fingerprint,
+                request_fingerprint,
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=server_restart_error_detail(
+                        "server_restart_request_changed",
+                        "The restart request ID was already used with different confirmation details.",
+                        action=(
+                            "Refresh the server connection and use a new request ID "
+                            "for a newly confirmed restart."
+                        ),
+                    ),
+                )
             if (
                 str(restart_status.get("phase") or "") == "accepted"
                 and str(restart_status.get("_source_instance_id") or "")
@@ -38938,31 +39571,72 @@ async def restart_server_endpoint(
                                 retryable=True,
                             ),
                         )
-                    active_count = len(
-                        BUSY_SESSIONS | SERVER_MAINTENANCE_SESSIONS
+                    tmux_cgroup_state = await asyncio.to_thread(
+                        server_restart_tmux_cgroup_state
                     )
-                    queued_count = update_blocking_queued_turn_count_locked()
-                    deleting_count = len(DELETING_SESSIONS)
-                    codex_goals_reconfiguring = bool(CODEX_GOALS_RECONFIGURING)
-                    provider_work_labels = (
-                        []
-                        if (
-                            active_count
-                            or queued_count
-                            or deleting_count
-                            or codex_goals_reconfiguring
-                        )
-                        else active_provider_background_work_labels()
+                    blocker_snapshot = server_restart_blocker_snapshot_locked(
+                        tmux_cgroup_state=tmux_cgroup_state,
                     )
-                    mutation_count = UNSAFE_HTTP_MUTATIONS_IN_FLIGHT
-                    if (
-                        active_count
-                        or queued_count
-                        or deleting_count
-                        or codex_goals_reconfiguring
-                        or provider_work_labels
-                        or mutation_count
+                    active_count = int(blocker_snapshot["active_count"])
+                    queued_count = int(
+                        blocker_snapshot["restart_blocking_queued_count"]
+                    )
+                    provider_count = int(
+                        blocker_snapshot["provider_background_count"]
+                    )
+                    maintenance_count = int(
+                        blocker_snapshot["server_maintenance_count"]
+                    )
+                    mutation_count = int(blocker_snapshot["mutation_count"])
+                    deleting_count = int(
+                        blocker_snapshot["deleting_session_count"]
+                    )
+                    codex_goals_reconfiguring = bool(
+                        blocker_snapshot["codex_goals_reconfiguring"]
+                    )
+                    if forced and not hmac.compare_digest(
+                        str(body.expected_blocker_revision or ""),
+                        str(blocker_snapshot["revision"]),
                     ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=server_restart_error_detail(
+                                "server_restart_blockers_changed",
+                                "Server work changed after force restart was confirmed.",
+                                action=(
+                                    "Review the refreshed blocker counts and confirm "
+                                    "force restart again."
+                                ),
+                                retryable=True,
+                                blocker_snapshot=blocker_snapshot,
+                            ),
+                        )
+                    if blocker_snapshot["has_safety_blockers"]:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=server_restart_error_detail(
+                                "server_restart_unsafe_busy",
+                                server_restart_safety_work_message(
+                                    maintenance_count,
+                                    mutation_count,
+                                    deleting_count,
+                                    codex_goals_reconfiguring,
+                                ),
+                                action=(
+                                    "Wait for safety-critical server work to finish, "
+                                    "then refresh restart status."
+                                ),
+                                retryable=True,
+                                server_maintenance_count=maintenance_count,
+                                mutation_count=mutation_count,
+                                deleting_session_count=deleting_count,
+                                codex_goals_reconfiguring=(
+                                    codex_goals_reconfiguring
+                                ),
+                                blocker_snapshot=blocker_snapshot,
+                            ),
+                        )
+                    if blocker_snapshot["has_forceable_blockers"] and not forced:
                         raise HTTPException(
                             status_code=409,
                             detail=server_restart_error_detail(
@@ -38970,23 +39644,35 @@ async def restart_server_endpoint(
                                 server_restart_work_message(
                                     active_count,
                                     queued_count,
-                                    len(provider_work_labels),
-                                    mutation_count,
-                                    deleting_count=deleting_count,
-                                    codex_goals_reconfiguring=(
-                                        codex_goals_reconfiguring
+                                    provider_count,
+                                    0,
+                                    tmux_server_in_service_cgroup=bool(
+                                        blocker_snapshot[
+                                            "tmux_server_in_service_cgroup"
+                                        ]
+                                    ),
+                                    tmux_server_cgroup_unknown=bool(
+                                        blocker_snapshot[
+                                            "tmux_server_cgroup_unknown"
+                                        ]
                                     ),
                                 ),
                                 action="Wait for current work to finish, then retry.",
                                 retryable=True,
                                 active_count=active_count,
                                 restart_blocking_queued_count=queued_count,
-                                provider_background_count=len(provider_work_labels),
-                                mutation_count=mutation_count,
-                                deleting_session_count=deleting_count,
-                                codex_goals_reconfiguring=(
-                                    codex_goals_reconfiguring
+                                provider_background_count=provider_count,
+                                tmux_server_in_service_cgroup=bool(
+                                    blocker_snapshot[
+                                        "tmux_server_in_service_cgroup"
+                                    ]
                                 ),
+                                tmux_server_cgroup_unknown=bool(
+                                    blocker_snapshot[
+                                        "tmux_server_cgroup_unknown"
+                                    ]
+                                ),
+                                blocker_snapshot=blocker_snapshot,
                             ),
                         )
                     try:
@@ -39006,13 +39692,25 @@ async def restart_server_endpoint(
                             ),
                         ) from exc
                     now = update_utc_now()
+                    forced_work_snapshot = public_server_restart_work_counts(
+                        blocker_snapshot
+                    )
                     try:
                         restart_status = write_server_restart_status(
                             phase="accepted",
                             request_id=request_id,
                             _source_instance_id=SERVER_INSTANCE_ID,
+                            _request_fingerprint=request_fingerprint,
+                            _forced=forced,
+                            _forced_work_snapshot=(
+                                forced_work_snapshot if forced else None
+                            ),
                             message=(
-                                "AgentsServer accepted the restart and will briefly "
+                                "AgentsServer accepted the forced restart; any active "
+                                "work will be interrupted while its user service "
+                                "relaunches."
+                                if forced
+                                else "AgentsServer accepted the restart and will briefly "
                                 "disconnect while its user service relaunches."
                             ),
                             requested_at=now,
@@ -39274,6 +39972,8 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                     expected_hub_id: str | None = None
                     expected_hub_transport: str | None = None
                     expected_hub_url: str | None = None
+                    expected_hub_routes: list[dict[str, Any]] | None = None
+                    expected_hub_direct_ip_url: str | None = None
                     if hub_snapshot is not None:
                         expected_hub_id = str(hub_capability.get("hub_id") or "")
                         expected_hub_transport = str(
@@ -39283,12 +39983,28 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                         expected_hub_url = (
                             str(raw_hub_url) if raw_hub_url is not None else None
                         )
+                        raw_hub_routes = hub_capability.get("routes")
+                        expected_hub_routes = (
+                            [dict(route) for route in raw_hub_routes]
+                            if isinstance(raw_hub_routes, list)
+                            and all(isinstance(route, dict) for route in raw_hub_routes)
+                            else None
+                        )
+                        if expected_hub_routes is not None:
+                            expected_hub_direct_ip_url = next(
+                                (
+                                    str(route.get("hub_url") or "")
+                                    for route in expected_hub_routes
+                                    if route.get("transport") == "direct_ip"
+                                ),
+                                "",
+                            )
                         if (
                             hub_capability.get("available") is not True
                             or hub_capability.get("designated_host") is not True
                             or not expected_hub_id
                             or expected_hub_transport
-                            not in {"loopback", "tailscale_serve"}
+                            not in {"loopback", "tailscale_serve", "direct_ip"}
                             or (
                                 expected_hub_transport == "loopback"
                                 and expected_hub_url is not None
@@ -39297,6 +40013,11 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                                 expected_hub_transport == "tailscale_serve"
                                 and not expected_hub_url
                             )
+                            or (
+                                expected_hub_transport == "direct_ip"
+                                and not expected_hub_url
+                            )
+                            or not expected_hub_routes
                         ):
                             try:
                                 await TEAM_HUB_RUNTIME.clear_maintenance(
@@ -39318,6 +40039,8 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                                 expected_hub_transport,
                                 "--expected-team-hub-url",
                                 expected_hub_url or "",
+                                "--expected-team-hub-direct-ip-url",
+                                expected_hub_direct_ip_url or "",
                                 "--team-hub-snapshot",
                                 str(hub_snapshot),
                                 "--team-hub-data-dir",
@@ -39345,6 +40068,8 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                             ),
                             team_hub_transport=expected_hub_transport,
                             team_hub_url=expected_hub_url,
+                            team_hub_direct_ip_url=expected_hub_direct_ip_url,
+                            team_hub_routes=expected_hub_routes,
                             message=(
                                 f"Starting switch to {track} AgentsServer {requested}."
                                 if channel_switch

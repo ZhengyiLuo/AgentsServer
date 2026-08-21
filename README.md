@@ -205,11 +205,34 @@ The installer persists and verifies the exact Team Hub transport and URL but
 does not alter Tailscale configuration. Confirm separately that the exact 8444
 mapping appears under `Web` in `tailscale serve status --json`, and run
 `tailscale funnel status` to confirm Team Hub's `:8444` mapping is not public;
-unrelated mappings may remain untouched. Do not use Funnel, a direct
-`100.x:7850` URL, a generic reverse proxy, or one of Funnel's supported ports
+unrelated mappings may remain untouched. Do not use Funnel, a generic reverse
+proxy, or one of Funnel's supported ports
 (`443`, `8443`, or `10000`).
 The ordinary AgentsServer endpoint and any unrelated Serve/Funnel mappings are
 unchanged.
+
+AgentsServer `0.1.25-beta.5` adds an optional bare-IP route. For a fresh host,
+the operator may additionally advertise the exact route used by its
+authenticated AgentsServer profile:
+
+```bash
+./install.sh --non-interactive \
+  --team-hub-tailscale-serve-url \
+  https://my-server.my-tailnet.ts.net:8444/api/team-hub \
+  --team-hub-direct-ip-url \
+  http://100.73.184.23:7850/api/team-hub
+```
+
+If Serve is not configured on a fresh/disabled host,
+`--team-hub-direct-ip-url` selects Direct IP as the primary route. Direct IP is
+advanced and unencrypted: the AgentsServer bearer, Teamspace credentials and
+messages are plaintext in transit. Literal IP shape is not proof of Tailscale
+or identity. The route must be canonical
+`http://<literal-ip>:<AgentsServer-port>/api/team-hub`; it cannot use a
+hostname, loopback, another port/path, credentials, query or fragment. The
+desktop labels AgentsServer control and Teamspace separately and requires an
+explicit Direct-IP choice plus an additional Start confirmation. Automatic
+selection continues to use the advertised Serve primary.
 
 If the host install fails or you abandon this setup, remove only that listener:
 
@@ -217,13 +240,20 @@ If the host install fails or you abandon this setup, remove only that listener:
 tailscale serve --https=8444 off
 ```
 
-The host choice and transport are preserved by later installs and managed
-updates. A fresh server with no Hub database may be designated directly.
+The host choice and exact primary/Direct-IP routes are preserved by managed
+updates and rollback. A fresh server with no Hub database may be designated
+directly.
 Direct adoption or reactivation of existing Hub state is refused unless the
 operation has the snapshot-bound rollback contract. `--no-team-hub-host`
 stops serving an existing Hub but preserves its data; use it only when you
 intend to keep the Hub offline pending a signed managed recovery or
 support-assisted restoration.
+
+Adding or changing Direct IP on an existing live Hub is intentionally rejected
+by the ordinary installer, including a same-version reinstall. That change
+needs an authenticated transaction that closes admission and journals the
+exact route before restart; do not edit the environment behind a running Hub
+and assume update continuity will adopt it.
 
 An existing beta.2 host remains loopback-only during a normal managed update;
 an origin change is never inferred from mutable environment state. The remote

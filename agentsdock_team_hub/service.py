@@ -29,7 +29,7 @@ TAILSCALE_SERVE_HEADERS_INFO = "https://tailscale.com/s/serve-headers"
 
 @dataclass(frozen=True)
 class ManagedTransportIdentity:
-    kind: Literal["loopback", "tailscale_serve"]
+    kind: Literal["loopback", "tailscale_serve", "direct_ip"]
     tailnet_login: str | None = None
     tailnet_user_name: str | None = None
 
@@ -227,7 +227,7 @@ def classify_managed_transport(
     matches the one configured public origin.
     """
 
-    if not _is_loopback_peer(request) or request.url.scheme != "http":
+    if request.url.scheme != "http":
         return None
     raw_names = [key.lower() for key, _value in request.scope.get("headers", [])]
     forwarded_names = {
@@ -239,10 +239,33 @@ def classify_managed_transport(
         b"tailscale-headers-info",
         b"tailscale-funnel-request",
     }
-    if _has_loopback_authority(request):
+    loopback_peer = _is_loopback_peer(request)
+    if loopback_peer and _has_loopback_authority(request):
         if any(name in forwarded_names for name in raw_names):
             return None
         return ManagedTransportIdentity("loopback")
+    if managed_transport == "direct_ip":
+        direct_forbidden_headers = forwarded_names | {
+            b"cookie",
+            b"x-forwarded-for",
+            b"x-forwarded-port",
+            b"via",
+        }
+        if loopback_peer or any(name in direct_forbidden_headers for name in raw_names):
+            return None
+        try:
+            parsed = urlsplit(managed_hub_url)
+        except ValueError:
+            return None
+        if (
+            parsed.scheme != "http"
+            or not parsed.netloc
+            or _exact_ascii_header(request, b"host") != parsed.netloc
+        ):
+            return None
+        return ManagedTransportIdentity("direct_ip")
+    if not loopback_peer:
+        return None
     if managed_transport != "tailscale_serve":
         return None
     try:
@@ -300,6 +323,7 @@ def create_app(
     managed_server_instance_id: str | None = None,
     managed_transport: str | None = None,
     managed_hub_url: str | None = None,
+    managed_routes: dict[str, str] | None = None,
     require_https_for_non_loopback: bool = False,
     require_loopback_transport: bool = False,
 ) -> FastAPI:
@@ -338,14 +362,24 @@ def create_app(
         if host_name is None or host_name not in {item.lower() for item in hosts}:
             return _error("invalid_request", "Invalid Host header", 400)
         managed_identity: ManagedTransportIdentity | None = None
-        if managed_transport is not None:
-            if managed_hub_url is None:
+        managed_identity_url: str | None = None
+        configured_routes = managed_routes or (
+            {managed_transport: managed_hub_url}
+            if managed_transport is not None and managed_hub_url is not None
+            else {}
+        )
+        if managed_transport is not None or managed_routes is not None:
+            if not configured_routes:
                 return _error("transport_configuration_invalid", "Transport is unavailable", 503)
-            managed_identity = classify_managed_transport(
-                request,
-                managed_transport=managed_transport,
-                managed_hub_url=managed_hub_url,
-            )
+            for route_kind, route_url in configured_routes.items():
+                managed_identity = classify_managed_transport(
+                    request,
+                    managed_transport=route_kind,
+                    managed_hub_url=route_url,
+                )
+                if managed_identity is not None:
+                    managed_identity_url = route_url
+                    break
             if managed_identity is None:
                 return _error(
                     "local_preview_only",
@@ -353,6 +387,7 @@ def create_app(
                     403,
                 )
             request.state.team_hub_transport = managed_identity.kind
+            request.state.team_hub_url = managed_identity_url
             request.state.tailnet_login = managed_identity.tailnet_login
         origin_values = values.get(b"origin", [])
         if len(origin_values) > 1:
@@ -575,7 +610,8 @@ def create_app(
                 request, b"x-team-hub-bootstrap-request-id"
             )
             tailnet_login = getattr(request.state, "tailnet_login", None)
-            if request_id is None or tailnet_login is None or managed_hub_url is None:
+            route_hub_url = getattr(request.state, "team_hub_url", None)
+            if request_id is None or tailnet_login is None or route_hub_url is None:
                 raise HubError("bootstrap_unavailable", "Bootstrap is unavailable", 403)
             return store.bootstrap(
                 proof,
@@ -585,7 +621,24 @@ def create_app(
                 transport="tailscale_serve",
                 request_id=request_id,
                 tailnet_login=tailnet_login,
-                hub_url=managed_hub_url,
+                hub_url=route_hub_url,
+            )
+        if transport == "direct_ip":
+            request_id = _exact_ascii_header(
+                request, b"x-team-hub-bootstrap-request-id"
+            )
+            route_hub_url = getattr(request.state, "team_hub_url", None)
+            if request_id is None or route_hub_url is None:
+                raise HubError("bootstrap_unavailable", "Bootstrap is unavailable", 403)
+            return store.bootstrap(
+                proof,
+                body.email,
+                body.display_name,
+                body.device_label,
+                transport="direct_ip",
+                request_id=request_id,
+                tailnet_login=body.email,
+                hub_url=route_hub_url,
             )
         raise HubError("bootstrap_unavailable", "Bootstrap is unavailable", 403)
 
@@ -602,7 +655,7 @@ def create_app(
     def device_recovery(request: Request, body: RedeemRecoveryRequest) -> dict[str, Any]:
         classified = getattr(request.state, "team_hub_transport", None)
         loopback_peer = _is_loopback_peer(request)
-        if classified not in {"loopback", "tailscale_serve"} and (
+        if classified not in {"loopback", "tailscale_serve", "direct_ip"} and (
             (loopback_peer and not _has_loopback_authority(request))
             or (not loopback_peer and request.url.scheme != "https")
         ):

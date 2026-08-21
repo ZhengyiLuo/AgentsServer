@@ -234,6 +234,29 @@ class AbandonedTurnRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["recovered_after_restart"])
         self.assertNotIn("prompt", payload)
 
+    async def test_forced_restart_marks_recovered_turn_as_forcibly_interrupted(self) -> None:
+        append_event = AsyncMock(return_value={})
+        with patch.object(
+            agent_server.STORE,
+            "sessions",
+            {"chat-1": {"id": "chat-1", "backend": "codex"}},
+        ), patch.object(
+            agent_server,
+            "abandoned_turn_after_restart",
+            return_value={"run_id": "run-orphan", "backend": "codex"},
+        ), patch.object(agent_server, "append_event", append_event):
+            recovered = await agent_server.recover_abandoned_turns_after_start(
+                forced_restart_request_id="restart-request-1",
+            )
+
+        self.assertEqual(recovered, 1)
+        _session_id, event_type, payload = append_event.await_args.args
+        self.assertEqual(event_type, "turn_stopped")
+        self.assertTrue(payload["stopped"])
+        self.assertTrue(payload["forced_restart"])
+        self.assertEqual(payload["restart_request_id"], "restart-request-1")
+        self.assertIn("forcibly interrupted", payload["message"])
+
 
 if __name__ == "__main__":
     unittest.main()

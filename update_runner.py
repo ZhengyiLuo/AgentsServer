@@ -392,6 +392,7 @@ def assert_post_update_identity(
     expected_team_hub_id: str | None = None,
     expected_team_hub_transport: str | None = None,
     expected_team_hub_url: str | None = None,
+    expected_team_hub_direct_ip_url: str | None = None,
 ) -> None:
     """Fence a replacement by stable server and managed Hub identities."""
 
@@ -399,7 +400,11 @@ def assert_post_update_identity(
     if str(health.get("server_identity") or "") != expected_server_identity:
         raise RuntimeError("updated AgentsServer stable identity does not match")
     if expected_team_hub_id is None:
-        if expected_team_hub_transport is not None or expected_team_hub_url is not None:
+        if (
+            expected_team_hub_transport is not None
+            or expected_team_hub_url is not None
+            or expected_team_hub_direct_ip_url is not None
+        ):
             raise RuntimeError("managed Team Hub transport has no bound Hub identity")
         return
     capabilities = health.get("capabilities")
@@ -431,6 +436,25 @@ def assert_post_update_identity(
         or actual_hub_url != expected_team_hub_url
     ):
         raise RuntimeError("updated AgentsServer changed its Team Hub transport")
+    if expected_team_hub_direct_ip_url is not None:
+        expected_routes = [
+            {
+                "transport": expected_team_hub_transport or "loopback",
+                "hub_url": expected_team_hub_url,
+            }
+        ]
+        if (
+            expected_team_hub_direct_ip_url
+            and expected_team_hub_transport != "direct_ip"
+        ):
+            expected_routes.append(
+                {
+                    "transport": "direct_ip",
+                    "hub_url": expected_team_hub_direct_ip_url,
+                }
+            )
+        if capability.get("routes") != expected_routes:
+            raise RuntimeError("updated AgentsServer changed its Team Hub routes")
 
 
 def assert_server_idle(port: int, *, token: str | None = None) -> None:
@@ -769,6 +793,14 @@ def run_update(args: argparse.Namespace) -> None:
         if raw_team_hub_url is not None
         else None
     )
+    raw_team_hub_direct_ip_url = getattr(
+        args, "expected_team_hub_direct_ip_url", None
+    )
+    expected_team_hub_direct_ip_url = (
+        str(raw_team_hub_direct_ip_url).strip()
+        if raw_team_hub_direct_ip_url is not None
+        else None
+    )
     team_hub_snapshot = str(
         getattr(args, "team_hub_snapshot", "") or ""
     ).strip() or None
@@ -780,7 +812,11 @@ def run_update(args: argparse.Namespace) -> None:
     ):
         raise RuntimeError("managed Team Hub rollback arguments must be complete")
     if expected_team_hub_id is None:
-        if expected_team_hub_transport is not None or expected_team_hub_url is not None:
+        if (
+            expected_team_hub_transport is not None
+            or expected_team_hub_url is not None
+            or expected_team_hub_direct_ip_url is not None
+        ):
             raise RuntimeError("managed Team Hub transport arguments require a Hub identity")
     elif expected_team_hub_transport is None:
         if raw_team_hub_url is not None:
@@ -789,9 +825,9 @@ def run_update(args: argparse.Namespace) -> None:
         if raw_team_hub_url is None or expected_team_hub_url != "":
             raise RuntimeError("loopback Team Hub cannot have a remote URL")
         expected_team_hub_url = None
-    elif expected_team_hub_transport == "tailscale_serve":
+    elif expected_team_hub_transport in {"tailscale_serve", "direct_ip"}:
         if expected_team_hub_url is None:
-            raise RuntimeError("Tailscale Serve Team Hub requires its exact URL")
+            raise RuntimeError("remote Team Hub transport requires its exact URL")
         try:
             from team_hub_host import (  # Imported only for the managed-Hub path.
                 TEAM_HUB_MODE_HOST,
@@ -802,6 +838,8 @@ def run_update(args: argparse.Namespace) -> None:
                 configured_team_hub_endpoint(
                     TEAM_HUB_MODE_HOST,
                     expected_team_hub_url,
+                    expected_team_hub_transport,
+                    args.port,
                 )
             )
         except Exception as exc:
@@ -814,6 +852,39 @@ def run_update(args: argparse.Namespace) -> None:
             raise RuntimeError("expected Team Hub URL is invalid")
     else:
         raise RuntimeError("managed Team Hub transport is invalid")
+    if expected_team_hub_direct_ip_url is not None:
+        if expected_team_hub_id is None:
+            raise RuntimeError("managed Team Hub direct-IP route requires a Hub identity")
+        if expected_team_hub_direct_ip_url:
+            try:
+                from team_hub_host import (
+                    TEAM_HUB_MODE_HOST,
+                    configured_team_hub_endpoint,
+                )
+
+                direct_transport, direct_url, _host, direct_error = (
+                    configured_team_hub_endpoint(
+                        TEAM_HUB_MODE_HOST,
+                        expected_team_hub_direct_ip_url,
+                        "direct_ip",
+                        args.port,
+                    )
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "could not validate the expected Team Hub direct-IP route"
+                ) from exc
+            if (
+                direct_error is not None
+                or direct_transport != "direct_ip"
+                or direct_url != expected_team_hub_direct_ip_url
+            ):
+                raise RuntimeError("expected Team Hub direct-IP route is invalid")
+        if (
+            expected_team_hub_transport == "direct_ip"
+            and expected_team_hub_direct_ip_url != expected_team_hub_url
+        ):
+            raise RuntimeError("primary direct-IP Team Hub route changed")
     update_status(
         status_path,
         expected_update_id=update_id,
@@ -883,6 +954,13 @@ def run_update(args: argparse.Namespace) -> None:
                         expected_team_hub_url or "",
                     ]
                 )
+            if expected_team_hub_direct_ip_url is not None:
+                command.extend(
+                    [
+                        "--expected-team-hub-direct-ip-url",
+                        expected_team_hub_direct_ip_url,
+                    ]
+                )
         assert_server_idle(args.port, token=auth_token)
         update_status(
             status_path,
@@ -910,6 +988,10 @@ def run_update(args: argparse.Namespace) -> None:
             )
         if expected_team_hub_url is not None:
             identity_arguments["expected_team_hub_url"] = expected_team_hub_url
+        if expected_team_hub_direct_ip_url is not None:
+            identity_arguments["expected_team_hub_direct_ip_url"] = (
+                expected_team_hub_direct_ip_url
+            )
         assert_post_update_identity(args.port, **identity_arguments)
         # install.sh owns the success clear while it can still stop the
         # candidate, restore the verified snapshot, and restart the old
@@ -941,6 +1023,7 @@ def main() -> int:
     parser.add_argument("--expected-team-hub-id")
     parser.add_argument("--expected-team-hub-transport")
     parser.add_argument("--expected-team-hub-url")
+    parser.add_argument("--expected-team-hub-direct-ip-url")
     parser.add_argument("--team-hub-snapshot")
     parser.add_argument("--team-hub-data-dir")
     args = parser.parse_args()

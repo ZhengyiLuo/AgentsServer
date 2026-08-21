@@ -408,6 +408,7 @@ exit 0
         self.assertIn("rolling back", source)
         self.assertIn("--team-hub-host", source)
         self.assertIn("--team-hub-tailscale-serve-url", source)
+        self.assertIn("--team-hub-direct-ip-url", source)
         self.assertIn("--no-team-hub-host", source)
         self.assertIn("AGENTSDOCK_TEAM_HUB_MODE=$TEAM_HUB_MODE", source)
         self.assertIn("AGENTSDOCK_TEAM_HUB_TRANSPORT=$TEAM_HUB_TRANSPORT", source)
@@ -484,6 +485,36 @@ exit 0
             )
             self.assertEqual(result.returncode, 2)
             self.assertIn("requires a URL", result.stderr)
+
+    def test_team_hub_direct_ip_rejects_noncanonical_or_wrong_port_urls_before_preflight(self):
+        invalid_urls = (
+            "https://100.73.184.23:7850/api/team-hub",
+            "http://127.0.0.1:7850/api/team-hub",
+            "http://224.1.2.3:7850/api/team-hub",
+            "http://100.073.184.23:7850/api/team-hub",
+            "http://100.73.184.23:7851/api/team-hub",
+            "http://100.73.184.23:7850/prefix/api/team-hub",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            isolated_home = Path(temporary) / "home"
+            isolated_home.mkdir()
+            environment = {**os.environ, "HOME": str(isolated_home)}
+            for hub_url in invalid_urls:
+                with self.subTest(hub_url=hub_url):
+                    result = subprocess.run(
+                        [
+                            "/bin/bash",
+                            str(INSTALLER),
+                            "--team-hub-direct-ip-url",
+                            hub_url,
+                        ],
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("Direct IP URL", result.stderr)
 
     def test_team_hub_tailscale_serve_requires_the_beta_port(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -570,6 +601,71 @@ exit 0
             self.assertEqual(result.returncode, 2)
             self.assertIn("transport and URL assertions", result.stderr)
             self.assertEqual(list(isolated_home.iterdir()), [])
+
+    def test_managed_update_rejects_a_changed_expected_direct_ip_route_before_preflight(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            isolated_home = Path(temporary) / "home"
+            isolated_home.mkdir()
+            environment = {
+                **os.environ,
+                "HOME": str(isolated_home),
+                "AGENTSDOCK_TEAM_HUB_MODE": "host",
+                "AGENTSDOCK_TEAM_HUB_TRANSPORT": "tailscale_serve",
+                "AGENTSDOCK_TEAM_HUB_URL": "https://sonic.example.ts.net:8444/api/team-hub",
+                "AGENTSDOCK_TEAM_HUB_DIRECT_IP_URL": "",
+            }
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(INSTALLER),
+                    "--expected-server-identity", "server_transport_contract_1234",
+                    "--expected-team-hub-id", "hub_transport_contract_1234567",
+                    "--expected-team-hub-transport", "tailscale_serve",
+                    "--expected-team-hub-url", "https://sonic.example.ts.net:8444/api/team-hub",
+                    "--expected-team-hub-direct-ip-url", "http://100.73.184.23:7850/api/team-hub",
+                    "--team-hub-snapshot", "/tmp/snapshot_transport_contract",
+                    "--team-hub-data-dir", "/tmp/data_transport_contract",
+                    "--team-hub-operation-id", "update_transport_contract_1234",
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("Direct IP route changed after update acceptance", result.stderr)
+
+    def test_legacy_managed_update_cannot_adopt_an_unasserted_direct_ip_route(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            isolated_home = Path(temporary) / "home"
+            isolated_home.mkdir()
+            environment = {
+                **os.environ,
+                "HOME": str(isolated_home),
+                "AGENTSDOCK_TEAM_HUB_MODE": "host",
+                "AGENTSDOCK_TEAM_HUB_TRANSPORT": "tailscale_serve",
+                "AGENTSDOCK_TEAM_HUB_URL": "https://sonic.example.ts.net:8444/api/team-hub",
+                "AGENTSDOCK_TEAM_HUB_DIRECT_IP_URL": "http://100.73.184.23:7850/api/team-hub",
+            }
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(INSTALLER),
+                    "--expected-server-identity", "server_transport_contract_1234",
+                    "--expected-team-hub-id", "hub_transport_contract_1234567",
+                    "--expected-team-hub-transport", "tailscale_serve",
+                    "--expected-team-hub-url", "https://sonic.example.ts.net:8444/api/team-hub",
+                    "--team-hub-snapshot", "/tmp/snapshot_transport_contract",
+                    "--team-hub-data-dir", "/tmp/data_transport_contract",
+                    "--team-hub-operation-id", "update_transport_contract_1234",
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("Direct IP route changed after update acceptance", result.stderr)
 
     def test_show_token_reads_current_token_without_mutating_configured_roots(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1422,10 +1518,18 @@ chmod 755 "$project/.venv/bin/python"
             self.assertTrue(proof_path.is_file())
             self.assertNotIn(proof_path.read_text().strip(), result.stdout)
 
-    def test_direct_host_install_refuses_existing_team_hub_state_before_staging(self):
+    def test_same_release_style_direct_ip_add_refuses_existing_team_hub_state_before_staging(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             _home, _fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            config_root = root / "config"
+            config_root.mkdir()
+            (config_root / "env").write_text(
+                "AGENTSDOCK_TEAM_HUB_MODE=host\n"
+                "AGENTSDOCK_TEAM_HUB_TRANSPORT=tailscale_serve\n"
+                "AGENTSDOCK_TEAM_HUB_URL=https://sonic.example.ts.net:8444/api/team-hub\n"
+                "AGENTSDOCK_TEAM_HUB_DIRECT_IP_URL=\n"
+            )
             hub_data = root / "state" / "team-hub"
             hub_data.mkdir(parents=True)
             (hub_data / "team-hub.sqlite3").write_bytes(b"legacy unbound database\n")
@@ -1435,7 +1539,8 @@ chmod 755 "$project/.venv/bin/python"
                     "/bin/bash",
                     str(INSTALLER),
                     "--non-interactive",
-                    "--team-hub-host",
+                    "--team-hub-direct-ip-url",
+                    "http://100.73.184.23:7850/api/team-hub",
                 ],
                 env=environment,
                 capture_output=True,
@@ -1444,8 +1549,7 @@ chmod 755 "$project/.venv/bin/python"
             )
 
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("signed managed update", result.stderr)
-            self.assertIn("Direct adoption", result.stderr)
+            self.assertIn("Changing an existing Team Hub Direct IP origin", result.stderr)
             self.assertTrue((install_root / "current" / "runtime-marker").is_file())
             self.assertFalse((install_root / "releases" / self.release_version()).exists())
 
@@ -3516,6 +3620,7 @@ chmod 755 "$project/.venv/bin/python"
             "AGENTSDOCK_TEAM_HUB_MODE",
             "AGENTSDOCK_TEAM_HUB_TRANSPORT",
             "AGENTSDOCK_TEAM_HUB_URL",
+            "AGENTSDOCK_TEAM_HUB_DIRECT_IP_URL",
         ):
             environment.pop(key, None)
         return home, fake_bin, install_root, environment
@@ -3677,21 +3782,27 @@ if [ -n "$output" ]; then
   if [ "${FAKE_TEAM_HUB_MODE:-disabled}" = "host" ]; then
     health_transport="${FAKE_TEAM_HUB_TRANSPORT:-loopback}"
     health_url="${FAKE_TEAM_HUB_URL:-}"
+    health_direct_ip_url="${FAKE_TEAM_HUB_DIRECT_IP_URL:-}"
     if [ "$after_restore" = "true" ]; then
       health_transport="${FAKE_TEAM_HUB_TRANSPORT_AFTER_RESTORE:-$health_transport}"
       health_url="${FAKE_TEAM_HUB_URL_AFTER_RESTORE:-$health_url}"
+      health_direct_ip_url="${FAKE_TEAM_HUB_DIRECT_IP_URL_AFTER_RESTORE:-$health_direct_ip_url}"
     fi
     if [ -n "$health_url" ]; then
       health_hub_url="$(printf '"%s"' "$health_url")"
     else
       health_hub_url="null"
     fi
+    health_routes="[{\\\"transport\\\":\\\"$health_transport\\\",\\\"hub_url\\\":$health_hub_url}]"
+    if [ -n "$health_direct_ip_url" ] && [ "$health_transport" != "direct_ip" ]; then
+      health_routes="[{\\\"transport\\\":\\\"$health_transport\\\",\\\"hub_url\\\":$health_hub_url},{\\\"transport\\\":\\\"direct_ip\\\",\\\"hub_url\\\":\\\"$health_direct_ip_url\\\"}]"
+    fi
     cat > "$output" <<EOF
-{"ok":true,"server_version":"$health_version","server_identity":"$health_server_identity","capabilities":{"team_hub_v1":{"available":true,"designated_host":true,"version":1,"base_path":"/api/team-hub","hub_id":"$health_hub_id","host_server_identity":"$health_server_identity","transport":"$health_transport","hub_url":$health_hub_url}}}
+{"ok":true,"server_version":"$health_version","server_identity":"$health_server_identity","capabilities":{"team_hub_v1":{"available":true,"designated_host":true,"version":1,"base_path":"/api/team-hub","hub_id":"$health_hub_id","host_server_identity":"$health_server_identity","transport":"$health_transport","hub_url":$health_hub_url,"routes":$health_routes}}}
 EOF
   else
     cat > "$output" <<EOF
-{"ok":true,"server_version":"$health_version","server_identity":"$health_server_identity","capabilities":{"team_hub_v1":{"available":false,"designated_host":false,"version":1,"base_path":null,"hub_id":null,"host_server_identity":null,"transport":null,"hub_url":null}}}
+{"ok":true,"server_version":"$health_version","server_identity":"$health_server_identity","capabilities":{"team_hub_v1":{"available":false,"designated_host":false,"version":1,"base_path":null,"hub_id":null,"host_server_identity":null,"transport":null,"hub_url":null,"routes":[]}}}
 EOF
   fi
 fi

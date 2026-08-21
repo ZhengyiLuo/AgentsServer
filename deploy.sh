@@ -12,6 +12,7 @@ HEALTH_ATTEMPTS="${AGENTSDOCK_HEALTH_ATTEMPTS:-${ZENITHDOCK_HEALTH_ATTEMPTS:-45}
 HEALTH_TOKEN="${AGENTSDOCK_AGENT_TOKEN:-${ZENITHDOCK_AGENT_TOKEN:-}}"
 RUNTIME_FILES=(
   "$SCRIPT_DIR/agent_server.py"
+  "$SCRIPT_DIR/team_hub_host.py"
   "$SCRIPT_DIR/agentsdock_jobs.py"
   "$SCRIPT_DIR/agentsdock_chats.py"
   "$SCRIPT_DIR/agentsdock_publish.py"
@@ -33,13 +34,120 @@ Optional:
   AGENTSDOCK_SERVER_SERVICE=<systemd-user-service>
   AGENTSDOCK_AGENT_TOKEN=<health-check-token>
   AGENTSDOCK_HEALTH_ATTEMPTS=<startup-health-attempts>
+
+Direct in-place deployment is refused when the target hosts Team Hub. Use the
+signed managed update so its snapshot and versioned rollback checks remain in
+force.
 USAGE
   exit 2
+fi
+
+if [[ -n "$HEALTH_TOKEN" ]] && [[ ! "$HEALTH_TOKEN" =~ ^[A-Za-z0-9_-]{32,}$ ]]; then
+  echo "AGENTSDOCK_AGENT_TOKEN is invalid." >&2
+  exit 2
+fi
+if [[ -z "$HEALTH_TOKEN" ]]; then
+  echo "AGENTSDOCK_AGENT_TOKEN is required to prove exact post-deploy version and disabled Team Hub state." >&2
+  echo "  Use the signed managed update if authenticated in-place health is unavailable." >&2
+  exit 2
+fi
+
+REMOTE_HAS_HUB_RUNTIME="$(
+  ssh "$REMOTE_HOST" \
+    "if [[ -f '$REMOTE_SERVER_DIR/team_hub_host.py' || -d '$REMOTE_SERVER_DIR/agentsdock_team_hub' ]]; then printf present; else printf absent; fi"
+)"
+if [[ "$REMOTE_HAS_HUB_RUNTIME" != "present" && "$REMOTE_HAS_HUB_RUNTIME" != "absent" ]]; then
+  echo "Could not determine whether the target already contains Team Hub runtime files." >&2
+  exit 1
+fi
+
+TARGET_HUB_STATE="unknown"
+EXPECTED_SERVER_IDENTITY=""
+if [[ -n "$HEALTH_TOKEN" ]]; then
+  if TARGET_HEALTH="$(
+    ssh "$REMOTE_HOST" \
+      "curl -fsS --connect-timeout 2 --max-time 5 --max-filesize 1048576 -H 'Authorization: Bearer ${HEALTH_TOKEN}' http://127.0.0.1:7850/api/health"
+  )"; then
+    if ((${#TARGET_HEALTH} > 1048576)); then
+      echo "Target health response exceeds its safety limit." >&2
+      exit 1
+    fi
+    if ! TARGET_HUB_RESULT="$(
+      printf '%s' "$TARGET_HEALTH" | python3 -c '
+import json
+import re
+import sys
+
+try:
+    health = json.load(sys.stdin)
+except (UnicodeError, json.JSONDecodeError):
+    raise SystemExit(2)
+if not isinstance(health, dict) or health.get("ok") is not True:
+    raise SystemExit(2)
+server_identity = health.get("server_identity")
+if not isinstance(server_identity, str) or re.fullmatch(r"[A-Za-z0-9_.:-]{8,240}", server_identity) is None:
+    raise SystemExit(2)
+capabilities = health.get("capabilities")
+if not isinstance(capabilities, dict) or "team_hub_v1" not in capabilities:
+    print(f"legacy\t{server_identity}")
+    raise SystemExit(0)
+capability = capabilities.get("team_hub_v1")
+if not isinstance(capability, dict):
+    raise SystemExit(2)
+if capability.get("designated_host") is True:
+    print(f"host\t{server_identity}")
+elif (
+    capability.get("designated_host") is False
+    and capability.get("available") is False
+    and capability.get("version") == 1
+    and capability.get("base_path") is None
+    and capability.get("hub_id") is None
+    and capability.get("host_server_identity") is None
+):
+    print(f"disabled\t{server_identity}")
+else:
+    raise SystemExit(2)
+'
+    )"; then
+      echo "Target returned a malformed Team Hub capability; refusing in-place deployment." >&2
+      exit 1
+    fi
+    TARGET_HUB_STATE="${TARGET_HUB_RESULT%%$'\t'*}"
+    EXPECTED_SERVER_IDENTITY="${TARGET_HUB_RESULT#*$'\t'}"
+  elif [[ "$REMOTE_HAS_HUB_RUNTIME" == "absent" ]]; then
+    TARGET_HUB_STATE="legacy"
+  fi
+elif [[ "$REMOTE_HAS_HUB_RUNTIME" == "absent" ]]; then
+  TARGET_HUB_STATE="legacy"
+fi
+
+if [[ "$TARGET_HUB_STATE" == "host" ]]; then
+  echo "Target is the designated Team Hub host; use the signed managed update instead of deploy.sh." >&2
+  exit 1
+fi
+if [[ "$TARGET_HUB_STATE" == "legacy" ]]; then
+  echo "Target does not report the exact disabled Team Hub capability; refusing in-place deployment." >&2
+  echo "  Use the signed installer/update so existing configuration and state cannot be migrated without rollback." >&2
+  exit 1
+fi
+if [[ "$TARGET_HUB_STATE" == "unknown" ]]; then
+  echo "Could not prove that the existing Team Hub runtime is disabled; set AGENTSDOCK_AGENT_TOKEN or use the signed managed update." >&2
+  exit 1
+fi
+if [[ "$TARGET_HUB_STATE" == "disabled" && -z "$EXPECTED_SERVER_IDENTITY" ]]; then
+  echo "Target did not provide a stable server identity; refusing in-place deployment." >&2
+  exit 1
 fi
 
 echo "Deploying AgentsServer runtime to $REMOTE_HOST:$REMOTE_SERVER_DIR"
 ssh "$REMOTE_HOST" "mkdir -p '$REMOTE_SERVER_DIR'"
 scp "${RUNTIME_FILES[@]}" "$REMOTE_HOST:$REMOTE_SERVER_DIR/"
+rsync -a --delete --delete-excluded \
+  --exclude '__pycache__/' \
+  --exclude '*.pyc' \
+  --exclude '*.pyo' \
+  "$SCRIPT_DIR/agentsdock_team_hub/" \
+  "$REMOTE_HOST:$REMOTE_SERVER_DIR/agentsdock_team_hub/"
 
 echo "Checking server runtime dependencies"
 ssh "$REMOTE_HOST" "
@@ -54,33 +162,58 @@ ssh "$REMOTE_HOST" "
         'claude-agent-sdk==0.2.130' 'croniter>=6,<7' 'cryptography>=44,<47' 'python-dateutil>=2.9,<3' 'tzdata>=2025.2'
     fi
   fi
-  '$REMOTE_PYTHON' -c 'from importlib.metadata import version; import claude_agent_sdk; sdk_version = version(\"claude-agent-sdk\"); raise SystemExit(0 if sdk_version == \"0.2.130\" else f\"expected claude-agent-sdk 0.2.130, got {sdk_version}\")'
+  PYTHONPATH='$REMOTE_SERVER_DIR' '$REMOTE_PYTHON' -c 'from importlib.metadata import version; import agentsdock_team_hub, claude_agent_sdk, team_hub_host; sdk_version = version(\"claude-agent-sdk\"); raise SystemExit(0 if sdk_version == \"0.2.130\" else f\"expected claude-agent-sdk 0.2.130, got {sdk_version}\")'
 "
 
 echo "Compiling server on $REMOTE_HOST"
-ssh "$REMOTE_HOST" "chmod 755 '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/agentsdock_chats.py' '$REMOTE_SERVER_DIR/agentsdock_publish.py' && '$REMOTE_PYTHON' -m py_compile '$REMOTE_SERVER_PATH' '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/agentsdock_chats.py' '$REMOTE_SERVER_DIR/agentsdock_publish.py' '$REMOTE_SERVER_DIR/claude_sdk_client.py' '$REMOTE_SERVER_DIR/codex_app_server.py' '$REMOTE_SERVER_DIR/update_runner.py'"
+ssh "$REMOTE_HOST" "chmod 755 '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/agentsdock_chats.py' '$REMOTE_SERVER_DIR/agentsdock_publish.py' && '$REMOTE_PYTHON' -m compileall -q '$REMOTE_SERVER_DIR/agentsdock_team_hub' && '$REMOTE_PYTHON' -m py_compile '$REMOTE_SERVER_PATH' '$REMOTE_SERVER_DIR/team_hub_host.py' '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/agentsdock_chats.py' '$REMOTE_SERVER_DIR/agentsdock_publish.py' '$REMOTE_SERVER_DIR/claude_sdk_client.py' '$REMOTE_SERVER_DIR/codex_app_server.py' '$REMOTE_SERVER_DIR/update_runner.py'"
 
 echo "Restarting $SERVICE_NAME"
 ssh "$REMOTE_HOST" "systemctl --user restart '$SERVICE_NAME'"
 
 echo "Checking health"
-REMOTE_HEALTH_BODY="/tmp/agents-server-health.json"
 HEALTH_OK=0
-STATUS="000"
+EXPECTED_VERSION="$(tr -d '[:space:]' < "$SCRIPT_DIR/VERSION")"
 for ((attempt = 1; attempt <= HEALTH_ATTEMPTS; attempt++)); do
-  if [[ -n "$HEALTH_TOKEN" ]]; then
-    if ssh "$REMOTE_HOST" "curl -fsS -H 'Authorization: Bearer ${HEALTH_TOKEN}' http://127.0.0.1:7850/api/health"; then
-      HEALTH_OK=1
-      break
-    fi
-  else
-    STATUS="$(ssh "$REMOTE_HOST" "curl -sS -o '$REMOTE_HEALTH_BODY' -w '%{http_code}' http://127.0.0.1:7850/api/health || true")"
-    if [[ "$STATUS" == "200" ]]; then
-      ssh "$REMOTE_HOST" "cat '$REMOTE_HEALTH_BODY'"
-      HEALTH_OK=1
-      break
-    elif [[ "$STATUS" == "401" ]]; then
-      echo "Health endpoint requires a token; service is responding. Set AGENTSDOCK_AGENT_TOKEN to verify authenticated health."
+  if REMOTE_HEALTH="$(
+    ssh "$REMOTE_HOST" \
+      "curl -fsS --connect-timeout 2 --max-time 5 --max-filesize 1048576 -H 'Authorization: Bearer ${HEALTH_TOKEN}' http://127.0.0.1:7850/api/health"
+  )"; then
+    if ((${#REMOTE_HEALTH} <= 1048576)) && \
+      printf '%s' "$REMOTE_HEALTH" | python3 -c '
+import json
+import re
+import sys
+
+expected_version = sys.argv[1]
+expected_server_identity = sys.argv[2]
+try:
+    health = json.load(sys.stdin)
+except (UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+if not isinstance(health, dict) or health.get("ok") is not True:
+    raise SystemExit(1)
+if health.get("server_version") != expected_version:
+    raise SystemExit(1)
+server_identity = health.get("server_identity")
+if not isinstance(server_identity, str) or re.fullmatch(r"[A-Za-z0-9_.:-]{8,240}", server_identity) is None:
+    raise SystemExit(1)
+if server_identity != expected_server_identity:
+    raise SystemExit(1)
+capabilities = health.get("capabilities")
+capability = capabilities.get("team_hub_v1") if isinstance(capabilities, dict) else None
+required = {
+    "available": False,
+    "designated_host": False,
+    "version": 1,
+    "base_path": None,
+    "hub_id": None,
+    "host_server_identity": None,
+}
+if not isinstance(capability, dict) or any(capability.get(key) != value for key, value in required.items()):
+    raise SystemExit(1)
+' "$EXPECTED_VERSION" "$EXPECTED_SERVER_IDENTITY"; then
+      printf '%s\n' "$REMOTE_HEALTH"
       HEALTH_OK=1
       break
     fi
@@ -88,8 +221,7 @@ for ((attempt = 1; attempt <= HEALTH_ATTEMPTS; attempt++)); do
   sleep 1
 done
 if [[ "$HEALTH_OK" != "1" ]]; then
-  ssh "$REMOTE_HOST" "cat '$REMOTE_HEALTH_BODY'" || true
-  echo "Health check failed with HTTP $STATUS" >&2
+  echo "Authenticated health did not prove exact version $EXPECTED_VERSION with Team Hub disabled." >&2
   exit 1
 fi
 echo

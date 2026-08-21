@@ -174,6 +174,70 @@ manifest and the archive SHA-256, installs into a versioned directory, restarts
 the user service, and accepts the release only after authenticated health
 passes. The previous healthy release remains available for automatic rollback.
 
+### Local Team Hub preview
+
+AgentsServer `0.1.25-beta.2` can designate one installed server as the Team Hub
+host. Team Hub runs inside that AgentsServer process and listener; there is no
+second service or separate `uv` command to keep running. Enable it on exactly
+one local development server with:
+
+```bash
+./install.sh --team-hub-host
+```
+
+The choice is preserved by later installs and managed updates. A fresh server
+with no Hub database may be designated with `--team-hub-host`. Direct adoption
+or reactivation of existing Hub state is refused because it cannot provide the
+snapshot-bound rollback contract. `--no-team-hub-host` stops serving an
+existing Hub but preserves its data; this beta has no direct reactivation path,
+so use it only when you intend to keep the Hub offline pending a signed managed
+recovery or support-assisted restoration. This beta preview is intentionally
+local-host-only: connect the desktop preview through the loopback AgentsServer
+profile on the same Mac. Remote Team Hub transport and multi-host enrollment
+are deferred; ordinary AgentsServer chat access can still use the existing
+private-network setup described below. Do not expose or reverse-proxy
+`/api/team-hub`: non-loopback Team Hub requests are rejected even when the
+ordinary AgentsServer listener is bound to `0.0.0.0` or a Tailscale interface.
+
+An existing beta.1 installation first updates to beta.2 with Team Hub disabled.
+While the server is idle and before any Hub database exists, designate only the
+chosen local host by running:
+
+```bash
+~/.local/share/agents-server/current/install.sh \
+  --non-interactive --team-hub-host
+```
+
+Leave every other server disabled; do not preseed or enable host mode on a
+client node.
+
+The installed release also provides the local operator controls; no repository
+checkout or separate service is needed. These commands print the path to an
+owner-only proof file, never the proof secret itself:
+
+```bash
+PYTHONPATH=~/.local/share/agents-server/current \
+  ~/.local/share/agents-server/current/.venv/bin/python -m agentsdock_team_hub.cli \
+  bootstrap-proof --data-dir ~/.agentsdock/team-hub
+
+PYTHONPATH=~/.local/share/agents-server/current \
+  ~/.local/share/agents-server/current/.venv/bin/python -m agentsdock_team_hub.cli \
+  device-recovery --data-dir ~/.agentsdock/team-hub \
+  --email member@example.com --device-label "Member Mac"
+```
+
+If you override the install or state directory, use the exact operator commands
+printed by `install.sh` at the end of a host-mode install.
+
+Team Hub keeps its own credentials and authorization boundary even though it
+shares the AgentsServer process. AgentsServer bearer tokens and Team Hub
+credentials are mutually non-interchangeable. Team posts and messages are
+passive in this preview: agent dispatch and wake-up are not available. Managed
+updates snapshot and verify the Hub database, signing key, and local enrollment
+proofs before replacement; if the candidate cannot prove the same server and
+Hub identities, the installer restores that snapshot before starting the
+previous server release.
+
 ## Manual Onboarding
 
 1. Clone this repo on the machine that will run the agents.
@@ -401,8 +465,10 @@ This stops and removes the user service, the versioned release runtime, and
 generated configuration (including the access token). It prompts before
 making changes unless `--yes` is passed. Chat history, jobs, files, and
 terminals under the state directory (`~/.agentsdock` by default) are kept by
-default, so a later `./install.sh` picks the same history back up. Passing
-`--purge-state` permanently deletes that too, but always requires an
+default, so a later `./install.sh` picks the same ordinary AgentsServer history
+back up. Preserved Team Hub state is intentionally not auto-reactivated in this
+beta; it requires a signed managed recovery or support-assisted restoration.
+Passing `--purge-state` permanently deletes that too, but always requires an
 interactive exact-path confirmation that `--yes` cannot bypass. Before any
 change, the uninstaller rejects root, home, broad system/user directories,
 path traversal, and overlapping install/configuration/state roots. Like

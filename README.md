@@ -44,6 +44,10 @@ machine paths.
 - Runs recurring/loop jobs per chat with host load/memory guardrails.
   Archiving a chat pauses every interval, cron, and RRULE job attached to it;
   unarchiving leaves those jobs paused until the user explicitly enables them.
+- Gives each live provider turn a private, chat-scoped Jobs/Publish authority
+  and rotates it with the logical run during native steering. Failed steering
+  restores the predecessor only when rejection is proven safe; stopped,
+  uncertain, and restarted runs fail closed.
 - Provides optional live process and tmux-pane inspection for active work.
 - Hosts one persistent interactive tmux terminal per chat. Clients attach over
   an authenticated PTY WebSocket; disconnecting a client does not stop the
@@ -176,10 +180,10 @@ passes. The previous healthy release remains available for automatic rollback.
 
 ### Team Hub preview
 
-AgentsServer `0.1.25-beta.3` can designate one installed server as the Team Hub
-host. Team Hub runs inside that AgentsServer process and listener; there is no
-second service or separate `uv` command to keep running. For same-machine use,
-enable it on exactly one development server with:
+AgentsServer `0.1.25-beta.3` and later can designate one installed server as the
+Team Hub host. Team Hub runs inside that AgentsServer process and listener;
+there is no second service or separate `uv` command to keep running. For
+same-machine use, enable it on exactly one development server with:
 
 ```bash
 ./install.sh --team-hub-host

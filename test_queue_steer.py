@@ -1252,6 +1252,116 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("chat-1", agent_server.RUN_NOW_REQUESTS)
         self.assertFalse(agent_server.RUN_NOW_COMPLETED_RESULTS)
 
+    async def test_safe_native_prefence_rejection_durably_requeues_in_order(
+        self,
+    ) -> None:
+        before = {
+            "queued_id": "queued-before",
+            "prompt": "Before",
+            "file_ids": [],
+            "backend": "codex",
+            "_durable": True,
+        }
+        selected = {
+            "queued_id": "queued-steer",
+            "prompt": "Retry normally",
+            "file_ids": [],
+            "backend": "codex",
+            "_durable": True,
+            # _run_queued_turn_now_once clears an explicit Stop hold before its
+            # final ACTIVE/QueueFull recheck, even though provider fencing has
+            # not begun. This branch still needs a durable compensation.
+            "_paused_after_stop": False,
+            "_native_delivery_queue_position": 2,
+        }
+        after = {
+            "queued_id": "queued-after",
+            "prompt": "After",
+            "file_ids": [],
+            "backend": "codex",
+            "_durable": True,
+        }
+        agent_server.QUEUED_TURNS["chat-1"] = deque([before, after])
+        append_batch = AsyncMock(return_value=[])
+
+        with patch.object(
+            agent_server,
+            "append_durable_event_batch",
+            append_batch,
+        ):
+            await agent_server.requeue_native_steer_after_safe_rejection(
+                "chat-1",
+                selected,
+                selected_index=1,
+                selected_predecessor_id="queued-before",
+                selected_successor_id="queued-after",
+            )
+            public = await agent_server.queued_turns_snapshot("chat-1")
+
+        self.assertEqual(
+            [item["queued_id"] for item in agent_server.QUEUED_TURNS["chat-1"]],
+            ["queued-before", "queued-steer", "queued-after"],
+        )
+        self.assertNotIn("_native_delivery_fenced", selected)
+        self.assertFalse(selected["_paused_after_stop"])
+        self.assertNotIn("_native_delivery_queue_position", selected)
+        self.assertFalse(public[1]["paused"])
+        self.assertIsNone(public[1]["pause_reason"])
+        event_specs = append_batch.await_args.args[1]
+        self.assertEqual(
+            [event_type for event_type, _payload in event_specs],
+            ["turn_queued", "turn_queue_reordered"],
+        )
+        self.assertEqual(event_specs[0][1]["position"], 2)
+        self.assertEqual(
+            event_specs[1][1]["positions"],
+            [
+                {"queued_id": "queued-before", "position": 1},
+                {"queued_id": "queued-steer", "position": 2},
+                {"queued_id": "queued-after", "position": 3},
+            ],
+        )
+
+    async def test_safe_native_rejection_compensation_failure_stays_fenced(
+        self,
+    ) -> None:
+        selected = {
+            "queued_id": "queued-steer",
+            "prompt": "Do not claim a safe rollback",
+            "file_ids": [],
+            "backend": "codex",
+            "_durable": True,
+            "_paused_after_stop": True,
+            "_native_delivery_fenced": True,
+        }
+        agent_server.QUEUED_TURNS.pop("chat-1", None)
+
+        with patch.object(
+            agent_server,
+            "append_durable_event_batch",
+            new_callable=AsyncMock,
+            side_effect=OSError("rollback fsync failed"),
+        ):
+            with self.assertRaises(
+                agent_server.NativeSteerHandoffError
+            ) as raised:
+                await agent_server.requeue_native_steer_after_safe_rejection(
+                    "chat-1",
+                    selected,
+                    selected_index=0,
+                    selected_predecessor_id=None,
+                    selected_successor_id=None,
+                )
+            public = await agent_server.queued_turns_snapshot("chat-1")
+
+        self.assertFalse(raised.exception.safe_to_requeue)
+        self.assertFalse(raised.exception.delivery_uncertain)
+        self.assertIs(agent_server.QUEUED_TURNS["chat-1"][0], selected)
+        self.assertTrue(selected["_paused_after_stop"])
+        self.assertTrue(selected["_native_delivery_fenced"])
+        self.assertTrue(public[0]["paused"])
+        self.assertEqual(public[0]["pause_reason"], "delivery_uncertain")
+
     async def test_deferred_response_requires_explicit_client_capability(self) -> None:
         deferred = {
             "ok": False,
@@ -2029,6 +2139,163 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["prompt"], "Steer exactly once.")
         self.assertEqual(item["file_ids"], ["file-one"])
         self.assertEqual(item["backend"], "codex")
+
+    async def test_recovery_replays_safe_rejection_compensation_as_runnable_in_order(
+        self,
+    ) -> None:
+        agent_server.QUEUED_TURNS.pop("chat-1", None)
+        events = [
+            {
+                "seq": 1,
+                "type": "turn_queued",
+                "queued_id": "queued-before",
+                "prompt": "Before",
+                "request_prompt": "Before",
+                "file_ids": [],
+                "position": 1,
+            },
+            {
+                "seq": 2,
+                "type": "turn_queued",
+                "queued_id": "queued-native",
+                "prompt": "Retry normally",
+                "request_prompt": "Retry normally",
+                "file_ids": [],
+                "position": 2,
+            },
+            {
+                "seq": 3,
+                "type": "turn_queued",
+                "queued_id": "queued-after",
+                "prompt": "After",
+                "request_prompt": "After",
+                "file_ids": [],
+                "position": 3,
+            },
+            {
+                "seq": 4,
+                "type": "turn_unqueued",
+                "queued_id": "queued-native",
+                "reason": "native_delivery_fence",
+            },
+            {
+                "seq": 5,
+                "type": "turn_queue_delivery_fenced",
+                "queued_id": "queued-native",
+                "backend": "codex",
+                "prompt": "Retry normally",
+                "request_prompt": "Retry normally",
+                "file_ids": [],
+                "position": 2,
+            },
+            {
+                "seq": 6,
+                "type": "turn_queued",
+                "queued_id": "queued-native",
+                "backend": "codex",
+                "prompt": "Retry normally",
+                "request_prompt": "Retry normally",
+                "file_ids": [],
+                "position": 2,
+            },
+            {
+                "seq": 7,
+                "type": "turn_queue_reordered",
+                "positions": [
+                    {"queued_id": "queued-before", "position": 1},
+                    {"queued_id": "queued-native", "position": 2},
+                    {"queued_id": "queued-after", "position": 3},
+                ],
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            path.write_text("".join(json.dumps({
+                "id": f"event-{event['seq']}",
+                "session_id": "chat-1",
+                "ts": "2026-08-21T00:00:00Z",
+                **event,
+            }) + "\n" for event in events))
+            with patch.object(agent_server, "events_path", return_value=path):
+                rebuilt = rebuild_queued_turns_from_events()
+
+        self.assertEqual(rebuilt, 3)
+        self.assertEqual(
+            [item["queued_id"] for item in agent_server.QUEUED_TURNS["chat-1"]],
+            ["queued-before", "queued-native", "queued-after"],
+        )
+        restored = agent_server.QUEUED_TURNS["chat-1"][1]
+        self.assertFalse(restored["_paused_after_stop"])
+        self.assertNotIn("_native_delivery_fenced", restored)
+        public = await agent_server.queued_turns_snapshot("chat-1")
+        self.assertFalse(public[1]["paused"])
+
+        start = AsyncMock(return_value={"run_id": "run-next"})
+        with patch.object(agent_server, "_start_turn_locked", start):
+            for _ in range(3):
+                await agent_server._start_next_queued_turn_locked(
+                    "chat-1",
+                    admission_backend="codex",
+                )
+
+        self.assertEqual(
+            [call.args[1].prompt for call in start.await_args_list],
+            ["Before", "Retry normally", "After"],
+        )
+        self.assertNotIn("chat-1", agent_server.QUEUED_TURNS)
+
+    def test_recovery_standard_compensation_releases_prefence_stop_hold(
+        self,
+    ) -> None:
+        agent_server.QUEUED_TURNS.pop("chat-1", None)
+        events = [
+            {
+                "seq": 1,
+                "type": "turn_queued",
+                "queued_id": "queued-native",
+                "prompt": "Retry after pre-fence rejection",
+                "request_prompt": "Retry after pre-fence rejection",
+                "file_ids": [],
+                "position": 1,
+            },
+            {
+                "seq": 2,
+                "type": "turn_queue_paused",
+                "queued_ids": ["queued-native"],
+            },
+            {
+                "seq": 3,
+                "type": "turn_queued",
+                "queued_id": "queued-native",
+                "backend": "claude",
+                "prompt": "Retry after pre-fence rejection",
+                "request_prompt": "Retry after pre-fence rejection",
+                "file_ids": [],
+                "position": 1,
+            },
+            {
+                "seq": 4,
+                "type": "turn_queue_reordered",
+                "positions": [
+                    {"queued_id": "queued-native", "position": 1},
+                ],
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            path.write_text("".join(json.dumps({
+                "id": f"event-{event['seq']}",
+                "session_id": "chat-1",
+                "ts": "2026-08-21T00:00:00Z",
+                **event,
+            }) + "\n" for event in events))
+            with patch.object(agent_server, "events_path", return_value=path):
+                rebuilt = rebuild_queued_turns_from_events()
+
+        self.assertEqual(rebuilt, 1)
+        restored = agent_server.QUEUED_TURNS["chat-1"][0]
+        self.assertFalse(restored["_paused_after_stop"])
+        self.assertNotIn("_native_delivery_fenced", restored)
 
     def test_recovery_keeps_unselected_turns_in_original_order_after_run_now_starts(self) -> None:
         events = [

@@ -615,7 +615,7 @@ class VendoredTeamHubParityTests(unittest.TestCase):
             "migrations/__init__.py": "aaf340c45c8d39c2939814977ba4cef8eb6b3bd0671b0f7542ebe06f5431d6ec",
             "security.py": "0c1895c7443e7be07a2f53c7e4c4228e3ee04c65d6cd36f039b7bbba1813e4fa",
             "service.py": "6932497ce860c4abdbef63e97dd9bda85199e6a3d0c4b40d0ee67140608e6f20",
-            "store.py": "82cf921360cc643e84dcbd2221fd8c85574b2d58cb70c7fc50590cdfb52d4fd3",
+            "store.py": "cf69accc82489ba2b8e916a946fd0d22019cd83cb35ad94df1e92f38ff8200a5",
         }
         entries = list(vendored.rglob("*"))
         for path in entries:

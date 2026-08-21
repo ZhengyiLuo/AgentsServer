@@ -8817,6 +8817,10 @@ def provider_cross_chat_route_projection(
 
 
 def cross_chat_authority_path(run_id: str, nonce: str | None = None) -> Path:
+    if not re.fullmatch(r"run_[A-Za-z0-9_-]+", run_id):
+        raise ValueError("invalid provider authority run id")
+    if nonce is not None and not re.fullmatch(r"[0-9a-f]{32}", nonce):
+        raise ValueError("invalid provider authority nonce")
     suffix = f"-{nonce}" if nonce else ""
     return CROSS_CHAT_AUTHORITY_ROOT / f"{run_id}{suffix}.json"
 
@@ -8830,6 +8834,7 @@ async def issue_cross_chat_capability(
     provider_route_snapshot: list[dict[str, Any]] | None = None,
     exchange_response_grants: set[tuple[str, str]] | None = None,
     exchange_request_grants: dict[str, str] | None = None,
+    native_transition_nonce: str | None = None,
 ) -> Path | None:
     grants = {
         (reference.session_id, reference.action)
@@ -8878,18 +8883,39 @@ async def issue_cross_chat_capability(
         "provider_jobs_access": jobs_access,
         "expires_at": expires_at,
     }, separators=(",", ":")).encode("utf-8")
-    descriptor = os.open(
-        authority_path,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
-    )
+    descriptor = -1
+    capability_record: dict[str, Any] | None = None
     try:
-        os.write(descriptor, payload)
+        descriptor = os.open(
+            authority_path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        write_all(descriptor, payload)
         os.fsync(descriptor)
-    finally:
         os.close(descriptor)
-    async with CROSS_CHAT_CAPABILITY_LOCK:
-        CROSS_CHAT_CAPABILITIES[token_hash] = {
+        descriptor = -1
+        # The file name is part of the provider prompt. Persist the directory
+        # entry before publishing the in-memory capability so a native steer
+        # can never revoke its predecessor in favor of an authority path that
+        # disappears after a crash. Windows flushes the file above; opening a
+        # directory for fsync is not supported there.
+        if os.name != "nt":
+            directory_fd = os.open(
+                CROSS_CHAT_AUTHORITY_ROOT,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        capability_record = {
             "server_identity": server_identity(),
             "source_session_id": source_session_id,
             "source_run_id": run_id,
@@ -8902,13 +8928,31 @@ async def issue_cross_chat_capability(
             "provider_route_consumed": {},
             "actions": effective_actions,
             "provider_jobs_access": jobs_access,
+            "native_transition_nonce": str(
+                native_transition_nonce or ""
+            ),
             "consumed": {},
             "authority_path": str(authority_path),
         }
+        async with CROSS_CHAT_CAPABILITY_LOCK:
+            CROSS_CHAT_CAPABILITIES[token_hash] = capability_record
+    except BaseException:
+        # An authority file without its matching in-memory grant is harmless,
+        # but removing it here prevents a provider from being handed a dead
+        # path when issuance is cancelled at the capability-lock boundary.
+        if CROSS_CHAT_CAPABILITIES.get(token_hash) is capability_record:
+            CROSS_CHAT_CAPABILITIES.pop(token_hash, None)
+        with suppress(OSError):
+            authority_path.unlink()
+        raise
+    finally:
+        if descriptor >= 0:
+            with suppress(OSError):
+                os.close(descriptor)
     return authority_path
 
 
-async def revoke_cross_chat_capability(run_id: str) -> None:
+async def _revoke_cross_chat_capability(run_id: str) -> None:
     paths: list[str] = []
     async with CROSS_CHAT_CAPABILITY_LOCK:
         for token_hash, capability in list(CROSS_CHAT_CAPABILITIES.items()):
@@ -8916,13 +8960,231 @@ async def revoke_cross_chat_capability(run_id: str) -> None:
                 continue
             paths.append(str(capability.get("authority_path") or ""))
             CROSS_CHAT_CAPABILITIES.pop(token_hash, None)
-    with suppress(OSError):
-        paths.extend(str(path) for path in CROSS_CHAT_AUTHORITY_ROOT.glob(f"{run_id}-*.json"))
     for raw_path in set(paths):
         if not raw_path:
             continue
+        path = Path(raw_path)
+        if (
+            path.parent != CROSS_CHAT_AUTHORITY_ROOT
+            or not re.fullmatch(
+                re.escape(run_id) + r"-[0-9a-f]{32}\.json",
+                path.name,
+            )
+        ):
+            continue
         with suppress(OSError):
-            Path(raw_path).unlink()
+            path.unlink()
+
+
+async def revoke_cross_chat_capability(run_id: str) -> None:
+    """Revoke a run grant even when its caller is concurrently cancelled."""
+
+    completion = asyncio.create_task(_revoke_cross_chat_capability(run_id))
+    try:
+        await asyncio.shield(completion)
+    except asyncio.CancelledError:
+        await join_task_despite_caller_cancellation(completion)
+        raise
+
+
+def provider_capability_is_attached_to_live_run(
+    source_session_id: str,
+    source_run_id: str,
+    native_transition_nonce: str = "",
+    *,
+    allow_native_transition: bool = False,
+) -> bool:
+    """Return whether an authority belongs to the exact live logical run.
+
+    Native steering has a narrow delivery interval in which the replacement
+    provider prompt can execute before local lifecycle bookkeeping changes
+    ``CURRENT_TURNS``. Only the explicitly reserved candidate for the same
+    active chat is accepted in that interval. Stop closes the interval
+    immediately; ordinary queued, stale, or neighboring run IDs never match.
+    """
+
+    active = ACTIVE.get(source_session_id) or {}
+    transition_ready = active.get("logical_transition_ready")
+    predecessor_run_id = str(
+        active.get("logical_transition_predecessor_run_id") or ""
+    )
+    current = CURRENT_TURNS.get(source_session_id) or {}
+    current_run_id = str(current.get("run_id") or "")
+    active_run_id = str(active.get("run_id") or "")
+    candidate_run_id = str(
+        active.get("logical_transition_candidate_run_id") or ""
+    )
+    transition_nonce = str(
+        active.get("logical_transition_authority_nonce") or ""
+    )
+    # The provider transport is shared across the rollover. As soon as the
+    # candidate authority is exposed to it, suspend the predecessor's still-
+    # visible file so candidate execution cannot spend old Publish, Jobs, or
+    # cross-chat grants. Safe preaccept rollback restores the predecessor only
+    # after release_transition removes this exact fenced state.
+    predecessor_suspended = bool(
+        active.get("logical_transition_authority_open") is True
+        and isinstance(transition_ready, asyncio.Event)
+        and not transition_ready.is_set()
+        and predecessor_run_id == source_run_id
+        and current_run_id == source_run_id
+        and candidate_run_id
+        and active_run_id in {source_run_id, candidate_run_id}
+        and transition_nonce
+    )
+    # Promotion changes ACTIVE and CURRENT before the durable lifecycle batch is
+    # appended.  Keep the candidate on its transition-only capability ceiling
+    # throughout that in-memory commit window: exact Jobs may run (Claude can
+    # invoke a tool before start_run returns), but Publish and cross-chat routes
+    # stay closed until the durable batch commits and release_transition sets the
+    # Event.  Evaluate this before the ordinary CURRENT fast path so promotion
+    # cannot accidentally turn a pending candidate into full current authority.
+    candidate_transition_pending = bool(
+        isinstance(transition_ready, asyncio.Event)
+        and not transition_ready.is_set()
+        and candidate_run_id == source_run_id
+        and predecessor_run_id
+    )
+    if candidate_transition_pending:
+        return bool(
+            source_session_id in BUSY_SESSIONS
+            and allow_native_transition
+            and source_run_id not in STOPPED_RUNS
+            and not active.get("stop_requested")
+            and active.get("logical_transition_authority_open") is True
+            and native_transition_nonce
+            and transition_nonce
+            and hmac.compare_digest(
+                transition_nonce,
+                native_transition_nonce,
+            )
+            and active_run_id in {predecessor_run_id, candidate_run_id}
+            and current_run_id in {predecessor_run_id, candidate_run_id}
+        )
+    if current_run_id == source_run_id:
+        if source_run_id in STOPPED_RUNS:
+            return False
+        if active_run_id == source_run_id and active.get("stop_requested"):
+            return False
+        return not predecessor_suspended
+    return bool(
+        source_session_id in BUSY_SESSIONS
+        and allow_native_transition
+        and not active.get("stop_requested")
+        and isinstance(transition_ready, asyncio.Event)
+        and not transition_ready.is_set()
+        and active.get("logical_transition_authority_open") is True
+        and native_transition_nonce
+        and hmac.compare_digest(
+            transition_nonce,
+            native_transition_nonce,
+        )
+        and candidate_run_id == source_run_id
+        and predecessor_run_id
+        and active_run_id == predecessor_run_id
+        and current_run_id == predecessor_run_id
+    )
+
+
+def native_steer_provider_actions(
+    source_session_id: str,
+    selected: dict[str, Any],
+) -> tuple[set[str], str]:
+    """Return the normal per-turn helper ceiling for a route-free steer."""
+
+    if (
+        selected.get("purpose") == "cross_chat_handoff_delivery"
+        or selected.get("chat_references")
+        or selected.get("cross_chat_obligation_ids")
+        or selected.get("cross_chat_exchange_ids")
+        or normalized_provider_cross_chat_route_snapshot(
+            selected.get("provider_cross_chat_route_snapshot")
+        )
+    ):
+        raise NativeSteerHandoffError(
+            "route-bearing work cannot reuse a native provider turn",
+            safe_to_requeue=True,
+        )
+    jobs_access = effective_provider_jobs_access(
+        STORE.sessions.get(source_session_id)
+    )
+    actions = {"publish"}
+    if jobs_access != "blocked" and AGENT_TOKEN:
+        actions.add("jobs")
+    return actions, jobs_access
+
+
+async def issue_native_steer_provider_authority(
+    source_session_id: str,
+    candidate_run_id: str,
+    selected: dict[str, Any],
+    request_prompt: str,
+    transition_nonce: str,
+) -> tuple[str, Path]:
+    """Durably issue and append a fresh authority for one native steer."""
+
+    actions, jobs_access = native_steer_provider_actions(
+        source_session_id,
+        selected,
+    )
+    authority_path = await issue_cross_chat_capability(
+        source_session_id,
+        candidate_run_id,
+        [],
+        actions=actions,
+        provider_route_snapshot=[],
+        native_transition_nonce=transition_nonce,
+    )
+    if authority_path is None:
+        raise NativeSteerHandoffError(
+            "could not issue provider authority for the steering run",
+            safe_to_requeue=True,
+        )
+    try:
+        authority_block = cross_chat_provider_authority_block(
+            [],
+            authority_path,
+            source_session_id,
+            actions,
+            jobs_access,
+        )
+        provider_prompt = request_prompt + authority_block
+    except BaseException:
+        await revoke_cross_chat_capability(candidate_run_id)
+        raise
+    return provider_prompt, authority_path
+
+
+async def purge_cross_chat_authority_files_after_restart() -> int:
+    """Fail closed after restart without following or broadly globbing paths.
+
+    Provider grants and live-run ownership are intentionally memory-only, and
+    startup terminalizes every provider turn orphaned with the old process.
+    Rehydrating a token from its provider-facing file would lose its exact
+    action, route, consumption, and transition fences. Clear the registry and
+    unlink only canonical authority-file names inside the private root.
+    """
+
+    async with CROSS_CHAT_CAPABILITY_LOCK:
+        CROSS_CHAT_CAPABILITIES.clear()
+    removed_files = 0
+    try:
+        candidates = list(CROSS_CHAT_AUTHORITY_ROOT.iterdir())
+    except OSError:
+        candidates = []
+    for path in candidates:
+        if not re.fullmatch(
+            r"run_[A-Za-z0-9_-]+(?:-[0-9a-f]{32})?\.json",
+            path.name,
+        ):
+            continue
+        try:
+            # unlink() removes a matching symlink itself and never follows it.
+            path.unlink()
+        except OSError:
+            continue
+        removed_files += 1
+    return removed_files
 
 
 def cross_chat_provider_authority_block(
@@ -9732,7 +9994,9 @@ async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]
             raise NativeSteerHandoffError(
                 str(error.get("message") or "Force Send delivery is uncertain"),
                 safe_to_requeue=False,
-                delivery_uncertain=True,
+                delivery_uncertain=bool(
+                    error.get("delivery_uncertain", True)
+                ),
             )
         result = cached.get("result")
         if isinstance(result, dict):
@@ -9829,6 +10093,7 @@ async def fence_native_steer_delivery(
             "client_capabilities": list(
                 selected.get("client_capabilities") or []
             ),
+            "position": selected.get("_native_delivery_queue_position"),
             "provider_cross_chat_route_snapshot": [
                 dict(route)
                 for route in normalized_provider_cross_chat_route_snapshot(
@@ -9843,6 +10108,188 @@ async def fence_native_steer_delivery(
     ])
     selected["_paused_after_stop"] = True
     selected["_native_delivery_fenced"] = True
+
+
+def native_steer_requeue_event_payload(
+    session_id: str,
+    selected: dict[str, Any],
+    *,
+    position: int,
+) -> dict[str, Any]:
+    """Return a normal, downgrade-safe queue event for a rejected steer."""
+
+    display_prompt = str(
+        selected.get("display_prompt")
+        if selected.get("display_prompt") is not None
+        else selected.get("prompt") or ""
+    )
+    return {
+        "queued_id": selected.get("queued_id"),
+        "backend": (
+            selected.get("backend")
+            or (STORE.sessions.get(session_id) or {}).get("backend")
+            or DEFAULT_BACKEND
+        ),
+        "model": selected.get("model"),
+        "effort": selected.get("effort"),
+        "prompt": display_prompt,
+        "request_prompt": str(selected.get("prompt") or ""),
+        "display_prompt": selected.get("display_prompt"),
+        "file_ids": list(selected.get("file_ids") or []),
+        "display_file_ids": list(
+            selected.get("display_file_ids")
+            if selected.get("display_file_ids") is not None
+            else selected.get("file_ids") or []
+        ),
+        "position": position,
+        "purpose": selected.get("purpose"),
+        "digest_job_id": selected.get("digest_job_id"),
+        "digest_detail": selected.get("digest_detail"),
+        "source_session_id": selected.get("source_session_id"),
+        "target_session_id": selected.get("target_session_id"),
+        "chat_references": list(selected.get("chat_references") or []),
+        "cross_chat_envelope_id": selected.get("cross_chat_envelope_id"),
+        "cross_chat_exchange_id": selected.get("cross_chat_exchange_id"),
+        "cross_chat_exchange_leg_id": selected.get("cross_chat_exchange_leg_id"),
+        "exchange_id": selected.get("cross_chat_exchange_id"),
+        "exchange_leg_id": selected.get("cross_chat_exchange_leg_id"),
+        "cross_chat_exchange_status": bool(
+            selected.get("cross_chat_exchange_status")
+        ),
+        "cross_chat_obligation_ids": list(
+            selected.get("cross_chat_obligation_ids") or []
+        ),
+        "cross_chat_exchange_ids": list(
+            selected.get("cross_chat_exchange_ids") or []
+        ),
+        "client_capabilities": list(selected.get("client_capabilities") or []),
+        "provider_cross_chat_route_snapshot": [
+            dict(route)
+            for route in normalized_provider_cross_chat_route_snapshot(
+                selected.get("provider_cross_chat_route_snapshot")
+            )
+        ],
+        "message": (
+            "Force Send was rejected before provider delivery; the message "
+            "returned to normal queue delivery."
+        ),
+    }
+
+
+async def requeue_native_steer_after_safe_rejection(
+    session_id: str,
+    selected: dict[str, Any],
+    *,
+    selected_index: int,
+    selected_predecessor_id: str | None,
+    selected_successor_id: str | None,
+) -> None:
+    """Restore one definitely rejected steer without leaving a replay fence.
+
+    A safe rejection can happen before or after the provider fence, but Run Now
+    has already detached the item and released a possible Stop hold. A full
+    turn_queued event plus the standard reorder projection makes that rollback
+    authoritative on this server and the previous beta. If compensation cannot
+    commit, the item stays visibly paused/fenced and the caller receives a
+    non-retryable error instead of a false deferred result.
+    """
+
+    rollback_error: BaseException | None = None
+    async with QUEUE_LOCK:
+        items = list(QUEUED_TURNS.get(session_id) or [])
+        successor_index = (
+            next(
+                (
+                    idx
+                    for idx, item in enumerate(items)
+                    if item.get("queued_id") == selected_successor_id
+                ),
+                None,
+            )
+            if selected_successor_id is not None
+            else None
+        )
+        predecessor_index = (
+            next(
+                (
+                    idx
+                    for idx, item in enumerate(items)
+                    if item.get("queued_id") == selected_predecessor_id
+                ),
+                None,
+            )
+            if selected_predecessor_id is not None
+            else None
+        )
+        if successor_index is not None:
+            insert_at = successor_index
+        elif predecessor_index is not None:
+            insert_at = predecessor_index + 1
+        else:
+            insert_at = min(selected_index, len(items))
+        items.insert(insert_at, selected)
+
+        positions = [
+            {
+                "queued_id": str(item.get("queued_id") or ""),
+                "position": index + 1,
+            }
+            for index, item in enumerate(items)
+            if str(item.get("queued_id") or "").strip()
+        ]
+        try:
+            # Even pre-fence rejection needs this compensation: Run Now already
+            # released a possible durable Stop hold, and concurrent reorder
+            # events may have been written while the selected item was detached.
+            await append_durable_event_batch(session_id, [
+                (
+                    "turn_queued",
+                    native_steer_requeue_event_payload(
+                        session_id,
+                        selected,
+                        position=insert_at + 1,
+                    ),
+                ),
+                (
+                    "turn_queue_reordered",
+                    {
+                        "positions": positions,
+                        "message": (
+                            "Queue order restored after Force Send was "
+                            "rejected before provider delivery."
+                        ),
+                    },
+                ),
+            ])
+        except BaseException as exc:
+            rollback_error = exc
+            # Never expose a runnable projection when restart recovery still
+            # holds the older queue state. Preserve a provider fence when one
+            # exists; otherwise a plain Stop-style hold is sufficient.
+            selected["_paused_after_stop"] = True
+        else:
+            # The durable compensation is the commit point. Never publish a
+            # runnable in-memory item before both standard events are fsynced.
+            selected["_paused_after_stop"] = False
+            selected.pop("_native_delivery_fenced", None)
+        selected.pop("_native_delivery_queue_position", None)
+        QUEUED_TURNS[session_id] = deque(items)
+
+    if rollback_error is not None:
+        if isinstance(
+            rollback_error,
+            (asyncio.CancelledError, KeyboardInterrupt, SystemExit),
+        ):
+            raise rollback_error
+        raise NativeSteerHandoffError(
+            (
+                "Force Send was rejected before provider delivery, but its "
+                "durable queue rollback failed; the message remains paused: "
+                f"{concise_error_message(rollback_error)}"
+            ),
+            safe_to_requeue=False,
+            delivery_uncertain=False,
+        ) from rollback_error
 
 
 def deferred_force_send_response_for_client(
@@ -9895,7 +10342,10 @@ async def _run_queued_turn_now_and_release(
             result = await deferred_force_send_outcome(session_id, queued_id, exc)
             return result
         if exc.delivery_uncertain or not exc.safe_to_requeue:
-            uncertain_error = {"message": str(exc)}
+            uncertain_error = {
+                "message": str(exc),
+                "delivery_uncertain": bool(exc.delivery_uncertain),
+            }
         raise
     finally:
         async with RUN_NOW_REQUEST_LOCK:
@@ -10027,10 +10477,19 @@ async def _run_queued_turn_now_once(
                     and not selected.get("chat_references")
                     and not selected.get("cross_chat_obligation_ids")
                     and not selected.get("cross_chat_exchange_ids")
-                    # Native steering reuses the interrupted provider run and
-                    # its capability. A route-bearing turn on either side
-                    # must instead stop and start a fresh run so admission
-                    # snapshots and per-run quotas cannot bleed across turns.
+                    and interrupted_turn.get("purpose")
+                    != "cross_chat_handoff_delivery"
+                    and not interrupted_turn.get("chat_references")
+                    and not interrupted_turn.get("cross_chat_obligation_ids")
+                    and not interrupted_turn.get("cross_chat_exchange_ids")
+                    and not interrupted_turn.get("cross_chat_envelope_id")
+                    and not interrupted_turn.get("cross_chat_exchange_id")
+                    and not interrupted_turn.get("cross_chat_exchange_leg_id")
+                    # Native steering reuses the provider transport but issues
+                    # a fresh helper authority for the new logical run. A
+                    # route-bearing turn on either side must instead stop and
+                    # start normally so admission snapshots and per-run quotas
+                    # cannot bleed across turns.
                     and not normalized_provider_cross_chat_route_snapshot(
                         interrupted_turn.get(
                             "provider_cross_chat_route_snapshot"
@@ -10068,6 +10527,13 @@ async def _run_queued_turn_now_once(
                     # explicit Stop cannot interleave between interruption and
                     # promotion of this queued message.
                     raise NonNativeForceSendRequiresLifecycleLock
+                if native_steer:
+                    # Provider-side fencing happens after this item leaves the
+                    # live deque. Preserve its exact durable position so crash
+                    # recovery and a safe rejection can restore the same order.
+                    selected["_native_delivery_queue_position"] = (
+                        selected_index + 1
+                    )
                 kept = deque(
                     item
                     for idx, item in enumerate(items)
@@ -10138,40 +10604,13 @@ async def _run_queued_turn_now_once(
                 selected_index is not None
                 and bool(getattr(exc, "safe_to_requeue", False))
             ):
-                async with QUEUE_LOCK:
-                    items = list(QUEUED_TURNS.get(session_id) or [])
-                    successor_index = (
-                        next(
-                            (
-                                idx
-                                for idx, item in enumerate(items)
-                                if item.get("queued_id") == selected_successor_id
-                            ),
-                            None,
-                        )
-                        if selected_successor_id is not None
-                        else None
-                    )
-                    predecessor_index = (
-                        next(
-                            (
-                                idx
-                                for idx, item in enumerate(items)
-                                if item.get("queued_id") == selected_predecessor_id
-                            ),
-                            None,
-                        )
-                        if selected_predecessor_id is not None
-                        else None
-                    )
-                    if successor_index is not None:
-                        insert_at = successor_index
-                    elif predecessor_index is not None:
-                        insert_at = predecessor_index + 1
-                    else:
-                        insert_at = min(selected_index, len(items))
-                    items.insert(insert_at, selected)
-                    QUEUED_TURNS[session_id] = deque(items)
+                await requeue_native_steer_after_safe_rejection(
+                    session_id,
+                    selected,
+                    selected_index=selected_index,
+                    selected_predecessor_id=selected_predecessor_id,
+                    selected_successor_id=selected_successor_id,
+                )
             raise
         finally:
             async with QUEUE_LOCK:
@@ -10936,7 +11375,20 @@ def scan_queued_turns_from_events(
                         sess,
                         len(order) + 1,
                     )
-                    order.append(queued_id)
+                    try:
+                        fenced_index = max(
+                            0,
+                            min(
+                                int(
+                                    event.get("position")
+                                    or len(order) + 1
+                                ) - 1,
+                                len(order),
+                            ),
+                        )
+                    except (TypeError, ValueError):
+                        fenced_index = len(order)
+                    order.insert(fenced_index, queued_id)
                 pending[queued_id]["_paused_after_stop"] = True
                 pending[queued_id]["_native_delivery_fenced"] = True
                 continue
@@ -21484,8 +21936,11 @@ async def create_authorized_cross_chat_instruction(
             raise HTTPException(status_code=403, detail="cross-chat capability belongs to another server")
         source_session_id = str(capability.get("source_session_id") or "")
         source_run_id = str(capability.get("source_run_id") or "")
-        current = CURRENT_TURNS.get(source_session_id) or {}
-        if str(current.get("run_id") or "") != source_run_id:
+        if not provider_capability_is_attached_to_live_run(
+            source_session_id,
+            source_run_id,
+            str(capability.get("native_transition_nonce") or ""),
+        ):
             if float(capability.get("expires_at") or 0) <= now:
                 CROSS_CHAT_CAPABILITIES.pop(token_hash, None)
             raise HTTPException(status_code=403, detail="cross-chat capability is no longer attached to a live source turn")
@@ -21582,8 +22037,11 @@ async def create_authorized_cross_chat_exchange_response(
             raise HTTPException(status_code=403, detail="provider capability belongs to another server")
         source_session_id = str(capability.get("source_session_id") or "")
         source_run_id = str(capability.get("source_run_id") or "")
-        current = CURRENT_TURNS.get(source_session_id) or {}
-        if str(current.get("run_id") or "") != source_run_id:
+        if not provider_capability_is_attached_to_live_run(
+            source_session_id,
+            source_run_id,
+            str(capability.get("native_transition_nonce") or ""),
+        ):
             raise HTTPException(status_code=403, detail="response capability is no longer attached to a live delivery run")
         if (
             "cross_chat_response" not in capability.get("actions", set())
@@ -21686,8 +22144,12 @@ async def authorize_provider_action(
                 status_code=403,
                 detail="configured route authority expired",
             )
-        current = CURRENT_TURNS.get(session_id) or {}
-        if str(current.get("run_id") or "") != run_id:
+        if not provider_capability_is_attached_to_live_run(
+            session_id,
+            run_id,
+            str(capability.get("native_transition_nonce") or ""),
+            allow_native_transition=action == "jobs",
+        ):
             if float(capability.get("expires_at") or 0) <= time.time():
                 CROSS_CHAT_CAPABILITIES.pop(token_hash, None)
             raise HTTPException(status_code=403, detail="provider capability is no longer attached to a live turn")
@@ -21760,8 +22222,11 @@ async def provider_route_capability_source(request: Request) -> str:
                 status_code=403,
                 detail="configured route authority expired",
             )
-        current = CURRENT_TURNS.get(source_session_id) or {}
-        if str(current.get("run_id") or "") != source_run_id:
+        if not provider_capability_is_attached_to_live_run(
+            source_session_id,
+            source_run_id,
+            str(capability.get("native_transition_nonce") or ""),
+        ):
             if float(capability.get("expires_at") or 0) <= time.time():
                 CROSS_CHAT_CAPABILITIES.pop(token_hash, None)
             raise HTTPException(
@@ -21912,8 +22377,11 @@ async def reserve_provider_route_handoff(
                 status_code=403,
                 detail="configured route authority expired",
             )
-        current = CURRENT_TURNS.get(source_session_id) or {}
-        if str(current.get("run_id") or "") != source_run_id:
+        if not provider_capability_is_attached_to_live_run(
+            source_session_id,
+            source_run_id,
+            str(capability.get("native_transition_nonce") or ""),
+        ):
             raise HTTPException(
                 status_code=403,
                 detail=(
@@ -32277,6 +32745,9 @@ async def run_claude_sdk(
                 active.pop("logical_transition_ready", None)
                 active.pop("logical_transition_candidate_run_id", None)
                 active.pop("logical_transition_accepting_permissions", None)
+                active.pop("logical_transition_authority_open", None)
+                active.pop("logical_transition_predecessor_run_id", None)
+                active.pop("logical_transition_authority_nonce", None)
 
     try:
         while True:
@@ -32298,6 +32769,7 @@ async def run_claude_sdk(
                 selected = request.get("selected") or {}
                 future = request.get("future")
                 candidate_run_id = f"run_{uuid.uuid4().hex[:16]}"
+                transition_nonce = secrets.token_hex(16)
                 try:
                     request_prompt = build_user_provider_prompt(
                         session_id,
@@ -32325,6 +32797,8 @@ async def run_claude_sdk(
                         continue
                     active["logical_transition_ready"] = transition_ready
                     active["logical_transition_candidate_run_id"] = candidate_run_id
+                    active["logical_transition_predecessor_run_id"] = current_run_id
+                    active["logical_transition_authority_nonce"] = transition_nonce
                     active["logical_transition_accepting_permissions"] = False
                     active["claude_permissions_open"] = False
                     transition_reserved = True
@@ -32378,6 +32852,8 @@ async def run_claude_sdk(
                     "remaining": int(request.get("remaining") or 0),
                     "future": future,
                     "candidate_run_id": candidate_run_id,
+                    "predecessor_run_id": current_run_id,
+                    "transition_nonce": transition_nonce,
                     "request_prompt": request_prompt,
                     "transition_ready": transition_ready,
                     "transition_reserved": transition_reserved,
@@ -32668,6 +33144,30 @@ async def run_claude_sdk(
                         ),
                         safe_to_requeue=True,
                     ) from exc
+                try:
+                    (
+                        steer_state["request_prompt"],
+                        steer_state["candidate_authority_path"],
+                    ) = await issue_native_steer_provider_authority(
+                        session_id,
+                        candidate_run_id,
+                        selected,
+                        str(steer_state["request_prompt"]),
+                        str(steer_state["transition_nonce"]),
+                    )
+                except BaseException as exc:
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
+                    if isinstance(exc, NativeSteerHandoffError):
+                        raise
+                    raise NativeSteerHandoffError(
+                        (
+                            "Claude steering was not sent because replacement "
+                            "authority issuance failed: "
+                            f"{concise_error_message(exc)}"
+                        ),
+                        safe_to_requeue=True,
+                    ) from exc
                 async with ACTIVE_LOCK:
                     active = ACTIVE.get(session_id)
                     delivery_still_allowed = bool(
@@ -32680,7 +33180,11 @@ async def run_claude_sdk(
                             or ""
                         ) == candidate_run_id
                     )
+                    if delivery_still_allowed:
+                        active["logical_transition_authority_open"] = True
                 if not delivery_still_allowed:
+                    await revoke_cross_chat_capability(candidate_run_id)
+                    steer_state.pop("candidate_authority_path", None)
                     raise NativeSteerHandoffError(
                         "the active Claude turn stopped before steering delivery",
                         safe_to_requeue=True,
@@ -32704,6 +33208,12 @@ async def run_claude_sdk(
                 steer_state["candidate_accepted"] = True
             except Exception as exc:
                 steer_state["candidate_failure_handled"] = True
+                if steer_state.get("candidate_authority_path") is not None:
+                    await revoke_cross_chat_capability(candidate_run_id)
+                    steer_state.pop("candidate_authority_path", None)
+                safe_to_requeue = bool(getattr(exc, "safe_to_requeue", False))
+                if not safe_to_requeue:
+                    await revoke_cross_chat_capability(previous_run_id)
                 candidate_watcher = manifest_watch_task
                 manifest_watch_task = None
                 if candidate_watcher is not None:
@@ -32729,7 +33239,6 @@ async def run_claude_sdk(
                     ):
                         active["claude_permissions_open"] = False
                 await release_transition(transition_ready)
-                safe_to_requeue = bool(getattr(exc, "safe_to_requeue", False))
                 if bool(getattr(exc, "delivery_uncertain", False)):
                     retire_supervisor = True
                 if isinstance(future, asyncio.Future) and not future.done():
@@ -32810,6 +33319,7 @@ async def run_claude_sdk(
                             "queued_id": selected.get("queued_id"),
                             "steering_lineage": lineage,
                         })
+                    steer_state["candidate_committed"] = True
 
             watch_provider_readiness(
                 candidate_run_id,
@@ -32873,6 +33383,7 @@ async def run_claude_sdk(
                     "result_text": previous_result_text,
                     **previous_metadata,
                 })
+            await revoke_cross_chat_capability(previous_run_id)
             await append_durable_event_batch(session_id, [
                 ("turn_queue_run_now", {
                     "queued_id": selected.get("queued_id"),
@@ -32962,8 +33473,6 @@ async def run_claude_sdk(
             )
         if pending_steer is not None:
             transition_ready = pending_steer.get("transition_ready")
-            if isinstance(transition_ready, asyncio.Event):
-                await release_transition(transition_ready)
             future = pending_steer.get("future")
             candidate_accepted = bool(
                 pending_steer.get("candidate_accepted")
@@ -32975,6 +33484,25 @@ async def run_claude_sdk(
                     and not pending_steer.get("candidate_failure_handled")
                 )
             )
+            candidate_run_id = str(
+                pending_steer.get("candidate_run_id") or ""
+            )
+            if (
+                candidate_run_id
+                and pending_steer.get("candidate_authority_path") is not None
+            ):
+                with suppress(Exception):
+                    await revoke_cross_chat_capability(candidate_run_id)
+                pending_steer.pop("candidate_authority_path", None)
+            if candidate_delivery_uncertain:
+                predecessor_run_id = str(
+                    pending_steer.get("predecessor_run_id") or ""
+                )
+                if predecessor_run_id:
+                    with suppress(Exception):
+                        await revoke_cross_chat_capability(predecessor_run_id)
+            if isinstance(transition_ready, asyncio.Event):
+                await release_transition(transition_ready)
             if candidate_delivery_uncertain:
                 retire_supervisor = True
                 stream_error = stream_error or (
@@ -32984,9 +33512,6 @@ async def run_claude_sdk(
                 candidate_baseline = pending_steer.get("candidate_baseline")
                 candidate_paths = pending_steer.get("candidate_paths")
                 candidate_artifacts = pending_steer.get("candidate_artifacts")
-                candidate_run_id = str(
-                    pending_steer.get("candidate_run_id") or ""
-                )
                 if (
                     candidate_run_id
                     and isinstance(candidate_baseline, dict)
@@ -34374,6 +34899,8 @@ async def run_codex_app_server(
             )
 
         candidate_run_id = f"run_{uuid.uuid4().hex[:16]}"
+        candidate_authority_path: Path | None = None
+        steer_rpc_attempted = False
         try:
             request_prompt = build_user_provider_prompt(
                 session_id,
@@ -34392,6 +34919,7 @@ async def run_codex_app_server(
             ) from exc
 
         transition_ready = asyncio.Event()
+        transition_nonce = secrets.token_hex(16)
         transition_reserved = False
 
         async def release_transition_boundary() -> None:
@@ -34408,6 +34936,9 @@ async def run_codex_app_server(
                 ):
                     active.pop("logical_transition_ready", None)
                     active.pop("logical_transition_candidate_run_id", None)
+                    active.pop("logical_transition_authority_open", None)
+                    active.pop("logical_transition_predecessor_run_id", None)
+                    active.pop("logical_transition_authority_nonce", None)
 
         async with ACTIVE_LOCK:
             active = ACTIVE.get(session_id)
@@ -34418,6 +34949,8 @@ async def run_codex_app_server(
                 )
             active["logical_transition_ready"] = transition_ready
             active["logical_transition_candidate_run_id"] = candidate_run_id
+            active["logical_transition_predecessor_run_id"] = current_run_id
+            active["logical_transition_authority_nonce"] = transition_nonce
             transition_reserved = True
 
         try:
@@ -34455,11 +34988,56 @@ async def run_codex_app_server(
                     "the active Codex turn stopped before steering delivery",
                     safe_to_requeue=True,
                 )
+            try:
+                request_prompt, candidate_authority_path = (
+                    await issue_native_steer_provider_authority(
+                        session_id,
+                        candidate_run_id,
+                        selected,
+                        request_prompt,
+                        transition_nonce,
+                    )
+                )
+            except BaseException as exc:
+                await release_transition_boundary()
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                if isinstance(exc, NativeSteerHandoffError):
+                    raise
+                raise NativeSteerHandoffError(
+                    (
+                        "Codex steering was not sent because replacement "
+                        f"authority issuance failed: {concise_error_message(exc)}"
+                    ),
+                    safe_to_requeue=True,
+                ) from exc
+            async with ACTIVE_LOCK:
+                active = ACTIVE.get(session_id)
+                delivery_still_allowed = bool(
+                    active
+                    and not active.get("stop_requested")
+                    and active.get("logical_transition_ready")
+                    is transition_ready
+                    and str(
+                        active.get("logical_transition_candidate_run_id") or ""
+                    ) == candidate_run_id
+                )
+                if delivery_still_allowed:
+                    active["logical_transition_authority_open"] = True
+            if not delivery_still_allowed:
+                await revoke_cross_chat_capability(candidate_run_id)
+                candidate_authority_path = None
+                await release_transition_boundary()
+                raise NativeSteerHandoffError(
+                    "the active Codex turn stopped before steering delivery",
+                    safe_to_requeue=True,
+                )
             steer_with_watermark = getattr(
                 turn,
                 "steer_with_notification_watermark",
                 None,
             )
+            steer_rpc_attempted = True
             if callable(steer_with_watermark):
                 _turn_id, notification_watermark = await steer_with_watermark(
                     [{
@@ -34484,12 +35062,26 @@ async def run_codex_app_server(
             # boundary cannot prove that Codex did not accept the steer. Retire
             # projection of this turn and let the command waiter receive the
             # conservative non-replay outcome below.
-            delivery_unknown = True
+            delivery_unknown = steer_rpc_attempted
             with suppress(Exception):
                 await turn.interrupt()
+            if candidate_authority_path is not None:
+                await revoke_cross_chat_capability(candidate_run_id)
+                candidate_authority_path = None
+            if steer_rpc_attempted:
+                await revoke_cross_chat_capability(current_run_id)
+            await release_transition_boundary()
+            raise
+        except NativeSteerHandoffError:
+            if candidate_authority_path is not None:
+                await revoke_cross_chat_capability(candidate_run_id)
+                candidate_authority_path = None
             await release_transition_boundary()
             raise
         except CodexAppServerRequestError as exc:
+            if candidate_authority_path is not None:
+                await revoke_cross_chat_capability(candidate_run_id)
+                candidate_authority_path = None
             await release_transition_boundary()
             raise NativeSteerHandoffError(
                 concise_error_message(exc),
@@ -34502,6 +35094,10 @@ async def run_codex_app_server(
             delivery_unknown = True
             with suppress(Exception):
                 await turn.interrupt()
+            if candidate_authority_path is not None:
+                await revoke_cross_chat_capability(candidate_run_id)
+                candidate_authority_path = None
+            await revoke_cross_chat_capability(current_run_id)
             with suppress(Exception):
                 await append_event(session_id, "error", {
                     "run_id": current_run_id,
@@ -34526,12 +35122,20 @@ async def run_codex_app_server(
             delivery_unknown = True
             with suppress(Exception):
                 await turn.interrupt()
+            if candidate_authority_path is not None:
+                await revoke_cross_chat_capability(candidate_run_id)
+                candidate_authority_path = None
+            await revoke_cross_chat_capability(current_run_id)
             await release_transition_boundary()
             raise
         except Exception as exc:
             delivery_unknown = True
             with suppress(Exception):
                 await turn.interrupt()
+            if candidate_authority_path is not None:
+                await revoke_cross_chat_capability(candidate_run_id)
+                candidate_authority_path = None
+            await revoke_cross_chat_capability(current_run_id)
             with suppress(Exception):
                 await append_event(session_id, "error", {
                     "run_id": current_run_id,
@@ -34552,6 +35156,10 @@ async def run_codex_app_server(
 
         if turn_completed:
             delivery_unknown = True
+            if candidate_authority_path is not None:
+                await revoke_cross_chat_capability(candidate_run_id)
+                candidate_authority_path = None
+            await revoke_cross_chat_capability(current_run_id)
             with suppress(Exception):
                 await append_event(session_id, "error", {
                     "run_id": current_run_id,
@@ -34571,49 +35179,79 @@ async def run_codex_app_server(
             )
 
         previous_run_id = current_run_id
-        previous_metadata = run_event_metadata(previous_run_id)
-        with suppress(Exception):
-            await flush_pending_unknown(final=False)
-        previous_watcher = manifest_watch_task
-        manifest_watch_task = None
-        if previous_watcher is not None:
-            previous_watcher.cancel()
-            await asyncio.gather(previous_watcher, return_exceptions=True)
-        previous_manifest_path = manifest_path.with_name(
-            f".{previous_run_id}.json"
-        )
-        with suppress(OSError):
-            previous_manifest_path.unlink()
-        with suppress(OSError):
-            manifest_path.replace(previous_manifest_path)
-        previous_diff_baseline = current_diff_baseline
-        previous_changed_paths = set(changed_paths)
-        previous_seen_artifacts = set(seen_artifacts)
 
-        metadata = queued_turn_run_metadata(selected)
-        metadata["steer_interrupted_run_id"] = previous_run_id
-        display_prompt = str(
-            selected.get("display_prompt")
-            if selected.get("display_prompt") is not None
-            else selected.get("prompt") or ""
-        )
-        display_file_ids = list(
-            selected.get("display_file_ids")
-            if selected.get("display_file_ids") is not None
-            else selected.get("file_ids") or []
-        )
-        lineage = turn_steering_lineage(CURRENT_TURNS.get(session_id))
-        steering_message = {
-            "prompt": str(selected.get("prompt") or ""),
-            "file_ids": list(selected.get("file_ids") or []),
-        }
-        if not lineage or steering_message != lineage[-1]:
-            lineage.append(steering_message)
+        async def retire_accepted_transition() -> None:
+            """Atomically retire both authorities before opening the fence."""
 
-        active_missing_after_accept = False
-        async with ACTIVE_LOCK:
-            active = ACTIVE.get(session_id)
-            if active:
+            nonlocal candidate_authority_path, delivery_unknown
+            delivery_unknown = True
+
+            async def cleanup() -> None:
+                nonlocal candidate_authority_path
+                await revoke_cross_chat_capability(candidate_run_id)
+                await revoke_cross_chat_capability(previous_run_id)
+                candidate_authority_path = None
+                with suppress(Exception):
+                    await turn.interrupt()
+                await release_transition_boundary()
+
+            completion = asyncio.create_task(cleanup())
+            try:
+                await asyncio.shield(completion)
+            except asyncio.CancelledError:
+                await join_task_despite_caller_cancellation(completion)
+
+        try:
+            previous_metadata = run_event_metadata(previous_run_id)
+            with suppress(Exception):
+                await flush_pending_unknown(final=False)
+            previous_watcher = manifest_watch_task
+            manifest_watch_task = None
+            if previous_watcher is not None:
+                previous_watcher.cancel()
+                await asyncio.gather(previous_watcher, return_exceptions=True)
+            previous_manifest_path = manifest_path.with_name(
+                f".{previous_run_id}.json"
+            )
+            with suppress(OSError):
+                previous_manifest_path.unlink()
+            with suppress(OSError):
+                manifest_path.replace(previous_manifest_path)
+            previous_diff_baseline = current_diff_baseline
+            previous_changed_paths = set(changed_paths)
+            previous_seen_artifacts = set(seen_artifacts)
+
+            metadata = queued_turn_run_metadata(selected)
+            metadata["steer_interrupted_run_id"] = previous_run_id
+            display_prompt = str(
+                selected.get("display_prompt")
+                if selected.get("display_prompt") is not None
+                else selected.get("prompt") or ""
+            )
+            display_file_ids = list(
+                selected.get("display_file_ids")
+                if selected.get("display_file_ids") is not None
+                else selected.get("file_ids") or []
+            )
+            lineage = turn_steering_lineage(CURRENT_TURNS.get(session_id))
+            steering_message = {
+                "prompt": str(selected.get("prompt") or ""),
+                "file_ids": list(selected.get("file_ids") or []),
+            }
+            if not lineage or steering_message != lineage[-1]:
+                lineage.append(steering_message)
+
+            async with ACTIVE_LOCK:
+                active = ACTIVE.get(session_id)
+                if not active:
+                    raise RuntimeError(
+                        "the active turn disappeared after Force Send was accepted"
+                    )
+                current = CURRENT_TURNS.get(session_id)
+                if current is None:
+                    raise RuntimeError(
+                        "the current turn disappeared after Force Send was accepted"
+                    )
                 stopped_during_handoff = bool(active.get("stop_requested"))
                 current_run_id = candidate_run_id
                 current_provider_prompt = request_prompt
@@ -34625,42 +35263,16 @@ async def run_codex_app_server(
                 active["started_at_iso"] = now_iso()
                 if stopped_during_handoff:
                     STOPPED_RUNS.add(candidate_run_id)
-                current = CURRENT_TURNS.get(session_id)
-                if current is not None:
-                    current.update({
-                        "run_id": candidate_run_id,
-                        "prompt": str(selected.get("prompt") or ""),
-                        "display_prompt": display_prompt,
-                        "file_ids": list(selected.get("file_ids") or []),
-                        "queued_id": selected.get("queued_id"),
-                        "steering_lineage": lineage,
-                    })
-            else:
-                active_missing_after_accept = True
-        if active_missing_after_accept:
-            delivery_unknown = True
-            # The provider accepted the steer, so the selected message must
-            # never be replayed even if local active bookkeeping vanished.
-            with suppress(Exception):
-                await append_event(session_id, "error", {
-                    "run_id": previous_run_id,
-                    "backend": BACKEND_CODEX,
-                    "transport": CODEX_TRANSPORT_APP_SERVER,
-                    "message": (
-                        "Force Send was accepted, but its local turn state "
-                        "disappeared. The message was not replayed."
-                    ),
-                    "delivery_unknown": True,
+                current.update({
+                    "run_id": candidate_run_id,
+                    "prompt": str(selected.get("prompt") or ""),
+                    "display_prompt": display_prompt,
+                    "file_ids": list(selected.get("file_ids") or []),
+                    "queued_id": selected.get("queued_id"),
+                    "steering_lineage": lineage,
                 })
-            await release_transition_boundary()
-            raise NativeSteerHandoffError(
-                "the active turn disappeared after Force Send was accepted",
-                safe_to_requeue=False,
-                delivery_uncertain=True,
-            )
-        last_activity = time.monotonic()
+            last_activity = time.monotonic()
 
-        try:
             with suppress(OSError):
                 manifest_path.unlink()
             manifest_watch_task = asyncio.create_task(
@@ -34714,50 +35326,34 @@ async def run_codex_app_server(
                     },
                 ),
             ]
-            try:
-                await append_durable_event_batch(session_id, event_specs)
-            except Exception as exc:
-                # The provider already accepted this prompt. Keep the durable
-                # pre-delivery fence as a restart hold, terminate projection of
-                # the uncertain turn, and surface a non-retryable result to the
-                # Force Send caller instead of reporting false success.
-                delivery_unknown = True
-                with suppress(Exception):
-                    await turn.interrupt()
-                with suppress(Exception):
-                    await append_event(session_id, "error", {
-                        "run_id": candidate_run_id,
-                        "backend": BACKEND_CODEX,
-                        "transport": CODEX_TRANSPORT_APP_SERVER,
-                        "message": (
-                            "Force Send was accepted, but its durable lifecycle "
-                            "could not be committed. The message was not replayed."
-                        ),
-                        "delivery_unknown": True,
-                    })
-                raise NativeSteerHandoffError(
-                    concise_error_message(exc),
-                    safe_to_requeue=False,
-                    delivery_uncertain=True,
-                ) from exc
-        except NativeSteerHandoffError:
-            raise
-        except Exception as exc:
+            await append_durable_event_batch(session_id, event_specs)
+            await revoke_cross_chat_capability(previous_run_id)
+        except BaseException as exc:
+            await retire_accepted_transition()
+            if isinstance(exc, asyncio.CancelledError):
+                raise
             logger.exception(
                 "could not finish native steer bookkeeping session=%s run=%s",
                 session_id,
                 candidate_run_id,
             )
-            delivery_unknown = True
             with suppress(Exception):
-                await turn.interrupt()
+                await append_event(session_id, "error", {
+                    "run_id": candidate_run_id,
+                    "backend": BACKEND_CODEX,
+                    "transport": CODEX_TRANSPORT_APP_SERVER,
+                    "message": (
+                        "Force Send was accepted, but its durable lifecycle "
+                        "could not be committed. The message was not replayed."
+                    ),
+                    "delivery_unknown": True,
+                })
             raise NativeSteerHandoffError(
                 concise_error_message(exc),
                 safe_to_requeue=False,
                 delivery_uncertain=True,
             ) from exc
-        finally:
-            await release_transition_boundary()
+        await release_transition_boundary()
 
         RUN_METADATA.pop(previous_run_id, None)
         STOPPED_RUNS.discard(previous_run_id)
@@ -37271,15 +37867,15 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(TEAM_HUB_RUNTIME.initialize)
     await asyncio.to_thread(scrub_tmux_global_secret_environment)
     await CROSS_CHAT.initialize()
-    for stale_authority in CROSS_CHAT_AUTHORITY_ROOT.glob("run_*.json"):
-        with suppress(OSError):
-            stale_authority.unlink()
     reconcile_server_restart_status_after_startup()
     await reconcile_server_update_status_after_startup()
     abandoned_compaction_count = (
         await recover_abandoned_codex_compactions_after_start()
     )
     abandoned_turn_count = await recover_abandoned_turns_after_start()
+    removed_authority_files = (
+        await purge_cross_chat_authority_files_after_restart()
+    )
     digest_job_count = await load_handoff_digest_jobs()
     JOBS.start_scheduler()
     queue_recovery_task = asyncio.create_task(recover_queued_turns_after_start())
@@ -37307,13 +37903,14 @@ async def lifespan(app: FastAPI):
     history_search_task = asyncio.create_task(history_search_index_loop())
     runtime_probe_task = asyncio.create_task(asyncio.to_thread(refresh_runtime_diagnostics, force=True))
     logger.info(
-        "agent server ready state=%s sessions=%d jobs=%d digests=%d abandoned_turns=%d abandoned_compactions=%d queue_recovery=background",
+        "agent server ready state=%s sessions=%d jobs=%d digests=%d abandoned_turns=%d abandoned_compactions=%d authority_removed=%d queue_recovery=background",
         STATE_DIR,
         len(STORE.sessions),
         len(JOBS.jobs),
         digest_job_count,
         abandoned_turn_count,
         abandoned_compaction_count,
+        removed_authority_files,
     )
     try:
         yield

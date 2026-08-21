@@ -42,6 +42,11 @@ logger = logging.getLogger(__name__)
 CLAUDE_AGENT_SDK_MIN_VERSION = "0.2.130"
 CLAUDE_SDK_MCP_STATUS_SCAN_LIMIT = 500
 CLAUDE_SDK_MCP_STATUS_TRUNCATED_KEY = "_agentsdock_mcp_status_truncated"
+CLAUDE_NON_DURABLE_SCHEDULER_TOOLS = (
+    "CronCreate",
+    "Monitor",
+    "ScheduleWakeup",
+)
 
 
 def canonical_claude_mcp_identifier(value: Any, max_chars: int) -> str | None:
@@ -298,6 +303,13 @@ _UNTRACKED_BACKGROUND_REASON = (
     "completion that must notify this chat, delegate a tracked Agent/workflow. If the "
     "user explicitly requested a durable service, use an observable service manager."
 )
+_NON_DURABLE_SCHEDULER_REASON = (
+    "Claude's {tool_name} is not an AgentsDock durable job and cannot be relied on "
+    "to survive this turn or deliver a later chat update. If the user explicitly "
+    "requested scheduling, use only the AgentsDock Jobs CLI with the exact authority "
+    "command in the current turn's provider-authority block. Otherwise keep required "
+    "work in the foreground or use a tracked Agent/workflow."
+)
 
 
 def _heredoc_delimiters(line: str) -> list[tuple[str, bool]]:
@@ -524,8 +536,35 @@ async def reject_untracked_background_hook(
     }
 
 
+def claude_nondurable_scheduler_reason(tool_name: Any) -> str | None:
+    """Reject only the exact Claude tools that cannot create durable Dock work."""
+
+    if tool_name not in CLAUDE_NON_DURABLE_SCHEDULER_TOOLS:
+        return None
+    return _NON_DURABLE_SCHEDULER_REASON.format(tool_name=tool_name)
+
+
+async def reject_nondurable_scheduler_hook(
+    hook_input: dict[str, Any],
+    _tool_use_id: str | None,
+    _context: dict[str, Any],
+) -> dict[str, Any]:
+    """Fail closed before Claude can arm a provider-local scheduler."""
+
+    reason = claude_nondurable_scheduler_reason(hook_input.get("tool_name"))
+    if reason is None:
+        return {}
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
+
+
 def claude_background_tracking_hooks() -> dict[str, list[ClaudeSDKHookMatcher]]:
-    """Return the stable SDK hook policy for shell background work."""
+    """Return SDK hooks for shell detachment and non-durable schedulers."""
 
     return {
         "PreToolUse": [
@@ -533,7 +572,15 @@ def claude_background_tracking_hooks() -> dict[str, list[ClaudeSDKHookMatcher]]:
                 matcher="Bash",
                 hooks=[reject_untracked_background_hook],
                 timeout=5.0,
-            )
+            ),
+            *[
+                ClaudeSDKHookMatcher(
+                    matcher=tool_name,
+                    hooks=[reject_nondurable_scheduler_hook],
+                    timeout=5.0,
+                )
+                for tool_name in CLAUDE_NON_DURABLE_SCHEDULER_TOOLS
+            ],
         ]
     }
 

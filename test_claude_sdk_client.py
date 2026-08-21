@@ -6,6 +6,7 @@ from importlib.metadata import version
 from typing import Any
 
 from claude_sdk_client import (
+    CLAUDE_NON_DURABLE_SCHEDULER_TOOLS,
     CLAUDE_SDK_MCP_STATUS_SCAN_LIMIT,
     CLAUDE_SDK_MCP_STATUS_TRUNCATED_KEY,
     ClaudeSDKConfigurationConflict,
@@ -19,7 +20,9 @@ from claude_sdk_client import (
     ClaudeSDKSupervisorManager,
     ClaudeSDKUnavailable,
     claude_background_tracking_hooks,
+    claude_nondurable_scheduler_reason,
     claude_untracked_background_reason,
+    reject_nondurable_scheduler_hook,
     reject_untracked_background_hook,
 )
 
@@ -2192,7 +2195,55 @@ class ClaudeSDKBackgroundTrackingHookTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(output["permissionDecision"], "deny")
         self.assertIn("run_in_background", output["permissionDecisionReason"])
 
-    async def test_hook_allows_normal_bash_and_policy_is_bash_scoped(self) -> None:
+    def test_scheduler_policy_matches_only_exact_nondurable_tool_names(self) -> None:
+        self.assertEqual(
+            CLAUDE_NON_DURABLE_SCHEDULER_TOOLS,
+            ("CronCreate", "Monitor", "ScheduleWakeup"),
+        )
+        for tool_name in CLAUDE_NON_DURABLE_SCHEDULER_TOOLS:
+            with self.subTest(tool_name=tool_name):
+                reason = claude_nondurable_scheduler_reason(tool_name)
+                self.assertIsNotNone(reason)
+                self.assertIn(tool_name, str(reason))
+                self.assertIn("AgentsDock Jobs CLI", str(reason))
+                self.assertIn("explicitly requested", str(reason))
+        for tool_name in (
+            "CronList",
+            "CronDelete",
+            "MonitorStatus",
+            "monitor",
+            "ScheduleWakeup ",
+            "/loop",
+            "",
+            None,
+        ):
+            with self.subTest(tool_name=tool_name):
+                self.assertIsNone(claude_nondurable_scheduler_reason(tool_name))
+
+    async def test_scheduler_hook_denies_exact_tools_and_allows_near_matches(self) -> None:
+        for tool_name in CLAUDE_NON_DURABLE_SCHEDULER_TOOLS:
+            with self.subTest(tool_name=tool_name):
+                result = await reject_nondurable_scheduler_hook(
+                    {"tool_name": tool_name, "tool_input": {}},
+                    "tool-1",
+                    {"signal": None},
+                )
+                output = result["hookSpecificOutput"]
+                self.assertEqual(output["hookEventName"], "PreToolUse")
+                self.assertEqual(output["permissionDecision"], "deny")
+                self.assertIn("provider-authority block", output["permissionDecisionReason"])
+        for tool_name in ("CronList", "CronDelete", "MonitorStatus", "monitor"):
+            with self.subTest(tool_name=tool_name):
+                self.assertEqual(
+                    await reject_nondurable_scheduler_hook(
+                        {"tool_name": tool_name, "tool_input": {}},
+                        "tool-1",
+                        {"signal": None},
+                    ),
+                    {},
+                )
+
+    async def test_hook_allows_normal_bash_and_policy_has_exact_matchers(self) -> None:
         self.assertEqual(
             await reject_untracked_background_hook(
                 {"tool_name": "Bash", "tool_input": {"command": "pwd"}},
@@ -2203,10 +2254,17 @@ class ClaudeSDKBackgroundTrackingHookTests(unittest.IsolatedAsyncioTestCase):
         )
         hooks = claude_background_tracking_hooks()
         self.assertEqual(set(hooks), {"PreToolUse"})
-        matcher = hooks["PreToolUse"][0]
-        self.assertEqual(matcher.matcher, "Bash")
-        self.assertEqual(matcher.timeout, 5.0)
-        self.assertEqual(matcher.hooks, [reject_untracked_background_hook])
+        matchers = hooks["PreToolUse"]
+        self.assertEqual(
+            [matcher.matcher for matcher in matchers],
+            ["Bash", *CLAUDE_NON_DURABLE_SCHEDULER_TOOLS],
+        )
+        self.assertTrue(all(matcher.timeout == 5.0 for matcher in matchers))
+        self.assertEqual(matchers[0].hooks, [reject_untracked_background_hook])
+        self.assertTrue(all(
+            matcher.hooks == [reject_nondurable_scheduler_hook]
+            for matcher in matchers[1:]
+        ))
 
 
 if __name__ == "__main__":

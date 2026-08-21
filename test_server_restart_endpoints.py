@@ -660,7 +660,11 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
         capability_builder = MagicMock(return_value=capability)
         with patch.object(agent_server, "SERVER_INSTANCE_ID", SERVER_INSTANCE_ID), \
              patch.object(agent_server, "server_restart_capability", capability_builder), \
-             patch.object(agent_server, "working_tmux_bin", return_value=None):
+             patch.object(
+                 agent_server,
+                 "server_restart_tmux_cgroup_state",
+                 return_value=tmux_restart_state(),
+             ):
             health = await agent_server.health()
 
         self.assertEqual(health["server_instance_id"], SERVER_INSTANCE_ID)

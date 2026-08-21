@@ -40,12 +40,16 @@ TEAM_HUB_TRANSPORT_OVERRIDE=""
 TEAM_HUB_TRANSPORT="loopback"
 TEAM_HUB_URL_OVERRIDE=""
 TEAM_HUB_URL=""
+TEAM_HUB_DIRECT_IP_URL_OVERRIDE=""
+TEAM_HUB_DIRECT_IP_URL=""
 EXPECTED_SERVER_IDENTITY=""
 EXPECTED_TEAM_HUB_ID=""
 EXPECTED_TEAM_HUB_TRANSPORT=""
 EXPECTED_TEAM_HUB_TRANSPORT_SET="false"
 EXPECTED_TEAM_HUB_URL=""
 EXPECTED_TEAM_HUB_URL_SET="false"
+EXPECTED_TEAM_HUB_DIRECT_IP_URL=""
+EXPECTED_TEAM_HUB_DIRECT_IP_URL_SET="false"
 TEAM_HUB_SNAPSHOT=""
 TEAM_HUB_DATA_DIR=""
 TEAM_HUB_OPERATION_ID=""
@@ -69,7 +73,7 @@ DOT_MARK="${COLOR_YELLOW}○${COLOR_RESET}"
 
 usage() {
   cat <<'USAGE'
-Usage: ./install.sh [--port PORT] [--bind ADDRESS] [--release-version VERSION] [--team-hub-host|--no-team-hub-host] [--team-hub-tailscale-serve-url URL] [--non-interactive] [--allow-port-fallback|--no-port-fallback]
+Usage: ./install.sh [--port PORT] [--bind ADDRESS] [--release-version VERSION] [--team-hub-host|--no-team-hub-host] [--team-hub-tailscale-serve-url URL] [--team-hub-direct-ip-url URL] [--non-interactive] [--allow-port-fallback|--no-port-fallback]
 
 Installs or updates AgentsServer for the current user. Releases and Python
 runtimes are versioned, the previous healthy release is retained for rollback,
@@ -94,6 +98,9 @@ to host-local access. For remote private-tailnet access, also pass the exact
 Tailscale Serve URL ending in /api/team-hub.
 --team-hub-tailscale-serve-url selects private Tailscale Serve HTTPS transport
 for this host. It implies --team-hub-host and rejects Funnel-capable ports.
+--team-hub-direct-ip-url adds an advanced, unencrypted raw IPv4 route on the
+same AgentsServer origin. It implies --team-hub-host. IP shape is not identity
+or Tailscale attestation; credentials and messages are plaintext on this route.
 --no-team-hub-host stops Team Hub hosting while preserving its state. This beta
 does not support direct reactivation of preserved Hub state; recovery requires
 a signed managed operation. Without either option, an existing host/disabled
@@ -136,6 +143,19 @@ while (($#)); do
       TEAM_HUB_MODE_OVERRIDE="host"
       shift 2
       ;;
+    --team-hub-direct-ip-url)
+      if [[ "$TEAM_HUB_MODE_OVERRIDE" == "disabled" ]]; then
+        echo "--team-hub-direct-ip-url and --no-team-hub-host cannot be combined." >&2
+        exit 2
+      fi
+      if (($# < 2)) || [[ -z "${2:-}" || "${2:-}" == --* ]]; then
+        echo "--team-hub-direct-ip-url requires a URL." >&2
+        exit 2
+      fi
+      TEAM_HUB_DIRECT_IP_URL_OVERRIDE="${2:-}"
+      TEAM_HUB_MODE_OVERRIDE="host"
+      shift 2
+      ;;
     --no-team-hub-host)
       if [[ "$TEAM_HUB_MODE_OVERRIDE" == "host" ]]; then
         echo "--team-hub-host and --no-team-hub-host cannot be combined." >&2
@@ -164,6 +184,15 @@ while (($#)); do
       fi
       EXPECTED_TEAM_HUB_URL="${2:-}"
       EXPECTED_TEAM_HUB_URL_SET="true"
+      shift 2
+      ;;
+    --expected-team-hub-direct-ip-url)
+      if (($# < 2)); then
+        echo "--expected-team-hub-direct-ip-url requires a value (empty when absent)." >&2
+        exit 2
+      fi
+      EXPECTED_TEAM_HUB_DIRECT_IP_URL="${2:-}"
+      EXPECTED_TEAM_HUB_DIRECT_IP_URL_SET="true"
       shift 2
       ;;
     --team-hub-snapshot) TEAM_HUB_SNAPSHOT="${2:-}"; shift 2 ;;
@@ -213,12 +242,19 @@ if [[ -n "$EXPECTED_TEAM_HUB_ID" ]]; then
     echo "Managed Team Hub transport and URL assertions must be supplied together." >&2
     exit 2
   fi
+  if [[ "$EXPECTED_TEAM_HUB_DIRECT_IP_URL_SET" != "true" ]]; then
+    # Runners predating the Direct IP route contract could only have accepted
+    # a route set without Direct IP. Preserve that exact absence rather than
+    # adopting a previously ignored environment value during the update.
+    EXPECTED_TEAM_HUB_DIRECT_IP_URL=""
+    EXPECTED_TEAM_HUB_DIRECT_IP_URL_SET="true"
+  fi
 fi
-if [[ "$EXPECTED_TEAM_HUB_TRANSPORT_SET" == "true" && "$EXPECTED_TEAM_HUB_TRANSPORT" != "loopback" && "$EXPECTED_TEAM_HUB_TRANSPORT" != "tailscale_serve" ]]; then
+if [[ "$EXPECTED_TEAM_HUB_TRANSPORT_SET" == "true" && "$EXPECTED_TEAM_HUB_TRANSPORT" != "loopback" && "$EXPECTED_TEAM_HUB_TRANSPORT" != "tailscale_serve" && "$EXPECTED_TEAM_HUB_TRANSPORT" != "direct_ip" ]]; then
   echo "Expected Team Hub transport is invalid." >&2
   exit 2
 fi
-if [[ -n "$EXPECTED_TEAM_HUB_ID" || "$EXPECTED_TEAM_HUB_TRANSPORT_SET" == "true" || "$EXPECTED_TEAM_HUB_URL_SET" == "true" || -n "$TEAM_HUB_SNAPSHOT" || -n "$TEAM_HUB_DATA_DIR" || -n "$TEAM_HUB_OPERATION_ID" ]]; then
+if [[ -n "$EXPECTED_TEAM_HUB_ID" || "$EXPECTED_TEAM_HUB_TRANSPORT_SET" == "true" || "$EXPECTED_TEAM_HUB_URL_SET" == "true" || "$EXPECTED_TEAM_HUB_DIRECT_IP_URL_SET" == "true" || -n "$TEAM_HUB_SNAPSHOT" || -n "$TEAM_HUB_DATA_DIR" || -n "$TEAM_HUB_OPERATION_ID" ]]; then
   if [[ -z "$EXPECTED_SERVER_IDENTITY" || -z "$EXPECTED_TEAM_HUB_ID" || "$EXPECTED_TEAM_HUB_TRANSPORT_SET" != "true" || "$EXPECTED_TEAM_HUB_URL_SET" != "true" || -z "$TEAM_HUB_SNAPSHOT" || -z "$TEAM_HUB_DATA_DIR" || -z "$TEAM_HUB_OPERATION_ID" ]]; then
     echo "Managed Team Hub rollback arguments must be supplied together with the expected server identity." >&2
     exit 2
@@ -465,6 +501,15 @@ read_persisted_team_hub_config() {
   else
     RESOLVED_TEAM_HUB_URL="${AGENTSDOCK_TEAM_HUB_URL:-}"
   fi
+
+  RESOLVED_TEAM_HUB_DIRECT_IP_URL=""
+  if env_file_has_key "$ENV_FILE" AGENTSDOCK_TEAM_HUB_DIRECT_IP_URL; then
+    RESOLVED_TEAM_HUB_DIRECT_IP_URL="$(read_env_value "$ENV_FILE" AGENTSDOCK_TEAM_HUB_DIRECT_IP_URL)"
+  elif env_file_has_key "$LEGACY_ENV_FILE" AGENTSDOCK_TEAM_HUB_DIRECT_IP_URL; then
+    RESOLVED_TEAM_HUB_DIRECT_IP_URL="$(read_env_value "$LEGACY_ENV_FILE" AGENTSDOCK_TEAM_HUB_DIRECT_IP_URL)"
+  else
+    RESOLVED_TEAM_HUB_DIRECT_IP_URL="${AGENTSDOCK_TEAM_HUB_DIRECT_IP_URL:-}"
+  fi
 }
 
 canonical_team_hub_tailnet_hostname() {
@@ -482,6 +527,22 @@ canonical_team_hub_tailnet_hostname() {
       return 1
     fi
   done
+}
+
+canonical_team_hub_direct_ipv4_url() {
+  local value="$1"
+  local expected_port="$2"
+  local octet=""
+  local -a octets=()
+  [[ "$value" =~ ^http://([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}):([0-9]{1,5})/api/team-hub$ ]] || return 1
+  [[ "${BASH_REMATCH[2]}" == "$expected_port" ]] || return 1
+  IFS='.' read -r -a octets <<< "${BASH_REMATCH[1]}"
+  ((${#octets[@]} == 4)) || return 1
+  for octet in "${octets[@]}"; do
+    [[ "$octet" =~ ^0$|^[1-9][0-9]{0,2}$ ]] || return 1
+    ((10#$octet <= 255)) || return 1
+  done
+  ((10#${octets[0]} != 0 && 10#${octets[0]} != 127 && 10#${octets[0]} < 224)) || return 1
 }
 
 LEGACY_ENV_FILE=""
@@ -572,11 +633,13 @@ fi
 EXISTING_TEAM_HUB_TRANSPORT="$RESOLVED_TEAM_HUB_TRANSPORT"
 EXISTING_TEAM_HUB_TRANSPORT_SET="$RESOLVED_TEAM_HUB_TRANSPORT_SET"
 EXISTING_TEAM_HUB_URL="$RESOLVED_TEAM_HUB_URL"
+EXISTING_TEAM_HUB_DIRECT_IP_URL="$RESOLVED_TEAM_HUB_DIRECT_IP_URL"
 PREVIOUS_TEAM_HUB_TRANSPORT="loopback"
 if [[ "$EXISTING_TEAM_HUB_TRANSPORT_SET" == "true" ]]; then
   PREVIOUS_TEAM_HUB_TRANSPORT="$EXISTING_TEAM_HUB_TRANSPORT"
 fi
 PREVIOUS_TEAM_HUB_URL="$EXISTING_TEAM_HUB_URL"
+PREVIOUS_TEAM_HUB_DIRECT_IP_URL="$EXISTING_TEAM_HUB_DIRECT_IP_URL"
 if [[ "$TEAM_HUB_MODE" == "disabled" ]]; then
   TEAM_HUB_TRANSPORT="loopback"
   TEAM_HUB_URL=""
@@ -589,6 +652,14 @@ else
     TEAM_HUB_TRANSPORT="loopback"
   fi
   TEAM_HUB_URL="${TEAM_HUB_URL_OVERRIDE:-$EXISTING_TEAM_HUB_URL}"
+  TEAM_HUB_DIRECT_IP_URL="${TEAM_HUB_DIRECT_IP_URL_OVERRIDE:-$EXISTING_TEAM_HUB_DIRECT_IP_URL}"
+  if [[ -n "$TEAM_HUB_DIRECT_IP_URL_OVERRIDE" && -z "$TEAM_HUB_TRANSPORT_OVERRIDE" ]] && {
+    [[ "$EXISTING_TEAM_HUB_TRANSPORT_SET" != "true" ]] \
+      || [[ "$EXISTING_TEAM_HUB_MODE" != "host" ]]
+  }; then
+    TEAM_HUB_TRANSPORT="direct_ip"
+    TEAM_HUB_URL="$TEAM_HUB_DIRECT_IP_URL"
+  fi
 fi
 case "$TEAM_HUB_TRANSPORT" in
   loopback)
@@ -627,11 +698,25 @@ case "$TEAM_HUB_TRANSPORT" in
       exit 2
     fi
     ;;
+  direct_ip)
+    if [[ "$TEAM_HUB_MODE" != "host" || -z "$TEAM_HUB_URL" || "$TEAM_HUB_URL" != "$TEAM_HUB_DIRECT_IP_URL" ]]; then
+      echo "Direct-IP Team Hub transport requires the exact configured direct-IP URL in host mode." >&2
+      exit 2
+    fi
+    ;;
   *)
-    echo "AGENTSDOCK_TEAM_HUB_TRANSPORT must be loopback or tailscale_serve." >&2
+    echo "AGENTSDOCK_TEAM_HUB_TRANSPORT must be loopback, tailscale_serve, or direct_ip." >&2
     exit 2
     ;;
 esac
+if [[ -n "$TEAM_HUB_DIRECT_IP_URL" ]] && ! canonical_team_hub_direct_ipv4_url "$TEAM_HUB_DIRECT_IP_URL" "$PORT"; then
+  echo "Team Hub Direct IP URL must be exact http://<literal-ip>:$PORT/api/team-hub on the AgentsServer port." >&2
+  exit 2
+fi
+if [[ "$EXPECTED_TEAM_HUB_DIRECT_IP_URL_SET" == "true" ]] && [[ "$TEAM_HUB_DIRECT_IP_URL" != "$EXPECTED_TEAM_HUB_DIRECT_IP_URL" ]]; then
+  echo "Managed Team Hub Direct IP route changed after update acceptance." >&2
+  exit 2
+fi
 if [[ -n "$EXPECTED_TEAM_HUB_ID" ]] && {
   [[ "$TEAM_HUB_TRANSPORT" != "$EXPECTED_TEAM_HUB_TRANSPORT" ]] \
     || [[ "$TEAM_HUB_URL" != "$EXPECTED_TEAM_HUB_URL" ]]
@@ -644,6 +729,10 @@ if [[ "$EXISTING_TEAM_HUB_MODE" == "host" && "$TEAM_HUB_MODE" == "host" ]] && {
     || [[ "$PREVIOUS_TEAM_HUB_URL" != "$TEAM_HUB_URL" ]]
 }; then
   echo "Changing an existing Team Hub origin is not supported by this beta." >&2
+  exit 2
+fi
+if [[ "$EXISTING_TEAM_HUB_MODE" == "host" && "$TEAM_HUB_MODE" == "host" && "$PREVIOUS_TEAM_HUB_DIRECT_IP_URL" != "$TEAM_HUB_DIRECT_IP_URL" ]]; then
+  echo "Changing an existing Team Hub Direct IP origin is not supported by this beta." >&2
   exit 2
 fi
 if [[ -n "$EXPECTED_TEAM_HUB_ID" && "$TEAM_HUB_MODE" != "host" ]]; then
@@ -750,7 +839,8 @@ assert_team_hub_config_unchanged() {
   if [[ "$RESOLVED_TEAM_HUB_MODE" != "$EXISTING_TEAM_HUB_MODE" \
     || "$RESOLVED_TEAM_HUB_TRANSPORT_SET" != "$EXISTING_TEAM_HUB_TRANSPORT_SET" \
     || "$RESOLVED_TEAM_HUB_TRANSPORT" != "$EXISTING_TEAM_HUB_TRANSPORT" \
-    || "$RESOLVED_TEAM_HUB_URL" != "$EXISTING_TEAM_HUB_URL" ]]; then
+    || "$RESOLVED_TEAM_HUB_URL" != "$EXISTING_TEAM_HUB_URL" \
+    || "$RESOLVED_TEAM_HUB_DIRECT_IP_URL" != "$EXISTING_TEAM_HUB_DIRECT_IP_URL" ]]; then
     echo "Team Hub configuration changed while the installer was preparing." >&2
     return 1
   fi
@@ -1405,7 +1495,7 @@ PRESERVE_SOURCE=""
 write_runtime_env() {
   local env_temp="$CONFIG_ROOT/.env.$$"
   if [[ -n "$PRESERVE_SOURCE" ]]; then
-    grep -Ev '^(AGENTSDOCK_(STATE_DIR|AGENT_CWD|AGENT_BIND|AGENT_PORT|AGENT_TOKEN|TEAM_HUB_MODE|TEAM_HUB_TRANSPORT|TEAM_HUB_URL)|AGENTS_SERVER_(STATE_DIR|INSTALL_DIR)|ZENITHBOT_AGENT_(DIR|CWD|BIND|PORT|TOKEN)|ZENITHDOCK_AGENT_TOKEN|PATH)=' \
+    grep -Ev '^(AGENTSDOCK_(STATE_DIR|AGENT_CWD|AGENT_BIND|AGENT_PORT|AGENT_TOKEN|TEAM_HUB_MODE|TEAM_HUB_TRANSPORT|TEAM_HUB_URL|TEAM_HUB_DIRECT_IP_URL)|AGENTS_SERVER_(STATE_DIR|INSTALL_DIR)|ZENITHBOT_AGENT_(DIR|CWD|BIND|PORT|TOKEN)|ZENITHDOCK_AGENT_TOKEN|PATH)=' \
       "$PRESERVE_SOURCE" > "$env_temp" || true
   else
     : > "$env_temp"
@@ -1419,6 +1509,7 @@ AGENTSDOCK_AGENT_TOKEN=$TOKEN
 AGENTSDOCK_TEAM_HUB_MODE=$TEAM_HUB_MODE
 AGENTSDOCK_TEAM_HUB_TRANSPORT=$TEAM_HUB_TRANSPORT
 AGENTSDOCK_TEAM_HUB_URL=$TEAM_HUB_URL
+AGENTSDOCK_TEAM_HUB_DIRECT_IP_URL=$TEAM_HUB_DIRECT_IP_URL
 AGENTS_SERVER_INSTALL_DIR=$INSTALL_ROOT
 PATH=$SERVER_PATH
 EOF
@@ -1660,6 +1751,7 @@ EOF
     <key>AGENTSDOCK_TEAM_HUB_MODE</key><string>$TEAM_HUB_MODE</string>
     <key>AGENTSDOCK_TEAM_HUB_TRANSPORT</key><string>$TEAM_HUB_TRANSPORT</string>
     <key>AGENTSDOCK_TEAM_HUB_URL</key><string>$TEAM_HUB_URL</string>
+    <key>AGENTSDOCK_TEAM_HUB_DIRECT_IP_URL</key><string>$TEAM_HUB_DIRECT_IP_URL</string>
     <key>AGENTS_SERVER_INSTALL_DIR</key><string>$INSTALL_ROOT</string>
     <key>PATH</key><string>$SERVER_PATH</string>
   </dict>
@@ -1745,6 +1837,7 @@ release_health_check_once() {
     "$expected_hub" \
     "$expected_hub_transport" \
     "$expected_hub_url" \
+    "$TEAM_HUB_DIRECT_IP_URL" \
     "$allow_legacy_transport" <<'PY'
 import json
 import re
@@ -1758,6 +1851,7 @@ import sys
     expected_hub,
     expected_transport,
     expected_hub_url,
+    expected_direct_ip_url,
     allow_legacy_transport,
 ) = sys.argv[1:]
 try:
@@ -1804,6 +1898,19 @@ if hub_mode == "host":
         transport = "loopback"
     if transport != expected_transport or hub_url != (expected_hub_url or None):
         raise SystemExit(1)
+    routes = capability.get("routes")
+    expected_routes = [{
+        "transport": expected_transport,
+        "hub_url": expected_hub_url or None,
+    }]
+    if expected_direct_ip_url and expected_transport != "direct_ip":
+        expected_routes.append({
+            "transport": "direct_ip",
+            "hub_url": expected_direct_ip_url,
+        })
+    if routes != expected_routes:
+        if not (allow_legacy_transport == "true" and routes is None):
+            raise SystemExit(1)
 elif hub_mode == "disabled":
     required = {
         "available": False,
@@ -2094,6 +2201,10 @@ if [[ "$TEAM_HUB_MODE" == "host" ]]; then
     echo "  ${COLOR_BOLD}Teamspace host${COLOR_RESET} $TEAM_HUB_URL"
     echo "  $CHECK_MARK server bound to the expected private Tailscale Serve URL"
     echo "  $DOT_MARK verify the separately managed Serve listener with: tailscale serve status --json"
+  fi
+  if [[ -n "$TEAM_HUB_DIRECT_IP_URL" ]]; then
+    echo "  ${COLOR_BOLD}Teamspace Direct IP (unencrypted, advanced)${COLOR_RESET} $TEAM_HUB_DIRECT_IP_URL"
+    echo "  $CROSS_MARK plaintext route: IP address is routing only, not identity or Tailscale attestation"
   fi
   echo "  ${COLOR_BOLD}Team Hub host operator commands${COLOR_RESET}"
   printf '  Bootstrap proof: PYTHONPATH='

@@ -15,6 +15,7 @@ from team_hub_host import (
     TEAM_HUB_MODE_DISABLED,
     TEAM_HUB_MODE_HOST,
     TEAM_HUB_TRANSPORT_TAILSCALE_SERVE,
+    TEAM_HUB_TRANSPORT_DIRECT_IP,
     ManagedTeamHubHost,
     configured_team_hub_endpoint,
 )
@@ -24,6 +25,8 @@ from agentsdock_team_hub.store import HubStore
 HOST_ID = "server-managed-host-12345678"
 TAILNET_HOST = "sonic.example.ts.net"
 TAILNET_HUB_URL = f"https://{TAILNET_HOST}:8444/api/team-hub"
+DIRECT_IP = "100.73.184.23"
+DIRECT_HUB_URL = f"http://{DIRECT_IP}:7850/api/team-hub"
 TAILNET_HEADERS = {
     "X-Forwarded-Host": f"{TAILNET_HOST}:8444",
     "X-Forwarded-Proto": "https",
@@ -54,7 +57,58 @@ def tailnet_host(root: Path, instance_id: str) -> ManagedTeamHubHost:
     )
 
 
+def direct_ip_host(root: Path, instance_id: str) -> ManagedTeamHubHost:
+    return ManagedTeamHubHost(
+        mode=TEAM_HUB_MODE_HOST,
+        data_dir=root,
+        server_identity=HOST_ID,
+        server_instance_id=instance_id,
+        allowed_hosts={"localhost", "127.0.0.1", DIRECT_IP},
+        transport=TEAM_HUB_TRANSPORT_DIRECT_IP,
+        hub_url=DIRECT_HUB_URL,
+    )
+
+
 class ManagedTeamHubHostTests(unittest.IsolatedAsyncioTestCase):
+    async def test_direct_ip_endpoint_requires_explicit_exact_plaintext_route(self) -> None:
+        self.assertEqual(
+            configured_team_hub_endpoint(
+                TEAM_HUB_MODE_HOST,
+                DIRECT_HUB_URL,
+                TEAM_HUB_TRANSPORT_DIRECT_IP,
+                7850,
+            ),
+            ("direct_ip", DIRECT_HUB_URL, DIRECT_IP, None),
+        )
+        for invalid in (
+            "http://sonic.local:7850/api/team-hub",
+            "https://100.73.184.23:7850/api/team-hub",
+            "http://100.73.184.23:7851/api/team-hub",
+            "http://127.0.0.1:7850/api/team-hub",
+            "http://100.73.184.023:7850/api/team-hub",
+            "http://user:secret@100.73.184.23:7850/api/team-hub",
+            "http://100.73.184.23:7850/api/team-hub/",
+            "http://100.73.184.23:7850/api/team-hub?token=secret",
+        ):
+            transport, hub_url, host_name, error = configured_team_hub_endpoint(
+                TEAM_HUB_MODE_HOST,
+                invalid,
+                TEAM_HUB_TRANSPORT_DIRECT_IP,
+                7850,
+            )
+            self.assertIsNone(transport, invalid)
+            self.assertIsNone(hub_url, invalid)
+            self.assertIsNone(host_name, invalid)
+            self.assertIsNotNone(error, invalid)
+        self.assertIsNotNone(
+            configured_team_hub_endpoint(
+                TEAM_HUB_MODE_HOST,
+                DIRECT_HUB_URL,
+                None,
+                7850,
+            )[3]
+        )
+
     async def test_tailnet_endpoint_configuration_is_exact_and_fail_closed(self) -> None:
         self.assertEqual(
             configured_team_hub_endpoint(TEAM_HUB_MODE_HOST, TAILNET_HUB_URL),
@@ -82,6 +136,34 @@ class ManagedTeamHubHostTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(hub_url, invalid)
             self.assertIsNone(host_name, invalid)
             self.assertIsNotNone(error, invalid)
+
+    async def test_capability_advertises_primary_then_secondary_route_deterministically(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = ManagedTeamHubHost(
+                mode=TEAM_HUB_MODE_HOST,
+                data_dir=Path(temporary) / "hub",
+                server_identity=HOST_ID,
+                allowed_hosts={"localhost", TAILNET_HOST, DIRECT_IP},
+                transport=TEAM_HUB_TRANSPORT_TAILSCALE_SERVE,
+                hub_url=TAILNET_HUB_URL,
+                routes={
+                    TEAM_HUB_TRANSPORT_DIRECT_IP: DIRECT_HUB_URL,
+                    TEAM_HUB_TRANSPORT_TAILSCALE_SERVE: TAILNET_HUB_URL,
+                },
+            )
+            self.assertEqual(
+                runtime.capability()["routes"],
+                [
+                    {
+                        "transport": TEAM_HUB_TRANSPORT_TAILSCALE_SERVE,
+                        "hub_url": TAILNET_HUB_URL,
+                    },
+                    {
+                        "transport": TEAM_HUB_TRANSPORT_DIRECT_IP,
+                        "hub_url": DIRECT_HUB_URL,
+                    },
+                ],
+            )
 
     async def test_disabled_host_creates_no_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -295,6 +377,54 @@ class ManagedTeamHubHostTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(duplicate_xfh.status_code, 403)
             await runtime.shutdown()
 
+    async def test_direct_ip_transport_is_exact_unproxied_and_not_range_attestation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = direct_ip_host(Path(temporary) / "hub", "server-instance-direct")
+            runtime.initialize()
+            application = FastAPI()
+            application.mount("/api/team-hub", runtime)
+            remote = TestClient(
+                application,
+                base_url=f"http://{DIRECT_IP}:7850",
+                client=("192.0.2.44", 41000),
+            )
+            health = remote.get("/api/team-hub/v1/health")
+            self.assertEqual(health.status_code, 200, health.text)
+            for headers in (
+                {"Cookie": "ambient=session"},
+                {"Origin": f"http://{DIRECT_IP}:7850"},
+                {"Forwarded": "for=192.0.2.44"},
+                {"X-Forwarded-For": "192.0.2.44"},
+                {"X-Forwarded-Host": f"{DIRECT_IP}:7850"},
+                {"Tailscale-Funnel-Request": "?1"},
+            ):
+                self.assertEqual(
+                    remote.get("/api/team-hub/v1/health", headers=headers).status_code,
+                    403,
+                    headers,
+                )
+            wrong_host = TestClient(
+                application,
+                base_url="http://192.168.1.8:7850",
+                client=("192.0.2.44", 41001),
+            )
+            self.assertEqual(
+                wrong_host.get("/api/team-hub/v1/health").status_code,
+                400,
+            )
+            forged_from_loopback = TestClient(
+                application,
+                base_url=f"http://{DIRECT_IP}:7850",
+                client=("127.0.0.1", 41002),
+            )
+            self.assertEqual(
+                forged_from_loopback.get("/api/team-hub/v1/health").status_code,
+                403,
+            )
+            self.assertEqual(runtime.capability()["transport"], "direct_ip")
+            self.assertIn("unencrypted", runtime.capability()["message"])
+            await runtime.shutdown()
+
     async def test_tailnet_rate_limits_aggregate_by_login_not_proxy_socket(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             runtime = tailnet_host(Path(temporary) / "hub", "server-instance-limits")
@@ -402,6 +532,46 @@ class ManagedTeamHubHostTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(stale.status_code, 403, stale.text)
             self.assertTrue((root / "bootstrap-owner.proof").is_file())
             await second.shutdown()
+
+    async def test_direct_ip_remote_bootstrap_is_bound_to_direct_route(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "hub"
+            runtime = direct_ip_host(root, "server-instance-direct-bootstrap")
+            runtime.initialize()
+            request_id = "f7cc034a-5df7-4d30-a69f-9022616d05ad"
+            grant = await runtime.issue_tailnet_bootstrap_proof(
+                request_id=request_id,
+                server_identity=HOST_ID,
+                server_instance_id="server-instance-direct-bootstrap",
+                hub_url=DIRECT_HUB_URL,
+                tailnet_login="owner@example.com",
+                recipient_email="owner@example.com",
+                display_name="Owner",
+                device_label="Owner Mac",
+                transport=TEAM_HUB_TRANSPORT_DIRECT_IP,
+            )
+            application = FastAPI()
+            application.mount("/api/team-hub", runtime)
+            direct = TestClient(
+                application,
+                base_url=f"http://{DIRECT_IP}:7850",
+                client=("192.0.2.45", 41000),
+            )
+            redeemed = direct.post(
+                "/api/team-hub/v1/bootstrap/redeem",
+                headers={
+                    "X-Team-Hub-Bootstrap-Proof": grant["bootstrap_proof"],
+                    "X-Team-Hub-Bootstrap-Request-Id": request_id,
+                },
+                json={
+                    "email": "owner@example.com",
+                    "display_name": "Owner",
+                    "device_label": "Owner Mac",
+                },
+            )
+            self.assertEqual(redeemed.status_code, 200, redeemed.text)
+            self.assertIn("access_token", redeemed.json())
+            await runtime.shutdown()
 
     async def test_remote_bootstrap_issuance_is_rate_limited_per_tailnet_login(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -614,8 +784,8 @@ class VendoredTeamHubParityTests(unittest.TestCase):
             "migrations/0005_tailnet_bootstrap_delegations.sql": "e47d25ea16353d023355cf875d008808cd3742cd038569abfb9607556cdbd09b",
             "migrations/__init__.py": "aaf340c45c8d39c2939814977ba4cef8eb6b3bd0671b0f7542ebe06f5431d6ec",
             "security.py": "0c1895c7443e7be07a2f53c7e4c4228e3ee04c65d6cd36f039b7bbba1813e4fa",
-            "service.py": "6932497ce860c4abdbef63e97dd9bda85199e6a3d0c4b40d0ee67140608e6f20",
-            "store.py": "cf69accc82489ba2b8e916a946fd0d22019cd83cb35ad94df1e92f38ff8200a5",
+            "service.py": "3440ebd10d4bb5daad49e823cccc4468c665407b96bad7a38f8ed98dd23225f9",
+            "store.py": "3387963db1bfee4984e4fd262feba06ffbef3865186a6df6f7209f9aba9a9b4c",
         }
         entries = list(vendored.rglob("*"))
         for path in entries:

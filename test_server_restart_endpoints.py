@@ -22,6 +22,25 @@ SERVER_IDENTITY = "server-identity-test"
 SERVER_INSTANCE_ID = "a" * 32
 
 
+def tmux_restart_state(
+    *,
+    in_service_cgroup: bool = False,
+    cgroup_unknown: bool = False,
+    pid: int | None = None,
+    paths: tuple[str, ...] = (),
+    service_cgroup: str | None = None,
+    inspection: str = "not-running",
+) -> dict[str, object]:
+    return {
+        "tmux_server_in_service_cgroup": in_service_cgroup,
+        "tmux_server_cgroup_unknown": cgroup_unknown,
+        "_tmux_server_pid": pid,
+        "_tmux_server_cgroup_paths": paths,
+        "_server_service_cgroup": service_cgroup,
+        "_tmux_server_inspection": inspection,
+    }
+
+
 def http_request(
     method: str = "GET",
     path: str = "/api/admin/restart",
@@ -57,12 +76,28 @@ def restart_body(
     *,
     server_identity: str = SERVER_IDENTITY,
     server_instance_id: str = SERVER_INSTANCE_ID,
+    force: bool = False,
+    blocker_revision: str | None = None,
 ) -> agent_server.ServerRestartRequest:
+    fields = {
+        "request_id": request_id or uuid.uuid4(),
+        "expected_server_identity": server_identity,
+        "expected_server_instance_id": server_instance_id,
+        "confirmed": True,
+    }
+    if force:
+        fields.update({
+            "force": True,
+            "force_confirmed": True,
+            "expected_blocker_revision": (
+                blocker_revision
+                or agent_server.server_restart_blocker_snapshot_locked()[
+                    "revision"
+                ]
+            ),
+        })
     return agent_server.ServerRestartRequest(
-        request_id=request_id or uuid.uuid4(),
-        expected_server_identity=server_identity,
-        expected_server_instance_id=server_instance_id,
-        confirmed=True,
+        **fields,
     )
 
 
@@ -116,6 +151,11 @@ def restart_environment(root: Path):
         ))
         stack.enter_context(patch.object(
             agent_server,
+            "server_restart_tmux_cgroup_state",
+            return_value=tmux_restart_state(),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
             "UNSAFE_HTTP_MUTATIONS_IN_FLIGHT",
             0,
         ))
@@ -143,8 +183,46 @@ class ServerRestartStateTests(unittest.TestCase):
         self.assertNotIn("_source_instance_id", public)
         self.assertNotIn("raw_path", public)
         self.assertNotIn("pid", public)
+        self.assertFalse(public["forced"])
         self.assertEqual(public["server_identity"], SERVER_IDENTITY)
         self.assertEqual(public["server_instance_id"], SERVER_INSTANCE_ID)
+
+    def test_forced_public_audit_is_bounded_and_does_not_expose_private_fields(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with restart_environment(root):
+                private = agent_server.write_server_restart_status(
+                    phase="accepted",
+                    request_id=str(uuid.uuid4()),
+                    _source_instance_id=SERVER_INSTANCE_ID,
+                    _forced=True,
+                    _forced_work_snapshot={
+                        "active_count": 10_000_001,
+                        "restart_blocking_queued_count": -2,
+                        "provider_background_count": "invalid",
+                        "mutation_count": True,
+                        "deleting_session_count": 3,
+                        "codex_goals_reconfiguring": True,
+                        "tmux_server_in_service_cgroup": True,
+                        "tmux_server_cgroup_unknown": False,
+                    },
+                )
+                public = agent_server.public_server_restart_status(private)
+
+        self.assertTrue(public["forced"])
+        self.assertEqual(public["interrupted_work"], {
+            "codex_goals_reconfiguring": True,
+            "tmux_server_in_service_cgroup": True,
+            "tmux_server_cgroup_unknown": False,
+            "active_count": 1_000_000,
+            "restart_blocking_queued_count": 0,
+            "provider_background_count": 0,
+            "server_maintenance_count": 0,
+            "mutation_count": 0,
+            "deleting_session_count": 3,
+        })
+        self.assertNotIn("_forced", public)
+        self.assertNotIn("_forced_work_snapshot", public)
 
     def test_startup_reconciliation_completes_only_after_a_new_instance(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -228,6 +306,63 @@ class ServerRestartStateTests(unittest.TestCase):
         self.assertFalse(agent_server.managed_server_restart_blocks_work(status))
         self.assertNotIn("denied", status["message"])
 
+    def test_forced_signal_arms_hard_kill_watchdog_before_sigterm(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            request_id = str(uuid.uuid4())
+            watchdog = MagicMock()
+            with restart_environment(root), \
+                 patch.object(agent_server.time, "sleep"), \
+                 patch.object(agent_server.os, "getpid", return_value=321), \
+                 patch.object(agent_server.os, "kill") as kill, \
+                 patch.object(agent_server.threading, "Thread", return_value=watchdog) as thread:
+                agent_server.write_server_restart_status(
+                    phase="accepted",
+                    request_id=request_id,
+                    _source_instance_id=SERVER_INSTANCE_ID,
+                    _forced=True,
+                )
+                agent_server.signal_managed_server_restart(request_id)
+
+        thread.assert_called_once_with(
+            target=agent_server.force_kill_managed_server_after_deadline,
+            args=(request_id, 321),
+            daemon=True,
+            name="agents-server-force-restart",
+        )
+        watchdog.start.assert_called_once_with()
+        kill.assert_called_once_with(321, signal.SIGTERM)
+
+    def test_force_kill_watchdog_rechecks_request_instance_and_force_fences(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            request_id = str(uuid.uuid4())
+            with restart_environment(root), \
+                 patch.object(agent_server.time, "sleep"), \
+                 patch.object(agent_server.os, "kill") as kill:
+                agent_server.write_server_restart_status(
+                    phase="signaling",
+                    request_id=request_id,
+                    _source_instance_id=SERVER_INSTANCE_ID,
+                    _forced=True,
+                )
+                agent_server.force_kill_managed_server_after_deadline(
+                    request_id,
+                    321,
+                )
+                agent_server.write_server_restart_status(
+                    phase="signaling",
+                    request_id="different-request",
+                    _source_instance_id=SERVER_INSTANCE_ID,
+                    _forced=True,
+                )
+                agent_server.force_kill_managed_server_after_deadline(
+                    request_id,
+                    321,
+                )
+
+        kill.assert_called_once_with(321, signal.SIGKILL)
+
     def test_duplicate_signal_workers_claim_only_one_restart(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -288,6 +423,135 @@ class ServerRestartStateTests(unittest.TestCase):
 
 
 class ManagedServerProofTests(unittest.TestCase):
+    def test_restart_tmux_cgroup_probe_is_read_only_and_fail_closed(self):
+        service_cgroup = (
+            "/user.slice/user-1000.slice/user@1000.service/"
+            "app.slice/agents-server.service"
+        )
+        probe = subprocess.CompletedProcess(
+            ["tmux", "list-sessions"],
+            0,
+            stdout="4242\n",
+            stderr="",
+        )
+        with patch.object(agent_server.sys, "platform", "linux"), patch.object(
+            agent_server,
+            "agents_server_systemd_cgroup",
+            return_value=service_cgroup,
+        ), patch.object(
+            agent_server,
+            "run_tmux",
+            return_value=probe,
+        ) as run_tmux, patch.object(
+            agent_server,
+            "process_cgroup_paths",
+            return_value=(service_cgroup,),
+        ):
+            inside = agent_server.server_restart_tmux_cgroup_state()
+        self.assertTrue(inside["tmux_server_in_service_cgroup"])
+        self.assertFalse(inside["tmux_server_cgroup_unknown"])
+        self.assertEqual(inside["_tmux_server_pid"], 4242)
+        run_tmux.assert_called_once_with(
+            ["list-sessions", "-F", "#{pid}"],
+            check=False,
+        )
+
+        with patch.object(agent_server.sys, "platform", "linux"), patch.object(
+            agent_server,
+            "agents_server_systemd_cgroup",
+            return_value=service_cgroup,
+        ), patch.object(
+            agent_server,
+            "run_tmux",
+            return_value=probe,
+        ), patch.object(
+            agent_server,
+            "process_cgroup_paths",
+            return_value=(),
+        ):
+            unknown = agent_server.server_restart_tmux_cgroup_state()
+        self.assertFalse(unknown["tmux_server_in_service_cgroup"])
+        self.assertTrue(unknown["tmux_server_cgroup_unknown"])
+
+        with patch.object(agent_server.sys, "platform", "linux"), patch.object(
+            agent_server,
+            "agents_server_systemd_cgroup",
+            return_value=None,
+        ), patch.object(
+            agent_server,
+            "run_tmux",
+            return_value=probe,
+        ), patch.object(agent_server, "process_cgroup_paths") as daemon_paths:
+            server_unknown = agent_server.server_restart_tmux_cgroup_state()
+        self.assertFalse(server_unknown["tmux_server_in_service_cgroup"])
+        self.assertTrue(server_unknown["tmux_server_cgroup_unknown"])
+        self.assertEqual(
+            server_unknown["_tmux_server_inspection"],
+            "server-cgroup-unavailable",
+        )
+        daemon_paths.assert_not_called()
+
+        failed_probe = subprocess.CompletedProcess(
+            ["tmux", "list-sessions"],
+            1,
+            stdout="",
+            stderr="server lookup failed",
+        )
+        with patch.object(agent_server.sys, "platform", "linux"), patch.object(
+            agent_server,
+            "agents_server_systemd_cgroup",
+            return_value=service_cgroup,
+        ), patch.object(
+            agent_server,
+            "run_tmux",
+            return_value=failed_probe,
+        ), patch.object(
+            agent_server.Path,
+            "lstat",
+            return_value=MagicMock(st_mode=0),
+        ), patch.object(
+            agent_server.stat,
+            "S_ISSOCK",
+            return_value=True,
+        ):
+            lookup_failed = agent_server.server_restart_tmux_cgroup_state()
+        self.assertFalse(lookup_failed["tmux_server_in_service_cgroup"])
+        self.assertTrue(lookup_failed["tmux_server_cgroup_unknown"])
+        self.assertEqual(
+            lookup_failed["_tmux_server_inspection"],
+            "lookup-failed-with-socket",
+        )
+
+        with patch.object(agent_server.sys, "platform", "linux"), patch.object(
+            agent_server,
+            "agents_server_systemd_cgroup",
+        ) as absent_service, patch.object(
+            agent_server,
+            "run_tmux",
+            return_value=failed_probe,
+        ), patch.object(
+            agent_server.Path,
+            "lstat",
+            side_effect=FileNotFoundError,
+        ):
+            absent = agent_server.server_restart_tmux_cgroup_state()
+        self.assertFalse(absent["tmux_server_in_service_cgroup"])
+        self.assertFalse(absent["tmux_server_cgroup_unknown"])
+        absent_service.assert_not_called()
+
+        with patch.object(agent_server.sys, "platform", "darwin"), patch.object(
+            agent_server,
+            "agents_server_systemd_cgroup",
+        ) as unmanaged_cgroup, patch.object(
+            agent_server,
+            "run_tmux",
+        ) as unmanaged_probe:
+            unmanaged = agent_server.server_restart_tmux_cgroup_state()
+        self.assertFalse(unmanaged["tmux_server_in_service_cgroup"])
+        self.assertFalse(unmanaged["tmux_server_cgroup_unknown"])
+        unmanaged_cgroup.assert_not_called()
+        unmanaged_probe.assert_not_called()
+
     def test_linux_requires_current_release_tree_and_exact_service_cgroup(self):
         with tempfile.TemporaryDirectory() as temporary:
             install_root = Path(temporary)
@@ -377,7 +641,9 @@ class ManagedServerProofTests(unittest.TestCase):
              patch.object(agent_server, "managed_server_service_kind", return_value="launch-agent"):
             capability = agent_server.server_restart_capability()
         self.assertTrue(capability["available"])
-        self.assertEqual(capability["version"], 1)
+        self.assertEqual(capability["version"], 2)
+        self.assertTrue(capability["force_restart"])
+        self.assertTrue(capability["force_confirmation_required"])
 
 
 class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
@@ -385,18 +651,52 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
         capability = {
             "available": True,
             "required": False,
-            "version": 1,
+            "version": 2,
+            "force_restart": True,
+            "force_confirmation_required": True,
             "message": "available",
             "action": None,
         }
+        capability_builder = MagicMock(return_value=capability)
         with patch.object(agent_server, "SERVER_INSTANCE_ID", SERVER_INSTANCE_ID), \
-             patch.object(agent_server, "server_restart_capability", return_value=capability), \
+             patch.object(agent_server, "server_restart_capability", capability_builder), \
              patch.object(agent_server, "working_tmux_bin", return_value=None):
             health = await agent_server.health()
 
         self.assertEqual(health["server_instance_id"], SERVER_INSTANCE_ID)
         self.assertEqual(health["capabilities"]["server_restart"], capability)
         self.assertEqual(health["api_contract_version"], 13)
+        snapshot = capability_builder.call_args.args[0]
+        self.assertEqual(snapshot["version"], 2)
+        self.assertRegex(snapshot["revision"], r"^[0-9a-f]{64}$")
+        self.assertFalse(snapshot["has_blockers"])
+
+    async def test_authenticated_get_exposes_bounded_private_blocker_digest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with restart_environment(root), \
+                 patch.object(agent_server, "BUSY_SESSIONS", {"private-chat-id"}), \
+                 patch.object(
+                     agent_server,
+                     "active_provider_background_work_labels",
+                     return_value=["private provider label"],
+                 ):
+                first = await agent_server.server_restart_status_endpoint(
+                    http_request()
+                )
+                second = await agent_server.server_restart_status_endpoint(
+                    http_request()
+                )
+
+        snapshot = first["blocker_snapshot"]
+        self.assertEqual(snapshot["version"], 2)
+        self.assertEqual(snapshot["revision"], second["blocker_snapshot"]["revision"])
+        self.assertEqual(snapshot["active_count"], 1)
+        self.assertEqual(snapshot["provider_background_count"], 1)
+        self.assertTrue(snapshot["has_forceable_blockers"])
+        self.assertFalse(snapshot["has_safety_blockers"])
+        self.assertNotIn("private-chat-id", json.dumps(first))
+        self.assertNotIn("private provider label", json.dumps(first))
 
     async def test_restart_routes_require_configured_header_auth_not_query_auth(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -629,10 +929,7 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
                 )
                 replay_tasks = BackgroundTasks()
                 replay = await agent_server.restart_server_endpoint(
-                    restart_body(
-                        request_id,
-                        server_instance_id="old-instance-after-reconnect",
-                    ),
+                    restart_body(request_id),
                     http_request(method="POST"),
                     replay_tasks,
                 )
@@ -640,6 +937,38 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(replay, first)
         self.assertEqual(len(first_tasks.tasks), 1)
         self.assertEqual(len(replay_tasks.tasks), 1)
+
+    async def test_same_request_id_rejects_changed_target_or_force_confirmation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            request_id = uuid.uuid4()
+            with restart_environment(root):
+                await agent_server.restart_server_endpoint(
+                    restart_body(request_id),
+                    http_request(method="POST"),
+                    BackgroundTasks(),
+                )
+                changed_bodies = (
+                    restart_body(
+                        request_id,
+                        server_instance_id="changed-instance",
+                    ),
+                    restart_body(request_id, force=True),
+                )
+                for body in changed_bodies:
+                    with self.subTest(body=body), self.assertRaises(
+                        HTTPException
+                    ) as raised:
+                        await agent_server.restart_server_endpoint(
+                            body,
+                            http_request(method="POST"),
+                            BackgroundTasks(),
+                        )
+                    self.assertEqual(raised.exception.status_code, 409)
+                    self.assertEqual(
+                        raised.exception.detail["code"],
+                        "server_restart_request_changed",
+                    )
 
     async def test_remote_agent_helper_is_rejected_before_mutation_admission(self):
         called = False
@@ -745,49 +1074,60 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(raised.exception.detail["retry_after_seconds"], 0)
 
     async def test_expected_identity_and_instance_are_both_authoritative(self):
-        for body in (
-            restart_body(server_identity="different-server"),
-            restart_body(server_instance_id="different-instance"),
-        ):
-            with self.subTest(body=body), tempfile.TemporaryDirectory() as temporary:
+        for force in (False, True):
+            for body in (
+                restart_body(
+                    server_identity="different-server",
+                    force=force,
+                ),
+                restart_body(
+                    server_instance_id="different-instance",
+                    force=force,
+                ),
+            ):
+                with self.subTest(
+                    force=force,
+                    body=body,
+                ), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    with restart_environment(root):
+                        with self.assertRaises(HTTPException) as raised:
+                            await agent_server.restart_server_endpoint(
+                                body,
+                                http_request(method="POST"),
+                                BackgroundTasks(),
+                            )
+                    self.assertEqual(raised.exception.status_code, 409)
+                    self.assertEqual(
+                        raised.exception.detail["code"],
+                        "server_restart_target_changed",
+                    )
+
+    async def test_update_active_blocks_restart(self):
+        for force in (False, True):
+            with self.subTest(force=force), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 with restart_environment(root):
+                    agent_server.write_server_update_status(
+                        phase="installing",
+                        update_id="update-1",
+                    )
                     with self.assertRaises(HTTPException) as raised:
                         await agent_server.restart_server_endpoint(
-                            body,
+                            restart_body(force=force),
                             http_request(method="POST"),
                             BackgroundTasks(),
                         )
+
                 self.assertEqual(raised.exception.status_code, 409)
                 self.assertEqual(
                     raised.exception.detail["code"],
-                    "server_restart_target_changed",
+                    "server_update_in_progress",
                 )
 
-    async def test_update_active_blocks_restart(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            with restart_environment(root):
-                agent_server.write_server_update_status(
-                    phase="installing",
-                    update_id="update-1",
-                )
-                with self.assertRaises(HTTPException) as raised:
-                    await agent_server.restart_server_endpoint(
-                        restart_body(),
-                        http_request(method="POST"),
-                        BackgroundTasks(),
-                    )
-
-        self.assertEqual(raised.exception.status_code, 409)
-        self.assertEqual(raised.exception.detail["code"], "server_update_in_progress")
-
-    async def test_active_maintenance_queue_and_provider_work_are_blockers(self):
+    async def test_active_queue_and_provider_work_are_forceable_blockers(self):
         scenarios = (
             ({"BUSY_SESSIONS": {"chat"}}, "active_count"),
-            ({"SERVER_MAINTENANCE_SESSIONS": {"chat"}}, "active_count"),
-            ({"DELETING_SESSIONS": {"chat"}}, "deleting_session_count"),
-            ({"CODEX_GOALS_RECONFIGURING": True}, "codex_goals_reconfiguring"),
             ({
                 "QUEUED_TURNS": {
                     "chat": deque([{"queued_id": "unsafe", "_durable": False}])
@@ -824,6 +1164,358 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
                     )
         self.assertEqual(raised.exception.detail["provider_background_count"], 1)
         self.assertNotIn("private provider label", json.dumps(raised.exception.detail))
+
+    async def test_active_codex_label_is_not_double_counted_as_provider_background(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with restart_environment(root), \
+                 patch.object(agent_server, "BUSY_SESSIONS", {"chat"}), \
+                 patch.object(
+                     agent_server,
+                     "active_provider_background_work_labels",
+                     return_value=[
+                         "active chat chat",
+                         "private provider background",
+                     ],
+                 ):
+                snapshot = agent_server.server_restart_blocker_snapshot_locked()
+
+        self.assertEqual(snapshot["active_count"], 1)
+        self.assertEqual(snapshot["provider_background_count"], 1)
+
+    def test_blocker_revision_binds_same_session_run_and_prebind_reservation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with restart_environment(root):
+                agent_server.BUSY_SESSIONS.add("private-chat-id")
+                agent_server.CURRENT_TURNS["private-chat-id"] = {
+                    "run_id": "private-run-a",
+                    "_server_restart_admission_id": "private-admission-a",
+                }
+                first_run = agent_server.server_restart_blocker_snapshot_locked()
+
+                agent_server.CURRENT_TURNS["private-chat-id"]["run_id"] = (
+                    "private-run-b"
+                )
+                replacement_run = (
+                    agent_server.server_restart_blocker_snapshot_locked()
+                )
+
+                agent_server.CURRENT_TURNS["private-chat-id"] = {
+                    "run_id": None,
+                    "_server_restart_admission_id": "private-admission-b",
+                }
+                first_prebind = (
+                    agent_server.server_restart_blocker_snapshot_locked()
+                )
+                agent_server.CURRENT_TURNS["private-chat-id"] = {
+                    "run_id": None,
+                    "_server_restart_admission_id": "private-admission-c",
+                }
+                replacement_prebind = (
+                    agent_server.server_restart_blocker_snapshot_locked()
+                )
+
+                agent_server.CURRENT_TURNS["private-chat-id"] = {
+                    "run_id": None,
+                    "codex_control_reservation_id": "private-control-a",
+                }
+                first_control = (
+                    agent_server.server_restart_blocker_snapshot_locked()
+                )
+                agent_server.CURRENT_TURNS["private-chat-id"] = {
+                    "run_id": None,
+                    "codex_control_reservation_id": "private-control-b",
+                }
+                replacement_control = (
+                    agent_server.server_restart_blocker_snapshot_locked()
+                )
+
+        snapshots = (
+            first_run,
+            replacement_run,
+            first_prebind,
+            replacement_prebind,
+            first_control,
+            replacement_control,
+        )
+        self.assertTrue(all(snapshot["active_count"] == 1 for snapshot in snapshots))
+        self.assertNotEqual(first_run["revision"], replacement_run["revision"])
+        self.assertNotEqual(
+            first_prebind["revision"],
+            replacement_prebind["revision"],
+        )
+        self.assertNotEqual(
+            first_control["revision"],
+            replacement_control["revision"],
+        )
+        public_json = json.dumps(snapshots)
+        for private_value in (
+            "private-chat-id",
+            "private-run-a",
+            "private-run-b",
+            "private-admission-a",
+            "private-admission-b",
+            "private-admission-c",
+            "private-control-a",
+            "private-control-b",
+        ):
+            self.assertNotIn(private_value, public_json)
+
+    async def test_safety_critical_work_blocks_normal_and_force_restart(self):
+        scenarios = (
+            ({"SERVER_MAINTENANCE_SESSIONS": {"chat"}}, "server_maintenance_count"),
+            ({"DELETING_SESSIONS": {"chat"}}, "deleting_session_count"),
+            ({"CODEX_GOALS_RECONFIGURING": True}, "codex_goals_reconfiguring"),
+            ({"UNSAFE_HTTP_MUTATIONS_IN_FLIGHT": 1}, "mutation_count"),
+        )
+        for changes, count_name in scenarios:
+            for force in (False, True):
+                with self.subTest(
+                    count_name=count_name,
+                    force=force,
+                ), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    with restart_environment(root), ExitStack() as stack:
+                        for name, value in changes.items():
+                            stack.enter_context(patch.object(agent_server, name, value))
+                        with self.assertRaises(HTTPException) as raised:
+                            await agent_server.restart_server_endpoint(
+                                restart_body(force=force),
+                                http_request(method="POST"),
+                                BackgroundTasks(),
+                            )
+                    self.assertEqual(raised.exception.status_code, 409)
+                    self.assertEqual(
+                        raised.exception.detail["code"],
+                        "server_restart_unsafe_busy",
+                    )
+                    expected = True if count_name == "codex_goals_reconfiguring" else 1
+                    self.assertEqual(raised.exception.detail[count_name], expected)
+
+    async def test_force_restart_accepts_busy_server_and_audits_interrupted_work(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queued = deque([
+                {"queued_id": "unsafe-1", "_durable": False},
+                {"queued_id": "durable", "_durable": True},
+            ])
+            run_now = {"queued_id": "unsafe-2", "_update_transitioning": True}
+            with restart_environment(root), \
+                 patch.object(agent_server, "BUSY_SESSIONS", {"chat-1", "chat-2"}), \
+                 patch.object(agent_server, "QUEUED_TURNS", {"chat-1": queued}), \
+                 patch.object(agent_server, "RUN_NOW_TURNS", {"chat-5": run_now}), \
+                 patch.object(
+                     agent_server,
+                     "active_provider_background_work_labels",
+                     return_value=["private provider label"],
+                 ):
+                tasks = BackgroundTasks()
+                status = await agent_server.restart_server_endpoint(
+                    restart_body(force=True),
+                    http_request(method="POST"),
+                    tasks,
+                )
+                private = agent_server.read_server_restart_status()
+
+        self.assertEqual(status["phase"], "accepted")
+        self.assertTrue(status["forced"])
+        self.assertEqual(status["interrupted_work"], {
+            "codex_goals_reconfiguring": False,
+            "tmux_server_in_service_cgroup": False,
+            "tmux_server_cgroup_unknown": False,
+            "active_count": 2,
+            "restart_blocking_queued_count": 2,
+            "provider_background_count": 1,
+            "server_maintenance_count": 0,
+            "mutation_count": 0,
+            "deleting_session_count": 0,
+        })
+        self.assertEqual(len(tasks.tasks), 1)
+        self.assertTrue(private["_forced"])
+        self.assertEqual(
+            private["_forced_work_snapshot"],
+            status["interrupted_work"],
+        )
+        self.assertNotIn("private provider label", json.dumps(status))
+
+    async def test_force_restart_rejects_stale_blocker_revision(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with restart_environment(root):
+                confirmed = agent_server.server_restart_blocker_snapshot_locked()
+                body = restart_body(
+                    force=True,
+                    blocker_revision=confirmed["revision"],
+                )
+                agent_server.BUSY_SESSIONS.add("newly-started-chat")
+                with self.assertRaises(HTTPException) as raised:
+                    await agent_server.restart_server_endpoint(
+                        body,
+                        http_request(method="POST"),
+                        BackgroundTasks(),
+                    )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(
+            raised.exception.detail["code"],
+            "server_restart_blockers_changed",
+        )
+        refreshed = raised.exception.detail["blocker_snapshot"]
+        self.assertNotEqual(refreshed["revision"], confirmed["revision"])
+        self.assertEqual(refreshed["active_count"], 1)
+        self.assertNotIn("newly-started-chat", json.dumps(raised.exception.detail))
+
+    async def test_tmux_cgroup_risk_requires_force_and_is_privately_revision_bound(self):
+        service_cgroup = (
+            "/user.slice/user-1000.slice/user@1000.service/"
+            "app.slice/agents-server.service"
+        )
+        scenarios = (
+            tmux_restart_state(
+                in_service_cgroup=True,
+                pid=4242,
+                paths=(service_cgroup,),
+                service_cgroup=service_cgroup,
+                inspection="verified",
+            ),
+            tmux_restart_state(
+                cgroup_unknown=True,
+                pid=4242,
+                service_cgroup=service_cgroup,
+                inspection="cgroup-unavailable",
+            ),
+        )
+        for state in scenarios:
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                with restart_environment(root), patch.object(
+                    agent_server,
+                    "server_restart_tmux_cgroup_state",
+                    return_value=state,
+                ):
+                    snapshot = agent_server.server_restart_blocker_snapshot_locked()
+                    public_json = json.dumps(snapshot)
+                    self.assertNotIn("4242", public_json)
+                    self.assertNotIn(service_cgroup, public_json)
+                    with self.assertRaises(HTTPException) as safe:
+                        await agent_server.restart_server_endpoint(
+                            restart_body(),
+                            http_request(method="POST"),
+                            BackgroundTasks(),
+                        )
+                    self.assertEqual(
+                        safe.exception.detail["code"],
+                        "server_restart_busy",
+                    )
+                    forced = await agent_server.restart_server_endpoint(
+                        restart_body(
+                            force=True,
+                            blocker_revision=snapshot["revision"],
+                        ),
+                        http_request(method="POST"),
+                        BackgroundTasks(),
+                    )
+                self.assertTrue(forced["forced"])
+                interrupted = forced["interrupted_work"]
+                self.assertEqual(
+                    interrupted["tmux_server_in_service_cgroup"],
+                    state["tmux_server_in_service_cgroup"],
+                )
+                self.assertEqual(
+                    interrupted["tmux_server_cgroup_unknown"],
+                    state["tmux_server_cgroup_unknown"],
+                )
+
+    async def test_tmux_private_pid_change_invalidates_force_confirmation(self):
+        service_cgroup = "/user.slice/agents-server.service"
+        confirmed_state = tmux_restart_state(
+            in_service_cgroup=True,
+            pid=4242,
+            paths=(service_cgroup,),
+            service_cgroup=service_cgroup,
+            inspection="verified",
+        )
+        changed_state = {**confirmed_state, "_tmux_server_pid": 4343}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with restart_environment(root), patch.object(
+                agent_server,
+                "server_restart_tmux_cgroup_state",
+                return_value=confirmed_state,
+            ):
+                confirmed = agent_server.server_restart_blocker_snapshot_locked()
+                body = restart_body(
+                    force=True,
+                    blocker_revision=confirmed["revision"],
+                )
+                with patch.object(
+                    agent_server,
+                    "server_restart_tmux_cgroup_state",
+                    return_value=changed_state,
+                ), self.assertRaises(HTTPException) as raised:
+                    await agent_server.restart_server_endpoint(
+                        body,
+                        http_request(method="POST"),
+                        BackgroundTasks(),
+                    )
+
+        self.assertEqual(
+            raised.exception.detail["code"],
+            "server_restart_blockers_changed",
+        )
+        self.assertTrue(
+            raised.exception.detail["blocker_snapshot"][
+                "tmux_server_in_service_cgroup"
+            ]
+        )
+        self.assertNotIn("4343", json.dumps(raised.exception.detail))
+
+    async def test_force_restart_audits_provider_only_background_blockers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with restart_environment(root), patch.object(
+                agent_server,
+                "active_provider_background_work_labels",
+                return_value=["private provider label", "second private label"],
+            ):
+                status = await agent_server.restart_server_endpoint(
+                    restart_body(force=True),
+                    http_request(method="POST"),
+                    BackgroundTasks(),
+                )
+
+        self.assertEqual(
+            status["interrupted_work"]["provider_background_count"],
+            2,
+        )
+        self.assertNotIn("private provider label", json.dumps(status))
+
+    async def test_force_restart_preserves_recent_terminal_cooldown(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with restart_environment(root), patch.object(
+                agent_server,
+                "server_restart_status_age_seconds",
+                return_value=2,
+            ):
+                agent_server.write_server_restart_status(
+                    phase="failed",
+                    request_id=str(uuid.uuid4()),
+                    failed_at="2026-08-19T00:00:00Z",
+                )
+                with self.assertRaises(HTTPException) as raised:
+                    await agent_server.restart_server_endpoint(
+                        restart_body(force=True),
+                        http_request(method="POST"),
+                        BackgroundTasks(),
+                    )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(
+            raised.exception.detail["code"],
+            "server_restart_cooldown",
+        )
 
     async def test_existing_http_mutation_blocks_restart_until_it_finishes(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -963,7 +1655,7 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(called)
         self.assertEqual(status["phase"], "failed")
 
-    def test_post_route_declares_202_and_confirmation_is_literal_true(self):
+    def test_post_route_declares_202_and_confirmations_are_literal_true(self):
         route = next(
             route
             for route in agent_server.app.routes
@@ -981,13 +1673,59 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
                     expected_server_instance_id=SERVER_INSTANCE_ID,
                     confirmed=invalid_confirmation,
                 )
+        forced = restart_body(force=True)
+        self.assertTrue(forced.force)
+        self.assertTrue(forced.force_confirmed)
+        self.assertRegex(
+            forced.expected_blocker_revision or "",
+            r"^[0-9a-f]{64}$",
+        )
+        revision = "b" * 64
+        for changes in (
+            {"force": True},
+            {"force_confirmed": True},
+            {"force": False, "force_confirmed": True},
+            {
+                "force": True,
+                "force_confirmed": False,
+                "expected_blocker_revision": revision,
+            },
+            {
+                "force": 1,
+                "force_confirmed": True,
+                "expected_blocker_revision": revision,
+            },
+            {
+                "force": True,
+                "force_confirmed": "true",
+                "expected_blocker_revision": revision,
+            },
+            {
+                "force": True,
+                "force_confirmed": True,
+            },
+            {"expected_blocker_revision": revision},
+            {
+                "force": True,
+                "force_confirmed": True,
+                "expected_blocker_revision": "B" * 64,
+            },
+        ):
+            with self.subTest(changes=changes), self.assertRaises(Exception):
+                agent_server.ServerRestartRequest(
+                    request_id=uuid.uuid4(),
+                    expected_server_identity=SERVER_IDENTITY,
+                    expected_server_instance_id=SERVER_INSTANCE_ID,
+                    confirmed=True,
+                    **changes,
+                )
         with self.assertRaises(Exception):
             agent_server.ServerRestartRequest(
                 request_id=uuid.uuid4(),
                 expected_server_identity=SERVER_IDENTITY,
                 expected_server_instance_id=SERVER_INSTANCE_ID,
                 confirmed=True,
-                force=True,
+                unexpected=True,
             )
 
 

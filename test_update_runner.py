@@ -595,6 +595,53 @@ class UpdateRunnerTests(unittest.TestCase):
                     ),
                 )
 
+    def test_post_update_identity_binds_exact_direct_route_set_and_order(self):
+        serve_url = "https://sonic.example.ts.net:8444/api/team-hub"
+        direct_url = "http://100.73.184.23:7850/api/team-hub"
+        capability = {
+            "available": True,
+            "designated_host": True,
+            "version": 1,
+            "base_path": "/api/team-hub",
+            "hub_id": "hub_test12345678",
+            "host_server_identity": "server-test-identity",
+            "transport": "tailscale_serve",
+            "hub_url": serve_url,
+            "routes": [
+                {"transport": "tailscale_serve", "hub_url": serve_url},
+                {"transport": "direct_ip", "hub_url": direct_url},
+            ],
+        }
+        health = {
+            "server_identity": "server-test-identity",
+            "capabilities": {"team_hub_v1": capability},
+        }
+        with patch.object(
+            update_runner,
+            "server_health_snapshot",
+            return_value=health,
+        ):
+            update_runner.assert_post_update_identity(
+                7850,
+                token="secret",
+                expected_server_identity="server-test-identity",
+                expected_team_hub_id="hub_test12345678",
+                expected_team_hub_transport="tailscale_serve",
+                expected_team_hub_url=serve_url,
+                expected_team_hub_direct_ip_url=direct_url,
+            )
+            capability["routes"] = list(reversed(capability["routes"]))
+            with self.assertRaisesRegex(RuntimeError, "changed its Team Hub routes"):
+                update_runner.assert_post_update_identity(
+                    7850,
+                    token="secret",
+                    expected_server_identity="server-test-identity",
+                    expected_team_hub_id="hub_test12345678",
+                    expected_team_hub_transport="tailscale_serve",
+                    expected_team_hub_url=serve_url,
+                    expected_team_hub_direct_ip_url=direct_url,
+                )
+
     def test_runner_passes_explicit_empty_url_for_loopback_hub(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -626,6 +673,7 @@ class UpdateRunnerTests(unittest.TestCase):
                 expected_team_hub_id="hub_test12345678",
                 expected_team_hub_transport="loopback",
                 expected_team_hub_url="",
+                expected_team_hub_direct_ip_url="",
                 team_hub_snapshot=str(root / "snapshot_exact"),
                 team_hub_data_dir=str(root / "hub"),
             )
@@ -633,7 +681,7 @@ class UpdateRunnerTests(unittest.TestCase):
                  patch.object(update_runner, "download_bytes", return_value=archive_bytes), \
                  patch.object(update_runner, "update_status", side_effect=lambda _path, **changes: changes), \
                  patch.object(update_runner, "assert_server_idle"), \
-                 patch.object(update_runner, "assert_post_update_identity"), \
+                 patch.object(update_runner, "assert_post_update_identity") as identity_check, \
                  patch.object(update_runner, "run_installer") as install:
                 update_runner.run_update(args)
 
@@ -642,6 +690,16 @@ class UpdateRunnerTests(unittest.TestCase):
         self.assertEqual(command[transport_index + 1], "loopback")
         self.assertEqual(command[transport_index + 2], "--expected-team-hub-url")
         self.assertEqual(command[transport_index + 3], "")
+        direct_index = command.index("--expected-team-hub-direct-ip-url")
+        self.assertEqual(command[direct_index + 1], "")
+        identity_check.assert_called_once_with(
+            7850,
+            token="",
+            expected_server_identity="server-test-identity",
+            expected_team_hub_id="hub_test12345678",
+            expected_team_hub_transport="loopback",
+            expected_team_hub_direct_ip_url="",
+        )
 
     def test_detached_runner_allows_explicit_beta_to_latest_stable_switch(self):
         with tempfile.TemporaryDirectory() as temporary:

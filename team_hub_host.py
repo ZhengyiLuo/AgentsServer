@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 from pathlib import Path
 import re
@@ -28,6 +29,7 @@ TEAM_HUB_MODE_DISABLED = "disabled"
 TEAM_HUB_MODE_HOST = "host"
 TEAM_HUB_TRANSPORT_LOOPBACK = "loopback"
 TEAM_HUB_TRANSPORT_TAILSCALE_SERVE = "tailscale_serve"
+TEAM_HUB_TRANSPORT_DIRECT_IP = "direct_ip"
 TEAM_HUB_TAILSCALE_SERVE_PORT = 8444
 TEAM_HUB_TAILNET_LABEL_PATTERN = re.compile(
     r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
@@ -77,13 +79,23 @@ def configured_team_hub_hosts(
 def configured_team_hub_endpoint(
     mode: str,
     configured_url: str | None,
+    configured_transport: str | None = None,
+    server_port: int = 7850,
 ) -> tuple[str | None, str | None, str | None, str | None]:
     """Return transport, public Hub URL, public hostname, and config error."""
 
     if mode != TEAM_HUB_MODE_HOST:
         return None, None, None, None
     value = str(configured_url or "").strip()
+    selected = str(configured_transport or "").strip().lower()
     if not value:
+        if selected not in {"", TEAM_HUB_TRANSPORT_LOOPBACK}:
+            return (
+                None,
+                None,
+                None,
+                "AGENTSDOCK_TEAM_HUB_URL is required for the selected Team Hub transport",
+            )
         return TEAM_HUB_TRANSPORT_LOOPBACK, None, None, None
     try:
         parsed = urlsplit(value)
@@ -91,6 +103,48 @@ def configured_team_hub_endpoint(
     except ValueError:
         return None, None, None, "AGENTSDOCK_TEAM_HUB_URL is invalid"
     hostname = parsed.hostname
+    if selected == TEAM_HUB_TRANSPORT_DIRECT_IP:
+        try:
+            address = ipaddress.ip_address(str(hostname or ""))
+        except ValueError:
+            address = None
+        canonical_host = str(address) if address is not None else ""
+        canonical = (
+            f"http://{canonical_host}:{server_port}{TEAM_HUB_MOUNT_PATH}"
+            if canonical_host
+            else ""
+        )
+        if (
+            parsed.scheme != "http"
+            or address is None
+            or address.version != 4
+            or address.is_loopback
+            or not 1 <= int(str(address).split(".", 1)[0]) < 224
+            or parsed.username is not None
+            or parsed.password is not None
+            or port != server_port
+            or parsed.path != TEAM_HUB_MOUNT_PATH
+            or parsed.query
+            or parsed.fragment
+            or value != canonical
+        ):
+            return (
+                None,
+                None,
+                None,
+                "AGENTSDOCK_TEAM_HUB_URL must be the exact same-origin "
+                f"http://<literal-ip>:{server_port}{TEAM_HUB_MOUNT_PATH} URL "
+                "for direct_ip transport",
+            )
+        return TEAM_HUB_TRANSPORT_DIRECT_IP, canonical, canonical_host, None
+
+    if selected not in {"", TEAM_HUB_TRANSPORT_TAILSCALE_SERVE}:
+        return (
+            None,
+            None,
+            None,
+            "AGENTSDOCK_TEAM_HUB_TRANSPORT must be loopback, tailscale_serve, or direct_ip",
+        )
     canonical = (
         f"https://{hostname}:{TEAM_HUB_TAILSCALE_SERVE_PORT}{TEAM_HUB_MOUNT_PATH}"
         if hostname is not None
@@ -131,6 +185,7 @@ class ManagedTeamHubHost:
         allowed_hosts: set[str],
         transport: str = TEAM_HUB_TRANSPORT_LOOPBACK,
         hub_url: str | None = None,
+        routes: dict[str, str | None] | None = None,
         config_error: str | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
@@ -141,7 +196,36 @@ class ManagedTeamHubHost:
         self.allowed_hosts = set(allowed_hosts)
         self.transport = transport
         self.hub_url = hub_url
-        self.config_error = config_error
+        configured_routes = dict(routes or {transport: hub_url})
+        route_error: str | None = None
+        if (
+            transport not in {
+                TEAM_HUB_TRANSPORT_LOOPBACK,
+                TEAM_HUB_TRANSPORT_TAILSCALE_SERVE,
+                TEAM_HUB_TRANSPORT_DIRECT_IP,
+            }
+            or configured_routes.get(transport) != hub_url
+            or any(
+                route not in {
+                    TEAM_HUB_TRANSPORT_LOOPBACK,
+                    TEAM_HUB_TRANSPORT_TAILSCALE_SERVE,
+                    TEAM_HUB_TRANSPORT_DIRECT_IP,
+                }
+                for route in configured_routes
+            )
+        ):
+            route_error = "Team Hub routes do not contain the exact primary transport"
+        self.routes = {
+            route: configured_routes[route]
+            for route in (
+                transport,
+                TEAM_HUB_TRANSPORT_LOOPBACK,
+                TEAM_HUB_TRANSPORT_TAILSCALE_SERVE,
+                TEAM_HUB_TRANSPORT_DIRECT_IP,
+            )
+            if route in configured_routes
+        }
+        self.config_error = config_error or route_error
         self.logger = logger or logging.getLogger("agents-server.team-hub")
         self._guard = threading.RLock()
         self._admission = asyncio.Condition()
@@ -187,6 +271,13 @@ class ManagedTeamHubHost:
                     self.hub_url
                     or f"http://127.0.0.1{TEAM_HUB_MOUNT_PATH}"
                 ),
+                managed_routes={
+                    route: (
+                        url
+                        or f"http://127.0.0.1{TEAM_HUB_MOUNT_PATH}"
+                    )
+                    for route, url in self.routes.items()
+                },
             )
         except Exception as exc:
             HubStore.release_managed_runtime_lease(lease)
@@ -225,6 +316,7 @@ class ManagedTeamHubHost:
                 "base_path": None,
                 "transport": None,
                 "hub_url": None,
+                "routes": [],
                 "hub_id": None,
                 "host_server_identity": None,
                 "message": message,
@@ -241,11 +333,19 @@ class ManagedTeamHubHost:
             "base_path": TEAM_HUB_MOUNT_PATH,
             "transport": self.transport,
             "hub_url": self.hub_url,
+            "routes": [
+                {"transport": route, "hub_url": url}
+                for route, url in self.routes.items()
+            ],
             "hub_id": hub_id,
             "host_server_identity": self.server_identity,
             "message": (
                 "This AgentsServer hosts Team Hub over private Tailscale Serve."
                 if available and self.transport == TEAM_HUB_TRANSPORT_TAILSCALE_SERVE
+                else (
+                    "This AgentsServer hosts Team Hub over direct, unencrypted IP access."
+                )
+                if available and self.transport == TEAM_HUB_TRANSPORT_DIRECT_IP
                 else "This AgentsServer hosts the local Team Hub preview."
                 if available
                 else "The designated Team Hub is unavailable."
@@ -263,17 +363,31 @@ class ManagedTeamHubHost:
         self,
         request: Request,
     ) -> ManagedTransportIdentity | None:
-        if (
-            self.transport != TEAM_HUB_TRANSPORT_TAILSCALE_SERVE
-            or self.hub_url is None
-        ):
+        route_url = self.routes.get(TEAM_HUB_TRANSPORT_TAILSCALE_SERVE)
+        if route_url is None:
             return None
         identity = classify_managed_transport(
             request,
-            managed_transport=self.transport,
-            managed_hub_url=self.hub_url,
+            managed_transport=TEAM_HUB_TRANSPORT_TAILSCALE_SERVE,
+            managed_hub_url=route_url,
         )
         if identity is None or identity.kind != TEAM_HUB_TRANSPORT_TAILSCALE_SERVE:
+            return None
+        return identity
+
+    def direct_ip_identity(
+        self,
+        request: Request,
+    ) -> ManagedTransportIdentity | None:
+        route_url = self.routes.get(TEAM_HUB_TRANSPORT_DIRECT_IP)
+        if route_url is None:
+            return None
+        identity = classify_managed_transport(
+            request,
+            managed_transport=TEAM_HUB_TRANSPORT_DIRECT_IP,
+            managed_hub_url=route_url,
+        )
+        if identity is None or identity.kind != TEAM_HUB_TRANSPORT_DIRECT_IP:
             return None
         return identity
 
@@ -288,8 +402,15 @@ class ManagedTeamHubHost:
         recipient_email: str,
         display_name: str,
         device_label: str,
+        transport: str = TEAM_HUB_TRANSPORT_TAILSCALE_SERVE,
     ) -> dict[str, Any]:
-        """Admit one delegated proof mutation into the Hub drain boundary."""
+        """Admit one route-bound remote proof mutation into the Hub drain boundary."""
+
+        if transport not in {
+            TEAM_HUB_TRANSPORT_TAILSCALE_SERVE,
+            TEAM_HUB_TRANSPORT_DIRECT_IP,
+        } or transport not in self.routes:
+            raise HubError("bootstrap_unavailable", "Bootstrap is unavailable", 403)
 
         async with self._admission:
             with self._guard:
@@ -346,6 +467,7 @@ class ManagedTeamHubHost:
                     recipient_email=recipient_email,
                     display_name=display_name,
                     device_label=device_label,
+                    transport=transport,
                 )
 
         try:

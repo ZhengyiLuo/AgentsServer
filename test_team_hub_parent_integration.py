@@ -101,7 +101,7 @@ class TeamHubParentIntegrationTests(unittest.TestCase):
                         ({**grant_headers, "Origin": "https://evil.test"}, None, 403),
                         ({**grant_headers, "Sec-Fetch-Site": "none"}, None, 403),
                         ({**grant_headers, "Sec-Fetch-Mode": "navigate"}, None, 403),
-                        ({**grant_headers, "Cookie": "session=ambient"}, None, 401),
+                        ({**grant_headers, "Cookie": "session=ambient"}, None, 403),
                         (
                             {
                                 **grant_headers,
@@ -374,6 +374,109 @@ class TeamHubParentIntegrationTests(unittest.TestCase):
                     )
                     self.assertEqual(hub_token_at_parent.status_code, 401)
                     serve.close()
+            finally:
+                mount.app = original_mount
+                asyncio.run(runtime.shutdown())
+
+    def test_parent_bootstrap_grant_supports_only_explicit_exact_direct_ip(self) -> None:
+        direct_ip = "100.73.184.23"
+        direct_url = f"http://{direct_ip}:7850/api/team-hub"
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = ManagedTeamHubHost(
+                mode=TEAM_HUB_MODE_HOST,
+                data_dir=Path(temporary) / "hub",
+                server_identity=HOST_ID,
+                server_instance_id=agent_server.SERVER_INSTANCE_ID,
+                allowed_hosts={"localhost", "127.0.0.1", TAILNET_HOST, direct_ip},
+                transport="tailscale_serve",
+                hub_url=TAILNET_HUB_URL,
+                routes={
+                    "tailscale_serve": TAILNET_HUB_URL,
+                    "direct_ip": direct_url,
+                },
+            )
+            runtime.initialize()
+            self.assertEqual(runtime.capability()["transport"], "tailscale_serve")
+            mount = next(
+                route
+                for route in agent_server.app.routes
+                if getattr(route, "name", None) == "team-hub"
+            )
+            original_mount = mount.app
+            mount.app = runtime
+            payload = {
+                "request_id": "fc34af4d-5f89-47cd-93df-b48d08256e41",
+                "expected_server_identity": HOST_ID,
+                "expected_server_instance_id": agent_server.SERVER_INSTANCE_ID,
+                "expected_hub_id": runtime.capability()["hub_id"],
+                "expected_hub_url": direct_url,
+                "expected_transport": "direct_ip",
+                "confirmed": True,
+                "unsafe_direct_ip_confirmed": True,
+                "recipient_email": "owner@example.com",
+                "display_name": "Owner",
+                "device_label": "Owner Mac",
+            }
+            try:
+                with patch.object(agent_server, "TEAM_HUB_RUNTIME", runtime), \
+                     patch.object(agent_server, "AGENT_TOKEN", "agents-server-token"):
+                    direct = TestClient(
+                        agent_server.app,
+                        base_url=f"http://{direct_ip}:7850",
+                        client=("192.0.2.50", 41000),
+                    )
+                    headers = {"Authorization": "Bearer agents-server-token"}
+                    missing_confirmation = direct.post(
+                        "/api/admin/team-hub/bootstrap-proof",
+                        headers=headers,
+                        json={
+                            key: value
+                            for key, value in payload.items()
+                            if key != "unsafe_direct_ip_confirmed"
+                        },
+                    )
+                    self.assertEqual(missing_confirmation.status_code, 409)
+                    for changed_headers in (
+                        {**headers, "Forwarded": "for=192.0.2.50"},
+                        {**headers, "X-Forwarded-For": "192.0.2.50"},
+                        {**headers, "Tailscale-Funnel-Request": "?1"},
+                        {**headers, "Origin": "https://evil.test"},
+                    ):
+                        denied = direct.post(
+                            "/api/admin/team-hub/bootstrap-proof",
+                            headers=changed_headers,
+                            json=payload,
+                        )
+                        self.assertEqual(denied.status_code, 403, denied.text)
+                    grant = direct.post(
+                        "/api/admin/team-hub/bootstrap-proof",
+                        headers=headers,
+                        json=payload,
+                    )
+                    self.assertEqual(grant.status_code, 200, grant.text)
+                    self.assertNotIn("access_token", grant.json())
+                    redeemed = direct.post(
+                        "/api/team-hub/v1/bootstrap/redeem",
+                        headers={
+                            "X-Team-Hub-Bootstrap-Proof": grant.json()["bootstrap_proof"],
+                            "X-Team-Hub-Bootstrap-Request-Id": payload["request_id"],
+                        },
+                        json={
+                            "email": payload["recipient_email"],
+                            "display_name": payload["display_name"],
+                            "device_label": payload["device_label"],
+                        },
+                    )
+                    self.assertEqual(redeemed.status_code, 200, redeemed.text)
+                    parent_with_hub_token = direct.post(
+                        "/api/admin/team-hub/bootstrap-proof",
+                        headers={
+                            "Authorization": f"Bearer {redeemed.json()['access_token']}"
+                        },
+                        json=payload,
+                    )
+                    self.assertEqual(parent_with_hub_token.status_code, 401)
+                    direct.close()
             finally:
                 mount.app = original_mount
                 asyncio.run(runtime.shutdown())

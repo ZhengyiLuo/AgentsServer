@@ -478,6 +478,46 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                     }
                 )
 
+    def test_update_identity_verification_binds_direct_primary_and_exact_ordered_routes(self):
+        direct_url = "http://100.73.184.23:7850/api/team-hub"
+        serve_url = "https://sonic.example.ts.net:8444/api/team-hub"
+        routes = [
+            {"transport": "direct_ip", "hub_url": direct_url},
+            {"transport": "tailscale_serve", "hub_url": serve_url},
+        ]
+        runtime = MagicMock()
+        runtime.capability.return_value = {
+            "available": True,
+            "designated_host": True,
+            "hub_id": "hub_test12345678",
+            "host_server_identity": "server-test-identity",
+            "transport": "direct_ip",
+            "hub_url": direct_url,
+            "routes": routes,
+        }
+        status = {
+            "team_hub_id": "hub_test12345678",
+            "team_hub_host_server_identity": "server-test-identity",
+            "team_hub_snapshot_generation": "snapshot_expected",
+            "team_hub_transport": "direct_ip",
+            "team_hub_url": direct_url,
+            "team_hub_direct_ip_url": direct_url,
+            "team_hub_routes": routes,
+        }
+        with patch.object(agent_server, "TEAM_HUB_RUNTIME", runtime), \
+             patch.object(agent_server, "server_identity", return_value="server-test-identity"):
+            agent_server._verify_server_update_team_hub_identity(status)
+            runtime.capability.return_value = {
+                **runtime.capability.return_value,
+                "routes": list(reversed(routes)),
+            }
+            with self.assertRaisesRegex(RuntimeError, "lost its designated Team Hub identity"):
+                agent_server._verify_server_update_team_hub_identity(status)
+            with self.assertRaisesRegex(RuntimeError, "route binding is invalid"):
+                agent_server._verify_server_update_team_hub_identity(
+                    {**status, "team_hub_direct_ip_url": ""}
+                )
+
     async def test_startup_clears_snapshot_fence_orphaned_before_status_acceptance(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

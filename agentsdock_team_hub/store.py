@@ -21,6 +21,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlsplit
 
 try:
     import fcntl
@@ -1515,8 +1516,9 @@ class HubStore:
         recipient_email: str,
         display_name: str,
         device_label: str,
+        transport: str = "tailscale_serve",
     ) -> dict[str, Any]:
-        """Issue an idempotent, hash-only first-owner proof for one Serve user."""
+        """Issue an idempotent, hash-only first-owner proof for one remote route."""
 
         timestamp = _now()
         clean_request_id = self._canonical_request_id(request_id)
@@ -1527,10 +1529,28 @@ class HubStore:
         clean_recipient = _email(recipient_email)
         clean_display_name = _bounded_text(display_name, "display_name", 1, 160)
         clean_device_label = _bounded_text(device_label, "device_label", 1, 160)
+        if transport not in {"tailscale_serve", "direct_ip"}:
+            raise HubError("bootstrap_unavailable", "Bootstrap is unavailable", 403)
+        try:
+            hub_scheme = urlsplit(clean_hub_url).scheme
+        except ValueError as exc:
+            raise HubError(
+                "bootstrap_unavailable", "Bootstrap is unavailable", 403
+            ) from exc
+        if (
+            transport == "tailscale_serve" and hub_scheme != "https"
+        ) or (
+            transport == "direct_ip" and hub_scheme != "http"
+        ):
+            raise HubError("bootstrap_unavailable", "Bootstrap is unavailable", 403)
         if clean_login != clean_recipient:
             raise HubError(
                 "bootstrap_identity_mismatch",
-                "Bootstrap recipient does not match the verified Tailnet identity",
+                (
+                    "Bootstrap recipient does not match the verified Tailnet identity"
+                    if transport == "tailscale_serve"
+                    else "Bootstrap recipient does not match the confirmed direct-IP owner"
+                ),
                 403,
             )
         if (
@@ -1551,6 +1571,7 @@ class HubStore:
                 "server_instance_id": clean_server_instance_id,
                 "hub_id": self.hub_id,
                 "hub_url": clean_hub_url,
+                "transport": transport,
                 "tailnet_login": clean_login,
                 "recipient_email": clean_recipient,
                 "display_name": clean_display_name,
@@ -1920,7 +1941,7 @@ class HubStore:
         hub_url: str | None = None,
     ) -> dict[str, Any]:
         timestamp = _now()
-        if transport not in {"loopback", "tailscale_serve"}:
+        if transport not in {"loopback", "tailscale_serve", "direct_ip"}:
             raise HubError("bootstrap_unavailable", "Bootstrap is unavailable", 403)
         try:
             digest = token_hash(proof)
@@ -1983,6 +2004,14 @@ class HubStore:
                         != self.managed_server_instance_id
                         or str(claim["hub_id"]) != self.hub_id
                         or str(claim["hub_url"]) != str(hub_url or "")
+                        or (
+                            transport == "tailscale_serve"
+                            and urlsplit(str(claim["hub_url"])).scheme != "https"
+                        )
+                        or (
+                            transport == "direct_ip"
+                            and urlsplit(str(claim["hub_url"])).scheme != "http"
+                        )
                         or str(claim["tailnet_login_normalized"]) != clean_login
                         or str(claim["recipient_email_normalized"]) != clean_email
                         or str(claim["display_name"]) != clean_display_name

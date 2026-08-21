@@ -100,7 +100,9 @@ Usage: ./uninstall.sh [--yes] [--purge-state]
 Stops and removes the AgentsServer user service, versioned release runtime,
 and generated configuration (including the access token). Chat history, jobs,
 files, and terminals under $STATE_ROOT are preserved by default so a later
-./install.sh picks them back up.
+./install.sh picks ordinary AgentsServer state back up. Preserved Team Hub state
+is not auto-reactivated in this beta; it requires signed managed recovery or
+support-assisted restoration.
 
   --yes           Do not prompt before removing the service, releases, and
                    configuration.
@@ -303,7 +305,10 @@ if [[ "$PURGE_STATE" == "true" ]]; then
   fi
 elif [[ -e "$STATE_ROOT" ]]; then
   echo "Preserved chat history, jobs, files, and tokens at $STATE_ROOT."
-  echo "Re-running ./install.sh will pick this state back up. Pass --purge-state to also delete it."
+  echo "Re-running ./install.sh will pick ordinary AgentsServer state back up. Pass --purge-state to also delete it."
+  if [[ -e "$STATE_ROOT/team-hub/team-hub.sqlite3" || -L "$STATE_ROOT/team-hub/team-hub.sqlite3" ]]; then
+    echo "Preserved Team Hub state is not auto-reactivated in this beta; use a signed managed recovery or support-assisted restoration."
+  fi
 fi
 
 # Keep the shared install/update lock alive until every requested removal has

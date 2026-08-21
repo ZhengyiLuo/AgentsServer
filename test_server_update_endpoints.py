@@ -370,6 +370,159 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["phase"], "restarting")
         self.assertTrue(agent_server.managed_server_update_blocks_work(status))
 
+    async def test_abandoned_update_clears_its_exact_fence_before_terminal_status(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            status_path = root / "status.json"
+            hub_data = root / "hub"
+            runtime = MagicMock()
+            runtime.capability.return_value = {
+                "available": True,
+                "designated_host": True,
+                "hub_id": "hub_test12345678",
+                "host_server_identity": "server-test-identity",
+            }
+            runtime.maintenance_fence_sync.return_value = {
+                "reason": "server-update",
+                "operation_id": "update-exact",
+                "snapshot": "snapshot_exact",
+            }
+            phases_at_clear: list[str] = []
+
+            def clear(reason, operation_id, snapshot):
+                phases_at_clear.append(
+                    agent_server.read_server_update_status()["phase"]
+                )
+                self.assertEqual(reason, "server-update")
+                self.assertEqual(operation_id, "update-exact")
+                self.assertEqual(snapshot, hub_data / "maintenance-backups" / "snapshot_exact")
+                return True
+
+            runtime.clear_maintenance_sync.side_effect = clear
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", status_path), \
+                 patch.object(agent_server, "TEAM_HUB_DATA_DIR", hub_data), \
+                 patch.object(agent_server, "TEAM_HUB_RUNTIME", runtime), \
+                 patch.object(agent_server, "server_identity", return_value="server-test-identity"), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server, "server_update_status_age_seconds", return_value=60.0):
+                agent_server.write_server_update_status(
+                    update_id="update-exact",
+                    phase="downloading",
+                    target_version="1.1.0",
+                    team_hub_id="hub_test12345678",
+                    team_hub_host_server_identity="server-test-identity",
+                    team_hub_snapshot_generation="snapshot_exact",
+                )
+                status = await agent_server.server_update_status()
+
+            self.assertEqual(phases_at_clear, ["downloading"])
+            self.assertEqual(status["phase"], "failed")
+            runtime.clear_maintenance_sync.assert_called_once()
+
+    async def test_current_candidate_with_missing_hub_cannot_finalize_complete(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            status_path = Path(temporary) / "status.json"
+            runtime = MagicMock()
+            runtime.capability.return_value = {
+                "available": False,
+                "designated_host": False,
+                "hub_id": None,
+                "host_server_identity": None,
+            }
+            with patch.object(agent_server, "SERVER_VERSION", "1.1.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", status_path), \
+                 patch.object(agent_server, "TEAM_HUB_RUNTIME", runtime), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server, "server_update_status_age_seconds", return_value=60.0):
+                agent_server.write_server_update_status(
+                    update_id="update-lost-hub",
+                    phase="restarting",
+                    target_version="1.1.0",
+                    team_hub_id="hub_expected123456",
+                    team_hub_host_server_identity="server-test-identity",
+                    team_hub_snapshot_generation="snapshot_expected",
+                )
+                status = await agent_server.server_update_status()
+
+            self.assertEqual(status["phase"], "restarting")
+            runtime.clear_maintenance_sync.assert_not_called()
+
+    async def test_startup_clears_snapshot_fence_orphaned_before_status_acceptance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            status_path = root / "status.json"
+            hub_data = root / "hub"
+            runtime = MagicMock()
+            runtime.maintenance_fence_sync.return_value = {
+                "reason": "server-update",
+                "operation_id": "update-pre-status",
+                "snapshot": "snapshot_pre_status",
+            }
+            with patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", status_path), \
+                 patch.object(agent_server, "TEAM_HUB_DATA_DIR", hub_data), \
+                 patch.object(agent_server, "TEAM_HUB_RUNTIME", runtime):
+                agent_server.write_server_update_status(phase="current")
+                status = await agent_server.reconcile_server_update_status_after_startup()
+
+            self.assertEqual(status["phase"], "current")
+            runtime.clear_maintenance_sync.assert_called_once_with(
+                "server-update",
+                "update-pre-status",
+                hub_data / "maintenance-backups" / "snapshot_pre_status",
+            )
+
+    async def test_startup_keeps_terminal_same_operation_fence_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            status_path = Path(temporary) / "status.json"
+            runtime = MagicMock()
+            runtime.maintenance_fence_sync.return_value = {
+                "reason": "server-update",
+                "operation_id": "update-incomplete",
+                "snapshot": "snapshot_incomplete",
+            }
+            with patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", status_path), \
+                 patch.object(agent_server, "TEAM_HUB_RUNTIME", runtime):
+                original = agent_server.write_server_update_status(
+                    update_id="update-incomplete",
+                    phase="failed",
+                    target_version="1.1.0",
+                )
+                status = await agent_server.reconcile_server_update_status_after_startup()
+
+            self.assertEqual(status["phase"], "failed")
+            self.assertEqual(status["update_id"], original["update_id"])
+            runtime.clear_maintenance_sync.assert_not_called()
+
+    async def test_check_and_start_cannot_overwrite_active_status_during_grace(self):
+        manifest = AsyncMock(
+            side_effect=AssertionError("active update must block release discovery")
+        )
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+             patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", Path(temporary) / "status.json"), \
+             patch.object(agent_server, "server_update_is_active", return_value=False), \
+             patch.object(agent_server, "server_update_status_age_seconds", return_value=1.0), \
+             patch.object(agent_server, "signed_release_manifest", new=manifest):
+            original = agent_server.write_server_update_status(
+                update_id="update-active",
+                phase="starting",
+                target_version="1.1.0",
+            )
+            with self.assertRaises(HTTPException) as check_error:
+                await agent_server.check_server_update()
+            with self.assertRaises(HTTPException) as start_error:
+                await agent_server.start_server_update(
+                    agent_server.ServerUpdateRequest(version="1.1.0")
+                )
+            current = agent_server.read_server_update_status()
+
+        self.assertEqual(check_error.exception.status_code, 409)
+        self.assertEqual(start_error.exception.status_code, 409)
+        self.assertEqual(current["update_id"], original["update_id"])
+        self.assertEqual(current["phase"], "starting")
+        manifest.assert_not_awaited()
+
     async def test_startup_reconciliation_completes_an_installed_orphan(self):
         with tempfile.TemporaryDirectory() as temporary, \
              patch.object(agent_server, "SERVER_VERSION", "1.1.0"), \

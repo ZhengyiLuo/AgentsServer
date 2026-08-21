@@ -87,7 +87,20 @@ from claude_sdk_client import (
     create_claude_agent_options,
 )
 from update_runner import atomic_json as atomic_update_json
-from update_runner import ReleaseUnavailableError, check_release, utc_now as update_utc_now, version_key
+from update_runner import (
+    ReleaseUnavailableError,
+    check_release,
+    server_update_status_lock,
+    utc_now as update_utc_now,
+    version_key,
+)
+from team_hub_host import (
+    TEAM_HUB_MODE_HOST,
+    TEAM_HUB_MOUNT_PATH,
+    ManagedTeamHubHost,
+    configured_team_hub_hosts,
+    configured_team_hub_mode,
+)
 
 try:
     import tomllib
@@ -36705,6 +36718,7 @@ def signal_managed_server_restart(request_id: str) -> None:
                 message="Managed service ownership changed before restart.",
                 failed_at=update_utc_now(),
             )
+            TEAM_HUB_RUNTIME.reopen_admission_sync()
             return
         write_server_restart_status(
             phase="signaling",
@@ -36723,12 +36737,14 @@ def signal_managed_server_restart(request_id: str) -> None:
                 ),
                 failed_at=update_utc_now(),
             )
+            TEAM_HUB_RUNTIME.reopen_admission_sync()
 
 
 def server_update_work_message(
     active_session_ids: list[str],
     queued_turn_count: int,
     provider_work_labels: list[str] | None = None,
+    mutation_count: int = 0,
 ) -> str:
     parts: list[str] = []
     if active_session_ids:
@@ -36751,6 +36767,11 @@ def server_update_work_message(
         parts.append(
             f"{count} provider background task{'s' if count != 1 else ''} "
             f"({preview})"
+        )
+    if mutation_count:
+        parts.append(
+            f"{mutation_count} in-flight server change"
+            f"{'s' if mutation_count != 1 else ''}"
         )
     detail = " and ".join(parts) or "agent work"
     return (
@@ -36822,12 +36843,17 @@ def read_server_update_status() -> dict[str, Any]:
     return value
 
 
-def write_server_update_status(**changes: Any) -> dict[str, Any]:
+def _write_server_update_status_unlocked(**changes: Any) -> dict[str, Any]:
     value = read_server_update_status()
     value.update(changes)
     value["updated_at"] = update_utc_now()
     atomic_update_json(SERVER_UPDATE_STATUS_FILE, value)
     return value
+
+
+def write_server_update_status(**changes: Any) -> dict[str, Any]:
+    with server_update_status_lock(SERVER_UPDATE_STATUS_FILE):
+        return _write_server_update_status_unlocked(**changes)
 
 
 def server_update_tmux_name(update_id: str) -> str:
@@ -36854,37 +36880,153 @@ def server_update_status_age_seconds(status: dict[str, Any]) -> float:
     return max(0.0, (datetime.now(timezone.utc) - updated_at).total_seconds())
 
 
+def _server_update_team_hub_snapshot(status: dict[str, Any]) -> Path | None:
+    generation = str(status.get("team_hub_snapshot_generation") or "").strip()
+    if not generation:
+        return None
+    if re.fullmatch(r"snapshot_[A-Za-z0-9_]+", generation) is None:
+        raise RuntimeError("server update Team Hub snapshot generation is invalid")
+    return TEAM_HUB_DATA_DIR / "maintenance-backups" / generation
+
+
+def _verify_server_update_team_hub_identity(status: dict[str, Any]) -> None:
+    expected_hub_id = str(status.get("team_hub_id") or "").strip()
+    if not expected_hub_id:
+        return
+    expected_host_identity = str(
+        status.get("team_hub_host_server_identity") or ""
+    ).strip()
+    snapshot = _server_update_team_hub_snapshot(status)
+    capability = TEAM_HUB_RUNTIME.capability()
+    if (
+        snapshot is None
+        or not expected_host_identity
+        or capability.get("available") is not True
+        or capability.get("designated_host") is not True
+        or capability.get("hub_id") != expected_hub_id
+        or capability.get("host_server_identity") != expected_host_identity
+        or expected_host_identity != server_identity()
+    ):
+        raise RuntimeError("updated server lost its designated Team Hub identity")
+
+
+def _clear_exact_server_update_team_hub_fence(
+    status: dict[str, Any],
+) -> bool:
+    """Clear only the fence owned by this exact durable update record."""
+
+    marker = TEAM_HUB_RUNTIME.maintenance_fence_sync()
+    if marker is None:
+        return False
+    update_id = str(status.get("update_id") or "").strip()
+    snapshot = _server_update_team_hub_snapshot(status)
+    if not update_id or snapshot is None:
+        raise RuntimeError("active server update is not bound to its Team Hub fence")
+    return TEAM_HUB_RUNTIME.clear_maintenance_sync(
+        "server-update",
+        update_id,
+        snapshot,
+    )
+
+
+def _reconcile_server_update_team_hub_fence(status: dict[str, Any]) -> None:
+    """Clear a pre-status orphan, or verify an active update owns its fence."""
+
+    marker = TEAM_HUB_RUNTIME.maintenance_fence_sync()
+    if marker is None:
+        return
+    if marker.get("reason") != "server-update":
+        raise RuntimeError("unexpected Team Hub maintenance fence")
+    phase = str(status.get("phase") or "")
+    if phase in SERVER_UPDATE_ACTIVE_PHASES:
+        update_id = str(status.get("update_id") or "").strip()
+        snapshot = _server_update_team_hub_snapshot(status)
+        if (
+            not update_id
+            or snapshot is None
+            or marker.get("operation_id") != update_id
+            or marker.get("snapshot") != snapshot.name
+        ):
+            raise RuntimeError("active server update does not own the Team Hub fence")
+        return
+    if marker.get("operation_id") == str(status.get("update_id") or "").strip():
+        raise RuntimeError(
+            "terminal server update still has an incomplete Team Hub recovery fence"
+        )
+    # The process died after committing snapshot+fence but before it durably
+    # accepted an update. Since this release opened the exact bound Hub and no
+    # update is active, the marker is an orphan and may be cleared by identity.
+    TEAM_HUB_RUNTIME.clear_maintenance_sync(
+        "server-update",
+        str(marker["operation_id"]),
+        TEAM_HUB_DATA_DIR / "maintenance-backups" / str(marker["snapshot"]),
+    )
+
+
 def finalize_abandoned_server_update(status: dict[str, Any]) -> dict[str, Any]:
     """Release a stale update drain after its detached runner disappeared."""
 
-    target_version = str(status.get("target_version") or "")
-    if target_version == SERVER_VERSION:
-        return write_server_update_status(
-            phase="complete",
-            update_available=False,
-            installed_version=SERVER_VERSION,
-            message=f"AgentsServer {SERVER_VERSION} is installed and healthy.",
-            finished_at=status.get("finished_at") or update_utc_now(),
+    expected_update_id = str(status.get("update_id") or "")
+    with server_update_status_lock(SERVER_UPDATE_STATUS_FILE):
+        current = read_server_update_status()
+        if str(current.get("update_id") or "") != expected_update_id:
+            return current
+        if str(current.get("phase") or "") not in SERVER_UPDATE_ACTIVE_PHASES:
+            return current
+        # The status-file CAS lock and the caller's operation lock prevent an
+        # old updater or a new /start from replacing ownership. Clear this
+        # exact fence while the active phase still blocks HTTP mutations; only
+        # then publish a terminal phase.
+        _verify_server_update_team_hub_identity(current)
+        _reconcile_server_update_team_hub_fence(current)
+        if (
+            str(current.get("phase") or "") in {"installing", "restarting"}
+            and TEAM_HUB_RUNTIME.maintenance_fence_sync() is not None
+        ):
+            raise RuntimeError(
+                "server update requires verified Team Hub restore or handoff"
+            )
+        _clear_exact_server_update_team_hub_fence(current)
+        target_version = str(current.get("target_version") or "")
+        if target_version == SERVER_VERSION:
+            return _write_server_update_status_unlocked(
+                phase="complete",
+                update_available=False,
+                installed_version=SERVER_VERSION,
+                message=f"AgentsServer {SERVER_VERSION} is installed and healthy.",
+                finished_at=current.get("finished_at") or update_utc_now(),
+            )
+        return _write_server_update_status_unlocked(
+            phase="failed",
+            message=(
+                "The detached updater exited before reporting completion. "
+                "See server-update.log."
+            ),
+            finished_at=update_utc_now(),
         )
-    return write_server_update_status(
-        phase="failed",
-        message=(
-            "The detached updater exited before reporting completion. "
-            "See server-update.log."
-        ),
-        finished_at=update_utc_now(),
-    )
 
 
 async def reconcile_server_update_status_after_startup() -> dict[str, Any]:
     """Resolve an update phase orphaned by a crash or power loss."""
 
-    status = read_server_update_status()
-    if str(status.get("phase") or "") not in SERVER_UPDATE_ACTIVE_PHASES:
-        return status
-    if await asyncio.to_thread(server_update_is_active, status):
-        return status
-    return finalize_abandoned_server_update(status)
+    async with SERVER_UPDATE_OPERATION_LOCK:
+        status = read_server_update_status()
+        try:
+            await asyncio.to_thread(
+                _reconcile_server_update_team_hub_fence,
+                status,
+            )
+            if str(status.get("phase") or "") not in SERVER_UPDATE_ACTIVE_PHASES:
+                return status
+            if await asyncio.to_thread(server_update_is_active, status):
+                return status
+            return await asyncio.to_thread(finalize_abandoned_server_update, status)
+        except Exception as exc:
+            logger.error(
+                "server update maintenance reconciliation failed error_type=%s",
+                type(exc).__name__,
+            )
+            return status
 
 
 def server_update_runner_environment() -> dict[str, str]:
@@ -36985,11 +37127,29 @@ async def signed_release_manifest(
         raise HTTPException(status_code=502, detail=f"signed release check failed: {exc}") from exc
 
 
+TEAM_HUB_MODE, TEAM_HUB_CONFIG_ERROR = configured_team_hub_mode(
+    os.environ.get("AGENTSDOCK_TEAM_HUB_MODE")
+)
+TEAM_HUB_DATA_DIR = STATE_DIR / "team-hub"
+TEAM_HUB_RUNTIME = ManagedTeamHubHost(
+    mode=TEAM_HUB_MODE,
+    data_dir=TEAM_HUB_DATA_DIR,
+    server_identity=server_identity(),
+    allowed_hosts=configured_team_hub_hosts(
+        SERVER_BIND_ADDRESS,
+        os.environ.get("AGENTSDOCK_TEAM_HUB_ALLOWED_HOSTS"),
+    ),
+    config_error=TEAM_HUB_CONFIG_ERROR,
+    logger=logger,
+)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await STORE.load()
     await JOBS.load()
     ensure_dirs()
+    await asyncio.to_thread(TEAM_HUB_RUNTIME.initialize)
     await asyncio.to_thread(scrub_tmux_global_secret_environment)
     await CROSS_CHAT.initialize()
     for stale_authority in CROSS_CHAT_AUTHORITY_ROOT.glob("run_*.json"):
@@ -37039,6 +37199,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await TEAM_HUB_RUNTIME.shutdown()
         with suppress(Exception):
             await close_claude_sdk_manager()
         with suppress(Exception):
@@ -37069,13 +37230,25 @@ async def lifespan(app: FastAPI):
             await runtime_probe_task
 
 
+class AgentsServerCORSMiddleware(CORSMiddleware):
+    """Leave the mounted Hub's exact-origin policy entirely to the Hub."""
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        path = str(scope.get("path") or "") if isinstance(scope, dict) else ""
+        if path == TEAM_HUB_MOUNT_PATH or path.startswith(TEAM_HUB_MOUNT_PATH + "/"):
+            await self.app(scope, receive, send)
+            return
+        await super().__call__(scope, receive, send)
+
+
 app = FastAPI(title="AgentsServer", lifespan=lifespan)
 app.add_middleware(
-    CORSMiddleware,
+    AgentsServerCORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.mount(TEAM_HUB_MOUNT_PATH, TEAM_HUB_RUNTIME, name="team-hub")
 
 AGENT_HELPER_ROUTE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("POST", re.compile(r"^/api/agent/cross-chat/handoffs$")),
@@ -37144,8 +37317,25 @@ def server_restart_post_transport_error(request: Request) -> tuple[int, str] | N
 @app.middleware("http")
 async def require_agent_token(request: Request, call_next):
     global UNSAFE_HTTP_MUTATIONS_IN_FLIGHT
+    # Starlette otherwise redirects a bare mount path and builds Location from
+    # the untrusted Host header. The Hub contract is versioned below the mount;
+    # the bare prefix is deliberately inert for every method.
+    if request.url.path == TEAM_HUB_MOUNT_PATH:
+        return JSONResponse(
+            {
+                "error": {
+                    "code": "not_found",
+                    "message": "Resource not found",
+                }
+            },
+            status_code=404,
+        )
     if request.method == "OPTIONS" or not request.url.path.startswith("/api/"):
         return await call_next(request)
+    team_hub_route = (
+        request.url.path == TEAM_HUB_MOUNT_PATH
+        or request.url.path.startswith(TEAM_HUB_MOUNT_PATH + "/")
+    )
     # Agent helper routes use a per-run provider capability and perform their
     # own loopback + action/session validation in-route. They never accept the
     # client/admin bearer as a substitute for that capability.
@@ -37158,7 +37348,7 @@ async def require_agent_token(request: Request, call_next):
             {"detail": "agent helper route is restricted to loopback clients"},
             status_code=403,
         )
-    if not agent_helper_route and not request_authorized(request):
+    if not team_hub_route and not agent_helper_route and not request_authorized(request):
         logger.warning("unauthorized request method=%s path=%s host=%s", request.method, request.url.path, request.client.host if request.client else "-")
         return JSONResponse({"detail": "unauthorized"}, status_code=401)
 
@@ -37202,13 +37392,26 @@ async def require_agent_token(request: Request, call_next):
 
     unsafe_mutation = (
         request.method.upper() in UNSAFE_HTTP_MUTATION_METHODS
-        and request.url.path != "/api/admin/restart"
+        and request.url.path not in {
+            "/api/admin/restart",
+            "/api/admin/update/start",
+        }
     )
     if not unsafe_mutation:
         return await call_next(request)
 
     async with UNSAFE_HTTP_MUTATION_ADMISSION_LOCK:
         if managed_server_restart_blocks_work():
+            if team_hub_route:
+                return JSONResponse(
+                    {
+                        "error": {
+                            "code": "hub_maintenance",
+                            "message": "Team Hub is unavailable during server maintenance",
+                        }
+                    },
+                    status_code=503,
+                )
             return JSONResponse(
                 {
                     "detail": server_restart_error_detail(
@@ -37218,6 +37421,21 @@ async def require_agent_token(request: Request, call_next):
                         retryable=True,
                     )
                 },
+                status_code=409,
+            )
+        if managed_server_update_blocks_work():
+            if team_hub_route:
+                return JSONResponse(
+                    {
+                        "error": {
+                            "code": "hub_maintenance",
+                            "message": "Team Hub is unavailable during server maintenance",
+                        }
+                    },
+                    status_code=503,
+                )
+            return JSONResponse(
+                {"detail": "AgentsServer is preparing a managed update"},
                 status_code=409,
             )
         UNSAFE_HTTP_MUTATIONS_IN_FLIGHT += 1
@@ -37256,6 +37474,7 @@ async def health() -> dict[str, Any]:
             and bool(tmux["available"])
         ),
         "capabilities": {
+            "team_hub_v1": TEAM_HUB_RUNTIME.capability(),
             "server_restart": server_restart_capability(),
             "server_updates": {
                 "available": (
@@ -37900,19 +38119,43 @@ async def restart_server_endpoint(
                                 ),
                             ),
                         )
+                    try:
+                        restart_hub_snapshot = await TEAM_HUB_RUNTIME.prepare_maintenance(
+                            "server-restart", persistent_fence=False
+                        )
+                    except Exception as exc:
+                        raise HTTPException(
+                            status_code=503,
+                            detail=server_restart_error_detail(
+                                "team_hub_snapshot_failed",
+                                "AgentsServer could not verify the Team Hub restart snapshot.",
+                                action=(
+                                    "Retry after checking the designated host's local Team Hub logs."
+                                ),
+                                retryable=True,
+                            ),
+                        ) from exc
                     now = update_utc_now()
-                    restart_status = write_server_restart_status(
-                        phase="accepted",
-                        request_id=request_id,
-                        _source_instance_id=SERVER_INSTANCE_ID,
-                        message=(
-                            "AgentsServer accepted the restart and will briefly "
-                            "disconnect while its user service relaunches."
-                        ),
-                        requested_at=now,
-                        completed_at=None,
-                        failed_at=None,
-                    )
+                    try:
+                        restart_status = write_server_restart_status(
+                            phase="accepted",
+                            request_id=request_id,
+                            _source_instance_id=SERVER_INSTANCE_ID,
+                            message=(
+                                "AgentsServer accepted the restart and will briefly "
+                                "disconnect while its user service relaunches."
+                            ),
+                            requested_at=now,
+                            completed_at=None,
+                            failed_at=None,
+                        )
+                    except BaseException:
+                        await TEAM_HUB_RUNTIME.reopen_admission()
+                        raise
+                    # The durable restart phase now fences every unsafe Hub
+                    # mutation in the parent middleware. Reopen read admission
+                    # so health/discovery remains observable until SIGTERM.
+                    await TEAM_HUB_RUNTIME.reopen_admission()
 
         background_tasks.add_task(signal_managed_server_restart, request_id)
         return public_server_restart_status(restart_status)
@@ -37920,18 +38163,28 @@ async def restart_server_endpoint(
 
 @app.get("/api/admin/update")
 async def server_update_status() -> dict[str, Any]:
-    status = read_server_update_status()
-    phase = str(status.get("phase") or "")
-    if phase in SERVER_UPDATE_ACTIVE_PHASES:
-        updater_active = await asyncio.to_thread(server_update_is_active, status)
-        updater_stale = (
-            not updater_active
-            and server_update_status_age_seconds(status)
-            >= SERVER_UPDATE_START_GRACE_SECONDS
-        )
-        if updater_stale:
-            status = finalize_abandoned_server_update(status)
-    return status
+    async with SERVER_UPDATE_OPERATION_LOCK:
+        status = read_server_update_status()
+        phase = str(status.get("phase") or "")
+        if phase in SERVER_UPDATE_ACTIVE_PHASES:
+            updater_active = await asyncio.to_thread(server_update_is_active, status)
+            updater_stale = (
+                not updater_active
+                and server_update_status_age_seconds(status)
+                >= SERVER_UPDATE_START_GRACE_SECONDS
+            )
+            if updater_stale:
+                try:
+                    status = await asyncio.to_thread(
+                        finalize_abandoned_server_update,
+                        status,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "server update finalization failed error_type=%s",
+                        type(exc).__name__,
+                    )
+        return status
 
 
 @app.post("/api/admin/update/check")
@@ -37945,8 +38198,27 @@ async def check_server_update(
                 detail="AgentsServer is restarting",
             )
         status = read_server_update_status()
-        if await asyncio.to_thread(server_update_is_active, status):
-            raise HTTPException(status_code=409, detail="a server update is already running")
+        if str(status.get("phase") or "") in SERVER_UPDATE_ACTIVE_PHASES:
+            updater_active = await asyncio.to_thread(server_update_is_active, status)
+            if (
+                updater_active
+                or server_update_status_age_seconds(status)
+                < SERVER_UPDATE_START_GRACE_SECONDS
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="a server update is already running",
+                )
+            try:
+                status = await asyncio.to_thread(
+                    finalize_abandoned_server_update,
+                    status,
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="the previous server update could not be safely finalized",
+                ) from exc
         track: Literal["stable", "beta"] = (
             body.track
             if body is not None and body.track is not None
@@ -38001,8 +38273,27 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                 detail="AgentsServer is restarting",
             )
         status = read_server_update_status()
-        if await asyncio.to_thread(server_update_is_active, status):
-            raise HTTPException(status_code=409, detail="a server update is already running")
+        if str(status.get("phase") or "") in SERVER_UPDATE_ACTIVE_PHASES:
+            updater_active = await asyncio.to_thread(server_update_is_active, status)
+            if (
+                updater_active
+                or server_update_status_age_seconds(status)
+                < SERVER_UPDATE_START_GRACE_SECONDS
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="a server update is already running",
+                )
+            try:
+                status = await asyncio.to_thread(
+                    finalize_abandoned_server_update,
+                    status,
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="the previous server update could not be safely finalized",
+                ) from exc
         track: Literal["stable", "beta"] = body.track or status["track"]
         requested = str(body.version or status.get("latest_version") or "").strip()
         if not requested:
@@ -38050,6 +38341,7 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
             "--expected-version", requested,
             "--current-version", SERVER_VERSION,
             "--track", track,
+            "--update-id", update_id,
         ]
         auth_token_file: Path | None = None
         if AGENT_TOKEN:
@@ -38057,67 +38349,188 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                 f".server-update-{update_id}.auth.json"
             )
             command.extend(["--auth-token-file", str(auth_token_file)])
-        runner_environment = server_update_runner_environment()
-        if runner_environment:
-            command = [
-                "env",
-                *(f"{key}={value}" for key, value in runner_environment.items()),
-                *command,
-            ]
         channel_switch = track != server_release_track(SERVER_VERSION)
+        hub_snapshot: Path | None = None
         # Close admission and establish the durable update phase while holding
         # the same lock used to reserve turns.  This removes the race where a
         # turn could start after an idle check but before the detached updater
         # was launched.
         async with ACTIVE_LOCK:
             async with QUEUE_LOCK:
-                active_session_ids = sorted(
-                    BUSY_SESSIONS | SERVER_MAINTENANCE_SESSIONS
-                )
-                queued_turn_count = update_blocking_queued_turn_count_locked()
-                provider_work_labels = (
-                    []
-                    if active_session_ids or queued_turn_count
-                    else active_provider_background_work_labels()
-                )
-                if active_session_ids or queued_turn_count or provider_work_labels:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=server_update_work_message(
-                            active_session_ids,
-                            queued_turn_count,
-                            provider_work_labels,
-                        ),
+                async with UNSAFE_HTTP_MUTATION_ADMISSION_LOCK:
+                    active_session_ids = sorted(
+                        BUSY_SESSIONS | SERVER_MAINTENANCE_SESSIONS
                     )
-                status = write_server_update_status(
-                    update_id=update_id,
-                    phase="starting",
-                    track=track,
-                    current_track=server_release_track(SERVER_VERSION),
-                    channel_switch=channel_switch,
-                    target_version=requested,
-                    latest_version=requested,
-                    update_available=True,
-                    message=(
-                        f"Starting switch to {track} AgentsServer {requested}."
-                        if channel_switch
-                        else (
-                            f"Starting detached update to AgentsServer "
-                            f"{requested}."
+                    queued_turn_count = update_blocking_queued_turn_count_locked()
+                    mutation_count = UNSAFE_HTTP_MUTATIONS_IN_FLIGHT
+                    provider_work_labels = (
+                        []
+                        if active_session_ids or queued_turn_count or mutation_count
+                        else active_provider_background_work_labels()
+                    )
+                    if (
+                        active_session_ids
+                        or queued_turn_count
+                        or provider_work_labels
+                        or mutation_count
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=server_update_work_message(
+                                active_session_ids,
+                                queued_turn_count,
+                                provider_work_labels,
+                                mutation_count,
+                            ),
                         )
-                    ),
-                    started_at=update_utc_now(),
-                    finished_at=None,
-                )
-        try:
-            if auth_token_file is not None:
-                atomic_update_json(auth_token_file, {"token": AGENT_TOKEN})
-            await asyncio.to_thread(run_tmux, ["new-session", "-d", "-s", tmux_name, shlex.join(command)])
-        except Exception as exc:
+                    expected_server_identity = server_identity()
+                    hub_capability = TEAM_HUB_RUNTIME.capability()
+                    try:
+                        hub_snapshot = await TEAM_HUB_RUNTIME.prepare_maintenance(
+                            "server-update",
+                            operation_id=update_id,
+                        )
+                    except Exception as exc:
+                        raise HTTPException(
+                            status_code=503,
+                            detail=(
+                                "AgentsServer could not verify the Team Hub update "
+                                "snapshot; retry after checking local Team Hub logs"
+                            ),
+                        ) from exc
+                    command.extend(
+                        ["--expected-server-identity", expected_server_identity]
+                    )
+                    expected_hub_id: str | None = None
+                    if hub_snapshot is not None:
+                        expected_hub_id = str(hub_capability.get("hub_id") or "")
+                        if (
+                            hub_capability.get("available") is not True
+                            or hub_capability.get("designated_host") is not True
+                            or not expected_hub_id
+                        ):
+                            try:
+                                await TEAM_HUB_RUNTIME.clear_maintenance(
+                                    "server-update",
+                                    update_id,
+                                    hub_snapshot,
+                                )
+                            finally:
+                                await TEAM_HUB_RUNTIME.reopen_admission()
+                            raise HTTPException(
+                                status_code=503,
+                                detail="designated Team Hub identity is unavailable",
+                            )
+                        command.extend(
+                            [
+                                "--expected-team-hub-id",
+                                expected_hub_id,
+                                "--team-hub-snapshot",
+                                str(hub_snapshot),
+                                "--team-hub-data-dir",
+                                str(TEAM_HUB_DATA_DIR),
+                            ]
+                        )
+                    try:
+                        status = write_server_update_status(
+                            update_id=update_id,
+                            phase="starting",
+                            track=track,
+                            current_track=server_release_track(SERVER_VERSION),
+                            channel_switch=channel_switch,
+                            target_version=requested,
+                            latest_version=requested,
+                            update_available=True,
+                            team_hub_id=expected_hub_id,
+                            team_hub_host_server_identity=(
+                                expected_server_identity
+                                if hub_snapshot is not None
+                                else None
+                            ),
+                            team_hub_snapshot_generation=(
+                                hub_snapshot.name if hub_snapshot is not None else None
+                            ),
+                            message=(
+                                f"Starting switch to {track} AgentsServer {requested}."
+                                if channel_switch
+                                else (
+                                    f"Starting detached update to AgentsServer "
+                                    f"{requested}."
+                                )
+                            ),
+                            started_at=update_utc_now(),
+                            finished_at=None,
+                        )
+                    except BaseException:
+                        try:
+                            if hub_snapshot is not None:
+                                await TEAM_HUB_RUNTIME.clear_maintenance(
+                                    "server-update",
+                                    update_id,
+                                    hub_snapshot,
+                                )
+                        finally:
+                            await TEAM_HUB_RUNTIME.reopen_admission()
+                        raise
+                    # The durable starting phase now closes unsafe mutation
+                    # admission. Reads may resume while the detached updater
+                    # downloads and verifies the release.
+                    TEAM_HUB_RUNTIME.reopen_admission_sync()
+
+        async def fail_runner_launch(exc: BaseException) -> None:
             if auth_token_file is not None:
                 with suppress(FileNotFoundError):
                     auth_token_file.unlink()
-            write_server_update_status(phase="failed", message=f"Could not start detached updater: {exc}", finished_at=update_utc_now())
+            fence_clear_failed = False
+            try:
+                if hub_snapshot is not None:
+                    await TEAM_HUB_RUNTIME.clear_maintenance(
+                        "server-update",
+                        update_id,
+                        hub_snapshot,
+                    )
+            except Exception:
+                fence_clear_failed = True
+                logger.error("Team Hub update fence clear failed after runner launch failure")
+            try:
+                if not fence_clear_failed:
+                    write_server_update_status(
+                        phase="failed",
+                        message=f"Could not start detached updater: {exc}",
+                        finished_at=update_utc_now(),
+                    )
+            finally:
+                await TEAM_HUB_RUNTIME.reopen_admission()
+
+        try:
+            runner_environment = server_update_runner_environment()
+            if runner_environment:
+                command = [
+                    "env",
+                    *(f"{key}={value}" for key, value in runner_environment.items()),
+                    *command,
+                ]
+            if auth_token_file is not None:
+                atomic_update_json(auth_token_file, {"token": AGENT_TOKEN})
+            launch_task = asyncio.create_task(
+                asyncio.to_thread(
+                    run_tmux,
+                    ["new-session", "-d", "-s", tmux_name, shlex.join(command)],
+                )
+            )
+            try:
+                await asyncio.shield(launch_task)
+            except asyncio.CancelledError:
+                launch_error: Exception | None = None
+                try:
+                    await launch_task
+                except Exception as exc:
+                    launch_error = exc
+                if launch_error is not None:
+                    await fail_runner_launch(launch_error)
+                raise
+        except Exception as exc:
+            await fail_runner_launch(exc)
             raise HTTPException(status_code=500, detail="could not start detached updater") from exc
         return status
 
@@ -44014,7 +44427,16 @@ def main() -> int:
     parser.add_argument("--bind", default=agentsdock_setting("AGENT_BIND", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(agentsdock_setting("AGENT_PORT", "7850")))
     args = parser.parse_args()
-    uvicorn.run("agent_server:app", host=args.bind, port=args.port, app_dir=str(Path(__file__).parent), log_level="info")
+    uvicorn.run(
+        app,
+        host=args.bind,
+        port=args.port,
+        log_level="info",
+        # The local-only Hub gate relies on the actual socket peer. This
+        # preview does not support header-trusting proxy operation.
+        proxy_headers=False,
+        server_header=False,
+    )
     return 0
 
 

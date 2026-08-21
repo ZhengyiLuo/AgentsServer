@@ -12,6 +12,7 @@ UV_INSTALL_TIMEOUT_SECONDS="${AGENTS_SERVER_UV_INSTALL_TIMEOUT_SECONDS:-300}"
 DEPENDENCY_SYNC_TIMEOUT_SECONDS="${AGENTS_SERVER_DEPENDENCY_TIMEOUT_SECONDS:-1200}"
 INSTALL_HEARTBEAT_SECONDS="${AGENTS_SERVER_INSTALL_HEARTBEAT_SECONDS:-15}"
 HEALTH_CHECK_ATTEMPTS="${AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS:-45}"
+ROLLBACK_HEALTH_CHECK_MAX_ATTEMPTS=45
 INSTALL_ROOT="${AGENTS_SERVER_INSTALL_DIR:-$HOME/.local/share/agents-server}"
 CONFIG_ROOT="${AGENTS_SERVER_CONFIG_DIR:-$HOME/.config/agents-server}"
 LEGACY_STATE_ROOT="$HOME/.zenithbot-agent"
@@ -33,6 +34,13 @@ NON_INTERACTIVE="false"
 PORT_EXPLICIT="false"
 PORT_FALLBACK="auto"
 PORT_FALLBACK_ATTEMPTS=5
+TEAM_HUB_MODE_OVERRIDE=""
+TEAM_HUB_MODE="disabled"
+EXPECTED_SERVER_IDENTITY=""
+EXPECTED_TEAM_HUB_ID=""
+TEAM_HUB_SNAPSHOT=""
+TEAM_HUB_DATA_DIR=""
+TEAM_HUB_OPERATION_ID=""
 
 if [[ -t 1 ]] && [[ "${TERM:-}" != "dumb" ]] && [[ -z "${NO_COLOR:-}" ]]; then
   COLOR_GREEN=$'\033[32m'
@@ -53,7 +61,7 @@ DOT_MARK="${COLOR_YELLOW}○${COLOR_RESET}"
 
 usage() {
   cat <<'USAGE'
-Usage: ./install.sh [--port PORT] [--bind ADDRESS] [--release-version VERSION] [--non-interactive] [--allow-port-fallback|--no-port-fallback]
+Usage: ./install.sh [--port PORT] [--bind ADDRESS] [--release-version VERSION] [--team-hub-host|--no-team-hub-host] [--non-interactive] [--allow-port-fallback|--no-port-fallback]
 
 Installs or updates AgentsServer for the current user. Releases and Python
 runtimes are versioned, the previous healthy release is retained for rollback,
@@ -73,6 +81,12 @@ already occupied by a service that does not authenticate as AgentsServer.
 --no-port-fallback disables automatically retrying on the next free port when
 the default port is already held by another process.
 
+--team-hub-host designates this server as the one local Team Hub host.
+--no-team-hub-host stops Team Hub hosting while preserving its state. This beta
+does not support direct reactivation of preserved Hub state; recovery requires
+a signed managed operation. Without either option, an existing host/disabled
+setting is preserved; new installs default to disabled.
+
 --show-token prints the current access token for an already-installed
 AgentsServer and exits immediately; it makes no other changes.
 USAGE
@@ -88,6 +102,29 @@ while (($#)); do
     --non-interactive) NON_INTERACTIVE="true"; shift ;;
     --allow-port-fallback) PORT_FALLBACK="true"; shift ;;
     --no-port-fallback) PORT_FALLBACK="false"; shift ;;
+    --team-hub-host)
+      if [[ "$TEAM_HUB_MODE_OVERRIDE" == "disabled" ]]; then
+        echo "--team-hub-host and --no-team-hub-host cannot be combined." >&2
+        exit 2
+      fi
+      TEAM_HUB_MODE_OVERRIDE="host"
+      shift
+      ;;
+    --no-team-hub-host)
+      if [[ "$TEAM_HUB_MODE_OVERRIDE" == "host" ]]; then
+        echo "--team-hub-host and --no-team-hub-host cannot be combined." >&2
+        exit 2
+      fi
+      TEAM_HUB_MODE_OVERRIDE="disabled"
+      shift
+      ;;
+    # Internal, fail-closed continuity assertions passed only by the
+    # authenticated managed updater.
+    --expected-server-identity) EXPECTED_SERVER_IDENTITY="${2:-}"; shift 2 ;;
+    --expected-team-hub-id) EXPECTED_TEAM_HUB_ID="${2:-}"; shift 2 ;;
+    --team-hub-snapshot) TEAM_HUB_SNAPSHOT="${2:-}"; shift 2 ;;
+    --team-hub-data-dir) TEAM_HUB_DATA_DIR="${2:-}"; shift 2 ;;
+    --team-hub-operation-id) TEAM_HUB_OPERATION_ID="${2:-}"; shift 2 ;;
     --show-token) SHOW_TOKEN="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -105,6 +142,25 @@ fi
 if [[ ! "$PORT" =~ ^[0-9]+$ ]] || ((PORT < 1 || PORT > 65535)); then
   echo "Port must be an integer between 1 and 65535." >&2
   exit 2
+fi
+
+if [[ -n "$EXPECTED_SERVER_IDENTITY" ]] && [[ ! "$EXPECTED_SERVER_IDENTITY" =~ ^[A-Za-z0-9_.:-]{8,240}$ ]]; then
+  echo "Expected server identity is invalid." >&2
+  exit 2
+fi
+if [[ -n "$EXPECTED_TEAM_HUB_ID" ]] && [[ ! "$EXPECTED_TEAM_HUB_ID" =~ ^[A-Za-z0-9_.:-]{8,240}$ ]]; then
+  echo "Expected Team Hub identity is invalid." >&2
+  exit 2
+fi
+if [[ -n "$TEAM_HUB_OPERATION_ID" ]] && [[ ! "$TEAM_HUB_OPERATION_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then
+  echo "Managed Team Hub operation ID is invalid." >&2
+  exit 2
+fi
+if [[ -n "$EXPECTED_TEAM_HUB_ID" || -n "$TEAM_HUB_SNAPSHOT" || -n "$TEAM_HUB_DATA_DIR" || -n "$TEAM_HUB_OPERATION_ID" ]]; then
+  if [[ -z "$EXPECTED_SERVER_IDENTITY" || -z "$EXPECTED_TEAM_HUB_ID" || -z "$TEAM_HUB_SNAPSHOT" || -z "$TEAM_HUB_DATA_DIR" || -z "$TEAM_HUB_OPERATION_ID" ]]; then
+    echo "Managed Team Hub rollback arguments must be supplied together with the expected server identity." >&2
+    exit 2
+  fi
 fi
 
 SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -140,6 +196,153 @@ CURRENT_LINK="$INSTALL_ROOT/current"
 PREVIOUS_LINK="$INSTALL_ROOT/previous"
 ENV_FILE="$CONFIG_ROOT/env"
 LEGACY_SERVICE_FILE="$HOME/.config/systemd/user/$LEGACY_SERVICE_NAME.service"
+OLD_TARGET=""
+RELEASE_ACTIVATED="false"
+CANDIDATE_SERVICE_MAY_HAVE_STARTED="false"
+TEAM_HUB_RECOVERY_ATTEMPTED="false"
+TEAM_HUB_OPERATION_FINALIZED="false"
+TEAM_HUB_OPERATION_PENDING="false"
+[[ -z "$EXPECTED_TEAM_HUB_ID" ]] || TEAM_HUB_OPERATION_PENDING="true"
+IN_EXIT_CLEANUP="false"
+ENV_CONFIG_BACKUP=""
+ENV_CONFIG_EXISTED="false"
+ENV_CONFIG_CAPTURED="false"
+SERVICE_CONFIG_BACKUP=""
+SERVICE_CONFIG_EXISTED="false"
+SERVICE_CONFIG_CAPTURED="false"
+
+team_hub_control_runtime() {
+  local preferred_root="${1:-}"
+  local candidate=""
+  for candidate in \
+    "$preferred_root" \
+    "${OLD_TARGET:-}" \
+    "$CURRENT_LINK" \
+    "$RELEASE_DIR" \
+    "$STAGE_DIR" \
+    "$SOURCE_DIR"; do
+    [[ -n "$candidate" ]] || continue
+    if [[ -f "$candidate/agentsdock_team_hub/store.py" && -x "$candidate/.venv/bin/python" ]]; then
+      printf '%s\n%s\n' "$candidate/.venv/bin/python" "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+clear_team_hub_operation_fence() {
+  [[ "$TEAM_HUB_OPERATION_PENDING" == "true" ]] || return 0
+  local runtime=""
+  local python_path=""
+  local source_root=""
+  runtime="$(team_hub_control_runtime "${1:-}")" || {
+    echo "No installed runtime can verify the Team Hub maintenance fence." >&2
+    return 1
+  }
+  python_path="${runtime%%$'\n'*}"
+  source_root="${runtime#*$'\n'}"
+  PYTHONPATH="$source_root" "$python_path" -c '
+from pathlib import Path
+import sys
+from agentsdock_team_hub.store import HubStore
+
+cleared = HubStore.clear_maintenance_fence_control(
+    Path(sys.argv[1]),
+    expected_hub_id=sys.argv[2],
+    expected_host_identity=sys.argv[3],
+    expected_reason="server-update",
+    expected_operation_id=sys.argv[4],
+    expected_snapshot=Path(sys.argv[5]),
+)
+if not cleared:
+    raise RuntimeError("the exact Team Hub maintenance fence is missing")
+' \
+    "$TEAM_HUB_DATA_DIR" \
+    "$EXPECTED_TEAM_HUB_ID" \
+    "$EXPECTED_SERVER_IDENTITY" \
+    "$TEAM_HUB_OPERATION_ID" \
+    "$TEAM_HUB_SNAPSHOT"
+}
+
+mask_install_signals() {
+  trap '' HUP INT TERM
+}
+
+resume_install_signals() {
+  trap 'exit 130' HUP INT TERM
+}
+
+verify_team_hub_operation_fence() {
+  [[ "$TEAM_HUB_OPERATION_PENDING" == "true" ]] || return 0
+  local runtime=""
+  local python_path=""
+  local source_root=""
+  runtime="$(team_hub_control_runtime "${1:-}")" || {
+    echo "No installed runtime can verify the Team Hub maintenance fence." >&2
+    return 1
+  }
+  python_path="${runtime%%$'\n'*}"
+  source_root="${runtime#*$'\n'}"
+  PYTHONPATH="$source_root" "$python_path" -c '
+from pathlib import Path
+import sys
+from agentsdock_team_hub.store import HubStore
+
+matched = HubStore.maintenance_fence_matches_control(
+    Path(sys.argv[1]),
+    expected_hub_id=sys.argv[2],
+    expected_host_identity=sys.argv[3],
+    expected_reason="server-update",
+    expected_operation_id=sys.argv[4],
+    expected_snapshot=Path(sys.argv[5]),
+)
+if not matched:
+    raise RuntimeError("the exact Team Hub maintenance fence is missing")
+' \
+    "$TEAM_HUB_DATA_DIR" \
+    "$EXPECTED_TEAM_HUB_ID" \
+    "$EXPECTED_SERVER_IDENTITY" \
+    "$TEAM_HUB_OPERATION_ID" \
+    "$TEAM_HUB_SNAPSHOT"
+}
+
+verify_team_hub_rollback_snapshot() {
+  [[ "$TEAM_HUB_OPERATION_PENDING" == "true" ]] || return 0
+  local runtime=""
+  local python_path=""
+  local source_root=""
+  runtime="$(team_hub_control_runtime "${1:-}")" || {
+    echo "No installed runtime can verify the Team Hub rollback snapshot." >&2
+    return 1
+  }
+  python_path="${runtime%%$'\n'*}"
+  source_root="${runtime#*$'\n'}"
+  PYTHONPATH="$source_root" "$python_path" -m agentsdock_team_hub.cli \
+    verify-snapshot \
+    --data-dir "$TEAM_HUB_DATA_DIR" \
+    --snapshot "$TEAM_HUB_SNAPSHOT" \
+    --expected-host-identity "$EXPECTED_SERVER_IDENTITY" \
+    --expected-hub-id "$EXPECTED_TEAM_HUB_ID" \
+    --expected-operation-id "$TEAM_HUB_OPERATION_ID"
+}
+
+early_operation_cleanup() {
+  local exit_status=$?
+  trap - EXIT
+  mask_install_signals
+  set +e
+  if [[ "$exit_status" != "0" && "$TEAM_HUB_OPERATION_PENDING" == "true" && "$TEAM_HUB_OPERATION_FINALIZED" != "true" ]]; then
+    if clear_team_hub_operation_fence "$CURRENT_LINK"; then
+      TEAM_HUB_OPERATION_FINALIZED="true"
+    else
+      echo "AgentsServer install failed before takeover and could not clear the exact Team Hub maintenance fence." >&2
+    fi
+  fi
+  exit "$exit_status"
+}
+
+trap early_operation_cleanup EXIT
+trap 'exit 130' HUP INT TERM
 
 read_env_value() {
   local file="$1"
@@ -188,6 +391,9 @@ if [[ "$SHOW_TOKEN" == "true" ]]; then
 fi
 
 OS_NAME="$(uname -s)"
+SYSTEMD_SERVICE_FILE="$HOME/.config/systemd/user/$SERVICE_NAME.service"
+LABEL="com.agentsdock.server"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 SERVER_PATH=""
 append_server_path() {
   local candidate="$1"
@@ -222,14 +428,127 @@ append_server_path "/usr/local/bin"
 append_server_path "/usr/bin"
 append_server_path "/bin"
 export PATH="$SERVER_PATH"
-RELEASE_FILES=(agent_server.py agentsdock_jobs.py agentsdock_chats.py agentsdock_publish.py claude_sdk_client.py codex_app_server.py install.sh uninstall.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem)
+
+EXISTING_TEAM_HUB_MODE="$(read_env_value "$ENV_FILE" AGENTSDOCK_TEAM_HUB_MODE)"
+[[ -n "$EXISTING_TEAM_HUB_MODE" ]] || EXISTING_TEAM_HUB_MODE="$(read_env_value "$LEGACY_ENV_FILE" AGENTSDOCK_TEAM_HUB_MODE)"
+[[ -n "$EXISTING_TEAM_HUB_MODE" ]] || EXISTING_TEAM_HUB_MODE="${AGENTSDOCK_TEAM_HUB_MODE:-}"
+TEAM_HUB_MODE="${TEAM_HUB_MODE_OVERRIDE:-${EXISTING_TEAM_HUB_MODE:-disabled}}"
+if [[ "$TEAM_HUB_MODE" != "host" && "$TEAM_HUB_MODE" != "disabled" ]]; then
+  echo "AGENTSDOCK_TEAM_HUB_MODE must be host or disabled." >&2
+  exit 2
+fi
+if [[ -n "$EXPECTED_TEAM_HUB_ID" && "$TEAM_HUB_MODE" != "host" ]]; then
+  echo "Managed Team Hub continuity requires AGENTSDOCK_TEAM_HUB_MODE=host." >&2
+  exit 2
+fi
+TEAM_HUB_CANONICAL_DATA_DIR="$STATE_ROOT/team-hub"
+if [[ "$TEAM_HUB_OPERATION_PENDING" == "true" && "$TEAM_HUB_DATA_DIR" != "$TEAM_HUB_CANONICAL_DATA_DIR" ]]; then
+  echo "Managed Team Hub data must use the configured AgentsServer state directory." >&2
+  exit 2
+fi
+if [[ "$TEAM_HUB_MODE" == "host" && "$TEAM_HUB_OPERATION_PENDING" != "true" ]]; then
+  TEAM_HUB_EXISTING_STATE="false"
+  for candidate in \
+    "$TEAM_HUB_CANONICAL_DATA_DIR/team-hub.sqlite3" \
+    "$TEAM_HUB_CANONICAL_DATA_DIR/team-hub.sqlite3-wal" \
+    "$TEAM_HUB_CANONICAL_DATA_DIR/team-hub.sqlite3-shm" \
+    "$TEAM_HUB_CANONICAL_DATA_DIR/access-token-signing.key" \
+    "$TEAM_HUB_CANONICAL_DATA_DIR/maintenance-fence.json"; do
+    if [[ -e "$candidate" || -L "$candidate" ]]; then
+      TEAM_HUB_EXISTING_STATE="true"
+      break
+    fi
+  done
+  if [[ "$TEAM_HUB_EXISTING_STATE" != "true" && -d "$TEAM_HUB_CANONICAL_DATA_DIR" ]]; then
+    if find "$TEAM_HUB_CANONICAL_DATA_DIR" -maxdepth 1 -type f -name '*.proof' -print -quit | grep -q .; then
+      TEAM_HUB_EXISTING_STATE="true"
+    fi
+  fi
+  if [[ "$TEAM_HUB_EXISTING_STATE" == "true" ]]; then
+    echo "Existing Team Hub state requires a signed managed update with an exact maintenance snapshot." >&2
+    echo "  Direct adoption or update of an existing Team Hub database is not supported by this beta." >&2
+    exit 1
+  fi
+fi
+
+RELEASE_FILES=(agent_server.py team_hub_host.py agentsdock_jobs.py agentsdock_chats.py agentsdock_publish.py claude_sdk_client.py codex_app_server.py install.sh uninstall.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem)
+RELEASE_DIRECTORIES=(agentsdock_team_hub)
+TEAM_HUB_RELEASE_FILES=(
+  __init__.py
+  auth.py
+  cli.py
+  database.py
+  security.py
+  service.py
+  store.py
+  migrations/__init__.py
+  migrations/0001_identity_auth.sql
+  migrations/0002_teamspace_ledger.sql
+  migrations/0003_service_runtime.sql
+  migrations/0004_managed_host_binding.sql
+)
 
 for name in "${RELEASE_FILES[@]}"; do
-  if [[ ! -f "$SOURCE_DIR/$name" ]]; then
-    echo "$name is missing beside install.sh." >&2
+  if [[ ! -f "$SOURCE_DIR/$name" || -L "$SOURCE_DIR/$name" ]]; then
+    echo "$name is missing beside install.sh or is not a regular release file." >&2
     exit 1
   fi
 done
+for name in "${RELEASE_DIRECTORIES[@]}"; do
+  if [[ ! -d "$SOURCE_DIR/$name" || -L "$SOURCE_DIR/$name" ]]; then
+    echo "$name is missing beside install.sh or is not a real directory." >&2
+    exit 1
+  fi
+  if find "$SOURCE_DIR/$name" \( -type l -o -type f \( -name '*.pyc' -o -name '*.pyo' \) -o -type d -name '__pycache__' -o \( ! -type d ! -type f \) \) -print -quit | grep -q .; then
+    echo "$name contains linked or generated entries and cannot be installed." >&2
+    exit 1
+  fi
+done
+for name in "${TEAM_HUB_RELEASE_FILES[@]}"; do
+  if [[ ! -f "$SOURCE_DIR/agentsdock_team_hub/$name" || -L "$SOURCE_DIR/agentsdock_team_hub/$name" ]]; then
+    echo "agentsdock_team_hub/$name is missing or is not a regular release file." >&2
+    exit 1
+  fi
+done
+TEAM_HUB_RELEASE_FILE_COUNT="$(find "$SOURCE_DIR/agentsdock_team_hub" -type f | wc -l)"
+TEAM_HUB_RELEASE_FILE_COUNT="${TEAM_HUB_RELEASE_FILE_COUNT//[[:space:]]/}"
+if [[ "$TEAM_HUB_RELEASE_FILE_COUNT" != "${#TEAM_HUB_RELEASE_FILES[@]}" ]]; then
+  echo "agentsdock_team_hub contains unexpected release files." >&2
+  exit 1
+fi
+TEAM_HUB_RELEASE_DIRECTORY_COUNT="$(find "$SOURCE_DIR/agentsdock_team_hub" -type d | wc -l)"
+TEAM_HUB_RELEASE_DIRECTORY_COUNT="${TEAM_HUB_RELEASE_DIRECTORY_COUNT//[[:space:]]/}"
+if [[ "$TEAM_HUB_RELEASE_DIRECTORY_COUNT" != "2" ]]; then
+  echo "agentsdock_team_hub contains unexpected release directories." >&2
+  exit 1
+fi
+
+if [[ "$TEAM_HUB_OPERATION_PENDING" == "true" ]]; then
+  TEAM_HUB_SNAPSHOT_PARENT="${TEAM_HUB_SNAPSHOT%/*}"
+  TEAM_HUB_SNAPSHOT_NAME="${TEAM_HUB_SNAPSHOT##*/}"
+  if [[ "$TEAM_HUB_SNAPSHOT_PARENT" != "$TEAM_HUB_DATA_DIR/maintenance-backups" || ! "$TEAM_HUB_SNAPSHOT_NAME" =~ ^snapshot_[A-Za-z0-9_]+$ ]]; then
+    echo "Managed Team Hub snapshot is not an exact maintenance generation." >&2
+    exit 2
+  fi
+  if [[ ! -d "$TEAM_HUB_DATA_DIR" || -L "$TEAM_HUB_DATA_DIR" || ! -d "$TEAM_HUB_SNAPSHOT" || -L "$TEAM_HUB_SNAPSHOT" ]]; then
+    echo "Managed Team Hub data or snapshot directory is unavailable or unsafe." >&2
+    exit 1
+  fi
+  for candidate in manifest.json team-hub.sqlite3 access-token-signing.key; do
+    if [[ ! -f "$TEAM_HUB_SNAPSHOT/$candidate" || -L "$TEAM_HUB_SNAPSHOT/$candidate" ]]; then
+      echo "Managed Team Hub snapshot is missing a safe $candidate file." >&2
+      exit 1
+    fi
+  done
+  if ! verify_team_hub_operation_fence "$CURRENT_LINK"; then
+    echo "Managed Team Hub installer takeover does not own the exact live maintenance fence." >&2
+    exit 1
+  fi
+  if ! verify_team_hub_rollback_snapshot "$CURRENT_LINK"; then
+    echo "Managed Team Hub rollback snapshot failed full read-only verification before candidate activation." >&2
+    exit 1
+  fi
+fi
 
 PREFLIGHT_FAILED="false"
 MISSING_PREREQUISITE_NAMES=()
@@ -363,12 +682,135 @@ preflight_prerequisites() {
 # migration, release staging, or service changes.
 preflight_prerequisites || exit 1
 
-SERVICE_CONFIG_BACKUP=""
 UV_INSTALLER=""
 ACTIVE_STAGE_PID=""
 ACTIVE_STAGE_PGID=""
 INSTALL_LOCK_DIR="$INSTALL_ROOT/.install-lock"
 INSTALL_LOCK_HELD="false"
+PREVIOUS_LINK_WAS_SYMLINK="false"
+PREVIOUS_LINK_TARGET=""
+PREVIOUS_LINK_STATE_CAPTURED="false"
+CURRENT_LINK_STATE_CAPTURED="false"
+CURRENT_LINK_WAS_SYMLINK="false"
+CURRENT_LINK_WAS_DIRECTORY="false"
+CURRENT_LINK_TARGET=""
+
+backup_runtime_configuration() {
+  if [[ -f "$ENV_FILE" && ! -L "$ENV_FILE" ]]; then
+    ENV_CONFIG_BACKUP="$(mktemp "${TMPDIR:-/tmp}/agents-server-env.XXXXXX")"
+    cp -p "$ENV_FILE" "$ENV_CONFIG_BACKUP"
+    ENV_CONFIG_EXISTED="true"
+  elif [[ -e "$ENV_FILE" || -L "$ENV_FILE" ]]; then
+    echo "$ENV_FILE is not a regular configuration file." >&2
+    return 1
+  fi
+  ENV_CONFIG_CAPTURED="true"
+
+  local service_file="$SYSTEMD_SERVICE_FILE"
+  [[ "$OS_NAME" != "Darwin" ]] || service_file="$PLIST"
+  if [[ -f "$service_file" && ! -L "$service_file" ]]; then
+    SERVICE_CONFIG_BACKUP="$(mktemp "${TMPDIR:-/tmp}/agents-server-service.XXXXXX")"
+    cp -p "$service_file" "$SERVICE_CONFIG_BACKUP"
+    SERVICE_CONFIG_EXISTED="true"
+  elif [[ -e "$service_file" || -L "$service_file" ]]; then
+    echo "$service_file is not a regular service configuration file." >&2
+    return 1
+  fi
+  SERVICE_CONFIG_CAPTURED="true"
+
+  if [[ -L "$CURRENT_LINK" ]]; then
+    CURRENT_LINK_WAS_SYMLINK="true"
+    CURRENT_LINK_TARGET="$(readlink "$CURRENT_LINK")"
+  elif [[ -d "$CURRENT_LINK" ]]; then
+    CURRENT_LINK_WAS_DIRECTORY="true"
+  elif [[ -e "$CURRENT_LINK" ]]; then
+    echo "$CURRENT_LINK is not a supported release link or directory." >&2
+    return 1
+  fi
+  CURRENT_LINK_STATE_CAPTURED="true"
+
+  if [[ -L "$PREVIOUS_LINK" ]]; then
+    PREVIOUS_LINK_WAS_SYMLINK="true"
+    PREVIOUS_LINK_TARGET="$(readlink "$PREVIOUS_LINK")"
+  elif [[ -e "$PREVIOUS_LINK" ]]; then
+    echo "$PREVIOUS_LINK is not a symbolic link." >&2
+    return 1
+  fi
+  PREVIOUS_LINK_STATE_CAPTURED="true"
+}
+
+restore_regular_configuration() {
+  local target="$1"
+  local backup="$2"
+  local existed="$3"
+  if [[ "$existed" == "true" ]]; then
+    [[ -n "$backup" && -f "$backup" ]] || return 1
+    cp -p "$backup" "$target"
+  else
+    if [[ -d "$target" && ! -L "$target" ]]; then
+      echo "Refusing to replace unexpected configuration directory $target." >&2
+      return 1
+    fi
+    if [[ -e "$target" || -L "$target" ]]; then
+      rm -f "$target"
+    fi
+  fi
+}
+
+restore_runtime_configuration() {
+  [[ "$ENV_CONFIG_CAPTURED" != "true" ]] || \
+    restore_regular_configuration "$ENV_FILE" "$ENV_CONFIG_BACKUP" "$ENV_CONFIG_EXISTED" || return
+  local service_file="$SYSTEMD_SERVICE_FILE"
+  [[ "$OS_NAME" != "Darwin" ]] || service_file="$PLIST"
+  [[ "$SERVICE_CONFIG_CAPTURED" != "true" ]] || \
+    restore_regular_configuration "$service_file" "$SERVICE_CONFIG_BACKUP" "$SERVICE_CONFIG_EXISTED" || return
+}
+
+restore_release_links() {
+  [[ "$CURRENT_LINK_STATE_CAPTURED" == "true" ]] || return 0
+  if [[ "$CURRENT_LINK_WAS_DIRECTORY" == "true" ]]; then
+    if [[ -n "$OLD_TARGET" && -d "$OLD_TARGET" ]]; then
+      if [[ -e "$CURRENT_LINK" && ! -L "$CURRENT_LINK" ]]; then
+        echo "Refusing to replace unexpected current release path $CURRENT_LINK." >&2
+        return 1
+      fi
+      ln -sfn "$OLD_TARGET" "$CURRENT_LINK" || return
+    elif [[ ! -d "$CURRENT_LINK" || -L "$CURRENT_LINK" ]]; then
+      echo "The original current release directory cannot be recovered." >&2
+      return 1
+    fi
+  elif [[ "$CURRENT_LINK_WAS_SYMLINK" == "true" ]]; then
+    if [[ -n "$OLD_TARGET" && -e "$OLD_TARGET" ]]; then
+      ln -sfn "$OLD_TARGET" "$CURRENT_LINK" || return
+    elif [[ -L "$CURRENT_LINK" && "$(readlink "$CURRENT_LINK")" == "$CURRENT_LINK_TARGET" ]]; then
+      :
+    else
+      echo "The original current release link cannot be recovered." >&2
+      return 1
+    fi
+  elif [[ -L "$CURRENT_LINK" ]]; then
+    rm -f "$CURRENT_LINK" || return
+  elif [[ -e "$CURRENT_LINK" ]]; then
+    echo "Refusing to replace unexpected current release path $CURRENT_LINK." >&2
+    return 1
+  fi
+
+  if [[ "$PREVIOUS_LINK_STATE_CAPTURED" == "true" ]]; then
+    if [[ "$PREVIOUS_LINK_WAS_SYMLINK" == "true" ]]; then
+      ln -sfn "$PREVIOUS_LINK_TARGET" "$PREVIOUS_LINK" || return
+    elif [[ -L "$PREVIOUS_LINK" ]]; then
+      rm -f "$PREVIOUS_LINK" || return
+    elif [[ -e "$PREVIOUS_LINK" ]]; then
+      echo "Refusing to replace unexpected previous release path $PREVIOUS_LINK." >&2
+      return 1
+    fi
+  fi
+}
+
+restore_pre_candidate_changes() {
+  restore_release_links || return
+  restore_runtime_configuration || return
+}
 
 signal_active_stage() {
   local signal_name="$1"
@@ -403,11 +845,38 @@ release_install_lock() {
 }
 
 cleanup() {
+  local exit_status=$?
+  trap - EXIT
+  mask_install_signals
+  IN_EXIT_CLEANUP="true"
+  set +e
   stop_active_stage
+  if [[ "$exit_status" != "0" && "$TEAM_HUB_RECOVERY_ATTEMPTED" != "true" && ( "$TEAM_HUB_OPERATION_PENDING" != "true" || "$TEAM_HUB_OPERATION_FINALIZED" != "true" ) ]]; then
+    TEAM_HUB_RECOVERY_ATTEMPTED="true"
+    if [[ "$CANDIDATE_SERVICE_MAY_HAVE_STARTED" == "true" ]]; then
+      if declare -F restore_previous_release >/dev/null && restore_previous_release; then
+        [[ "$TEAM_HUB_OPERATION_PENDING" != "true" ]] || TEAM_HUB_OPERATION_FINALIZED="true"
+      elif [[ "$TEAM_HUB_OPERATION_PENDING" == "true" ]]; then
+        echo "Managed Team Hub rollback is incomplete; the exact maintenance fence remains fail-closed when present." >&2
+      fi
+    elif restore_pre_candidate_changes; then
+      if [[ "$TEAM_HUB_OPERATION_PENDING" == "true" ]]; then
+        if clear_team_hub_operation_fence "$OLD_TARGET"; then
+          TEAM_HUB_OPERATION_FINALIZED="true"
+        else
+          echo "AgentsServer install failed before candidate health and could not safely release Team Hub maintenance." >&2
+        fi
+      fi
+    elif [[ "$TEAM_HUB_OPERATION_PENDING" == "true" ]]; then
+      echo "AgentsServer install failed before candidate health and could not restore local configuration; Team Hub remains fail-closed." >&2
+    fi
+  fi
   [[ -z "$UV_INSTALLER" ]] || rm -f "$UV_INSTALLER"
   rm -rf "$STAGE_DIR"
+  [[ -z "$ENV_CONFIG_BACKUP" ]] || rm -f "$ENV_CONFIG_BACKUP"
   [[ -z "$SERVICE_CONFIG_BACKUP" ]] || rm -f "$SERVICE_CONFIG_BACKUP"
   release_install_lock
+  exit "$exit_status"
 }
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
@@ -591,6 +1060,13 @@ mkdir -p "$STAGE_DIR"
 for name in "${RELEASE_FILES[@]}"; do
   install -m 644 "$SOURCE_DIR/$name" "$STAGE_DIR/$name"
 done
+mkdir -p "$STAGE_DIR/agentsdock_team_hub/migrations"
+chmod 755 "$STAGE_DIR/agentsdock_team_hub" "$STAGE_DIR/agentsdock_team_hub/migrations"
+for name in "${TEAM_HUB_RELEASE_FILES[@]}"; do
+  install -m 644 \
+    "$SOURCE_DIR/agentsdock_team_hub/$name" \
+    "$STAGE_DIR/agentsdock_team_hub/$name"
+done
 chmod 755 "$STAGE_DIR/agent_server.py" "$STAGE_DIR/agentsdock_jobs.py" "$STAGE_DIR/agentsdock_chats.py" "$STAGE_DIR/agentsdock_publish.py" "$STAGE_DIR/install.sh" "$STAGE_DIR/uninstall.sh" "$STAGE_DIR/update_runner.py"
 
 echo "[2/7] Resolving the release dependencies with uv"
@@ -614,12 +1090,15 @@ fi
 "$STAGE_DIR/.venv/bin/python" -c 'import croniter, dateutil; from zoneinfo import ZoneInfo; ZoneInfo("America/Los_Angeles")' >/dev/null
 "$STAGE_DIR/.venv/bin/python" -m py_compile \
   "$STAGE_DIR/agent_server.py" \
+  "$STAGE_DIR/team_hub_host.py" \
   "$STAGE_DIR/agentsdock_jobs.py" \
   "$STAGE_DIR/agentsdock_chats.py" \
   "$STAGE_DIR/agentsdock_publish.py" \
   "$STAGE_DIR/claude_sdk_client.py" \
   "$STAGE_DIR/codex_app_server.py" \
   "$STAGE_DIR/update_runner.py"
+"$STAGE_DIR/.venv/bin/python" -m compileall -q "$STAGE_DIR/agentsdock_team_hub"
+PYTHONPATH="$STAGE_DIR" "$STAGE_DIR/.venv/bin/python" -c 'import agentsdock_team_hub, team_hub_host' >/dev/null
 
 TOKEN="$(find_existing_token || true)"
 generate_token() {
@@ -638,7 +1117,7 @@ PRESERVE_SOURCE=""
 write_runtime_env() {
   local env_temp="$CONFIG_ROOT/.env.$$"
   if [[ -n "$PRESERVE_SOURCE" ]]; then
-    grep -Ev '^(AGENTSDOCK_(STATE_DIR|AGENT_CWD|AGENT_BIND|AGENT_PORT|AGENT_TOKEN)|AGENTS_SERVER_(STATE_DIR|INSTALL_DIR)|ZENITHBOT_AGENT_(DIR|CWD|BIND|PORT|TOKEN)|ZENITHDOCK_AGENT_TOKEN|PATH)=' \
+    grep -Ev '^(AGENTSDOCK_(STATE_DIR|AGENT_CWD|AGENT_BIND|AGENT_PORT|AGENT_TOKEN|TEAM_HUB_MODE)|AGENTS_SERVER_(STATE_DIR|INSTALL_DIR)|ZENITHBOT_AGENT_(DIR|CWD|BIND|PORT|TOKEN)|ZENITHDOCK_AGENT_TOKEN|PATH)=' \
       "$PRESERVE_SOURCE" > "$env_temp" || true
   else
     : > "$env_temp"
@@ -649,6 +1128,7 @@ AGENTSDOCK_AGENT_CWD=$HOME
 AGENTSDOCK_AGENT_BIND=$BIND_ADDRESS
 AGENTSDOCK_AGENT_PORT=$PORT
 AGENTSDOCK_AGENT_TOKEN=$TOKEN
+AGENTSDOCK_TEAM_HUB_MODE=$TEAM_HUB_MODE
 AGENTS_SERVER_INSTALL_DIR=$INSTALL_ROOT
 PATH=$SERVER_PATH
 EOF
@@ -656,35 +1136,6 @@ EOF
   mv "$env_temp" "$ENV_FILE"
   PRESERVE_SOURCE="$ENV_FILE"
 }
-
-write_runtime_env
-
-echo "[3/7] Activating release $RELEASE_VERSION"
-OLD_TARGET=""
-if [[ -L "$CURRENT_LINK" ]]; then
-  OLD_TARGET="$(readlink "$CURRENT_LINK")"
-  [[ "$OLD_TARGET" == /* ]] || OLD_TARGET="$INSTALL_ROOT/$OLD_TARGET"
-elif [[ -d "$CURRENT_LINK" ]]; then
-  LEGACY_DIR="$RELEASES_ROOT/legacy-$(date -u +%Y%m%d%H%M%S)"
-  mv "$CURRENT_LINK" "$LEGACY_DIR"
-  OLD_TARGET="$LEGACY_DIR"
-fi
-
-if [[ -d "$RELEASE_DIR" ]]; then
-  if [[ -n "$OLD_TARGET" && "$OLD_TARGET" == "$RELEASE_DIR" ]]; then
-    REPLACED_DIR="$RELEASES_ROOT/$RELEASE_VERSION-replaced-$(date -u +%Y%m%d%H%M%S)-$$"
-    mv "$RELEASE_DIR" "$REPLACED_DIR"
-    OLD_TARGET="$REPLACED_DIR"
-  else
-    rm -rf "$RELEASE_DIR"
-  fi
-fi
-mv "$STAGE_DIR" "$RELEASE_DIR"
-
-if [[ -n "$OLD_TARGET" && -e "$OLD_TARGET" ]]; then
-  ln -sfn "$OLD_TARGET" "$PREVIOUS_LINK"
-fi
-ln -sfn "$RELEASE_DIR" "$CURRENT_LINK"
 
 wait_for_launch_agent_removal() {
   local service_target="$1"
@@ -765,18 +1216,94 @@ restart_service() {
   fi
 }
 
-restore_previous_release() {
-  local restore_service_config="${1:-false}"
+restore_previous_release_transaction() {
   [[ -n "$OLD_TARGET" && -e "$OLD_TARGET" ]] || return 1
-  ln -sfn "$OLD_TARGET" "$CURRENT_LINK" || return
-  if [[ "$restore_service_config" == "true" && "$OS_NAME" == "Darwin" && -n "$SERVICE_CONFIG_BACKUP" ]]; then
-    cp -p "$SERVICE_CONFIG_BACKUP" "$PLIST" || return
+  if ! stop_service; then
+    echo "The candidate service could not be stopped, so rollback was not attempted." >&2
+    return 1
   fi
-  if restart_service; then
+  if ! restore_team_hub_snapshot; then
+    echo "The verified Team Hub snapshot could not be restored; the previous release was not started." >&2
+    return 1
+  fi
+  if ! restore_release_links || ! restore_runtime_configuration; then
+    echo "The Team Hub snapshot was restored, but the previous release configuration could not be restored." >&2
+    return 1
+  fi
+  if ! restart_service; then
+    echo "The previous release link and configuration were restored, but its service could not be restarted." >&2
+    return 1
+  fi
+  if [[ "$TEAM_HUB_OPERATION_PENDING" == "true" ]]; then
+    if ! wait_for_previous_release_health; then
+      echo "The previous service restarted, but its exact server and Team Hub identities were not healthy; rollback is incomplete." >&2
+      return 1
+    fi
+    # A verified offline restore consumes the exact operation fence together
+    # with the candidate-mutated state.  Mark final only after the old process
+    # proves its stable server and Hub identities.
+    TEAM_HUB_OPERATION_FINALIZED="true"
+  elif ! wait_for_health; then
+    echo "The previous release restarted but did not become healthy." >&2
+    return 1
+  fi
+  return 0
+}
+
+restore_previous_release() {
+  TEAM_HUB_RECOVERY_ATTEMPTED="true"
+  mask_install_signals
+  local status=0
+  if restore_previous_release_transaction; then
+    status=0
+  else
+    status=$?
+  fi
+  if [[ "$IN_EXIT_CLEANUP" != "true" && ( "$TEAM_HUB_OPERATION_PENDING" != "true" || "$TEAM_HUB_OPERATION_FINALIZED" != "true" ) ]]; then
+    resume_install_signals
+  fi
+  return "$status"
+}
+
+stop_service() {
+  if [[ "$OS_NAME" == "Linux" ]]; then
+    systemctl --user stop "$SERVICE_NAME.service"
+    return
+  fi
+  local domain="gui/$(id -u)"
+  local service_target="$domain/$LABEL"
+  local output=""
+  local status=0
+  if ! launchctl print "$service_target" >/dev/null 2>&1; then
     return 0
   fi
-  echo "The previous release link was restored, but its service could not be restarted." >&2
-  return 1
+  if output="$(launchctl bootout "$service_target" 2>&1)"; then
+    [[ -z "$output" ]] || printf '%s\n' "$output"
+  else
+    status=$?
+    if launchctl print "$service_target" >/dev/null 2>&1; then
+      [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+      return "$status"
+    fi
+  fi
+  wait_for_launch_agent_removal "$service_target"
+}
+
+restore_team_hub_snapshot() {
+  [[ -n "$EXPECTED_TEAM_HUB_ID" ]] || return 0
+  local restore_python="$RELEASE_DIR/.venv/bin/python"
+  if [[ ! -x "$restore_python" ]]; then
+    echo "The candidate runtime cannot verify the Team Hub rollback snapshot." >&2
+    return 1
+  fi
+  echo "      Restoring the verified Team Hub maintenance snapshot"
+  PYTHONPATH="$RELEASE_DIR" "$restore_python" -m agentsdock_team_hub.cli \
+    restore-snapshot \
+    --data-dir "$TEAM_HUB_DATA_DIR" \
+    --snapshot "$TEAM_HUB_SNAPSHOT" \
+    --expected-host-identity "$EXPECTED_SERVER_IDENTITY" \
+    --expected-hub-id "$EXPECTED_TEAM_HUB_ID" \
+    --expected-operation-id "$TEAM_HUB_OPERATION_ID"
 }
 
 port_has_listener() {
@@ -798,7 +1325,7 @@ write_service_files() {
   if [[ "$OS_NAME" == "Linux" ]]; then
     USER_SERVICE_DIR="$HOME/.config/systemd/user"
     mkdir -p "$USER_SERVICE_DIR"
-    cat > "$USER_SERVICE_DIR/$SERVICE_NAME.service" <<EOF
+    cat > "$SYSTEMD_SERVICE_FILE" <<EOF
 [Unit]
 Description=AgentsServer
 After=network-online.target
@@ -820,14 +1347,8 @@ WantedBy=default.target
 EOF
     SERVICE_KIND="systemd-user"
   elif [[ "$OS_NAME" == "Darwin" ]]; then
-    LABEL="com.agentsdock.server"
     LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
-    PLIST="$LAUNCH_AGENTS/$LABEL.plist"
     mkdir -p "$LAUNCH_AGENTS" "$HOME/Library/Logs/AgentsServer"
-    if [[ -f "$PLIST" && -z "$SERVICE_CONFIG_BACKUP" ]]; then
-      SERVICE_CONFIG_BACKUP="$(mktemp "${TMPDIR:-/tmp}/agents-server-launch-agent.XXXXXX")"
-      cp -p "$PLIST" "$SERVICE_CONFIG_BACKUP"
-    fi
     cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -846,6 +1367,7 @@ EOF
     <key>AGENTSDOCK_AGENT_BIND</key><string>$BIND_ADDRESS</string>
     <key>AGENTSDOCK_AGENT_PORT</key><string>$PORT</string>
     <key>AGENTSDOCK_AGENT_TOKEN</key><string>$TOKEN</string>
+    <key>AGENTSDOCK_TEAM_HUB_MODE</key><string>$TEAM_HUB_MODE</string>
     <key>AGENTS_SERVER_INSTALL_DIR</key><string>$INSTALL_ROOT</string>
     <key>PATH</key><string>$SERVER_PATH</string>
   </dict>
@@ -884,6 +1406,107 @@ health_check_once() {
   return 1
 }
 
+release_health_check_once() {
+  local port="$1"
+  local runtime_root="$2"
+  local expected_version="$3"
+  local expected_server="$4"
+  local expected_hub_mode="$5"
+  local expected_hub="$6"
+  local response_file=""
+  response_file="$(mktemp "$STATE_ROOT/admin/.install-health.XXXXXX")" || return 1
+  chmod 600 "$response_file"
+  if command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1; then
+    if ! curl --fail --silent --show-error --connect-timeout 1 --max-time 2 --max-filesize 1048576 \
+      -H "Authorization: Bearer $TOKEN" \
+      --output "$response_file" \
+      "http://127.0.0.1:$port/api/health" >/dev/null 2>&1; then
+      rm -f "$response_file"
+      return 1
+    fi
+  elif ! wget \
+    --quiet \
+    --timeout=2 \
+    --tries=1 \
+    --header="Authorization: Bearer $TOKEN" \
+    --output-document="$response_file" \
+    "http://127.0.0.1:$port/api/health" >/dev/null 2>&1; then
+    rm -f "$response_file"
+    return 1
+  fi
+  local response_size=""
+  response_size="$(wc -c < "$response_file" 2>/dev/null || true)"
+  response_size="${response_size//[[:space:]]/}"
+  if [[ ! "$response_size" =~ ^[0-9]+$ ]] || ((response_size > 1048576)); then
+    rm -f "$response_file"
+    return 1
+  fi
+  local result=1
+  if "$runtime_root/.venv/bin/python" - \
+    "$response_file" \
+    "$expected_version" \
+    "$expected_server" \
+    "$expected_hub_mode" \
+    "$expected_hub" <<'PY'
+import json
+import re
+import sys
+
+path, expected_version, expected_server, hub_mode, expected_hub = sys.argv[1:]
+try:
+    with open(path, "rb") as stream:
+        health = json.load(stream)
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+if not isinstance(health, dict) or health.get("ok") is not True:
+    raise SystemExit(1)
+if health.get("server_version") != expected_version:
+    raise SystemExit(1)
+server_identity = health.get("server_identity")
+if not isinstance(server_identity, str) or re.fullmatch(r"[A-Za-z0-9_.:-]{8,240}", server_identity) is None:
+    raise SystemExit(1)
+if expected_server and server_identity != expected_server:
+    raise SystemExit(1)
+capabilities = health.get("capabilities")
+capability = capabilities.get("team_hub_v1") if isinstance(capabilities, dict) else None
+if not isinstance(capability, dict):
+    raise SystemExit(1)
+if hub_mode == "host":
+    required = {
+        "available": True,
+        "designated_host": True,
+        "version": 1,
+        "base_path": "/api/team-hub",
+        "host_server_identity": server_identity,
+    }
+    if any(capability.get(key) != value for key, value in required.items()):
+        raise SystemExit(1)
+    hub_id = capability.get("hub_id")
+    if not isinstance(hub_id, str) or re.fullmatch(r"[A-Za-z0-9_.:-]{8,240}", hub_id) is None:
+        raise SystemExit(1)
+    if expected_hub and hub_id != expected_hub:
+        raise SystemExit(1)
+elif hub_mode == "disabled":
+    required = {
+        "available": False,
+        "designated_host": False,
+        "version": 1,
+        "base_path": None,
+        "hub_id": None,
+        "host_server_identity": None,
+    }
+    if any(capability.get(key) != value for key, value in required.items()):
+        raise SystemExit(1)
+else:
+    raise SystemExit(1)
+PY
+  then
+    result=0
+  fi
+  rm -f "$response_file"
+  return "$result"
+}
+
 wait_for_health() {
   local attempt
   for ((attempt = 1; attempt <= HEALTH_CHECK_ATTEMPTS; attempt++)); do
@@ -897,6 +1520,117 @@ wait_for_health() {
   done
   return 1
 }
+
+wait_for_exact_release_health() {
+  local runtime_root="$1"
+  local expected_version="$2"
+  local expected_server="$3"
+  local expected_hub_mode="$4"
+  local expected_hub="$5"
+  local health_label="$6"
+  local attempt_limit="${7:-$HEALTH_CHECK_ATTEMPTS}"
+  local attempt
+  for ((attempt = 1; attempt <= attempt_limit; attempt++)); do
+    if release_health_check_once \
+      "$PORT" \
+      "$runtime_root" \
+      "$expected_version" \
+      "$expected_server" \
+      "$expected_hub_mode" \
+      "$expected_hub"; then
+      return 0
+    fi
+    if ((attempt < attempt_limit)) && ((attempt % HEALTH_CHECK_HEARTBEAT_ATTEMPTS == 0)); then
+      echo "      Still waiting for exact $health_label health (${attempt}s elapsed, timeout ${attempt_limit}s)"
+    fi
+    ((attempt == attempt_limit)) || sleep 1
+  done
+  return 1
+}
+
+wait_for_release_health() {
+  wait_for_exact_release_health \
+    "$RELEASE_DIR" \
+    "$RELEASE_VERSION" \
+    "$EXPECTED_SERVER_IDENTITY" \
+    "$TEAM_HUB_MODE" \
+    "$EXPECTED_TEAM_HUB_ID" \
+    "candidate release"
+}
+
+wait_for_previous_release_health() {
+  local previous_version=""
+  local rollback_attempts="$HEALTH_CHECK_ATTEMPTS"
+  [[ -n "$OLD_TARGET" && -f "$OLD_TARGET/VERSION" ]] || {
+    echo "The previous release version cannot be verified." >&2
+    return 1
+  }
+  previous_version="$(tr -d '[:space:]' < "$OLD_TARGET/VERSION")"
+  if [[ ! "$previous_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.-]+)?$ ]]; then
+    echo "The previous release version is invalid." >&2
+    return 1
+  fi
+  if ((rollback_attempts > ROLLBACK_HEALTH_CHECK_MAX_ATTEMPTS)); then
+    rollback_attempts="$ROLLBACK_HEALTH_CHECK_MAX_ATTEMPTS"
+  fi
+  wait_for_exact_release_health \
+    "$OLD_TARGET" \
+    "$previous_version" \
+    "$EXPECTED_SERVER_IDENTITY" \
+    "host" \
+    "$EXPECTED_TEAM_HUB_ID" \
+    "restored release" \
+    "$rollback_attempts"
+}
+
+if [[ "$TEAM_HUB_OPERATION_PENDING" == "true" ]]; then
+  if ! verify_team_hub_rollback_snapshot "$STAGE_DIR"; then
+    echo "Candidate Team Hub rollback verifier rejected the exact snapshot before activation." >&2
+    exit 1
+  fi
+fi
+
+echo "[3/7] Activating release $RELEASE_VERSION"
+CURRENT_LINK_WAS_DIRECTORY="false"
+if [[ -L "$CURRENT_LINK" ]]; then
+  OLD_TARGET="$(readlink "$CURRENT_LINK")"
+  [[ "$OLD_TARGET" == /* ]] || OLD_TARGET="$INSTALL_ROOT/$OLD_TARGET"
+elif [[ -d "$CURRENT_LINK" ]]; then
+  CURRENT_LINK_WAS_DIRECTORY="true"
+  OLD_TARGET="$RELEASES_ROOT/legacy-$(date -u +%Y%m%d%H%M%S)"
+elif [[ -e "$CURRENT_LINK" ]]; then
+  echo "$CURRENT_LINK is not a supported release link or directory." >&2
+  exit 1
+fi
+if [[ "$TEAM_HUB_OPERATION_PENDING" == "true" && "$CURRENT_LINK_WAS_DIRECTORY" == "true" ]]; then
+  echo "Managed Team Hub update requires a versioned current-release symlink; legacy directory takeover is not supported." >&2
+  exit 1
+fi
+if [[ "$TEAM_HUB_OPERATION_PENDING" == "true" && ( -z "$OLD_TARGET" || ! -d "$OLD_TARGET" ) ]]; then
+  echo "Managed Team Hub update requires an existing installed release for verified rollback." >&2
+  exit 1
+fi
+
+backup_runtime_configuration
+RELEASE_ACTIVATED="true"
+if [[ "$CURRENT_LINK_WAS_DIRECTORY" == "true" ]]; then
+  mv "$CURRENT_LINK" "$OLD_TARGET"
+fi
+if [[ -d "$RELEASE_DIR" ]]; then
+  if [[ -n "$OLD_TARGET" && "$OLD_TARGET" == "$RELEASE_DIR" ]]; then
+    REPLACED_DIR="$RELEASES_ROOT/$RELEASE_VERSION-replaced-$(date -u +%Y%m%d%H%M%S)-$$"
+    OLD_TARGET="$REPLACED_DIR"
+    mv "$RELEASE_DIR" "$OLD_TARGET"
+  else
+    rm -rf "$RELEASE_DIR"
+  fi
+fi
+mv "$STAGE_DIR" "$RELEASE_DIR"
+if [[ -n "$OLD_TARGET" && -e "$OLD_TARGET" ]]; then
+  ln -sfn "$OLD_TARGET" "$PREVIOUS_LINK"
+fi
+ln -sfn "$RELEASE_DIR" "$CURRENT_LINK"
+write_runtime_env
 
 # A requested port held by an authenticated AgentsServer is the service being
 # replaced and will be released by restart_service. A listener that is present
@@ -931,24 +1665,36 @@ while true; do
 
   echo "[4/7] Installing the user service (port $PORT)"
   write_service_files
+  CANDIDATE_SERVICE_MAY_HAVE_STARTED="true"
   if ! restart_service; then
     echo "AgentsServer $RELEASE_VERSION could not start; restoring the previous service when possible." >&2
-    if restore_previous_release true; then
+    if restore_previous_release; then
       echo "The previous release and service were restored." >&2
     fi
     exit 1
   fi
 
   echo "[5/7] Waiting for authenticated health"
-  if wait_for_health; then
+  if wait_for_release_health; then
+    if [[ "$TEAM_HUB_OPERATION_PENDING" == "true" ]]; then
+      mask_install_signals
+      if clear_team_hub_operation_fence "$RELEASE_DIR"; then
+        TEAM_HUB_OPERATION_FINALIZED="true"
+      else
+        resume_install_signals
+        echo "AgentsServer $RELEASE_VERSION became healthy but could not clear its exact Team Hub maintenance fence; rolling back." >&2
+        if restore_previous_release; then
+          echo "The previous release and service were restored." >&2
+        fi
+        exit 1
+      fi
+    fi
     break
   fi
 
   echo "AgentsServer $RELEASE_VERSION did not become healthy; rolling back." >&2
   PORT="$ORIGINAL_PORT"
-  write_service_files
-  if restore_previous_release false; then
-    wait_for_health || true
+  if restore_previous_release; then
     echo "The previous release was restored." >&2
   fi
   if [[ "$OS_NAME" == "Linux" ]]; then
@@ -1006,6 +1752,21 @@ if [[ -n "$TAILSCALE_IP" ]]; then
   echo "  $CHECK_MARK reachable via Tailscale at $TAILSCALE_IP"
 else
   echo "  $DOT_MARK optional: install and connect Tailscale to reach this server from another device or WiFi network: https://tailscale.com/download"
+fi
+if [[ "$TEAM_HUB_MODE" == "host" ]]; then
+  echo
+  echo "  ${COLOR_BOLD}Local Team Hub operator commands${COLOR_RESET}"
+  printf '  Bootstrap proof: PYTHONPATH='
+  printf '%q ' "$CURRENT_LINK"
+  printf '%q ' "$CURRENT_LINK/.venv/bin/python"
+  printf '%s ' -m agentsdock_team_hub.cli bootstrap-proof --data-dir
+  printf '%q\n' "$STATE_ROOT/team-hub"
+  printf '  Device recovery: PYTHONPATH='
+  printf '%q ' "$CURRENT_LINK"
+  printf '%q ' "$CURRENT_LINK/.venv/bin/python"
+  printf '%s ' -m agentsdock_team_hub.cli device-recovery --data-dir
+  printf '%q ' "$STATE_ROOT/team-hub"
+  printf '%s\n' '--email EMAIL --device-label LABEL'
 fi
 echo
 printf 'AGENTSDOCK_SETUP_RESULT={"server_url":"%s","access_token":"%s","service":"%s","tailscale_ip":"%s","server_version":"%s"}\n' \

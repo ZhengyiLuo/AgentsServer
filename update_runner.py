@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
 import re
 import signal
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -17,7 +20,7 @@ import time
 import urllib.request
 from urllib.error import HTTPError
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -36,7 +39,10 @@ VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$")
 # updater cannot terminate a healthy installer first.
 INSTALLER_TIMEOUT_SECONDS = 1_800
 INSTALLER_HEARTBEAT_SECONDS = 10.0
-INSTALLER_TERMINATION_GRACE_SECONDS = 10.0
+# install.sh masks TERM while it restores a verified Team Hub snapshot,
+# switches the old release/configuration back, restarts it, and proves exact
+# health.  Keep force-kill escalation beyond that bounded recovery window.
+INSTALLER_TERMINATION_GRACE_SECONDS = 180.0
 INSTALLER_LOG_TAIL_BYTES = 64 * 1024
 INSTALLER_LOG_TAIL_LINES = 12
 INSTALLER_ERROR_MAX_CHARS = 4_000
@@ -53,10 +59,22 @@ INSTALLER_ENVIRONMENT_SELECTORS = (
     "VIRTUAL_ENV",
 )
 RELEASE_TRACKS = {"stable", "beta"}
+RUNNER_OWNED_ACTIVE_PHASES = {
+    "starting",
+    "checking",
+    "downloading",
+    "verifying",
+    "installing",
+    "restarting",
+}
 
 
 class ReleaseUnavailableError(RuntimeError):
     """Raised when the repository has not published a signed release yet."""
+
+
+class UpdateOwnershipLostError(RuntimeError):
+    """Raised when a detached updater no longer owns the durable status row."""
 
 
 def utc_now() -> str:
@@ -71,15 +89,69 @@ def atomic_json(path: Path, value: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
-def update_status(path: Path, **changes: Any) -> dict[str, Any]:
+@contextmanager
+def server_update_status_lock(path: Path):
+    """Cross-process lock shared by the server and detached updater."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f".{path.name}.lock")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != os.getuid()
+        ):
+            raise PermissionError("server update status lock is unsafe")
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _read_status_unlocked(path: Path) -> dict[str, Any]:
     try:
         current = json.loads(path.read_text())
     except (FileNotFoundError, json.JSONDecodeError, OSError):
-        current = {}
+        return {}
+    return current if isinstance(current, dict) else {}
+
+
+def _update_status_unlocked(path: Path, current: dict[str, Any], **changes: Any) -> dict[str, Any]:
+    current = dict(current)
     current.update(changes)
     current["updated_at"] = utc_now()
     atomic_json(path, current)
     return current
+
+
+def update_status(
+    path: Path,
+    *,
+    expected_update_id: str | None = None,
+    **changes: Any,
+) -> dict[str, Any]:
+    with server_update_status_lock(path):
+        current = _read_status_unlocked(path)
+        if (
+            expected_update_id is not None
+            and (
+                str(current.get("update_id") or "") != expected_update_id
+                or str(current.get("phase") or "")
+                not in RUNNER_OWNED_ACTIVE_PHASES
+            )
+        ):
+            raise UpdateOwnershipLostError(
+                "detached updater no longer owns the server update status"
+            )
+        return _update_status_unlocked(path, current, **changes)
 
 
 def installer_log_tail(log_path: Path) -> str:
@@ -137,8 +209,10 @@ def run_installer(
     status_path: Path,
     log_path: Path,
     version: str,
+    expected_update_id: str | None = None,
     timeout_seconds: float = INSTALLER_TIMEOUT_SECONDS,
     heartbeat_seconds: float = INSTALLER_HEARTBEAT_SECONDS,
+    on_started: Callable[[], None] | None = None,
 ) -> None:
     """Run the installer with live logging and a durable status heartbeat."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -154,6 +228,8 @@ def run_installer(
             start_new_session=True,
             env=installer_environment(),
         )
+        if on_started is not None:
+            on_started()
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -169,13 +245,18 @@ def run_installer(
                 break
             except subprocess.TimeoutExpired:
                 elapsed = max(1, int(time.monotonic() - started))
-                update_status(
-                    status_path,
-                    phase="installing",
-                    message=f"Installing AgentsServer {version} ({elapsed}s elapsed).",
-                    heartbeat_at=utc_now(),
-                    elapsed_seconds=elapsed,
-                )
+                try:
+                    update_status(
+                        status_path,
+                        expected_update_id=expected_update_id,
+                        phase="installing",
+                        message=f"Installing AgentsServer {version} ({elapsed}s elapsed).",
+                        heartbeat_at=utc_now(),
+                        elapsed_seconds=elapsed,
+                    )
+                except UpdateOwnershipLostError:
+                    terminate_installer(process)
+                    raise
         log.flush()
 
     if returncode != 0:
@@ -197,13 +278,13 @@ def download_bytes(url: str, limit: int, timeout: float = 30.0) -> bytes:
     return content
 
 
-def server_work_snapshot(
+def server_health_snapshot(
     port: int,
     *,
     token: str | None = None,
     timeout: float = SERVER_IDLE_CHECK_TIMEOUT_SECONDS,
-) -> tuple[int, int]:
-    """Read the live workload immediately before invoking the installer."""
+) -> dict[str, Any]:
+    """Read one bounded authenticated AgentsServer health document."""
 
     headers = {"User-Agent": "AgentsServer-Updater/1"}
     clean_token = str(token or "").strip()
@@ -223,6 +304,18 @@ def server_work_snapshot(
         raise RuntimeError("server health response is invalid JSON") from exc
     if not isinstance(health, dict) or health.get("ok") is not True:
         raise RuntimeError("server health response is not healthy")
+    return health
+
+
+def server_work_snapshot(
+    port: int,
+    *,
+    token: str | None = None,
+    timeout: float = SERVER_IDLE_CHECK_TIMEOUT_SECONDS,
+) -> tuple[int, int]:
+    """Read the live workload immediately before invoking the installer."""
+
+    health = server_health_snapshot(port, token=token, timeout=timeout)
 
     active = health.get("active")
     raw_active_count = health.get("active_count")
@@ -258,6 +351,41 @@ def server_work_snapshot(
                 raise RuntimeError("server health response has an invalid queued count")
             queued_count += value
     return active_count, queued_count
+
+
+def assert_post_update_identity(
+    port: int,
+    *,
+    token: str | None,
+    expected_server_identity: str,
+    expected_team_hub_id: str | None = None,
+) -> None:
+    """Fence a replacement by stable server and managed Hub identities."""
+
+    health = server_health_snapshot(port, token=token)
+    if str(health.get("server_identity") or "") != expected_server_identity:
+        raise RuntimeError("updated AgentsServer stable identity does not match")
+    if expected_team_hub_id is None:
+        return
+    capabilities = health.get("capabilities")
+    capability = (
+        capabilities.get("team_hub_v1")
+        if isinstance(capabilities, dict)
+        else None
+    )
+    expected_capability = {
+        "available": True,
+        "designated_host": True,
+        "version": 1,
+        "base_path": "/api/team-hub",
+        "hub_id": expected_team_hub_id,
+        "host_server_identity": expected_server_identity,
+    }
+    if not isinstance(capability, dict) or any(
+        capability.get(name) != value
+        for name, value in expected_capability.items()
+    ):
+        raise RuntimeError("updated AgentsServer lost or changed its Team Hub identity")
 
 
 def assert_server_idle(port: int, *, token: str | None = None) -> None:
@@ -307,6 +435,58 @@ def consume_auth_token_file(path: str | None) -> str:
     if not token:
         raise RuntimeError("server update health credential is empty")
     return token
+
+
+def clear_team_hub_maintenance(args: argparse.Namespace) -> bool:
+    """Clear the exact durable update fence without opening the Hub DB."""
+
+    hub_id = str(getattr(args, "expected_team_hub_id", "") or "").strip()
+    snapshot = str(getattr(args, "team_hub_snapshot", "") or "").strip()
+    data_dir = str(getattr(args, "team_hub_data_dir", "") or "").strip()
+    host_identity = str(
+        getattr(args, "expected_server_identity", "") or ""
+    ).strip()
+    operation_id = str(getattr(args, "update_id", "") or "").strip()
+    if not any((hub_id, snapshot, data_dir)):
+        return False
+    if not all((hub_id, snapshot, data_dir, host_identity, operation_id)):
+        raise RuntimeError("managed Team Hub maintenance arguments are incomplete")
+    from agentsdock_team_hub.store import HubStore
+
+    return HubStore.clear_maintenance_fence_control(
+        Path(data_dir),
+        expected_hub_id=hub_id,
+        expected_host_identity=host_identity,
+        expected_reason="server-update",
+        expected_operation_id=operation_id,
+        expected_snapshot=Path(snapshot),
+    )
+
+
+def team_hub_maintenance_fence_present(args: argparse.Namespace) -> bool:
+    """Return whether this exact update still has an on-disk Hub fence."""
+
+    hub_id = str(getattr(args, "expected_team_hub_id", "") or "").strip()
+    snapshot = str(getattr(args, "team_hub_snapshot", "") or "").strip()
+    data_dir = str(getattr(args, "team_hub_data_dir", "") or "").strip()
+    host_identity = str(
+        getattr(args, "expected_server_identity", "") or ""
+    ).strip()
+    operation_id = str(getattr(args, "update_id", "") or "").strip()
+    if not any((hub_id, snapshot, data_dir)):
+        return False
+    if not all((hub_id, snapshot, data_dir, host_identity, operation_id)):
+        raise RuntimeError("managed Team Hub maintenance arguments are incomplete")
+    from agentsdock_team_hub.store import HubStore
+
+    return HubStore.maintenance_fence_matches_control(
+        Path(data_dir),
+        expected_hub_id=hub_id,
+        expected_host_identity=host_identity,
+        expected_reason="server-update",
+        expected_operation_id=operation_id,
+        expected_snapshot=Path(snapshot),
+    )
 
 
 def version_is_prerelease(version: str) -> bool:
@@ -521,8 +701,30 @@ def run_update(args: argparse.Namespace) -> None:
     public_key = Path(args.public_key).expanduser().resolve()
     track = normalized_release_track(getattr(args, "track", "stable"))
     auth_token = consume_auth_token_file(getattr(args, "auth_token_file", None))
+    expected_server_identity = str(
+        getattr(args, "expected_server_identity", "") or ""
+    ).strip()
+    if not expected_server_identity:
+        raise RuntimeError("managed update is missing the stable server identity")
+    update_id = str(getattr(args, "update_id", "") or "").strip()
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", update_id) is None:
+        raise RuntimeError("managed update is missing a valid update ID")
+    expected_team_hub_id = str(
+        getattr(args, "expected_team_hub_id", "") or ""
+    ).strip() or None
+    team_hub_snapshot = str(
+        getattr(args, "team_hub_snapshot", "") or ""
+    ).strip() or None
+    team_hub_data_dir = str(
+        getattr(args, "team_hub_data_dir", "") or ""
+    ).strip() or None
+    if any((expected_team_hub_id, team_hub_snapshot, team_hub_data_dir)) and not all(
+        (expected_team_hub_id, team_hub_snapshot, team_hub_data_dir)
+    ):
+        raise RuntimeError("managed Team Hub rollback arguments must be complete")
     update_status(
         status_path,
+        expected_update_id=update_id,
         phase="checking",
         track=track,
         message=f"Checking the signed {track} release manifest.",
@@ -542,6 +744,7 @@ def run_update(args: argparse.Namespace) -> None:
         archive_path = root / str(manifest["archive"]["name"])
         update_status(
             status_path,
+            expected_update_id=update_id,
             phase="downloading",
             track=track,
             target_version=version,
@@ -553,7 +756,12 @@ def run_update(args: argparse.Namespace) -> None:
             raise RuntimeError("release archive checksum does not match the signed manifest")
         archive_path.write_bytes(archive_bytes)
 
-        update_status(status_path, phase="verifying", message="Signature and archive checksum verified.")
+        update_status(
+            status_path,
+            expected_update_id=update_id,
+            phase="verifying",
+            message="Signature and archive checksum verified.",
+        )
         source = safe_extract(archive_path, root / "extracted")
         install = source / "install.sh"
         install.chmod(0o755)
@@ -563,9 +771,24 @@ def run_update(args: argparse.Namespace) -> None:
             "--release-version", version,
             "--port", str(args.port),
             "--bind", args.bind,
+            "--expected-server-identity", expected_server_identity,
         ]
+        if expected_team_hub_id is not None:
+            command.extend(
+                [
+                    "--expected-team-hub-id", expected_team_hub_id,
+                    "--team-hub-snapshot", str(team_hub_snapshot),
+                    "--team-hub-data-dir", str(team_hub_data_dir),
+                    "--team-hub-operation-id", update_id,
+                ]
+            )
         assert_server_idle(args.port, token=auth_token)
-        update_status(status_path, phase="installing", message=f"Installing AgentsServer {version} with rollback protection.")
+        update_status(
+            status_path,
+            expected_update_id=update_id,
+            phase="installing",
+            message=f"Installing AgentsServer {version} with rollback protection.",
+        )
         log_path = status_path.with_name("server-update.log")
         run_installer(
             command,
@@ -573,10 +796,21 @@ def run_update(args: argparse.Namespace) -> None:
             status_path=status_path,
             log_path=log_path,
             version=version,
+            expected_update_id=update_id,
         )
+        assert_post_update_identity(
+            args.port,
+            token=auth_token,
+            expected_server_identity=expected_server_identity,
+            expected_team_hub_id=expected_team_hub_id,
+        )
+        # install.sh owns the success clear while it can still stop the
+        # candidate, restore the verified snapshot, and restart the old
+        # release. The runner clears only failures before install starts.
 
     update_status(
         status_path,
+        expected_update_id=update_id,
         phase="complete",
         message=f"AgentsServer {version} is installed and healthy.",
         track=track,
@@ -595,17 +829,53 @@ def main() -> int:
     parser.add_argument("--current-version")
     parser.add_argument("--track", choices=sorted(RELEASE_TRACKS), default="stable")
     parser.add_argument("--auth-token-file")
+    parser.add_argument("--expected-server-identity", required=True)
+    parser.add_argument("--update-id", required=True)
+    parser.add_argument("--expected-team-hub-id")
+    parser.add_argument("--team-hub-snapshot")
+    parser.add_argument("--team-hub-data-dir")
     args = parser.parse_args()
     try:
         run_update(args)
         return 0
     except Exception as exc:
-        update_status(
-            Path(args.status_file).expanduser().resolve(),
-            phase="failed",
-            message=str(exc),
-            finished_at=utc_now(),
-        )
+        status_path = Path(args.status_file).expanduser().resolve()
+        update_id = str(getattr(args, "update_id", "") or "").strip()
+        try:
+            with server_update_status_lock(status_path):
+                current = _read_status_unlocked(status_path)
+                if (
+                    str(current.get("update_id") or "") != update_id
+                    or str(current.get("phase") or "")
+                    not in RUNNER_OWNED_ACTIVE_PHASES
+                ):
+                    return 1
+                phase = str(current.get("phase") or "")
+                if phase in {
+                    "starting",
+                    "checking",
+                    "downloading",
+                    "verifying",
+                }:
+                    # Keep the owning active status in place until its exact
+                    # Hub fence is cleared. A clear failure therefore remains
+                    # fail-closed instead of publishing a false terminal row.
+                    clear_team_hub_maintenance(args)
+                elif phase in {"installing", "restarting"} and \
+                        team_hub_maintenance_fence_present(args):
+                    # Once install.sh starts, only its verified rollback or
+                    # successful candidate handoff may clear the fence. Keep
+                    # the active row if recovery was not proven complete.
+                    return 1
+                _update_status_unlocked(
+                    status_path,
+                    current,
+                    phase="failed",
+                    message=str(exc),
+                    finished_at=utc_now(),
+                )
+        except (UpdateOwnershipLostError, RuntimeError, OSError):
+            pass
         return 1
 
 

@@ -241,6 +241,51 @@ class UpdateRunnerTests(unittest.TestCase):
         self.assertEqual(value["phase"], "complete")
         self.assertEqual(value["update_id"], "abc")
 
+    def test_stale_runner_cannot_heartbeat_or_complete_newer_update(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            status_path = root / "server-update.json"
+            log_path = root / "server-update.log"
+            newer = update_runner.update_status(
+                status_path,
+                phase="starting",
+                update_id="update-new",
+                target_version="2.0.0",
+            )
+            with self.assertRaises(update_runner.UpdateOwnershipLostError):
+                update_runner.run_installer(
+                    [sys.executable, "-c", "import time; time.sleep(5)"],
+                    cwd=root,
+                    status_path=status_path,
+                    log_path=log_path,
+                    version="1.2.3",
+                    expected_update_id="update-old",
+                    timeout_seconds=2,
+                    heartbeat_seconds=0.02,
+                )
+            self.assertEqual(json.loads(status_path.read_text()), newer)
+            with self.assertRaises(update_runner.UpdateOwnershipLostError):
+                update_runner.update_status(
+                    status_path,
+                    expected_update_id="update-old",
+                    phase="complete",
+                    installed_version="1.2.3",
+                )
+            self.assertEqual(json.loads(status_path.read_text()), newer)
+            terminal = update_runner.update_status(
+                status_path,
+                phase="failed",
+                update_id="update-old",
+                message="finalized by the server",
+            )
+            with self.assertRaises(update_runner.UpdateOwnershipLostError):
+                update_runner.update_status(
+                    status_path,
+                    expected_update_id="update-old",
+                    phase="complete",
+                )
+            self.assertEqual(json.loads(status_path.read_text()), terminal)
+
     def test_missing_release_has_a_clear_error(self):
         missing = HTTPError(update_runner.RELEASES_API_URL, 404, "Not Found", {}, None)
         with patch.object(update_runner, "download_bytes", side_effect=missing):
@@ -349,6 +394,8 @@ class UpdateRunnerTests(unittest.TestCase):
             bind="127.0.0.1",
             expected_version="1.2.3",
             current_version="1.2.4",
+            expected_server_identity="server-test-identity",
+            update_id="update-test-downgrade",
         )
         with patch.object(update_runner, "update_status"), \
              patch.object(update_runner, "check_release", return_value={"version": "1.2.3"}), \
@@ -391,6 +438,8 @@ class UpdateRunnerTests(unittest.TestCase):
                 bind="127.0.0.1",
                 expected_version="1.2.4",
                 current_version="1.2.3",
+                expected_server_identity="server-test-identity",
+                update_id="update-test-stable",
             )
             statuses: list[dict] = []
 
@@ -402,6 +451,7 @@ class UpdateRunnerTests(unittest.TestCase):
                  patch.object(update_runner, "download_bytes", return_value=archive_bytes), \
                  patch.object(update_runner, "update_status", side_effect=record_status), \
                  patch.object(update_runner, "assert_server_idle") as idle_check, \
+                 patch.object(update_runner, "assert_post_update_identity") as identity_check, \
                  patch.object(update_runner, "run_installer") as install:
                 update_runner.run_update(args)
 
@@ -410,6 +460,12 @@ class UpdateRunnerTests(unittest.TestCase):
         self.assertEqual(statuses[-1]["track"], "stable")
         idle_check.assert_called_once_with(7850, token="")
         install.assert_called_once()
+        identity_check.assert_called_once_with(
+            7850,
+            token="",
+            expected_server_identity="server-test-identity",
+            expected_team_hub_id=None,
+        )
 
     def test_detached_runner_allows_explicit_beta_to_latest_stable_switch(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -438,6 +494,8 @@ class UpdateRunnerTests(unittest.TestCase):
                 expected_version="1.2.4",
                 current_version="1.3.0-beta.2",
                 track="stable",
+                expected_server_identity="server-test-identity",
+                update_id="update-test-switch",
             )
             statuses: list[dict] = []
 
@@ -445,12 +503,14 @@ class UpdateRunnerTests(unittest.TestCase):
                  patch.object(update_runner, "download_bytes", return_value=archive_bytes), \
                  patch.object(update_runner, "update_status", side_effect=lambda _path, **changes: statuses.append(changes) or changes), \
                  patch.object(update_runner, "assert_server_idle") as idle_check, \
+                 patch.object(update_runner, "assert_post_update_identity") as identity_check, \
                  patch.object(update_runner, "run_installer") as install:
                 update_runner.run_update(args)
 
         check.assert_called_once_with(Path(args.public_key).resolve(), "stable")
         idle_check.assert_called_once_with(7850, token="")
         install.assert_called_once()
+        identity_check.assert_called_once()
         self.assertEqual(statuses[-1]["phase"], "complete")
         self.assertEqual(statuses[-1]["installed_version"], "1.2.4")
         self.assertEqual(statuses[-1]["track"], "stable")
@@ -520,6 +580,37 @@ class UpdateRunnerTests(unittest.TestCase):
 
         self.assertEqual(token, "secret")
         self.assertFalse(path.exists())
+
+    def test_termination_grace_allows_masked_installer_recovery_to_finish(self):
+        class RecoveringInstaller:
+            pid = 424242
+
+            def __init__(self):
+                self.wait_timeouts = []
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                self.wait_timeouts.append(timeout)
+                return 0
+
+            def terminate(self):
+                self.fail("terminate fallback must not be used")
+
+            def kill(self):
+                self.fail("SIGKILL fallback must not be used")
+
+        process = RecoveringInstaller()
+        with patch.object(update_runner.os, "killpg") as kill_group:
+            update_runner.terminate_installer(process)
+
+        self.assertEqual(
+            process.wait_timeouts,
+            [update_runner.INSTALLER_TERMINATION_GRACE_SECONDS],
+        )
+        self.assertGreaterEqual(update_runner.INSTALLER_TERMINATION_GRACE_SECONDS, 180)
+        kill_group.assert_called_once_with(process.pid, update_runner.signal.SIGTERM)
 
 
 if __name__ == "__main__":

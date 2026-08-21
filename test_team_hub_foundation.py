@@ -51,7 +51,7 @@ class DatabaseTests(unittest.TestCase):
         connection = open_database()
         self.addCleanup(connection.close)
 
-        self.assertEqual(LATEST_SCHEMA_VERSION, 4)
+        self.assertEqual(LATEST_SCHEMA_VERSION, 5)
         self.assertEqual(
             connection.execute("PRAGMA user_version").fetchone()[0],
             LATEST_SCHEMA_VERSION,
@@ -84,8 +84,83 @@ class DatabaseTests(unittest.TestCase):
                 "library_versions",
                 "audit_events",
                 "outbox_events",
+                "bootstrap_claims",
+                "bootstrap_delegations",
             }.issubset(table_names)
         )
+
+    def test_tailnet_bootstrap_delegation_is_bound_and_immutable(self) -> None:
+        connection = open_database()
+        self.addCleanup(connection.close)
+        connection.execute(
+            "INSERT INTO hub_metadata(singleton, hub_id, created_at) VALUES (1, ?, ?)",
+            ("hub_test12345678", NOW),
+        )
+        connection.execute(
+            """
+            INSERT INTO bootstrap_claims(id, token_hash, created_at, expires_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            ("bootstrap_claim_test", b"a" * 32, NOW, NOW + 300),
+        )
+        values = (
+            "bootstrap_claim_test",
+            "58c9470a-9443-42f2-973c-b35d3f4ec768",
+            b"b" * 32,
+            "server-test-identity",
+            "server-instance-test",
+            "hub_test12345678",
+            "https://sonic.example.ts.net:8444/api/team-hub",
+            "owner@example.com",
+            "owner@example.com",
+            "Owner",
+            "Owner Mac",
+            NOW,
+            NOW + 300,
+        )
+        connection.execute(
+            """
+            INSERT INTO bootstrap_delegations(
+                bootstrap_claim_id, request_id, request_fingerprint,
+                server_identity, server_instance_id, hub_id, hub_url,
+                tailnet_login_normalized, recipient_email_normalized,
+                display_name, device_label, created_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
+        )
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+            connection.execute(
+                "UPDATE bootstrap_delegations SET device_label = 'Other'"
+            )
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "cannot be deleted"):
+            connection.execute("DELETE FROM bootstrap_delegations")
+        connection.execute(
+            """
+            INSERT INTO bootstrap_claims(id, token_hash, created_at, expires_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            ("bootstrap_claim_bad", b"c" * 32, NOW, NOW + 301),
+        )
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "match its claim lifetime"):
+            connection.execute(
+                """
+                INSERT INTO bootstrap_delegations(
+                    bootstrap_claim_id, request_id, request_fingerprint,
+                    server_identity, server_instance_id, hub_id, hub_url,
+                    tailnet_login_normalized, recipient_email_normalized,
+                    display_name, device_label, created_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "bootstrap_claim_bad",
+                    "9aacde87-018a-4e1f-84b9-951ac6a75a7d",
+                    b"d" * 32,
+                    *values[3:-2],
+                    NOW,
+                    NOW + 300,
+                ),
+            )
 
     def test_changed_migration_checksum_is_rejected(self) -> None:
         connection = open_database()

@@ -18,6 +18,7 @@ import sqlite3
 import stat
 import tempfile
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -67,6 +68,8 @@ from .security import (
 
 NODE_CHALLENGE_TTL_SECONDS = 2 * 60
 RECOVERY_PROOF_TTL_SECONDS = 10 * 60
+TAILNET_BOOTSTRAP_PROOF_TTL_SECONDS = 5 * 60
+MAX_BOOTSTRAP_DELEGATION_LEDGER_ROWS = 256
 LOCAL_CONTROL_PRINCIPAL_ID = "service_local_control"
 
 
@@ -197,6 +200,7 @@ class HubStore:
         *,
         now: int | None = None,
         managed_host_identity: str | None = None,
+        managed_server_instance_id: str | None = None,
         allow_bound_control: bool = False,
     ) -> None:
         self.data_dir = Path(os.path.abspath(os.path.expanduser(os.fspath(data_dir))))
@@ -205,6 +209,11 @@ class HubStore:
         self.bootstrap_proof_path = self.data_dir / "bootstrap-owner.proof"
         self.maintenance_fence_path = self.data_dir / "maintenance-fence.json"
         self.managed_host_identity: str | None = None
+        self.managed_server_instance_id = (
+            _identity(managed_server_instance_id)
+            if managed_server_instance_id is not None
+            else None
+        )
         ensure_private_directory(self.data_dir)
         self.instance_id = _id("hub_instance")
         self.hub_id = ""
@@ -571,19 +580,37 @@ class HubStore:
         return value if 16 <= len(value) <= 512 else None
 
     def _ensure_bootstrap_claim(
-        self, connection: sqlite3.Connection, timestamp: int
+        self,
+        connection: sqlite3.Connection,
+        timestamp: int,
+        *,
+        force_local: bool = False,
     ) -> None:
         active = connection.execute(
             """
-            SELECT id, token_hash, expires_at FROM bootstrap_claims
-            WHERE consumed_at IS NULL AND revoked_at IS NULL AND expires_at > ?
-            ORDER BY created_at DESC LIMIT 1
+            SELECT c.id, c.token_hash, c.expires_at,
+                   d.server_instance_id AS delegated_server_instance_id
+            FROM bootstrap_claims AS c
+            LEFT JOIN bootstrap_delegations AS d ON d.bootstrap_claim_id = c.id
+            WHERE c.consumed_at IS NULL AND c.revoked_at IS NULL AND c.expires_at > ?
+            ORDER BY c.created_at DESC LIMIT 1
             """,
             (timestamp,),
         ).fetchone()
         local_proof = self._read_local_proof(self.bootstrap_proof_path)
         if (
-            active is not None
+            not force_local
+            and active is not None
+            and active["delegated_server_instance_id"] is not None
+            and str(active["delegated_server_instance_id"])
+            == self.managed_server_instance_id
+            and local_proof is None
+        ):
+            return
+        if (
+            not force_local
+            and active is not None
+            and active["delegated_server_instance_id"] is None
             and local_proof is not None
             and hmac.compare_digest(active["token_hash"], token_hash(local_proof))
         ):
@@ -855,6 +882,23 @@ class HubStore:
         destination: sqlite3.Connection | None = None
         try:
             source = self.connect()
+            snapshot_time = _now()
+            # A delegated bootstrap proof is scoped to the live AgentsServer
+            # instance. Maintenance may replace that instance, so revoke the
+            # remote authority before the durable snapshot is taken. The
+            # immutable delegation row remains as audit/idempotency evidence.
+            with _write_transaction(source):
+                source.execute(
+                    """
+                    UPDATE bootstrap_claims SET revoked_at = ?
+                    WHERE consumed_at IS NULL AND revoked_at IS NULL
+                      AND EXISTS (
+                          SELECT 1 FROM bootstrap_delegations AS d
+                          WHERE d.bootstrap_claim_id = bootstrap_claims.id
+                      )
+                    """,
+                    (snapshot_time,),
+                )
             checkpoint = source.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
             if checkpoint is None or int(checkpoint[0]) != 0:
                 raise RuntimeError("Team Hub WAL checkpoint could not drain")
@@ -889,13 +933,15 @@ class HubStore:
                 or str(binding[1]) != self.managed_host_identity
             ):
                 raise RuntimeError("Team Hub maintenance backup identity verification failed")
-            snapshot_time = _now()
             proof_rows: list[tuple[str, str, bytes]] = []
             bootstrap_claims = destination.execute(
                 """
-                SELECT id, token_hash FROM bootstrap_claims
-                WHERE consumed_at IS NULL AND revoked_at IS NULL AND expires_at > ?
-                ORDER BY created_at, id
+                SELECT c.id, c.token_hash FROM bootstrap_claims AS c
+                LEFT JOIN bootstrap_delegations AS d
+                  ON d.bootstrap_claim_id = c.id
+                WHERE c.consumed_at IS NULL AND c.revoked_at IS NULL
+                  AND c.expires_at > ? AND d.bootstrap_claim_id IS NULL
+                ORDER BY c.created_at, c.id
                 """,
                 (snapshot_time,),
             ).fetchall()
@@ -1291,8 +1337,12 @@ class HubStore:
             database_proofs: dict[str, tuple[str, bytes, int]] = {}
             for row in connection.execute(
                 """
-                SELECT id, token_hash, expires_at FROM bootstrap_claims
-                WHERE consumed_at IS NULL AND revoked_at IS NULL
+                SELECT c.id, c.token_hash, c.expires_at
+                FROM bootstrap_claims AS c
+                LEFT JOIN bootstrap_delegations AS d
+                  ON d.bootstrap_claim_id = c.id
+                WHERE c.consumed_at IS NULL AND c.revoked_at IS NULL
+                  AND d.bootstrap_claim_id IS NULL
                 """
             ):
                 database_proofs["bootstrap-owner.proof"] = (
@@ -1405,8 +1455,215 @@ class HubStore:
             with _write_transaction(connection):
                 if self._is_bootstrapped(connection) or not self._globally_empty(connection):
                     raise HubError("bootstrap_unavailable", "Bootstrap is unavailable", 409)
-                self._ensure_bootstrap_claim(connection, timestamp)
+                self._ensure_bootstrap_claim(
+                    connection,
+                    timestamp,
+                    force_local=True,
+                )
             return self.bootstrap_proof_path
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _canonical_request_id(value: str) -> str:
+        try:
+            parsed = uuid.UUID(str(value))
+            canonical = str(parsed)
+        except (ValueError, AttributeError) as exc:
+            raise ValueError("request_id is invalid") from exc
+        if parsed.version != 4 or canonical != str(value):
+            raise ValueError("request_id must be a canonical UUIDv4")
+        return canonical
+
+    def _tailnet_bootstrap_proof(self, fingerprint: bytes) -> str:
+        key = read_secret_file(self.signing_key_path)
+        digest = hmac.new(
+            key,
+            b"agentsdock-team-hub-tailnet-bootstrap-v1\0" + fingerprint,
+            hashlib.sha256,
+        ).digest()
+        encoded = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+        return f"bootstrap_remote.{encoded}"
+
+    def issue_tailnet_bootstrap_proof(
+        self,
+        *,
+        request_id: str,
+        server_identity: str,
+        server_instance_id: str,
+        hub_url: str,
+        tailnet_login: str,
+        recipient_email: str,
+        display_name: str,
+        device_label: str,
+    ) -> dict[str, Any]:
+        """Issue an idempotent, hash-only first-owner proof for one Serve user."""
+
+        timestamp = _now()
+        clean_request_id = self._canonical_request_id(request_id)
+        clean_server_identity = _identity(server_identity)
+        clean_server_instance_id = _identity(server_instance_id)
+        clean_hub_url = _bounded_text(hub_url, "hub_url", 16, 2048)
+        clean_login = _email(tailnet_login)
+        clean_recipient = _email(recipient_email)
+        clean_display_name = _bounded_text(display_name, "display_name", 1, 160)
+        clean_device_label = _bounded_text(device_label, "device_label", 1, 160)
+        if clean_login != clean_recipient:
+            raise HubError(
+                "bootstrap_identity_mismatch",
+                "Bootstrap recipient does not match the verified Tailnet identity",
+                403,
+            )
+        if (
+            self.managed_host_identity is None
+            or clean_server_identity != self.managed_host_identity
+            or self.managed_server_instance_id is None
+            or clean_server_instance_id != self.managed_server_instance_id
+        ):
+            raise HubError(
+                "bootstrap_target_changed",
+                "The designated Team Hub host changed before confirmation",
+                409,
+            )
+        fingerprint = canonical_fingerprint(
+            {
+                "request_id": clean_request_id,
+                "server_identity": clean_server_identity,
+                "server_instance_id": clean_server_instance_id,
+                "hub_id": self.hub_id,
+                "hub_url": clean_hub_url,
+                "tailnet_login": clean_login,
+                "recipient_email": clean_recipient,
+                "display_name": clean_display_name,
+                "device_label": clean_device_label,
+            }
+        )
+        proof = self._tailnet_bootstrap_proof(fingerprint)
+        digest = token_hash(proof)
+        expires_at = timestamp + TAILNET_BOOTSTRAP_PROOF_TTL_SECONDS
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                if self._is_bootstrapped(connection) or not self._globally_empty(connection):
+                    raise HubError(
+                        "bootstrap_unavailable", "Bootstrap is unavailable", 409
+                    )
+                prior = connection.execute(
+                    """
+                    SELECT d.request_fingerprint, d.expires_at,
+                           c.token_hash, c.consumed_at, c.revoked_at
+                    FROM bootstrap_delegations AS d
+                    JOIN bootstrap_claims AS c ON c.id = d.bootstrap_claim_id
+                    WHERE d.request_id = ?
+                    """,
+                    (clean_request_id,),
+                ).fetchone()
+                if prior is not None:
+                    if not hmac.compare_digest(
+                        bytes(prior["request_fingerprint"]), fingerprint
+                    ):
+                        raise HubError(
+                            "idempotency_conflict",
+                            "Bootstrap request_id was already used for another request",
+                            409,
+                        )
+                    if (
+                        prior["consumed_at"] is not None
+                        or prior["revoked_at"] is not None
+                        or int(prior["expires_at"]) <= timestamp
+                        or not hmac.compare_digest(bytes(prior["token_hash"]), digest)
+                    ):
+                        raise HubError(
+                            "bootstrap_unavailable", "Bootstrap is unavailable", 409
+                        )
+                    expires_at = int(prior["expires_at"])
+                else:
+                    delegation_count = int(
+                        connection.execute(
+                            "SELECT count(*) FROM bootstrap_delegations"
+                        ).fetchone()[0]
+                    )
+                    if delegation_count >= MAX_BOOTSTRAP_DELEGATION_LEDGER_ROWS:
+                        raise HubError(
+                            "bootstrap_ledger_exhausted",
+                            (
+                                "Remote bootstrap proof issuance is exhausted; "
+                                "complete first-owner setup from the host"
+                            ),
+                            409,
+                        )
+                    competing = connection.execute(
+                        """
+                        SELECT d.request_id
+                        FROM bootstrap_delegations AS d
+                        JOIN bootstrap_claims AS c
+                          ON c.id = d.bootstrap_claim_id
+                        WHERE c.consumed_at IS NULL AND c.revoked_at IS NULL
+                          AND c.expires_at > ?
+                        LIMIT 1
+                        """,
+                        (timestamp,),
+                    ).fetchone()
+                    if competing is not None:
+                        raise HubError(
+                            "bootstrap_request_in_progress",
+                            "Another bootstrap confirmation is still active",
+                            409,
+                        )
+                    connection.execute(
+                        """
+                        UPDATE bootstrap_claims SET revoked_at = ?
+                        WHERE consumed_at IS NULL AND revoked_at IS NULL
+                        """,
+                        (timestamp,),
+                    )
+                    claim_id = _id("bootstrap_claim")
+                    connection.execute(
+                        """
+                        INSERT INTO bootstrap_claims(
+                            id, token_hash, created_at, expires_at
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (claim_id, digest, timestamp, expires_at),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO bootstrap_delegations(
+                            bootstrap_claim_id, request_id, request_fingerprint,
+                            server_identity, server_instance_id, hub_id, hub_url,
+                            tailnet_login_normalized, recipient_email_normalized,
+                            display_name, device_label, created_at, expires_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            claim_id,
+                            clean_request_id,
+                            fingerprint,
+                            clean_server_identity,
+                            clean_server_instance_id,
+                            self.hub_id,
+                            clean_hub_url,
+                            clean_login,
+                            clean_recipient,
+                            clean_display_name,
+                            clean_device_label,
+                            timestamp,
+                            expires_at,
+                        ),
+                    )
+            try:
+                self.bootstrap_proof_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return {
+                "request_id": clean_request_id,
+                "server_identity": clean_server_identity,
+                "server_instance_id": clean_server_instance_id,
+                "hub_id": self.hub_id,
+                "tailnet_login": clean_login,
+                "expires_at": _iso8601(expires_at),
+                "bootstrap_proof": proof,
+            }
         finally:
             connection.close()
 
@@ -1632,9 +1889,20 @@ class HubStore:
         }
 
     def bootstrap(
-        self, proof: str, email: str, display_name: str, device_label: str
+        self,
+        proof: str,
+        email: str,
+        display_name: str,
+        device_label: str,
+        *,
+        transport: str = "loopback",
+        request_id: str | None = None,
+        tailnet_login: str | None = None,
+        hub_url: str | None = None,
     ) -> dict[str, Any]:
         timestamp = _now()
+        if transport not in {"loopback", "tailscale_serve"}:
+            raise HubError("bootstrap_unavailable", "Bootstrap is unavailable", 403)
         try:
             digest = token_hash(proof)
         except TokenError as exc:
@@ -1648,14 +1916,62 @@ class HubStore:
                     raise HubError("bootstrap_unavailable", "Bootstrap is unavailable", 409)
                 claim = connection.execute(
                     """
-                    SELECT id, token_hash FROM bootstrap_claims
-                    WHERE token_hash = ? AND consumed_at IS NULL AND revoked_at IS NULL
-                      AND expires_at > ?
+                    SELECT c.id, c.token_hash,
+                           d.request_id, d.server_identity, d.server_instance_id,
+                           d.hub_id, d.hub_url, d.tailnet_login_normalized,
+                           d.recipient_email_normalized, d.display_name,
+                           d.device_label
+                    FROM bootstrap_claims AS c
+                    LEFT JOIN bootstrap_delegations AS d
+                      ON d.bootstrap_claim_id = c.id
+                    WHERE c.token_hash = ? AND c.consumed_at IS NULL
+                      AND c.revoked_at IS NULL AND c.expires_at > ?
                     """,
                     (digest, timestamp),
                 ).fetchone()
                 if claim is None or not hmac.compare_digest(claim["token_hash"], digest):
                     raise HubError("bootstrap_unavailable", "Bootstrap is unavailable", 403)
+                delegated = claim["request_id"] is not None
+                if transport == "loopback":
+                    if delegated or request_id is not None or not proof.startswith("bootstrap."):
+                        raise HubError(
+                            "bootstrap_unavailable", "Bootstrap is unavailable", 403
+                        )
+                else:
+                    try:
+                        clean_request_id = self._canonical_request_id(str(request_id or ""))
+                        clean_login = _email(str(tailnet_login or ""))
+                        clean_email = _email(email)
+                        clean_display_name = _bounded_text(
+                            display_name, "display_name", 1, 160
+                        )
+                        clean_device_label = _bounded_text(
+                            device_label, "device_label", 1, 160
+                        )
+                    except ValueError as exc:
+                        raise HubError(
+                            "bootstrap_unavailable", "Bootstrap is unavailable", 403
+                        ) from exc
+                    if (
+                        not delegated
+                        or not proof.startswith("bootstrap_remote.")
+                        or clean_request_id != str(claim["request_id"])
+                        or self.managed_host_identity is None
+                        or str(claim["server_identity"])
+                        != self.managed_host_identity
+                        or self.managed_server_instance_id is None
+                        or str(claim["server_instance_id"])
+                        != self.managed_server_instance_id
+                        or str(claim["hub_id"]) != self.hub_id
+                        or str(claim["hub_url"]) != str(hub_url or "")
+                        or str(claim["tailnet_login_normalized"]) != clean_login
+                        or str(claim["recipient_email_normalized"]) != clean_email
+                        or str(claim["display_name"]) != clean_display_name
+                        or str(claim["device_label"]) != clean_device_label
+                    ):
+                        raise HubError(
+                            "bootstrap_unavailable", "Bootstrap is unavailable", 403
+                        )
                 result = bootstrap_personal_team(
                     connection, email, display_name, now=timestamp
                 )

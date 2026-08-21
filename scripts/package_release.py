@@ -44,6 +44,7 @@ DIRECTORY_FILES = {
         "migrations/0002_teamspace_ledger.sql",
         "migrations/0003_service_runtime.sql",
         "migrations/0004_managed_host_binding.sql",
+        "migrations/0005_tailnet_bootstrap_delegations.sql",
     ),
 }
 DIRECTORIES = tuple(DIRECTORY_FILES)

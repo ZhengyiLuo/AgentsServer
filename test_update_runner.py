@@ -336,6 +336,89 @@ class UpdateRunnerTests(unittest.TestCase):
                     heartbeat_seconds=0.02,
                 )
 
+    def test_installer_failure_redacts_setup_and_bearer_secrets_from_status_tail(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            secret = "secret_agent_token_abcdefghijklmnopqrstuvwxyz0123456789"
+            script = (
+                "import sys; "
+                f"print('AGENTSDOCK_SETUP_RESULT={{\"access_token\":\"{secret}\"}}', flush=True); "
+                f"print('Authorization: Bearer {secret}', flush=True); "
+                f"print('{{\"access_token\":\"{secret}\"}}', flush=True); "
+                "print('safe diagnostic', flush=True); "
+                "raise SystemExit(7)"
+            )
+            with self.assertRaises(RuntimeError) as raised:
+                update_runner.run_installer(
+                    [sys.executable, "-c", script],
+                    cwd=root,
+                    status_path=root / "server-update.json",
+                    log_path=root / "server-update.log",
+                    version="1.2.3",
+                    timeout_seconds=2,
+                    heartbeat_seconds=0.02,
+                )
+
+            message = str(raised.exception)
+            self.assertIn("safe diagnostic", message)
+            self.assertNotIn(secret, message)
+            self.assertNotIn("AGENTSDOCK_SETUP_RESULT", message)
+            self.assertIn("[REDACTED]", message)
+
+    def test_installer_log_tail_redacts_json_secret_when_tail_starts_mid_line(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "server-update.log"
+            secret = "secret_agent_token_abcdefghijklmnopqrstuvwxyz0123456789"
+            log_path.write_text(
+                "AGENTSDOCK_SETUP_RESULT={\"padding\":\""
+                + ("x" * (update_runner.INSTALLER_LOG_TAIL_BYTES + 100))
+                + f"\",\"access_token\":\"{secret}\"}}\n"
+                + "safe diagnostic\n"
+            )
+
+            tail = update_runner.installer_log_tail(log_path)
+
+            self.assertNotIn(secret, tail)
+            self.assertEqual(tail, "safe diagnostic")
+
+    def test_installer_log_tail_redacts_short_and_punctuated_secrets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "server-update.log"
+            secrets = ("x+:/=", "/a b", "p+q==:$", "Q")
+            log_path.write_text(
+                "prefix AGENTSDOCK_SETUP_RESULT={\"access_token\":\"drop-me\"}\n"
+                f"Authorization: Bearer {secrets[0]}\n"
+                f"AGENTSDOCK_PROVIDER_AUTHORITY_FILE={secrets[1]}\n"
+                f"{{\"access_token\":\"{secrets[2]}\"}}\n"
+                f"Bearer {secrets[3]}\n"
+                "safe diagnostic\n"
+            )
+
+            tail = update_runner.installer_log_tail(log_path)
+
+            self.assertNotIn("AGENTSDOCK_SETUP_RESULT", tail)
+            for secret in secrets:
+                self.assertNotIn(secret, tail)
+            self.assertEqual(tail.count("[REDACTED]"), 4)
+            self.assertIn("safe diagnostic", tail)
+
+    def test_installer_log_tail_discards_a_partial_secret_line_at_the_cutoff(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "server-update.log"
+            secret_suffix = "LEAK+:/=END"
+            log_path.write_text(
+                "AGENTSDOCK_AGENT_TOKEN="
+                + ("x" * (update_runner.INSTALLER_LOG_TAIL_BYTES + 128))
+                + secret_suffix
+                + "\n"
+                + "safe diagnostic\n"
+            )
+
+            tail = update_runner.installer_log_tail(log_path)
+
+            self.assertNotIn(secret_suffix, tail)
+            self.assertEqual(tail, "safe diagnostic")
+
     def test_installer_timeout_includes_log_tail_and_stops_process(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -466,6 +549,99 @@ class UpdateRunnerTests(unittest.TestCase):
             expected_server_identity="server-test-identity",
             expected_team_hub_id=None,
         )
+
+    def test_post_update_identity_binds_exact_tailnet_transport_and_url(self):
+        health = {
+            "server_identity": "server-test-identity",
+            "capabilities": {
+                "team_hub_v1": {
+                    "available": True,
+                    "designated_host": True,
+                    "version": 1,
+                    "base_path": "/api/team-hub",
+                    "hub_id": "hub_test12345678",
+                    "host_server_identity": "server-test-identity",
+                    "transport": "tailscale_serve",
+                    "hub_url": (
+                        "https://sonic.example.ts.net:8444/api/team-hub"
+                    ),
+                }
+            },
+        }
+        with patch.object(
+            update_runner,
+            "server_health_snapshot",
+            return_value=health,
+        ):
+            update_runner.assert_post_update_identity(
+                7850,
+                token="secret",
+                expected_server_identity="server-test-identity",
+                expected_team_hub_id="hub_test12345678",
+                expected_team_hub_transport="tailscale_serve",
+                expected_team_hub_url=(
+                    "https://sonic.example.ts.net:8444/api/team-hub"
+                ),
+            )
+            with self.assertRaisesRegex(RuntimeError, "changed its Team Hub transport"):
+                update_runner.assert_post_update_identity(
+                    7850,
+                    token="secret",
+                    expected_server_identity="server-test-identity",
+                    expected_team_hub_id="hub_test12345678",
+                    expected_team_hub_transport="tailscale_serve",
+                    expected_team_hub_url=(
+                        "https://other.example.ts.net:8444/api/team-hub"
+                    ),
+                )
+
+    def test_runner_passes_explicit_empty_url_for_loopback_hub(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive_buffer = io.BytesIO()
+            with tarfile.open(fileobj=archive_buffer, mode="w:gz") as archive:
+                installer = b"#!/bin/sh\nexit 0\n"
+                entry = tarfile.TarInfo("agents-server-1.2.4/install.sh")
+                entry.mode = 0o755
+                entry.size = len(installer)
+                archive.addfile(entry, io.BytesIO(installer))
+            archive_bytes = archive_buffer.getvalue()
+            manifest = {
+                "version": "1.2.4",
+                "archive": {
+                    "name": "agents-server-1.2.4.tar.gz",
+                    "url": "https://example.invalid/agents-server-1.2.4.tar.gz",
+                    "sha256": hashlib.sha256(archive_bytes).hexdigest(),
+                },
+            }
+            args = argparse.Namespace(
+                status_file=str(root / "server-update.json"),
+                public_key=str(root / "release-public-key.pem"),
+                port=7850,
+                bind="127.0.0.1",
+                expected_version="1.2.4",
+                current_version="1.2.3",
+                expected_server_identity="server-test-identity",
+                update_id="update-test-loopback-hub",
+                expected_team_hub_id="hub_test12345678",
+                expected_team_hub_transport="loopback",
+                expected_team_hub_url="",
+                team_hub_snapshot=str(root / "snapshot_exact"),
+                team_hub_data_dir=str(root / "hub"),
+            )
+            with patch.object(update_runner, "check_release", return_value=manifest), \
+                 patch.object(update_runner, "download_bytes", return_value=archive_bytes), \
+                 patch.object(update_runner, "update_status", side_effect=lambda _path, **changes: changes), \
+                 patch.object(update_runner, "assert_server_idle"), \
+                 patch.object(update_runner, "assert_post_update_identity"), \
+                 patch.object(update_runner, "run_installer") as install:
+                update_runner.run_update(args)
+
+        command = install.call_args.args[0]
+        transport_index = command.index("--expected-team-hub-transport")
+        self.assertEqual(command[transport_index + 1], "loopback")
+        self.assertEqual(command[transport_index + 2], "--expected-team-hub-url")
+        self.assertEqual(command[transport_index + 3], "")
 
     def test_detached_runner_allows_explicit_beta_to_latest_stable_switch(self):
         with tempfile.TemporaryDirectory() as temporary:

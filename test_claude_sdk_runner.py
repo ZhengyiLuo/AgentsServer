@@ -231,6 +231,40 @@ class FakeClaudeManager:
         return self.loaded and chat_id == "chat-claude"
 
 
+class FakeClaudeManagerFailingAfterOwnership(FakeClaudeManager):
+    """A reused supervisor that registers ownership, then fails to deliver.
+
+    Models a stale client picked up from the cache (for example, one whose
+    backing CLI process authenticated under an account that was since
+    switched out): the chat is claimed via ``on_supervisor_ready`` exactly
+    like a healthy start, but the delivery call itself then raises something
+    other than ``ClaudeSDKQueryError``.
+    """
+
+    def __init__(self, error: BaseException) -> None:
+        super().__init__()
+        self.error = error
+
+    async def start_run(
+        self,
+        chat_id: str,
+        prompt: str,
+        *,
+        run_id: str,
+        options: object,
+        configuration_key: str,
+        query_session_id: str | None = None,
+        on_supervisor_ready: object | None = None,
+    ) -> FakeClaudeRun:
+        self.start_calls.append(
+            (chat_id, prompt, run_id, options, configuration_key, query_session_id)
+        )
+        self.active_run_id = run_id
+        if on_supervisor_ready is not None:
+            await on_supervisor_ready(self.owner_token)  # type: ignore[operator]
+        raise self.error
+
+
 class SequencedClaudeManager(FakeClaudeManager):
     def __init__(self, handles: list[FakeClaudeRun]) -> None:
         super().__init__(handles[0])
@@ -3775,6 +3809,106 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(
             call.args[1] == "error"
             and "replay ACK missing" in call.args[2]["message"]
+            for call in append_event.await_args_list
+        ))
+
+    async def test_reused_client_generic_start_failure_evicts_stale_client(
+        self,
+    ) -> None:
+        """A non-ClaudeSDKQueryError start failure must not leave a stale
+        client cached. Regression test: previously only ClaudeSDKQueryError
+        triggered eviction here, so a client that failed for any other
+        reason immediately after claiming ownership (for example, one whose
+        backing CLI process authenticated under an account that was since
+        switched out) stayed cached and kept failing the same way on every
+        following turn until it aged out after CLAUDE_SDK_IDLE_TTL_SECONDS.
+        """
+
+        manager = FakeClaudeManagerFailingAfterOwnership(
+            RuntimeError("client not authenticated")
+        )
+        append_event = AsyncMock(return_value={})
+        append_finished = AsyncMock(return_value={})
+        project = AsyncMock()
+
+        with patch.object(
+            agent_server,
+            "resolve_claude_resume_provider",
+            return_value=(None, None),
+        ), patch.object(
+            agent_server,
+            "capture_git_baseline",
+            AsyncMock(return_value={"head": "base"}),
+        ), patch.object(
+            agent_server,
+            "build_claude_sdk_options",
+            return_value=(object(), "config", "/usr/bin/claude"),
+        ), patch.object(
+            agent_server,
+            "claude_sdk_manager",
+            AsyncMock(return_value=manager),
+        ), patch.object(
+            agent_server,
+            "watch_manifest_artifacts",
+            wait_forever,
+        ), patch.object(
+            agent_server,
+            "append_event",
+            append_event,
+        ), patch.object(
+            agent_server,
+            "project_claude_sdk_message",
+            project,
+        ), patch.object(
+            agent_server,
+            "cancel_claude_interactions",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "collect_manifest",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "collect_recent_leftover_manifests",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "append_turn_finished_event",
+            append_finished,
+        ), patch.object(
+            agent_server,
+            "release_turn_slot",
+            AsyncMock(return_value=True),
+        ), patch.object(
+            agent_server,
+            "record_runtime_failure",
+            Mock(),
+        ), patch.object(
+            agent_server,
+            "should_schedule_queue_after_finish",
+            return_value=False,
+        ), patch.object(
+            agent_server,
+            "schedule_next_queued_turn",
+            Mock(),
+        ):
+            await agent_server.run_claude_sdk(
+                "chat-claude",
+                "run-claude",
+                "Prompt",
+                dict(self.session),
+                Path(self.cwd) / ".manifest.json",
+            )
+
+        self.assertEqual(len(manager.start_calls), 1)
+        self.assertEqual(manager.evict_calls, [("chat-claude", True)])
+        project.assert_not_awaited()
+        terminal = append_finished.await_args.args[1]
+        self.assertIsNone(terminal["exit_code"])
+        self.assertEqual(terminal["result_text"], "")
+        self.assertTrue(any(
+            call.args[1] == "error"
+            and "client not authenticated" in call.args[2]["message"]
             for call in append_event.await_args_list
         ))
 

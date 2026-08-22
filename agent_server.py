@@ -34512,14 +34512,30 @@ async def run_claude_sdk(
         )
         return
     except Exception as exc:
+        # A client that fails before its first query (for example, credentials
+        # changed on disk after the client was created) would otherwise stay
+        # cached and keep failing the same way for every following turn until
+        # it ages out at CLAUDE_SDK_IDLE_TTL_SECONDS. Evict it immediately so
+        # the next turn starts a fresh client against whatever is currently
+        # authenticated, instead of silently reusing the stale one.
+        startup_ownership_token = str(
+            startup_active.get("claude_sdk_owner_token") or ""
+        )
+        if startup_ownership_token and await turn_slot_is_owned(
+            session_id,
+            run_id,
+        ):
+            await evict_claude_sdk_chat(
+                session_id,
+                force=True,
+                manager=manager,
+                ownership_token=startup_ownership_token,
+            )
         await finish_claude_sdk_start_failure(
             session_id,
             run_id,
             f"Claude SDK could not start: {concise_error_message(exc)}",
-            ownership_token=(
-                str(startup_active.get("claude_sdk_owner_token") or "")
-                or None
-            ),
+            ownership_token=startup_ownership_token or None,
         )
         return
 

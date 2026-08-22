@@ -30227,23 +30227,39 @@ async def evict_codex_app_server_thread(
 async def unpin_codex_app_server_thread(
     manager: CodexAppServerManager,
     thread_id: str,
+    *,
+    force: bool = False,
 ) -> None:
+    """Release one pin; evict only once nothing else needs the thread.
+
+    ``force=True`` skips the "does some chat still reference this thread"
+    keep-alive check. Use it when the caller already knows the thread is
+    broken (for example, a turn/start rejection during the codex-exec
+    fallback path) - the owning chat's own session record almost always
+    still points at that exact thread_id, since that record is what made
+    it "this chat's thread" in the first place. Without force, that would
+    always read as "still retained" and keep the known-bad thread cached
+    for the next turn to fail against again, instead of being evicted.
+    evict_codex_app_server_thread() still declines if the thread has a
+    genuinely active turn, so this cannot evict work in flight elsewhere.
+    """
     if not thread_id:
         return
     async with CODEX_APP_SERVER_THREAD_LRU_LOCK:
         count = CODEX_APP_SERVER_THREAD_PIN_COUNTS.get(thread_id, 0)
-        if count > 1:
+        if count > 1 and not force:
             CODEX_APP_SERVER_THREAD_PIN_COUNTS[thread_id] = count - 1
             return
         CODEX_APP_SERVER_THREAD_PIN_COUNTS.pop(thread_id, None)
         CODEX_APP_SERVER_PINNED_THREADS.discard(thread_id)
-    retained = any(
-        str(session_provider_id(session) or "") == thread_id
-        for session in STORE.sessions.values()
-    )
-    if retained:
-        await touch_codex_app_server_thread(manager, thread_id)
-        return
+    if not force:
+        retained = any(
+            str(session_provider_id(session) or "") == thread_id
+            for session in STORE.sessions.values()
+        )
+        if retained:
+            await touch_codex_app_server_thread(manager, thread_id)
+            return
     async with CODEX_APP_SERVER_THREAD_LRU_LOCK:
         CODEX_APP_SERVER_THREAD_LRU.pop(thread_id, None)
     await evict_codex_app_server_thread(
@@ -38001,7 +38017,14 @@ async def run_codex_app_server(
             if turn is not None:
                 await turn.close()
             if thread_pinned and provider_id:
-                await unpin_codex_app_server_thread(manager, provider_id)
+                # force=True: this thread just failed to start a turn, so
+                # it must not be kept alive for the next one to fail against
+                # again just because this chat's own session still names it.
+                await unpin_codex_app_server_thread(
+                    manager,
+                    provider_id,
+                    force=True,
+                )
                 thread_pinned = False
             cleared = await clear_active_process(
                 session_id,

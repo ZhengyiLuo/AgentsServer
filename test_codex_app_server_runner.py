@@ -213,6 +213,22 @@ class FakeManager:
         return []
 
 
+class FakeThreadEvictionManager:
+    """Minimal manager double for unpin/evict_codex_app_server_thread only."""
+
+    def __init__(self) -> None:
+        self.unsubscribe_calls: list[str] = []
+
+    def active_turn(self, thread_id: str) -> object | None:
+        return None
+
+    def is_thread_loaded(self, thread_id: str) -> bool:
+        return True
+
+    async def unsubscribe_thread(self, thread_id: str) -> None:
+        self.unsubscribe_calls.append(thread_id)
+
+
 def completed_notification(status: str = "completed") -> dict[str, object]:
     return {
         "method": "turn/completed",
@@ -1033,6 +1049,63 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             fallback_events[0]["from"],
             agent_server.CODEX_TRANSPORT_APP_SERVER,
         )
+
+    async def _unpin_native_thread_with_clean_registry(
+        self,
+        manager: "FakeThreadEvictionManager",
+        *,
+        force: bool,
+    ) -> None:
+        previous_lru = agent_server.CODEX_APP_SERVER_THREAD_LRU
+        previous_pinned = agent_server.CODEX_APP_SERVER_PINNED_THREADS
+        previous_pin_counts = agent_server.CODEX_APP_SERVER_THREAD_PIN_COUNTS
+        previous_evicting = agent_server.CODEX_APP_SERVER_EVICTING_THREADS
+        agent_server.CODEX_APP_SERVER_THREAD_LRU = OrderedDict()
+        agent_server.CODEX_APP_SERVER_PINNED_THREADS = set()
+        agent_server.CODEX_APP_SERVER_THREAD_PIN_COUNTS = {}
+        agent_server.CODEX_APP_SERVER_EVICTING_THREADS = {}
+        try:
+            # self.session (the sole entry in STORE.sessions from
+            # asyncSetUp) already has codex_thread_id == "thread-native", so
+            # this chat "retains" its own thread the same way it would for
+            # the real failing chat in the account-switch scenario.
+            await agent_server.unpin_codex_app_server_thread(
+                manager, "thread-native", force=force
+            )
+        finally:
+            agent_server.CODEX_APP_SERVER_THREAD_LRU = previous_lru
+            agent_server.CODEX_APP_SERVER_PINNED_THREADS = previous_pinned
+            agent_server.CODEX_APP_SERVER_THREAD_PIN_COUNTS = previous_pin_counts
+            agent_server.CODEX_APP_SERVER_EVICTING_THREADS = previous_evicting
+
+    async def test_unpin_keeps_a_thread_still_referenced_by_its_own_chat(
+        self,
+    ) -> None:
+        """Unchanged existing behavior: a normal (non-forced) unpin at the
+        end of a successful turn must NOT evict a thread its own chat still
+        points at - otherwise every ordinary turn would tear down and
+        reconnect the persistent thread it just used.
+        """
+
+        manager = FakeThreadEvictionManager()
+        await self._unpin_native_thread_with_clean_registry(manager, force=False)
+        self.assertEqual(manager.unsubscribe_calls, [])
+
+    async def test_forced_unpin_evicts_a_thread_still_referenced_by_its_own_chat(
+        self,
+    ) -> None:
+        """Regression test for the account-switch bug report: a Codex chat's
+        own persisted thread_id must not block a forced eviction. Without
+        force=True, this reads as "still retained" (the failing chat's own
+        session record is exactly what names that thread_id) and the
+        known-bad thread stays cached for the next turn to fail against
+        again - which is what run_codex_app_server's codex-exec fallback
+        path now opts out of with force=True after a turn/start rejection.
+        """
+
+        manager = FakeThreadEvictionManager()
+        await self._unpin_native_thread_with_clean_registry(manager, force=True)
+        self.assertEqual(manager.unsubscribe_calls, ["thread-native"])
 
     async def test_ambiguous_post_send_failure_never_replays_through_exec(self) -> None:
         pending_turn = FakeTurn(

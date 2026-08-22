@@ -784,8 +784,10 @@ class VendoredTeamHubParityTests(unittest.TestCase):
             "migrations/0005_tailnet_bootstrap_delegations.sql": "e47d25ea16353d023355cf875d008808cd3742cd038569abfb9607556cdbd09b",
             "migrations/__init__.py": "aaf340c45c8d39c2939814977ba4cef8eb6b3bd0671b0f7542ebe06f5431d6ec",
             "security.py": "0c1895c7443e7be07a2f53c7e4c4228e3ee04c65d6cd36f039b7bbba1813e4fa",
-            "service.py": "3440ebd10d4bb5daad49e823cccc4468c665407b96bad7a38f8ed98dd23225f9",
-            "store.py": "3387963db1bfee4984e4fd262feba06ffbef3865186a6df6f7209f9aba9a9b4c",
+            "secure_peer.py": "069ef40aceb18802b3d349ffda2375d8a82d26f0329b78ed60db1f232a75038a",
+            "secure_peer_hub.py": "08ae2d20fa5bf52c340c72027be20f923f4fea3214a6bc67b45882d52eebc806",
+            "service.py": "cbdb2e0daf5b77fb881b8b4f7411a4e618fcbbefdbe25e2cf00eb9958da8abb1",
+            "store.py": "b9957d44770ba6ef94eb4a1f4171e2744ab3da10b8b583c3b9201797cb539073",
         }
         entries = list(vendored.rglob("*"))
         for path in entries:

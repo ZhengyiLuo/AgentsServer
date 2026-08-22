@@ -186,6 +186,7 @@ class ManagedTeamHubHost:
         transport: str = TEAM_HUB_TRANSPORT_LOOPBACK,
         hub_url: str | None = None,
         routes: dict[str, str | None] | None = None,
+        secure_peer_manager: Any | None = None,
         config_error: str | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
@@ -225,6 +226,7 @@ class ManagedTeamHubHost:
             )
             if route in configured_routes
         }
+        self.secure_peer_manager = secure_peer_manager
         self.config_error = config_error or route_error
         self.logger = logger or logging.getLogger("agents-server.team-hub")
         self._guard = threading.RLock()
@@ -278,6 +280,7 @@ class ManagedTeamHubHost:
                     )
                     for route, url in self.routes.items()
                 },
+                secure_peer_manager=self.secure_peer_manager,
             )
         except Exception as exc:
             HubStore.release_managed_runtime_lease(lease)
@@ -297,6 +300,21 @@ class ManagedTeamHubHost:
             self._store = application.state.store
             self._accepting = True
             self._startup_failed = False
+        if self.secure_peer_manager is not None:
+            try:
+                self.secure_peer_manager.attach_host_hub(
+                    hub_id=application.state.store.hub_id,
+                    hub_data_dir=self.data_dir,
+                    hub_store=application.state.store,
+                )
+            except Exception as exc:
+                self.logger.error(
+                    "secure peer host attachment failed error_type=%s",
+                    type(exc).__name__,
+                )
+                self.secure_peer_manager.mark_host_unavailable(
+                    "The secure peer host could not be initialized."
+                )
 
     def capability(self) -> dict[str, Any]:
         with self._guard:
@@ -479,6 +497,13 @@ class ManagedTeamHubHost:
                     self._admission.notify_all()
 
     async def _close_and_drain(self) -> None:
+        if self.secure_peer_manager is not None:
+            # The TLS gateway bypasses ASGI but shares the authoritative Hub
+            # database. Close and drain it before a maintenance snapshot can
+            # begin so an acknowledged peer write cannot land post-snapshot.
+            await asyncio.to_thread(
+                self.secure_peer_manager.close_host_admission
+            )
         async with self._admission:
             with self._guard:
                 self._accepting = False
@@ -602,6 +627,10 @@ class ManagedTeamHubHost:
             with self._guard:
                 self._accepting = ready
             self._admission.notify_all()
+        if self.secure_peer_manager is not None:
+            await asyncio.to_thread(
+                self.secure_peer_manager.reopen_host_admission
+            )
 
     def reopen_admission_sync(self) -> None:
         """Reopen after a synchronous restart signal worker fails.
@@ -614,6 +643,8 @@ class ManagedTeamHubHost:
 
         with self._guard:
             self._accepting = self._delegate is not None and self._store is not None
+        if self.secure_peer_manager is not None:
+            self.secure_peer_manager.reopen_host_admission()
 
     async def shutdown(self) -> None:
         if not self.designated_host:

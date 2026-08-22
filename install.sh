@@ -769,7 +769,7 @@ if [[ "$TEAM_HUB_MODE" == "host" && "$TEAM_HUB_OPERATION_PENDING" != "true" ]]; 
   fi
 fi
 
-RELEASE_FILES=(agent_server.py team_hub_host.py agentsdock_jobs.py agentsdock_chats.py agentsdock_publish.py claude_sdk_client.py codex_app_server.py install.sh uninstall.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem)
+RELEASE_FILES=(agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py agentsdock_publish.py claude_sdk_client.py codex_app_server.py install.sh uninstall.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem)
 RELEASE_DIRECTORIES=(agentsdock_team_hub)
 TEAM_HUB_RELEASE_FILES=(
   __init__.py
@@ -777,6 +777,8 @@ TEAM_HUB_RELEASE_FILES=(
   cli.py
   database.py
   security.py
+  secure_peer.py
+  secure_peer_hub.py
   service.py
   store.py
   migrations/__init__.py
@@ -1392,6 +1394,8 @@ validate_staged_release_runtime() (
   "$STAGE_DIR/.venv/bin/python" -m py_compile \
     "$STAGE_DIR/agent_server.py" \
     "$STAGE_DIR/team_hub_host.py" \
+    "$STAGE_DIR/secure_peer_runtime.py" \
+    "$STAGE_DIR/secure_peer_delivery.py" \
     "$STAGE_DIR/agentsdock_jobs.py" \
     "$STAGE_DIR/agentsdock_chats.py" \
     "$STAGE_DIR/agentsdock_publish.py" \
@@ -1399,7 +1403,7 @@ validate_staged_release_runtime() (
     "$STAGE_DIR/codex_app_server.py" \
     "$STAGE_DIR/update_runner.py"
   "$STAGE_DIR/.venv/bin/python" -m compileall -q "$STAGE_DIR/agentsdock_team_hub"
-  PYTHONPATH="$STAGE_DIR" "$STAGE_DIR/.venv/bin/python" -c 'import agentsdock_team_hub, team_hub_host' >/dev/null
+  PYTHONPATH="$STAGE_DIR" "$STAGE_DIR/.venv/bin/python" -c 'import agentsdock_team_hub, secure_peer_delivery, secure_peer_runtime, team_hub_host; from agentsdock_team_hub import secure_peer, secure_peer_hub' >/dev/null
 )
 
 migrate_legacy_state() {
@@ -1926,6 +1930,24 @@ elif hub_mode == "disabled":
         raise SystemExit(1)
 else:
     raise SystemExit(1)
+secure_capability = capabilities.get("secure_peer_v1")
+if secure_capability is None and allow_legacy_transport == "true":
+    pass
+else:
+    secure_required = {
+        "available": True,
+        "state_available": True,
+        "state_error_code": None,
+        "required": False,
+        "version": 1,
+        "control_path": "/api/admin/secure-peers/v1/status",
+        "proxy_prefix": "/api/team-hub-secure",
+    }
+    if not isinstance(secure_capability, dict) or any(
+        secure_capability.get(key) != value
+        for key, value in secure_required.items()
+    ):
+        raise SystemExit(1)
 PY
   then
     result=0

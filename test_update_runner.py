@@ -18,6 +18,20 @@ import update_runner
 
 
 class UpdateRunnerTests(unittest.TestCase):
+    @staticmethod
+    def secure_peer_capability(*, state_available: bool = True):
+        return {
+            "available": True,
+            "state_available": state_available,
+            "state_error_code": (
+                None if state_available else "secure_peer_state_unavailable"
+            ),
+            "required": False,
+            "version": 1,
+            "control_path": "/api/admin/secure-peers/v1/status",
+            "proxy_prefix": "/api/team-hub-secure",
+        }
+
     def signed_manifest(
         self,
         version: str = "1.2.3",
@@ -554,6 +568,7 @@ class UpdateRunnerTests(unittest.TestCase):
         health = {
             "server_identity": "server-test-identity",
             "capabilities": {
+                "secure_peer_v1": self.secure_peer_capability(),
                 "team_hub_v1": {
                     "available": True,
                     "designated_host": True,
@@ -614,7 +629,10 @@ class UpdateRunnerTests(unittest.TestCase):
         }
         health = {
             "server_identity": "server-test-identity",
-            "capabilities": {"team_hub_v1": capability},
+            "capabilities": {
+                "secure_peer_v1": self.secure_peer_capability(),
+                "team_hub_v1": capability,
+            },
         }
         with patch.object(
             update_runner,
@@ -640,6 +658,27 @@ class UpdateRunnerTests(unittest.TestCase):
                     expected_team_hub_transport="tailscale_serve",
                     expected_team_hub_url=serve_url,
                     expected_team_hub_direct_ip_url=direct_url,
+                )
+
+    def test_post_update_identity_rejects_quarantined_secure_peer_state(self):
+        health = {
+            "server_identity": "server-test-identity",
+            "capabilities": {
+                "secure_peer_v1": self.secure_peer_capability(
+                    state_available=False
+                ),
+            },
+        }
+        with patch.object(
+            update_runner,
+            "server_health_snapshot",
+            return_value=health,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "secure-peer state is unavailable"):
+                update_runner.assert_post_update_identity(
+                    7850,
+                    token="secret",
+                    expected_server_identity="server-test-identity",
                 )
 
     def test_runner_passes_explicit_empty_url_for_loopback_hub(self):

@@ -99,16 +99,17 @@ Usage: ./uninstall.sh [--yes] [--purge-state]
 
 Stops and removes the AgentsServer user service, versioned release runtime,
 and generated configuration (including the access token). Chat history, jobs,
-files, and terminals under $STATE_ROOT are preserved by default so a later
-./install.sh picks ordinary AgentsServer state back up. Preserved Team Hub state
-is not auto-reactivated in this beta; it requires signed managed recovery or
-support-assisted restoration.
+files, secure-peer credentials, and terminals under $STATE_ROOT are preserved
+by default so a later ./install.sh picks ordinary AgentsServer state back up.
+Preserved Team Hub state is not auto-reactivated in this beta; it requires
+signed managed recovery or support-assisted restoration.
 
   --yes           Do not prompt before removing the service, releases, and
                    configuration.
-  --purge-state   Also delete $STATE_ROOT (chat history, jobs, files, and
-                   tokens). This cannot be undone and always requires typing
-                   the exact state path interactively; --yes never bypasses it.
+  --purge-state   Also delete $STATE_ROOT (chat history, jobs, files, tokens,
+                   and secure-peer credentials). This cannot be undone and
+                   always requires typing the exact state path interactively;
+                   --yes never bypasses it.
 USAGE
 }
 
@@ -304,7 +305,7 @@ if [[ "$PURGE_STATE" == "true" ]]; then
     echo "Deleted $STATE_ROOT"
   fi
 elif [[ -e "$STATE_ROOT" ]]; then
-  echo "Preserved chat history, jobs, files, and tokens at $STATE_ROOT."
+  echo "Preserved chat history, jobs, files, tokens, and secure-peer credentials at $STATE_ROOT."
   echo "Re-running ./install.sh will pick ordinary AgentsServer state back up. Pass --purge-state to also delete it."
   if [[ -e "$STATE_ROOT/team-hub/team-hub.sqlite3" || -L "$STATE_ROOT/team-hub/team-hub.sqlite3" ]]; then
     echo "Preserved Team Hub state is not auto-reactivated in this beta; use a signed managed recovery or support-assisted restoration."

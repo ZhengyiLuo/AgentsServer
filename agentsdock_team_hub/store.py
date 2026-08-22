@@ -88,6 +88,10 @@ class AccessClaims:
     session_id: str
     jti: str
     expires_at: int
+    auth_kind: str = "human"
+    team_id: str | None = None
+    scopes: frozenset[str] = frozenset()
+    peer_id: str | None = None
 
 
 def _now(value: int | None = None) -> int:
@@ -1720,10 +1724,48 @@ class HubStore:
     def _require_session(
         connection: sqlite3.Connection, claims: AccessClaims, timestamp: int
     ) -> sqlite3.Row:
+        if claims.auth_kind == "secure_peer":
+            if (
+                claims.team_id is None
+                or claims.peer_id is None
+                or claims.expires_at <= timestamp
+                or claims.session_id != f"secure_peer_session_{claims.peer_id}"
+            ):
+                raise HubError("authentication_required", "Authentication required", 401)
+            row = connection.execute(
+                """
+                SELECT ? AS id, p.id AS human_principal_id,
+                       ? AS device_label, ? AS expires_at,
+                       NULL AS email_normalized, p.display_name,
+                       p.kind AS principal_kind
+                FROM principals AS p
+                JOIN service_accounts AS s ON s.principal_id = p.id
+                JOIN memberships AS m ON m.principal_id = p.id
+                WHERE p.id = ? AND p.kind = 'service'
+                  AND p.scope_team_id IS NULL AND p.status = 'active'
+                  AND s.service_identifier = ?
+                  AND m.team_id = ? AND m.role = 'automation'
+                  AND m.status = 'active'
+                """,
+                (
+                    claims.session_id,
+                    "Secure paired server",
+                    claims.expires_at,
+                    claims.principal_id,
+                    f"agentsdock.secure-peer.{claims.peer_id}",
+                    claims.team_id,
+                ),
+            ).fetchone()
+            if row is None:
+                raise HubError("authentication_required", "Authentication required", 401)
+            return row
+        if claims.auth_kind != "human":
+            raise HubError("authentication_required", "Authentication required", 401)
         row = connection.execute(
             """
             SELECT s.id, s.human_principal_id, s.device_label, s.expires_at,
-                   h.email_normalized, p.display_name
+                   h.email_normalized, p.display_name,
+                   p.kind AS principal_kind
             FROM device_sessions AS s
             JOIN human_accounts AS h ON h.principal_id = s.human_principal_id
             JOIN principals AS p ON p.id = s.human_principal_id
@@ -1848,6 +1890,267 @@ class HubStore:
             raise RuntimeError("invalid Team Hub local-control team membership")
         return LOCAL_CONTROL_PRINCIPAL_ID
 
+    @staticmethod
+    def _secure_peer_principal_id(peer_id: str) -> str:
+        try:
+            parsed = uuid.UUID(peer_id)
+        except (ValueError, AttributeError) as exc:
+            raise HubError("peer_unavailable", "Secure peer is unavailable", 404) from exc
+        if parsed.version != 4 or str(parsed) != peer_id:
+            raise HubError("peer_unavailable", "Secure peer is unavailable", 404)
+        return "service_secure_peer_" + parsed.hex
+
+    def ensure_secure_peer_service(
+        self,
+        *,
+        peer_id: str,
+        peer_server_identity: str,
+        team_id: str,
+        display_name: str,
+    ) -> str:
+        """Idempotently bind one approved mTLS peer to an automation member.
+
+        The certificate and scope authority remain in the separate secure-peer
+        store and are rechecked for every proxied request.  This row supplies
+        only an auditable Team Hub author principal; it cannot authenticate on
+        any ordinary HTTP Hub route.
+        """
+
+        principal_id = self._secure_peer_principal_id(peer_id)
+        identity = _identity(peer_server_identity)
+        label = _bounded_text(display_name, "display_name", 1, 160)
+        clean_team = _identity(team_id)
+        timestamp = _now()
+        service_identifier = f"agentsdock.secure-peer.{peer_id}"
+        changed = False
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                team = connection.execute(
+                    "SELECT id FROM teams WHERE id = ?",
+                    (clean_team,),
+                ).fetchone()
+                if team is None:
+                    raise HubError("not_found", "Resource not found", 404)
+                principal = connection.execute(
+                    """
+                    SELECT p.kind,p.scope_team_id,p.display_name,p.status,
+                           s.service_identifier
+                    FROM principals AS p
+                    LEFT JOIN service_accounts AS s ON s.principal_id=p.id
+                    WHERE p.id=?
+                    """,
+                    (principal_id,),
+                ).fetchone()
+                if principal is None:
+                    connection.execute(
+                        """
+                        INSERT INTO principals(
+                            id,kind,scope_team_id,display_name,status,
+                            created_at,updated_at
+                        ) VALUES (?,'service',NULL,?,'active',?,?)
+                        """,
+                        (principal_id, label, timestamp, timestamp),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO service_accounts(
+                            principal_id,service_identifier,created_at
+                        ) VALUES (?,?,?)
+                        """,
+                        (principal_id, service_identifier, timestamp),
+                    )
+                    changed = True
+                elif (
+                    principal["kind"] != "service"
+                    or principal["scope_team_id"] is not None
+                    or principal["status"] != "active"
+                    or principal["service_identifier"] != service_identifier
+                    or principal["display_name"] != label
+                ):
+                    raise HubError(
+                        "peer_identity_conflict",
+                        "Secure peer identity conflicts with Team Hub state",
+                        409,
+                    )
+                membership = connection.execute(
+                    """
+                    SELECT role,status FROM memberships
+                    WHERE team_id=? AND principal_id=?
+                    """,
+                    (clean_team, principal_id),
+                ).fetchone()
+                if membership is None:
+                    connection.execute(
+                        """
+                        INSERT INTO memberships(
+                            id,team_id,principal_id,role,status,
+                            invited_by_principal_id,created_at,updated_at
+                        ) VALUES (?,?,?,'automation','active',NULL,?,?)
+                        """,
+                        (
+                            _id("membership"),
+                            clean_team,
+                            principal_id,
+                            timestamp,
+                            timestamp,
+                        ),
+                    )
+                    changed = True
+                elif membership["role"] != "automation" or membership["status"] != "active":
+                    raise HubError(
+                        "peer_identity_conflict",
+                        "Secure peer membership conflicts with Team Hub state",
+                        409,
+                    )
+                # Existing public channels predate the automation ACL role.
+                # Install only the shared role entry; private/direct channels
+                # require an explicit principal ACL and remain invisible.
+                channels = connection.execute(
+                    """
+                    SELECT id,kind FROM channels
+                    WHERE team_id=? AND visibility='team' AND archived_at IS NULL
+                    """,
+                    (clean_team,),
+                ).fetchall()
+                for channel in channels:
+                    inserted = connection.execute(
+                        """
+                        INSERT OR IGNORE INTO channel_acl_entries(
+                            id,team_id,channel_id,subject_kind,
+                            subject_principal_id,subject_role,
+                            can_read,can_post,can_manage,can_dispatch,created_at
+                        ) VALUES (?,?,?,'role',NULL,'automation',1,?,0,0,?)
+                        """,
+                        (
+                            _id("channel_acl"),
+                            clean_team,
+                            channel["id"],
+                            0 if channel["kind"] == "announcements" else 1,
+                            timestamp,
+                        ),
+                    ).rowcount
+                    changed = changed or inserted == 1
+                if changed:
+                    self._audit(
+                        connection,
+                        clean_team,
+                        principal_id,
+                        "secure_peer.bind",
+                        "secure_peer",
+                        peer_id,
+                        "succeeded",
+                        {"server_identity": identity},
+                        timestamp,
+                    )
+            return principal_id
+        finally:
+            connection.close()
+
+    def require_secure_peer_target_team(self, team_id: str) -> None:
+        """Preflight an approval target before the peer certificate commits."""
+
+        team = _identity(team_id)
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "SELECT id FROM teams WHERE id=?",
+                (team,),
+            ).fetchone()
+            if row is None:
+                raise HubError(
+                    "team_not_found",
+                    "Secure peer approval target team is unavailable",
+                    404,
+                )
+        finally:
+            connection.close()
+
+    def secure_peer_claims(
+        self,
+        *,
+        peer_id: str,
+        peer_server_identity: str,
+        team_id: str,
+        scopes: frozenset[str],
+        expires_at: int,
+        display_name: str | None = None,
+    ) -> AccessClaims:
+        allowed = {
+            "teamspace.read",
+            "teamspace.write",
+            "cross_chat.instruction",
+            "cross_chat.request_reply",
+        }
+        if not scopes or not scopes.issubset(allowed):
+            raise HubError("peer_unavailable", "Secure peer is unavailable", 403)
+        # Provisioning is an explicit approval-time mutation.  Request-time
+        # claims remain read-only so a paired peer cannot turn GET traffic
+        # into an unbounded audit/SQLite write stream.
+        principal_id = self._secure_peer_principal_id(peer_id)
+        _identity(peer_server_identity)
+        _identity(team_id)
+        if display_name is not None:
+            _bounded_text(display_name, "display_name", 1, 160)
+        return AccessClaims(
+            principal_id=principal_id,
+            session_id=f"secure_peer_session_{peer_id}",
+            jti=f"secure_peer_{peer_id}",
+            expires_at=int(expires_at),
+            auth_kind="secure_peer",
+            team_id=team_id,
+            scopes=frozenset(scopes),
+            peer_id=peer_id,
+        )
+
+    def revoke_secure_peer_service(
+        self,
+        *,
+        peer_id: str,
+        team_id: str,
+    ) -> None:
+        principal_id = self._secure_peer_principal_id(peer_id)
+        timestamp = _now()
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                connection.execute(
+                    """
+                    UPDATE memberships SET status='revoked',updated_at=?
+                    WHERE team_id=? AND principal_id=? AND status='active'
+                    """,
+                    (timestamp, team_id, principal_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE principals SET status='revoked',updated_at=?
+                    WHERE id=? AND status='active'
+                    """,
+                    (timestamp, principal_id),
+                )
+        finally:
+            connection.close()
+
+    def secure_peer_resource_team(
+        self,
+        resource_kind: str,
+        resource_id: str,
+    ) -> str | None:
+        """Resolve only the small resource set accepted by the mTLS proxy."""
+
+        if resource_kind != "channel":
+            return None
+        clean_id = _identity(resource_id)
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "SELECT team_id FROM channels WHERE id=? AND archived_at IS NULL",
+                (clean_id,),
+            ).fetchone()
+            return str(row["team_id"]) if row is not None else None
+        finally:
+            connection.close()
+
     def _session_public(
         self, connection: sqlite3.Connection, session: sqlite3.Row
     ) -> dict[str, Any]:
@@ -1861,6 +2164,7 @@ class HubStore:
                 "id": session["human_principal_id"],
                 "email": session["email_normalized"],
                 "display_name": session["display_name"],
+                "kind": session["principal_kind"],
             },
             "teams": self._teams_for(connection, str(session["human_principal_id"])),
         }
@@ -1897,7 +2201,8 @@ class HubStore:
         row = connection.execute(
             """
             SELECT s.id, s.human_principal_id, s.device_label, s.expires_at,
-                   h.email_normalized, p.display_name
+                   h.email_normalized, p.display_name,
+                   p.kind AS principal_kind
             FROM device_sessions AS s
             JOIN human_accounts AS h ON h.principal_id = s.human_principal_id
             JOIN principals AS p ON p.id = s.human_principal_id
@@ -2175,7 +2480,8 @@ class HubStore:
                 current = connection.execute(
                     """
                     SELECT s.id, s.human_principal_id, s.device_label, s.expires_at,
-                           h.email_normalized, p.display_name
+                           h.email_normalized, p.display_name,
+                           p.kind AS principal_kind
                     FROM device_sessions AS s
                     JOIN human_accounts AS h ON h.principal_id = s.human_principal_id
                     JOIN principals AS p ON p.id = s.human_principal_id
@@ -2282,7 +2588,7 @@ class HubStore:
                 connection,
                 team_id,
                 claims.principal_id,
-                ("owner", "admin", "member", "guest"),
+                ("owner", "admin", "member", "guest", "automation"),
             )
             row = connection.execute(
                 "SELECT id, kind, slug, display_name FROM teams WHERE id = ?",
@@ -2314,7 +2620,7 @@ class HubStore:
                 connection,
                 team_id,
                 claims.principal_id,
-                ("owner", "admin", "member", "guest"),
+                ("owner", "admin", "member", "guest", "automation"),
             )
             email_projection = "h.email_normalized" if viewer["role"] in ("owner", "admin") else "NULL"
             members = [
@@ -2327,10 +2633,13 @@ class HubStore:
                     JOIN principals AS p ON p.id = m.principal_id
                     LEFT JOIN human_accounts AS h ON h.principal_id = m.principal_id
                     WHERE m.team_id = ? AND m.status = 'active' AND p.status = 'active'
-                      AND p.kind = 'human'
+                      AND (
+                        p.kind = 'human'
+                        OR (p.kind = 'service' AND p.id = ?)
+                      )
                     ORDER BY p.display_name COLLATE NOCASE, m.principal_id
                     """,
-                    (team_id,),
+                    (team_id, claims.principal_id),
                 )
             ]
             connection.execute("COMMIT")
@@ -3198,6 +3507,80 @@ class HubStore:
         finally:
             connection.close()
 
+    def require_team_admin(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+    ) -> dict[str, str]:
+        """Prove a live owner/admin session without leaking team existence."""
+
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            self._require_session(connection, claims, _now())
+            membership = _require_team_role(
+                connection,
+                team_id,
+                claims.principal_id,
+                ("owner", "admin"),
+            )
+            connection.execute("COMMIT")
+            return {
+                "team_id": team_id,
+                "principal_id": claims.principal_id,
+                "role": str(membership["role"]),
+            }
+        except (AuthorizationError, AuthenticationError) as exc:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise HubError("not_found", "Resource not found", 404) from exc
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def require_team_owner(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+    ) -> dict[str, str]:
+        """Prove a live owner session without leaking team existence.
+
+        Unassigned inbound peer-pairing requests are host-global until an
+        owner deliberately binds one to a team.  Team administrators must not
+        be able to inspect or claim that global queue merely by choosing a
+        team id they administer.
+        """
+
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            self._require_session(connection, claims, _now())
+            membership = _require_team_role(
+                connection,
+                team_id,
+                claims.principal_id,
+                ("owner",),
+            )
+            connection.execute("COMMIT")
+            return {
+                "team_id": team_id,
+                "principal_id": claims.principal_id,
+                "role": str(membership["role"]),
+            }
+        except (AuthorizationError, AuthenticationError) as exc:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise HubError("not_found", "Resource not found", 404) from exc
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
     @staticmethod
     def _channel_permission(
         connection: sqlite3.Connection,
@@ -3384,7 +3767,7 @@ class HubStore:
                 connection,
                 team_id,
                 claims.principal_id,
-                ("owner", "admin", "member", "guest"),
+                ("owner", "admin", "member", "guest", "automation"),
             )
             rows = connection.execute(
                 """
@@ -3566,6 +3949,15 @@ class HubStore:
                         "admin": (1, 1, 1),
                         "member": (1, 0 if kind == "announcements" else 1, 0),
                         "guest": (1, 0, 0),
+                        # Secure paired servers are automation principals. The
+                        # gateway separately checks the peer's live mTLS
+                        # certificate and teamspace.read/write scope on every
+                        # request; this ACL only makes shared channels visible.
+                        "automation": (
+                            1,
+                            0 if kind == "announcements" else 1,
+                            0,
+                        ),
                     }
                     for role, (can_read, can_post, can_manage) in role_permissions.items():
                         connection.execute(
@@ -3722,6 +4114,41 @@ class HubStore:
                 )
                 if cached is not None:
                     return cached
+                if claims.auth_kind == "secure_peer":
+                    subject = f"secure-peer:{claims.peer_id or claims.principal_id}"
+                    # These durable buckets bound remote write amplification
+                    # even across gateway/server restarts. Replays with the
+                    # same idempotency key return above without being charged.
+                    self._charge_rate_bucket(
+                        connection,
+                        team_id=team_id,
+                        subject_key=subject,
+                        action="peer.message.count.minute",
+                        timestamp=timestamp,
+                        window_seconds=60,
+                        cost=1,
+                        limit=60,
+                    )
+                    self._charge_rate_bucket(
+                        connection,
+                        team_id=team_id,
+                        subject_key=subject,
+                        action="peer.message.count.day",
+                        timestamp=timestamp,
+                        window_seconds=86_400,
+                        cost=1,
+                        limit=5_000,
+                    )
+                    self._charge_rate_bucket(
+                        connection,
+                        team_id=team_id,
+                        subject_key=subject,
+                        action="peer.message.bytes.hour",
+                        timestamp=timestamp,
+                        window_seconds=3_600,
+                        cost=len(encoded_body),
+                        limit=4 * 1024 * 1024,
+                    )
                 root_id = request.get("thread_root_message_id")
                 parent_id = request.get("parent_message_id")
                 if parent_id is not None and root_id is None:
@@ -3841,6 +4268,52 @@ class HubStore:
                 return response
         finally:
             connection.close()
+
+    @staticmethod
+    def _charge_rate_bucket(
+        connection: sqlite3.Connection,
+        *,
+        team_id: str,
+        subject_key: str,
+        action: str,
+        timestamp: int,
+        window_seconds: int,
+        cost: int,
+        limit: int,
+    ) -> None:
+        if cost < 0 or limit <= 0 or window_seconds <= 0:
+            raise RuntimeError("invalid durable rate bucket")
+        row = connection.execute(
+            """
+            SELECT window_started_at, count FROM rate_limit_buckets
+            WHERE team_id=? AND subject_key=? AND action=?
+            """,
+            (team_id, subject_key, action),
+        ).fetchone()
+        if row is None or int(row["window_started_at"]) + window_seconds <= timestamp:
+            window_started = timestamp
+            next_count = cost
+        else:
+            window_started = int(row["window_started_at"])
+            next_count = int(row["count"]) + cost
+        if next_count > limit:
+            raise HubError(
+                "rate_limited",
+                "Secure peer write limit exceeded; retry after the current window",
+                429,
+            )
+        connection.execute(
+            """
+            INSERT INTO rate_limit_buckets(
+                team_id, subject_key, action, window_started_at, count, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(team_id, subject_key, action) DO UPDATE SET
+                window_started_at=excluded.window_started_at,
+                count=excluded.count,
+                updated_at=excluded.updated_at
+            """,
+            (team_id, subject_key, action, window_started, next_count, timestamp),
+        )
 
     @staticmethod
     def _outbox(

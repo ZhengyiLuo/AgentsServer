@@ -72,6 +72,15 @@ RUNNER_OWNED_ACTIVE_PHASES = {
     "installing",
     "restarting",
 }
+SECURE_PEER_HEALTH_REQUIREMENTS = {
+    "available": True,
+    "state_available": True,
+    "state_error_code": None,
+    "required": False,
+    "version": 1,
+    "control_path": "/api/admin/secure-peers/v1/status",
+    "proxy_prefix": "/api/team-hub-secure",
+}
 
 
 class ReleaseUnavailableError(RuntimeError):
@@ -399,6 +408,17 @@ def assert_post_update_identity(
     health = server_health_snapshot(port, token=token)
     if str(health.get("server_identity") or "") != expected_server_identity:
         raise RuntimeError("updated AgentsServer stable identity does not match")
+    capabilities = health.get("capabilities")
+    secure_peer_capability = (
+        capabilities.get("secure_peer_v1")
+        if isinstance(capabilities, dict)
+        else None
+    )
+    if not isinstance(secure_peer_capability, dict) or any(
+        secure_peer_capability.get(name) != value
+        for name, value in SECURE_PEER_HEALTH_REQUIREMENTS.items()
+    ):
+        raise RuntimeError("updated AgentsServer secure-peer state is unavailable")
     if expected_team_hub_id is None:
         if (
             expected_team_hub_transport is not None
@@ -407,7 +427,6 @@ def assert_post_update_identity(
         ):
             raise RuntimeError("managed Team Hub transport has no bound Hub identity")
         return
-    capabilities = health.get("capabilities")
     capability = (
         capabilities.get("team_hub_v1")
         if isinstance(capabilities, dict)

@@ -16,6 +16,8 @@ from pathlib import Path
 FILES = (
     "agent_server.py",
     "team_hub_host.py",
+    "secure_peer_runtime.py",
+    "secure_peer_delivery.py",
     "agentsdock_jobs.py",
     "agentsdock_chats.py",
     "agentsdock_publish.py",
@@ -37,6 +39,8 @@ DIRECTORY_FILES = {
         "cli.py",
         "database.py",
         "security.py",
+        "secure_peer.py",
+        "secure_peer_hub.py",
         "service.py",
         "store.py",
         "migrations/__init__.py",
@@ -163,7 +167,7 @@ def main() -> int:
         "version": version,
         "track": "beta" if "-" in version.split("+", 1)[0] else "stable",
         "prerelease": "-" in version.split("+", 1)[0],
-        "api_contract_version": 13,
+        "api_contract_version": 14,
         "commit": commit,
         "archive": {
             "name": archive_name,

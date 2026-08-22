@@ -135,6 +135,36 @@ class MessageRequest(StrictModel):
     idempotency_key: str = Field(min_length=8, max_length=240)
 
 
+SecurePeerScope = Literal[
+    "teamspace.read",
+    "teamspace.write",
+    "cross_chat.instruction",
+    "cross_chat.request_reply",
+]
+
+
+class SecurePeerApprovalRequest(StrictModel):
+    idempotency_key: str = Field(min_length=8, max_length=128)
+    sas_confirmed: Literal[True]
+    expected_peer_server_identity: str = Field(min_length=8, max_length=240)
+    expected_transcript_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    scopes: list[SecurePeerScope] = Field(min_length=1, max_length=4)
+
+
+class SecurePeerRejectionRequest(StrictModel):
+    idempotency_key: str = Field(min_length=8, max_length=128)
+    expected_peer_server_identity: str = Field(min_length=8, max_length=240)
+    expected_transcript_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    reason: str | None = Field(default=None, min_length=1, max_length=160)
+
+
+class SecurePeerRevocationRequest(StrictModel):
+    idempotency_key: str = Field(min_length=8, max_length=128)
+    expected_certificate_fingerprint: str = Field(
+        pattern=r"^sha256:[0-9a-f]{64}$"
+    )
+
+
 def _error(code: str, message: str, status_code: int) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"error": {"code": code, "message": message}})
 
@@ -324,6 +354,7 @@ def create_app(
     managed_transport: str | None = None,
     managed_hub_url: str | None = None,
     managed_routes: dict[str, str] | None = None,
+    secure_peer_manager: Any | None = None,
     require_https_for_non_loopback: bool = False,
     require_loopback_transport: bool = False,
 ) -> FastAPI:
@@ -344,6 +375,7 @@ def create_app(
     )
     app.state.store = store
     app.state.rate_limiter = rate_limiter
+    app.state.secure_peer_manager = secure_peer_manager
 
     @app.middleware("http")
     async def strict_transport(request: Request, call_next):
@@ -729,6 +761,41 @@ def create_app(
     @app.get("/v1/teams/{team_id}/nodes")
     def nodes(team_id: str, claims: Auth) -> dict[str, Any]:
         return store.list_nodes(claims, team_id)
+
+    @app.get("/v1/teams/{team_id}/secure-peers")
+    def secure_peers(team_id: str, claims: Auth) -> dict[str, Any]:
+        store.require_team_admin(claims, team_id)
+        if secure_peer_manager is None:
+            raise HubError(
+                "secure_peer_unavailable",
+                "Secure peer pairing is unavailable",
+                503,
+            )
+        return secure_peer_manager.list_peers(team_id=team_id)
+
+    @app.post("/v1/teams/{team_id}/secure-peers/{peer_id}/revoke")
+    def revoke_secure_peer(
+        team_id: str,
+        peer_id: str,
+        body: SecurePeerRevocationRequest,
+        claims: Auth,
+    ) -> dict[str, Any]:
+        store.require_team_admin(claims, team_id)
+        if secure_peer_manager is None:
+            raise HubError(
+                "secure_peer_unavailable",
+                "Secure peer pairing is unavailable",
+                503,
+            )
+        return secure_peer_manager.revoke_peer(
+            peer_id=peer_id,
+            team_id=team_id,
+            revoked_by=claims.principal_id,
+            expected_certificate_fingerprint=(
+                body.expected_certificate_fingerprint
+            ),
+            idempotency_key=body.idempotency_key,
+        )
 
     @app.get("/v1/teams/{team_id}/channels")
     def channels(team_id: str, claims: Auth) -> dict[str, Any]:

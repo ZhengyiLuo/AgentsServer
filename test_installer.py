@@ -105,11 +105,20 @@ class InstallerContractTests(unittest.TestCase):
         )
         self.assertTrue(any(item.startswith("websockets") for item in dependencies))
         self.assertTrue(any(item.startswith("croniter") for item in dependencies))
+        self.assertTrue(any(item.startswith("cryptography") for item in dependencies))
         self.assertTrue(any(item.startswith("python-dateutil") for item in dependencies))
         self.assertTrue(any(item.startswith("tzdata") for item in dependencies))
         self.assertIn("-c 'import websockets'", INSTALLER.read_text())
         self.assertIn("import claude_agent_sdk", INSTALLER.read_text())
         self.assertIn("import croniter, dateutil", INSTALLER.read_text())
+        self.assertIn("import agentsdock_team_hub, secure_peer_delivery, secure_peer_runtime", INSTALLER.read_text())
+        self.assertIn("from agentsdock_team_hub import secure_peer, secure_peer_hub", INSTALLER.read_text())
+        self.assertIn('"state_available": True', INSTALLER.read_text())
+        self.assertIn('"state_error_code": None', INSTALLER.read_text())
+        self.assertIn(
+            'secure_capability is None and allow_legacy_transport == "true"',
+            INSTALLER.read_text(),
+        )
         self.assertIn('version("claude-agent-sdk")', INSTALLER.read_text())
         self.assertIn(
             'raise SystemExit(0 if sdk_version == "0.2.130"',
@@ -129,6 +138,8 @@ class InstallerContractTests(unittest.TestCase):
 
     def test_direct_deploy_includes_scheduler_runtime(self):
         source = DEPLOYER.read_text()
+        self.assertIn('"$SCRIPT_DIR/secure_peer_runtime.py"', source)
+        self.assertIn('"$SCRIPT_DIR/secure_peer_delivery.py"', source)
         self.assertIn('"$SCRIPT_DIR/agentsdock_jobs.py"', source)
         self.assertIn('"$SCRIPT_DIR/agentsdock_chats.py"', source)
         self.assertIn('"$SCRIPT_DIR/agentsdock_publish.py"', source)
@@ -145,8 +156,16 @@ class InstallerContractTests(unittest.TestCase):
         self.assertIn("'$REMOTE_SERVER_DIR/claude_sdk_client.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/codex_app_server.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/team_hub_host.py'", source)
+        self.assertIn("'$REMOTE_SERVER_DIR/secure_peer_runtime.py'", source)
+        self.assertIn("'$REMOTE_SERVER_DIR/secure_peer_delivery.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/agentsdock_team_hub'", source)
-        self.assertIn("import agentsdock_team_hub, claude_agent_sdk, team_hub_host", source)
+        self.assertIn(
+            "import agentsdock_team_hub, claude_agent_sdk, secure_peer_delivery, secure_peer_runtime, team_hub_host",
+            source,
+        )
+        self.assertIn("from agentsdock_team_hub import secure_peer, secure_peer_hub", source)
+        self.assertIn('"state_available": True', source)
+        self.assertIn('"state_error_code": None', source)
 
     def test_direct_deploy_refuses_designated_hub_before_copy_or_restart(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -311,11 +330,74 @@ exit 0
                 any("systemctl --user restart" in line for line in ssh_log.read_text().splitlines())
             )
 
+    def test_direct_deploy_rejects_quarantined_secure_peer_state_after_restart(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            ssh_log = root / "ssh.log"
+            copy_log = root / "copy.log"
+            health_count = root / "health-count"
+            self.write_executable(
+                fake_bin / "ssh",
+                """#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_SSH_LOG"
+case "$*" in
+  *"team_hub_host.py"*) printf 'present'; exit 0 ;;
+  *"/api/health"*)
+    if [ ! -f "$FAKE_HEALTH_COUNT" ]; then
+      : > "$FAKE_HEALTH_COUNT"
+      version="0.1.25-beta.1"
+      secure_capability=""
+    else
+      version="$(cat "$FAKE_RELEASE_VERSION")"
+      secure_capability=',"secure_peer_v1":{"available":true,"state_available":false,"state_error_code":"secure_peer_state_unavailable","required":false,"version":1,"control_path":"/api/admin/secure-peers/v1/status","proxy_prefix":"/api/team-hub-secure"}'
+    fi
+    printf '{"ok":true,"server_version":"%s","server_identity":"server_deploy_stable_12345678","capabilities":{"team_hub_v1":{"available":false,"designated_host":false,"version":1,"base_path":null,"hub_id":null,"host_server_identity":null}%s}}\n' "$version" "$secure_capability"
+    exit 0
+    ;;
+esac
+exit 0
+""",
+            )
+            for name in ("scp", "rsync"):
+                self.write_executable(
+                    fake_bin / name,
+                    "#!/bin/sh\nprintf '%s:%s\\n' \"$0\" \"$*\" >> \"$FAKE_COPY_LOG\"\n",
+                )
+            self.write_executable(fake_bin / "sleep", "#!/bin/sh\nexit 0\n")
+            environment = {
+                **os.environ,
+                "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+                "AGENTSDOCK_REMOTE_HOST": "fake-host",
+                "AGENTSDOCK_AGENT_TOKEN": "deploy_token_abcdefghijklmnopqrstuvwxyz0123456789",
+                "AGENTSDOCK_HEALTH_ATTEMPTS": "1",
+                "FAKE_SSH_LOG": str(ssh_log),
+                "FAKE_COPY_LOG": str(copy_log),
+                "FAKE_HEALTH_COUNT": str(health_count),
+                "FAKE_RELEASE_VERSION": str(ROOT / "VERSION"),
+            }
+
+            result = subprocess.run(
+                ["/bin/bash", str(DEPLOYER)],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("secure-peer state available", result.stderr)
+            self.assertTrue(copy_log.is_file())
+            self.assertTrue(
+                any("systemctl --user restart" in line for line in ssh_log.read_text().splitlines())
+            )
+
     def test_installer_and_release_archive_include_runtime_tools_and_uninstaller(self):
         installer_source = INSTALLER.read_text()
         packager_source = PACKAGER.read_text()
         self.assertIn(
-            "RELEASE_FILES=(agent_server.py team_hub_host.py agentsdock_jobs.py agentsdock_chats.py agentsdock_publish.py claude_sdk_client.py codex_app_server.py",
+            "RELEASE_FILES=(agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py agentsdock_publish.py claude_sdk_client.py codex_app_server.py",
             installer_source,
         )
         self.assertIn("RELEASE_DIRECTORIES=(agentsdock_team_hub)", installer_source)
@@ -323,13 +405,19 @@ exit 0
         self.assertIn('"$STAGE_DIR/agentsdock_publish.py"', installer_source)
         self.assertIn('"$STAGE_DIR/claude_sdk_client.py"', installer_source)
         self.assertIn('"$STAGE_DIR/codex_app_server.py"', installer_source)
+        self.assertIn('"$STAGE_DIR/secure_peer_runtime.py"', installer_source)
+        self.assertIn('"$STAGE_DIR/secure_peer_delivery.py"', installer_source)
         self.assertIn('"$STAGE_DIR/uninstall.sh"', installer_source)
         self.assertIn('"agentsdock_publish.py"', packager_source)
         self.assertIn('"agentsdock_chats.py"', packager_source)
         self.assertIn('"claude_sdk_client.py"', packager_source)
         self.assertIn('"codex_app_server.py"', packager_source)
+        self.assertIn('"secure_peer_runtime.py"', packager_source)
+        self.assertIn('"secure_peer_delivery.py"', packager_source)
         self.assertIn('"uninstall.sh"', packager_source)
         self.assertIn('"agentsdock_team_hub": (', packager_source)
+        self.assertIn('"secure_peer.py"', packager_source)
+        self.assertIn('"secure_peer_hub.py"', packager_source)
         self.assertIn("DIRECTORIES = tuple(DIRECTORY_FILES)", packager_source)
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -368,8 +456,18 @@ exit 0
             )
             self.assertIn(f"agents-server-{version}/uninstall.sh", members)
             self.assertIn(f"agents-server-{version}/team_hub_host.py", members)
+            self.assertIn(f"agents-server-{version}/secure_peer_runtime.py", members)
+            self.assertIn(f"agents-server-{version}/secure_peer_delivery.py", members)
             self.assertIn(
                 f"agents-server-{version}/agentsdock_team_hub/store.py",
+                members,
+            )
+            self.assertIn(
+                f"agents-server-{version}/agentsdock_team_hub/secure_peer.py",
+                members,
+            )
+            self.assertIn(
+                f"agents-server-{version}/agentsdock_team_hub/secure_peer_hub.py",
                 members,
             )
             self.assertIn(
@@ -390,6 +488,7 @@ exit 0
                 "beta" if "-" in version.split("+", 1)[0] else "stable",
             )
             self.assertEqual(manifest["prerelease"], manifest["track"] == "beta")
+            self.assertEqual(manifest["api_contract_version"], 14)
 
     def test_installer_preserves_state_and_emits_private_result(self):
         source = INSTALLER.read_text()
@@ -967,7 +1066,7 @@ done
 case "$*" in
   *astral.sh*) cp "$FAKE_UV_INSTALLER_SOURCE" "$output" ;;
   *) cat > "$output" <<'JSON'
-{{"ok":true,"server_version":"{self.release_version()}","server_identity":"server_uv_bootstrap_12345678","capabilities":{{"team_hub_v1":{{"available":false,"designated_host":false,"version":1,"base_path":null,"hub_id":null,"host_server_identity":null,"transport":null,"hub_url":null}}}}}}
+{{"ok":true,"server_version":"{self.release_version()}","server_identity":"server_uv_bootstrap_12345678","capabilities":{{"team_hub_v1":{{"available":false,"designated_host":false,"version":1,"base_path":null,"hub_id":null,"host_server_identity":null,"transport":null,"hub_url":null}},"secure_peer_v1":{{"available":true,"state_available":true,"state_error_code":null,"required":false,"version":1,"control_path":"/api/admin/secure-peers/v1/status","proxy_prefix":"/api/team-hub-secure"}}}}}}
 JSON
   ;;
 esac
@@ -1384,6 +1483,52 @@ chmod 755 "$project/.venv/bin/python"
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertNotIn("AGENTSDOCK_SETUP_RESULT", result.stdout)
             self.assertNotIn(token, result.stdout)
+
+    def test_candidate_with_quarantined_secure_peer_state_is_not_accepted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_exact_health_uv(fake_bin)
+            self.write_json_health_curl(fake_bin)
+            server_identity = "server_secure_state_gate_12345678"
+            token = "preserved_token_abcdefghijklmnopqrstuvwxyz0123456789"
+            config_root = root / "config"
+            config_root.mkdir()
+            (config_root / "env").write_text(
+                f"AGENTSDOCK_AGENT_TOKEN={token}\n"
+                "AGENTSDOCK_AGENT_PORT=17850\n"
+                "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
+            )
+            environment.update(
+                {
+                    "FAKE_HEALTH_VERSION": self.release_version(),
+                    "FAKE_SERVER_IDENTITY": server_identity,
+                    "FAKE_TEAM_HUB_MODE": "disabled",
+                    "FAKE_SECURE_PEER_STATE_AVAILABLE": "false",
+                    "REAL_PYTHON": sys.executable,
+                    "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(INSTALLER),
+                    "--non-interactive",
+                    "--port",
+                    "17850",
+                    "--expected-server-identity",
+                    server_identity,
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("did not become healthy; rolling back", result.stderr)
+            self.assertTrue((install_root / "current" / "runtime-marker").is_file())
 
     def test_team_hub_tailscale_serve_transport_is_persisted_and_verified(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3260,6 +3405,9 @@ chmod 755 "$project/.venv/bin/python"
             home, fake_bin, install_root, config_root, state_root, service_file, environment = (
                 self.fake_linux_uninstall_environment(root)
             )
+            peer_identity = state_root / "secure-peers" / "client" / "identity.key"
+            peer_identity.parent.mkdir(parents=True)
+            peer_identity.write_text("preserve-secure-peer-identity\n")
 
             result = subprocess.run(
                 ["/bin/bash", str(UNINSTALLER), "--yes"],
@@ -3274,7 +3422,9 @@ chmod 755 "$project/.venv/bin/python"
             self.assertFalse(config_root.exists())
             self.assertFalse(service_file.exists())
             self.assertTrue((state_root / "sessions.json").is_file())
+            self.assertEqual(peer_identity.read_text(), "preserve-secure-peer-identity\n")
             self.assertIn("Preserved chat history", result.stdout)
+            self.assertIn("secure-peer credentials", result.stdout)
 
     def test_uninstall_purge_state_requires_interactive_exact_confirmation(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3769,6 +3919,7 @@ if [ -n "$output" ]; then
   health_version="$FAKE_HEALTH_VERSION"
   health_server_identity="$FAKE_SERVER_IDENTITY"
   health_hub_id="$FAKE_TEAM_HUB_ID"
+  health_secure_state_available="${FAKE_SECURE_PEER_STATE_AVAILABLE:-true}"
   after_restore="false"
   if [ -n "${FAKE_EVENT_LOG:-}" ]; then
     printf 'health\n' >> "$FAKE_EVENT_LOG"
@@ -3777,8 +3928,14 @@ if [ -n "$output" ]; then
       health_version="${FAKE_HEALTH_VERSION_AFTER_RESTORE:-$health_version}"
       health_server_identity="${FAKE_SERVER_IDENTITY_AFTER_RESTORE:-$health_server_identity}"
       health_hub_id="${FAKE_TEAM_HUB_ID_AFTER_RESTORE:-$health_hub_id}"
+      health_secure_state_available="${FAKE_SECURE_PEER_STATE_AVAILABLE_AFTER_RESTORE:-$health_secure_state_available}"
     fi
   fi
+  case "$health_secure_state_available" in
+    true) health_secure_state_error_code="null" ;;
+    false) health_secure_state_error_code='"secure_peer_state_unavailable"' ;;
+    *) exit 97 ;;
+  esac
   if [ "${FAKE_TEAM_HUB_MODE:-disabled}" = "host" ]; then
     health_transport="${FAKE_TEAM_HUB_TRANSPORT:-loopback}"
     health_url="${FAKE_TEAM_HUB_URL:-}"
@@ -3798,11 +3955,11 @@ if [ -n "$output" ]; then
       health_routes="[{\\\"transport\\\":\\\"$health_transport\\\",\\\"hub_url\\\":$health_hub_url},{\\\"transport\\\":\\\"direct_ip\\\",\\\"hub_url\\\":\\\"$health_direct_ip_url\\\"}]"
     fi
     cat > "$output" <<EOF
-{"ok":true,"server_version":"$health_version","server_identity":"$health_server_identity","capabilities":{"team_hub_v1":{"available":true,"designated_host":true,"version":1,"base_path":"/api/team-hub","hub_id":"$health_hub_id","host_server_identity":"$health_server_identity","transport":"$health_transport","hub_url":$health_hub_url,"routes":$health_routes}}}
+{"ok":true,"server_version":"$health_version","server_identity":"$health_server_identity","capabilities":{"team_hub_v1":{"available":true,"designated_host":true,"version":1,"base_path":"/api/team-hub","hub_id":"$health_hub_id","host_server_identity":"$health_server_identity","transport":"$health_transport","hub_url":$health_hub_url,"routes":$health_routes},"secure_peer_v1":{"available":true,"state_available":$health_secure_state_available,"state_error_code":$health_secure_state_error_code,"required":false,"version":1,"control_path":"/api/admin/secure-peers/v1/status","proxy_prefix":"/api/team-hub-secure"}}}
 EOF
   else
     cat > "$output" <<EOF
-{"ok":true,"server_version":"$health_version","server_identity":"$health_server_identity","capabilities":{"team_hub_v1":{"available":false,"designated_host":false,"version":1,"base_path":null,"hub_id":null,"host_server_identity":null,"transport":null,"hub_url":null,"routes":[]}}}
+{"ok":true,"server_version":"$health_version","server_identity":"$health_server_identity","capabilities":{"team_hub_v1":{"available":false,"designated_host":false,"version":1,"base_path":null,"hub_id":null,"host_server_identity":null,"transport":null,"hub_url":null,"routes":[]},"secure_peer_v1":{"available":true,"state_available":$health_secure_state_available,"state_error_code":$health_secure_state_error_code,"required":false,"version":1,"control_path":"/api/admin/secure-peers/v1/status","proxy_prefix":"/api/team-hub-secure"}}}
 EOF
   fi
 fi

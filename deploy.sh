@@ -13,6 +13,8 @@ HEALTH_TOKEN="${AGENTSDOCK_AGENT_TOKEN:-${ZENITHDOCK_AGENT_TOKEN:-}}"
 RUNTIME_FILES=(
   "$SCRIPT_DIR/agent_server.py"
   "$SCRIPT_DIR/team_hub_host.py"
+  "$SCRIPT_DIR/secure_peer_runtime.py"
+  "$SCRIPT_DIR/secure_peer_delivery.py"
   "$SCRIPT_DIR/agentsdock_jobs.py"
   "$SCRIPT_DIR/agentsdock_chats.py"
   "$SCRIPT_DIR/agentsdock_publish.py"
@@ -162,11 +164,11 @@ ssh "$REMOTE_HOST" "
         'claude-agent-sdk==0.2.130' 'croniter>=6,<7' 'cryptography>=44,<47' 'python-dateutil>=2.9,<3' 'tzdata>=2025.2'
     fi
   fi
-  PYTHONPATH='$REMOTE_SERVER_DIR' '$REMOTE_PYTHON' -c 'from importlib.metadata import version; import agentsdock_team_hub, claude_agent_sdk, team_hub_host; sdk_version = version(\"claude-agent-sdk\"); raise SystemExit(0 if sdk_version == \"0.2.130\" else f\"expected claude-agent-sdk 0.2.130, got {sdk_version}\")'
+  PYTHONPATH='$REMOTE_SERVER_DIR' '$REMOTE_PYTHON' -c 'from importlib.metadata import version; import agentsdock_team_hub, claude_agent_sdk, secure_peer_delivery, secure_peer_runtime, team_hub_host; from agentsdock_team_hub import secure_peer, secure_peer_hub; sdk_version = version(\"claude-agent-sdk\"); raise SystemExit(0 if sdk_version == \"0.2.130\" else f\"expected claude-agent-sdk 0.2.130, got {sdk_version}\")'
 "
 
 echo "Compiling server on $REMOTE_HOST"
-ssh "$REMOTE_HOST" "chmod 755 '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/agentsdock_chats.py' '$REMOTE_SERVER_DIR/agentsdock_publish.py' && '$REMOTE_PYTHON' -m compileall -q '$REMOTE_SERVER_DIR/agentsdock_team_hub' && '$REMOTE_PYTHON' -m py_compile '$REMOTE_SERVER_PATH' '$REMOTE_SERVER_DIR/team_hub_host.py' '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/agentsdock_chats.py' '$REMOTE_SERVER_DIR/agentsdock_publish.py' '$REMOTE_SERVER_DIR/claude_sdk_client.py' '$REMOTE_SERVER_DIR/codex_app_server.py' '$REMOTE_SERVER_DIR/update_runner.py'"
+ssh "$REMOTE_HOST" "chmod 755 '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/agentsdock_chats.py' '$REMOTE_SERVER_DIR/agentsdock_publish.py' && '$REMOTE_PYTHON' -m compileall -q '$REMOTE_SERVER_DIR/agentsdock_team_hub' && '$REMOTE_PYTHON' -m py_compile '$REMOTE_SERVER_PATH' '$REMOTE_SERVER_DIR/team_hub_host.py' '$REMOTE_SERVER_DIR/secure_peer_runtime.py' '$REMOTE_SERVER_DIR/secure_peer_delivery.py' '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/agentsdock_chats.py' '$REMOTE_SERVER_DIR/agentsdock_publish.py' '$REMOTE_SERVER_DIR/claude_sdk_client.py' '$REMOTE_SERVER_DIR/codex_app_server.py' '$REMOTE_SERVER_DIR/update_runner.py'"
 
 echo "Restarting $SERVICE_NAME"
 ssh "$REMOTE_HOST" "systemctl --user restart '$SERVICE_NAME'"
@@ -212,6 +214,21 @@ required = {
 }
 if not isinstance(capability, dict) or any(capability.get(key) != value for key, value in required.items()):
     raise SystemExit(1)
+secure_capability = capabilities.get("secure_peer_v1")
+secure_required = {
+    "available": True,
+    "state_available": True,
+    "state_error_code": None,
+    "required": False,
+    "version": 1,
+    "control_path": "/api/admin/secure-peers/v1/status",
+    "proxy_prefix": "/api/team-hub-secure",
+}
+if not isinstance(secure_capability, dict) or any(
+    secure_capability.get(key) != value
+    for key, value in secure_required.items()
+):
+    raise SystemExit(1)
 ' "$EXPECTED_VERSION" "$EXPECTED_SERVER_IDENTITY"; then
       printf '%s\n' "$REMOTE_HEALTH"
       HEALTH_OK=1
@@ -221,7 +238,7 @@ if not isinstance(capability, dict) or any(capability.get(key) != value for key,
   sleep 1
 done
 if [[ "$HEALTH_OK" != "1" ]]; then
-  echo "Authenticated health did not prove exact version $EXPECTED_VERSION with Team Hub disabled." >&2
+  echo "Authenticated health did not prove exact version $EXPECTED_VERSION with Team Hub disabled and secure-peer state available." >&2
   exit 1
 fi
 echo

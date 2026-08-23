@@ -189,6 +189,9 @@ SERVER_UPDATE_PUBLIC_KEY = SERVER_ROOT / "release-public-key.pem"
 SERVER_UPDATE_RUNNER = SERVER_ROOT / "update_runner.py"
 CLAUDE_PROJECTS_ROOT = Path(os.environ.get("CLAUDE_PROJECTS_ROOT", Path.home() / ".claude" / "projects"))
 CODEX_SESSIONS_ROOT = Path(os.environ.get("CODEX_SESSIONS_ROOT", Path.home() / ".codex" / "sessions"))
+CODEX_SESSION_INDEX_PATH = (
+    Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser() / "session_index.jsonl"
+)
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CODEX_BIN = os.environ.get("CODEX_BIN", "codex")
 CODEX_DEFAULT_MODEL = agentsdock_setting("CODEX_MODEL", "gpt-5.5").strip() or "gpt-5.5"
@@ -668,6 +671,10 @@ Scheduled jobs:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def iso_from_timestamp(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 VALID_JOB_SCHEDULE_KINDS = {"interval", "cron", "rrule"}
@@ -3280,6 +3287,20 @@ class CreateSessionRequest(BaseModel):
     codex_approvals_reviewer: Literal["user", "auto_review", "guardian_subagent"] | None = None
     provider_jobs_access: Literal["full", "read_only", "blocked"] | None = None
     import_history: bool | None = None
+
+
+MAX_BULK_IMPORT_ITEMS = 25
+
+
+class BulkImportSessionItem(BaseModel):
+    provider_session_id: str
+    backend: str
+    cwd: str | None = None
+    title: str | None = None
+
+
+class BulkImportSessionsRequest(BaseModel):
+    items: list[BulkImportSessionItem]
 
 
 class UpdateSessionRequest(BaseModel):
@@ -24941,6 +24962,7 @@ def is_import_boilerplate(text: str) -> bool:
         "<environment_context>",
         "<permissions instructions>",
         "<collaboration_mode>",
+        "<recommended_plugins>",
         "# AGENTS.md instructions",
         "# Context from my IDE setup:",
     )
@@ -25071,6 +25093,44 @@ def claude_transcript_matches_cwd(path: Path, cwd: str) -> bool:
             if recorded_cwd and str(Path(str(recorded_cwd)).expanduser()) == expected_cwd:
                 return True
     return False
+
+
+def claude_transcript_cwd(path: Path) -> str | None:
+    """Recover the working directory Claude recorded for a transcript, if any."""
+
+    for region in bounded_claude_transcript_regions(path):
+        for raw_line in region.splitlines():
+            if not raw_line or len(raw_line) > CLAUDE_TRANSCRIPT_CWD_LINE_BYTES:
+                continue
+            try:
+                event = json.loads(raw_line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            recorded_cwd = event.get("cwd") if isinstance(event, dict) else None
+            if recorded_cwd:
+                return str(recorded_cwd)
+    return None
+
+
+def claude_transcript_preview(path: Path) -> str | None:
+    """Return a short snippet of the first user message, for a local-session label."""
+
+    region = next(bounded_claude_transcript_regions(path), None)
+    if not region:
+        return None
+    for raw_line in region.splitlines():
+        if not raw_line or len(raw_line) > CLAUDE_TRANSCRIPT_CWD_LINE_BYTES:
+            continue
+        try:
+            event = json.loads(raw_line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(event, dict) or event.get("type") != "user":
+            continue
+        text = compact_import_text(strip_agentsdock_generated_user_text(message_text(event.get("message"))))
+        if text and not is_import_boilerplate(text):
+            return text[:160]
+    return None
 
 
 def claude_project_dir_for_cwd(cwd: str) -> Path:
@@ -25332,6 +25392,160 @@ def session_provider_id(sess: dict[str, Any]) -> str | None:
     if backend == BACKEND_CODEX:
         return sess.get("codex_thread_id") or sess.get("session_id")
     return sess.get("session_id")
+
+
+def local_claude_session_candidates(known_provider_ids: set[str]) -> list[dict[str, Any]]:
+    if not CLAUDE_PROJECTS_ROOT.exists():
+        return []
+    candidates: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for path in CLAUDE_PROJECTS_ROOT.rglob("*.jsonl"):
+        provider_id = path.stem
+        if not provider_id or provider_id in seen_ids or provider_id in known_provider_ids:
+            continue
+        seen_ids.add(provider_id)
+        with suppress(OSError):
+            mtime = path.stat().st_mtime
+            cwd = claude_transcript_cwd(path)
+            preview = claude_transcript_preview(path)
+            folder_display = Path(cwd).name if cwd else path.parent.name
+            label = f"{folder_display}: {preview}" if preview else (folder_display or f"Claude chat {provider_id[:8]}")
+            candidates.append({
+                "provider_session_id": provider_id,
+                "backend": BACKEND_CLAUDE,
+                "label": label,
+                "updated_at": iso_from_timestamp(mtime),
+                "cwd": cwd,
+            })
+    return candidates
+
+
+CODEX_TRANSCRIPT_SCAN_LINES = 200
+
+
+def codex_transcript_meta(path: Path) -> tuple[str | None, str | None]:
+    """Return (session_id, cwd) from a Codex transcript's session_meta record."""
+    with suppress(OSError):
+        with path.open("r", encoding="utf-8", errors="ignore") as stream:
+            for _ in range(CODEX_TRANSCRIPT_SCAN_LINES):
+                line = stream.readline()
+                if not line:
+                    break
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(event, dict) or event.get("type") != "session_meta":
+                    continue
+                payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+                session_id = payload.get("id") or payload.get("session_id")
+                cwd = payload.get("cwd")
+                return (str(session_id) if session_id else None, str(cwd) if cwd else None)
+    return None, None
+
+
+def codex_transcript_preview(path: Path) -> str | None:
+    """Return a short snippet of the first user message, for a local-session label."""
+    with suppress(OSError):
+        with path.open("r", encoding="utf-8", errors="ignore") as stream:
+            for _ in range(CODEX_TRANSCRIPT_SCAN_LINES):
+                line = stream.readline()
+                if not line:
+                    break
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                event_type = event.get("type")
+                payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+                text: str | None = None
+                if event_type == "event_msg" and payload.get("type") == "user_message":
+                    text = str(payload.get("message") or "")
+                elif event_type == "response_item" and payload.get("type") == "message" and payload.get("role") == "user":
+                    text = text_from_content(payload.get("content"))
+                if not text:
+                    continue
+                text = compact_import_text(strip_agentsdock_generated_user_text(text))
+                if text and not is_import_boilerplate(text):
+                    return text[:160]
+    return None
+
+
+def codex_session_index_thread_names() -> dict[str, str]:
+    """Best-effort id -> human title map. Not authoritative: many real Codex
+
+    sessions (including every ``codex exec`` run) never get an entry here, so
+    this is only used to prefer a nicer label, never to decide what counts as
+    a session — that comes from scanning the transcripts themselves.
+    """
+    names: dict[str, str] = {}
+    if not CODEX_SESSION_INDEX_PATH.exists():
+        return names
+    with suppress(OSError):
+        with CODEX_SESSION_INDEX_PATH.open("r", encoding="utf-8", errors="ignore") as stream:
+            for line in stream:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                provider_id = str(entry.get("id") or "").strip()
+                thread_name = str(entry.get("thread_name") or "").strip()
+                if provider_id and thread_name:
+                    names[provider_id] = thread_name
+    return names
+
+
+def local_codex_session_candidates(known_provider_ids: set[str]) -> list[dict[str, Any]]:
+    if not CODEX_SESSIONS_ROOT.exists():
+        return []
+    thread_names = codex_session_index_thread_names()
+    candidates: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for path in CODEX_SESSIONS_ROOT.rglob("*.jsonl"):
+        provider_id, cwd = codex_transcript_meta(path)
+        if not provider_id or provider_id in seen_ids or provider_id in known_provider_ids:
+            continue
+        seen_ids.add(provider_id)
+        with suppress(OSError):
+            mtime = path.stat().st_mtime
+            label = thread_names.get(provider_id)
+            if not label:
+                preview = codex_transcript_preview(path)
+                folder_display = Path(cwd).name if cwd else path.stem
+                label = f"{folder_display}: {preview}" if preview else (folder_display or f"Codex chat {provider_id[:8]}")
+            candidates.append({
+                "provider_session_id": provider_id,
+                "backend": BACKEND_CODEX,
+                "label": label,
+                "updated_at": iso_from_timestamp(mtime),
+                "cwd": cwd,
+            })
+    return candidates
+
+
+def local_session_candidates(limit: int) -> list[dict[str, Any]]:
+    """Enumerate local Claude/Codex sessions not already imported into AgentsDock."""
+
+    known_provider_ids = {
+        pid for pid in (session_provider_id(sess) for sess in STORE.sessions.values()) if pid
+    }
+    candidates = [
+        *local_claude_session_candidates(known_provider_ids),
+        *local_codex_session_candidates(known_provider_ids),
+    ]
+    candidates.sort(key=lambda c: c["updated_at"], reverse=True)
+    return candidates[:limit]
 
 
 def standalone_provider_session(sess: dict[str, Any]) -> dict[str, Any]:
@@ -42858,6 +43072,55 @@ async def create_session(req: CreateSessionRequest) -> dict[str, Any]:
     if should_import:
         await import_session_history(sess)
     return {"session": public_session(sess)}
+
+
+@app.get("/api/local-sessions")
+async def get_local_sessions(
+    limit: int = Query(default=200, ge=1, le=500),
+) -> dict[str, Any]:
+    """List local Claude/Codex chat history not yet imported into AgentsDock."""
+
+    sessions = await asyncio.to_thread(local_session_candidates, limit)
+    return {"sessions": sessions}
+
+
+@app.post("/api/sessions/bulk-import")
+async def bulk_import_sessions(req: BulkImportSessionsRequest) -> dict[str, Any]:
+    if not req.items:
+        raise HTTPException(status_code=400, detail="items must not be empty")
+    if len(req.items) > MAX_BULK_IMPORT_ITEMS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"at most {MAX_BULK_IMPORT_ITEMS} items are allowed per bulk import",
+        )
+    results: list[dict[str, Any]] = []
+    for item in req.items:
+        try:
+            create_req = CreateSessionRequest(
+                backend=item.backend,
+                provider_session_id=item.provider_session_id,
+                cwd=item.cwd,
+                title=item.title,
+            )
+            sess = await STORE.create(create_req)
+            await import_session_history(sess)
+            results.append({
+                "provider_session_id": item.provider_session_id,
+                "session_id": sess["id"],
+                "ok": True,
+            })
+        except Exception as exc:
+            results.append({
+                "provider_session_id": item.provider_session_id,
+                "session_id": None,
+                "ok": False,
+                "error": concise_error_message(exc),
+            })
+        # Yield between items so a large batch doesn't monopolize the event
+        # loop for its entire duration (import_session_history itself still
+        # does blocking file I/O inline; this bounds exposure, it doesn't fix it).
+        await asyncio.sleep(0)
+    return {"results": results}
 
 
 @app.get("/api/sessions/{session_id}/timeline-index")

@@ -118,11 +118,8 @@ logger = logging.getLogger("agents-server")
 
 BACKEND_CLAUDE = "claude"
 BACKEND_CODEX = "codex"
-# Not activated: BACKEND_CURSOR is intentionally left out of VALID_BACKENDS.
-# run_cursor() below is real but unreachable until a future change adds
-# "cursor" to VALID_BACKENDS and the _start_turn_locked dispatch branch.
 BACKEND_CURSOR = "cursor"
-VALID_BACKENDS = {BACKEND_CLAUDE, BACKEND_CODEX}
+VALID_BACKENDS = {BACKEND_CLAUDE, BACKEND_CODEX, BACKEND_CURSOR}
 CODEX_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 CODEX_EFFORT_ALIASES = {
     "extra high": "xhigh",
@@ -30618,11 +30615,19 @@ def claude_supports_no_session_persistence() -> bool:
 
 
 def runtime_executable(backend: str) -> str:
-    return CLAUDE_BIN if backend == BACKEND_CLAUDE else CODEX_BIN
+    if backend == BACKEND_CLAUDE:
+        return CLAUDE_BIN
+    if backend == BACKEND_CURSOR:
+        return CURSOR_BIN
+    return CODEX_BIN
 
 
 def runtime_display_name(backend: str) -> str:
-    return "Claude Code" if backend == BACKEND_CLAUDE else "Codex"
+    if backend == BACKEND_CLAUDE:
+        return "Claude Code"
+    if backend == BACKEND_CURSOR:
+        return "Cursor"
+    return "Codex"
 
 
 def runtime_action(backend: str, status: str) -> str | None:
@@ -30630,10 +30635,20 @@ def runtime_action(backend: str, status: str) -> str | None:
     if status == "missing":
         return f"Install {runtime_display_name(backend)} for the server user, make `{executable}` available on PATH, then restart the agent server."
     if status == "unauthenticated":
-        command = "claude auth login" if backend == BACKEND_CLAUDE else "codex login"
+        if backend == BACKEND_CLAUDE:
+            command = "claude auth login"
+        elif backend == BACKEND_CURSOR:
+            command = "agent login"
+        else:
+            command = "codex login"
         return f"Run `{command}` as the server user, then refresh runtime status."
     if status == "error":
-        command = "claude auth status" if backend == BACKEND_CLAUDE else "codex login status"
+        if backend == BACKEND_CLAUDE:
+            command = "claude auth status"
+        elif backend == BACKEND_CURSOR:
+            command = "agent status"
+        else:
+            command = "codex login status"
         return f"Run `{executable} --version` and `{command}` as the server user, then refresh runtime status."
     return None
 
@@ -30715,7 +30730,12 @@ def probe_runtime(backend: str) -> dict[str, Any]:
     if version_result.returncode != 0:
         return runtime_diagnostic_payload(backend, "error", installed=True, authenticated=None, version=version)
 
-    auth_cmd = [resolved, "auth", "status", "--json"] if backend == BACKEND_CLAUDE else [resolved, "login", "status"]
+    if backend == BACKEND_CLAUDE:
+        auth_cmd = [resolved, "auth", "status", "--json"]
+    elif backend == BACKEND_CURSOR:
+        auth_cmd = [resolved, "status"]
+    else:
+        auth_cmd = [resolved, "login", "status"]
     try:
         auth_result = runtime_command(auth_cmd)
     except (OSError, subprocess.SubprocessError) as exc:
@@ -30723,6 +30743,17 @@ def probe_runtime(backend: str) -> dict[str, Any]:
         return runtime_diagnostic_payload(backend, "error", installed=True, authenticated=None, version=version)
 
     combined = f"{auth_result.stdout}\n{auth_result.stderr}"
+    if backend == BACKEND_CURSOR:
+        # `agent status` returns exit 0 whether logged in or not (verified
+        # live), so exit-code-based detection below would misreport a
+        # logged-out server as "ready". Parse the real text instead.
+        from cursor_agent_client import parse_cursor_auth_status
+        parsed = parse_cursor_auth_status(auth_result.stdout or auth_result.stderr)
+        if parsed["state"] == "ready":
+            return runtime_diagnostic_payload(backend, "ready", installed=True, authenticated=True, version=version)
+        if parsed["state"] == "unauthenticated":
+            return runtime_diagnostic_payload(backend, "unauthenticated", installed=True, authenticated=False, version=version)
+        return runtime_diagnostic_payload(backend, "error", installed=True, authenticated=None, version=version)
     if backend == BACKEND_CLAUDE and auth_result.stdout.strip():
         try:
             auth_payload = json.loads(auth_result.stdout)
@@ -36594,12 +36625,13 @@ async def run_cursor(
 ) -> None:
     """Stateless, spawn-per-turn turn runner for the Cursor CLI (``agent``).
 
-    NOT ACTIVATED: BACKEND_CURSOR is not in VALID_BACKENDS and nothing calls
-    this function yet. It is real, working code (verified by
-    test_run_cursor.py against the real cursor_agent_client parser and a
-    fake subprocess), not a stub - written now so the runner shape can be
-    reviewed before the separate activation step wires "cursor" into
-    VALID_BACKENDS and the _start_turn_locked dispatch branch.
+    Activated on this branch (research/cursor-backend-prototype, local only,
+    not pushed): BACKEND_CURSOR is in VALID_BACKENDS and the
+    _start_turn_locked dispatch calls this directly for cursor sessions.
+    Verified by test_run_cursor.py against the real cursor_agent_client
+    parser and a fake subprocess, and by a real local server + a real
+    authenticated `agent` CLI turn (see stress-test notes in the branch's
+    commit history for what was actually exercised).
 
     Deliberately mirrors run_codex_exec's spawn-per-turn shape (a fresh
     subprocess per turn, resumed via --resume <session_id>) rather than the
@@ -39442,8 +39474,8 @@ async def _start_turn_locked(
         # from an older server build. Scrub it immediately before provider
         # launch even when the user never opened the terminal UI.
         await asyncio.to_thread(scrub_tmux_global_secret_environment)
-        task = (
-            run_codex(
+        if backend == BACKEND_CODEX:
+            task = run_codex(
                 session_id,
                 run_id,
                 prompt,
@@ -39456,8 +39488,20 @@ async def _start_turn_locked(
                     else {}
                 ),
             )
-            if backend == BACKEND_CODEX
-            else run_claude(
+        elif backend == BACKEND_CURSOR:
+            # standalone_provider_context (memory-fork / scheduled-job
+            # projection) is not implemented yet for Cursor - not needed
+            # for interactive chat turns, which is all this backend
+            # supports so far.
+            task = run_cursor(
+                session_id,
+                run_id,
+                prompt,
+                dict(sess),
+                manifest_path,
+            )
+        else:
+            task = run_claude(
                 session_id,
                 run_id,
                 prompt,
@@ -39470,7 +39514,6 @@ async def _start_turn_locked(
                     else {}
                 ),
             )
-        )
         turn_task = asyncio.create_task(supervise_provider_turn_task(
             session_id,
             run_id,

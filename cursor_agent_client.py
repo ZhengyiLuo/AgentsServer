@@ -244,7 +244,12 @@ def build_cursor_cmd(
     resume_id = sess.get("cursor_session_id")
     if resume_id:
         cmd += ["--resume", str(resume_id)]
-    model = sess.get("cursor_model")
+    # Reuses the generic "model" field (same one Claude/Codex sessions use)
+    # rather than a cursor-specific field - already fully wired through
+    # CreateSessionRequest/UpdateSessionRequest with no schema changes
+    # needed, and matches the client's existing reset-on-backend-switch
+    # behavior (`updateSession(id, { backend, model: null, effort: null })`).
+    model = sess.get("model")
     if model:
         cmd += ["--model", str(model)]
     cmd += cursor_permission_flags(str(sess.get("cursor_permission_mode") or "default"))

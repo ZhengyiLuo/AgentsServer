@@ -300,7 +300,7 @@ class BuildCursorCmdTests(unittest.TestCase):
         )
 
     def test_model_and_permission_mode_are_threaded_through(self) -> None:
-        sess = {"cursor_model": "sonnet-5-thinking", "cursor_permission_mode": "full_access"}
+        sess = {"model": "sonnet-5-thinking", "cursor_permission_mode": "full_access"}
         cmd = build_cursor_cmd(sess, "hi", cursor_bin="agent")
         self.assertEqual(
             cmd,

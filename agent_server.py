@@ -325,6 +325,8 @@ CLAUDE_PERMISSION_MODE_OPTIONS = (
 )
 CLAUDE_PERMISSION_MODES = set(CLAUDE_PERMISSION_MODE_OPTIONS)
 CLAUDE_DEFAULT_PERMISSION_MODE = "default"
+CURSOR_PERMISSION_MODES = ("default", "auto_review", "full_access", "plan")
+CURSOR_DEFAULT_PERMISSION_MODE = "default"
 PROVIDER_JOBS_ACCESS_MODES = ("full", "read_only", "blocked")
 PROVIDER_JOBS_ACCESS_MODE_SET = set(PROVIDER_JOBS_ACCESS_MODES)
 PROVIDER_JOBS_ACCESS_DEFAULT = "full"
@@ -3289,6 +3291,8 @@ class CreateSessionRequest(BaseModel):
     codex_approvals_reviewer: Literal["user", "auto_review", "guardian_subagent"] | None = None
     provider_jobs_access: Literal["full", "read_only", "blocked"] | None = None
     import_history: bool | None = None
+    cursor_session_id: str | None = None
+    cursor_permission_mode: Literal["default", "auto_review", "full_access", "plan"] | None = None
 
 
 MAX_BULK_IMPORT_ITEMS = 25
@@ -3328,6 +3332,7 @@ class UpdateSessionRequest(BaseModel):
     codex_permission_profile: str | None = Field(default=None, max_length=240)
     codex_approvals_reviewer: Literal["user", "auto_review", "guardian_subagent"] | None = None
     provider_jobs_access: Literal["full", "read_only", "blocked"] | None = None
+    cursor_permission_mode: Literal["default", "auto_review", "full_access", "plan"] | None = None
 
 
 SESSION_LIFECYCLE_UPDATE_FIELDS = frozenset({
@@ -3342,6 +3347,7 @@ SESSION_LIFECYCLE_UPDATE_FIELDS = frozenset({
     "codex_permission_profile",
     "codex_approvals_reviewer",
     "provider_jobs_access",
+    "cursor_permission_mode",
     "archived",
 })
 
@@ -4671,7 +4677,12 @@ class SessionStore:
         provider_id = req.provider_session_id or req.session_id
         claude_session_id = req.claude_session_id or (provider_id if backend == BACKEND_CLAUDE else None)
         codex_thread_id = req.codex_thread_id or (provider_id if backend == BACKEND_CODEX else None)
-        active_provider_id = claude_session_id if backend == BACKEND_CLAUDE else codex_thread_id
+        cursor_session_id = req.cursor_session_id or (provider_id if backend == BACKEND_CURSOR else None)
+        active_provider_id = (
+            claude_session_id if backend == BACKEND_CLAUDE
+            else codex_thread_id if backend == BACKEND_CODEX
+            else cursor_session_id
+        )
         # A Claude chat can park an inactive Codex identity for later backend
         # switching, so validate every supplied Codex thread, not only the
         # currently active provider identity.
@@ -4696,12 +4707,16 @@ class SessionStore:
             "session_id": active_provider_id,
             "claude_session_id": claude_session_id,
             "codex_thread_id": codex_thread_id,
+            "cursor_session_id": cursor_session_id,
             # Backend identity becomes immutable as soon as an ordinary chat
             # turn is admitted, before the provider has necessarily returned
             # its durable thread/session id.
             "backend_locked": bool(active_provider_id),
             "claude_permission_mode": (
                 req.claude_permission_mode or CLAUDE_DEFAULT_PERMISSION_MODE
+            ),
+            "cursor_permission_mode": (
+                req.cursor_permission_mode or CURSOR_DEFAULT_PERMISSION_MODE
             ),
             "codex_approval_policy": (
                 req.codex_approval_policy or CODEX_DEFAULT_APPROVAL_POLICY
@@ -4819,9 +4834,15 @@ class SessionStore:
                             status_code=409,
                             detail="backend is locked after the chat starts; fork or create a new chat to use another backend",
                         )
+                    def provider_id_field(name: str) -> str:
+                        if name == BACKEND_CLAUDE:
+                            return "claude_session_id"
+                        if name == BACKEND_CURSOR:
+                            return "cursor_session_id"
+                        return "codex_thread_id"
                     if sess.get("session_id"):
-                        sess["claude_session_id" if old == BACKEND_CLAUDE else "codex_thread_id"] = sess["session_id"]
-                    sess["session_id"] = sess.get("claude_session_id" if backend == BACKEND_CLAUDE else "codex_thread_id")
+                        sess[provider_id_field(old)] = sess["session_id"]
+                    sess["session_id"] = sess.get(provider_id_field(backend))
                     sess["backend"] = backend
                     if "model" not in patch:
                         sess["model"] = None
@@ -4856,6 +4877,11 @@ class SessionStore:
                     "provider_jobs_access",
                     PROVIDER_JOBS_ACCESS_DEFAULT,
                     PROVIDER_JOBS_ACCESS_MODE_SET,
+                ),
+                (
+                    "cursor_permission_mode",
+                    CURSOR_DEFAULT_PERMISSION_MODE,
+                    set(CURSOR_PERMISSION_MODES),
                 ),
             ):
                 if key not in patch:
@@ -26324,7 +26350,8 @@ async def rollover_codex_provider_session(
 def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, Any]:
     detail_fields = () if summary else (
         "system_prompt", "session_id", "claude_session_id", "codex_thread_id",
-        "claude_permission_mode",
+        "cursor_session_id",
+        "claude_permission_mode", "cursor_permission_mode",
         "codex_approval_policy", "codex_sandbox_mode",
         "codex_permission_profile", "codex_approvals_reviewer",
         "provider_jobs_access",
@@ -38775,6 +38802,24 @@ async def start_turn(
     accepted_obligation_ids: list[str] | None = None,
     accepted_exchange_ids: list[str] | None = None,
 ) -> dict[str, Any]:
+    if provider_context_mode == "standalone":
+        # run_cursor has no standalone_provider_context support yet (see its
+        # docstring). Reject explicitly here, before any turn-slot state is
+        # touched, rather than silently running the turn in chat context
+        # and mis-projecting a "standalone" scheduled-job run into the
+        # parent chat's own timeline.
+        standalone_session = STORE.sessions.get(session_id)
+        if standalone_session is not None and str(
+            standalone_session.get("backend") or DEFAULT_BACKEND
+        ).strip().lower() == BACKEND_CURSOR:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Standalone/scheduled-job context is not yet supported "
+                    "for the Cursor backend; use chat context, or a "
+                    "Claude/Codex session."
+                ),
+            )
     # Capture the chat backend before this request can wait on lifecycle work.
     # If a concurrent backend PATCH wins the lock, the request must be retried
     # instead of applying a now-stale per-turn backend after the PATCH.

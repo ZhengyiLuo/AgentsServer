@@ -6020,6 +6020,90 @@ class SecurePeerClient:
                 expected_certificate_fingerprint=expected_certificate_fingerprint,
             )
 
+    def retire_remote_revoked_connection(
+        self,
+        connection_id: str,
+        *,
+        expected_host_server_identity: str,
+        expected_hub_id: str,
+        expected_certificate_fingerprint: str,
+    ) -> dict[str, Any]:
+        """Persist a pinned host's terminal revocation without forgetting its tombstone."""
+
+        with self._route_guard:
+            canonical = _uuid(connection_id, "connection_id")
+            expected_host = _identifier(
+                expected_host_server_identity,
+                "expected host identity",
+            )
+            expected_hub = _identifier(expected_hub_id, "expected hub id")
+            if _HEX_FP_RE.fullmatch(expected_certificate_fingerprint) is None:
+                raise SecurePeerError(
+                    "invalid_request",
+                    "expected certificate fingerprint is invalid",
+                    422,
+                )
+            timestamp = self._timestamp()
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT * FROM client_connections WHERE connection_id=?",
+                    (canonical,),
+                ).fetchone()
+                if (
+                    row is None
+                    or row["host_server_identity"] != expected_host
+                    or row["hub_id"] != expected_hub
+                    or row["certificate_fingerprint"]
+                    != expected_certificate_fingerprint
+                    or row["status"]
+                    not in {"approved", "connected", "deactivated", "revoked"}
+                ):
+                    raise SecurePeerError(
+                        "connection_changed",
+                        "Secure peer connection identity changed",
+                        409,
+                    )
+                connection.execute(
+                    "UPDATE client_meta SET value=NULL "
+                    "WHERE key='active_connection_id' AND value=?",
+                    (canonical,),
+                )
+                connection.execute(
+                    """UPDATE client_connections SET status='revoked',
+                    relay_available=0,updated_at=?
+                    WHERE connection_id=? AND certificate_fingerprint=?""",
+                    (
+                        timestamp,
+                        canonical,
+                        expected_certificate_fingerprint,
+                    ),
+                )
+                # The authenticated host has already revoked this peer and all
+                # routes associated with it. These local rows are terminal
+                # receipts, not an outbox: retrying them with the revoked
+                # credential can never succeed.
+                connection.execute(
+                    """UPDATE client_routes SET status='revoked',
+                    revoke_pending=0,revoke_expected_revision=NULL,
+                    revoke_idempotency_key=NULL,updated_at=?
+                    WHERE connection_id=?""",
+                    (timestamp, canonical),
+                )
+                connection.execute(
+                    "DELETE FROM client_renewals WHERE connection_id=?",
+                    (canonical,),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            finally:
+                connection.close()
+            return self.get_connection(canonical)
+
     def _forget_connection_locked(
         self,
         connection_id: str,
@@ -6165,7 +6249,7 @@ class SecurePeerClient:
                 connection_id,
                 relay_required=False,
             )
-            return self._proxy_locked(
+            response = self._proxy_locked(
                 connection_id,
                 method,
                 hub_path,
@@ -6173,6 +6257,21 @@ class SecurePeerClient:
                 headers=headers,
                 body=body,
             )
+            # Proxy errors normally remain byte-for-byte upstream responses.
+            # A pinned host's structured terminal revocation is the one
+            # exception: surface it as a typed error so the runtime can retire
+            # this exact credential before returning the same failure locally.
+            if response.status == 401:
+                try:
+                    self._decode_json_response(
+                        response.status,
+                        list(response.headers),
+                        response.body,
+                    )
+                except SecurePeerError as exc:
+                    if exc.code == "peer_revoked" and exc.status_code == 401:
+                        raise
+            return response
 
     def _proxy_locked(
         self,

@@ -407,6 +407,70 @@ class SecurePeerStoreTests(unittest.TestCase):
             )
         self.assertEqual(invalid_remote_error.exception.code, "remote_invalid")
 
+    def test_client_proxy_surfaces_only_structured_peer_revocation(self) -> None:
+        client = SecurePeerClient(
+            self.root / "proxy-client",
+            "proxy-peer-001",
+            "Proxy peer",
+            clock=self.clock,
+        )
+        connection_id = _uuid()
+        revoked = ProxyResponse(
+            401,
+            (("content-type", "application/json"),),
+            b'{"error":{"code":"peer_revoked","message":"Peer authentication is unavailable"}}',
+        )
+        with (
+            mock.patch.object(
+                client,
+                "_require_active_connection_locked",
+            ),
+            mock.patch.object(
+                client,
+                "_proxy_locked",
+                return_value=revoked,
+            ),
+            self.assertRaises(SecurePeerError) as terminal,
+        ):
+            client.proxy(connection_id, "GET", "/v1/teams")
+        self.assertEqual(terminal.exception.code, "peer_revoked")
+        self.assertEqual(terminal.exception.status_code, 401)
+
+        passthrough = (
+            ProxyResponse(
+                401,
+                (("content-type", "application/json"),),
+                b'{"error":{"code":"authorization_failed","message":"Denied"}}',
+            ),
+            ProxyResponse(
+                503,
+                (("content-type", "application/json"),),
+                b'{"error":{"code":"peer_revoked","message":"Retry later"}}',
+            ),
+            ProxyResponse(
+                401,
+                (("content-type", "text/plain"),),
+                b'{"error":{"code":"peer_revoked","message":"Untrusted shape"}}',
+            ),
+        )
+        for response in passthrough:
+            with (
+                self.subTest(response=response),
+                mock.patch.object(
+                    client,
+                    "_require_active_connection_locked",
+                ),
+                mock.patch.object(
+                    client,
+                    "_proxy_locked",
+                    return_value=response,
+                ),
+            ):
+                self.assertIs(
+                    client.proxy(connection_id, "GET", "/v1/teams"),
+                    response,
+                )
+
     def test_pairing_capacity_is_transactional_and_prunes_old_terminal_rows(self) -> None:
         _key, request = self.request()
         template = self.store.submit_pairing(request)
@@ -1141,6 +1205,165 @@ class SecurePeerStoreTests(unittest.TestCase):
         SecurePeerClient(client_root, "bound-peer-001", "Bound peer")
         with self.assertRaisesRegex(PermissionError, "quarantined"):
             SecurePeerClient(client_root, "other-peer-001", "Other peer")
+
+    def test_remote_revocation_retires_exact_connection_and_routes_atomically(self) -> None:
+        client = SecurePeerClient(
+            self.root / "revoked-client",
+            "revoked-peer-001",
+            "Revoked peer",
+            clock=self.clock,
+        )
+        connection_id = _uuid()
+        certificate_fingerprint = "sha256:" + "d" * 64
+        key_path = client.keys_dir / f"{connection_id}.key.pem"
+        certificate_path = client.keys_dir / f"{connection_id}.certificate.pem"
+        key_path.write_bytes(b"preserved-private-key")
+        certificate_path.write_bytes(b"preserved-certificate")
+        key_path.chmod(0o600)
+        certificate_path.chmod(0o600)
+        active_route = _uuid()
+        pending_route = _uuid()
+        database = client._connect()
+        try:
+            database.execute(
+                """INSERT INTO client_connections(
+                connection_id,host_ip,port,status,pairing_id,pairing_request_id,
+                poll_token,pairing_request_json,pairing_request_digest,peer_id,
+                team_id,scopes_json,host_server_identity,hub_id,
+                host_ca_certificate_pem,host_ca_fingerprint,transcript_hash,
+                sas_json,requested_scopes_json,peer_public_key_fingerprint,
+                key_path,certificate_path,certificate_fingerprint,
+                certificate_expires_at,relay_available,created_at,updated_at,
+                last_validated_at
+                ) VALUES (
+                :connection_id,'192.0.2.20',7851,'connected',:pairing_id,
+                :request_id,'poll-token','{}',:request_digest,:peer_id,
+                'team-alpha','["teamspace.read"]','host-server-001',
+                'team-hub-001',:ca_pem,:ca_fingerprint,:transcript_hash,
+                '["amber","beacon","cedar","delta","ember","forest"]',
+                '["teamspace.read"]',:public_key_fingerprint,:key_path,
+                :certificate_path,:certificate_fingerprint,:certificate_expires_at,
+                1,:created_at,:created_at,:created_at
+                )""",
+                {
+                    "connection_id": connection_id,
+                    "pairing_id": _uuid(),
+                    "request_id": _uuid(),
+                    "request_digest": b"pairing-digest",
+                    "peer_id": _uuid(),
+                    "ca_pem": self.store.ca_certificate_pem,
+                    "ca_fingerprint": self.store.ca_fingerprint,
+                    "transcript_hash": "a" * 64,
+                    "public_key_fingerprint": "sha256:" + "b" * 64,
+                    "key_path": str(key_path),
+                    "certificate_path": str(certificate_path),
+                    "certificate_fingerprint": certificate_fingerprint,
+                    "certificate_expires_at": self.clock.value + 3_600,
+                    "created_at": self.clock.value,
+                },
+            )
+            database.execute(
+                "UPDATE client_meta SET value=? WHERE key='active_connection_id'",
+                (connection_id,),
+            )
+            for route_id, status, pending in (
+                (active_route, "active", 0),
+                (pending_route, "revoked", 1),
+            ):
+                database.execute(
+                    """INSERT INTO client_routes(
+                    route_id,connection_id,revision,alias,display_title,
+                    actions_json,chat_id,status,revoke_pending,
+                    revoke_expected_revision,revoke_idempotency_key,
+                    created_at,updated_at
+                    ) VALUES (?,?,?,'route','Route','["instruction"]',?,?,?,?,?,?,?)""",
+                    (
+                        route_id,
+                        connection_id,
+                        "rev_" + "e" * 32,
+                        f"chat-{route_id}",
+                        status,
+                        pending,
+                        "rev_" + "e" * 32 if pending else None,
+                        _uuid() if pending else None,
+                        self.clock.value,
+                        self.clock.value,
+                    ),
+                )
+            database.execute(
+                """INSERT INTO client_renewals(
+                request_id,connection_id,old_certificate_fingerprint,
+                request_json,key_path,status,created_at,updated_at
+                ) VALUES (?,?,?,'{}',?,'pending',?,?)""",
+                (
+                    _uuid(),
+                    connection_id,
+                    certificate_fingerprint,
+                    str(key_path),
+                    self.clock.value,
+                    self.clock.value,
+                ),
+            )
+        finally:
+            database.close()
+
+        with self.assertRaises(SecurePeerError) as changed:
+            client.retire_remote_revoked_connection(
+                connection_id,
+                expected_host_server_identity="host-server-001",
+                expected_hub_id="team-hub-001",
+                expected_certificate_fingerprint="sha256:" + "f" * 64,
+            )
+        self.assertEqual(changed.exception.code, "connection_changed")
+        self.assertTrue(client.get_connection(connection_id)["active"])
+        self.assertEqual(
+            {route["status"] for route in client.list_published_routes()},
+            {"active", "revoked"},
+        )
+
+        retired = client.retire_remote_revoked_connection(
+            connection_id,
+            expected_host_server_identity="host-server-001",
+            expected_hub_id="team-hub-001",
+            expected_certificate_fingerprint=certificate_fingerprint,
+        )
+        self.assertEqual(retired["status"], "revoked")
+        self.assertFalse(retired["active"])
+        self.assertFalse(retired["remote_route_delivery_available"])
+        self.assertEqual(key_path.read_bytes(), b"preserved-private-key")
+        self.assertEqual(
+            certificate_path.read_bytes(),
+            b"preserved-certificate",
+        )
+        database = client._connect()
+        try:
+            routes = database.execute(
+                """SELECT status,revoke_pending,revoke_expected_revision,
+                revoke_idempotency_key FROM client_routes
+                WHERE connection_id=? ORDER BY route_id""",
+                (connection_id,),
+            ).fetchall()
+            renewals = database.execute(
+                "SELECT COUNT(*) AS count FROM client_renewals WHERE connection_id=?",
+                (connection_id,),
+            ).fetchone()
+        finally:
+            database.close()
+        self.assertEqual(len(routes), 2)
+        self.assertTrue(all(route["status"] == "revoked" for route in routes))
+        self.assertTrue(all(int(route["revoke_pending"]) == 0 for route in routes))
+        self.assertTrue(all(route["revoke_expected_revision"] is None for route in routes))
+        self.assertTrue(all(route["revoke_idempotency_key"] is None for route in routes))
+        self.assertEqual(int(renewals["count"]), 0)
+
+        repeated = client.retire_remote_revoked_connection(
+            connection_id,
+            expected_host_server_identity="host-server-001",
+            expected_hub_id="team-hub-001",
+            expected_certificate_fingerprint=certificate_fingerprint,
+        )
+        self.assertEqual(repeated["status"], "revoked")
+        self.assertFalse(repeated["active"])
 
     def test_expired_unanswered_pairing_attempt_retires_its_private_key(self) -> None:
         client = SecurePeerClient(

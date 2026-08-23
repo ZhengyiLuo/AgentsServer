@@ -1412,6 +1412,62 @@ class SecurePeerRuntime:
             else "secure_peer_state_unavailable"
         )
 
+    def _retire_remote_revoked_active_connection(
+        self,
+        observed: Mapping[str, Any],
+        pairing_recovery: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        connection_id = str(observed.get("connection_id") or "")
+        with self._outbound_guard:
+            connections = self.client.list_connections()
+            current = next(
+                (
+                    item
+                    for item in connections
+                    if item.get("connection_id") == connection_id
+                ),
+                None,
+            )
+            if current is not None and (
+                current.get("host_server_identity")
+                != observed.get("host_server_identity")
+                or current.get("hub_id") != observed.get("hub_id")
+            ):
+                raise SecurePeerError(
+                    "connection_changed",
+                    "Secure peer connection changed during revocation",
+                    409,
+                )
+            if current is not None:
+                self.client.retire_remote_revoked_connection(
+                    connection_id,
+                    expected_host_server_identity=str(
+                        current.get("host_server_identity") or ""
+                    ),
+                    expected_hub_id=str(current.get("hub_id") or ""),
+                    expected_certificate_fingerprint=str(
+                        current.get("certificate_fingerprint") or ""
+                    ),
+                )
+            replacement_active = any(
+                item.get("active")
+                and item.get("connection_id") != connection_id
+                for item in connections
+            )
+        with self._guard:
+            self._remote_routes_cache.pop(connection_id, None)
+            self._remote_routes_refreshed_at.pop(connection_id, None)
+        self._client_error = None
+        return {
+            "active": replacement_active,
+            "renewed": False,
+            "healthy": False,
+            "revoked": True,
+            "revoked_connection_id": connection_id,
+            "error": "peer_revoked",
+            "pairing_recovery": dict(pairing_recovery),
+        }
+
     def maintenance_once(self) -> dict[str, Any]:
         """Renew and revalidate the one explicitly active peer connection."""
 
@@ -1439,17 +1495,35 @@ class SecurePeerRuntime:
                 "pairing_recovery": pairing_recovery,
             }
         connection_id = str(active.get("connection_id") or "")
+        revocation_observation = active
         try:
-            retired_routes = self.client.flush_pending_route_revocations(
-                limit=8
-            )
-            renewal = self.client.renew_if_due(connection_id)
-            health = self.client.peer_health(connection_id)
-            remote_routes = (
-                self.client.list_remote_routes(connection_id)
-                if self._relay_enabled
-                else []
-            )
+            try:
+                retired_routes = (
+                    self.client.flush_pending_route_revocations_for_connection(
+                        connection_id,
+                        limit=8,
+                    )
+                )
+                renewal = self.client.renew_if_due(connection_id)
+                renewed_connection = renewal.get("connection")
+                if (
+                    isinstance(renewed_connection, Mapping)
+                    and renewed_connection.get("connection_id") == connection_id
+                ):
+                    revocation_observation = renewed_connection
+                health = self.client.peer_health(connection_id)
+                remote_routes = (
+                    self.client.list_remote_routes(connection_id)
+                    if self._relay_enabled
+                    else []
+                )
+            except SecurePeerError as exc:
+                if exc.code == "peer_revoked" and exc.status_code == 401:
+                    return self._retire_remote_revoked_active_connection(
+                        revocation_observation,
+                        pairing_recovery,
+                    )
+                raise
             with self._guard:
                 self._remote_routes_cache[connection_id] = [
                     dict(item) for item in remote_routes
@@ -2534,20 +2608,34 @@ class SecurePeerRuntime:
         headers: Mapping[str, str] | None,
         body: bytes | None,
     ):
-        active = next(
-            (item for item in self.client.list_connections() if item.get("active")),
-            None,
-        )
-        if active is None or active.get("connection_id") != connection_id:
-            raise SecurePeerError("connection_unavailable", "Secure peer connection is unavailable", 404)
-        return self.client.proxy(
-            connection_id,
-            method,
-            path,
-            query=query,
-            headers=headers,
-            body=body,
-        )
+        with self._outbound_guard:
+            active = next(
+                (
+                    item
+                    for item in self.client.list_connections()
+                    if item.get("active")
+                ),
+                None,
+            )
+            if active is None or active.get("connection_id") != connection_id:
+                raise SecurePeerError(
+                    "connection_unavailable",
+                    "Secure peer connection is unavailable",
+                    404,
+                )
+            try:
+                return self.client.proxy(
+                    connection_id,
+                    method,
+                    path,
+                    query=query,
+                    headers=headers,
+                    body=body,
+                )
+            except SecurePeerError as exc:
+                if exc.code == "peer_revoked" and exc.status_code == 401:
+                    self._retire_remote_revoked_active_connection(active, {})
+                raise
 
     def shutdown(self) -> None:
         self.close_host_admission()

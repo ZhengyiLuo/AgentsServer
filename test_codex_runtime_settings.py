@@ -34,6 +34,26 @@ class CodexRuntimeSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(model, "gpt-5.5")
         self.assertEqual(effort, "xhigh")
 
+    def test_app_server_service_tier_aliases_priority_to_fast(self) -> None:
+        self.assertEqual(agent_server.codex_app_server_service_tier("priority"), "fast")
+        self.assertEqual(agent_server.codex_app_server_service_tier("flex"), "flex")
+        self.assertEqual(agent_server.codex_app_server_service_tier(""), "")
+
+    def test_thread_params_use_app_server_alias_for_priority_models(self) -> None:
+        # The Codex app-server's thread/start JSON-RPC only accepts "fast"/"flex"
+        # for serviceTier, unlike the canonical "priority" value used for
+        # `codex exec` CLI config overrides. gpt-5.6-sol/terra/luna fall back to
+        # canonical "priority" (CODEX_FALLBACK_SERVICE_TIERS), so thread/start
+        # must translate it rather than forward it unchanged.
+        with patch.object(
+            agent_server,
+            "codex_user_config_defaults",
+            return_value=("", "", ""),
+        ):
+            params = agent_server.codex_thread_params({"model": "gpt-5.6-sol"}, "/tmp")
+
+        self.assertEqual(params["serviceTier"], "fast")
+
     async def test_load_preserves_effort_not_known_by_static_model_map(self) -> None:
         store = agent_server.SessionStore()
         payload = {

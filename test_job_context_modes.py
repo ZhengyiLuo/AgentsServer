@@ -224,7 +224,7 @@ class StandaloneProviderContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(standalone_id, "thread_standalone")
         self.assertEqual(chat_id, "thread_parent")
         start_standalone.assert_awaited_once()
-        pin.assert_awaited_once_with("thread_standalone")
+        pin.assert_awaited_once_with("thread_standalone", manager)
         ensure_chat.assert_awaited_once_with(
             manager,
             "sess_parent",

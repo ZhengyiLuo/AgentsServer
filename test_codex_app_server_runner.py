@@ -1019,8 +1019,14 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                 Path(self.cwd) / ".runner-test-manifest.json",
                 allow_exec_fallback=True,
             )
+            unpin = agent_server.unpin_codex_app_server_thread
 
         exec_fallback.assert_awaited_once()
+        unpin.assert_awaited_once_with(
+            manager,
+            "thread-native",
+            invalidate_loaded_thread=True,
+        )
         self.context_invalidator.assert_awaited_once_with("chat-native")
         self.assertEqual(exec_fallback.await_args.args[2], "Safe to retry exactly once")
         fallback_events = [
@@ -1032,6 +1038,71 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             fallback_events[0]["from"],
             agent_server.CODEX_TRANSPORT_APP_SERVER,
+        )
+
+    async def test_interactive_turn_start_rejection_invalidates_without_replay(
+        self,
+    ) -> None:
+        rejection = CodexAppServerRequestError(
+            "turn/start",
+            {"code": -32602, "message": "account changed"},
+        )
+        manager = FakeManager(start_turn_error=rejection)
+        stack, events, _finished, exec_fallback = self.runner_patches(manager)
+        with stack:
+            await agent_server.run_codex_app_server(
+                "chat-native",
+                "run-original",
+                "Do not replay interactive input",
+                dict(self.session),
+                Path(self.cwd) / ".runner-test-manifest.json",
+                allow_exec_fallback=False,
+                interactive_app_server=True,
+                allow_resume_rollover=False,
+            )
+            unpin = agent_server.unpin_codex_app_server_thread
+
+        exec_fallback.assert_not_awaited()
+        unpin.assert_awaited_once_with(
+            manager,
+            "thread-native",
+            invalidate_loaded_thread=True,
+        )
+        self.assertFalse(
+            any(
+                call.args[1] == "codex_transport_fallback"
+                for call in events.await_args_list
+            )
+        )
+
+    async def test_post_handle_request_error_does_not_invalidate_or_replay(
+        self,
+    ) -> None:
+        rejection = CodexAppServerRequestError(
+            "thread/read",
+            {"code": -32602, "message": "late rejection"},
+        )
+        manager = FakeManager(FakeTurn([rejection]))
+        stack, events, _finished, exec_fallback = self.runner_patches(manager)
+        with stack:
+            await agent_server.run_codex_app_server(
+                "chat-native",
+                "run-original",
+                "A handle was already returned",
+                dict(self.session),
+                Path(self.cwd) / ".runner-test-manifest.json",
+                allow_exec_fallback=True,
+                allow_resume_rollover=False,
+            )
+            unpin = agent_server.unpin_codex_app_server_thread
+
+        exec_fallback.assert_not_awaited()
+        unpin.assert_awaited_once_with(manager, "thread-native")
+        self.assertFalse(
+            any(
+                call.args[1] == "codex_transport_fallback"
+                for call in events.await_args_list
+            )
         )
 
     async def test_ambiguous_post_send_failure_never_replays_through_exec(self) -> None:

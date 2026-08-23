@@ -8,6 +8,7 @@ import agent_server
 class FakeCodexAppServerManager:
     def __init__(self, *, loaded: set[str] | None = None) -> None:
         self.loaded = set(loaded or set())
+        self.active: dict[str, object] = {}
         self.start_calls: list[dict[str, object]] = []
         self.resume_calls: list[tuple[str, dict[str, object]]] = []
         self.inject_calls: list[tuple[str, list[dict[str, object]]]] = []
@@ -15,6 +16,9 @@ class FakeCodexAppServerManager:
 
     def is_thread_loaded(self, thread_id: str) -> bool:
         return thread_id in self.loaded
+
+    def active_turn(self, thread_id: str) -> object | None:
+        return self.active.get(thread_id)
 
     async def start_thread(self, params: dict[str, object]) -> str:
         self.start_calls.append(params)
@@ -49,6 +53,8 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
             event.set()
         agent_server.CODEX_APP_SERVER_EVICTING_THREADS.clear()
         agent_server.CODEX_APP_SERVER_PINNED_THREADS.clear()
+        agent_server.CODEX_APP_SERVER_THREAD_PIN_COUNTS.clear()
+        agent_server.CODEX_APP_SERVER_INVALIDATED_THREADS.clear()
         agent_server.CODEX_APP_SERVER_THREAD_LRU.clear()
 
     def session(self, **overrides: object) -> dict[str, object]:
@@ -343,7 +349,10 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
             )
             await asyncio.wait_for(manager.started.wait(), timeout=1)
             await asyncio.wait_for(
-                agent_server.pin_codex_app_server_thread("thread-unrelated"),
+                agent_server.pin_codex_app_server_thread(
+                    "thread-unrelated",
+                    manager,  # type: ignore[arg-type]
+                ),
                 timeout=0.1,
             )
             manager.release.set()
@@ -354,6 +363,208 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
             "thread-old",
             agent_server.CODEX_APP_SERVER_EVICTING_THREADS,
         )
+
+    async def test_invalidation_releases_only_callers_pin_and_defers_eviction(
+        self,
+    ) -> None:
+        manager = FakeCodexAppServerManager(loaded={"thread-shared"})
+        await agent_server.pin_codex_app_server_thread(
+            "thread-shared", manager  # type: ignore[arg-type]
+        )
+        await agent_server.pin_codex_app_server_thread(
+            "thread-shared", manager  # type: ignore[arg-type]
+        )
+
+        await agent_server.unpin_codex_app_server_thread(
+            manager,  # type: ignore[arg-type]
+            "thread-shared",
+            invalidate_loaded_thread=True,
+        )
+
+        self.assertEqual(
+            agent_server.CODEX_APP_SERVER_THREAD_PIN_COUNTS["thread-shared"],
+            1,
+        )
+        self.assertIn("thread-shared", agent_server.CODEX_APP_SERVER_PINNED_THREADS)
+        self.assertIn("thread-shared", agent_server.CODEX_APP_SERVER_INVALIDATED_THREADS)
+        self.assertEqual(manager.unsubscribe_calls, [])
+
+        await agent_server.unpin_codex_app_server_thread(
+            manager,  # type: ignore[arg-type]
+            "thread-shared",
+        )
+
+        self.assertEqual(manager.unsubscribe_calls, ["thread-shared"])
+        self.assertNotIn("thread-shared", agent_server.CODEX_APP_SERVER_INVALIDATED_THREADS)
+        self.assertNotIn("thread-shared", agent_server.CODEX_APP_SERVER_THREAD_PIN_COUNTS)
+
+    async def test_new_pin_fails_closed_while_invalidated_owner_remains(self) -> None:
+        manager = FakeCodexAppServerManager(loaded={"thread-shared"})
+        await agent_server.pin_codex_app_server_thread(
+            "thread-shared", manager  # type: ignore[arg-type]
+        )
+        await agent_server.pin_codex_app_server_thread(
+            "thread-shared", manager  # type: ignore[arg-type]
+        )
+        await agent_server.unpin_codex_app_server_thread(
+            manager,  # type: ignore[arg-type]
+            "thread-shared",
+            invalidate_loaded_thread=True,
+        )
+
+        with self.assertRaises(agent_server.CodexAppServerError) as raised:
+            await agent_server.pin_codex_app_server_thread(
+                "thread-shared", manager  # type: ignore[arg-type]
+            )
+
+        self.assertTrue(raised.exception.safe_to_retry)
+        self.assertFalse(raised.exception.request_sent)
+        self.assertEqual(
+            agent_server.CODEX_APP_SERVER_THREAD_PIN_COUNTS["thread-shared"],
+            1,
+        )
+
+    async def test_invalidation_retries_after_active_turn_clears(self) -> None:
+        manager = FakeCodexAppServerManager(loaded={"thread-stale"})
+        manager.active["thread-stale"] = object()
+        await agent_server.pin_codex_app_server_thread(
+            "thread-stale", manager  # type: ignore[arg-type]
+        )
+        await agent_server.unpin_codex_app_server_thread(
+            manager,  # type: ignore[arg-type]
+            "thread-stale",
+            invalidate_loaded_thread=True,
+        )
+        self.assertIn("thread-stale", agent_server.CODEX_APP_SERVER_INVALIDATED_THREADS)
+        self.assertEqual(manager.unsubscribe_calls, [])
+
+        with self.assertRaises(agent_server.CodexAppServerError):
+            await agent_server.pin_codex_app_server_thread(
+                "thread-stale", manager  # type: ignore[arg-type]
+            )
+        manager.active.clear()
+        await agent_server.pin_codex_app_server_thread(
+            "thread-stale", manager  # type: ignore[arg-type]
+        )
+
+        self.assertEqual(manager.unsubscribe_calls, ["thread-stale"])
+        self.assertNotIn("thread-stale", agent_server.CODEX_APP_SERVER_INVALIDATED_THREADS)
+        self.assertEqual(
+            agent_server.CODEX_APP_SERVER_THREAD_PIN_COUNTS["thread-stale"],
+            1,
+        )
+
+    async def test_unsubscribe_failure_keeps_invalidation_for_next_pin(self) -> None:
+        class FlakyManager(FakeCodexAppServerManager):
+            def __init__(self) -> None:
+                super().__init__(loaded={"thread-stale"})
+                self.failures = 1
+
+            async def unsubscribe_thread(self, thread_id: str) -> str:
+                self.unsubscribe_calls.append(thread_id)
+                if self.failures:
+                    self.failures -= 1
+                    raise agent_server.CodexAppServerError("unsubscribe failed")
+                self.loaded.discard(thread_id)
+                return "unsubscribed"
+
+        manager = FlakyManager()
+        await agent_server.pin_codex_app_server_thread(
+            "thread-stale", manager  # type: ignore[arg-type]
+        )
+        await agent_server.unpin_codex_app_server_thread(
+            manager,  # type: ignore[arg-type]
+            "thread-stale",
+            invalidate_loaded_thread=True,
+        )
+        self.assertIn("thread-stale", agent_server.CODEX_APP_SERVER_INVALIDATED_THREADS)
+        self.assertNotIn("thread-stale", agent_server.CODEX_APP_SERVER_THREAD_LRU)
+
+        await agent_server.pin_codex_app_server_thread(
+            "thread-stale", manager  # type: ignore[arg-type]
+        )
+
+        self.assertEqual(manager.unsubscribe_calls, ["thread-stale", "thread-stale"])
+        self.assertNotIn("thread-stale", agent_server.CODEX_APP_SERVER_INVALIDATED_THREADS)
+        self.assertEqual(
+            agent_server.CODEX_APP_SERVER_THREAD_PIN_COUNTS["thread-stale"],
+            1,
+        )
+
+    async def test_next_ensure_reloads_an_invalidated_subscription(self) -> None:
+        session = self.session(
+            session_id="thread-stale",
+            codex_thread_id="thread-stale",
+        )
+        with patch.object(
+            agent_server,
+            "codex_user_developer_instructions",
+            return_value="",
+        ):
+            session["codex_instruction_hash"] = (
+                agent_server.codex_thread_instruction_hash("chat-1", session)
+            )
+
+        manager = FakeCodexAppServerManager(loaded={"thread-stale"})
+        await agent_server.pin_codex_app_server_thread(
+            "thread-stale", manager  # type: ignore[arg-type]
+        )
+        await agent_server.unpin_codex_app_server_thread(
+            manager,  # type: ignore[arg-type]
+            "thread-stale",
+            invalidate_loaded_thread=True,
+        )
+
+        with patch.object(
+            agent_server,
+            "codex_user_developer_instructions",
+            return_value="",
+        ), patch.object(
+            agent_server.STORE,
+            "save_provider_session",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "touch_codex_app_server_thread",
+            AsyncMock(),
+        ):
+            thread_id, _instruction_hash = (
+                await agent_server.ensure_codex_app_server_thread(
+                    manager,  # type: ignore[arg-type]
+                    "chat-1",
+                    session,
+                    "/repo",
+                )
+            )
+
+        self.assertEqual(thread_id, "thread-stale")
+        self.assertEqual(manager.unsubscribe_calls, ["thread-stale"])
+        self.assertEqual(len(manager.resume_calls), 1)
+        self.assertEqual(manager.resume_calls[0][0], "thread-stale")
+
+    async def test_normal_retained_unpin_keeps_loaded_thread_warm(self) -> None:
+        manager = FakeCodexAppServerManager(loaded={"thread-retained"})
+        await agent_server.pin_codex_app_server_thread(
+            "thread-retained", manager  # type: ignore[arg-type]
+        )
+        with patch.object(
+            agent_server.STORE,
+            "sessions",
+            {
+                "chat": {
+                    "backend": agent_server.BACKEND_CODEX,
+                    "codex_thread_id": "thread-retained",
+                }
+            },
+        ):
+            await agent_server.unpin_codex_app_server_thread(
+                manager,  # type: ignore[arg-type]
+                "thread-retained",
+            )
+
+        self.assertEqual(manager.unsubscribe_calls, [])
+        self.assertIn("thread-retained", manager.loaded)
+        self.assertIn("thread-retained", agent_server.CODEX_APP_SERVER_THREAD_LRU)
 
 
 if __name__ == "__main__":

@@ -472,6 +472,14 @@ MAX_ARTIFACT_TITLE_CHARS = int(agentsdock_setting("ARTIFACT_TITLE_MAX_CHARS", "1
 MAX_ARTIFACT_TEXT_CHARS = int(agentsdock_setting("ARTIFACT_TEXT_MAX_CHARS", "12000"))
 MAX_IMPORT_MESSAGES = int(agentsdock_setting("HISTORY_IMPORT_LIMIT", "400"))
 MAX_IMPORTED_TEXT_CHARS = int(agentsdock_setting("HISTORY_IMPORT_TEXT_CHARS", "12000"))
+MAX_LOCAL_SESSION_LIST_ITEMS = 500
+MAX_LOCAL_SESSION_SCAN_FILES = 10_000
+MAX_LOCAL_TRANSCRIPT_BYTES = 256 * 1024 * 1024
+MAX_LOCAL_TRANSCRIPT_LINE_BYTES = 4 * 1024 * 1024
+MAX_LOCAL_TRANSCRIPT_SCAN_LINES = 250_000
+MAX_CODEX_SESSION_INDEX_BYTES = 16 * 1024 * 1024
+MAX_CODEX_SESSION_INDEX_LINES = 100_000
+MAX_LOCAL_SESSION_LABEL_CHARS = 240
 MAX_FORK_MEMORY_CHARS = int(agentsdock_setting("FORK_MEMORY_CHARS", "24000"))
 MAX_FORK_MEMORY_ITEM_CHARS = int(agentsdock_setting("FORK_MEMORY_ITEM_CHARS", "1800"))
 MAX_HANDOFF_DIGEST_CHARS = int(agentsdock_setting("HANDOFF_DIGEST_CHARS", "56000"))
@@ -593,7 +601,7 @@ PROVIDER_SECRET_ENV_NAMES = (
 SERVER_BIND_ADDRESS = agentsdock_setting("AGENT_BIND", "0.0.0.0")
 SERVER_PORT = int(agentsdock_setting("AGENT_PORT", "7850"))
 SERVER_INSTANCE_ID = uuid.uuid4().hex
-API_CONTRACT_VERSION = 14
+API_CONTRACT_VERSION = 15
 SESSION_ORDER_STEP = 1000.0
 SECURE_PEER_DELIVERY_PURPOSE = "secure_peer_handoff_delivery"
 CROSS_CHAT_DELIVERY_PURPOSES = {
@@ -3290,17 +3298,37 @@ class CreateSessionRequest(BaseModel):
 
 
 MAX_BULK_IMPORT_ITEMS = 25
+LOCAL_SESSION_IMPORT_LOCK = asyncio.Lock()
+PROVIDER_SESSION_IDENTIFIER_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
+)
 
 
 class BulkImportSessionItem(BaseModel):
-    provider_session_id: str
-    backend: str
-    cwd: str | None = None
-    title: str | None = None
+    provider_session_id: str = Field(min_length=1, max_length=256)
+    backend: Literal["claude", "codex"]
+    cwd: str | None = Field(default=None, max_length=MAX_WORKSPACE_PATH_CHARS)
+    title: str | None = Field(default=None, max_length=MAX_LOCAL_SESSION_LABEL_CHARS)
+
+    @field_validator("provider_session_id")
+    @classmethod
+    def validate_provider_session_id(cls, value: str) -> str:
+        clean = value.strip()
+        if not PROVIDER_SESSION_IDENTIFIER_RE.fullmatch(clean):
+            raise ValueError("provider_session_id is not a valid local session identifier")
+        return clean
+
+    @field_validator("cwd", "title")
+    @classmethod
+    def strip_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        clean = value.strip()
+        return clean or None
 
 
 class BulkImportSessionsRequest(BaseModel):
-    items: list[BulkImportSessionItem]
+    items: list[BulkImportSessionItem] = Field(max_length=MAX_BULK_IMPORT_ITEMS)
 
 
 class UpdateSessionRequest(BaseModel):
@@ -4454,10 +4482,36 @@ class SessionStore:
             except Exception as e:
                 logger.warning("failed to load sessions: %s", e)
                 self.sessions = {}
+        abandoned_imports = {
+            str(session_id): session
+            for session_id, session in self.sessions.items()
+            if isinstance(session, dict)
+            and session.get("_history_import_initializing")
+        }
+        for session_id in abandoned_imports:
+            # History import stages only local AgentsDock state. Never add its
+            # provider id to the abandoned-fork cleanup ledger: the source
+            # transcript belongs to Claude/Codex and must remain untouched.
+            self.sessions.pop(session_id, None)
+            with suppress(Exception):
+                await asyncio.to_thread(delete_session_owned_file_records, session_id)
+            with suppress(OSError):
+                shutil.rmtree(session_dir(session_id), ignore_errors=True)
+            with suppress(Exception):
+                await forget_event_seq(session_id)
+            HISTORY_SEARCH_DIRTY.add(session_id)
+        if abandoned_imports:
+            runtime_changed = True
+            logger.warning(
+                "removed abandoned staged history imports after restart count=%s",
+                len(abandoned_imports),
+            )
         abandoned_forks = {
             str(session_id): session
             for session_id, session in self.sessions.items()
-            if isinstance(session, dict) and session.get("_fork_initializing")
+            if isinstance(session, dict)
+            and session.get("_fork_initializing")
+            and not session.get("_history_import_initializing")
         }
         pending_provider_cleanup = read_abandoned_fork_thread_ids()
         durable_provider_cleanup = set(pending_provider_cleanup)
@@ -4655,6 +4709,7 @@ class SessionStore:
         *,
         parent_id: str | None = None,
         initializing_fork: bool = False,
+        initializing_import: bool = False,
     ) -> dict[str, Any]:
         backend = (req.backend or DEFAULT_BACKEND).lower()
         if backend not in VALID_BACKENDS:
@@ -4737,10 +4792,14 @@ class SessionStore:
             "created_at": now,
             "updated_at": now,
         }
-        if initializing_fork:
+        if initializing_fork or initializing_import:
             # Persist the staging marker so a server crash can discard this
-            # child instead of exposing a half-bound provider/history clone.
+            # session instead of exposing a half-written timeline.
             sess["_fork_initializing"] = True
+        if initializing_import:
+            # Distinguish local history imports from provider-created forks so
+            # startup cleanup never retires the source provider thread.
+            sess["_history_import_initializing"] = True
         sess["sort_order"] = self.top_order_for_section(session_section_key(sess))
         try:
             async with self._lock:
@@ -6046,6 +6105,7 @@ CODEX_APP_SERVER_THREAD_LRU: OrderedDict[str, float] = OrderedDict()
 CODEX_APP_SERVER_PINNED_THREADS: set[str] = set()
 CODEX_APP_SERVER_THREAD_PIN_COUNTS: dict[str, int] = {}
 CODEX_APP_SERVER_EVICTING_THREADS: dict[str, asyncio.Event] = {}
+CODEX_APP_SERVER_INVALIDATED_THREADS: set[str] = set()
 CODEX_APP_SERVER_THREAD_LRU_LOCK = asyncio.Lock()
 CODEX_THREAD_SESSION_INDEX: dict[str, str] = {}
 # A persisted thread goal belongs to the provider thread, while AgentsDock's
@@ -24998,7 +25058,7 @@ def message_text(message: Any) -> str:
     return text_from_content(message)
 
 
-def add_history_item(items: list[dict[str, str]], kind: str, text: str) -> None:
+def add_history_item(items: Any, kind: str, text: str) -> None:
     text = compact_import_text(text)
     if not text or (kind == "user" and is_import_boilerplate(text)):
         return
@@ -25014,14 +25074,111 @@ def tail_limit_items(items: list[dict[str, str]], limit: int | None) -> list[dic
     return items
 
 
-def path_if_jsonl(value: str) -> Path | None:
+def normalized_history_import_limit(limit: int | None) -> int:
+    configured = MAX_IMPORT_MESSAGES if MAX_IMPORT_MESSAGES > 0 else 400
+    requested = configured if limit is None or limit <= 0 else limit
+    return max(1, min(requested, configured, 2_000))
+
+
+def provider_session_identifier(value: Any) -> str | None:
+    clean = str(value or "").strip()
+    if not PROVIDER_SESSION_IDENTIFIER_RE.fullmatch(clean):
+        return None
+    return clean
+
+
+def contained_jsonl_path(path: Path, root: Path) -> Path | None:
+    """Resolve a regular transcript without permitting root escape or symlinks."""
+
+    try:
+        resolved_root = root.expanduser().resolve(strict=True)
+        expanded = path.expanduser()
+        if expanded.is_symlink():
+            return None
+        resolved = expanded.resolve(strict=True)
+        resolved.relative_to(resolved_root)
+        if resolved.suffix != ".jsonl" or not resolved.is_file():
+            return None
+        return resolved
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def bounded_jsonl_paths(root: Path) -> Iterator[Path]:
+    try:
+        resolved_root = root.expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        return
+    scanned = 0
+    pending = [resolved_root]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = os.scandir(directory)
+        except OSError:
+            continue
+        with entries:
+            for entry in entries:
+                scanned += 1
+                if scanned > MAX_LOCAL_SESSION_SCAN_FILES:
+                    logger.warning(
+                        "local session scan reached entry cap root=%s cap=%s",
+                        root,
+                        MAX_LOCAL_SESSION_SCAN_FILES,
+                    )
+                    return
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(Path(entry.path))
+                    elif (
+                        entry.name.endswith(".jsonl")
+                        and entry.is_file(follow_symlinks=False)
+                    ):
+                        path = contained_jsonl_path(Path(entry.path), resolved_root)
+                        if path is not None:
+                            yield path
+                except OSError:
+                    continue
+
+
+def bounded_jsonl_events(path: Path) -> Iterator[dict[str, Any]]:
+    """Parse a transcript with hard byte, line-size, and line-count bounds."""
+
+    size = path.stat().st_size
+    if size > MAX_LOCAL_TRANSCRIPT_BYTES:
+        raise ValueError(
+            f"transcript exceeds the {MAX_LOCAL_TRANSCRIPT_BYTES}-byte import limit"
+        )
+    consumed = 0
+    with path.open("rb") as stream:
+        for line_number in range(1, MAX_LOCAL_TRANSCRIPT_SCAN_LINES + 1):
+            raw_line = stream.readline(MAX_LOCAL_TRANSCRIPT_LINE_BYTES + 1)
+            if not raw_line:
+                return
+            consumed += len(raw_line)
+            if consumed > MAX_LOCAL_TRANSCRIPT_BYTES:
+                raise ValueError("transcript changed while it was being imported")
+            if len(raw_line) > MAX_LOCAL_TRANSCRIPT_LINE_BYTES:
+                raise ValueError(f"transcript line {line_number} exceeds the import limit")
+            if not raw_line.strip():
+                continue
+            try:
+                event = json.loads(raw_line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if isinstance(event, dict):
+                yield event
+        if stream.read(1):
+            raise ValueError(
+                f"transcript exceeds the {MAX_LOCAL_TRANSCRIPT_SCAN_LINES}-line import limit"
+            )
+
+
+def path_if_jsonl(value: str, root: Path) -> Path | None:
     raw = value.strip()
     if not raw:
         return None
-    candidate = Path(raw).expanduser()
-    if candidate.is_file() and candidate.suffix == ".jsonl":
-        return candidate
-    return None
+    return contained_jsonl_path(Path(raw), root)
 
 
 def find_claude_history(provider_id: str) -> Path | None:
@@ -25030,12 +25187,19 @@ def find_claude_history(provider_id: str) -> Path | None:
 
 
 def claude_history_candidates(provider_id: str) -> list[Path]:
-    direct = path_if_jsonl(provider_id)
+    direct = path_if_jsonl(provider_id, CLAUDE_PROJECTS_ROOT)
     if direct:
         return [direct]
+    clean_provider_id = provider_session_identifier(provider_id)
+    if clean_provider_id is None:
+        return []
     if not CLAUDE_PROJECTS_ROOT.exists():
         return []
-    matches = [p for p in CLAUDE_PROJECTS_ROOT.rglob("*.jsonl") if p.stem == provider_id]
+    matches = [
+        path
+        for path in bounded_jsonl_paths(CLAUDE_PROJECTS_ROOT)
+        if path.stem == clean_provider_id
+    ]
 
     def modified_at(path: Path) -> float:
         with suppress(OSError):
@@ -25052,29 +25216,47 @@ CLAUDE_TRANSCRIPT_CWD_LINE_BYTES = 4 * 1024 * 1024
 def bounded_claude_transcript_regions(path: Path) -> Iterator[bytes]:
     """Yield complete JSONL regions near both ends without loading a huge transcript."""
 
+    regions: list[bytes] = []
     try:
         size = path.stat().st_size
+        window = max(1, int(CLAUDE_TRANSCRIPT_CWD_SCAN_BYTES))
         with path.open("rb") as handle:
-            prefix = handle.read(CLAUDE_TRANSCRIPT_CWD_SCAN_BYTES)
+            prefix = handle.read(window)
+            # A short read means the transcript was truncated after stat; a
+            # longer read when the original file fit in the window means it
+            # grew. Do not combine regions from different file snapshots.
+            if len(prefix) != min(size, window):
+                return
             if size > len(prefix) and not prefix.endswith(b"\n"):
                 prefix = prefix.rsplit(b"\n", 1)[0] if b"\n" in prefix else b""
             if prefix:
-                yield prefix
+                regions.append(prefix)
 
-            if size <= CLAUDE_TRANSCRIPT_CWD_SCAN_BYTES:
-                return
-            start = max(0, size - CLAUDE_TRANSCRIPT_CWD_SCAN_BYTES)
-            handle.seek(max(0, start - 1))
-            suffix = handle.read()
+            start = 0
+            if size > window:
+                start = max(0, size - window)
+                read_offset = max(0, start - 1)
+                read_size = size - read_offset
+                handle.seek(read_offset)
+                # Read only the intended suffix window plus its boundary byte
+                # and one sentinel. A sentinel byte means the file grew after
+                # stat; a short read means it shrank. Either case fails closed
+                # without ever reading to EOF.
+                suffix = handle.read(read_size + 1)
+                if len(suffix) != read_size:
+                    return
+            else:
+                suffix = b""
             if start > 0:
                 previous = suffix[:1]
                 suffix = suffix[1:]
                 if previous != b"\n":
                     suffix = suffix.split(b"\n", 1)[1] if b"\n" in suffix else b""
             if suffix:
-                yield suffix
+                regions.append(suffix)
     except OSError:
         return
+    yield from regions
 
 
 def claude_transcript_matches_cwd(path: Path, cwd: str) -> bool:
@@ -25225,42 +25407,41 @@ def validated_claude_fork_provider_id(
 
 
 def find_codex_history(provider_id: str) -> Path | None:
-    direct = path_if_jsonl(provider_id)
+    direct = path_if_jsonl(provider_id, CODEX_SESSIONS_ROOT)
     if direct:
         return direct
+    clean_provider_id = provider_session_identifier(provider_id)
+    if clean_provider_id is None:
+        return None
     if not CODEX_SESSIONS_ROOT.exists():
         return None
-    name_matches = [p for p in CODEX_SESSIONS_ROOT.rglob("*.jsonl") if provider_id in p.name]
-    if name_matches:
-        return max(name_matches, key=lambda p: p.stat().st_mtime)
-    for path in sorted(CODEX_SESSIONS_ROOT.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True):
-        with suppress(Exception):
-            with path.open("r", encoding="utf-8", errors="ignore") as stream:
-                first = stream.readline()
-            meta = json.loads(first)
-            if meta.get("type") == "session_meta" and meta.get("payload", {}).get("id") == provider_id:
-                return path
-    return None
+    selected: Path | None = None
+    selected_mtime = -1.0
+    for path in bounded_jsonl_paths(CODEX_SESSIONS_ROOT):
+        transcript_id, _cwd = codex_transcript_meta(path)
+        if transcript_id != clean_provider_id:
+            continue
+        with suppress(OSError):
+            mtime = path.stat().st_mtime
+            if mtime > selected_mtime:
+                selected = path
+                selected_mtime = mtime
+    return selected
 
 
 def parse_claude_history(path: Path, limit: int | None) -> list[dict[str, str]]:
-    items: list[dict[str, str]] = []
-    with path.open("r", encoding="utf-8", errors="ignore") as stream:
-        for line in stream:
-            if not line.strip():
-                continue
-            with suppress(Exception):
-                event = json.loads(line)
-                event_type = event.get("type")
-                if event_type == "user":
-                    add_history_item(
-                        items,
-                        "user",
-                        strip_agentsdock_generated_user_text(message_text(event.get("message"))),
-                    )
-                elif event_type == "assistant":
-                    add_history_item(items, "assistant", message_text(event.get("message")))
-    return tail_limit_items(items, limit)
+    items: deque[dict[str, str]] = deque(maxlen=normalized_history_import_limit(limit))
+    for event in bounded_jsonl_events(path):
+        event_type = event.get("type")
+        if event_type == "user":
+            add_history_item(
+                items,
+                "user",
+                strip_agentsdock_generated_user_text(message_text(event.get("message"))),
+            )
+        elif event_type == "assistant":
+            add_history_item(items, "assistant", message_text(event.get("message")))
+    return list(items)
 
 
 def strip_agentsdock_provider_context(text: str) -> str:
@@ -25353,36 +25534,31 @@ def strip_agentsdock_generated_user_text(text: str) -> str:
 
 
 def parse_codex_history(path: Path, limit: int | None) -> list[dict[str, str]]:
-    items: list[dict[str, str]] = []
-    with path.open("r", encoding="utf-8", errors="ignore") as stream:
-        for line in stream:
-            if not line.strip():
-                continue
-            with suppress(Exception):
-                event = json.loads(line)
-                event_type = event.get("type")
-                payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-                if event_type == "event_msg":
-                    payload_type = payload.get("type")
-                    if payload_type == "user_message":
-                        add_history_item(
-                            items,
-                            "user",
-                            strip_agentsdock_generated_user_text(str(payload.get("message") or "")),
-                        )
-                    elif payload_type == "agent_message":
-                        add_history_item(items, "assistant", str(payload.get("message") or ""))
-                elif event_type == "response_item" and payload.get("type") == "message":
-                    role = payload.get("role")
-                    if role == "user":
-                        add_history_item(
-                            items,
-                            "user",
-                            strip_agentsdock_generated_user_text(text_from_content(payload.get("content"))),
-                        )
-                    elif role == "assistant":
-                        add_history_item(items, "assistant", text_from_content(payload.get("content")))
-    return tail_limit_items(items, limit)
+    items: deque[dict[str, str]] = deque(maxlen=normalized_history_import_limit(limit))
+    for event in bounded_jsonl_events(path):
+        event_type = event.get("type")
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        if event_type == "event_msg":
+            payload_type = payload.get("type")
+            if payload_type == "user_message":
+                add_history_item(
+                    items,
+                    "user",
+                    strip_agentsdock_generated_user_text(str(payload.get("message") or "")),
+                )
+            elif payload_type == "agent_message":
+                add_history_item(items, "assistant", str(payload.get("message") or ""))
+        elif event_type == "response_item" and payload.get("type") == "message":
+            role = payload.get("role")
+            if role == "user":
+                add_history_item(
+                    items,
+                    "user",
+                    strip_agentsdock_generated_user_text(text_from_content(payload.get("content"))),
+                )
+            elif role == "assistant":
+                add_history_item(items, "assistant", text_from_content(payload.get("content")))
+    return list(items)
 
 
 def session_provider_id(sess: dict[str, Any]) -> str | None:
@@ -25394,29 +25570,51 @@ def session_provider_id(sess: dict[str, Any]) -> str | None:
     return sess.get("session_id")
 
 
+def normalized_local_session_cwd(value: Any) -> str | None:
+    clean = str(value or "").strip()
+    if not clean or len(clean) > MAX_WORKSPACE_PATH_CHARS:
+        return None
+    candidate = Path(clean).expanduser()
+    if not candidate.is_absolute():
+        return None
+    return os.path.normpath(str(candidate))
+
+
+def local_session_label(value: Any, fallback: str) -> str:
+    clean = compact_import_text(str(value or "")).strip()
+    return (clean or fallback)[:MAX_LOCAL_SESSION_LABEL_CHARS]
+
+
 def local_claude_session_candidates(known_provider_ids: set[str]) -> list[dict[str, Any]]:
     if not CLAUDE_PROJECTS_ROOT.exists():
         return []
     candidates: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
-    for path in CLAUDE_PROJECTS_ROOT.rglob("*.jsonl"):
-        provider_id = path.stem
-        if not provider_id or provider_id in seen_ids or provider_id in known_provider_ids:
+    newest_paths: dict[str, tuple[float, Path]] = {}
+    for path in bounded_jsonl_paths(CLAUDE_PROJECTS_ROOT):
+        provider_id = provider_session_identifier(path.stem)
+        if not provider_id or provider_id in known_provider_ids:
             continue
-        seen_ids.add(provider_id)
         with suppress(OSError):
             mtime = path.stat().st_mtime
-            cwd = claude_transcript_cwd(path)
-            preview = claude_transcript_preview(path)
-            folder_display = Path(cwd).name if cwd else path.parent.name
-            label = f"{folder_display}: {preview}" if preview else (folder_display or f"Claude chat {provider_id[:8]}")
-            candidates.append({
-                "provider_session_id": provider_id,
-                "backend": BACKEND_CLAUDE,
-                "label": label,
-                "updated_at": iso_from_timestamp(mtime),
-                "cwd": cwd,
-            })
+            previous = newest_paths.get(provider_id)
+            if previous is None or mtime > previous[0]:
+                newest_paths[provider_id] = (mtime, path)
+    for provider_id, (mtime, path) in newest_paths.items():
+        cwd = normalized_local_session_cwd(claude_transcript_cwd(path))
+        preview = claude_transcript_preview(path)
+        folder_display = Path(cwd).name if cwd else path.parent.name
+        fallback = folder_display or f"Claude chat {provider_id[:8]}"
+        label = local_session_label(
+            f"{folder_display}: {preview}" if preview else fallback,
+            fallback,
+        )
+        candidates.append({
+            "provider_session_id": provider_id,
+            "backend": BACKEND_CLAUDE,
+            "label": label,
+            "updated_at": iso_from_timestamp(mtime),
+            "cwd": cwd,
+        })
     return candidates
 
 
@@ -25425,55 +25623,39 @@ CODEX_TRANSCRIPT_SCAN_LINES = 200
 
 def codex_transcript_meta(path: Path) -> tuple[str | None, str | None]:
     """Return (session_id, cwd) from a Codex transcript's session_meta record."""
-    with suppress(OSError):
-        with path.open("r", encoding="utf-8", errors="ignore") as stream:
-            for _ in range(CODEX_TRANSCRIPT_SCAN_LINES):
-                line = stream.readline()
-                if not line:
-                    break
-                if not line.strip():
-                    continue
-                try:
-                    event = json.loads(line)
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    continue
-                if not isinstance(event, dict) or event.get("type") != "session_meta":
-                    continue
-                payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-                session_id = payload.get("id") or payload.get("session_id")
-                cwd = payload.get("cwd")
-                return (str(session_id) if session_id else None, str(cwd) if cwd else None)
+    with suppress(OSError, ValueError):
+        for index, event in enumerate(bounded_jsonl_events(path)):
+            if index >= CODEX_TRANSCRIPT_SCAN_LINES:
+                break
+            if event.get("type") != "session_meta":
+                continue
+            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            session_id = provider_session_identifier(
+                payload.get("id") or payload.get("session_id")
+            )
+            cwd = normalized_local_session_cwd(payload.get("cwd"))
+            return session_id, cwd
     return None, None
 
 
 def codex_transcript_preview(path: Path) -> str | None:
     """Return a short snippet of the first user message, for a local-session label."""
-    with suppress(OSError):
-        with path.open("r", encoding="utf-8", errors="ignore") as stream:
-            for _ in range(CODEX_TRANSCRIPT_SCAN_LINES):
-                line = stream.readline()
-                if not line:
-                    break
-                if not line.strip():
-                    continue
-                try:
-                    event = json.loads(line)
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    continue
-                if not isinstance(event, dict):
-                    continue
-                event_type = event.get("type")
-                payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-                text: str | None = None
-                if event_type == "event_msg" and payload.get("type") == "user_message":
-                    text = str(payload.get("message") or "")
-                elif event_type == "response_item" and payload.get("type") == "message" and payload.get("role") == "user":
-                    text = text_from_content(payload.get("content"))
-                if not text:
-                    continue
-                text = compact_import_text(strip_agentsdock_generated_user_text(text))
-                if text and not is_import_boilerplate(text):
-                    return text[:160]
+    with suppress(OSError, ValueError):
+        for index, event in enumerate(bounded_jsonl_events(path)):
+            if index >= CODEX_TRANSCRIPT_SCAN_LINES:
+                break
+            event_type = event.get("type")
+            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            text: str | None = None
+            if event_type == "event_msg" and payload.get("type") == "user_message":
+                text = str(payload.get("message") or "")
+            elif event_type == "response_item" and payload.get("type") == "message" and payload.get("role") == "user":
+                text = text_from_content(payload.get("content"))
+            if not text:
+                continue
+            text = compact_import_text(strip_agentsdock_generated_user_text(text))
+            if text and not is_import_boilerplate(text):
+                return text[:160]
     return None
 
 
@@ -25488,19 +25670,25 @@ def codex_session_index_thread_names() -> dict[str, str]:
     if not CODEX_SESSION_INDEX_PATH.exists():
         return names
     with suppress(OSError):
-        with CODEX_SESSION_INDEX_PATH.open("r", encoding="utf-8", errors="ignore") as stream:
-            for line in stream:
-                line = line.strip()
-                if not line:
+        if CODEX_SESSION_INDEX_PATH.stat().st_size > MAX_CODEX_SESSION_INDEX_BYTES:
+            return names
+        with CODEX_SESSION_INDEX_PATH.open("rb") as stream:
+            for _index in range(MAX_CODEX_SESSION_INDEX_LINES):
+                raw_line = stream.readline(MAX_LOCAL_TRANSCRIPT_LINE_BYTES + 1)
+                if not raw_line:
+                    break
+                if len(raw_line) > MAX_LOCAL_TRANSCRIPT_LINE_BYTES:
+                    continue
+                if not raw_line.strip():
                     continue
                 try:
-                    entry = json.loads(line)
+                    entry = json.loads(raw_line)
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     continue
                 if not isinstance(entry, dict):
                     continue
-                provider_id = str(entry.get("id") or "").strip()
-                thread_name = str(entry.get("thread_name") or "").strip()
+                provider_id = provider_session_identifier(entry.get("id"))
+                thread_name = local_session_label(entry.get("thread_name"), "")
                 if provider_id and thread_name:
                     names[provider_id] = thread_name
     return names
@@ -25511,41 +25699,64 @@ def local_codex_session_candidates(known_provider_ids: set[str]) -> list[dict[st
         return []
     thread_names = codex_session_index_thread_names()
     candidates: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
-    for path in CODEX_SESSIONS_ROOT.rglob("*.jsonl"):
+    newest_paths: dict[str, tuple[float, Path, str | None]] = {}
+    for path in bounded_jsonl_paths(CODEX_SESSIONS_ROOT):
         provider_id, cwd = codex_transcript_meta(path)
-        if not provider_id or provider_id in seen_ids or provider_id in known_provider_ids:
+        if not provider_id or provider_id in known_provider_ids:
             continue
-        seen_ids.add(provider_id)
         with suppress(OSError):
             mtime = path.stat().st_mtime
-            label = thread_names.get(provider_id)
-            if not label:
-                preview = codex_transcript_preview(path)
-                folder_display = Path(cwd).name if cwd else path.stem
-                label = f"{folder_display}: {preview}" if preview else (folder_display or f"Codex chat {provider_id[:8]}")
-            candidates.append({
-                "provider_session_id": provider_id,
-                "backend": BACKEND_CODEX,
-                "label": label,
-                "updated_at": iso_from_timestamp(mtime),
-                "cwd": cwd,
-            })
+            previous = newest_paths.get(provider_id)
+            if previous is None or mtime > previous[0]:
+                newest_paths[provider_id] = (mtime, path, cwd)
+    for provider_id, (mtime, path, cwd) in newest_paths.items():
+        label = thread_names.get(provider_id)
+        if not label:
+            preview = codex_transcript_preview(path)
+            folder_display = Path(cwd).name if cwd else path.stem
+            fallback = folder_display or f"Codex chat {provider_id[:8]}"
+            label = f"{folder_display}: {preview}" if preview else fallback
+        candidates.append({
+            "provider_session_id": provider_id,
+            "backend": BACKEND_CODEX,
+            "label": local_session_label(label, f"Codex chat {provider_id[:8]}"),
+            "updated_at": iso_from_timestamp(mtime),
+            "cwd": cwd,
+        })
     return candidates
 
 
-def local_session_candidates(limit: int) -> list[dict[str, Any]]:
+def local_session_candidates(
+    limit: int,
+    known_provider_keys: set[tuple[str, str]] | None = None,
+) -> list[dict[str, Any]]:
     """Enumerate local Claude/Codex sessions not already imported into AgentsDock."""
 
-    known_provider_ids = {
-        pid for pid in (session_provider_id(sess) for sess in STORE.sessions.values()) if pid
+    if known_provider_keys is None:
+        known_provider_keys = {
+            (
+                str(sess.get("backend") or DEFAULT_BACKEND).strip().lower(),
+                str(pid),
+            )
+            for sess in STORE.sessions.values()
+            if (pid := session_provider_id(sess))
+        }
+    claude_known = {
+        provider_id
+        for backend, provider_id in known_provider_keys
+        if backend == BACKEND_CLAUDE
+    }
+    codex_known = {
+        provider_id
+        for backend, provider_id in known_provider_keys
+        if backend == BACKEND_CODEX
     }
     candidates = [
-        *local_claude_session_candidates(known_provider_ids),
-        *local_codex_session_candidates(known_provider_ids),
+        *local_claude_session_candidates(claude_known),
+        *local_codex_session_candidates(codex_known),
     ]
     candidates.sort(key=lambda c: c["updated_at"], reverse=True)
-    return candidates[:limit]
+    return candidates[:max(1, min(limit, MAX_LOCAL_SESSION_LIST_ITEMS))]
 
 
 def standalone_provider_session(sess: dict[str, Any]) -> dict[str, Any]:
@@ -25597,6 +25808,91 @@ def provider_history(sess: dict[str, Any], limit: int | None) -> tuple[Path | No
     return None, []
 
 
+async def append_imported_history(
+    sess: dict[str, Any],
+    source_path: Path,
+    items: list[dict[str, str]],
+) -> dict[str, Any]:
+    session_id = str(sess["id"])
+    provider_id = str(session_provider_id(sess) or "")
+    backend = str(sess.get("backend") or DEFAULT_BACKEND).lower()
+    run_id = f"import_{uuid.uuid4().hex[:12]}"
+    message = f"Imported {len(items)} rough messages from {backend} history."
+    imported_events: list[tuple[str, dict[str, Any]]] = [("history_imported", {
+        "run_id": run_id,
+        "backend": backend,
+        "provider_session_id": provider_id,
+        "source_path": str(source_path),
+        "message": message,
+    })]
+    for item in items:
+        if item["kind"] == "user":
+            imported_events.append(("turn_started", {
+                "run_id": run_id,
+                "backend": backend,
+                "prompt": item["text"],
+                "imported": True,
+            }))
+        elif item["kind"] == "assistant":
+            imported_events.append(("assistant_text", {
+                "run_id": run_id,
+                "backend": backend,
+                "text": item["text"],
+                "imported": True,
+            }))
+    for event_type, payload in imported_events:
+        await append_event(session_id, event_type, payload)
+    return {
+        "imported": len(items),
+        "source_path": str(source_path),
+        "message": message,
+    }
+
+
+async def append_staged_imported_history(
+    sess: dict[str, Any],
+    source_path: Path,
+    items: list[dict[str, str]],
+) -> dict[str, Any]:
+    """Append one hidden import as an fsynced, rollback-capable batch."""
+
+    session_id = str(sess["id"])
+    provider_id = str(session_provider_id(sess) or "")
+    backend = str(sess.get("backend") or DEFAULT_BACKEND).lower()
+    run_id = f"import_{uuid.uuid4().hex[:12]}"
+    message = f"Imported {len(items)} rough messages from {backend} history."
+    imported_events: list[tuple[str, dict[str, Any]]] = [("history_imported", {
+        "run_id": run_id,
+        "backend": backend,
+        "provider_session_id": provider_id,
+        "source_path": str(source_path),
+        "message": message,
+    })]
+    for item in items:
+        if item["kind"] == "user":
+            imported_events.append(("turn_started", {
+                "run_id": run_id,
+                "backend": backend,
+                "prompt": item["text"],
+                "imported": True,
+            }))
+        elif item["kind"] == "assistant":
+            imported_events.append(("assistant_text", {
+                "run_id": run_id,
+                "backend": backend,
+                "text": item["text"],
+                "imported": True,
+            }))
+    written = await append_imported_events(session_id, imported_events)
+    if written != len(imported_events):
+        raise RuntimeError("history event batch was not fully persisted")
+    return {
+        "imported": len(items),
+        "source_path": str(source_path),
+        "message": message,
+    }
+
+
 async def import_session_history(sess: dict[str, Any], *, force: bool = False, limit: int | None = None) -> dict[str, Any]:
     session_id = sess["id"]
     provider_id = session_provider_id(sess)
@@ -25607,10 +25903,10 @@ async def import_session_history(sess: dict[str, Any], *, force: bool = False, l
         return {"imported": 0, "source_path": None, "message": "History already imported."}
 
     try:
-        source_path, items = provider_history(sess, limit)
+        source_path, items = await asyncio.to_thread(provider_history, sess, limit)
     except Exception as e:
         logger.warning("history import failed session=%s provider=%s: %s", session_id, provider_id, e)
-        message = f"History import failed: {e}"
+        message = f"History import failed: {concise_error_message(e)}"
         await append_event(session_id, "history_imported", {
             "backend": backend,
             "provider_session_id": provider_id,
@@ -25637,31 +25933,7 @@ async def import_session_history(sess: dict[str, Any], *, force: bool = False, l
         })
         return {"imported": 0, "source_path": str(source_path), "message": message}
 
-    run_id = f"import_{uuid.uuid4().hex[:12]}"
-    message = f"Imported {len(items)} rough messages from {backend} history."
-    await append_event(session_id, "history_imported", {
-        "run_id": run_id,
-        "backend": backend,
-        "provider_session_id": provider_id,
-        "source_path": str(source_path),
-        "message": message,
-    })
-    for item in items:
-        if item["kind"] == "user":
-            await append_event(session_id, "turn_started", {
-                "run_id": run_id,
-                "backend": backend,
-                "prompt": item["text"],
-                "imported": True,
-            })
-        elif item["kind"] == "assistant":
-            await append_event(session_id, "assistant_text", {
-                "run_id": run_id,
-                "backend": backend,
-                "text": item["text"],
-                "imported": True,
-            })
-    return {"imported": len(items), "source_path": str(source_path), "message": message}
+    return await append_imported_history(sess, source_path, items)
 
 
 FORK_HISTORY_EVENT_TYPES = {
@@ -29466,6 +29738,7 @@ async def close_codex_app_server_manager() -> None:
         CODEX_APP_SERVER_THREAD_LRU.clear()
         CODEX_APP_SERVER_PINNED_THREADS.clear()
         CODEX_APP_SERVER_THREAD_PIN_COUNTS.clear()
+        CODEX_APP_SERVER_INVALIDATED_THREADS.clear()
     if manager is not None:
         await manager.close()
     shutdown_tasks = [
@@ -29498,6 +29771,7 @@ async def close_codex_app_server_manager() -> None:
         CODEX_APP_SERVER_THREAD_LRU.clear()
         CODEX_APP_SERVER_PINNED_THREADS.clear()
         CODEX_APP_SERVER_THREAD_PIN_COUNTS.clear()
+        CODEX_APP_SERVER_INVALIDATED_THREADS.clear()
     CODEX_APPROVAL_ITEM_CACHE.clear()
     CODEX_INTERACTIVE_CONTROL_THREADS.clear()
     CODEX_INTERACTIVE_CONTROL_THREAD_COUNTS.clear()
@@ -29626,7 +29900,7 @@ async def acquire_codex_control_thread(
                     detail="wait for the active Codex thread to finish loading",
                 )
             thread_id = active_thread_id
-            await pin_codex_app_server_thread(thread_id)
+            await pin_codex_app_server_thread(thread_id, manager)
             thread_pinned = True
             acquire_codex_interactive_control_lease(thread_id)
             control_lease_acquired = True
@@ -30374,19 +30648,49 @@ async def consume_codex_native_turn(
                 )
 
 
-async def pin_codex_app_server_thread(thread_id: str) -> None:
+def invalidated_codex_thread_error(thread_id: str) -> CodexAppServerError:
+    return CodexAppServerError(
+        (
+            "the cached Codex thread is being refreshed after a provider "
+            f"account change ({thread_id})"
+        ),
+        request_sent=False,
+        safe_to_retry=True,
+    )
+
+
+async def pin_codex_app_server_thread(
+    thread_id: str,
+    manager: CodexAppServerManager | None = None,
+) -> None:
     if not thread_id:
         return
     while True:
+        retire_invalidated = False
         async with CODEX_APP_SERVER_THREAD_LRU_LOCK:
             eviction = CODEX_APP_SERVER_EVICTING_THREADS.get(thread_id)
-            if eviction is None:
+            if eviction is not None:
+                wait_for_eviction = eviction
+            elif thread_id in CODEX_APP_SERVER_INVALIDATED_THREADS:
+                wait_for_eviction = None
+                if CODEX_APP_SERVER_THREAD_PIN_COUNTS.get(thread_id, 0) > 0:
+                    raise invalidated_codex_thread_error(thread_id)
+                retire_invalidated = True
+            else:
                 CODEX_APP_SERVER_THREAD_PIN_COUNTS[thread_id] = (
                     CODEX_APP_SERVER_THREAD_PIN_COUNTS.get(thread_id, 0) + 1
                 )
                 CODEX_APP_SERVER_PINNED_THREADS.add(thread_id)
                 return
-        await eviction.wait()
+        if wait_for_eviction is not None:
+            await wait_for_eviction.wait()
+            continue
+        if retire_invalidated:
+            if manager is None or not await retire_invalidated_codex_app_server_thread(
+                manager,
+                thread_id,
+            ):
+                raise invalidated_codex_thread_error(thread_id)
 
 
 async def evict_codex_app_server_thread(
@@ -30407,6 +30711,7 @@ async def evict_codex_app_server_thread(
                 wait_for_existing = None
                 if (
                     thread_id in CODEX_APP_SERVER_PINNED_THREADS
+                    or thread_id in CODEX_INTERACTIVE_CONTROL_THREADS
                     or manager.active_turn(thread_id) is not None
                     or not manager.is_thread_loaded(thread_id)
                 ):
@@ -30438,19 +30743,60 @@ async def evict_codex_app_server_thread(
             eviction.set()
 
 
+async def retire_invalidated_codex_app_server_thread(
+    manager: CodexAppServerManager,
+    thread_id: str,
+) -> bool:
+    """Unload an invalidated subscription, preserving the fence on failure."""
+
+    try:
+        evicted = await evict_codex_app_server_thread(
+            manager,
+            thread_id,
+            reinsert_on_failure=False,
+        )
+    except Exception as exc:
+        logger.warning(
+            "failed to retire invalidated Codex thread=%s: %s",
+            thread_id,
+            concise_error_message(exc),
+        )
+        evicted = False
+    unloaded = evicted or not manager.is_thread_loaded(thread_id)
+    if unloaded:
+        async with CODEX_APP_SERVER_THREAD_LRU_LOCK:
+            if CODEX_APP_SERVER_THREAD_PIN_COUNTS.get(thread_id, 0) == 0:
+                CODEX_APP_SERVER_INVALIDATED_THREADS.discard(thread_id)
+    return unloaded
+
+
 async def unpin_codex_app_server_thread(
     manager: CodexAppServerManager,
     thread_id: str,
+    *,
+    invalidate_loaded_thread: bool = False,
 ) -> None:
+    """Release exactly the caller's pin and defer invalidation until safe."""
+
     if not thread_id:
         return
     async with CODEX_APP_SERVER_THREAD_LRU_LOCK:
         count = CODEX_APP_SERVER_THREAD_PIN_COUNTS.get(thread_id, 0)
-        if count > 1:
-            CODEX_APP_SERVER_THREAD_PIN_COUNTS[thread_id] = count - 1
+        if count <= 0:
+            return
+        if invalidate_loaded_thread:
+            CODEX_APP_SERVER_INVALIDATED_THREADS.add(thread_id)
+            CODEX_APP_SERVER_THREAD_LRU.pop(thread_id, None)
+        remaining = count - 1
+        if remaining > 0:
+            CODEX_APP_SERVER_THREAD_PIN_COUNTS[thread_id] = remaining
             return
         CODEX_APP_SERVER_THREAD_PIN_COUNTS.pop(thread_id, None)
         CODEX_APP_SERVER_PINNED_THREADS.discard(thread_id)
+        must_retire = thread_id in CODEX_APP_SERVER_INVALIDATED_THREADS
+    if must_retire:
+        await retire_invalidated_codex_app_server_thread(manager, thread_id)
+        return
     retained = any(
         str(session_provider_id(session) or "") == thread_id
         for session in STORE.sessions.values()
@@ -30475,6 +30821,9 @@ async def touch_codex_app_server_thread(
     if not thread_id:
         return
     async with CODEX_APP_SERVER_THREAD_LRU_LOCK:
+        if thread_id in CODEX_APP_SERVER_INVALIDATED_THREADS:
+            CODEX_APP_SERVER_THREAD_LRU.pop(thread_id, None)
+            return
         CODEX_APP_SERVER_THREAD_LRU.pop(thread_id, None)
         CODEX_APP_SERVER_THREAD_LRU[thread_id] = time.monotonic()
         candidates = [
@@ -30890,6 +31239,21 @@ def codex_default_service_tier(model: str) -> str:
     return CODEX_FALLBACK_SERVICE_TIERS.get(str(model or "").strip(), "")
 
 
+# The Codex app-server's thread/start and turn-override JSON-RPC params only
+# accept a narrower serviceTier enum ("fast"/"flex") than the canonical
+# service_tier values used for `codex exec` CLI config overrides (see
+# docs/DEV_LOG.md "GPT-5.6 Priority Tier Root Cause": "fast" is the documented
+# user-facing alias for the canonical "priority" tier). Translate at this
+# boundary only; the CLI-facing `-c service_tier=...` invocations keep using
+# the canonical value, which is already validated to work there.
+CODEX_APP_SERVER_SERVICE_TIER_ALIASES = {"priority": "fast"}
+
+
+def codex_app_server_service_tier(service_tier: str) -> str:
+    clean = str(service_tier or "").strip()
+    return CODEX_APP_SERVER_SERVICE_TIER_ALIASES.get(clean, clean)
+
+
 def discovered_codex_default_model(models: list[dict[str, Any]], preferred_slug: str = "") -> dict[str, Any] | None:
     if preferred_slug:
         for model in models:
@@ -31262,7 +31626,7 @@ def codex_thread_params(
     if model:
         params["model"] = model
     if service_tier:
-        params["serviceTier"] = service_tier
+        params["serviceTier"] = codex_app_server_service_tier(service_tier)
     return params
 
 
@@ -31579,7 +31943,7 @@ async def ensure_codex_app_server_thread(
     pinned = False
     try:
         if provider_id:
-            await pin_codex_app_server_thread(provider_id)
+            await pin_codex_app_server_thread(provider_id, manager)
             pinned = True
         already_loaded = bool(
             provider_id and manager.is_thread_loaded(provider_id)
@@ -31597,7 +31961,7 @@ async def ensure_codex_app_server_thread(
                     "serviceName": "AgentsDock",
                 }
             )
-            await pin_codex_app_server_thread(provider_id)
+            await pin_codex_app_server_thread(provider_id, manager)
             pinned = True
         elif already_loaded and policy_changed:
             # A loaded thread keeps its native thread settings. Reload it with
@@ -31743,7 +32107,7 @@ async def acquire_codex_run_thread(
             sess,
             cwd,
         )
-        await pin_codex_app_server_thread(provider_id)
+        await pin_codex_app_server_thread(provider_id, manager)
         return provider_id
     ensure_kwargs: dict[str, Any] = {}
     if expected_run_id is not None:
@@ -32453,7 +32817,7 @@ async def bind_forked_codex_thread(
     manager = await codex_app_server_manager()
     instructions = codex_thread_instructions(session_id, sess)
     instruction_hash = codex_thread_instruction_hash(session_id, sess)
-    await pin_codex_app_server_thread(thread_id)
+    await pin_codex_app_server_thread(thread_id, manager)
     bound_thread_id = thread_id
     try:
         if manager.is_thread_loaded(thread_id):
@@ -32556,6 +32920,7 @@ async def retire_failed_codex_fork(thread_id: str) -> bool:
         CODEX_APP_SERVER_THREAD_LRU.pop(clean_thread_id, None)
         CODEX_APP_SERVER_THREAD_PIN_COUNTS.pop(clean_thread_id, None)
         CODEX_APP_SERVER_PINNED_THREADS.discard(clean_thread_id)
+        CODEX_APP_SERVER_INVALIDATED_THREADS.discard(clean_thread_id)
     return deleted
 
 
@@ -34726,14 +35091,24 @@ async def run_claude_sdk(
         )
         return
     except Exception as exc:
+        startup_ownership_token = str(
+            startup_active.get("claude_sdk_owner_token") or ""
+        )
+        if startup_ownership_token and await turn_slot_is_owned(
+            session_id,
+            run_id,
+        ):
+            await evict_claude_sdk_chat(
+                session_id,
+                force=True,
+                manager=manager,
+                ownership_token=startup_ownership_token,
+            )
         await finish_claude_sdk_start_failure(
             session_id,
             run_id,
             f"Claude SDK could not start: {concise_error_message(exc)}",
-            ownership_token=(
-                str(startup_active.get("claude_sdk_owner_token") or "")
-                or None
-            ),
+            ownership_token=startup_ownership_token or None,
         )
         return
 
@@ -36643,6 +37018,7 @@ async def run_codex_app_server(
     thread_pinned = False
     turn = None
     turn_start_attempted = False
+    explicit_pre_accept_rejection = False
     ambiguous_turn_start = False
     ambiguous_accept_deadline = 0.0
     ambiguous_reconcile_at = 0.0
@@ -37970,7 +38346,7 @@ async def run_codex_app_server(
                 if effort:
                     overrides["effort"] = effort
                 if service_tier:
-                    overrides["serviceTier"] = service_tier
+                    overrides["serviceTier"] = codex_app_server_service_tier(service_tier)
 
                 turn_start_attempted = True
                 turn_start_epoch = time.time()
@@ -37983,6 +38359,10 @@ async def run_codex_app_server(
                 except CodexAppServerError as exc:
                     pending_turn = getattr(exc, "pending_turn", None)
                     if pending_turn is None:
+                        explicit_pre_accept_rejection = (
+                            isinstance(exc, CodexAppServerRequestError)
+                            and bool(getattr(exc, "safe_to_retry", False))
+                        )
                         raise
                     # Delivery is ambiguous. Observe the routed provisional
                     # handle and never replay the user input through exec.
@@ -38189,18 +38569,32 @@ async def run_codex_app_server(
             current_run_id in STOPPED_RUNS
             or planned_transport_shutdown
         )
-        safe_rejection = isinstance(exc, CodexAppServerRequestError)
+        if (
+            explicit_pre_accept_rejection
+            and thread_pinned
+            and provider_id
+        ):
+            # An explicit turn/start rejection proves the provider accepted no
+            # user input. Retire the cached subscription even when exec replay
+            # is disabled (for example, interactive_v1). This releases only
+            # this runner's pin; concurrent owners remain fenced.
+            await unpin_codex_app_server_thread(
+                manager,
+                provider_id,
+                invalidate_loaded_thread=True,
+            )
+            thread_pinned = False
         can_fallback = (
             allow_exec_fallback
             and not stop_requested
-            and (not turn_start_attempted or safe_rejection)
+            and (
+                not turn_start_attempted
+                or explicit_pre_accept_rejection
+            )
         )
         if can_fallback:
             if turn is not None:
                 await turn.close()
-            if thread_pinned and provider_id:
-                await unpin_codex_app_server_thread(manager, provider_id)
-                thread_pinned = False
             cleared = await clear_active_process(
                 session_id,
                 expected_run_id=current_run_id,
@@ -41603,6 +41997,15 @@ async def health() -> dict[str, Any]:
         ),
         "capabilities": {
             "team_hub_v1": current_team_hub_capability(),
+            "local_session_import_v1": {
+                "available": True,
+                "required": False,
+                "message": "Bounded local Claude and Codex session import is available.",
+                "action": None,
+                "version": 1,
+                "max_batch_items": MAX_BULK_IMPORT_ITEMS,
+                "max_list_items": MAX_LOCAL_SESSION_LIST_ITEMS,
+            },
             "secure_peer_v1": {
                 "available": bool(AGENT_TOKEN),
                 "state_available": SECURE_PEER_RUNTIME.state_available(),
@@ -43076,12 +43479,65 @@ async def create_session(req: CreateSessionRequest) -> dict[str, Any]:
 
 @app.get("/api/local-sessions")
 async def get_local_sessions(
-    limit: int = Query(default=200, ge=1, le=500),
+    limit: int = Query(default=200, ge=1, le=MAX_LOCAL_SESSION_LIST_ITEMS),
 ) -> dict[str, Any]:
     """List local Claude/Codex chat history not yet imported into AgentsDock."""
 
-    sessions = await asyncio.to_thread(local_session_candidates, limit)
+    async with STORE._lock:
+        known_provider_keys = {
+            (
+                str(session.get("backend") or DEFAULT_BACKEND).strip().lower(),
+                str(provider_id),
+            )
+            for session in STORE.sessions.values()
+            if (provider_id := session_provider_id(session))
+        }
+    sessions = await asyncio.to_thread(
+        local_session_candidates,
+        limit,
+        known_provider_keys,
+    )
     return {"sessions": sessions}
+
+
+def bulk_import_result(
+    item: BulkImportSessionItem,
+    *,
+    ok: bool,
+    session_id: str | None = None,
+    imported: int = 0,
+    code: str | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "provider_session_id": item.provider_session_id,
+        "backend": item.backend,
+        "session_id": session_id,
+        "ok": ok,
+        "imported": imported,
+    }
+    if code:
+        result["code"] = code
+    if error:
+        result["error"] = error[:1000]
+    return result
+
+
+async def rollback_staged_history_import(session_id: str) -> None:
+    with suppress(BaseException):
+        await STORE.delete(session_id)
+
+
+async def commit_staged_history_import(sess: dict[str, Any]) -> None:
+    session_id = str(sess["id"])
+    async with STORE._lock:
+        current = STORE.sessions.get(session_id)
+        if current is not sess or not current.get("_history_import_initializing"):
+            raise RuntimeError("staged history import lost ownership before commit")
+        current.pop("_history_import_initializing", None)
+        current.pop("_fork_initializing", None)
+        current["updated_at"] = now_iso()
+        await STORE.save()
 
 
 @app.post("/api/sessions/bulk-import")
@@ -43093,34 +43549,155 @@ async def bulk_import_sessions(req: BulkImportSessionsRequest) -> dict[str, Any]
             status_code=400,
             detail=f"at most {MAX_BULK_IMPORT_ITEMS} items are allowed per bulk import",
         )
-    results: list[dict[str, Any]] = []
-    for item in req.items:
-        try:
-            create_req = CreateSessionRequest(
-                backend=item.backend,
-                provider_session_id=item.provider_session_id,
-                cwd=item.cwd,
-                title=item.title,
-            )
-            sess = await STORE.create(create_req)
-            await import_session_history(sess)
-            results.append({
-                "provider_session_id": item.provider_session_id,
-                "session_id": sess["id"],
-                "ok": True,
-            })
-        except Exception as exc:
-            results.append({
-                "provider_session_id": item.provider_session_id,
-                "session_id": None,
-                "ok": False,
-                "error": concise_error_message(exc),
-            })
-        # Yield between items so a large batch doesn't monopolize the event
-        # loop for its entire duration (import_session_history itself still
-        # does blocking file I/O inline; this bounds exposure, it doesn't fix it).
-        await asyncio.sleep(0)
-    return {"results": results}
+    async with LOCAL_SESSION_IMPORT_LOCK:
+        async with STORE._lock:
+            known_provider_keys = {
+                (
+                    str(session.get("backend") or DEFAULT_BACKEND).strip().lower(),
+                    str(provider_id),
+                )
+                for session in STORE.sessions.values()
+                if (provider_id := session_provider_id(session))
+            }
+        available = await asyncio.to_thread(
+            local_session_candidates,
+            MAX_LOCAL_SESSION_LIST_ITEMS,
+            set(),
+        )
+        candidate_by_key = {
+            (str(candidate["backend"]), str(candidate["provider_session_id"])): candidate
+            for candidate in available
+        }
+        requested_keys: set[tuple[str, str]] = set()
+        results: list[dict[str, Any]] = []
+        for item in req.items:
+            key = (item.backend, item.provider_session_id)
+            if key in requested_keys:
+                results.append(bulk_import_result(
+                    item,
+                    ok=False,
+                    code="duplicate_request",
+                    error="This local session appears more than once in the import request.",
+                ))
+                continue
+            requested_keys.add(key)
+            if key in known_provider_keys:
+                results.append(bulk_import_result(
+                    item,
+                    ok=False,
+                    code="already_imported",
+                    error="This local session is already present in AgentsDock.",
+                ))
+                continue
+            candidate = candidate_by_key.get(key)
+            if candidate is None:
+                results.append(bulk_import_result(
+                    item,
+                    ok=False,
+                    code="not_found",
+                    error="The selected local transcript is no longer available.",
+                ))
+                continue
+            requested_cwd = normalized_local_session_cwd(item.cwd)
+            candidate_cwd = normalized_local_session_cwd(candidate.get("cwd"))
+            if item.cwd is not None and requested_cwd != candidate_cwd:
+                results.append(bulk_import_result(
+                    item,
+                    ok=False,
+                    code="candidate_changed",
+                    error="The selected transcript metadata changed; refresh and try again.",
+                ))
+                continue
+
+            staged_session: dict[str, Any] | None = None
+            try:
+                source_path, history_items = await asyncio.to_thread(
+                    provider_history,
+                    {
+                        "backend": item.backend,
+                        "session_id": item.provider_session_id,
+                        "claude_session_id": (
+                            item.provider_session_id
+                            if item.backend == BACKEND_CLAUDE
+                            else None
+                        ),
+                        "codex_thread_id": (
+                            item.provider_session_id
+                            if item.backend == BACKEND_CODEX
+                            else None
+                        ),
+                    },
+                    None,
+                )
+                if source_path is None:
+                    results.append(bulk_import_result(
+                        item,
+                        ok=False,
+                        code="not_found",
+                        error="The selected local transcript is no longer available.",
+                    ))
+                    continue
+                if not history_items:
+                    results.append(bulk_import_result(
+                        item,
+                        ok=False,
+                        code="no_messages",
+                        error="The transcript contains no importable chat messages.",
+                    ))
+                    continue
+                staged_session = await STORE.create(
+                    CreateSessionRequest(
+                        backend=item.backend,
+                        provider_session_id=item.provider_session_id,
+                        cwd=candidate_cwd or DEFAULT_CWD,
+                        title=(item.title or str(candidate.get("label") or "")).strip()
+                        or None,
+                    ),
+                    initializing_import=True,
+                )
+                imported = await append_staged_imported_history(
+                    staged_session,
+                    source_path,
+                    history_items,
+                )
+                if int(imported.get("imported") or 0) <= 0:
+                    raise RuntimeError("history import produced no durable messages")
+                await commit_staged_history_import(staged_session)
+                known_provider_keys.add(key)
+                results.append(bulk_import_result(
+                    item,
+                    ok=True,
+                    session_id=str(staged_session["id"]),
+                    imported=int(imported["imported"]),
+                ))
+            except asyncio.CancelledError:
+                if staged_session is not None:
+                    cleanup_task = asyncio.create_task(
+                        rollback_staged_history_import(str(staged_session["id"]))
+                    )
+                    with suppress(BaseException):
+                        await join_task_despite_caller_cancellation(cleanup_task)
+                raise
+            except Exception as exc:
+                if staged_session is not None:
+                    cleanup_task = asyncio.create_task(
+                        rollback_staged_history_import(str(staged_session["id"]))
+                    )
+                    with suppress(BaseException):
+                        await join_task_despite_caller_cancellation(cleanup_task)
+                logger.warning(
+                    "bulk history import failed backend=%s provider=%s: %s",
+                    item.backend,
+                    item.provider_session_id,
+                    concise_error_message(exc),
+                )
+                results.append(bulk_import_result(
+                    item,
+                    ok=False,
+                    code="import_failed",
+                    error=concise_error_message(exc),
+                ))
+        return {"results": results}
 
 
 @app.get("/api/sessions/{session_id}/timeline-index")
@@ -45600,6 +46177,9 @@ async def delete_session(session_id: str) -> dict[str, Any]:
                             None,
                         )
                         CODEX_APP_SERVER_PINNED_THREADS.discard(
+                            provider_thread_id
+                        )
+                        CODEX_APP_SERVER_INVALIDATED_THREADS.discard(
                             provider_thread_id
                         )
             for provider_thread_id in provider_thread_ids:

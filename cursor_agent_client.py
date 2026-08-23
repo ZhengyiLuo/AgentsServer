@@ -15,18 +15,18 @@ Known gaps this prototype does NOT attempt to resolve yet:
   - Permission/approval strategy for unattended (job/scheduled) turns:
     --trust alone permits file reads/edits but not shell execution; shell
     calls come back as {"result": {"rejected": ...}} without --force or
-    --auto-review. Which of those AgentsServer should default to is a
-    product decision, not resolved here.
+    --auto-review. AgentsDock already solves this exact problem for Claude
+    and Codex the same way (a per-session user-selectable permission mode,
+    e.g. ClaudePermissionMenu.tsx / CodexPermissionMenu.tsx, stored on the
+    session and read by the turn runner) rather than the server hard-coding
+    one default - a Cursor permission mode should follow that precedent,
+    not invent a new pattern. Not implemented here; this file has no
+    server-side session model to attach it to yet.
   - stream-json can hang for minutes on some failure paths (reproduced
     directly: an unauthenticated run hung well past 120s before finally
     surfacing the same error --output-format json returned in under two
     seconds). Any real integration needs its own hard timeout around the
     subprocess, independent of whatever timeout the CLI itself claims.
-  - Model catalog discovery: `agent --list-models` returns a flat text
-    list ("id - name" per line), not JSON. A real discover_cursor_catalog()
-    would parse that text, the same shape of problem
-    parse_claude_help_catalog() already solves for Claude's --help output,
-    but that parser is not written here.
 """
 
 from __future__ import annotations
@@ -168,3 +168,51 @@ def normalize_cursor_stream(lines: Iterator[str]) -> Iterator[dict[str, Any]]:
         normalized = normalize_cursor_stream_event(raw_line)
         if normalized is not None:
             yield normalized
+
+
+def parse_cursor_models_list(output: str) -> list[dict[str, Any]]:
+    """Parse ``agent --list-models``'s plain-text output.
+
+    Unlike Claude/Codex, this is not JSON - one "id - display name" pair per
+    line, with a header line, a blank-line-separated footer tip, and no
+    other structure. The model matching the id "auto" is Cursor's own
+    server-side model router, not a concrete model; every other line is a
+    concrete selectable model.
+    """
+    models: list[dict[str, Any]] = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("Available models") or line.startswith("Tip:"):
+            continue
+        if " - " not in line:
+            continue
+        model_id, _, label = line.partition(" - ")
+        model_id = model_id.strip()
+        label = label.strip()
+        is_default = "(current, default)" in label
+        if is_default:
+            label = label.replace("(current, default)", "").strip()
+        models.append({
+            "id": model_id,
+            "label": label,
+            "is_router": model_id == "auto",
+            "is_default": is_default,
+        })
+    return models
+
+
+def parse_cursor_auth_status(status_output: str) -> dict[str, Any]:
+    """Parse ``agent status``'s one-line output into a ready/unauthenticated
+    shape matching the vocabulary /api/runtime/catalog already reports for
+    Claude and Codex (ready, missing, unauthenticated, error).
+    """
+    text = status_output.strip()
+    if text.startswith("Not logged in"):
+        return {
+            "state": "unauthenticated",
+            "action": "Run 'agent login', or set CURSOR_API_KEY.",
+        }
+    if text.startswith("✓ Logged in as "):
+        email = text[len("✓ Logged in as "):].strip()
+        return {"state": "ready", "email": email or None}
+    return {"state": "error", "message": text}

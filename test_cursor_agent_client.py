@@ -11,9 +11,23 @@ import unittest
 from cursor_agent_client import (
     CursorEventParseError,
     normalize_cursor_stream_event,
+    parse_cursor_auth_status,
+    parse_cursor_models_list,
 )
 
 SESSION_ID = "51cc22bb-e694-4f7c-807b-961b5b41810c"
+
+# Real captured output from `agent --list-models` (2026.08.11-e8db854),
+# truncated to a representative slice - the full list is 200+ lines.
+REAL_MODELS_LIST_OUTPUT = """Available models
+
+auto - Auto (current, default)
+gpt-5.3-codex-low - Codex 5.3 Low
+claude-sonnet-5-thinking-high - Claude Sonnet 5 1M Thinking
+gpt-5.4-nano-none - GPT-5.4 Nano None
+
+Tip: use --model <id> (or /model <id> in interactive mode) to switch. Parameterized models also accept quoted overrides, e.g. --model 'claude-opus-4-8[context=1m,effort=high,fast=false]'.
+"""
 
 
 class NormalizeCursorStreamEventTests(unittest.TestCase):
@@ -190,6 +204,51 @@ class NormalizeCursorStreamEventTests(unittest.TestCase):
             normalize_cursor_stream_event(
                 '{"type":"something_new","session_id":"%s"}' % SESSION_ID
             )
+
+
+class ParseCursorModelsListTests(unittest.TestCase):
+    def test_parses_real_captured_output(self) -> None:
+        models = parse_cursor_models_list(REAL_MODELS_LIST_OUTPUT)
+        by_id = {model["id"]: model for model in models}
+        self.assertEqual(len(models), 4)
+        self.assertTrue(by_id["auto"]["is_router"])
+        self.assertTrue(by_id["auto"]["is_default"])
+        self.assertEqual(by_id["auto"]["label"], "Auto")
+        self.assertFalse(by_id["claude-sonnet-5-thinking-high"]["is_router"])
+        self.assertFalse(by_id["claude-sonnet-5-thinking-high"]["is_default"])
+        self.assertEqual(
+            by_id["claude-sonnet-5-thinking-high"]["label"],
+            "Claude Sonnet 5 1M Thinking",
+        )
+
+    def test_empty_output_yields_no_models(self) -> None:
+        self.assertEqual(parse_cursor_models_list(""), [])
+
+
+class ParseCursorAuthStatusTests(unittest.TestCase):
+    def test_not_logged_in(self) -> None:
+        # Real captured output from `agent status` before login.
+        self.assertEqual(
+            parse_cursor_auth_status("Not logged in"),
+            {
+                "state": "unauthenticated",
+                "action": "Run 'agent login', or set CURSOR_API_KEY.",
+            },
+        )
+
+    def test_logged_in(self) -> None:
+        # Real captured output from `agent status` after login.
+        result = parse_cursor_auth_status(
+            "✓ Logged in as georgialin1999@gmail.com"
+        )
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(result["email"], "georgialin1999@gmail.com")
+
+    def test_unrecognized_output_is_reported_as_error_not_silently_ready(
+        self,
+    ) -> None:
+        result = parse_cursor_auth_status("something the CLI never printed before")
+        self.assertEqual(result["state"], "error")
 
 
 if __name__ == "__main__":

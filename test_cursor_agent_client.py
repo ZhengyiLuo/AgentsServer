@@ -10,6 +10,8 @@ import unittest
 
 from cursor_agent_client import (
     CursorEventParseError,
+    build_cursor_cmd,
+    cursor_permission_flags,
     normalize_cursor_stream_event,
     parse_cursor_auth_status,
     parse_cursor_models_list,
@@ -249,6 +251,69 @@ class ParseCursorAuthStatusTests(unittest.TestCase):
     ) -> None:
         result = parse_cursor_auth_status("something the CLI never printed before")
         self.assertEqual(result["state"], "error")
+
+
+class CursorPermissionFlagsTests(unittest.TestCase):
+    def test_default_is_trust_only_no_shell_auto_approval(self) -> None:
+        # Real behavior confirmed live: --trust alone lets file edits through
+        # but shell calls come back {"result": {"rejected": ...}}.
+        self.assertEqual(cursor_permission_flags("default"), ["--trust"])
+
+    def test_unrecognized_mode_fails_safe_to_trust_only(self) -> None:
+        self.assertEqual(cursor_permission_flags("not_a_real_mode"), ["--trust"])
+
+    def test_auto_review_adds_smart_classifier_flag(self) -> None:
+        self.assertEqual(
+            cursor_permission_flags("auto_review"), ["--trust", "--auto-review"]
+        )
+
+    def test_full_access_adds_force(self) -> None:
+        self.assertEqual(
+            cursor_permission_flags("full_access"), ["--trust", "--force"]
+        )
+
+    def test_plan_mode_is_read_only_and_skips_trust(self) -> None:
+        self.assertEqual(cursor_permission_flags("plan"), ["--mode", "plan"])
+
+
+class BuildCursorCmdTests(unittest.TestCase):
+    def test_first_turn_has_no_resume_flag(self) -> None:
+        cmd = build_cursor_cmd({}, "hello", cursor_bin="agent")
+        self.assertEqual(
+            cmd,
+            ["agent", "-p", "hello", "--output-format", "stream-json", "--trust"],
+        )
+
+    def test_resume_uses_real_session_id_shape(self) -> None:
+        # Real captured behavior: `agent -p "..." --output-format json
+        # --trust --resume <session_id>` correctly resumed conversation
+        # context from a prior real turn against the actual CLI.
+        sess = {"cursor_session_id": "11784a88-5107-44b3-9e2f-d5b4897dd94d"}
+        cmd = build_cursor_cmd(sess, "follow up", cursor_bin="agent")
+        self.assertEqual(
+            cmd,
+            [
+                "agent", "-p", "follow up", "--output-format", "stream-json",
+                "--resume", "11784a88-5107-44b3-9e2f-d5b4897dd94d",
+                "--trust",
+            ],
+        )
+
+    def test_model_and_permission_mode_are_threaded_through(self) -> None:
+        sess = {"cursor_model": "sonnet-5-thinking", "cursor_permission_mode": "full_access"}
+        cmd = build_cursor_cmd(sess, "hi", cursor_bin="agent")
+        self.assertEqual(
+            cmd,
+            [
+                "agent", "-p", "hi", "--output-format", "stream-json",
+                "--model", "sonnet-5-thinking",
+                "--trust", "--force",
+            ],
+        )
+
+    def test_falsy_resume_id_is_treated_as_first_turn(self) -> None:
+        cmd = build_cursor_cmd({"cursor_session_id": ""}, "hi", cursor_bin="agent")
+        self.assertNotIn("--resume", cmd)
 
 
 if __name__ == "__main__":

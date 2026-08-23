@@ -118,6 +118,10 @@ logger = logging.getLogger("agents-server")
 
 BACKEND_CLAUDE = "claude"
 BACKEND_CODEX = "codex"
+# Not activated: BACKEND_CURSOR is intentionally left out of VALID_BACKENDS.
+# run_cursor() below is real but unreachable until a future change adds
+# "cursor" to VALID_BACKENDS and the _start_turn_locked dispatch branch.
+BACKEND_CURSOR = "cursor"
 VALID_BACKENDS = {BACKEND_CLAUDE, BACKEND_CODEX}
 CODEX_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 CODEX_EFFORT_ALIASES = {
@@ -194,6 +198,7 @@ CODEX_SESSION_INDEX_PATH = (
 )
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CODEX_BIN = os.environ.get("CODEX_BIN", "codex")
+CURSOR_BIN = os.environ.get("CURSOR_BIN", "agent")
 CODEX_DEFAULT_MODEL = agentsdock_setting("CODEX_MODEL", "gpt-5.5").strip() or "gpt-5.5"
 _configured_codex_effort = agentsdock_setting("CODEX_EFFORT", "xhigh").strip().lower() or "xhigh"
 CODEX_DEFAULT_EFFORT = CODEX_EFFORT_ALIASES.get(_configured_codex_effort, _configured_codex_effort)
@@ -5118,7 +5123,12 @@ class SessionStore:
             sess["session_id"] = provider_id
             sess["backend"] = sess.get("backend") or backend
             sess["backend_locked"] = True
-            sess["claude_session_id" if backend == BACKEND_CLAUDE else "codex_thread_id"] = provider_id
+            if backend == BACKEND_CLAUDE:
+                sess["claude_session_id"] = provider_id
+            elif backend == BACKEND_CODEX:
+                sess["codex_thread_id"] = provider_id
+            elif backend == BACKEND_CURSOR:
+                sess["cursor_session_id"] = provider_id
             if backend == BACKEND_CLAUDE and cwd:
                 sess["claude_session_cwd"] = cwd
             if backend == BACKEND_CODEX and codex_instruction_hash is not None:
@@ -25391,6 +25401,8 @@ def session_provider_id(sess: dict[str, Any]) -> str | None:
         return sess.get("claude_session_id") or sess.get("session_id")
     if backend == BACKEND_CODEX:
         return sess.get("codex_thread_id") or sess.get("session_id")
+    if backend == BACKEND_CURSOR:
+        return sess.get("cursor_session_id") or sess.get("session_id")
     return sess.get("session_id")
 
 
@@ -31943,6 +31955,11 @@ def redacted_provider_argv(cmd: list[str], backend: str) -> list[str]:
         ]
         if redacted:
             redacted[-1] = "<prompt>"
+        return redacted
+    if backend == BACKEND_CURSOR:
+        # build_cursor_cmd's argv shape is [bin, "-p", prompt, "--output-format", ...]
+        with suppress(ValueError, IndexError):
+            redacted[2] = "<prompt>"
     return redacted
 
 
@@ -36552,6 +36569,271 @@ async def run_codex_exec(
         "backend": BACKEND_CODEX,
         "exit_code": proc.returncode,
         "result_text": clean_assistant_text("\n\n".join(text_parts).strip()),
+        "stopped": stopped,
+        **run_event_metadata(run_id),
+    }
+    finalize_task = asyncio.create_task(finalize_owned_turn_finished(
+        session_id,
+        run_id,
+        stopped=stopped,
+        payload=terminal_payload,
+    ))
+    try:
+        await asyncio.shield(finalize_task)
+    except asyncio.CancelledError:
+        await join_task_despite_caller_cancellation(finalize_task)
+        raise
+
+
+async def run_cursor(
+    session_id: str,
+    run_id: str,
+    prompt: str,
+    sess: dict[str, Any],
+    manifest_path: Path,
+) -> None:
+    """Stateless, spawn-per-turn turn runner for the Cursor CLI (``agent``).
+
+    NOT ACTIVATED: BACKEND_CURSOR is not in VALID_BACKENDS and nothing calls
+    this function yet. It is real, working code (verified by
+    test_run_cursor.py against the real cursor_agent_client parser and a
+    fake subprocess), not a stub - written now so the runner shape can be
+    reviewed before the separate activation step wires "cursor" into
+    VALID_BACKENDS and the _start_turn_locked dispatch branch.
+
+    Deliberately mirrors run_codex_exec's spawn-per-turn shape (a fresh
+    subprocess per turn, resumed via --resume <session_id>) rather than the
+    persistent-connection pattern used for Claude/the Codex app-server: with
+    no long-lived connection object cached across turns, there is no
+    equivalent of the stale-cached-client class of bug fixed in PR #28
+    (run_claude_sdk's generic-exception eviction gap,
+    unpin_codex_app_server_thread's force-eviction gap).
+
+    Known gaps this first cut does NOT attempt to resolve yet:
+      - No compaction/resume-rollover recovery (see run_codex_exec's
+        should_recover_codex_resume path). Not yet observed to be necessary
+        for Cursor's --resume; add it if a resumed session is found to
+        silently fail to continue.
+      - No CodexExecMessageBuffer-style delta reconciliation: Cursor's
+        stream-json "assistant"/"thinking" events were observed (real,
+        authenticated CLI runs) to arrive as complete blocks per turn
+        segment, not token-level deltas needing merge, so each event is
+        emitted as it arrives.
+      - standalone_provider_context (used by memory-fork / handoff turns in
+        run_codex_exec) is not threaded through here yet.
+    """
+    from cursor_agent_client import (
+        CursorEventParseError,
+        build_cursor_cmd,
+        normalize_cursor_stream_event,
+    )
+
+    requested_cwd = str(sess.get("cwd") or DEFAULT_CWD)
+    cwd = existing_cwd(requested_cwd)
+    diff_baseline = await capture_git_baseline(session_id, run_id, cwd)
+    if str(Path(requested_cwd).expanduser()) != cwd:
+        await append_event(session_id, "cwd_fallback", {"run_id": run_id, "requested_cwd": requested_cwd, "cwd": cwd})
+
+    cmd = build_cursor_cmd(sess, prompt, cursor_bin=CURSOR_BIN)
+    public_cmd = redacted_provider_argv(cmd, BACKEND_CURSOR)
+    await append_event(session_id, "process_started", {"run_id": run_id, "backend": BACKEND_CURSOR, "argv": public_cmd, "cwd": cwd})
+    env = agent_runner_env(session_id)
+    cursor_dir = os.path.dirname(os.path.abspath(CURSOR_BIN))
+    if cursor_dir and cursor_dir not in env.get("PATH", "").split(os.pathsep):
+        env["PATH"] = cursor_dir + os.pathsep + env.get("PATH", "")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd,
+            env=env,
+            limit=PROCESS_STREAM_LIMIT,
+            start_new_session=True,
+        )
+    except Exception as e:
+        released = await release_turn_slot(
+            session_id,
+            expected_run_id=run_id,
+        )
+        try:
+            if released:
+                record_runtime_failure(BACKEND_CURSOR, e, spawn_failure=True)
+                await append_event(session_id, "error", {"run_id": run_id, "backend": BACKEND_CURSOR, "message": f"failed to start Cursor: {e}", **run_event_metadata(run_id)})
+                await append_turn_finished_event(session_id, {
+                    "run_id": run_id,
+                    "backend": BACKEND_CURSOR,
+                    "exit_code": None,
+                    "result_text": "",
+                    **run_event_metadata(run_id),
+                })
+        finally:
+            RUN_METADATA.pop(run_id, None)
+            STOPPED_RUNS.discard(run_id)
+            if released:
+                schedule_next_queued_turn(session_id)
+        return
+
+    pgid = process_group_for_pid(proc.pid)
+    bound, stop_requested = await bind_active_turn(
+        session_id,
+        run_id,
+        {
+            "proc": proc,
+            "run_id": run_id,
+            "backend": BACKEND_CURSOR,
+            "transport": "exec",
+            "pid": proc.pid,
+            "pgid": pgid,
+            "cwd": cwd,
+            "argv": public_cmd,
+            "started_at": time.time(),
+            "started_at_iso": now_iso(),
+            "provider_turn_ready": False,
+            "stdout_tail": deque(maxlen=LIVE_STDOUT_MAX_LINES),
+            "stdout_total_lines": 0,
+            "stdout_updated_at": None,
+        },
+    )
+    if not bound:
+        await terminate_process_tree(proc, grace=0.5)
+        return
+    if stop_requested:
+        await terminate_process_tree(proc)
+
+    text_parts: list[str] = []
+    provider_id: str | None = sess.get("cursor_session_id")
+    last_event = time.time()
+    stream_error: str | None = None
+    turn_is_error = False
+    result_text = ""
+    tool_calls: dict[str, dict[str, Any]] = {}
+    started_tool_ids: set[str] = set()
+    finished_tool_ids: set[str] = set()
+    changed_paths: set[str] = set()
+    seen_artifacts: set[str] = set()
+    manifest_watch_task = asyncio.create_task(watch_manifest_artifacts(session_id, run_id, manifest_path, seen_artifacts))
+
+    async def emit_provider_session(new_provider_id: str) -> None:
+        nonlocal provider_id
+        if not new_provider_id:
+            return
+        provider_id = new_provider_id
+        await persist_run_provider_session(session_id, run_id, BACKEND_CURSOR, provider_id)
+
+    try:
+        while True:
+            try:
+                raw = await asyncio.wait_for(proc.stdout.readline(), timeout=5)  # type: ignore[union-attr]
+            except asyncio.TimeoutError:
+                idle = time.time() - last_event
+                if idle >= IDLE_WARN_SECONDS:
+                    await append_event(session_id, "idle_warning", {"run_id": run_id, "idle_seconds": int(idle)})
+                if idle >= IDLE_KILL_SECONDS:
+                    await terminate_process_tree(proc)
+                    break
+                continue
+            if not raw:
+                break
+            last_event = time.time()
+            decoded = raw.decode("utf-8", "replace").rstrip("\r\n")
+            await append_active_stdout(session_id, decoded)
+            line = decoded.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                normalized = normalize_cursor_stream_event(line)
+            except CursorEventParseError as exc:
+                await append_event(session_id, "raw_event", {"run_id": run_id, "backend": BACKEND_CURSOR, "raw": line[:2000]})
+                logger.warning("unrecognized Cursor stream-json event session=%s run=%s error=%s", session_id, run_id, exc)
+                continue
+            if normalized is None:
+                continue
+            kind = normalized["kind"]
+            if kind == "session_started":
+                await emit_provider_session(str(normalized.get("session_id") or ""))
+                await mark_provider_turn_ready(session_id, run_id, provider_id)
+            elif kind == "assistant_text":
+                text = clean_assistant_text(str(normalized.get("text") or ""))
+                if text:
+                    text_parts.append(text)
+                    await append_event(session_id, "assistant_text", {"run_id": run_id, "text": text, **run_event_metadata(run_id)})
+            elif kind == "reasoning_delta":
+                text = str(normalized.get("text") or "").strip()
+                if text:
+                    await append_event(session_id, "reasoning_summary", {"run_id": run_id, "text": text, "phase": "commentary"})
+            elif kind == "tool_started":
+                call_id = str(normalized.get("call_id") or f"tool_{uuid.uuid4().hex[:8]}")
+                tool = {"id": call_id, "name": normalized.get("tool") or "Tool", "input": normalized.get("args") or {}}
+                tool_calls[call_id] = tool
+                changed_paths.update(tool_changed_paths(tool))
+                if call_id not in started_tool_ids:
+                    started_tool_ids.add(call_id)
+                    await append_event(session_id, "tool_started", {"run_id": run_id, "tool": tool})
+            elif kind in ("tool_finished", "tool_rejected"):
+                call_id = str(normalized.get("call_id") or "")
+                if call_id and call_id not in finished_tool_ids:
+                    finished_tool_ids.add(call_id)
+                    tool = tool_calls.get(call_id) or {"id": call_id, "name": normalized.get("tool") or "Tool", "input": {}}
+                    if kind == "tool_rejected":
+                        output: Any = normalized.get("reason") or "Rejected by permission policy."
+                        exit_code = 1
+                    else:
+                        output = normalized.get("result")
+                        exit_code = None
+                    await append_event(session_id, "tool_finished", {
+                        "run_id": run_id,
+                        "tool_id": call_id,
+                        "tool": tool,
+                        "output": output,
+                        "exit_code": exit_code,
+                    })
+            elif kind == "turn_finished":
+                turn_is_error = bool(normalized.get("is_error"))
+                result_text = str(normalized.get("result_text") or "")
+    except Exception as e:
+        stream_error = f"{type(e).__name__}: {e}"
+        logger.exception("Cursor run failed session=%s run=%s", session_id, run_id)
+    finally:
+        manifest_watch_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await manifest_watch_task
+        await terminate_process_tree(proc, grace=0.5)
+        await clear_active_process(session_id, expected_run_id=run_id)
+
+    stderr = ""
+    if proc.stderr:
+        stderr = (await proc.stderr.read()).decode("utf-8", "replace").strip()
+    stopped = run_id in STOPPED_RUNS
+
+    if stream_error and not stopped:
+        await append_event(session_id, "error", {"run_id": run_id, "message": f"Cursor stream failed: {stream_error}", **run_event_metadata(run_id)})
+    elif turn_is_error and not stopped:
+        await append_event(session_id, "error", {"run_id": run_id, "message": result_text or stderr[:4000] or "Cursor reported an error.", "exit_code": proc.returncode, **run_event_metadata(run_id)})
+    elif not stopped and proc.returncode not in (0, None):
+        await append_event(session_id, "error", {
+            "run_id": run_id,
+            "message": stderr[:4000] if stderr else f"Cursor exited {proc.returncode} without error output.",
+            "exit_code": proc.returncode,
+            **run_event_metadata(run_id),
+        })
+
+    if not stopped and (stream_error or turn_is_error or proc.returncode not in (0, None)):
+        record_runtime_failure(BACKEND_CURSOR, stream_error or result_text or f"exit {proc.returncode}")
+    elif not stopped:
+        record_runtime_success(BACKEND_CURSOR)
+
+    if provider_id:
+        await persist_run_provider_session(session_id, run_id, BACKEND_CURSOR, provider_id)
+    await collect_manifest(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts, final=True)
+    await collect_recent_leftover_manifests(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts)
+    await publish_turn_code_diff(session_id, run_id, BACKEND_CURSOR, cwd, diff_baseline, changed_paths)
+
+    terminal_payload = {
+        "run_id": run_id,
+        "backend": BACKEND_CURSOR,
+        "exit_code": proc.returncode,
+        "result_text": clean_assistant_text(result_text or "\n\n".join(text_parts).strip()),
         "stopped": stopped,
         **run_event_metadata(run_id),
     }

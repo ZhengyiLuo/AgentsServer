@@ -201,6 +201,56 @@ def parse_cursor_models_list(output: str) -> list[dict[str, Any]]:
     return models
 
 
+CURSOR_PERMISSION_MODES = ("default", "auto_review", "full_access", "plan")
+
+
+def cursor_permission_flags(mode: str) -> list[str]:
+    """Translate a single-enum permission mode (matching the precedent set by
+    AgentsDock's ClaudePermissionMenu.tsx - one user-chosen mode per session,
+    not a server-hardcoded default) into real Cursor CLI flags.
+
+    Verified live against the actual `agent` CLI: --trust alone permits file
+    reads/edits but shell calls come back rejected; --auto-review runs a
+    server-side classifier that auto-approves safe commands and prompts for
+    the rest (not usable headless, so treated as approval-required here);
+    --force/--yolo allows every command unconditionally.
+    """
+    if mode == "plan":
+        return ["--mode", "plan"]
+    if mode == "auto_review":
+        return ["--trust", "--auto-review"]
+    if mode == "full_access":
+        return ["--trust", "--force"]
+    # "default" and any unrecognized mode fail safe to the most restrictive
+    # real option: workspace trust only, shell commands rejected outright.
+    return ["--trust"]
+
+
+def build_cursor_cmd(
+    sess: dict[str, Any],
+    prompt: str,
+    *,
+    cursor_bin: str = "agent",
+) -> list[str]:
+    """Build the `agent` CLI argv for one turn from a session dict + prompt.
+
+    Verified live: `agent -p "<prompt>" --output-format json --trust` runs
+    non-interactively and returns a result event with a `session_id`; passing
+    that id back via `--resume <session_id>` on a later call correctly
+    resumes conversation context (both confirmed by hand against the real
+    CLI, not inferred from --help text alone).
+    """
+    cmd = [cursor_bin, "-p", prompt, "--output-format", "stream-json"]
+    resume_id = sess.get("cursor_session_id")
+    if resume_id:
+        cmd += ["--resume", str(resume_id)]
+    model = sess.get("cursor_model")
+    if model:
+        cmd += ["--model", str(model)]
+    cmd += cursor_permission_flags(str(sess.get("cursor_permission_mode") or "default"))
+    return cmd
+
+
 def parse_cursor_auth_status(status_output: str) -> dict[str, Any]:
     """Parse ``agent status``'s one-line output into a ready/unauthenticated
     shape matching the vocabulary /api/runtime/catalog already reports for

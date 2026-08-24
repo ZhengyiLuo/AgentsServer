@@ -22,9 +22,24 @@ All via the existing `POST /api/sessions` and `PATCH /api/sessions/{id}` endpoin
 | Field | Type | Notes |
 |---|---|---|
 | `backend` | `"claude" \| "codex" \| "cursor"` | now accepts `"cursor"` |
-| `model` | `string \| null` | **reused generic field**, not cursor-specific. Passed straight through to `--model`. Get real model ids from `runtimes.cursor` catalog / `agent --list-models` shape (parsed server-side by `parse_cursor_models_list`). |
+| `model` | `string \| null` | **reused generic field**, not cursor-specific. Passed straight through to `--model`. |
 | `cursor_permission_mode` | `"default" \| "auto_review" \| "full_access" \| "plan"` | **new field**, mirrors `claude_permission_mode`'s single-enum pattern (not Codex's 4-field style). Default: `"default"`. |
 | `cursor_session_id` | `string \| null`, **read-only** | server-populated resume handle (like `codex_thread_id`/`claude_session_id`). Returned in session detail responses now (was silently `null` until this was fixed). |
+
+### Model discovery — now live, real per-account model list
+
+`GET /api/runtime/catalog` → `backends.cursor.models` is real, not hardcoded: the server runs
+`agent --list-models` and returns every model the account can see (~200+ entries on a paid account),
+same shape as `backends.claude.models`/`backends.codex.models` (`{value, label}` pairs, empty-value
+entry first = "use server default"). No cursor-specific parsing needed on the client side — same
+`runtimeCatalogOptions()` helper that already works for Claude/Codex works here unchanged.
+
+**Free-plan accounts see the full list too**, but Cursor's own API rejects actually *using* any model
+other than `"auto"` with `ActionRequiredError: Named models unavailable Free plans can only use Auto`
+— that's an account-tier restriction from Cursor's backend, not something the server filters out.
+It surfaces as a normal turn `error` event (visible in-chat), the same as any other provider rejection —
+no special client-side handling needed, but worth knowing so a free-plan user's "why did picking a
+model fail" question has a real answer instead of looking like a bug.
 
 ### `cursor_permission_mode` semantics (for the picker UI)
 
@@ -107,8 +122,19 @@ on this test instance) to drive it against real server code on this branch.
 
 ## Server-side test coverage already run (real, not just unit tests)
 
-Against a real authenticated Cursor CLI account, on the isolated test server above:
-concurrency, idle-timeout kill, mid-flight interrupt/stop, 6-turn resume stability, 200-function large-diff
-edit, full permission-mode matrix (all 4 modes, confirmed both correct CLI flags *and* correct actual tool
-execution behavior), model switching, missing-binary detection, and the standalone-context safety guard.
-Full existing test suite (`pytest`, 1301 tests) passes unchanged.
+Against a real authenticated Cursor CLI account (both free and, later, upgraded-to-paid), on the isolated
+test server above: concurrency, idle-timeout kill, mid-flight interrupt/stop, 6-turn resume stability,
+200-function large-diff edit, full permission-mode matrix (all 4 modes, confirmed both correct CLI flags
+*and* correct actual tool execution behavior), model switching with a real named model
+(`claude-sonnet-5-thinking-high`, confirmed the model itself responded correctly), live per-account model
+catalog discovery (205 real models on the paid account), missing-binary detection, and the
+standalone-context safety guard. Full existing test suite (`pytest`, 1302 tests) passes unchanged.
+
+## Note on concurrent editing
+
+This repo's working tree was edited by more than one agent in parallel during this work (no git worktree
+isolation between sessions). One collision was found and resolved: two near-identical, independently
+written `discover_cursor_catalog()` implementations, both with the same real bug (default-model detection
+only matched the older `"(current, default)"` label format, not the current `"(default)"` one). If picking
+up this branch, diff against `origin/main` before assuming the working tree state matches what's described
+here — another agent may have made further uncommitted changes since.

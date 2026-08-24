@@ -302,6 +302,62 @@ class RuntimeDiagnosticTests(unittest.TestCase):
         with patch.object(agent_server.subprocess, "run", return_value=completed([], stdout="2.1.207 (Claude Code)\n")):
             self.assertTrue(agent_server.claude_supports_effort("ultracode"))
 
+    def test_cursor_catalog_locks_named_models_on_free_plan(self) -> None:
+        list_models_output = (
+            "Available models\n\n"
+            "auto - Auto (default)\n"
+            "gpt-5.2 - GPT-5.2\n"
+        )
+        about_output = (
+            "About Cursor CLI\n\n"
+            "CLI Version         2026.08.11-e8db854\n"
+            "Subscription Tier   Free\n"
+            "User Email          user@example.com\n"
+        )
+        with patch.object(
+            agent_server, "run_catalog_command", side_effect=[list_models_output, about_output]
+        ):
+            catalog = agent_server.discover_cursor_catalog()
+
+        by_value = {option["value"]: option for option in catalog["models"]}
+        self.assertNotIn("locked", by_value["auto"])
+        self.assertTrue(by_value["gpt-5.2"]["locked"])
+        self.assertIn("free plan", by_value["gpt-5.2"]["locked_reason"])
+        # The synthetic "Server default" entry mirrors "auto" (the default),
+        # so it must stay selectable too - only named models lock.
+        self.assertNotIn("locked", by_value[""])
+
+    def test_cursor_catalog_does_not_lock_models_on_paid_plan(self) -> None:
+        list_models_output = (
+            "Available models\n\n"
+            "auto - Auto (default)\n"
+            "gpt-5.2 - GPT-5.2\n"
+        )
+        about_output = (
+            "About Cursor CLI\n\n"
+            "Subscription Tier   Pro\n"
+            "User Email          user@example.com\n"
+        )
+        with patch.object(
+            agent_server, "run_catalog_command", side_effect=[list_models_output, about_output]
+        ):
+            catalog = agent_server.discover_cursor_catalog()
+
+        for option in catalog["models"]:
+            self.assertNotIn("locked", option)
+
+    def test_cursor_catalog_fails_toward_locked_when_tier_detection_errors(self) -> None:
+        list_models_output = "Available models\n\nauto - Auto (default)\ngpt-5.2 - GPT-5.2\n"
+        with patch.object(
+            agent_server,
+            "run_catalog_command",
+            side_effect=[list_models_output, RuntimeError("agent about exited 1")],
+        ):
+            catalog = agent_server.discover_cursor_catalog()
+
+        by_value = {option["value"]: option for option in catalog["models"]}
+        self.assertTrue(by_value["gpt-5.2"]["locked"])
+
 
 class RuntimePreflightTests(unittest.IsolatedAsyncioTestCase):
     async def test_unavailable_runtime_fails_before_launch(self) -> None:

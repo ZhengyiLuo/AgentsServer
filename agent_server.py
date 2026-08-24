@@ -31172,25 +31172,41 @@ def discover_cursor_catalog() -> dict[str, Any]:
     Free-plan Cursor accounts still list every model name here, but reject
     any of them except "auto" at turn-launch time with "ActionRequiredError:
     Named models unavailable Free plans can only use Auto" (confirmed live).
-    That's an account-tier restriction enforced by Cursor's own API, not
-    something this discovery step can or should filter - if a free-plan
-    turn picks a named model, the real error surfaces as a normal turn
-    "error" event, the same as any other provider rejection.
+    That's an account-tier restriction enforced by Cursor's own API. Rather
+    than let a free-plan turn hit that error, every non-"auto" model is
+    marked `locked` (with a human-readable `locked_reason`) via `agent
+    about`'s Subscription Tier - the client disables locked options instead
+    of letting them fail at send time. If tier detection itself fails, this
+    fails toward locking (see cursor_account_is_free_tier) rather than
+    silently allowing turns that would fail server-side.
 
-    Parsing is delegated to cursor_agent_client.parse_cursor_models_list(),
-    which is unit-tested against real captured output from more than one
-    CLI version/account tier (the default-marker format itself changed
-    between captures: "(current, default)" vs plain "(default)").
+    Parsing is delegated to cursor_agent_client, which is unit-tested against
+    real captured output from more than one CLI version/account tier (the
+    default-marker format itself changed between captures: "(current,
+    default)" vs plain "(default)").
     """
+    from cursor_agent_client import (
+        cursor_account_is_free_tier,
+        parse_cursor_account_tier,
+        parse_cursor_models_list,
+    )
+
     model_source = "agent --list-models"
     try:
-        from cursor_agent_client import parse_cursor_models_list
         output = run_catalog_command([CURSOR_BIN, "--list-models"])
         parsed = parse_cursor_models_list(output)
     except Exception as exc:
         logger.warning("cursor model discovery failed: %s", exc)
         parsed = []
         model_source = f"{model_source} failed"
+
+    is_free_tier = True
+    try:
+        about_output = run_catalog_command([CURSOR_BIN, "about"])
+        is_free_tier = cursor_account_is_free_tier(parse_cursor_account_tier(about_output))
+    except Exception as exc:
+        logger.warning("cursor account tier detection failed, defaulting to locked: %s", exc)
+
     if not parsed:
         # Never regress below the one value already confirmed to work.
         return {
@@ -31202,7 +31218,16 @@ def discover_cursor_catalog() -> dict[str, Any]:
             "default_effort": None,
         }
     default_entry = next((model for model in parsed if model.get("is_default")), parsed[0])
-    model_options = [runtime_option(model["id"], model["label"]) for model in parsed]
+    locked_reason = "Requires a paid Cursor plan - this account is on the free plan, which can only use Auto"
+    model_options = [
+        runtime_option(
+            model["id"],
+            model["label"],
+            **({"locked": True, "locked_reason": locked_reason}
+               if is_free_tier and not model.get("is_router") else {}),
+        )
+        for model in parsed
+    ]
     return {
         "models": unique_runtime_options(model_options, default_entry["label"]),
         "efforts": [],

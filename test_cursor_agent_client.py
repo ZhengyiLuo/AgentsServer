@@ -11,8 +11,10 @@ import unittest
 from cursor_agent_client import (
     CursorEventParseError,
     build_cursor_cmd,
+    cursor_account_is_free_tier,
     cursor_permission_flags,
     normalize_cursor_stream_event,
+    parse_cursor_account_tier,
     parse_cursor_auth_status,
     parse_cursor_models_list,
 )
@@ -277,6 +279,68 @@ class ParseCursorAuthStatusTests(unittest.TestCase):
     ) -> None:
         result = parse_cursor_auth_status("something the CLI never printed before")
         self.assertEqual(result["state"], "error")
+
+
+# Real captured output from `agent about` (2026.08.11-e8db854, authenticated,
+# on an account since upgraded to Cursor Pro).
+REAL_ABOUT_OUTPUT_PRO = """About Cursor CLI
+
+CLI Version         2026.08.11-e8db854
+Model               Claude Sonnet 5 300K High
+Subscription Tier   Pro
+OS                  darwin (arm64)
+Terminal            unknown
+Shell               zsh
+User Email          georgialin1999@gmail.com
+"""
+
+# Same account/table shape, tier value swapped to what a free-plan account is
+# expected to report - not independently captured (the account was upgraded
+# before this was written), so treat the exact free-tier label as unverified
+# until seen for real; the parser only needs the row's position/format,
+# which is captured above.
+ABOUT_OUTPUT_FREE_PLAN_EXPECTED_SHAPE = """About Cursor CLI
+
+CLI Version         2026.08.11-e8db854
+Model               Auto
+Subscription Tier   Free
+OS                  darwin (arm64)
+Terminal            unknown
+Shell               zsh
+User Email          georgialin1999@gmail.com
+"""
+
+
+class ParseCursorAccountTierTests(unittest.TestCase):
+    def test_paid_tier_from_real_captured_output(self) -> None:
+        self.assertEqual(parse_cursor_account_tier(REAL_ABOUT_OUTPUT_PRO), "Pro")
+
+    def test_free_tier(self) -> None:
+        self.assertEqual(
+            parse_cursor_account_tier(ABOUT_OUTPUT_FREE_PLAN_EXPECTED_SHAPE), "Free"
+        )
+
+    def test_missing_row_returns_none(self) -> None:
+        self.assertIsNone(parse_cursor_account_tier("About Cursor CLI\n\nOS   darwin\n"))
+
+
+class CursorAccountIsFreeTierTests(unittest.TestCase):
+    def test_pro_is_not_free(self) -> None:
+        self.assertFalse(cursor_account_is_free_tier("Pro"))
+
+    def test_case_and_whitespace_insensitive(self) -> None:
+        self.assertFalse(cursor_account_is_free_tier("  pro  "))
+
+    def test_free_is_free(self) -> None:
+        self.assertTrue(cursor_account_is_free_tier("Free"))
+
+    def test_unknown_or_missing_tier_fails_toward_free(self) -> None:
+        # Fail toward locking named models rather than letting a turn hit
+        # Cursor's own ActionRequiredError - see the docstring on
+        # cursor_account_is_free_tier for why "unknown" leans locked.
+        self.assertTrue(cursor_account_is_free_tier(None))
+        self.assertTrue(cursor_account_is_free_tier(""))
+        self.assertTrue(cursor_account_is_free_tier("SomeFutureTierName"))
 
 
 class CursorPermissionFlagsTests(unittest.TestCase):

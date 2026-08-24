@@ -276,3 +276,49 @@ def parse_cursor_auth_status(status_output: str) -> dict[str, Any]:
         email = text[len("✓ Logged in as "):].strip()
         return {"state": "ready", "email": email or None}
     return {"state": "error", "message": text}
+
+
+# Real captured `agent about` output only ever showed a single free-form
+# "Subscription Tier" value (e.g. "Pro"). Any tier that isn't recognized as a
+# paid one is treated as free/unknown by cursor_account_is_free_tier() below,
+# so a future tier name we haven't seen yet still locks named models rather
+# than silently allowing turns that would fail server-side - failing toward
+# the safer (if less convenient) UI state.
+CURSOR_KNOWN_PAID_TIERS = {"pro", "pro+", "ultra", "business", "enterprise", "teams"}
+
+
+def parse_cursor_account_tier(about_output: str) -> str | None:
+    """Parse ``agent about``'s table output for the ``Subscription Tier`` row.
+
+    Real captured output (2026.08.11-e8db854, authenticated):
+        About Cursor CLI
+
+        CLI Version         2026.08.11-e8db854
+        Model               Claude Sonnet 5 300K High
+        Subscription Tier   Pro
+        OS                  darwin (arm64)
+        ...
+
+    Returns the raw tier string (e.g. "Pro") verbatim, or None if the row
+    isn't present (older CLI, or output shape changed).
+    """
+    for raw_line in about_output.splitlines():
+        line = raw_line.strip()
+        if not line.lower().startswith("subscription tier"):
+            continue
+        _, _, value = line.partition("Subscription Tier")
+        return value.strip() or None
+    return None
+
+
+def cursor_account_is_free_tier(tier: str | None) -> bool:
+    """True unless the tier is recognized as a paid one.
+
+    Deliberately fails toward "free" (locks named models in the picker) for
+    an unparseable/unrecognized/missing tier, rather than toward "paid" -
+    picking a named model that then fails server-side with
+    ActionRequiredError is worse UX than a model staying locked one CLI
+    release longer than strictly necessary.
+    """
+    clean = str(tier or "").strip().lower()
+    return clean not in CURSOR_KNOWN_PAID_TIERS

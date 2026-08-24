@@ -76,6 +76,31 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     self.assertEqual(job["prompt"], prompt)
 
+    def test_client_safe_event_projects_completed_commentary_into_chat_body(self) -> None:
+        commentary = self.event(
+            23,
+            "reasoning_summary",
+            run_id="run-1",
+            item_id="commentary-1",
+            phase="commentary",
+            text="Training is healthy at step 25.",
+        )
+        private_reasoning = self.event(
+            24,
+            "reasoning_summary",
+            run_id="run-1",
+            text="Private reasoning",
+        )
+
+        projected = agent_server.client_safe_event(commentary)
+
+        self.assertIsNot(projected, commentary)
+        self.assertEqual(projected["type"], "assistant_text")
+        self.assertEqual(projected["phase"], "commentary")
+        self.assertEqual(projected["text"], commentary["text"])
+        self.assertEqual(commentary["type"], "reasoning_summary")
+        self.assertIs(agent_server.client_safe_event(private_reasoning), private_reasoning)
+
     def test_history_projects_promptless_job_for_older_clients(self) -> None:
         path = agent_server.events_path(self.session_id)
         stored = self.event(1, "job_created", job={"id": "job-1", "title": "Data Repeater"})
@@ -103,6 +128,34 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("prompt", event["job"])
         persisted = json.loads(agent_server.events_path(self.session_id).read_text(encoding="utf-8").splitlines()[-1])
         self.assertNotIn("prompt", persisted["job"])
+
+    async def test_append_event_broadcasts_commentary_as_body_without_rewriting_history(self) -> None:
+        broadcast = AsyncMock()
+        with patch.object(agent_server.HUB, "broadcast", new=broadcast), patch.object(
+            agent_server,
+            "ensure_dirs",
+        ):
+            event = await agent_server.append_event(
+                self.session_id,
+                "reasoning_summary",
+                {
+                    "run_id": "run-1",
+                    "item_id": "commentary-1",
+                    "phase": "commentary",
+                    "text": "Training is healthy at step 25.",
+                },
+            )
+
+        live_event = broadcast.await_args.args[1]
+        self.assertEqual(live_event["type"], "assistant_text")
+        self.assertEqual(live_event["phase"], "commentary")
+        self.assertEqual(event["type"], "reasoning_summary")
+        persisted = json.loads(
+            agent_server.events_path(self.session_id)
+            .read_text(encoding="utf-8")
+            .splitlines()[-1]
+        )
+        self.assertEqual(persisted["type"], "reasoning_summary")
 
     def test_compact_filter_preserves_conversation_system_job_and_file_events(self) -> None:
         default_page = agent_server.read_visible_events_page(
@@ -170,7 +223,7 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
             [(event["seq"], event["type"]) for event in page[0]],
             [
                 (1, "turn_started"),
-                (3, "reasoning_summary"),
+                (3, "assistant_text"),
                 (5, "assistant_text"),
             ],
         )
@@ -658,7 +711,8 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
             for event in page["events"]
         ))
         self.assertTrue(any(
-            event["type"] == "reasoning_summary"
+            event["type"] == "assistant_text"
+            and event.get("phase") == "commentary"
             and event.get("run_id") == "job-run"
             for event in page["events"]
         ))
@@ -669,7 +723,7 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             [event["type"] for event in trace["events"]],
-            ["reasoning_summary", "tool_started"],
+            ["assistant_text", "tool_started"],
         )
 
     def test_native_steer_stop_uses_legacy_run_to_job_mapping(self) -> None:
@@ -1710,7 +1764,7 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
         commentary = [
             event
             for event in page["events"]
-            if event["type"] == "reasoning_summary"
+            if event["type"] == "assistant_text"
             and event.get("phase") == "commentary"
         ]
         self.assertEqual(
@@ -1800,7 +1854,7 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
         commentary = [
             event
             for event in page["events"]
-            if event["type"] == "reasoning_summary"
+            if event["type"] == "assistant_text"
             and event.get("phase") == "commentary"
         ]
         self.assertEqual(
@@ -1891,7 +1945,7 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
         commentary = [
             event
             for event in page["events"]
-            if event["type"] == "reasoning_summary"
+            if event["type"] == "assistant_text"
             and event.get("phase") == "commentary"
         ]
         self.assertEqual(

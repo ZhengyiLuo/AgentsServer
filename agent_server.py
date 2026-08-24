@@ -14611,8 +14611,27 @@ def event_files_belong_to_session(event: dict[str, Any], session_id: str | None 
     return True
 
 
+def is_completed_commentary_event(event: dict[str, Any]) -> bool:
+    """Return whether an event is durable completed agent commentary."""
+    return (
+        str(event.get("type") or "") in {"reasoning_summary", "assistant_text"}
+        and str(event.get("phase") or "") == "commentary"
+        and bool(str(event.get("text") or "").strip())
+    )
+
+
 def client_safe_event(event: dict[str, Any]) -> dict[str, Any]:
     safe = event
+    if (
+        str(event.get("type") or "") == "reasoning_summary"
+        and is_completed_commentary_event(event)
+    ):
+        # Codex reports completed progress updates as agent messages with the
+        # commentary phase. Keep the provider-shaped event in durable history,
+        # but expose it as assistant text so every client path (live, catch-up,
+        # and reload) renders the update in the conversation body.
+        safe = dict(event)
+        safe["type"] = "assistant_text"
     if (
         "provider_cross_chat_route_snapshot" in event
         or "secure_peer_route_snapshots" in event
@@ -15264,15 +15283,6 @@ async def send_event_catchup(
             completed_scan = True
             break
     return through if completed_scan else cursor
-
-
-def is_completed_commentary_event(event: dict[str, Any]) -> bool:
-    """Return whether an event is durable completed agent commentary."""
-    return (
-        str(event.get("type") or "") == "reasoning_summary"
-        and str(event.get("phase") or "") == "commentary"
-        and bool(str(event.get("text") or "").strip())
-    )
 
 
 COMPACT_TIMELINE_HIDDEN_TYPES = {
@@ -18144,6 +18154,7 @@ def new_semantic_job_state(landmark: dict[str, Any]) -> dict[str, Any]:
         # but these anchors make an interrupted job's retained reasoning
         # visibly discoverable immediately after a chat reload.
         "latest_run_reasoning": None,
+        "latest_run_commentary": None,
         "latest_run_tool": None,
         "title": str(landmark.get("title") or "Scheduled job"),
         "job": None,
@@ -18207,11 +18218,14 @@ def add_semantic_job_event(state: dict[str, Any], event: dict[str, Any]) -> None
             state["latest_run_id"] = run_id
             state["latest_run_extras"] = deque(maxlen=SEMANTIC_TIMELINE_JOB_EXTRA_LIMIT)
             state["latest_run_reasoning"] = None
+            state["latest_run_commentary"] = None
             state["latest_run_tool"] = None
         state["latest_run_seq"] = seq
     if run_id == state.get("latest_run_id"):
         event_type = str(event.get("type") or "")
-        if event_type == "reasoning_summary":
+        if is_completed_commentary_event(event):
+            state["latest_run_commentary"] = event
+        elif event_type == "reasoning_summary":
             state["latest_run_reasoning"] = event
         elif event_type in {"tool_started", "tool_finished"}:
             state["latest_run_tool"] = event
@@ -18429,9 +18443,19 @@ def semantic_timeline_ordinary_candidates(
         (event for event in ordered if str(event.get("type") or "") == "turn_started"),
         None,
     )
+    display_events = [
+        event for event in ordered if semantic_timeline_event_is_display(event)
+    ]
+    # A stopped/completed lifecycle marker remains the turn representative
+    # even when Codex flushes completed commentary afterward. Commentary is
+    # retained separately below, so it must not displace the terminal state.
     latest_display = next(
-        (event for event in reversed(ordered) if semantic_timeline_event_is_display(event)),
-        ordered[-1],
+        (
+            event
+            for event in reversed(display_events)
+            if not is_completed_commentary_event(event)
+        ),
+        display_events[-1] if display_events else ordered[-1],
     )
     primary = [latest_display]
     secondary_event = first_turn
@@ -18695,6 +18719,12 @@ def collect_semantic_timeline_events(
                     [state["latest_run_reasoning"]]
                     if retain_interrupted_trace_anchor
                     and isinstance(state.get("latest_run_reasoning"), dict)
+                    else []
+                ),
+                *(
+                    [state["latest_run_commentary"]]
+                    if retain_interrupted_trace_anchor
+                    and isinstance(state.get("latest_run_commentary"), dict)
                     else []
                 ),
                 *(

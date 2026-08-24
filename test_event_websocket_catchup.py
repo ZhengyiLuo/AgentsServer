@@ -24,6 +24,40 @@ class FakeWebSocket:
 
 
 class EventWebSocketCatchupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_catchup_projects_completed_commentary_into_chat_body(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "events.jsonl"
+            path.write_text(
+                json.dumps({
+                    "seq": 1,
+                    "id": "commentary-1",
+                    "session_id": "chat",
+                    "type": "reasoning_summary",
+                    "phase": "commentary",
+                    "ts": "2026-07-28T00:00:00Z",
+                    "text": "Still validating step 25.",
+                })
+                + "\n",
+                encoding="utf-8",
+            )
+
+            socket = FakeWebSocket()
+            with (
+                patch.object(agent_server, "events_path", return_value=path),
+                patch.object(agent_server, "fork_internal_run_ids", return_value=set()),
+            ):
+                cursor = await agent_server.send_event_catchup(
+                    "chat",
+                    socket,  # type: ignore[arg-type]
+                    after=0,
+                    through=1,
+                    visible=True,
+                )
+
+        self.assertEqual(cursor, 1)
+        self.assertEqual(socket.events[0]["type"], "assistant_text")
+        self.assertEqual(socket.events[0]["phase"], "commentary")
+
     async def test_catchup_drains_more_than_one_page_without_raw_events(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "events.jsonl"

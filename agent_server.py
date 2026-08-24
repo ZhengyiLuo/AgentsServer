@@ -31166,6 +31166,53 @@ def parse_claude_help_catalog() -> dict[str, Any]:
     }
 
 
+def discover_cursor_catalog() -> dict[str, Any]:
+    """Discover real, per-account selectable Cursor models via `agent --list-models`.
+
+    Free-plan Cursor accounts still list every model name here, but reject
+    any of them except "auto" at turn-launch time with "ActionRequiredError:
+    Named models unavailable Free plans can only use Auto" (confirmed live).
+    That's an account-tier restriction enforced by Cursor's own API, not
+    something this discovery step can or should filter - if a free-plan
+    turn picks a named model, the real error surfaces as a normal turn
+    "error" event, the same as any other provider rejection.
+
+    Parsing is delegated to cursor_agent_client.parse_cursor_models_list(),
+    which is unit-tested against real captured output from more than one
+    CLI version/account tier (the default-marker format itself changed
+    between captures: "(current, default)" vs plain "(default)").
+    """
+    model_source = "agent --list-models"
+    try:
+        from cursor_agent_client import parse_cursor_models_list
+        output = run_catalog_command([CURSOR_BIN, "--list-models"])
+        parsed = parse_cursor_models_list(output)
+    except Exception as exc:
+        logger.warning("cursor model discovery failed: %s", exc)
+        parsed = []
+        model_source = f"{model_source} failed"
+    if not parsed:
+        # Never regress below the one value already confirmed to work.
+        return {
+            "models": [runtime_option("auto", "Auto")],
+            "efforts": [],
+            "model_source": model_source if "failed" in model_source else f"{model_source} empty",
+            "effort_source": "none",
+            "default_model": "auto",
+            "default_effort": None,
+        }
+    default_entry = next((model for model in parsed if model.get("is_default")), parsed[0])
+    model_options = [runtime_option(model["id"], model["label"]) for model in parsed]
+    return {
+        "models": unique_runtime_options(model_options, default_entry["label"]),
+        "efforts": [],
+        "model_source": model_source,
+        "effort_source": "none",
+        "default_model": str(default_entry.get("id") or "auto"),
+        "default_effort": None,
+    }
+
+
 def discover_runtime_catalog(*, force_runtime_probe: bool = False) -> dict[str, Any]:
     diagnostics = refresh_runtime_diagnostics(force=force_runtime_probe)
     catalog = {
@@ -31173,6 +31220,7 @@ def discover_runtime_catalog(*, force_runtime_probe: bool = False) -> dict[str, 
         "backends": {
             BACKEND_CLAUDE: parse_claude_help_catalog(),
             BACKEND_CODEX: discover_codex_catalog(),
+            BACKEND_CURSOR: discover_cursor_catalog(),
         },
     }
     for backend, diagnostic in diagnostics.items():

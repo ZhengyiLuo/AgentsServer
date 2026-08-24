@@ -32,6 +32,7 @@ Known gaps this prototype does NOT attempt to resolve yet:
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Iterator
 
 
@@ -189,9 +190,13 @@ def parse_cursor_models_list(output: str) -> list[dict[str, Any]]:
         model_id, _, label = line.partition(" - ")
         model_id = model_id.strip()
         label = label.strip()
-        is_default = "(current, default)" in label
-        if is_default:
-            label = label.replace("(current, default)", "").strip()
+        # Real captured formats have varied by CLI version: "(current,
+        # default)" and, later, plain "(default)". Match "default" as a
+        # word inside a trailing parenthetical rather than one exact phrase.
+        default_match = re.search(r"\(\s*[^)]*\bdefault\b[^)]*\)\s*$", label, re.IGNORECASE)
+        is_default = default_match is not None
+        if default_match:
+            label = label[: default_match.start()].strip()
         models.append({
             "id": model_id,
             "label": label,

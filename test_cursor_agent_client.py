@@ -21,12 +21,27 @@ SESSION_ID = "51cc22bb-e694-4f7c-807b-961b5b41810c"
 
 # Real captured output from `agent --list-models` (2026.08.11-e8db854),
 # truncated to a representative slice - the full list is 200+ lines.
+# Captured on a free-plan account; the CLI used "(current, default)" then.
 REAL_MODELS_LIST_OUTPUT = """Available models
 
 auto - Auto (current, default)
 gpt-5.3-codex-low - Codex 5.3 Low
 claude-sonnet-5-thinking-high - Claude Sonnet 5 1M Thinking
 gpt-5.4-nano-none - GPT-5.4 Nano None
+
+Tip: use --model <id> (or /model <id> in interactive mode) to switch. Parameterized models also accept quoted overrides, e.g. --model 'claude-opus-4-8[context=1m,effort=high,fast=false]'.
+"""
+
+# Re-captured later against the same CLI version after upgrading to a paid
+# plan: the default marker changed to plain "(default)" with no "current,"
+# prefix - real evidence the label format isn't stable across accounts/time,
+# which is exactly what broke the naive substring match this fixture guards.
+REAL_MODELS_LIST_OUTPUT_PAID_PLAN = """Available models
+
+auto - Auto (default)
+gpt-5.3-codex-low - Codex 5.3 Low
+gpt-5.3-codex-low-fast - Codex 5.3 Low Fast
+claude-sonnet-5-thinking-high - Claude Sonnet 5 1M Thinking
 
 Tip: use --model <id> (or /model <id> in interactive mode) to switch. Parameterized models also accept quoted overrides, e.g. --model 'claude-opus-4-8[context=1m,effort=high,fast=false]'.
 """
@@ -222,6 +237,17 @@ class ParseCursorModelsListTests(unittest.TestCase):
             by_id["claude-sonnet-5-thinking-high"]["label"],
             "Claude Sonnet 5 1M Thinking",
         )
+
+    def test_parses_real_captured_output_paid_plan_default_format(self) -> None:
+        # Guards the "(current, default)" vs "(default)" format drift found
+        # live: the naive substring match silently made is_default always
+        # False against this real later-captured output.
+        models = parse_cursor_models_list(REAL_MODELS_LIST_OUTPUT_PAID_PLAN)
+        by_id = {model["id"]: model for model in models}
+        self.assertEqual(len(models), 4)
+        self.assertTrue(by_id["auto"]["is_default"])
+        self.assertEqual(by_id["auto"]["label"], "Auto")
+        self.assertFalse(by_id["gpt-5.3-codex-low-fast"]["is_default"])
 
     def test_empty_output_yields_no_models(self) -> None:
         self.assertEqual(parse_cursor_models_list(""), [])

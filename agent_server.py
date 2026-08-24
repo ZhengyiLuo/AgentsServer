@@ -15266,6 +15266,15 @@ async def send_event_catchup(
     return through if completed_scan else cursor
 
 
+def is_completed_commentary_event(event: dict[str, Any]) -> bool:
+    """Return whether an event is durable completed agent commentary."""
+    return (
+        str(event.get("type") or "") == "reasoning_summary"
+        and str(event.get("phase") or "") == "commentary"
+        and bool(str(event.get("text") or "").strip())
+    )
+
+
 COMPACT_TIMELINE_HIDDEN_TYPES = {
     "raw_event",
     "reasoning_summary",
@@ -15291,6 +15300,8 @@ def is_visible_timeline_event(
         return False
     event_type = str(event.get("type") or "")
     if compact:
+        if is_completed_commentary_event(event):
+            return True
         return event_type not in COMPACT_TIMELINE_HIDDEN_TYPES
     return event_type != "raw_event"
 
@@ -18389,17 +18400,6 @@ def semantic_timeline_event_is_display(event: dict[str, Any]) -> bool:
     return event_type not in TIMELINE_INDEX_TRACE_TYPES and event_type != "turn_started"
 
 
-def semantic_timeline_event_is_completed_commentary(
-    event: dict[str, Any],
-) -> bool:
-    """Return whether an event is durable completed agent commentary."""
-    return (
-        str(event.get("type") or "") == "reasoning_summary"
-        and str(event.get("phase") or "") == "commentary"
-        and bool(str(event.get("text") or "").strip())
-    )
-
-
 def semantic_timeline_event_is_trace_anchor(event: dict[str, Any]) -> bool:
     """Keep one lightweight handle so completed trace detail stays discoverable."""
     event_type = str(event.get("type") or "")
@@ -18467,7 +18467,7 @@ def semantic_timeline_ordinary_candidates(
         event
         for event in remaining
         if preserve_completed_commentary
-        and semantic_timeline_event_is_completed_commentary(event)
+        and is_completed_commentary_event(event)
     ]
     essential = [*detail_essential, *commentary_essential]
     essential_ids = {

@@ -139,6 +139,44 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual(compact_page[1:], (22, 11, 0, 0))
 
+    def test_compact_filter_preserves_commentary_but_hides_private_trace(self) -> None:
+        self.write_events([
+            self.event(1, "turn_started", run_id="run-1", prompt="Monitor it"),
+            self.event(
+                2,
+                "reasoning_summary",
+                run_id="run-1",
+                text="Private reasoning",
+            ),
+            self.event(
+                3,
+                "reasoning_summary",
+                run_id="run-1",
+                phase="commentary",
+                text="Training is healthy at step 25.",
+            ),
+            self.event(4, "tool_started", run_id="run-1", tool={"name": "exec"}),
+            self.event(5, "assistant_text", run_id="run-1", text="Still running."),
+        ])
+
+        page = agent_server.read_visible_events_page(
+            self.session_id,
+            limit=100,
+            tail=False,
+            compact=True,
+        )
+
+        self.assertEqual(
+            [(event["seq"], event["type"]) for event in page[0]],
+            [
+                (1, "turn_started"),
+                (3, "reasoning_summary"),
+                (5, "assistant_text"),
+            ],
+        )
+        self.assertEqual(page[0][1]["phase"], "commentary")
+        self.assertEqual(page[1:], (5, 3, 0, 0))
+
     def test_compact_before_and_after_pages_count_only_compact_events(self) -> None:
         before_page = agent_server.read_visible_events_page(
             self.session_id,

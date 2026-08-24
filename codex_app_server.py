@@ -332,6 +332,7 @@ class CodexAppServerTurn:
     thread_id: str
     turn_id: str
     _subscription: CodexAppServerSubscription
+    _follow_goal_continuations: bool = False
     _closed: bool = False
     _completed: bool = False
 
@@ -384,7 +385,8 @@ class CodexAppServerTurn:
                 f"provisional turn already bound to {self.turn_id}, not {resolved}"
             )
         self.turn_id = resolved
-        self._subscription.turn_id = resolved
+        if not self._follow_goal_continuations:
+            self._subscription.turn_id = resolved
 
     async def close(self) -> None:
         if self._closed:
@@ -979,7 +981,10 @@ class CodexAppServerClient:
             # turn/interrupt to target the work that is actually running.
             if not active_turn.turn_id or method == "turn/started":
                 active_turn.turn_id = turn_id
-                active_turn._subscription.turn_id = turn_id
+                if not active_turn._follow_goal_continuations:
+                    active_turn._subscription.turn_id = turn_id
+                if method == "turn/started":
+                    active_turn._completed = False
 
         for subscription in tuple(self._subscriptions):
             if subscription._matches(notification):
@@ -1024,9 +1029,10 @@ class CodexAppServerClient:
         if method == "turn/completed" and active_turn:
             if not turn_id or not active_turn.turn_id or turn_id == active_turn.turn_id:
                 active_turn._completed = True
-                if self._turns_by_thread.get(thread_id) is active_turn:
-                    self._turns_by_thread.pop(thread_id, None)
-                active_turn._subscription._finish()
+                if not active_turn._follow_goal_continuations:
+                    if self._turns_by_thread.get(thread_id) is active_turn:
+                        self._turns_by_thread.pop(thread_id, None)
+                    active_turn._subscription._finish()
         if method == "turn/completed" and thread_id and turn_id:
             self._finish_scoped_subscriptions(thread_id, turn_id=turn_id)
         elif method == "thread/closed" and thread_id:
@@ -2008,6 +2014,7 @@ class CodexAppServerClient:
         input_items: list[dict[str, Any]],
         *,
         overrides: dict[str, Any] | None = None,
+        follow_goal_continuations: bool = False,
     ) -> CodexAppServerTurn:
         # Initialize before installing the provisional turn subscription.
         # Otherwise the first lazy start would correctly discard it as stale
@@ -2019,7 +2026,13 @@ class CodexAppServerClient:
             )
 
         subscription = self.subscribe(thread_id=thread_id)
-        provisional = CodexAppServerTurn(self, thread_id, "", subscription)
+        provisional = CodexAppServerTurn(
+            self,
+            thread_id,
+            "",
+            subscription,
+            _follow_goal_continuations=follow_goal_continuations,
+        )
         self._turns_by_thread[thread_id] = provisional
 
         params = dict(overrides or {})
@@ -2042,7 +2055,8 @@ class CodexAppServerClient:
                     safe_to_retry=False,
                 )
             provisional.turn_id = turn_id
-            provisional._subscription.turn_id = turn_id
+            if not follow_goal_continuations:
+                provisional._subscription.turn_id = turn_id
             return provisional
         except CodexAppServerError as exc:
             if not exc.safe_to_retry:
@@ -2343,11 +2357,13 @@ class CodexAppServerManager:
         input_items: list[dict[str, Any]],
         *,
         overrides: dict[str, Any] | None = None,
+        follow_goal_continuations: bool = False,
     ) -> CodexAppServerTurn:
         return await self.client.start_turn(
             thread_id,
             input_items,
             overrides=overrides,
+            follow_goal_continuations=follow_goal_continuations,
         )
 
     async def steer_turn(

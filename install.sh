@@ -1686,7 +1686,7 @@ stop_managed_systemd_service_bounded() {
   fi
   echo "AgentsServer did not finish its bounded managed-update stop; terminating the exact drained service cgroup." >&2
   if ! systemctl --user kill \
-      --kill-whom=all \
+      --kill-who=all \
       --signal=SIGKILL \
       "$SERVICE_NAME.service"; then
     # systemctl may race the unit's final transition and report that there is

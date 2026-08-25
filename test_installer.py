@@ -136,6 +136,12 @@ class InstallerContractTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_bounded_systemd_kill_uses_the_systemd_249_option_name(self):
+        source = INSTALLER.read_text()
+        self.assertIn("--kill-who=all", source)
+        self.assertNotIn("--kill-whom", source)
+        self.assertIn('"$SERVICE_NAME.service"', source)
+
     def test_managed_update_private_environment_is_consumed_and_cli_overrides_it(self):
         source = INSTALLER.read_text()
         captured = source.index(
@@ -262,7 +268,7 @@ case "$*" in
     if [ -e "$FAKE_STOPPED_SENTINEL" ]; then echo inactive; else echo deactivating; fi
     exit 0
     ;;
-  "--user kill --kill-whom=all --signal=SIGKILL agents-server.service")
+  "--user kill --kill-who=all --signal=SIGKILL agents-server.service")
     : > "$FAKE_STOPPED_SENTINEL"
     exit 0
     ;;
@@ -300,7 +306,7 @@ exit 0
 
         self.assertEqual(result.returncode, 0, result.stderr)
         kill = lines.index(
-            "--user kill --kill-whom=all --signal=SIGKILL agents-server.service"
+            "--user kill --kill-who=all --signal=SIGKILL agents-server.service"
         )
         start = lines.index("--user start --no-block agents-server.service")
         self.assertLess(kill, start)
@@ -332,7 +338,7 @@ case "$*" in
     if [ "$current" -gt 50 ]; then echo inactive; else echo deactivating; fi
     exit 0
     ;;
-  "--user kill --kill-whom=all --signal=SIGKILL agents-server.service")
+  "--user kill --kill-who=all --signal=SIGKILL agents-server.service")
     exit 99
     ;;
 esac
@@ -369,7 +375,7 @@ exit 0
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn(
-            "--user kill --kill-whom=all --signal=SIGKILL agents-server.service",
+            "--user kill --kill-who=all --signal=SIGKILL agents-server.service",
             lines,
         )
         self.assertIn("--user start --no-block agents-server.service", lines)
@@ -393,7 +399,7 @@ printf '%s\n' "$*" >> "$FAKE_EVENT_LOG"
 case "$*" in
   "--user show agents-server.service --property=ActiveState --value")
     if [ -e "$FAKE_STOPPED_SENTINEL" ]; then echo inactive; else echo deactivating; fi ;;
-  "--user kill --kill-whom=all --signal=SIGKILL agents-server.service")
+  "--user kill --kill-who=all --signal=SIGKILL agents-server.service")
     : > "$FAKE_STOPPED_SENTINEL" ;;
 esac
 exit 0
@@ -425,7 +431,7 @@ exit 0
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
-            "--user kill --kill-whom=all --signal=SIGKILL agents-server.service",
+            "--user kill --kill-who=all --signal=SIGKILL agents-server.service",
             stubborn_lines,
         )
         self.assertEqual(stubborn_lines[-1], "--user start --no-block agents-server.service")
@@ -452,7 +458,7 @@ case "$*" in
     current=$((current + 1))
     printf '%s\n' "$current" > "$FAKE_SHOW_COUNT"
     if [ "$current" -gt 2 ]; then echo inactive; else echo deactivating; fi ;;
-  "--user kill --kill-whom=all --signal=SIGKILL agents-server.service") exit 99 ;;
+  "--user kill --kill-who=all --signal=SIGKILL agents-server.service") exit 99 ;;
 esac
 exit 0
 """,
@@ -619,7 +625,7 @@ exit 0
                 systemctl("stop", "--no-block", unit_name)
                 systemctl(
                     "kill",
-                    "--kill-whom=all",
+                    "--kill-who=all",
                     "--signal=SIGKILL",
                     unit_name,
                 )

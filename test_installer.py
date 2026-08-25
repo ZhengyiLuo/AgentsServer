@@ -240,10 +240,11 @@ class InstallerContractTests(unittest.TestCase):
                 text=True,
                 check=False,
             )
+            after = self.snapshot_trees(install_root)
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("managed updater isolation", result.stderr)
-        self.assertEqual(self.snapshot_trees(install_root), before)
+        self.assertEqual(after, before)
 
     def test_linux_managed_update_force_stops_exact_unit_then_starts(self):
         if not Path("/proc/self/cgroup").is_file():

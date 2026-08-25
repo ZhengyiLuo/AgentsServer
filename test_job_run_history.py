@@ -79,6 +79,74 @@ class JobRunHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(oldest["has_more"])
         self.assertIsNone(oldest["next_before"])
 
+    def test_timeline_group_filter_keeps_card_history_segment_local(self) -> None:
+        self.write_events([
+            self.event(
+                1,
+                "turn_started",
+                run_id="run-1",
+                purpose="scheduled_job",
+                job_id="job-1",
+                prompt="Poll",
+            ),
+            self.event(
+                2,
+                "turn_finished",
+                run_id="run-1",
+                purpose="scheduled_job",
+                job_id="job-1",
+                result_text="First result",
+            ),
+            self.event(3, "turn_started", run_id="human", prompt="Question"),
+            self.event(4, "turn_finished", run_id="human", result_text="Answer"),
+            self.event(
+                5,
+                "turn_started",
+                run_id="run-2",
+                purpose="scheduled_job",
+                job_id="job-1",
+                prompt="Poll",
+            ),
+            self.event(
+                6,
+                "turn_finished",
+                run_id="run-2",
+                purpose="scheduled_job",
+                job_id="job-1",
+                result_text="Second result",
+            ),
+        ])
+
+        global_history = agent_server.read_scheduled_job_runs(
+            self.session_id,
+            "job-1",
+        )
+        first_group = agent_server.read_scheduled_job_runs(
+            self.session_id,
+            "job-1",
+            timeline_group_id="job:job-1",
+        )
+        second_group = agent_server.read_scheduled_job_runs(
+            self.session_id,
+            "job-1",
+            timeline_group_id="job:job-1:segment:5",
+        )
+
+        self.assertEqual(global_history["total"], 2)
+        self.assertIsNone(global_history["timeline_group_id"])
+        self.assertEqual(
+            [event["run_id"] for event in first_group["runs"]],
+            ["run-1"],
+        )
+        self.assertEqual(
+            [event["run_id"] for event in second_group["runs"]],
+            ["run-2"],
+        )
+        self.assertEqual(
+            second_group["runs"][0]["job_timeline_group_id"],
+            "job:job-1:segment:5",
+        )
+
     def test_incrementally_adds_appended_runs_without_losing_cached_history(self) -> None:
         first = agent_server.read_scheduled_job_runs(
             self.session_id,
@@ -843,6 +911,99 @@ class JobRunHistoryTests(unittest.IsolatedAsyncioTestCase):
                 anchor_seq=99,
             )
 
+    def test_trace_occurrence_filters_reused_run_id_after_late_finish(self) -> None:
+        common = {
+            "run_id": "reused",
+            "purpose": "scheduled_job",
+            "job_id": "job-1",
+            "job_title": "Monitor",
+        }
+        first = {**common, "job_scheduled_run_at": 1_775_000_000.0}
+        second = {**common, "job_scheduled_run_at": 1_775_003_600.0}
+        self.write_events([
+            self.event(1, "turn_started", prompt="First", **first),
+            self.event(2, "reasoning_summary", text="First trace", **first),
+            self.event(3, "tool_started", tool_name="first-tool", **first),
+            self.event(4, "turn_started", prompt="Second", **second),
+            self.event(5, "reasoning_summary", text="Second trace", **second),
+            self.event(6, "tool_started", tool_name="second-tool", **second),
+            self.event(7, "turn_finished", result_text="Second result", **second),
+            self.event(8, "turn_finished", result_text="First late result", **first),
+        ])
+
+        first_trace = agent_server.read_indexed_run_trace(
+            self.session_id,
+            "reused",
+            anchor_seq=8,
+        )
+        second_trace = agent_server.read_indexed_run_trace(
+            self.session_id,
+            "reused",
+            anchor_seq=7,
+        )
+
+        self.assertEqual(
+            [(event["seq"], event["type"]) for event in first_trace["events"]],
+            [(2, "reasoning_summary"), (3, "tool_started")],
+        )
+        self.assertEqual(
+            [(event["seq"], event["type"]) for event in second_trace["events"]],
+            [(5, "reasoning_summary"), (6, "tool_started")],
+        )
+
+    def test_history_snapshot_preserves_explicit_and_iso_occurrence_fields(self) -> None:
+        self.write_events([
+            self.event(
+                1,
+                "turn_started",
+                run_id="explicit-run",
+                purpose="scheduled_job",
+                job_id="job-1",
+                job_occurrence_id="occurrence-1",
+            ),
+            self.event(
+                2,
+                "turn_finished",
+                run_id="explicit-run",
+                purpose="scheduled_job",
+                job_id="job-1",
+                job_occurrence_id="occurrence-1",
+                result_text="Explicit result",
+            ),
+            self.event(
+                3,
+                "turn_started",
+                run_id="iso-run",
+                purpose="scheduled_job",
+                job_id="job-1",
+                job_scheduled_run_at_iso="2026-08-25T01:00:00Z",
+            ),
+            self.event(
+                4,
+                "turn_finished",
+                run_id="iso-run",
+                purpose="scheduled_job",
+                job_id="job-1",
+                job_scheduled_run_at_iso="2026-08-25T01:00:00Z",
+                result_text="ISO result",
+            ),
+        ])
+
+        history = agent_server.read_scheduled_job_runs(
+            self.session_id,
+            "job-1",
+        )
+
+        by_run = {event["run_id"]: event for event in history["runs"]}
+        self.assertEqual(
+            by_run["explicit-run"]["job_occurrence_id"],
+            "occurrence-1",
+        )
+        self.assertEqual(
+            by_run["iso-run"]["job_scheduled_run_at_iso"],
+            "2026-08-25T01:00:00Z",
+        )
+
     def test_cache_eviction_is_safe_during_concurrent_builds_and_history_reads(self) -> None:
         second_session = "job-history-chat-2"
         second_path = agent_server.events_path(second_session)
@@ -901,6 +1062,7 @@ class JobRunHistoryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response["session_id"], self.session_id)
         self.assertEqual(response["job_id"], "job-1")
+        self.assertIsNone(response["timeline_group_id"])
         self.assertEqual(response["total"], 5)
         self.assertEqual(len(response["runs"]), 3)
         self.assertTrue(response["has_more"])

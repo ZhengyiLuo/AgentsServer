@@ -27,7 +27,7 @@ from agentsdock_team_hub import (
     redeem_invitation,
     redeem_node_enrollment,
 )
-from agentsdock_team_hub.database import MigrationError
+from agentsdock_team_hub.database import MIGRATIONS, MigrationError
 
 
 NOW = 1_800_000_000
@@ -51,7 +51,7 @@ class DatabaseTests(unittest.TestCase):
         connection = open_database()
         self.addCleanup(connection.close)
 
-        self.assertEqual(LATEST_SCHEMA_VERSION, 5)
+        self.assertEqual(LATEST_SCHEMA_VERSION, 6)
         self.assertEqual(
             connection.execute("PRAGMA user_version").fetchone()[0],
             LATEST_SCHEMA_VERSION,
@@ -86,7 +86,65 @@ class DatabaseTests(unittest.TestCase):
                 "outbox_events",
                 "bootstrap_claims",
                 "bootstrap_delegations",
+                "network_peer_bindings",
+                "network_boards",
+                "network_mailbox_items",
+                "network_deliveries",
+                "network_passive_requests",
             }.issubset(table_names)
+        )
+
+    def test_version_five_database_upgrades_to_network_schema(self) -> None:
+        connection = sqlite3.connect(":memory:", isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(
+            """
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                sha256 TEXT NOT NULL CHECK(length(sha256) = 64),
+                applied_at INTEGER NOT NULL
+            )
+            """
+        )
+        for migration in MIGRATIONS[:5]:
+            connection.executescript(migration.source)
+            connection.execute(
+                """
+                INSERT INTO schema_migrations(version,name,sha256,applied_at)
+                VALUES (?,?,?,?)
+                """,
+                (migration.version, migration.name, migration.sha256, NOW),
+            )
+            connection.execute(f"PRAGMA user_version = {migration.version}")
+
+        self.assertEqual(apply_migrations(connection), 6)
+        self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+        objects = {
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type IN ('table','trigger','index')
+                """
+            )
+        }
+        self.assertTrue(
+            {
+                "network_peer_bindings",
+                "network_boards",
+                "network_mailbox_items",
+                "network_deliveries",
+                "network_passive_requests",
+                "network_agents_limit_per_server",
+                "network_bulletin_body_limit_on_insert",
+                "network_bulletin_body_limit_on_update",
+                "network_mailbox_sender_is_authorized",
+                "network_delivery_state_is_monotonic",
+                "network_request_state_is_forward_only",
+            }.issubset(objects)
         )
 
     def test_tailnet_bootstrap_delegation_is_bound_and_immutable(self) -> None:

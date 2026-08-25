@@ -20,7 +20,7 @@ import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 try:
@@ -71,6 +71,12 @@ NODE_CHALLENGE_TTL_SECONDS = 2 * 60
 RECOVERY_PROOF_TTL_SECONDS = 10 * 60
 TAILNET_BOOTSTRAP_PROOF_TTL_SECONDS = 5 * 60
 MAX_BOOTSTRAP_DELEGATION_LEDGER_ROWS = 256
+MAX_NETWORK_AGENTS_PER_SERVER = 256
+MAX_NETWORK_BODY_BYTES = 8_192
+MAX_NETWORK_PAGE_ITEMS = 100
+# Secure-peer responses are hard-capped at 2 MiB. Keep paged network payloads
+# below that transport ceiling, including JSON escaping and envelope fields.
+MAX_NETWORK_PAGE_RESPONSE_BYTES = 1_900_000
 LOCAL_CONTROL_PRINCIPAL_ID = "service_local_control"
 
 
@@ -538,7 +544,34 @@ class HubStore:
                         )
                     self.managed_host_identity = str(binding["server_identity"])
                 self._validate_owner_invariants(connection)
-                if not self._is_bootstrapped(connection):
+                bootstrapped = self._is_bootstrapped(connection)
+                if bootstrapped and self.managed_host_identity is not None:
+                    team_owners = connection.execute(
+                        """
+                        SELECT t.id AS team_id,m.principal_id AS owner_principal_id
+                        FROM teams AS t
+                        JOIN memberships AS m
+                          ON m.team_id=t.id AND m.role='owner' AND m.status='active'
+                        ORDER BY t.created_at,t.id
+                        """
+                    ).fetchall()
+                    # A managed AgentsServer identity is one logical server and
+                    # cannot be silently attached to multiple team networks.
+                    # Existing single-team databases are upgraded eagerly;
+                    # multi-team stores bind only through an explicit peer/team
+                    # approval path.
+                    if len(team_owners) == 1:
+                        team_owner = team_owners[0]
+                        self._ensure_managed_host_node(
+                            connection, team_owner["team_id"], timestamp
+                        )
+                        self._ensure_network_board(
+                            connection,
+                            team_owner["team_id"],
+                            team_owner["owner_principal_id"],
+                            timestamp,
+                        )
+                if not bootstrapped:
                     if not self._globally_empty(connection):
                         raise RuntimeError(
                             "Team Hub refuses a partial unbootstrapped identity database"
@@ -655,6 +688,24 @@ class HubStore:
                 "instance_id": self.instance_id,
                 "bootstrapped": bootstrapped,
                 "bootstrap_required": not bootstrapped,
+                "capabilities": {
+                    "team_network_v1": {
+                        "available": True,
+                        "version": 1,
+                        "logical_servers": True,
+                        "agent_registry": True,
+                        "bulletin": True,
+                        "mailbox": True,
+                        "delivery_receipts": ["delivered", "read"],
+                        "passive_requests": True,
+                        "server_invites": False,
+                        "skill_attachments": False,
+                        "dispatch": False,
+                        "max_agents_per_server": MAX_NETWORK_AGENTS_PER_SERVER,
+                        "max_page_items": MAX_NETWORK_PAGE_ITEMS,
+                        "max_body_bytes": MAX_NETWORK_BODY_BYTES,
+                    }
+                },
             }
         finally:
             connection.close()
@@ -1900,6 +1951,67 @@ class HubStore:
             raise HubError("peer_unavailable", "Secure peer is unavailable", 404)
         return "service_secure_peer_" + parsed.hex
 
+    def _ensure_managed_host_node(
+        self,
+        connection: sqlite3.Connection,
+        team_id: str,
+        timestamp: int,
+    ) -> str | None:
+        """Materialize the designated host as one ordinary logical server."""
+
+        identity = self.managed_host_identity
+        if identity is None:
+            return None
+        row = connection.execute(
+            """
+            SELECT n.id,n.team_id,n.principal_id,n.status,
+                   p.kind AS principal_kind,p.scope_team_id,p.status AS principal_status
+            FROM nodes AS n JOIN principals AS p ON p.id=n.principal_id
+            WHERE n.server_identity=?
+            """,
+            (identity,),
+        ).fetchone()
+        if row is not None:
+            if (
+                row["team_id"] != team_id
+                or row["principal_kind"] != "node"
+                or row["scope_team_id"] != team_id
+                or row["principal_status"] != "active"
+                or row["status"] == "revoked"
+            ):
+                raise HubError(
+                    "server_identity_conflict",
+                    "Managed server identity conflicts with Team Hub state",
+                    409,
+                )
+            if row["status"] != "active":
+                connection.execute(
+                    "UPDATE nodes SET status='active',last_seen_at=? WHERE id=?",
+                    (timestamp, row["id"]),
+                )
+            return str(row["id"])
+        principal_id = _id("node_principal")
+        node_id = _id("node")
+        label = "Team Hub host"
+        connection.execute(
+            """
+            INSERT INTO principals(
+                id,kind,scope_team_id,display_name,status,created_at,updated_at
+            ) VALUES (?,'node',?,?,'active',?,?)
+            """,
+            (principal_id, team_id, label, timestamp, timestamp),
+        )
+        connection.execute(
+            """
+            INSERT INTO nodes(
+                id,team_id,principal_id,server_identity,display_name,status,
+                enrolled_at,last_seen_at
+            ) VALUES (?,?,?,?,?,'active',?,?)
+            """,
+            (node_id, team_id, principal_id, identity, label, timestamp, timestamp),
+        )
+        return node_id
+
     def ensure_secure_peer_service(
         self,
         *,
@@ -1932,6 +2044,7 @@ class HubStore:
                 ).fetchone()
                 if team is None:
                     raise HubError("not_found", "Resource not found", 404)
+                self._ensure_managed_host_node(connection, clean_team, timestamp)
                 principal = connection.execute(
                     """
                     SELECT p.kind,p.scope_team_id,p.display_name,p.status,
@@ -2003,6 +2116,130 @@ class HubStore:
                         "Secure peer membership conflicts with Team Hub state",
                         409,
                     )
+                self._ensure_network_board(
+                    connection, clean_team, principal_id, timestamp
+                )
+                node = connection.execute(
+                    """
+                    SELECT n.id,n.team_id,n.principal_id,n.display_name,n.status,
+                           p.kind AS principal_kind,p.scope_team_id,p.status AS principal_status
+                    FROM nodes AS n
+                    JOIN principals AS p ON p.id=n.principal_id
+                    WHERE n.server_identity=?
+                    """,
+                    (identity,),
+                ).fetchone()
+                if node is None:
+                    node_principal_id = _id("node_principal")
+                    node_id = _id("node")
+                    connection.execute(
+                        """
+                        INSERT INTO principals(
+                            id,kind,scope_team_id,display_name,status,
+                            created_at,updated_at
+                        ) VALUES (?,'node',?,?,'active',?,?)
+                        """,
+                        (node_principal_id, clean_team, label, timestamp, timestamp),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO nodes(
+                            id,team_id,principal_id,server_identity,display_name,
+                            status,enrolled_at,last_seen_at
+                        ) VALUES (?,?,?,?,?,'active',?,?)
+                        """,
+                        (
+                            node_id,
+                            clean_team,
+                            node_principal_id,
+                            identity,
+                            label,
+                            timestamp,
+                            timestamp,
+                        ),
+                    )
+                    changed = True
+                else:
+                    if (
+                        node["team_id"] != clean_team
+                        or node["principal_kind"] != "node"
+                        or node["scope_team_id"] != clean_team
+                        or node["principal_status"] != "active"
+                        or node["status"] == "revoked"
+                    ):
+                        raise HubError(
+                            "peer_identity_conflict",
+                            "Secure peer server identity conflicts with Team Hub state",
+                            409,
+                        )
+                    node_id = str(node["id"])
+                    if node["display_name"] != label or node["status"] != "active":
+                        connection.execute(
+                            """
+                            UPDATE nodes
+                            SET display_name=?,status='active',last_seen_at=?
+                            WHERE id=?
+                            """,
+                            (label, timestamp, node_id),
+                        )
+                        connection.execute(
+                            """
+                            UPDATE principals SET display_name=?,updated_at=?
+                            WHERE id=?
+                            """,
+                            (label, timestamp, node["principal_id"]),
+                        )
+                        changed = True
+                binding = connection.execute(
+                    """
+                    SELECT peer_id,node_id,service_principal_id,
+                           peer_server_identity,status
+                    FROM network_peer_bindings WHERE peer_id=?
+                    """,
+                    (peer_id,),
+                ).fetchone()
+                active_for_node = connection.execute(
+                    """
+                    SELECT peer_id FROM network_peer_bindings
+                    WHERE team_id=? AND node_id=? AND status='active'
+                    """,
+                    (clean_team, node_id),
+                ).fetchone()
+                if binding is None:
+                    if active_for_node is not None:
+                        raise HubError(
+                            "peer_identity_conflict",
+                            "Server already has an active secure peer connection",
+                            409,
+                        )
+                    connection.execute(
+                        """
+                        INSERT INTO network_peer_bindings(
+                            peer_id,team_id,node_id,service_principal_id,
+                            peer_server_identity,status,created_at
+                        ) VALUES (?,?,?,?,?,'active',?)
+                        """,
+                        (
+                            peer_id,
+                            clean_team,
+                            node_id,
+                            principal_id,
+                            identity,
+                            timestamp,
+                        ),
+                    )
+                    changed = True
+                elif (
+                    binding["node_id"] != node_id
+                    or binding["service_principal_id"] != principal_id
+                    or binding["peer_server_identity"] != identity
+                    or binding["status"] != "active"
+                ):
+                    raise HubError(
+                        "peer_identity_conflict",
+                        "Secure peer binding conflicts with Team Hub state",
+                        409,
+                    )
                 # Existing public channels predate the automation ACL role.
                 # Install only the shared role entry; private/direct channels
                 # require an explicit principal ACL and remain invisible.
@@ -2040,7 +2277,7 @@ class HubStore:
                         "secure_peer",
                         peer_id,
                         "succeeded",
-                        {"server_identity": identity},
+                        {"server_identity": identity, "node_id": node_id},
                         timestamp,
                     )
             return principal_id
@@ -2114,6 +2351,29 @@ class HubStore:
         connection = self.connect()
         try:
             with _write_transaction(connection):
+                binding = connection.execute(
+                    """
+                    SELECT node_id,status FROM network_peer_bindings
+                    WHERE peer_id=? AND team_id=?
+                    """,
+                    (peer_id, team_id),
+                ).fetchone()
+                if binding is not None and binding["status"] == "active":
+                    connection.execute(
+                        """
+                        UPDATE network_peer_bindings
+                        SET status='revoked',revoked_at=?
+                        WHERE peer_id=? AND team_id=? AND status='active'
+                        """,
+                        (timestamp, peer_id, team_id),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE nodes SET status='offline',last_seen_at=?
+                        WHERE team_id=? AND id=? AND status='active'
+                        """,
+                        (timestamp, team_id, binding["node_id"]),
+                    )
                 connection.execute(
                     """
                     UPDATE memberships SET status='revoked',updated_at=?
@@ -2327,6 +2587,15 @@ class HubStore:
                         )
                 result = bootstrap_personal_team(
                     connection, email, display_name, now=timestamp
+                )
+                self._ensure_managed_host_node(
+                    connection, result.team_id, timestamp
+                )
+                self._ensure_network_board(
+                    connection,
+                    result.team_id,
+                    result.human_principal_id,
+                    timestamp,
                 )
                 changed = connection.execute(
                     """
@@ -3757,6 +4026,1925 @@ class HubStore:
                 timestamp,
             ),
         )
+
+    @staticmethod
+    def _require_network_scope(
+        connection: sqlite3.Connection,
+        claims: AccessClaims,
+        team_id: str,
+        *,
+        write: bool,
+    ) -> sqlite3.Row:
+        HubStore._require_session(connection, claims, _now())
+        if claims.auth_kind == "secure_peer":
+            expected_scope = "teamspace.write" if write else "teamspace.read"
+            if claims.team_id != team_id or expected_scope not in claims.scopes:
+                raise HubError("forbidden", "Operation is not permitted", 403)
+            roles = ("automation",)
+        else:
+            roles = (
+                ("owner", "admin", "member")
+                if write
+                else ("owner", "admin", "member", "guest")
+            )
+        try:
+            return _require_team_role(
+                connection, team_id, claims.principal_id, roles
+            )
+        except (AuthorizationError, AuthenticationError) as exc:
+            raise HubError("not_found", "Resource not found", 404) from exc
+
+    @staticmethod
+    def _bound_network_node(
+        connection: sqlite3.Connection,
+        claims: AccessClaims,
+        team_id: str,
+    ) -> sqlite3.Row:
+        if claims.auth_kind != "secure_peer" or claims.peer_id is None:
+            raise HubError(
+                "network_peer_required",
+                "A bound server connection is required",
+                403,
+            )
+        row = connection.execute(
+            """
+            SELECT b.node_id,n.principal_id,n.server_identity,n.display_name,n.status
+            FROM network_peer_bindings AS b
+            JOIN nodes AS n ON n.team_id=b.team_id AND n.id=b.node_id
+            WHERE b.peer_id=? AND b.team_id=?
+              AND b.service_principal_id=? AND b.status='active'
+              AND n.status='active'
+            """,
+            (claims.peer_id, team_id, claims.principal_id),
+        ).fetchone()
+        if row is None:
+            raise HubError(
+                "network_peer_unavailable",
+                "Bound server identity is unavailable",
+                403,
+            )
+        return row
+
+    def _caller_network_node(
+        self,
+        connection: sqlite3.Connection,
+        claims: AccessClaims,
+        team_id: str,
+    ) -> sqlite3.Row:
+        """Resolve the one logical server this authenticated caller controls.
+
+        An incoming secure peer is fenced by its durable certificate binding.
+        An ordinary Team Hub session acts only for this installation's
+        designated managed host, never for another server listed in the team.
+        """
+
+        if claims.auth_kind == "secure_peer":
+            return self._bound_network_node(connection, claims, team_id)
+        try:
+            _require_team_role(
+                connection,
+                team_id,
+                claims.principal_id,
+                ("owner", "admin", "member"),
+            )
+        except (AuthorizationError, AuthenticationError) as exc:
+            raise HubError("not_found", "Resource not found", 404) from exc
+        if self.managed_host_identity is None:
+            raise HubError(
+                "network_host_unavailable",
+                "Designated host server identity is unavailable",
+                409,
+            )
+        row = connection.execute(
+            """
+            SELECT n.id AS node_id,n.principal_id,n.server_identity,
+                   n.display_name,n.status
+            FROM nodes AS n
+            JOIN principals AS p ON p.id=n.principal_id
+            WHERE n.team_id=? AND n.server_identity=?
+              AND n.status='active' AND p.status='active'
+            """,
+            (team_id, self.managed_host_identity),
+        ).fetchone()
+        if row is None:
+            raise HubError(
+                "network_host_unavailable",
+                "Designated host server identity is unavailable",
+                409,
+            )
+        return row
+
+    @staticmethod
+    def _agent_public(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "server_id": row["node_id"],
+            "external_agent_id": row["external_agent_id"],
+            "backend": row["backend"],
+            "display_name": row["display_name"],
+            "status": row["status"],
+        }
+
+    def get_network(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        *,
+        after_server_id: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        if type(limit) is not int or not 1 <= limit <= MAX_NETWORK_PAGE_ITEMS:
+            raise HubError("invalid_request", "Network page limit is invalid", 422)
+        bounded_limit = limit
+        clean_after: str | None = None
+        if after_server_id is not None:
+            try:
+                clean_after = _identity(after_server_id)
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise HubError(
+                    "invalid_request", "Network page cursor is invalid", 422
+                ) from exc
+            if clean_after != after_server_id:
+                raise HubError(
+                    "invalid_request", "Network page cursor is invalid", 422
+                )
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            membership = self._require_network_scope(
+                connection, claims, team_id, write=False
+            )
+            team = connection.execute(
+                "SELECT id,display_name FROM teams WHERE id=?",
+                (team_id,),
+            ).fetchone()
+            if team is None:
+                raise HubError("not_found", "Resource not found", 404)
+            owned_node_id: str | None = None
+            if claims.auth_kind == "secure_peer":
+                owned_node_id = str(
+                    self._bound_network_node(connection, claims, team_id)["node_id"]
+                )
+            elif membership["role"] in {"owner", "admin", "member"}:
+                try:
+                    owned_node_id = str(
+                        self._caller_network_node(
+                            connection, claims, team_id
+                        )["node_id"]
+                    )
+                except HubError as exc:
+                    if exc.code != "network_host_unavailable":
+                        raise
+            network = {
+                "id": team["id"],
+                "display_name": team["display_name"],
+                "hub_id": self.hub_id,
+            }
+            server_rows = list(
+                connection.execute(
+                    """
+                    SELECT id,server_identity,display_name,status
+                    FROM nodes
+                    WHERE team_id=? AND status<>'revoked' AND id>?
+                    ORDER BY id
+                    LIMIT ?
+                    """,
+                    (team_id, clean_after or "", bounded_limit + 1),
+                )
+            )
+            candidate_rows = server_rows[:bounded_limit]
+            servers: list[dict[str, Any]] = []
+            agents: list[dict[str, Any]] = []
+            visible_rows: list[sqlite3.Row] = []
+            for row in candidate_rows:
+                server = {
+                    "id": row["id"],
+                    "server_identity": row["server_identity"],
+                    "display_name": row["display_name"],
+                    "status": row["status"],
+                    "is_host": bool(
+                        self.managed_host_identity is not None
+                        and row["server_identity"] == self.managed_host_identity
+                    ),
+                    "owned_by_caller": row["id"] == owned_node_id,
+                }
+                # Materialize at most one server's bounded agent group at a
+                # time. A page that reaches its byte ceiling never loads the
+                # remaining candidate groups into memory.
+                group_agents = [
+                    self._agent_public(agent_row)
+                    for agent_row in connection.execute(
+                        """
+                        SELECT id,node_id,external_agent_id,backend,
+                               display_name,status
+                        FROM agents
+                        WHERE team_id=? AND node_id=? AND status<>'retired'
+                        ORDER BY id
+                        """,
+                        (team_id, row["id"]),
+                    )
+                ]
+                candidate_response = {
+                    "network": network,
+                    "servers": [*servers, server],
+                    "agents": [*agents, *group_agents],
+                    "next_after_server_id": row["id"],
+                    # false is one byte larger than true in canonical JSON, so
+                    # it is the conservative value for the transport bound.
+                    "has_more": False,
+                }
+                if (
+                    len(canonical_json(candidate_response))
+                    > MAX_NETWORK_PAGE_RESPONSE_BYTES
+                ):
+                    break
+                servers.append(server)
+                agents.extend(group_agents)
+                visible_rows.append(row)
+            if candidate_rows and not visible_rows:
+                raise RuntimeError(
+                    "one bounded network server group exceeds the page response limit"
+                )
+            has_more = len(visible_rows) < len(server_rows)
+            response = {
+                "network": network,
+                "servers": servers,
+                "agents": agents,
+                "next_after_server_id": (
+                    str(visible_rows[-1]["id"]) if visible_rows else None
+                ),
+                "has_more": has_more,
+            }
+            if len(canonical_json(response)) > MAX_NETWORK_PAGE_RESPONSE_BYTES:
+                raise RuntimeError("bounded network page exceeds the response limit")
+            connection.execute("COMMIT")
+            return response
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def register_network_agent(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        timestamp = _now()
+        external_id = _bounded_text(
+            request.get("external_agent_id") or "",
+            "external_agent_id",
+            1,
+            240,
+        )
+        display_name = _bounded_text(
+            request.get("display_name") or "", "display_name", 1, 160
+        )
+        backend = request.get("backend")
+        if backend not in {"codex", "claude", "other"}:
+            raise HubError("invalid_request", "Agent backend is invalid", 422)
+        fingerprint = canonical_fingerprint(
+            {
+                "team_id": team_id,
+                "external_agent_id": external_id,
+                "backend": backend,
+                "display_name": display_name,
+            }
+        )
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                self._require_network_scope(connection, claims, team_id, write=True)
+                if claims.auth_kind == "human":
+                    try:
+                        _require_team_role(
+                            connection,
+                            team_id,
+                            claims.principal_id,
+                            ("owner", "admin"),
+                        )
+                    except (AuthorizationError, AuthenticationError) as exc:
+                        raise HubError(
+                            "forbidden", "Operation is not permitted", 403
+                        ) from exc
+                node = self._caller_network_node(connection, claims, team_id)
+                cached = self._idempotency_lookup(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "network.agent.register",
+                    request["idempotency_key"],
+                    fingerprint,
+                )
+                if cached is not None:
+                    return cached
+                if connection.execute(
+                    "SELECT 1 FROM agents WHERE node_id=? AND external_agent_id=?",
+                    (node["node_id"], external_id),
+                ).fetchone() is not None:
+                    raise HubError(
+                        "agent_conflict",
+                        "Agent identity is already registered",
+                        409,
+                    )
+                agent_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM agents WHERE node_id=?",
+                        (node["node_id"],),
+                    ).fetchone()[0]
+                )
+                if agent_count >= MAX_NETWORK_AGENTS_PER_SERVER:
+                    raise HubError(
+                        "agent_limit_reached",
+                        "Server agent limit has been reached",
+                        409,
+                    )
+                principal_id = _id("agent_principal")
+                agent_id = _id("agent")
+                connection.execute(
+                    """
+                    INSERT INTO principals(
+                        id,kind,scope_team_id,display_name,status,
+                        created_at,updated_at
+                    ) VALUES (?,'agent',?,?,'active',?,?)
+                    """,
+                    (principal_id, team_id, display_name, timestamp, timestamp),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO agents(
+                        id,team_id,principal_id,node_id,external_agent_id,
+                        backend,display_name,status,created_at,updated_at
+                    ) VALUES (?,?,?,?,?,?,?,'active',?,?)
+                    """,
+                    (
+                        agent_id,
+                        team_id,
+                        principal_id,
+                        node["node_id"],
+                        external_id,
+                        backend,
+                        display_name,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                row = connection.execute(
+                    """
+                    SELECT id,node_id,external_agent_id,backend,display_name,status
+                    FROM agents WHERE id=?
+                    """,
+                    (agent_id,),
+                ).fetchone()
+                assert row is not None
+                response = {"agent": self._agent_public(row)}
+                self._idempotency_store(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "network.agent.register",
+                    request["idempotency_key"],
+                    fingerprint,
+                    "agent",
+                    agent_id,
+                    response,
+                    timestamp,
+                )
+                self._audit(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "network.agent.register",
+                    "agent",
+                    agent_id,
+                    "succeeded",
+                    {"node_id": node["node_id"], "backend": backend},
+                    timestamp,
+                )
+                self._outbox(
+                    connection, team_id, "agent", agent_id, "network.agent.registered", timestamp
+                )
+                return response
+        finally:
+            connection.close()
+
+    def _ensure_network_board(
+        self,
+        connection: sqlite3.Connection,
+        team_id: str,
+        creator_principal_id: str,
+        timestamp: int,
+    ) -> sqlite3.Row:
+        binding = connection.execute(
+            """
+            SELECT c.*,b.channel_id AS bound_channel_id
+            FROM network_boards AS b
+            LEFT JOIN channels AS c
+              ON c.team_id=b.team_id AND c.id=b.channel_id
+            WHERE b.team_id=?
+            """,
+            (team_id,),
+        ).fetchone()
+        if (
+            binding is not None
+            and binding["id"] is not None
+            and binding["kind"] == "board"
+            and binding["visibility"] == "team"
+            and binding["archived_at"] is None
+        ):
+            return binding
+        membership = _require_team_role(
+            connection,
+            team_id,
+            creator_principal_id,
+            ("owner", "admin", "member", "automation"),
+        )
+        channel_id = _id("channel")
+        occupied_slugs = {
+            str(row["slug"])
+            for row in connection.execute(
+                "SELECT slug FROM channels WHERE team_id=? AND slug IS NOT NULL",
+                (team_id,),
+            )
+        }
+        primary_slug = "agentsdock-bulletin"
+        fallback_slug = "agentsdock-bulletin-v1"
+        if primary_slug not in occupied_slugs:
+            slug = primary_slug
+        elif fallback_slug not in occupied_slugs:
+            slug = fallback_slug
+        else:
+            suffix = 2
+            while f"{fallback_slug}-{suffix}" in occupied_slugs:
+                suffix += 1
+            slug = f"{fallback_slug}-{suffix}"
+        connection.execute(
+            """
+            INSERT INTO channels(
+                id,team_id,kind,visibility,slug,display_name,
+                direct_pair_key,created_by_principal_id,
+                created_at,updated_at
+            ) VALUES (?,?,'board','team',?,'Bulletin',NULL,?,?,?)
+            """,
+            (
+                channel_id,
+                team_id,
+                slug,
+                creator_principal_id,
+                timestamp,
+                timestamp,
+            ),
+        )
+        role_permissions = {
+            "owner": (1, 1, 1),
+            "admin": (1, 1, 1),
+            "member": (1, 1, 0),
+            "guest": (1, 0, 0),
+            "automation": (1, 1, 0),
+        }
+        for role, (can_read, can_post, can_manage) in role_permissions.items():
+            connection.execute(
+                """
+                INSERT INTO channel_acl_entries(
+                    id,team_id,channel_id,subject_kind,
+                    subject_principal_id,subject_role,
+                    can_read,can_post,can_manage,can_dispatch,created_at
+                ) VALUES (?,?,?,'role',NULL,?,?,?,?,0,?)
+                """,
+                (
+                    _id("channel_acl"),
+                    team_id,
+                    channel_id,
+                    role,
+                    can_read,
+                    can_post,
+                    can_manage,
+                    timestamp,
+                ),
+            )
+        if binding is None:
+            connection.execute(
+                """
+                INSERT INTO network_boards(team_id,channel_id,created_at)
+                VALUES (?,?,?)
+                """,
+                (team_id, channel_id, timestamp),
+            )
+        else:
+            connection.execute(
+                "UPDATE network_boards SET channel_id=? WHERE team_id=?",
+                (channel_id, team_id),
+            )
+        row = connection.execute(
+            "SELECT * FROM channels WHERE id=?", (channel_id,)
+        ).fetchone()
+        assert row is not None
+        self._audit(
+            connection,
+            team_id,
+            creator_principal_id,
+            "network.bulletin.create",
+            "network_bulletin",
+            team_id,
+            "succeeded",
+            {
+                "creator_role": membership["role"],
+                "replaced_unavailable_binding": binding is not None,
+                "reserved_slug": slug,
+            },
+            timestamp,
+        )
+        return row
+
+    @staticmethod
+    def _bulletin_post_public(row: sqlite3.Row) -> dict[str, Any]:
+        author_kind = "server" if row["author_node_id"] is not None else "human"
+        return {
+            "id": row["id"],
+            "sequence": int(row["channel_sequence"]),
+            "author": {
+                "kind": author_kind,
+                "id": (
+                    row["author_node_id"]
+                    if author_kind == "server"
+                    else row["author_principal_id"]
+                ),
+                "display_name": (
+                    row["author_node_display_name"]
+                    if author_kind == "server"
+                    else row["author_principal_display_name"]
+                ),
+            },
+            "body_format": row["body_format"],
+            "body": row["body"],
+            "thread_root_post_id": row["thread_root_message_id"],
+            "reply_to_post_id": row["parent_message_id"],
+            "created_at": _iso8601(row["created_at"]),
+        }
+
+    @staticmethod
+    def _bulletin_post_select() -> str:
+        return """
+            SELECT m.*,p.display_name AS author_principal_display_name,
+                   b.node_id AS author_node_id,
+                   n.display_name AS author_node_display_name
+            FROM messages AS m
+            JOIN principals AS p ON p.id=m.author_principal_id
+            LEFT JOIN network_peer_bindings AS b
+              ON b.service_principal_id=m.author_principal_id
+             AND b.team_id=m.team_id
+            LEFT JOIN nodes AS n ON n.team_id=b.team_id AND n.id=b.node_id
+        """
+
+    @staticmethod
+    def _bounded_network_page(
+        rows: list[sqlite3.Row],
+        *,
+        clean_after: int,
+        bounded_limit: int,
+        collection_key: str,
+        sequence_column: str,
+        render: Callable[[sqlite3.Row], dict[str, Any]],
+    ) -> dict[str, Any]:
+        visible_rows: list[sqlite3.Row] = []
+        visible_items: list[dict[str, Any]] = []
+        encoded_collection_bytes = 2  # JSON array brackets.
+        collection_budget = MAX_NETWORK_PAGE_RESPONSE_BYTES - 1_024
+        for row in rows[:bounded_limit]:
+            item = render(row)
+            item_bytes = len(canonical_json(item))
+            separator_bytes = 1 if visible_items else 0
+            if (
+                encoded_collection_bytes + separator_bytes + item_bytes
+                > collection_budget
+            ):
+                break
+            encoded_collection_bytes += separator_bytes + item_bytes
+            visible_rows.append(row)
+            visible_items.append(item)
+        if rows and not visible_rows:
+            raise RuntimeError("one bounded network item exceeds the page response limit")
+        response = {
+            collection_key: visible_items,
+            "next_after_sequence": (
+                int(visible_rows[-1][sequence_column])
+                if visible_rows
+                else clean_after
+            ),
+            "has_more": len(visible_rows) < len(rows),
+        }
+        if len(canonical_json(response)) > MAX_NETWORK_PAGE_RESPONSE_BYTES:
+            raise RuntimeError("bounded network page exceeds the response limit")
+        return response
+
+    def list_network_bulletin(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        *,
+        after_sequence: int,
+        limit: int,
+    ) -> dict[str, Any]:
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            self._require_network_scope(connection, claims, team_id, write=False)
+            board = connection.execute(
+                """
+                SELECT c.* FROM network_boards AS b
+                JOIN channels AS c ON c.team_id=b.team_id AND c.id=b.channel_id
+                WHERE b.team_id=? AND c.archived_at IS NULL
+                """,
+                (team_id,),
+            ).fetchone()
+            bounded_limit = max(1, min(int(limit), MAX_NETWORK_PAGE_ITEMS))
+            clean_after = max(0, int(after_sequence))
+            if board is None:
+                rows: list[sqlite3.Row] = []
+            else:
+                if not self._channel_permission(
+                    connection, board, claims.principal_id, "read"
+                ):
+                    raise HubError("not_found", "Resource not found", 404)
+                rows = connection.execute(
+                    self._bulletin_post_select()
+                    + """
+                    WHERE m.channel_id=? AND m.channel_sequence>?
+                      AND m.deleted_at IS NULL
+                    ORDER BY m.channel_sequence ASC LIMIT ?
+                    """,
+                    (board["id"], clean_after, bounded_limit + 1),
+                ).fetchall()
+            response = self._bounded_network_page(
+                rows,
+                clean_after=clean_after,
+                bounded_limit=bounded_limit,
+                collection_key="posts",
+                sequence_column="channel_sequence",
+                render=self._bulletin_post_public,
+            )
+            connection.execute("COMMIT")
+            return response
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def create_network_bulletin_post(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        timestamp = _now()
+        body = request.get("body")
+        try:
+            encoded = body.encode("utf-8") if isinstance(body, str) else b""
+        except UnicodeEncodeError as exc:
+            raise HubError("invalid_request", "Bulletin body is invalid", 422) from exc
+        if not 1 <= len(encoded) <= MAX_NETWORK_BODY_BYTES:
+            raise HubError("invalid_request", "Bulletin body is invalid", 422)
+        body_format = request.get("body_format")
+        if body_format not in {"plain", "markdown"}:
+            raise HubError("invalid_request", "Bulletin body format is invalid", 422)
+        reply_to = request.get("reply_to_post_id")
+        fingerprint = canonical_fingerprint(
+            {
+                "team_id": team_id,
+                "body": body,
+                "body_format": body_format,
+                "reply_to_post_id": reply_to,
+            }
+        )
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                self._require_network_scope(connection, claims, team_id, write=True)
+                board = self._ensure_network_board(
+                    connection, team_id, claims.principal_id, timestamp
+                )
+                if not self._channel_permission(
+                    connection, board, claims.principal_id, "post"
+                ):
+                    raise HubError("forbidden", "Operation is not permitted", 403)
+                cached = self._idempotency_lookup(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "network.bulletin.post",
+                    request["idempotency_key"],
+                    fingerprint,
+                )
+                if cached is not None:
+                    return cached
+                root_id: str | None = None
+                if reply_to is not None:
+                    parent = connection.execute(
+                        """
+                        SELECT id,thread_root_message_id FROM messages
+                        WHERE team_id=? AND channel_id=? AND id=?
+                          AND deleted_at IS NULL
+                        """,
+                        (team_id, board["id"], reply_to),
+                    ).fetchone()
+                    if parent is None:
+                        raise HubError(
+                            "invalid_request", "Bulletin reply target is unavailable", 422
+                        )
+                    root_id = str(parent["thread_root_message_id"] or parent["id"])
+                self._charge_network_peer_write(
+                    connection, claims, team_id, len(encoded), timestamp
+                )
+                sequence = int(board["next_message_sequence"])
+                message_id = _id("message")
+                connection.execute(
+                    "UPDATE channels SET next_message_sequence=?,updated_at=? WHERE id=?",
+                    (sequence + 1, timestamp, board["id"]),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO messages(
+                        id,team_id,channel_id,channel_sequence,kind,
+                        thread_root_message_id,parent_message_id,
+                        author_principal_id,body_format,body,
+                        idempotency_key,created_at
+                    ) VALUES (?,?,?,?,'post',?,?,?,?,?,?,?)
+                    """,
+                    (
+                        message_id,
+                        team_id,
+                        board["id"],
+                        sequence,
+                        root_id,
+                        reply_to,
+                        claims.principal_id,
+                        body_format,
+                        body,
+                        hashlib.sha256(
+                            f"{team_id}\0{claims.principal_id}\0network.bulletin.post\0{request['idempotency_key']}".encode(
+                                "utf-8"
+                            )
+                        ).digest(),
+                        timestamp,
+                    ),
+                )
+                row = connection.execute(
+                    self._bulletin_post_select() + " WHERE m.id=?",
+                    (message_id,),
+                ).fetchone()
+                assert row is not None
+                response = {"post": self._bulletin_post_public(row)}
+                self._idempotency_store(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "network.bulletin.post",
+                    request["idempotency_key"],
+                    fingerprint,
+                    "network_bulletin_post",
+                    message_id,
+                    response,
+                    timestamp,
+                )
+                self._audit(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "network.bulletin.post",
+                    "network_bulletin_post",
+                    message_id,
+                    "succeeded",
+                    {"reply": reply_to is not None},
+                    timestamp,
+                )
+                self._outbox(
+                    connection,
+                    team_id,
+                    "network_bulletin_post",
+                    message_id,
+                    "network.bulletin.posted",
+                    timestamp,
+                )
+                return response
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _network_item_select() -> str:
+        return """
+            SELECT i.*,i.id AS request_item_id,
+                   d.id AS delivery_id,d.state AS delivery_state,
+                   d.available_at,d.delivered_at,d.read_at,
+                   sp.display_name AS sender_principal_display_name,
+                   sn.server_identity AS sender_server_identity,
+                   sn.display_name AS sender_server_display_name,
+                   sa.display_name AS sender_agent_display_name,
+                   sa.backend AS sender_agent_backend,
+                   rp.display_name AS recipient_principal_display_name,
+                   rn.server_identity AS recipient_server_identity,
+                   rn.display_name AS recipient_server_display_name,
+                   ra.display_name AS recipient_agent_display_name,
+                   ra.backend AS recipient_agent_backend,
+                   (SELECT pr.status FROM network_passive_requests AS pr
+                    WHERE pr.team_id=i.team_id AND pr.request_item_id=i.id)
+                       AS request_status,
+                   (SELECT pr.expires_at FROM network_passive_requests AS pr
+                    WHERE pr.team_id=i.team_id AND pr.request_item_id=i.id)
+                       AS request_expires_at,
+                   (SELECT pr.reply_item_id FROM network_passive_requests AS pr
+                    WHERE pr.team_id=i.team_id AND pr.request_item_id=i.id)
+                       AS reply_item_id
+            FROM network_mailbox_items AS i
+            JOIN network_deliveries AS d
+              ON d.team_id=i.team_id AND d.item_id=i.id
+            JOIN principals AS sp ON sp.id=i.sender_principal_id
+            JOIN principals AS rp ON rp.id=i.recipient_principal_id
+            LEFT JOIN nodes AS sn
+              ON sn.team_id=i.team_id AND sn.id=i.sender_node_id
+            LEFT JOIN agents AS sa
+              ON sa.team_id=i.team_id AND sa.id=i.sender_agent_id
+            LEFT JOIN nodes AS rn
+              ON rn.team_id=i.team_id AND rn.id=i.recipient_node_id
+            LEFT JOIN agents AS ra
+              ON ra.team_id=i.team_id AND ra.id=i.recipient_agent_id
+        """
+
+    @staticmethod
+    def _network_address(row: sqlite3.Row, prefix: str) -> dict[str, Any]:
+        kind = str(row[f"{prefix}_kind"])
+        if kind == "human":
+            return {
+                "kind": "human",
+                "id": row[f"{prefix}_principal_id"],
+                "display_name": row[f"{prefix}_principal_display_name"],
+            }
+        if kind == "server":
+            return {
+                "kind": "server",
+                "id": row[f"{prefix}_node_id"],
+                "server_identity": row[f"{prefix}_server_identity"],
+                "display_name": row[f"{prefix}_server_display_name"],
+            }
+        return {
+            "kind": "agent",
+            "id": row[f"{prefix}_agent_id"],
+            "server_id": row[f"{prefix}_node_id"],
+            "backend": row[f"{prefix}_agent_backend"],
+            "display_name": row[f"{prefix}_agent_display_name"],
+        }
+
+    @classmethod
+    def _network_item_public(cls, row: sqlite3.Row) -> dict[str, Any]:
+        kind = str(row["kind"])
+        request_id = (
+            row["id"]
+            if kind == "request"
+            else row["root_request_item_id"]
+            if kind == "reply"
+            else None
+        )
+        return {
+            "id": row["id"],
+            "sequence": int(row["queue_ordinal"]),
+            "kind": kind,
+            "from": cls._network_address(row, "sender"),
+            "to": cls._network_address(row, "recipient"),
+            "body_format": row["body_format"],
+            "body": row["body"],
+            "request_id": request_id,
+            "created_at": _iso8601(row["created_at"]),
+            "expires_at": _iso8601(row["expires_at"]),
+        }
+
+    @staticmethod
+    def _network_delivery_public(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["delivery_id"],
+            "state": row["delivery_state"],
+            "available_at": _iso8601(row["available_at"]),
+            "delivered_at": _iso8601(row["delivered_at"]),
+            "read_at": _iso8601(row["read_at"]),
+        }
+
+    def _network_sender(
+        self,
+        connection: sqlite3.Connection,
+        claims: AccessClaims,
+        team_id: str,
+        from_agent_id: str | None,
+    ) -> dict[str, str | None]:
+        if claims.auth_kind == "human":
+            if from_agent_id is not None:
+                raise HubError(
+                    "forbidden", "A human session cannot claim agent authorship", 403
+                )
+            return {
+                "kind": "human",
+                "principal_id": claims.principal_id,
+                "node_id": None,
+                "agent_id": None,
+            }
+        node = self._caller_network_node(connection, claims, team_id)
+        if from_agent_id is None:
+            return {
+                "kind": "server",
+                "principal_id": claims.principal_id,
+                "node_id": str(node["node_id"]),
+                "agent_id": None,
+            }
+        agent_id = _identity(from_agent_id)
+        agent = connection.execute(
+            """
+            SELECT id FROM agents
+            WHERE team_id=? AND node_id=? AND id=? AND status='active'
+            """,
+            (team_id, node["node_id"], agent_id),
+        ).fetchone()
+        if agent is None:
+            raise HubError("forbidden", "Agent is not owned by this server", 403)
+        return {
+            "kind": "agent",
+            "principal_id": claims.principal_id,
+            "node_id": str(node["node_id"]),
+            "agent_id": agent_id,
+        }
+
+    @staticmethod
+    def _network_recipient(
+        connection: sqlite3.Connection,
+        team_id: str,
+        target: dict[str, Any],
+    ) -> dict[str, str | None]:
+        kind = target.get("kind")
+        identifier = _identity(str(target.get("id") or ""))
+        if kind == "server":
+            row = connection.execute(
+                """
+                SELECT id,principal_id FROM nodes
+                WHERE team_id=? AND id=? AND status='active'
+                """,
+                (team_id, identifier),
+            ).fetchone()
+            if row is None:
+                raise HubError("recipient_unavailable", "Recipient is unavailable", 404)
+            return {
+                "kind": "server",
+                "principal_id": str(row["principal_id"]),
+                "node_id": str(row["id"]),
+                "agent_id": None,
+            }
+        if kind == "agent":
+            row = connection.execute(
+                """
+                SELECT a.id,a.node_id,a.principal_id
+                FROM agents AS a
+                JOIN nodes AS n ON n.team_id=a.team_id AND n.id=a.node_id
+                JOIN principals AS p ON p.id=a.principal_id
+                WHERE a.team_id=? AND a.id=? AND a.status='active'
+                  AND n.status='active' AND p.status='active'
+                """,
+                (team_id, identifier),
+            ).fetchone()
+            if row is None:
+                raise HubError("recipient_unavailable", "Recipient is unavailable", 404)
+            return {
+                "kind": "agent",
+                "principal_id": str(row["principal_id"]),
+                "node_id": str(row["node_id"]),
+                "agent_id": str(row["id"]),
+            }
+        raise HubError("invalid_request", "Recipient kind is invalid", 422)
+
+    @staticmethod
+    def _network_body(request: dict[str, Any]) -> tuple[str, str, int]:
+        body = request.get("body")
+        try:
+            encoded = body.encode("utf-8") if isinstance(body, str) else b""
+        except UnicodeEncodeError as exc:
+            raise HubError("invalid_request", "Mailbox body is invalid", 422) from exc
+        if not 1 <= len(encoded) <= MAX_NETWORK_BODY_BYTES:
+            raise HubError("invalid_request", "Mailbox body is invalid", 422)
+        body_format = request.get("body_format")
+        if body_format not in {"plain", "markdown"}:
+            raise HubError("invalid_request", "Mailbox body format is invalid", 422)
+        return body, str(body_format), len(encoded)
+
+    def _insert_network_item(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        team_id: str,
+        kind: str,
+        sender: dict[str, str | None],
+        recipient: dict[str, str | None],
+        body: str,
+        body_format: str,
+        operation: str,
+        idempotency_key: str,
+        timestamp: int,
+        root_request_item_id: str | None = None,
+        expires_at: int | None = None,
+    ) -> tuple[dict[str, Any], sqlite3.Row]:
+        item_id = _id("network_item")
+        delivery_id = _id("network_delivery")
+        connection.execute(
+            """
+            INSERT INTO network_mailbox_items(
+                id,team_id,kind,sender_kind,sender_principal_id,
+                sender_node_id,sender_agent_id,
+                recipient_kind,recipient_principal_id,
+                recipient_node_id,recipient_agent_id,root_request_item_id,
+                body_format,body,idempotency_key,created_at,expires_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                item_id,
+                team_id,
+                kind,
+                sender["kind"],
+                sender["principal_id"],
+                sender["node_id"],
+                sender["agent_id"],
+                recipient["kind"],
+                recipient["principal_id"],
+                recipient["node_id"],
+                recipient["agent_id"],
+                root_request_item_id,
+                body_format,
+                body,
+                hashlib.sha256(
+                    f"{team_id}\0{sender['principal_id']}\0{operation}\0{idempotency_key}".encode(
+                        "utf-8"
+                    )
+                ).digest(),
+                timestamp,
+                expires_at,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO network_deliveries(
+                id,team_id,item_id,state,available_at
+            ) VALUES (?,?,?,'available',?)
+            """,
+            (delivery_id, team_id, item_id, timestamp),
+        )
+        row = connection.execute(
+            self._network_item_select() + " WHERE i.id=?",
+            (item_id,),
+        ).fetchone()
+        assert row is not None
+        response = {
+            "item": self._network_item_public(row),
+            "delivery": self._network_delivery_public(row),
+        }
+        return response, row
+
+    def _charge_network_peer_write(
+        self,
+        connection: sqlite3.Connection,
+        claims: AccessClaims,
+        team_id: str,
+        body_bytes: int,
+        timestamp: int,
+    ) -> None:
+        if claims.auth_kind != "secure_peer":
+            return
+        subject = f"secure-peer:{claims.peer_id or claims.principal_id}"
+        self._charge_rate_bucket(
+            connection,
+            team_id=team_id,
+            subject_key=subject,
+            action="network.mailbox.count.minute",
+            timestamp=timestamp,
+            window_seconds=60,
+            cost=1,
+            limit=60,
+        )
+        self._charge_rate_bucket(
+            connection,
+            team_id=team_id,
+            subject_key=subject,
+            action="network.mailbox.bytes.hour",
+            timestamp=timestamp,
+            window_seconds=3_600,
+            cost=body_bytes,
+            limit=4 * 1024 * 1024,
+        )
+
+    def create_network_mailbox_item(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        timestamp = _now()
+        body, body_format, body_bytes = self._network_body(request)
+        fingerprint = canonical_fingerprint(
+            {
+                "team_id": team_id,
+                "to": request.get("to"),
+                "from_agent_id": request.get("from_agent_id"),
+                "body": body,
+                "body_format": body_format,
+            }
+        )
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                self._require_network_scope(connection, claims, team_id, write=True)
+                cached = self._idempotency_lookup(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "network.mailbox.send",
+                    request["idempotency_key"],
+                    fingerprint,
+                )
+                if cached is not None:
+                    return cached
+                sender = self._network_sender(
+                    connection, claims, team_id, request.get("from_agent_id")
+                )
+                recipient = self._network_recipient(
+                    connection, team_id, dict(request.get("to") or {})
+                )
+                self._charge_network_peer_write(
+                    connection, claims, team_id, body_bytes, timestamp
+                )
+                response, row = self._insert_network_item(
+                    connection,
+                    team_id=team_id,
+                    kind="message",
+                    sender=sender,
+                    recipient=recipient,
+                    body=body,
+                    body_format=body_format,
+                    operation="network.mailbox.send",
+                    idempotency_key=request["idempotency_key"],
+                    timestamp=timestamp,
+                )
+                item_id = str(row["id"])
+                self._idempotency_store(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "network.mailbox.send",
+                    request["idempotency_key"],
+                    fingerprint,
+                    "network_mailbox_item",
+                    item_id,
+                    response,
+                    timestamp,
+                )
+                self._audit(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "network.mailbox.send",
+                    "network_mailbox_item",
+                    item_id,
+                    "succeeded",
+                    {
+                        "sender_kind": sender["kind"],
+                        "recipient_kind": recipient["kind"],
+                    },
+                    timestamp,
+                )
+                self._outbox(
+                    connection,
+                    team_id,
+                    "network_mailbox_item",
+                    item_id,
+                    "network.mailbox.available",
+                    timestamp,
+                )
+                return response
+        finally:
+            connection.close()
+
+    def _require_network_address_owner(
+        self,
+        connection: sqlite3.Connection,
+        claims: AccessClaims,
+        team_id: str,
+        address_kind: str,
+        address_id: str,
+    ) -> tuple[str | None, str | None]:
+        identifier = _identity(address_id)
+        if address_kind == "human":
+            if (
+                address_id != identifier
+                or claims.auth_kind != "human"
+                or identifier != claims.principal_id
+            ):
+                raise HubError("not_found", "Resource not found", 404)
+            human = connection.execute(
+                """
+                SELECT p.id FROM principals AS p
+                JOIN memberships AS m
+                  ON m.team_id=? AND m.principal_id=p.id
+                WHERE p.id=? AND p.kind='human' AND p.status='active'
+                  AND m.status='active'
+                """,
+                (team_id, identifier),
+            ).fetchone()
+            if human is None:
+                raise HubError("not_found", "Resource not found", 404)
+            return None, None
+        node = self._caller_network_node(connection, claims, team_id)
+        if address_kind == "server":
+            if identifier != node["node_id"]:
+                raise HubError("not_found", "Resource not found", 404)
+            return str(node["node_id"]), None
+        if address_kind == "agent":
+            agent = connection.execute(
+                """
+                SELECT id FROM agents
+                WHERE team_id=? AND node_id=? AND id=? AND status='active'
+                """,
+                (team_id, node["node_id"], identifier),
+            ).fetchone()
+            if agent is None:
+                raise HubError("not_found", "Resource not found", 404)
+            return str(node["node_id"]), identifier
+        raise HubError("invalid_request", "Mailbox address kind is invalid", 422)
+
+    def list_network_mailbox(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        *,
+        address_kind: str,
+        address_id: str,
+        after_sequence: int,
+        limit: int,
+    ) -> dict[str, Any]:
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            self._require_network_scope(connection, claims, team_id, write=False)
+            node_id, agent_id = self._require_network_address_owner(
+                connection, claims, team_id, address_kind, address_id
+            )
+            bounded_limit = max(1, min(int(limit), MAX_NETWORK_PAGE_ITEMS))
+            clean_after = max(0, int(after_sequence))
+            if address_kind == "human":
+                routing = (
+                    "i.recipient_kind='human' AND i.recipient_principal_id=?"
+                )
+                routing_values = (claims.principal_id,)
+            elif agent_id is None:
+                routing = "i.recipient_kind='server' AND i.recipient_node_id=?"
+                routing_values: tuple[Any, ...] = (node_id,)
+            else:
+                routing = (
+                    "i.recipient_kind='agent' AND i.recipient_node_id=? "
+                    "AND i.recipient_agent_id=?"
+                )
+                routing_values = (node_id, agent_id)
+            rows = connection.execute(
+                self._network_item_select()
+                + f"""
+                WHERE i.team_id=? AND {routing} AND i.queue_ordinal>?
+                ORDER BY i.queue_ordinal ASC LIMIT ?
+                """,
+                (team_id, *routing_values, clean_after, bounded_limit + 1),
+            ).fetchall()
+            response = self._bounded_network_page(
+                rows,
+                clean_after=clean_after,
+                bounded_limit=bounded_limit,
+                collection_key="items",
+                sequence_column="queue_ordinal",
+                render=lambda row: {
+                    "item": self._network_item_public(row),
+                    "delivery": self._network_delivery_public(row),
+                },
+            )
+            connection.execute("COMMIT")
+            return response
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def _network_item_participant(
+        self,
+        connection: sqlite3.Connection,
+        claims: AccessClaims,
+        team_id: str,
+        row: sqlite3.Row,
+    ) -> bool:
+        if claims.auth_kind == "human" and claims.principal_id in {
+            row["sender_principal_id"],
+            row["recipient_principal_id"],
+        }:
+            return True
+        node = self._caller_network_node(connection, claims, team_id)
+        return node["node_id"] in {
+            row["sender_node_id"],
+            row["recipient_node_id"],
+        }
+
+    def get_network_item(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        item_id: str,
+    ) -> dict[str, Any]:
+        clean_id = _identity(item_id)
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            self._require_network_scope(connection, claims, team_id, write=False)
+            row = connection.execute(
+                self._network_item_select() + " WHERE i.team_id=? AND i.id=?",
+                (team_id, clean_id),
+            ).fetchone()
+            if row is None or not self._network_item_participant(
+                connection, claims, team_id, row
+            ):
+                raise HubError("not_found", "Resource not found", 404)
+            response = {
+                "item": self._network_item_public(row),
+                "delivery": self._network_delivery_public(row),
+            }
+            connection.execute("COMMIT")
+            return response
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def record_network_delivery_receipt(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        delivery_id: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        timestamp = _now()
+        clean_id = _identity(delivery_id)
+        target_state = request.get("state")
+        if target_state not in {"delivered", "read"}:
+            raise HubError("invalid_request", "Receipt state is invalid", 422)
+        fingerprint = canonical_fingerprint(
+            {"team_id": team_id, "delivery_id": clean_id, "state": target_state}
+        )
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                self._require_network_scope(connection, claims, team_id, write=True)
+                row = connection.execute(
+                    self._network_item_select()
+                    + " WHERE i.team_id=? AND d.id=?",
+                    (team_id, clean_id),
+                ).fetchone()
+                if row is None:
+                    raise HubError("not_found", "Resource not found", 404)
+                if (
+                    claims.auth_kind == "human"
+                    and row["recipient_kind"] == "human"
+                    and row["recipient_principal_id"] == claims.principal_id
+                ):
+                    authorized = True
+                else:
+                    node = self._caller_network_node(
+                        connection, claims, team_id
+                    )
+                    authorized = row["recipient_node_id"] == node["node_id"]
+                if not authorized:
+                    raise HubError("not_found", "Resource not found", 404)
+                cached = self._idempotency_lookup(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "network.delivery.receipt",
+                    request["idempotency_key"],
+                    fingerprint,
+                )
+                if cached is not None:
+                    return cached
+                current = str(row["delivery_state"])
+                if (
+                    target_state == "delivered"
+                    and current in {"delivered", "read"}
+                ) or (target_state == "read" and current == "read"):
+                    return {"delivery": self._network_delivery_public(row)}
+                if target_state == "delivered" and current != "available":
+                    raise HubError(
+                        "receipt_conflict", "Receipt state is invalid", 409
+                    )
+                if target_state == "read" and current == "available":
+                    raise HubError(
+                        "receipt_conflict",
+                        "Delivery must be recorded before it is read",
+                        409,
+                    )
+                if target_state == "read" and current != "delivered":
+                    raise HubError(
+                        "receipt_conflict", "Receipt state is invalid", 409
+                    )
+                self._charge_network_peer_write(
+                    connection, claims, team_id, 0, timestamp
+                )
+                if target_state == "delivered":
+                    connection.execute(
+                        """
+                        UPDATE network_deliveries
+                        SET state='delivered',delivered_at=? WHERE id=?
+                        """,
+                        (timestamp, clean_id),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        UPDATE network_deliveries
+                        SET state='read',read_at=? WHERE id=?
+                        """,
+                        (timestamp, clean_id),
+                    )
+                updated = connection.execute(
+                    self._network_item_select()
+                    + " WHERE i.team_id=? AND d.id=?",
+                    (team_id, clean_id),
+                ).fetchone()
+                assert updated is not None
+                response = {"delivery": self._network_delivery_public(updated)}
+                self._idempotency_store(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "network.delivery.receipt",
+                    request["idempotency_key"],
+                    fingerprint,
+                    "network_delivery",
+                    clean_id,
+                    response,
+                    timestamp,
+                )
+                self._audit(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "network.delivery.receipt",
+                    "network_delivery",
+                    clean_id,
+                    "succeeded",
+                    {"state": target_state},
+                    timestamp,
+                )
+                self._outbox(
+                    connection,
+                    team_id,
+                    "network_delivery",
+                    clean_id,
+                    f"network.delivery.{target_state}",
+                    timestamp,
+                )
+                return response
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _network_request_public(
+        request_row: sqlite3.Row,
+        *,
+        timestamp: int,
+    ) -> dict[str, Any]:
+        status = str(request_row["request_status"])
+        if status == "open" and int(request_row["request_expires_at"]) <= timestamp:
+            status = "expired"
+        return {
+            "id": request_row["request_item_id"],
+            "status": status,
+            "expires_at": _iso8601(request_row["request_expires_at"]),
+            "reply_item_id": request_row["reply_item_id"],
+        }
+
+    def create_network_request(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        timestamp = _now()
+        body, body_format, body_bytes = self._network_body(request)
+        ttl = int(request.get("expires_in_seconds", 86_400))
+        if not 60 <= ttl <= 86_400:
+            raise HubError("invalid_request", "Request expiry is invalid", 422)
+        expires_at = timestamp + ttl
+        fingerprint = canonical_fingerprint(
+            {
+                "team_id": team_id,
+                "to": request.get("to"),
+                "from_agent_id": request.get("from_agent_id"),
+                "body": body,
+                "body_format": body_format,
+                "expires_in_seconds": ttl,
+            }
+        )
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                self._require_network_scope(connection, claims, team_id, write=True)
+                cached = self._idempotency_lookup(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "network.request.create",
+                    request["idempotency_key"],
+                    fingerprint,
+                )
+                if cached is not None:
+                    return cached
+                sender = self._network_sender(
+                    connection, claims, team_id, request.get("from_agent_id")
+                )
+                recipient = self._network_recipient(
+                    connection, team_id, dict(request.get("to") or {})
+                )
+                self._charge_network_peer_write(
+                    connection, claims, team_id, body_bytes, timestamp
+                )
+                response, row = self._insert_network_item(
+                    connection,
+                    team_id=team_id,
+                    kind="request",
+                    sender=sender,
+                    recipient=recipient,
+                    body=body,
+                    body_format=body_format,
+                    operation="network.request.create",
+                    idempotency_key=request["idempotency_key"],
+                    timestamp=timestamp,
+                    expires_at=expires_at,
+                )
+                item_id = str(row["id"])
+                connection.execute(
+                    """
+                    INSERT INTO network_passive_requests(
+                        request_item_id,team_id,status,created_at,expires_at
+                    ) VALUES (?,?,'open',?,?)
+                    """,
+                    (item_id, team_id, timestamp, expires_at),
+                )
+                request_row = connection.execute(
+                    """
+                    SELECT request_item_id,status AS request_status,
+                           expires_at AS request_expires_at,reply_item_id
+                    FROM network_passive_requests WHERE request_item_id=?
+                    """,
+                    (item_id,),
+                ).fetchone()
+                assert request_row is not None
+                response["request"] = self._network_request_public(
+                    request_row, timestamp=timestamp
+                )
+                self._idempotency_store(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "network.request.create",
+                    request["idempotency_key"],
+                    fingerprint,
+                    "network_request",
+                    item_id,
+                    response,
+                    timestamp,
+                )
+                self._audit(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "network.request.create",
+                    "network_request",
+                    item_id,
+                    "succeeded",
+                    {
+                        "sender_kind": sender["kind"],
+                        "recipient_kind": recipient["kind"],
+                        "expires_at": expires_at,
+                        "passive": True,
+                    },
+                    timestamp,
+                )
+                self._outbox(
+                    connection,
+                    team_id,
+                    "network_request",
+                    item_id,
+                    "network.request.available",
+                    timestamp,
+                )
+                return response
+        finally:
+            connection.close()
+
+    def _request_participant_row(
+        self,
+        connection: sqlite3.Connection,
+        claims: AccessClaims,
+        team_id: str,
+        request_id: str,
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            self._network_item_select()
+            + """
+            JOIN network_passive_requests AS pr
+              ON pr.team_id=i.team_id AND pr.request_item_id=i.id
+            WHERE i.team_id=? AND i.id=? AND i.kind='request'
+            """,
+            (team_id, request_id),
+        ).fetchone()
+        if row is None or not self._network_item_participant(
+            connection, claims, team_id, row
+        ):
+            raise HubError("not_found", "Resource not found", 404)
+        return row
+
+    def get_network_request(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        clean_id = _identity(request_id)
+        timestamp = _now()
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            self._require_network_scope(connection, claims, team_id, write=False)
+            row = self._request_participant_row(
+                connection, claims, team_id, clean_id
+            )
+            response: dict[str, Any] = {
+                "item": self._network_item_public(row),
+                "delivery": self._network_delivery_public(row),
+                "request": self._network_request_public(row, timestamp=timestamp),
+                "reply": None,
+            }
+            if row["reply_item_id"] is not None:
+                reply = connection.execute(
+                    self._network_item_select() + " WHERE i.id=?",
+                    (row["reply_item_id"],),
+                ).fetchone()
+                if reply is None:
+                    raise RuntimeError("passive request reply is missing")
+                response["reply"] = {
+                    "item": self._network_item_public(reply),
+                    "delivery": self._network_delivery_public(reply),
+                }
+            connection.execute("COMMIT")
+            return response
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _network_reply_recipient(
+        connection: sqlite3.Connection,
+        team_id: str,
+        request_item: sqlite3.Row,
+    ) -> dict[str, str | None]:
+        sender_kind = str(request_item["sender_kind"])
+        if sender_kind == "human":
+            human = connection.execute(
+                """
+                SELECT p.id FROM principals AS p
+                JOIN memberships AS m
+                  ON m.team_id=? AND m.principal_id=p.id
+                WHERE p.id=? AND p.kind='human' AND p.status='active'
+                  AND m.status='active'
+                """,
+                (team_id, request_item["sender_principal_id"]),
+            ).fetchone()
+            if human is None:
+                raise HubError(
+                    "request_unavailable", "Requester is unavailable", 409
+                )
+            return {
+                "kind": "human",
+                "principal_id": str(human["id"]),
+                "node_id": None,
+                "agent_id": None,
+            }
+        if sender_kind == "server":
+            node = connection.execute(
+                """
+                SELECT n.id,n.principal_id FROM nodes AS n
+                JOIN principals AS p ON p.id=n.principal_id
+                WHERE n.team_id=? AND n.id=? AND n.status='active'
+                  AND p.status='active'
+                """,
+                (team_id, request_item["sender_node_id"]),
+            ).fetchone()
+            if node is None:
+                raise HubError(
+                    "request_unavailable", "Requester is unavailable", 409
+                )
+            return {
+                "kind": "server",
+                "principal_id": str(node["principal_id"]),
+                "node_id": str(node["id"]),
+                "agent_id": None,
+            }
+        agent = connection.execute(
+            """
+            SELECT a.id,a.node_id,a.principal_id FROM agents AS a
+            JOIN principals AS p ON p.id=a.principal_id
+            JOIN nodes AS n ON n.team_id=a.team_id AND n.id=a.node_id
+            WHERE a.team_id=? AND a.id=? AND a.node_id=?
+              AND a.status='active' AND p.status='active' AND n.status='active'
+            """,
+            (
+                team_id,
+                request_item["sender_agent_id"],
+                request_item["sender_node_id"],
+            ),
+        ).fetchone()
+        if agent is None:
+            raise HubError("request_unavailable", "Requester is unavailable", 409)
+        return {
+            "kind": "agent",
+            "principal_id": str(agent["principal_id"]),
+            "node_id": str(agent["node_id"]),
+            "agent_id": str(agent["id"]),
+        }
+
+    def create_network_request_reply(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        request_id: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        clean_id = _identity(request_id)
+        timestamp = _now()
+        body, body_format, body_bytes = self._network_body(request)
+        fingerprint = canonical_fingerprint(
+            {
+                "team_id": team_id,
+                "request_id": clean_id,
+                "from_agent_id": request.get("from_agent_id"),
+                "body": body,
+                "body_format": body_format,
+            }
+        )
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                self._require_network_scope(connection, claims, team_id, write=True)
+                request_item = connection.execute(
+                    self._network_item_select()
+                    + """
+                    JOIN network_passive_requests AS pr
+                      ON pr.team_id=i.team_id AND pr.request_item_id=i.id
+                    WHERE i.team_id=? AND i.id=? AND i.kind='request'
+                    """,
+                    (team_id, clean_id),
+                ).fetchone()
+                if request_item is None:
+                    raise HubError("not_found", "Resource not found", 404)
+                cached = self._idempotency_lookup(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "network.request.reply",
+                    request["idempotency_key"],
+                    fingerprint,
+                )
+                if cached is not None:
+                    return cached
+                if request_item["request_status"] != "open" or int(
+                    request_item["request_expires_at"]
+                ) <= timestamp:
+                    raise HubError(
+                        "request_unavailable", "Passive request is no longer open", 409
+                    )
+                if (
+                    claims.auth_kind == "human"
+                    and request_item["recipient_kind"] == "human"
+                    and request_item["recipient_principal_id"]
+                    == claims.principal_id
+                ):
+                    authorized = True
+                else:
+                    bound = self._caller_network_node(
+                        connection, claims, team_id
+                    )
+                    authorized = (
+                        request_item["recipient_node_id"] == bound["node_id"]
+                    )
+                if not authorized:
+                    raise HubError("not_found", "Resource not found", 404)
+                from_agent_id = request.get("from_agent_id")
+                if request_item["recipient_kind"] == "agent":
+                    if claims.auth_kind == "human":
+                        agent_author_matches = from_agent_id is None
+                    else:
+                        agent_author_matches = (
+                            from_agent_id == request_item["recipient_agent_id"]
+                        )
+                    if not agent_author_matches:
+                        raise HubError(
+                            "forbidden",
+                            "The addressed agent must author this reply",
+                            403,
+                        )
+                sender = self._network_sender(
+                    connection, claims, team_id, from_agent_id
+                )
+                recipient = self._network_reply_recipient(
+                    connection, team_id, request_item
+                )
+                self._charge_network_peer_write(
+                    connection, claims, team_id, body_bytes, timestamp
+                )
+                response, reply_row = self._insert_network_item(
+                    connection,
+                    team_id=team_id,
+                    kind="reply",
+                    sender=sender,
+                    recipient=recipient,
+                    body=body,
+                    body_format=body_format,
+                    operation="network.request.reply",
+                    idempotency_key=request["idempotency_key"],
+                    timestamp=timestamp,
+                    root_request_item_id=clean_id,
+                )
+                reply_id = str(reply_row["id"])
+                changed = connection.execute(
+                    """
+                    UPDATE network_passive_requests
+                    SET status='replied',reply_item_id=?,replied_at=?
+                    WHERE request_item_id=? AND status='open'
+                    """,
+                    (reply_id, timestamp, clean_id),
+                ).rowcount
+                if changed != 1:
+                    raise HubError(
+                        "request_unavailable", "Passive request is no longer open", 409
+                    )
+                updated_request = connection.execute(
+                    """
+                    SELECT request_item_id,status AS request_status,
+                           expires_at AS request_expires_at,reply_item_id
+                    FROM network_passive_requests WHERE request_item_id=?
+                    """,
+                    (clean_id,),
+                ).fetchone()
+                assert updated_request is not None
+                response["request"] = self._network_request_public(
+                    updated_request, timestamp=timestamp
+                )
+                self._idempotency_store(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "network.request.reply",
+                    request["idempotency_key"],
+                    fingerprint,
+                    "network_request_reply",
+                    reply_id,
+                    response,
+                    timestamp,
+                )
+                self._audit(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "network.request.reply",
+                    "network_request",
+                    clean_id,
+                    "succeeded",
+                    {"reply_item_id": reply_id, "passive": True},
+                    timestamp,
+                )
+                self._outbox(
+                    connection,
+                    team_id,
+                    "network_request_reply",
+                    reply_id,
+                    "network.request.replied",
+                    timestamp,
+                )
+                return response
+        finally:
+            connection.close()
 
     def list_channels(self, claims: AccessClaims, team_id: str) -> dict[str, Any]:
         connection = self.connect()

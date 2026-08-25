@@ -15,14 +15,16 @@ import time
 from typing import Any
 from urllib.parse import parse_qsl
 
+from .auth import _identity
 from .secure_peer import PeerAuthorization, ProxyRequest, ProxyResponse
 from .security import canonical_json
-from .store import HubError, HubStore
+from .store import MAX_NETWORK_BODY_BYTES, HubError, HubStore
 
 
 _TEAM_PREFIX = "/v1/teams/"
 _CHANNEL_PREFIX = "/v1/channels/"
 _MESSAGE_SUFFIX = "/messages"
+_NETWORK_CHILD = "network"
 
 
 class SecurePeerHubAdapter:
@@ -158,6 +160,230 @@ class SecurePeerHubAdapter:
                 raise HubError("invalid_request", "Request body is invalid", 422)
         return result
 
+    @staticmethod
+    def _object_body(
+        request: ProxyRequest,
+        *,
+        allowed: set[str],
+        required: set[str],
+    ) -> dict[str, Any]:
+        try:
+            value = json.loads(request.body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HubError("invalid_request", "Request body is invalid", 422) from exc
+        if (
+            not isinstance(value, dict)
+            or not set(value).issubset(allowed)
+            or not required.issubset(value)
+        ):
+            raise HubError("invalid_request", "Request body is invalid", 422)
+        return value
+
+    @staticmethod
+    def _identifier(
+        value: Any,
+        *,
+        minimum: int = 1,
+        maximum: int = 240,
+    ) -> str:
+        try:
+            encoded = value.encode("utf-8", "strict") if isinstance(value, str) else b""
+        except UnicodeEncodeError as exc:
+            raise HubError("invalid_request", "Request body is invalid", 422) from exc
+        if (
+            not isinstance(value, str)
+            or value != value.strip()
+            or not minimum <= len(encoded) <= maximum
+        ):
+            raise HubError("invalid_request", "Request body is invalid", 422)
+        return value
+
+    @staticmethod
+    def _resource_id(value: Any) -> str:
+        try:
+            return _identity(value) if isinstance(value, str) else _identity("")
+        except ValueError as exc:
+            raise HubError("invalid_request", "Resource identifier is invalid", 422) from exc
+
+    @classmethod
+    def _address(cls, value: Any) -> dict[str, str]:
+        if not isinstance(value, dict) or set(value) != {"kind", "id"}:
+            raise HubError("invalid_request", "Request body is invalid", 422)
+        if value.get("kind") not in {"server", "agent"}:
+            raise HubError("invalid_request", "Request body is invalid", 422)
+        return {
+            "kind": str(value["kind"]),
+            "id": cls._identifier(value.get("id")),
+        }
+
+    @classmethod
+    def _network_agent_body(cls, request: ProxyRequest) -> dict[str, Any]:
+        value = cls._object_body(
+            request,
+            allowed={
+                "external_agent_id",
+                "backend",
+                "display_name",
+                "idempotency_key",
+            },
+            required={
+                "external_agent_id",
+                "backend",
+                "display_name",
+                "idempotency_key",
+            },
+        )
+        if value.get("backend") not in {"codex", "claude", "other"}:
+            raise HubError("invalid_request", "Request body is invalid", 422)
+        return {
+            "external_agent_id": cls._identifier(value["external_agent_id"]),
+            "backend": value["backend"],
+            "display_name": cls._identifier(value["display_name"], maximum=160),
+            "idempotency_key": cls._identifier(
+                value["idempotency_key"], minimum=8
+            ),
+        }
+
+    @classmethod
+    def _network_text_body(
+        cls,
+        request: ProxyRequest,
+        *,
+        mode: str,
+    ) -> dict[str, Any]:
+        if mode == "bulletin":
+            allowed = {
+                "body",
+                "body_format",
+                "reply_to_post_id",
+                "idempotency_key",
+            }
+            required = {"body", "idempotency_key"}
+        elif mode == "mailbox":
+            allowed = {
+                "to",
+                "from_agent_id",
+                "body",
+                "body_format",
+                "idempotency_key",
+            }
+            required = {"to", "body", "idempotency_key"}
+        elif mode == "request":
+            allowed = {
+                "to",
+                "from_agent_id",
+                "body",
+                "body_format",
+                "expires_in_seconds",
+                "idempotency_key",
+            }
+            required = {"to", "body", "idempotency_key"}
+        elif mode == "reply":
+            allowed = {
+                "from_agent_id",
+                "body",
+                "body_format",
+                "idempotency_key",
+            }
+            required = {"body", "idempotency_key"}
+        else:  # pragma: no cover - internal contract only.
+            raise RuntimeError("unknown Team Networks body mode")
+        value = cls._object_body(
+            request, allowed=allowed, required=required
+        )
+        body = value.get("body")
+        try:
+            body_bytes = body.encode("utf-8", "strict") if isinstance(body, str) else b""
+        except UnicodeEncodeError as exc:
+            raise HubError("invalid_request", "Request body is invalid", 422) from exc
+        body_format = value.get("body_format", "markdown")
+        if not 1 <= len(body_bytes) <= MAX_NETWORK_BODY_BYTES or body_format not in {"plain", "markdown"}:
+            raise HubError("invalid_request", "Request body is invalid", 422)
+        result: dict[str, Any] = {
+            "body": body,
+            "body_format": body_format,
+            "idempotency_key": cls._identifier(
+                value["idempotency_key"], minimum=8
+            ),
+        }
+        from_agent = value.get("from_agent_id")
+        if from_agent is not None:
+            result["from_agent_id"] = cls._identifier(from_agent)
+        else:
+            result["from_agent_id"] = None
+        if mode in {"mailbox", "request"}:
+            result["to"] = cls._address(value.get("to"))
+        if mode == "bulletin":
+            reply_to = value.get("reply_to_post_id")
+            result["reply_to_post_id"] = (
+                cls._identifier(reply_to) if reply_to is not None else None
+            )
+            result.pop("from_agent_id", None)
+        if mode == "request":
+            ttl = value.get("expires_in_seconds", 86_400)
+            if type(ttl) is not int or not 60 <= ttl <= 86_400:
+                raise HubError("invalid_request", "Request body is invalid", 422)
+            result["expires_in_seconds"] = ttl
+        return result
+
+    @classmethod
+    def _network_receipt_body(cls, request: ProxyRequest) -> dict[str, Any]:
+        value = cls._object_body(
+            request,
+            allowed={"state", "idempotency_key"},
+            required={"state", "idempotency_key"},
+        )
+        if value.get("state") not in {"delivered", "read"}:
+            raise HubError("invalid_request", "Request body is invalid", 422)
+        return {
+            "state": value["state"],
+            "idempotency_key": cls._identifier(
+                value["idempotency_key"], minimum=8
+            ),
+        }
+
+    @staticmethod
+    def _query(
+        request: ProxyRequest,
+        *,
+        allowed: set[str],
+    ) -> dict[str, str]:
+        try:
+            pairs = parse_qsl(request.query, keep_blank_values=True, strict_parsing=True)
+        except ValueError as exc:
+            raise HubError("invalid_request", "Query is invalid", 422) from exc
+        if len(pairs) != len({key for key, _value in pairs}) or any(
+            key not in allowed for key, _value in pairs
+        ):
+            raise HubError("invalid_request", "Query is invalid", 422)
+        values = dict(pairs)
+        for key in ("after_sequence", "limit"):
+            if key in values and (
+                not values[key].isdigit()
+                or str(int(values[key])) != values[key]
+            ):
+                raise HubError("invalid_request", "Query is invalid", 422)
+        if "after_sequence" in values and not 0 <= int(
+            values["after_sequence"]
+        ) <= 9_223_372_036_854_775_807:
+            raise HubError("invalid_request", "Query is invalid", 422)
+        if "limit" in values and not 1 <= int(values["limit"]) <= 100:
+            raise HubError("invalid_request", "Query is invalid", 422)
+        if "address_kind" in values and values["address_kind"] not in {
+            "server",
+            "agent",
+        }:
+            raise HubError("invalid_request", "Query is invalid", 422)
+        if "address_id" in values:
+            values["address_id"] = SecurePeerHubAdapter._resource_id(
+                values["address_id"]
+            )
+        if "after_server_id" in values:
+            values["after_server_id"] = SecurePeerHubAdapter._resource_id(
+                values["after_server_id"]
+            )
+        return values
+
     def forward(self, request: ProxyRequest) -> ProxyResponse:
         """Serve one already-sanitized request without network recursion."""
 
@@ -188,7 +414,111 @@ class SecurePeerHubAdapter:
                     result = self.store.list_nodes(claims, team_id)
                 elif len(pieces) == 2 and pieces[1] == "channels":
                     result = self.store.list_channels(claims, team_id)
+                elif len(pieces) == 2 and pieces[1] == _NETWORK_CHILD:
+                    values = self._query(
+                        request, allowed={"after_server_id", "limit"}
+                    )
+                    result = self.store.get_network(
+                        claims,
+                        team_id,
+                        after_server_id=values.get("after_server_id"),
+                        limit=int(values.get("limit", "50")),
+                    )
+                elif len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "bulletin"]:
+                    values = self._query(
+                        request, allowed={"after_sequence", "limit"}
+                    )
+                    result = self.store.list_network_bulletin(
+                        claims,
+                        team_id,
+                        after_sequence=int(values.get("after_sequence", "0")),
+                        limit=int(values.get("limit", "50")),
+                    )
+                elif len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "mailbox"]:
+                    values = self._query(
+                        request,
+                        allowed={
+                            "address_kind",
+                            "address_id",
+                            "after_sequence",
+                            "limit",
+                        },
+                    )
+                    if not {"address_kind", "address_id"}.issubset(values):
+                        raise HubError("invalid_request", "Query is invalid", 422)
+                    result = self.store.list_network_mailbox(
+                        claims,
+                        team_id,
+                        address_kind=values["address_kind"],
+                        address_id=values["address_id"],
+                        after_sequence=int(values.get("after_sequence", "0")),
+                        limit=int(values.get("limit", "50")),
+                    )
+                elif (
+                    len(pieces) == 4
+                    and pieces[1:3] == [_NETWORK_CHILD, "items"]
+                ):
+                    result = self.store.get_network_item(
+                        claims, team_id, self._resource_id(pieces[3])
+                    )
+                elif (
+                    len(pieces) == 4
+                    and pieces[1:3] == [_NETWORK_CHILD, "requests"]
+                ):
+                    result = self.store.get_network_request(
+                        claims, team_id, self._resource_id(pieces[3])
+                    )
                 else:  # The gateway sanitizer should make this unreachable.
+                    raise HubError("not_found", "Resource not found", 404)
+            elif request.method == "POST" and path.startswith(_TEAM_PREFIX):
+                remainder = path[len(_TEAM_PREFIX) :]
+                pieces = remainder.split("/")
+                team_id = pieces[0]
+                if len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "agents"]:
+                    result = self.store.register_network_agent(
+                        claims, team_id, self._network_agent_body(request)
+                    )
+                elif len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "bulletin"]:
+                    result = self.store.create_network_bulletin_post(
+                        claims,
+                        team_id,
+                        self._network_text_body(request, mode="bulletin"),
+                    )
+                elif len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "mailbox"]:
+                    result = self.store.create_network_mailbox_item(
+                        claims,
+                        team_id,
+                        self._network_text_body(request, mode="mailbox"),
+                    )
+                elif len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "requests"]:
+                    result = self.store.create_network_request(
+                        claims,
+                        team_id,
+                        self._network_text_body(request, mode="request"),
+                    )
+                elif (
+                    len(pieces) == 5
+                    and pieces[1:3] == [_NETWORK_CHILD, "deliveries"]
+                    and pieces[4] == "receipts"
+                ):
+                    result = self.store.record_network_delivery_receipt(
+                        claims,
+                        team_id,
+                        self._resource_id(pieces[3]),
+                        self._network_receipt_body(request),
+                    )
+                elif (
+                    len(pieces) == 5
+                    and pieces[1:3] == [_NETWORK_CHILD, "requests"]
+                    and pieces[4] == "replies"
+                ):
+                    result = self.store.create_network_request_reply(
+                        claims,
+                        team_id,
+                        self._resource_id(pieces[3]),
+                        self._network_text_body(request, mode="reply"),
+                    )
+                else:
                     raise HubError("not_found", "Resource not found", 404)
             elif path.startswith(_CHANNEL_PREFIX) and path.endswith(_MESSAGE_SUFFIX):
                 channel_id = path[len(_CHANNEL_PREFIX) : -len(_MESSAGE_SUFFIX)]

@@ -18,7 +18,13 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from .auth import AuthenticationError, AuthorizationError
-from .store import AccessClaims, HubError, HubStore
+from .store import (
+    MAX_NETWORK_BODY_BYTES,
+    MAX_NETWORK_PAGE_ITEMS,
+    AccessClaims,
+    HubError,
+    HubStore,
+)
 
 
 MAX_JSON_BODY_BYTES = 65_536
@@ -132,6 +138,49 @@ class MessageRequest(StrictModel):
     kind: Literal["post", "announcement"] = "post"
     thread_root_message_id: str | None = Field(default=None, min_length=1, max_length=240)
     parent_message_id: str | None = Field(default=None, min_length=1, max_length=240)
+    idempotency_key: str = Field(min_length=8, max_length=240)
+
+
+class NetworkAddress(StrictModel):
+    kind: Literal["server", "agent"]
+    id: str = Field(min_length=1, max_length=240)
+
+
+class NetworkAgentRequest(StrictModel):
+    external_agent_id: str = Field(min_length=1, max_length=240)
+    backend: Literal["codex", "claude", "other"]
+    display_name: str = Field(min_length=1, max_length=160)
+    idempotency_key: str = Field(min_length=8, max_length=240)
+
+
+class NetworkBulletinRequest(StrictModel):
+    body: str = Field(min_length=1, max_length=MAX_NETWORK_BODY_BYTES)
+    body_format: Literal["plain", "markdown"] = "markdown"
+    reply_to_post_id: str | None = Field(default=None, min_length=1, max_length=240)
+    idempotency_key: str = Field(min_length=8, max_length=240)
+
+
+class NetworkMailboxRequest(StrictModel):
+    to: NetworkAddress
+    from_agent_id: str | None = Field(default=None, min_length=1, max_length=240)
+    body: str = Field(min_length=1, max_length=MAX_NETWORK_BODY_BYTES)
+    body_format: Literal["plain", "markdown"] = "markdown"
+    idempotency_key: str = Field(min_length=8, max_length=240)
+
+
+class NetworkPassiveRequest(NetworkMailboxRequest):
+    expires_in_seconds: int = Field(default=86_400, ge=60, le=86_400)
+
+
+class NetworkReplyRequest(StrictModel):
+    from_agent_id: str | None = Field(default=None, min_length=1, max_length=240)
+    body: str = Field(min_length=1, max_length=MAX_NETWORK_BODY_BYTES)
+    body_format: Literal["plain", "markdown"] = "markdown"
+    idempotency_key: str = Field(min_length=8, max_length=240)
+
+
+class NetworkReceiptRequest(StrictModel):
+    state: Literal["delivered", "read"]
     idempotency_key: str = Field(min_length=8, max_length=240)
 
 
@@ -795,6 +844,132 @@ def create_app(
                 body.expected_certificate_fingerprint
             ),
             idempotency_key=body.idempotency_key,
+        )
+
+    @app.get("/v1/teams/{team_id}/network")
+    def network(
+        team_id: str,
+        claims: Auth,
+        after_server_id: Annotated[
+            str | None, Query(min_length=8, max_length=240)
+        ] = None,
+        limit: Annotated[int, Query(ge=1, le=MAX_NETWORK_PAGE_ITEMS)] = 50,
+    ) -> dict[str, Any]:
+        return store.get_network(
+            claims,
+            team_id,
+            after_server_id=after_server_id,
+            limit=limit,
+        )
+
+    @app.post("/v1/teams/{team_id}/network/agents")
+    def register_network_agent(
+        team_id: str,
+        body: NetworkAgentRequest,
+        claims: Auth,
+    ) -> dict[str, Any]:
+        return store.register_network_agent(claims, team_id, body.model_dump())
+
+    @app.get("/v1/teams/{team_id}/network/bulletin")
+    def network_bulletin(
+        team_id: str,
+        claims: Auth,
+        after_sequence: Annotated[
+            int, Query(ge=0, le=9_223_372_036_854_775_807)
+        ] = 0,
+        limit: Annotated[int, Query(ge=1, le=MAX_NETWORK_PAGE_ITEMS)] = 50,
+    ) -> dict[str, Any]:
+        return store.list_network_bulletin(
+            claims,
+            team_id,
+            after_sequence=after_sequence,
+            limit=limit,
+        )
+
+    @app.post("/v1/teams/{team_id}/network/bulletin")
+    def create_network_bulletin_post(
+        team_id: str,
+        body: NetworkBulletinRequest,
+        claims: Auth,
+    ) -> dict[str, Any]:
+        return store.create_network_bulletin_post(
+            claims, team_id, body.model_dump()
+        )
+
+    @app.get("/v1/teams/{team_id}/network/mailbox")
+    def network_mailbox(
+        team_id: str,
+        claims: Auth,
+        address_kind: Annotated[Literal["human", "server", "agent"], Query()],
+        address_id: Annotated[str, Query(min_length=1, max_length=240)],
+        after_sequence: Annotated[
+            int, Query(ge=0, le=9_223_372_036_854_775_807)
+        ] = 0,
+        limit: Annotated[int, Query(ge=1, le=MAX_NETWORK_PAGE_ITEMS)] = 50,
+    ) -> dict[str, Any]:
+        return store.list_network_mailbox(
+            claims,
+            team_id,
+            address_kind=address_kind,
+            address_id=address_id,
+            after_sequence=after_sequence,
+            limit=limit,
+        )
+
+    @app.post("/v1/teams/{team_id}/network/mailbox")
+    def send_network_mailbox_item(
+        team_id: str,
+        body: NetworkMailboxRequest,
+        claims: Auth,
+    ) -> dict[str, Any]:
+        return store.create_network_mailbox_item(
+            claims, team_id, body.model_dump()
+        )
+
+    @app.get("/v1/teams/{team_id}/network/items/{item_id}")
+    def network_item(
+        team_id: str,
+        item_id: str,
+        claims: Auth,
+    ) -> dict[str, Any]:
+        return store.get_network_item(claims, team_id, item_id)
+
+    @app.post("/v1/teams/{team_id}/network/deliveries/{delivery_id}/receipts")
+    def network_delivery_receipt(
+        team_id: str,
+        delivery_id: str,
+        body: NetworkReceiptRequest,
+        claims: Auth,
+    ) -> dict[str, Any]:
+        return store.record_network_delivery_receipt(
+            claims, team_id, delivery_id, body.model_dump()
+        )
+
+    @app.post("/v1/teams/{team_id}/network/requests")
+    def create_network_request(
+        team_id: str,
+        body: NetworkPassiveRequest,
+        claims: Auth,
+    ) -> dict[str, Any]:
+        return store.create_network_request(claims, team_id, body.model_dump())
+
+    @app.get("/v1/teams/{team_id}/network/requests/{request_id}")
+    def network_request(
+        team_id: str,
+        request_id: str,
+        claims: Auth,
+    ) -> dict[str, Any]:
+        return store.get_network_request(claims, team_id, request_id)
+
+    @app.post("/v1/teams/{team_id}/network/requests/{request_id}/replies")
+    def create_network_request_reply(
+        team_id: str,
+        request_id: str,
+        body: NetworkReplyRequest,
+        claims: Auth,
+    ) -> dict[str, Any]:
+        return store.create_network_request_reply(
+            claims, team_id, request_id, body.model_dump()
         )
 
     @app.get("/v1/teams/{team_id}/channels")

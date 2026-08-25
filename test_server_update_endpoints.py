@@ -46,6 +46,133 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         tmux_pid.assert_not_called()
 
+    def test_tmux_guard_does_not_false_open_when_service_appears_on_reprobe(self):
+        cgroup = "/user.slice/user@1000.service/app.slice/agents-server.service"
+        server_pid = os.getpid()
+        paths = {
+            server_pid: (cgroup,),
+            4242: ("/user.slice/user@1000.service/app.slice/updater.scope",),
+        }
+        with patch.object(agent_server.sys, "platform", "linux"), \
+             patch.object(agent_server, "agents_server_systemd_cgroup", return_value=None), \
+             patch.object(agent_server, "linux_process_ids", return_value=(server_pid,)), \
+             patch.object(
+                 agent_server,
+                 "process_cgroup_paths",
+                 side_effect=lambda pid: paths[pid],
+             ), \
+             patch.object(agent_server, "tmux_server_pid", return_value=4242):
+            verified = agent_server.ensure_managed_update_tmux_isolated()
+
+        self.assertEqual(verified, cgroup)
+
+    def test_service_cgroup_probe_fails_closed_on_a_stubborn_descendant(self):
+        cgroup = "/user.slice/user@1000.service/app.slice/agents-server.service"
+        server_pid = os.getpid()
+        paths = {
+            server_pid: (cgroup,),
+            4242: (cgroup,),
+            5151: ("/user.slice/user@1000.service/app.slice/other.service",),
+        }
+        with patch.object(agent_server.sys, "platform", "linux"), \
+             patch.object(
+                 agent_server,
+                 "linux_process_ids",
+                 return_value=tuple(paths),
+             ), \
+             patch.object(
+                 agent_server,
+                 "process_cgroup_paths",
+                 side_effect=lambda pid: paths[pid],
+             ):
+            state = agent_server.managed_update_service_cgroup_state(
+                service_cgroup=cgroup,
+            )
+            with self.assertRaises(HTTPException) as raised:
+                agent_server.ensure_managed_update_service_cgroup_clear(
+                    service_cgroup=cgroup,
+                )
+
+        self.assertFalse(state["safe"])
+        self.assertEqual(state["unknown_descendant_count"], 1)
+        self.assertNotIn("4242", str(raised.exception.detail))
+        self.assertNotIn(cgroup, str(raised.exception.detail))
+        self.assertEqual(
+            raised.exception.detail["code"],
+            "unsafe_update_service_cgroup",
+        )
+
+    def test_service_cgroup_probe_fails_closed_when_proc_is_unavailable(self):
+        cgroup = "/user.slice/user@1000.service/app.slice/agents-server.service"
+        with patch.object(agent_server.sys, "platform", "linux"), \
+             patch.object(agent_server, "linux_process_ids", return_value=None):
+            state = agent_server.managed_update_service_cgroup_state(
+                service_cgroup=cgroup,
+            )
+
+        self.assertFalse(state["safe"])
+        self.assertIsNone(state["unknown_descendant_count"])
+        public = agent_server.public_managed_update_service_cgroup_state(state)
+        self.assertEqual(public, {
+            "safe": False,
+            "unknown_descendant_count": None,
+            "inspection": "process-list-unavailable",
+        })
+
+    def test_service_cgroup_probe_fails_closed_on_unreadable_live_membership(self):
+        cgroup = "/user.slice/user@1000.service/app.slice/agents-server.service"
+        server_pid = os.getpid()
+        with patch.object(agent_server.sys, "platform", "linux"), \
+             patch.object(
+                 agent_server,
+                 "linux_process_ids",
+                 return_value=(server_pid, 4242),
+             ), \
+             patch.object(
+                 agent_server,
+                 "process_cgroup_paths",
+                 side_effect=lambda pid: (cgroup,) if pid == server_pid else (),
+             ), \
+             patch.object(
+                 agent_server,
+                 "linux_process_still_exists",
+                 return_value=True,
+             ):
+            state = agent_server.managed_update_service_cgroup_state(
+                service_cgroup=cgroup,
+            )
+
+        self.assertFalse(state["safe"])
+        self.assertIsNone(state["unknown_descendant_count"])
+        self.assertEqual(state["inspection"], "process-cgroup-unavailable")
+
+    def test_service_cgroup_probe_distinguishes_nonservice_from_unreadable_self_cgroup(self):
+        with patch.object(agent_server.sys, "platform", "linux"), \
+             patch.object(agent_server, "agents_server_systemd_cgroup", return_value=None), \
+             patch.object(agent_server, "process_cgroup_paths", return_value=()):
+            unavailable = agent_server.managed_update_service_cgroup_state()
+
+        self.assertEqual(
+            agent_server.public_managed_update_service_cgroup_state(unavailable),
+            {
+                "safe": False,
+                "unknown_descendant_count": None,
+                "inspection": "self-cgroup-unavailable",
+            },
+        )
+
+        with patch.object(agent_server.sys, "platform", "linux"), \
+             patch.object(agent_server, "agents_server_systemd_cgroup", return_value=None), \
+             patch.object(
+                 agent_server,
+                 "process_cgroup_paths",
+                 return_value=("/user.slice/user@1000.service/session.scope",),
+             ):
+            direct = agent_server.managed_update_service_cgroup_state()
+
+        self.assertTrue(direct["safe"])
+        self.assertEqual(direct["inspection"], "not-systemd-managed")
+
     def test_missing_tmux_server_is_bootstrapped_in_a_user_scope(self):
         cgroup = "/user.slice/user@1000.service/app.slice/agents-server.service"
         completed = MagicMock(returncode=0, stdout="", stderr="")
@@ -121,6 +248,108 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         run_tmux.assert_not_called()
         self.assertFalse(status_path.exists())
 
+    async def test_residual_service_descendant_reopens_admission_before_launch(self):
+        cgroup = "/user.slice/user@1000.service/app.slice/agents-server.service"
+        blocker = HTTPException(
+            status_code=409,
+            detail={
+                "code": "unsafe_update_service_cgroup",
+                "message": "Managed update cannot safely start.",
+                "action": "Retry.",
+                "retryable": True,
+            },
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "update_runner.py"
+            key = root / "release-public-key.pem"
+            status_path = root / "status.json"
+            runner.write_text("# runner\n")
+            key.write_text("public key\n")
+            quiesce = AsyncMock(side_effect=blocker)
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", status_path), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
+                 patch.object(
+                     agent_server,
+                     "ensure_managed_update_tmux_isolated",
+                     return_value=cgroup,
+                 ), \
+                 patch.object(
+                     agent_server,
+                     "quiesce_managed_update_service_cgroup",
+                     new=quiesce,
+                 ), \
+                 patch.object(agent_server, "run_tmux") as run_tmux:
+                with self.assertRaises(HTTPException) as raised:
+                    await agent_server.start_server_update(
+                        agent_server.ServerUpdateRequest(version="1.1.0"),
+                    )
+                status = agent_server.read_server_update_status()
+                admission_blocker = agent_server.managed_server_update_blocker()
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(
+            raised.exception.detail["code"],
+            "unsafe_update_service_cgroup",
+        )
+        self.assertEqual(status["phase"], "failed")
+        self.assertIsNone(admission_blocker)
+        quiesce.assert_awaited_once_with(service_cgroup=cgroup)
+        run_tmux.assert_not_called()
+
+    async def test_cancelled_prelaunch_quiesce_reopens_admission(self):
+        cgroup = "/user.slice/user@1000.service/app.slice/agents-server.service"
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_quiesce(*, service_cgroup):
+            self.assertEqual(service_cgroup, cgroup)
+            entered.set()
+            await release.wait()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "update_runner.py"
+            key = root / "release-public-key.pem"
+            status_path = root / "status.json"
+            runner.write_text("# runner\n")
+            key.write_text("public key\n")
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", status_path), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
+                 patch.object(
+                     agent_server,
+                     "ensure_managed_update_tmux_isolated",
+                     return_value=cgroup,
+                 ), \
+                 patch.object(
+                     agent_server,
+                     "quiesce_managed_update_service_cgroup",
+                     side_effect=slow_quiesce,
+                 ), \
+                 patch.object(agent_server, "run_tmux") as run_tmux:
+                task = asyncio.create_task(agent_server.start_server_update(
+                    agent_server.ServerUpdateRequest(version="1.1.0"),
+                ))
+                await asyncio.wait_for(entered.wait(), timeout=1)
+                task.cancel()
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                status = agent_server.read_server_update_status()
+                admission_blocker = agent_server.managed_server_update_blocker()
+
+        self.assertEqual(status["phase"], "failed")
+        self.assertIsNone(admission_blocker)
+        run_tmux.assert_not_called()
+
     def test_linux_runner_environment_restores_the_user_service_bus(self):
         with tempfile.TemporaryDirectory() as temporary:
             runtime = Path(temporary)
@@ -175,8 +404,13 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response["managed_updates"])
         self.assertEqual(
             response["capabilities"]["server_updates"]["version"],
-            3,
+            4,
         )
+        self.assertEqual(response["update_service_cgroup"], {
+            "safe": True,
+            "unknown_descendant_count": 0,
+            "inspection": "not-systemd-managed",
+        })
         self.assertEqual(
             response["capabilities"]["server_updates"]["tracks"],
             ["stable", "beta"],
@@ -736,6 +970,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
             key = root / "release-public-key.pem"
             runner.write_text("# runner\n")
             key.write_text("public key\n")
+            quiesce = AsyncMock()
             with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
                  patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", root / "status.json"), \
                  patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
@@ -745,6 +980,11 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(agent_server, "RUN_NOW_TURNS", {}), \
                  patch.object(agent_server, "server_update_is_active", return_value=False), \
                  patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
+                 patch.object(
+                     agent_server,
+                     "quiesce_managed_update_service_cgroup",
+                     new=quiesce,
+                 ), \
                  patch.object(agent_server, "run_tmux") as run_tmux:
                 with self.assertRaises(HTTPException) as raised:
                     await agent_server.start_server_update(
@@ -753,6 +993,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.status_code, 409)
         self.assertIn("1 active agent run", str(raised.exception.detail))
+        quiesce.assert_not_awaited()
         run_tmux.assert_not_called()
 
     async def test_start_rejects_update_while_queued_turns_are_not_durable(self):

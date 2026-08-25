@@ -21,6 +21,34 @@ HOST_B = "server-host-b-12345678"
 
 class ManagedHostTests(unittest.TestCase):
     @staticmethod
+    def downgrade_database_to_schema5(database_path: Path) -> None:
+        connection = sqlite3.connect(database_path, isolation_level=None)
+        try:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            connection.execute("BEGIN IMMEDIATE")
+            for trigger in (
+                "network_agents_limit_per_server",
+                "network_bulletin_body_limit_on_insert",
+                "network_bulletin_body_limit_on_update",
+            ):
+                connection.execute(f"DROP TRIGGER {trigger}")
+            for table in (
+                "network_passive_requests",
+                "network_deliveries",
+                "network_mailbox_items",
+                "network_boards",
+                "network_peer_bindings",
+            ):
+                connection.execute(f"DROP TABLE {table}")
+            connection.execute("DELETE FROM schema_migrations WHERE version > 5")
+            connection.execute("PRAGMA user_version = 5")
+            connection.execute("COMMIT")
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            connection.close()
+
+    @staticmethod
     def downgrade_database_to_schema4(
         database_path: Path,
         *,
@@ -31,6 +59,17 @@ class ManagedHostTests(unittest.TestCase):
             connection.execute("PRAGMA foreign_keys = OFF")
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DROP TRIGGER network_agents_limit_per_server")
+            connection.execute("DROP TRIGGER network_bulletin_body_limit_on_insert")
+            connection.execute("DROP TRIGGER network_bulletin_body_limit_on_update")
+            for table in (
+                "network_passive_requests",
+                "network_deliveries",
+                "network_mailbox_items",
+                "network_boards",
+                "network_peer_bindings",
+            ):
+                connection.execute(f"DROP TABLE {table}")
             for trigger in (
                 "bootstrap_delegation_is_immutable",
                 "bootstrap_delegations_cannot_be_deleted",
@@ -40,7 +79,7 @@ class ManagedHostTests(unittest.TestCase):
                 connection.execute(f"DROP TRIGGER {trigger}")
             connection.execute("DROP TABLE bootstrap_delegations")
             if update_version_ledger:
-                connection.execute("DELETE FROM schema_migrations WHERE version = 5")
+                connection.execute("DELETE FROM schema_migrations WHERE version > 4")
                 connection.execute("PRAGMA user_version = 4")
             connection.execute("COMMIT")
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -350,15 +389,271 @@ class ManagedHostTests(unittest.TestCase):
             self.assertEqual(migrated.bootstrap_proof_path.read_bytes(), expected_proof)
             connection = migrated.connect()
             try:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 5)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 6)
                 self.assertEqual(
                     connection.execute(
                         "SELECT count(*) FROM bootstrap_delegations"
                     ).fetchone()[0],
                     0,
                 )
+                self.assertIsNotNone(
+                    connection.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'network_mailbox_items'"
+                    ).fetchone()
+                )
             finally:
                 connection.close()
+
+    def test_schema5_bulletin_slug_collisions_upgrade_without_hijacking(self) -> None:
+        collisions = {
+            "live-shared": {
+                "kind": "board",
+                "visibility": "team",
+                "archived": False,
+            },
+            "archived": {"kind": "board", "visibility": "team", "archived": True},
+            "private": {"kind": "board", "visibility": "private", "archived": False},
+            "wrong-kind": {
+                "kind": "announcements",
+                "visibility": "team",
+                "archived": False,
+            },
+        }
+        for label, collision in collisions.items():
+            with self.subTest(collision=label), tempfile.TemporaryDirectory() as temporary:
+                data_dir = Path(temporary) / "hub"
+                store = HubStore(data_dir, managed_host_identity=HOST_A)
+                proof = store.bootstrap_proof_path.read_text().strip()
+                bootstrap = store.bootstrap(
+                    proof,
+                    f"owner-{label}@example.com",
+                    "Owner",
+                    "Owner Mac",
+                )
+                owner = store.verify_access(bootstrap["access_token"])
+                team_id = bootstrap["teams"][0]["id"]
+                preserved_post = store.create_network_bulletin_post(
+                    owner,
+                    team_id,
+                    {
+                        "body": f"preserve pre-V6 {label}",
+                        "body_format": "plain",
+                        "reply_to_post_id": None,
+                        "idempotency_key": f"preserve-pre-v6-{label}",
+                    },
+                )["post"]
+                connection = store.connect()
+                try:
+                    old_board = connection.execute(
+                        """
+                        SELECT c.* FROM network_boards AS b
+                        JOIN channels AS c
+                          ON c.team_id=b.team_id AND c.id=b.channel_id
+                        WHERE b.team_id=?
+                        """,
+                        (team_id,),
+                    ).fetchone()
+                    assert old_board is not None
+                    archived_at = (
+                        int(old_board["created_at"])
+                        if collision["archived"]
+                        else None
+                    )
+                    connection.execute(
+                        """
+                        UPDATE channels
+                        SET kind=?,visibility=?,archived_at=?,updated_at=updated_at+1
+                        WHERE id=?
+                        """,
+                        (
+                            collision["kind"],
+                            collision["visibility"],
+                            archived_at,
+                            old_board["id"],
+                        ),
+                    )
+                    old_board_id = str(old_board["id"])
+                finally:
+                    connection.close()
+
+                self.downgrade_database_to_schema5(store.database_path)
+                migrated = HubStore(data_dir, managed_host_identity=HOST_A)
+                connection = migrated.connect()
+                try:
+                    self.assertEqual(
+                        connection.execute("PRAGMA user_version").fetchone()[0],
+                        6,
+                    )
+                    preserved = connection.execute(
+                        "SELECT * FROM channels WHERE id=?", (old_board_id,)
+                    ).fetchone()
+                    self.assertIsNotNone(preserved)
+                    assert preserved is not None
+                    self.assertEqual(preserved["slug"], "agentsdock-bulletin")
+                    self.assertEqual(preserved["kind"], collision["kind"])
+                    self.assertEqual(preserved["visibility"], collision["visibility"])
+                    self.assertEqual(
+                        preserved["archived_at"] is not None,
+                        collision["archived"],
+                    )
+                    replacement = connection.execute(
+                        """
+                        SELECT c.* FROM network_boards AS b
+                        JOIN channels AS c
+                          ON c.team_id=b.team_id AND c.id=b.channel_id
+                        WHERE b.team_id=?
+                        """,
+                        (team_id,),
+                    ).fetchone()
+                    self.assertIsNotNone(replacement)
+                    assert replacement is not None
+                    self.assertNotEqual(replacement["id"], old_board_id)
+                    self.assertEqual(replacement["slug"], "agentsdock-bulletin-v1")
+                    self.assertEqual(replacement["kind"], "board")
+                    self.assertEqual(replacement["visibility"], "team")
+                    self.assertIsNone(replacement["archived_at"])
+                    self.assertIsNotNone(
+                        connection.execute(
+                            "SELECT 1 FROM messages WHERE id=? AND channel_id=?",
+                            (preserved_post["id"], old_board_id),
+                        ).fetchone()
+                    )
+                finally:
+                    connection.close()
+                bulletin = migrated.list_network_bulletin(
+                    owner,
+                    team_id,
+                    after_sequence=0,
+                    limit=100,
+                )
+                self.assertEqual(bulletin["posts"], [])
+
+    def test_unavailable_bulletin_binding_is_repaired_without_hijacking(self) -> None:
+        for mode in ("archived", "missing"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                data_dir = Path(temporary) / "hub"
+                store = HubStore(data_dir, managed_host_identity=HOST_A)
+                proof = store.bootstrap_proof_path.read_text().strip()
+                bootstrap = store.bootstrap(
+                    proof,
+                    f"owner-{mode}@example.com",
+                    "Owner",
+                    "Owner Mac",
+                )
+                owner = store.verify_access(bootstrap["access_token"])
+                team_id = bootstrap["teams"][0]["id"]
+                occupied_fallback = store.create_channel(
+                    owner,
+                    team_id,
+                    {
+                        "kind": "board",
+                        "visibility": "team",
+                        "slug": "agentsdock-bulletin-v1",
+                        "display_name": "User fallback board",
+                        "participant_principal_ids": [],
+                        "idempotency_key": f"fallback-board-{mode}",
+                    },
+                )["channel"]
+                connection = store.connect()
+                try:
+                    old_board = connection.execute(
+                        """
+                        SELECT c.* FROM network_boards AS b
+                        JOIN channels AS c
+                          ON c.team_id=b.team_id AND c.id=b.channel_id
+                        WHERE b.team_id=?
+                        """,
+                        (team_id,),
+                    ).fetchone()
+                    assert old_board is not None
+                    old_board_id = str(old_board["id"])
+                    if mode == "archived":
+                        connection.execute(
+                            "UPDATE channels SET archived_at=?,updated_at=updated_at+1 "
+                            "WHERE id=?",
+                            (int(old_board["created_at"]), old_board_id),
+                        )
+                finally:
+                    connection.close()
+                if mode == "missing":
+                    connection = sqlite3.connect(
+                        store.database_path, isolation_level=None
+                    )
+                    try:
+                        connection.execute("PRAGMA foreign_keys=OFF")
+                        connection.execute("BEGIN IMMEDIATE")
+                        connection.execute(
+                            "DELETE FROM channel_acl_entries WHERE channel_id=?",
+                            (old_board_id,),
+                        )
+                        connection.execute(
+                            "DELETE FROM messages WHERE channel_id=?",
+                            (old_board_id,),
+                        )
+                        connection.execute(
+                            "DELETE FROM channels WHERE id=?", (old_board_id,)
+                        )
+                        connection.execute("COMMIT")
+                    finally:
+                        connection.close()
+
+                repaired = HubStore(data_dir, managed_host_identity=HOST_A)
+                connection = repaired.connect()
+                try:
+                    replacement = connection.execute(
+                        """
+                        SELECT c.* FROM network_boards AS b
+                        JOIN channels AS c
+                          ON c.team_id=b.team_id AND c.id=b.channel_id
+                        WHERE b.team_id=?
+                        """,
+                        (team_id,),
+                    ).fetchone()
+                    self.assertIsNotNone(replacement)
+                    assert replacement is not None
+                    self.assertNotEqual(replacement["id"], old_board_id)
+                    self.assertEqual(
+                        replacement["slug"],
+                        (
+                            "agentsdock-bulletin-v1-2"
+                            if mode == "archived"
+                            else "agentsdock-bulletin"
+                        ),
+                    )
+                    self.assertEqual(replacement["kind"], "board")
+                    self.assertEqual(replacement["visibility"], "team")
+                    self.assertIsNone(replacement["archived_at"])
+                    self.assertIsNotNone(
+                        connection.execute(
+                            "SELECT 1 FROM channels WHERE id=? AND slug=?",
+                            (
+                                occupied_fallback["id"],
+                                "agentsdock-bulletin-v1",
+                            ),
+                        ).fetchone()
+                    )
+                    if mode == "archived":
+                        archived = connection.execute(
+                            "SELECT archived_at FROM channels WHERE id=?",
+                            (old_board_id,),
+                        ).fetchone()
+                        self.assertIsNotNone(archived)
+                        assert archived is not None
+                        self.assertIsNotNone(archived["archived_at"])
+                    else:
+                        self.assertIsNone(
+                            connection.execute(
+                                "SELECT 1 FROM channels WHERE id=?",
+                                (old_board_id,),
+                            ).fetchone()
+                        )
+                    self.assertEqual(
+                        connection.execute("PRAGMA foreign_key_check").fetchall(),
+                        [],
+                    )
+                finally:
+                    connection.close()
 
     def test_schema5_snapshot_does_not_fall_back_when_delegation_schema_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

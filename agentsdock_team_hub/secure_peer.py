@@ -3665,6 +3665,9 @@ _TEAM_ROUTE_RE = re.compile(
     rf"^/v1/teams/(?P<team>{_HUB_SEGMENT})(?:/(?P<child>members|nodes|channels|invitations))?$"
 )
 _CHANNEL_MESSAGES_RE = re.compile(rf"^/v1/channels/(?P<channel>{_HUB_SEGMENT})/messages$")
+_NETWORK_ROUTE_RE = re.compile(
+    rf"^/v1/teams/(?P<team>{_HUB_SEGMENT})/network(?P<suffix>(?:/{_HUB_SEGMENT}){{0,3}})$"
+)
 _BLOCKED_PROXY_PREFIXES = (
     "/v1/bootstrap",
     "/v1/owner-recovery",
@@ -3744,6 +3747,7 @@ def sanitize_proxy_request(
     required_scope: str
     resource: tuple[str, str] | None = None
     allow_query = False
+    allowed_query_keys: set[str] = set()
     if normalized_method == "GET" and path == "/v1/health":
         required_scope = "teamspace.read"
     elif path in {"/v1/peer-session", "/v1/session", "/v1/teams"} and normalized_method == "GET":
@@ -3751,6 +3755,7 @@ def sanitize_proxy_request(
     else:
         team_match = _TEAM_ROUTE_RE.fullmatch(path)
         channel_match = _CHANNEL_MESSAGES_RE.fullmatch(path)
+        network_match = _NETWORK_ROUTE_RE.fullmatch(path)
         if team_match is not None:
             if team_match.group("team") != peer.team_id:
                 raise SecurePeerError("route_forbidden", "Hub route is outside the paired team", 403)
@@ -3764,6 +3769,65 @@ def sanitize_proxy_request(
             resource = ("channel", channel_id)
             required_scope = "teamspace.read" if normalized_method == "GET" else "teamspace.write"
             allow_query = normalized_method == "GET"
+            allowed_query_keys = {"limit", "before_sequence"}
+        elif network_match is not None:
+            if network_match.group("team") != peer.team_id:
+                raise SecurePeerError("route_forbidden", "Hub route is outside the paired team", 403)
+            suffix = network_match.group("suffix")
+            pieces = [piece for piece in suffix.split("/") if piece]
+            route_allowed = False
+            if not pieces and normalized_method == "GET":
+                route_allowed = True
+                allow_query = True
+                allowed_query_keys = {"after_server_id", "limit"}
+            elif pieces == ["agents"] and normalized_method == "POST":
+                route_allowed = True
+            elif pieces == ["bulletin"] and normalized_method in {"GET", "POST"}:
+                route_allowed = True
+                allow_query = normalized_method == "GET"
+                allowed_query_keys = {"after_sequence", "limit"}
+            elif pieces == ["mailbox"] and normalized_method in {"GET", "POST"}:
+                route_allowed = True
+                allow_query = normalized_method == "GET"
+                allowed_query_keys = {
+                    "address_kind",
+                    "address_id",
+                    "after_sequence",
+                    "limit",
+                }
+            elif (
+                len(pieces) == 2
+                and pieces[0] == "items"
+                and normalized_method == "GET"
+            ):
+                route_allowed = True
+            elif pieces == ["requests"] and normalized_method == "POST":
+                route_allowed = True
+            elif (
+                len(pieces) == 2
+                and pieces[0] == "requests"
+                and normalized_method == "GET"
+            ):
+                route_allowed = True
+            elif (
+                len(pieces) == 3
+                and pieces[0] == "requests"
+                and pieces[2] == "replies"
+                and normalized_method == "POST"
+            ):
+                route_allowed = True
+            elif (
+                len(pieces) == 3
+                and pieces[0] == "deliveries"
+                and pieces[2] == "receipts"
+                and normalized_method == "POST"
+            ):
+                route_allowed = True
+            if not route_allowed:
+                raise SecurePeerError("route_forbidden", "Hub route is not permitted", 403)
+            required_scope = (
+                "teamspace.read" if normalized_method == "GET" else "teamspace.write"
+            )
         else:
             raise SecurePeerError("route_forbidden", "Hub route is not permitted", 403)
     if required_scope not in peer.scopes:
@@ -3779,16 +3843,41 @@ def sanitize_proxy_request(
         except ValueError as exc:
             raise SecurePeerError("invalid_request", "Proxy query is invalid", 422) from exc
         if (
-            len(pairs) > 2
+            len(pairs) > len(allowed_query_keys)
             or len({key for key, _value in pairs}) != len(pairs)
-            or any(key not in {"limit", "before_sequence"} for key, _value in pairs)
-            or any(not value.isdigit() or str(int(value)) != value for _key, value in pairs)
+            or any(key not in allowed_query_keys for key, _value in pairs)
         ):
             raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         values = dict(pairs)
+        for key in ("limit", "before_sequence", "after_sequence"):
+            if key in values and (
+                not values[key].isdigit() or str(int(values[key])) != values[key]
+            ):
+                raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         if "limit" in values and not 1 <= int(values["limit"]) <= 100:
             raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         if "before_sequence" in values and int(values["before_sequence"]) < 1:
+            raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
+        if "after_sequence" in values and not 0 <= int(
+            values["after_sequence"]
+        ) <= 9_223_372_036_854_775_807:
+            raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
+        if "after_server_id" in values and _ID_RE.fullmatch(
+            values["after_server_id"]
+        ) is None:
+            raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
+        if "address_kind" in values and values["address_kind"] not in {"server", "agent"}:
+            raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
+        if "address_id" in values and (
+            not values["address_id"]
+            or len(values["address_id"]) > 240
+            or any(ord(character) < 33 or ord(character) > 126 for character in values["address_id"])
+        ):
+            raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
+        if path.endswith("/network/mailbox") and normalized_method == "GET" and not {
+            "address_kind",
+            "address_id",
+        }.issubset(values):
             raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         query = urlencode(pairs)
 

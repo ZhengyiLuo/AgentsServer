@@ -53,6 +53,16 @@ EXPECTED_TEAM_HUB_DIRECT_IP_URL_SET="false"
 TEAM_HUB_SNAPSHOT=""
 TEAM_HUB_DATA_DIR=""
 TEAM_HUB_OPERATION_ID=""
+# The detached updater passes these private continuity fields in its
+# environment so a beta-to-stable transition remains compatible with older
+# signed installers that do not recognize new CLI flags. Explicit CLI values
+# below override these defaults for current-version callers.
+MANAGED_UPDATE_ID="${AGENTSDOCK_MANAGED_UPDATE_ID:-}"
+EXPECTED_SERVICE_CGROUP="${AGENTSDOCK_EXPECTED_SERVICE_CGROUP:-}"
+unset AGENTSDOCK_MANAGED_UPDATE_ID AGENTSDOCK_EXPECTED_SERVICE_CGROUP
+SYSTEMD_MANAGED_STOP_ATTEMPTS=50
+SYSTEMD_MANAGED_STOP_DELAY=0.1
+SYSTEMD_MANAGED_KILL_ATTEMPTS=20
 
 if [[ -t 1 ]] && [[ "${TERM:-}" != "dumb" ]] && [[ -z "${NO_COLOR:-}" ]]; then
   COLOR_GREEN=$'\033[32m'
@@ -198,6 +208,8 @@ while (($#)); do
     --team-hub-snapshot) TEAM_HUB_SNAPSHOT="${2:-}"; shift 2 ;;
     --team-hub-data-dir) TEAM_HUB_DATA_DIR="${2:-}"; shift 2 ;;
     --team-hub-operation-id) TEAM_HUB_OPERATION_ID="${2:-}"; shift 2 ;;
+    --managed-update-id) MANAGED_UPDATE_ID="${2:-}"; shift 2 ;;
+    --expected-service-cgroup) EXPECTED_SERVICE_CGROUP="${2:-}"; shift 2 ;;
     --show-token) SHOW_TOKEN="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -227,6 +239,18 @@ if [[ -n "$EXPECTED_TEAM_HUB_ID" ]] && [[ ! "$EXPECTED_TEAM_HUB_ID" =~ ^[A-Za-z0
 fi
 if [[ -n "$TEAM_HUB_OPERATION_ID" ]] && [[ ! "$TEAM_HUB_OPERATION_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then
   echo "Managed Team Hub operation ID is invalid." >&2
+  exit 2
+fi
+if [[ -n "$MANAGED_UPDATE_ID" ]] && [[ ! "$MANAGED_UPDATE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then
+  echo "Managed update ID is invalid." >&2
+  exit 2
+fi
+if [[ -n "$EXPECTED_SERVICE_CGROUP" ]] && [[ ! "$EXPECTED_SERVICE_CGROUP" =~ ^/([A-Za-z0-9_.@:-]+/)*[A-Za-z0-9_.@:-]+$ ]]; then
+  echo "Expected service cgroup is invalid." >&2
+  exit 2
+fi
+if [[ -n "$EXPECTED_SERVICE_CGROUP" && -z "$MANAGED_UPDATE_ID" ]]; then
+  echo "Expected service cgroup requires a managed update ID." >&2
   exit 2
 fi
 if [[ -n "$EXPECTED_TEAM_HUB_ID" ]]; then
@@ -787,6 +811,7 @@ TEAM_HUB_RELEASE_FILES=(
   migrations/0003_service_runtime.sql
   migrations/0004_managed_host_binding.sql
   migrations/0005_tailnet_bootstrap_delegations.sql
+  migrations/0006_team_network_mailbox.sql
 )
 
 for name in "${RELEASE_FILES[@]}"; do
@@ -962,6 +987,47 @@ probe_service_manager() {
   fi
 }
 
+cgroup_path_is_within() {
+  local path="/${1#/}"
+  local ancestor="/${2#/}"
+  [[ "$path" == "$ancestor" || "$path" == "$ancestor/"* ]]
+}
+
+verify_managed_update_runner_isolated() {
+  [[ -n "$MANAGED_UPDATE_ID" && "$OS_NAME" == "Linux" ]] || return 0
+  if [[ -z "$EXPECTED_SERVICE_CGROUP" ]]; then
+    record_prerequisite_failure \
+      "managed updater service-cgroup proof" \
+      "Retry from AgentsDock; the authenticated updater did not bind this install to the exact AgentsServer service cgroup."
+    return
+  fi
+  if [[ ! -r /proc/self/cgroup ]]; then
+    record_prerequisite_failure \
+      "managed updater service-cgroup proof" \
+      "Retry after checking the host's /proc and systemd user session."
+    return
+  fi
+  local hierarchy=""
+  local controllers=""
+  local path=""
+  local inspected="false"
+  while IFS=: read -r hierarchy controllers path; do
+    [[ -n "$path" ]] || continue
+    inspected="true"
+    if cgroup_path_is_within "$path" "$EXPECTED_SERVICE_CGROUP"; then
+      record_prerequisite_failure \
+        "managed updater isolation" \
+        "Retry after AgentsServer creates its detached updater outside agents-server.service."
+      return
+    fi
+  done < /proc/self/cgroup
+  if [[ "$inspected" != "true" ]]; then
+    record_prerequisite_failure \
+      "managed updater service-cgroup proof" \
+      "Retry after checking the host's /proc and systemd user session."
+  fi
+}
+
 TMUX_WARNING=""
 
 tmux_working() {
@@ -1022,6 +1088,7 @@ preflight_prerequisites() {
     Darwin|Linux) check_tmux_prerequisite ;;
   esac
   probe_service_manager
+  verify_managed_update_runner_isolated
   if [[ "$PREFLIGHT_FAILED" == "true" ]]; then
     local names=""
     local actions=""
@@ -1571,12 +1638,85 @@ bootstrap_launch_agent() {
   return "$status"
 }
 
+systemd_service_active_state() {
+  systemctl --user show "$SERVICE_NAME.service" --property=ActiveState --value
+}
+
+managed_systemd_service_is_stopped() {
+  local state=""
+  state="$(systemd_service_active_state 2>/dev/null)" || return 1
+  state="${state%%$'\n'*}"
+  [[ "$state" == "inactive" || "$state" == "failed" ]]
+}
+
+wait_for_managed_systemd_stop() {
+  local attempts="$1"
+  local attempt=1
+  local state=""
+  while ((attempt <= attempts)); do
+    if ! state="$(systemd_service_active_state 2>/dev/null)"; then
+      return 1
+    fi
+    state="${state%%$'\n'*}"
+    case "$state" in
+      inactive|failed) return 0 ;;
+      active|activating|deactivating|reloading) ;;
+      *) return 1 ;;
+    esac
+    sleep "$SYSTEMD_MANAGED_STOP_DELAY"
+    ((attempt += 1))
+  done
+  return 1
+}
+
+stop_managed_systemd_service_bounded() {
+  # This path is reachable only from the authenticated managed updater after
+  # AgentsServer closed work admission, retired idle provider supervisors,
+  # proved an empty descendant set, and the installer proved it is outside the
+  # exact service cgroup. Never use a broad process match here.
+  systemctl --user stop --no-block "$SERVICE_NAME.service" || return
+  if wait_for_managed_systemd_stop "$SYSTEMD_MANAGED_STOP_ATTEMPTS"; then
+    return 0
+  fi
+  # Close the poll/kill race: the exact unit may have reached inactive after
+  # the final timed poll. Never turn that normal completion into a false
+  # updater failure or send a signal to a later state.
+  if managed_systemd_service_is_stopped; then
+    return 0
+  fi
+  echo "AgentsServer did not finish its bounded managed-update stop; terminating the exact drained service cgroup." >&2
+  if ! systemctl --user kill \
+      --kill-who=all \
+      --signal=SIGKILL \
+      "$SERVICE_NAME.service"; then
+    # systemctl may race the unit's final transition and report that there is
+    # nothing left to kill. An authoritative inactive state is success.
+    managed_systemd_service_is_stopped || return
+  fi
+  if wait_for_managed_systemd_stop "$SYSTEMD_MANAGED_KILL_ATTEMPTS"; then
+    return 0
+  fi
+  echo "AgentsServer did not reach a stopped state after exact-unit termination." >&2
+  return 1
+}
+
+restart_managed_systemd_service_bounded() {
+  stop_managed_systemd_service_bounded || return
+  # Do not attach the updater to the service start job. The following
+  # authenticated health check proves the candidate or enters rollback.
+  systemctl --user start --no-block "$SERVICE_NAME.service"
+}
+
 restart_service() {
   if [[ "$OS_NAME" == "Linux" ]]; then
     systemctl --user disable --now "$LEGACY_SERVICE_NAME.service" >/dev/null 2>&1 || true
     systemctl --user daemon-reload || return
     systemctl --user enable "$SERVICE_NAME.service" >/dev/null || return
-    systemctl --user restart "$SERVICE_NAME.service"
+    if [[ -n "$MANAGED_UPDATE_ID" ]]; then
+      restart_managed_systemd_service_bounded
+    else
+      systemctl --user restart "$SERVICE_NAME.service"
+    fi
   else
     local domain="gui/$(id -u)"
     local service_target="$domain/$LABEL"
@@ -1652,7 +1792,11 @@ restore_previous_release() {
 
 stop_service() {
   if [[ "$OS_NAME" == "Linux" ]]; then
-    systemctl --user stop "$SERVICE_NAME.service"
+    if [[ -n "$MANAGED_UPDATE_ID" ]]; then
+      stop_managed_systemd_service_bounded
+    else
+      systemctl --user stop "$SERVICE_NAME.service"
+    fi
     return
   fi
   local domain="gui/$(id -u)"
@@ -1722,6 +1866,11 @@ EnvironmentFile=$ENV_FILE
 ExecStart=$CURRENT_LINK/.venv/bin/python $CURRENT_LINK/agent_server.py serve --bind $BIND_ADDRESS --port $PORT
 Restart=always
 RestartSec=2
+# Shutdown normally completes in under a second after provider admission is
+# drained. Bound orphaned cgroup descendants so even a legacy updater invoking
+# synchronous `systemctl restart` cannot be stranded behind systemd's 90s
+# default. New managed updaters use the stricter external stop/start path too.
+TimeoutStopSec=10s
 # Keep the coordinator alive long enough to record/recover agent failures
 # when systemd-oomd must choose among pressured user services. Provider
 # subprocesses remain in this cgroup and are stopped with the service.

@@ -352,15 +352,106 @@ class SecurePeerStoreTests(unittest.TestCase):
             request.headers,
             (("content-type", "application/json"), ("accept", "application/json")),
         )
+        network = sanitize_proxy_request(
+            peer,
+            "GET",
+            "/v1/teams/team-alpha/network",
+            "after_server_id=node_12345678&limit=100",
+            (),
+            b"",
+        )
+        self.assertEqual(network.path, "/v1/teams/team-alpha/network")
+        self.assertEqual(
+            network.query, "after_server_id=node_12345678&limit=100"
+        )
+        mailbox = sanitize_proxy_request(
+            peer,
+            "GET",
+            "/v1/teams/team-alpha/network/mailbox",
+            "address_kind=server&address_id=node_12345678&after_sequence=0&limit=100",
+            (),
+            b"",
+        )
+        self.assertEqual(
+            mailbox.query,
+            "address_kind=server&address_id=node_12345678&after_sequence=0&limit=100",
+        )
+        registration = sanitize_proxy_request(
+            peer,
+            "POST",
+            "/v1/teams/team-alpha/network/agents",
+            "",
+            (("Content-Type", "application/json"),),
+            b'{"external_agent_id":"agent-runtime","backend":"codex","display_name":"Agent","idempotency_key":"agent-register-001"}',
+        )
+        self.assertEqual(registration.method, "POST")
         for path in (
             "/v1/sessions/refresh",
             "/v1/invitations/redeem",
             "/v1/bootstrap/redeem",
             "/v1/teams/team-alpha/channels/new",
             "/v1/teams/team-other/members",
+            "/v1/teams/team-other/network",
+            "/v1/teams/team-alpha/network/invites",
+            "/v1/teams/team-alpha/network/skills",
         ):
             with self.subTest(path=path), self.assertRaises(SecurePeerError):
                 sanitize_proxy_request(peer, "GET", path, "", (), b"")
+        for query in (
+            "address_kind=server",
+            "address_kind=server&address_id=node_12345678&limit=101",
+            "address_kind=server&address_id=node_12345678&after_sequence=01",
+            "address_kind=server&address_id=node_12345678&after_sequence=9223372036854775808",
+            "address_kind=server&address_id=node_12345678&limit=1&limit=2",
+            "address_kind=human&address_id=node_12345678",
+        ):
+            with self.subTest(query=query), self.assertRaises(SecurePeerError):
+                sanitize_proxy_request(
+                    peer,
+                    "GET",
+                    "/v1/teams/team-alpha/network/mailbox",
+                    query,
+                    (),
+                    b"",
+                )
+        for query in (
+            "after_server_id=short",
+            "after_server_id=node_12345678&limit=0",
+            "after_server_id=node_12345678&limit=101",
+            "after_server_id=node_12345678&limit=01",
+            "after_server_id=node_12345678&after_server_id=node_87654321",
+            "unknown=value",
+        ):
+            with self.subTest(network_query=query), self.assertRaises(
+                SecurePeerError
+            ):
+                sanitize_proxy_request(
+                    peer,
+                    "GET",
+                    "/v1/teams/team-alpha/network",
+                    query,
+                    (),
+                    b"",
+                )
+        read_only_peer = PeerAuthorization(
+            peer.peer_id,
+            peer.pairing_id,
+            peer.peer_server_identity,
+            peer.team_id,
+            frozenset({"teamspace.read"}),
+            peer.certificate_fingerprint,
+            peer.certificate_expires_at,
+            peer.peer_display_name,
+        )
+        with self.assertRaises(SecurePeerError):
+            sanitize_proxy_request(
+                read_only_peer,
+                "POST",
+                "/v1/teams/team-alpha/network/mailbox",
+                "",
+                (("Content-Type", "application/json"),),
+                b'{"to":{"kind":"server","id":"node_12345678"},"body":"no","idempotency_key":"mail-denied-001"}',
+            )
 
     def test_proxy_response_is_bounded_and_strips_peer_control_headers(self) -> None:
         sanitized = sanitize_proxy_response(

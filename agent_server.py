@@ -13130,10 +13130,10 @@ def process_cgroup_paths(pid: int) -> tuple[str, ...]:
     return tuple(dict.fromkeys(paths))
 
 
-def agents_server_systemd_cgroup(pid: int | None = None) -> str | None:
-    """Return this process's systemd-user service cgroup, when applicable."""
+def agents_server_systemd_cgroup_from_paths(paths: tuple[str, ...]) -> str | None:
+    """Derive the exact service cgroup from one captured cgroup snapshot."""
 
-    for path in process_cgroup_paths(os.getpid() if pid is None else pid):
+    for path in paths:
         parts = [part for part in path.split("/") if part]
         if AGENTS_SERVER_SYSTEMD_UNIT not in parts:
             continue
@@ -13142,10 +13142,148 @@ def agents_server_systemd_cgroup(pid: int | None = None) -> str | None:
     return None
 
 
+def agents_server_systemd_cgroup(pid: int | None = None) -> str | None:
+    """Return this process's systemd-user service cgroup, when applicable."""
+
+    paths = process_cgroup_paths(os.getpid() if pid is None else pid)
+    return agents_server_systemd_cgroup_from_paths(paths)
+
+
 def cgroup_is_within(path: str, ancestor: str) -> bool:
     clean_path = "/" + path.strip("/")
     clean_ancestor = "/" + ancestor.strip("/")
     return clean_path == clean_ancestor or clean_path.startswith(clean_ancestor + "/")
+
+
+def linux_process_ids(proc_root: Path = Path("/proc")) -> tuple[int, ...] | None:
+    """Return a stable-enough Linux PID snapshot, or ``None`` on probe failure."""
+
+    if not sys.platform.startswith("linux"):
+        return ()
+    try:
+        entries = tuple(proc_root.iterdir())
+    except OSError:
+        return None
+    return tuple(sorted(
+        int(entry.name)
+        for entry in entries
+        if entry.name.isdigit() and int(entry.name) > 0
+    ))
+
+
+def linux_process_still_exists(
+    pid: int,
+    proc_root: Path = Path("/proc"),
+) -> bool | None:
+    """Distinguish an exited process from an unreadable live /proc entry."""
+
+    try:
+        (proc_root / str(pid)).stat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+    return True
+
+
+def managed_update_service_cgroup_state(
+    *,
+    service_cgroup: str | None = None,
+) -> dict[str, Any]:
+    """Inspect residual processes that could delay a Linux managed update.
+
+    Public callers receive only a boolean, a bounded count, and an inspection
+    label. PID and cgroup details remain process-private.
+    """
+
+    state: dict[str, Any] = {
+        "safe": True,
+        "unknown_descendant_count": 0,
+        "inspection": "not-systemd-managed",
+        "_service_cgroup": None,
+        "_unknown_descendant_pids": (),
+    }
+    if not sys.platform.startswith("linux"):
+        return state
+    selected_cgroup = service_cgroup
+    if selected_cgroup is None:
+        self_paths = process_cgroup_paths(os.getpid())
+        if not self_paths:
+            state.update({
+                "safe": False,
+                "unknown_descendant_count": None,
+                "inspection": "self-cgroup-unavailable",
+            })
+            return state
+        selected_cgroup = agents_server_systemd_cgroup_from_paths(self_paths)
+    state["_service_cgroup"] = selected_cgroup
+    if selected_cgroup is None:
+        # A readable non-service cgroup is an ordinary direct/non-systemd
+        # launch.
+        return state
+    pids = linux_process_ids()
+    if pids is None or os.getpid() not in pids:
+        state.update({
+            "safe": False,
+            "unknown_descendant_count": None,
+            "inspection": "process-list-unavailable",
+        })
+        return state
+    service_pids: set[int] = set()
+    for pid in pids:
+        paths = process_cgroup_paths(pid)
+        if not paths:
+            # Exiting processes are no longer capable of delaying the unit.
+            # A still-present but unreadable process remains an unknown
+            # membership candidate and must fail closed.
+            if linux_process_still_exists(pid) is not False:
+                state.update({
+                    "safe": False,
+                    "unknown_descendant_count": None,
+                    "inspection": "process-cgroup-unavailable",
+                })
+                return state
+            continue
+        if any(
+            cgroup_is_within(path, selected_cgroup)
+            for path in paths
+        ):
+            service_pids.add(pid)
+    if os.getpid() not in service_pids:
+        state.update({
+            "safe": False,
+            "unknown_descendant_count": None,
+            "inspection": "service-membership-unavailable",
+        })
+        return state
+    unknown = tuple(sorted(service_pids - {os.getpid()}))
+    state.update({
+        "safe": not unknown,
+        "unknown_descendant_count": len(unknown),
+        "inspection": "verified",
+        "_unknown_descendant_pids": unknown,
+    })
+    return state
+
+
+def public_managed_update_service_cgroup_state(
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    current = (
+        state
+        if isinstance(state, dict)
+        else managed_update_service_cgroup_state()
+    )
+    raw_count = current.get("unknown_descendant_count")
+    return {
+        "safe": current.get("safe") is True,
+        "unknown_descendant_count": (
+            min(SERVER_RESTART_COUNT_LIMIT, max(0, raw_count))
+            if isinstance(raw_count, int) and not isinstance(raw_count, bool)
+            else None
+        ),
+        "inspection": str(current.get("inspection") or "unknown")[:80],
+    }
 
 
 def tmux_server_pid() -> int | None:
@@ -40811,16 +40949,19 @@ def unsafe_update_tmux_detail(
     }
 
 
-def ensure_managed_update_tmux_isolated() -> None:
+def ensure_managed_update_tmux_isolated() -> str | None:
     """Fail closed when systemd restart would also kill the updater."""
 
     service_cgroup = agents_server_systemd_cgroup()
     if service_cgroup is None:
-        return
+        state = ensure_managed_update_service_cgroup_clear(service_cgroup=None)
+        service_cgroup = state.get("_service_cgroup")
+        if not isinstance(service_cgroup, str):
+            return None
     pid = tmux_server_pid()
     if pid is None:
         if bootstrap_isolated_tmux_server():
-            return
+            return service_cgroup
         raise HTTPException(
             status_code=409,
             detail=unsafe_update_tmux_detail(bootstrap_failed=True),
@@ -40836,6 +40977,76 @@ def ensure_managed_update_tmux_isolated() -> None:
             status_code=409,
             detail=unsafe_update_tmux_detail(),
         )
+    return service_cgroup
+
+
+def unsafe_update_service_cgroup_detail(
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    count = state.get("unknown_descendant_count")
+    if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+        message = (
+            "Managed update cannot safely start because an untracked process "
+            "remains inside agents-server.service."
+            if count == 1
+            else (
+                "Managed update cannot safely start because untracked processes "
+                "remain inside agents-server.service."
+            )
+        )
+        action = (
+            "Let current provider cleanup finish, then retry. If this repeats, "
+            "restart AgentsServer from the host before updating."
+        )
+    else:
+        message = (
+            "Managed update cannot safely start because AgentsServer could not "
+            "verify that its service cgroup is free of child processes."
+        )
+        action = "Retry after checking the host's systemd user service."
+    return {
+        "code": "unsafe_update_service_cgroup",
+        "message": message,
+        "action": action,
+        "retryable": True,
+    }
+
+
+def ensure_managed_update_service_cgroup_clear(
+    *,
+    service_cgroup: str | None = None,
+) -> dict[str, Any]:
+    """Fail closed unless only this server remains in its service cgroup."""
+
+    state = managed_update_service_cgroup_state(
+        service_cgroup=service_cgroup,
+    )
+    if state.get("safe") is True:
+        return state
+    raise HTTPException(
+        status_code=409,
+        detail=unsafe_update_service_cgroup_detail(state),
+    )
+
+
+async def quiesce_managed_update_service_cgroup(
+    *,
+    service_cgroup: str | None,
+) -> None:
+    """Retire idle provider supervisors, then prove no descendant is left.
+
+    The caller has already written the durable update drain, so no new turn or
+    unsafe mutation can start while these known server-owned supervisors close.
+    """
+
+    if service_cgroup is None:
+        return
+    await close_claude_sdk_manager()
+    await close_codex_app_server_manager()
+    await asyncio.to_thread(
+        ensure_managed_update_service_cgroup_clear,
+        service_cgroup=service_cgroup,
+    )
 
 
 async def signed_release_manifest(
@@ -41980,6 +42191,7 @@ async def health() -> dict[str, Any]:
     restart_blocker_snapshot = await current_server_restart_blocker_snapshot()
     pressure = host_pressure_snapshot()
     tmux = tmux_capability(use_cache=True)
+    update_service_cgroup = public_managed_update_service_cgroup_state()
     return {
         "ok": True,
         "server_version": SERVER_VERSION,
@@ -42037,10 +42249,9 @@ async def health() -> dict[str, Any]:
                 "required": False,
                 "message": "Signed Stable and Beta AgentsServer channels are available.",
                 "action": None,
-                # v3 guarantees durable queued turns are preserved across a
-                # managed restart and exposes update_blocking_queued_count for
-                # the detached runner's final admission check.
-                "version": 3,
+                # v4 also exposes a PID-free service-cgroup admission proof
+                # for the detached runner's final pre-restart check.
+                "version": 4,
                 "tracks": ["stable", "beta"],
             },
             "tmux": tmux,
@@ -42170,6 +42381,7 @@ async def health() -> dict[str, Any]:
         # complete queue map, while beta.8+ detached runners distinguish
         # durable preserved messages from restart-blocking provisional work.
         "update_blocking_queued_count": update_blocking_queued_count,
+        "update_service_cgroup": update_service_cgroup,
         "jobs": len(JOBS.jobs),
         "job_guard": pressure,
         "host_health_log": str(HOST_HEALTH_FILE),
@@ -43074,7 +43286,9 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
         # Check before closing admission or writing a durable drain phase. A
         # detached updater in this service cgroup cannot survive install.sh's
         # systemctl --user restart.
-        await asyncio.to_thread(ensure_managed_update_tmux_isolated)
+        service_cgroup = await asyncio.to_thread(
+            ensure_managed_update_tmux_isolated
+        )
 
         update_id = uuid.uuid4().hex
         tmux_name = server_update_tmux_name(update_id)
@@ -43090,6 +43304,8 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
             "--track", track,
             "--update-id", update_id,
         ]
+        if service_cgroup is not None:
+            command.extend(["--expected-service-cgroup", service_cgroup])
         auth_token_file: Path | None = None
         if AGENT_TOKEN:
             auth_token_file = SERVER_UPDATE_STATUS_FILE.with_name(
@@ -43300,6 +43516,38 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                     )
             finally:
                 await TEAM_HUB_RUNTIME.reopen_admission()
+
+        # The durable drain is now authoritative. Retire only the known idle
+        # provider supervisors, then fail closed if any other process remains
+        # in the exact service cgroup. Shield teardown so cancellation cannot
+        # reopen admission while a stale supervisor is still being retired.
+        quiesce_task = asyncio.create_task(
+            quiesce_managed_update_service_cgroup(
+                service_cgroup=service_cgroup,
+            )
+        )
+        try:
+            await asyncio.shield(quiesce_task)
+        except asyncio.CancelledError:
+            quiesce_error: BaseException | None = None
+            try:
+                await quiesce_task
+            except BaseException as exc:
+                quiesce_error = exc
+            await fail_runner_launch(
+                quiesce_error
+                or RuntimeError("update request ended before detached launch")
+            )
+            raise
+        except HTTPException as exc:
+            await fail_runner_launch(exc)
+            raise
+        except Exception as exc:
+            await fail_runner_launch(exc)
+            raise HTTPException(
+                status_code=500,
+                detail="could not safely quiesce AgentsServer for update",
+            ) from exc
 
         try:
             runner_environment = server_update_runner_environment()

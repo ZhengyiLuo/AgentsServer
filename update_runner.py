@@ -48,6 +48,8 @@ INSTALLER_LOG_TAIL_LINES = 12
 INSTALLER_ERROR_MAX_CHARS = 4_000
 INSTALLER_ENVIRONMENT_SELECTORS = (
     "AGENTSDOCK_AGENT_TOKEN",
+    "AGENTSDOCK_EXPECTED_SERVICE_CGROUP",
+    "AGENTSDOCK_MANAGED_UPDATE_ID",
     "AGENTSDOCK_PROVIDER_AUTHORITY_FILE",
     "AGENTSDOCK_PUBLISH_TOKEN",
     "CONDA_PREFIX",
@@ -250,6 +252,8 @@ def run_installer(
     log_path: Path,
     version: str,
     expected_update_id: str | None = None,
+    managed_update_id: str | None = None,
+    expected_service_cgroup: str | None = None,
     timeout_seconds: float = INSTALLER_TIMEOUT_SECONDS,
     heartbeat_seconds: float = INSTALLER_HEARTBEAT_SECONDS,
     on_started: Callable[[], None] | None = None,
@@ -258,6 +262,11 @@ def run_installer(
     log_path.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     deadline = started + timeout_seconds
+    environment = installer_environment()
+    if managed_update_id is not None:
+        environment["AGENTSDOCK_MANAGED_UPDATE_ID"] = managed_update_id
+    if expected_service_cgroup is not None:
+        environment["AGENTSDOCK_EXPECTED_SERVICE_CGROUP"] = expected_service_cgroup
     with log_path.open("wb") as log:
         os.chmod(log_path, 0o600)
         process = subprocess.Popen(
@@ -266,7 +275,7 @@ def run_installer(
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
-            env=installer_environment(),
+            env=environment,
         )
         if on_started is not None:
             on_started()
@@ -352,6 +361,8 @@ def server_work_snapshot(
     *,
     token: str | None = None,
     timeout: float = SERVER_IDLE_CHECK_TIMEOUT_SECONDS,
+    require_cgroup_safe: bool = False,
+    require_verified_service_cgroup: bool = False,
 ) -> tuple[int, int]:
     """Read the live workload immediately before invoking the installer."""
 
@@ -390,6 +401,29 @@ def server_work_snapshot(
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise RuntimeError("server health response has an invalid queued count")
             queued_count += value
+    if require_cgroup_safe and not active_count and not queued_count:
+        cgroup = health.get("update_service_cgroup")
+        if not isinstance(cgroup, dict):
+            raise RuntimeError(
+                "server health response is missing its service-cgroup admission proof"
+            )
+        raw_count = cgroup.get("unknown_descendant_count")
+        if (
+            cgroup.get("safe") is not True
+            or isinstance(raw_count, bool)
+            or not isinstance(raw_count, int)
+            or raw_count != 0
+        ):
+            raise RuntimeError(
+                "AgentsServer has an unverified or nonempty service cgroup"
+            )
+        if (
+            require_verified_service_cgroup
+            and cgroup.get("inspection") != "verified"
+        ):
+            raise RuntimeError(
+                "AgentsServer did not return a verified systemd service-cgroup proof"
+            )
     return active_count, queued_count
 
 
@@ -476,13 +510,20 @@ def assert_post_update_identity(
             raise RuntimeError("updated AgentsServer changed its Team Hub routes")
 
 
-def assert_server_idle(port: int, *, token: str | None = None) -> None:
+def assert_server_idle(
+    port: int,
+    *,
+    token: str | None = None,
+    require_verified_service_cgroup: bool = False,
+) -> None:
     """Fail closed if work appeared after the update was accepted."""
 
     try:
         active_count, queued_count = server_work_snapshot(
             port,
             token=token,
+            require_cgroup_safe=True,
+            require_verified_service_cgroup=require_verified_service_cgroup,
         )
     except Exception as exc:
         raise RuntimeError(
@@ -797,6 +838,14 @@ def run_update(args: argparse.Namespace) -> None:
     update_id = str(getattr(args, "update_id", "") or "").strip()
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", update_id) is None:
         raise RuntimeError("managed update is missing a valid update ID")
+    expected_service_cgroup = str(
+        getattr(args, "expected_service_cgroup", "") or ""
+    ).strip() or None
+    if expected_service_cgroup is not None and re.fullmatch(
+        r"/(?:[A-Za-z0-9_.@:-]+/)*[A-Za-z0-9_.@:-]+",
+        expected_service_cgroup,
+    ) is None:
+        raise RuntimeError("managed update has an invalid service cgroup")
     expected_team_hub_id = str(
         getattr(args, "expected_team_hub_id", "") or ""
     ).strip() or None
@@ -980,7 +1029,11 @@ def run_update(args: argparse.Namespace) -> None:
                         expected_team_hub_direct_ip_url,
                     ]
                 )
-        assert_server_idle(args.port, token=auth_token)
+        assert_server_idle(
+            args.port,
+            token=auth_token,
+            require_verified_service_cgroup=expected_service_cgroup is not None,
+        )
         update_status(
             status_path,
             expected_update_id=update_id,
@@ -995,6 +1048,10 @@ def run_update(args: argparse.Namespace) -> None:
             log_path=log_path,
             version=version,
             expected_update_id=update_id,
+            managed_update_id=(
+                update_id if expected_service_cgroup is not None else None
+            ),
+            expected_service_cgroup=expected_service_cgroup,
         )
         identity_arguments: dict[str, Any] = {
             "token": auth_token,
@@ -1039,6 +1096,7 @@ def main() -> int:
     parser.add_argument("--auth-token-file")
     parser.add_argument("--expected-server-identity", required=True)
     parser.add_argument("--update-id", required=True)
+    parser.add_argument("--expected-service-cgroup")
     parser.add_argument("--expected-team-hub-id")
     parser.add_argument("--expected-team-hub-transport")
     parser.add_argument("--expected-team-hub-url")

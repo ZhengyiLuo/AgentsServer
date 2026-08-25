@@ -31,15 +31,23 @@ All via the existing `POST /api/sessions` and `PATCH /api/sessions/{id}` endpoin
 `GET /api/runtime/catalog` → `backends.cursor.models` is real, not hardcoded: the server runs
 `agent --list-models` and returns every model the account can see (~200+ entries on a paid account),
 same shape as `backends.claude.models`/`backends.codex.models` (`{value, label}` pairs, empty-value
-entry first = "use server default"). No cursor-specific parsing needed on the client side — same
-`runtimeCatalogOptions()` helper that already works for Claude/Codex works here unchanged.
+entry first = "use server default"). Same `runtimeCatalogOptions()` helper that already works for
+Claude/Codex works here unchanged.
 
 **Free-plan accounts see the full list too**, but Cursor's own API rejects actually *using* any model
 other than `"auto"` with `ActionRequiredError: Named models unavailable Free plans can only use Auto`
-— that's an account-tier restriction from Cursor's backend, not something the server filters out.
-It surfaces as a normal turn `error` event (visible in-chat), the same as any other provider rejection —
-no special client-side handling needed, but worth knowing so a free-plan user's "why did picking a
-model fail" question has a real answer instead of looking like a bug.
+— an account-tier restriction from Cursor's own backend. Rather than let that surface as a failed turn,
+the server proactively detects the account tier (`agent about`'s Subscription Tier row) and marks every
+non-`"auto"` model option with **two extra fields not present on Claude/Codex options**:
+
+| Field | Type | Notes |
+|---|---|---|
+| `locked` | `boolean`, only present when `true` | absent entirely on unlocked options — check `option.locked` truthily, don't assume the key exists |
+| `locked_reason` | `string`, only present when `locked` is `true` | human-readable, safe to show directly, e.g. "Requires a paid Cursor plan - this account is on the free plan, which can only use Auto" |
+
+The client picker should render `locked` options disabled/greyed with `locked_reason` as a tooltip,
+the same UX pattern a "requires upgrade" state would get elsewhere. If tier detection itself fails,
+the server fails toward `locked: true` (safer default) rather than toward leaving options selectable.
 
 ### `cursor_permission_mode` semantics (for the picker UI)
 

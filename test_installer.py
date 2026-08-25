@@ -136,6 +136,497 @@ class InstallerContractTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_managed_update_private_environment_is_consumed_and_cli_overrides_it(self):
+        source = INSTALLER.read_text()
+        captured = source.index(
+            'MANAGED_UPDATE_ID="${AGENTSDOCK_MANAGED_UPDATE_ID:-}"'
+        )
+        scrubbed = source.index(
+            "unset AGENTSDOCK_MANAGED_UPDATE_ID AGENTSDOCK_EXPECTED_SERVICE_CGROUP"
+        )
+        argument_parsing = source.index("while (($#)); do")
+        self.assertLess(captured, scrubbed)
+        self.assertLess(scrubbed, argument_parsing)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            home.mkdir()
+            install_root = root / "install"
+            environment = {
+                **os.environ,
+                "HOME": str(home),
+                "AGENTS_SERVER_INSTALL_DIR": str(install_root),
+                "AGENTS_SERVER_CONFIG_DIR": str(root / "config"),
+                "AGENTSDOCK_STATE_DIR": str(root / "state"),
+                "AGENTSDOCK_MANAGED_UPDATE_ID": "invalid managed update id",
+                "AGENTSDOCK_EXPECTED_SERVICE_CGROUP": "/valid/test.service",
+            }
+            rejected = subprocess.run(
+                ["/bin/bash", str(INSTALLER), "--show-token"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(rejected.returncode, 2)
+            self.assertIn("Managed update ID is invalid", rejected.stderr)
+            self.assertFalse(install_root.exists())
+
+            environment["AGENTSDOCK_EXPECTED_SERVICE_CGROUP"] = "invalid cgroup"
+            overridden = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(INSTALLER),
+                    "--managed-update-id",
+                    "update_test_cli_override",
+                    "--expected-service-cgroup",
+                    "/valid/test.service",
+                    "--show-token",
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(overridden.returncode, 1)
+            self.assertIn("No AgentsServer access token found", overridden.stderr)
+            self.assertNotIn("invalid", overridden.stderr.lower())
+            self.assertFalse(install_root.exists())
+
+    def test_linux_managed_update_rejects_installer_inside_service_cgroup(self):
+        cgroup_file = Path("/proc/self/cgroup")
+        if not cgroup_file.is_file():
+            self.skipTest("Linux /proc cgroup fixture is unavailable")
+        cgroup_paths = [
+            line.split(":", 2)[2].strip()
+            for line in cgroup_file.read_text().splitlines()
+            if len(line.split(":", 2)) == 3 and line.split(":", 2)[2].strip()
+        ]
+        service_cgroup = next(
+            (path for path in cgroup_paths if path != "/"),
+            None,
+        )
+        if service_cgroup is None:
+            self.skipTest("fixture process is in the root cgroup")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _home, fake_bin, install_root, environment = (
+                self.fake_linux_preinstall_environment(root)
+            )
+            environment.update({
+                "AGENTSDOCK_MANAGED_UPDATE_ID": "update_test_isolation",
+                "AGENTSDOCK_EXPECTED_SERVICE_CGROUP": service_cgroup,
+            })
+            before = self.snapshot_trees(install_root)
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(INSTALLER),
+                    "--non-interactive",
+                    "--expected-server-identity",
+                    "server_test_identity_12345678",
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("managed updater isolation", result.stderr)
+        self.assertEqual(self.snapshot_trees(install_root), before)
+
+    def test_linux_managed_update_force_stops_exact_unit_then_starts(self):
+        if not Path("/proc/self/cgroup").is_file():
+            self.skipTest("Linux /proc cgroup fixture is unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _home, fake_bin, _install_root, environment = (
+                self.fake_linux_preinstall_environment(root)
+            )
+            events = root / "systemctl.log"
+            stopped = root / "stopped"
+            self.write_fake_uv(fake_bin)
+            self.write_json_health_curl(fake_bin)
+            self.write_executable(fake_bin / "sleep", "#!/bin/sh\nexit 0\n")
+            self.write_executable(
+                fake_bin / "systemctl",
+                """#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_SYSTEMCTL_LOG"
+case "$*" in
+  "--user show-environment") exit 0 ;;
+  "--user show agents-server.service --property=ActiveState --value")
+    if [ -e "$FAKE_STOPPED_SENTINEL" ]; then echo inactive; else echo deactivating; fi
+    exit 0
+    ;;
+  "--user kill --kill-whom=all --signal=SIGKILL agents-server.service")
+    : > "$FAKE_STOPPED_SENTINEL"
+    exit 0
+    ;;
+esac
+exit 0
+""",
+            )
+            server_identity = "server_test_identity_12345678"
+            environment.update({
+                "FAKE_SYSTEMCTL_LOG": str(events),
+                "FAKE_STOPPED_SENTINEL": str(stopped),
+                "FAKE_HEALTH_VERSION": self.release_version(),
+                "FAKE_SERVER_IDENTITY": server_identity,
+                "FAKE_TEAM_HUB_ID": "",
+                "REAL_PYTHON": sys.executable,
+            })
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(INSTALLER),
+                    "--non-interactive",
+                    "--expected-server-identity",
+                    server_identity,
+                    "--managed-update-id",
+                    "update_test_bounded_restart",
+                    "--expected-service-cgroup",
+                    "/agents-server-test.slice/agents-server.service",
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            lines = events.read_text().splitlines()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        kill = lines.index(
+            "--user kill --kill-whom=all --signal=SIGKILL agents-server.service"
+        )
+        start = lines.index("--user start --no-block agents-server.service")
+        self.assertLess(kill, start)
+        self.assertFalse(any("pkill" in line or "killall" in line for line in lines))
+
+    def test_linux_managed_update_reprobes_before_force_kill(self):
+        if not Path("/proc/self/cgroup").is_file():
+            self.skipTest("Linux /proc cgroup fixture is unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _home, fake_bin, _install_root, environment = (
+                self.fake_linux_preinstall_environment(root)
+            )
+            events = root / "systemctl.log"
+            count = root / "show-count"
+            self.write_fake_uv(fake_bin)
+            self.write_json_health_curl(fake_bin)
+            self.write_executable(fake_bin / "sleep", "#!/bin/sh\nexit 0\n")
+            self.write_executable(
+                fake_bin / "systemctl",
+                """#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_SYSTEMCTL_LOG"
+case "$*" in
+  "--user show-environment") exit 0 ;;
+  "--user show agents-server.service --property=ActiveState --value")
+    current="$(cat "$FAKE_SHOW_COUNT" 2>/dev/null || echo 0)"
+    current=$((current + 1))
+    printf '%s\n' "$current" > "$FAKE_SHOW_COUNT"
+    if [ "$current" -gt 50 ]; then echo inactive; else echo deactivating; fi
+    exit 0
+    ;;
+  "--user kill --kill-whom=all --signal=SIGKILL agents-server.service")
+    exit 99
+    ;;
+esac
+exit 0
+""",
+            )
+            server_identity = "server_test_identity_12345678"
+            environment.update({
+                "FAKE_SYSTEMCTL_LOG": str(events),
+                "FAKE_SHOW_COUNT": str(count),
+                "FAKE_HEALTH_VERSION": self.release_version(),
+                "FAKE_SERVER_IDENTITY": server_identity,
+                "FAKE_TEAM_HUB_ID": "",
+                "REAL_PYTHON": sys.executable,
+            })
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(INSTALLER),
+                    "--non-interactive",
+                    "--expected-server-identity",
+                    server_identity,
+                    "--managed-update-id",
+                    "update_test_stop_race",
+                    "--expected-service-cgroup",
+                    "/agents-server-test.slice/agents-server.service",
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            lines = events.read_text().splitlines()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(
+            "--user kill --kill-whom=all --signal=SIGKILL agents-server.service",
+            lines,
+        )
+        self.assertIn("--user start --no-block agents-server.service", lines)
+
+    def test_bounded_systemd_restart_shell_fixture_survives_stubborn_descendant(self):
+        source = INSTALLER.read_text()
+        start = source.index("systemd_service_active_state() {")
+        end = source.index("\nrestart_service() {", start)
+        functions = source[start:end]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            events = root / "events"
+            stopped = root / "stopped"
+            self.write_executable(fake_bin / "sleep", "#!/bin/sh\nexit 0\n")
+            self.write_executable(
+                fake_bin / "systemctl",
+                """#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_EVENT_LOG"
+case "$*" in
+  "--user show agents-server.service --property=ActiveState --value")
+    if [ -e "$FAKE_STOPPED_SENTINEL" ]; then echo inactive; else echo deactivating; fi ;;
+  "--user kill --kill-whom=all --signal=SIGKILL agents-server.service")
+    : > "$FAKE_STOPPED_SENTINEL" ;;
+esac
+exit 0
+""",
+            )
+            harness = root / "harness.sh"
+            harness.write_text(
+                "set -euo pipefail\n"
+                "SERVICE_NAME=agents-server\n"
+                "SYSTEMD_MANAGED_STOP_ATTEMPTS=2\n"
+                "SYSTEMD_MANAGED_STOP_DELAY=0\n"
+                "SYSTEMD_MANAGED_KILL_ATTEMPTS=2\n"
+                + functions
+                + "\nrestart_managed_systemd_service_bounded\n"
+            )
+            result = subprocess.run(
+                ["/bin/bash", str(harness)],
+                env={
+                    **os.environ,
+                    "PATH": f"{fake_bin}:/usr/bin:/bin",
+                    "FAKE_EVENT_LOG": str(events),
+                    "FAKE_STOPPED_SENTINEL": str(stopped),
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            stubborn_lines = events.read_text().splitlines()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "--user kill --kill-whom=all --signal=SIGKILL agents-server.service",
+            stubborn_lines,
+        )
+        self.assertEqual(stubborn_lines[-1], "--user start --no-block agents-server.service")
+
+    def test_bounded_systemd_restart_shell_fixture_closes_poll_kill_race(self):
+        source = INSTALLER.read_text()
+        start = source.index("systemd_service_active_state() {")
+        end = source.index("\nrestart_service() {", start)
+        functions = source[start:end]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            events = root / "events"
+            count = root / "count"
+            self.write_executable(fake_bin / "sleep", "#!/bin/sh\nexit 0\n")
+            self.write_executable(
+                fake_bin / "systemctl",
+                """#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_EVENT_LOG"
+case "$*" in
+  "--user show agents-server.service --property=ActiveState --value")
+    current="$(cat "$FAKE_SHOW_COUNT" 2>/dev/null || echo 0)"
+    current=$((current + 1))
+    printf '%s\n' "$current" > "$FAKE_SHOW_COUNT"
+    if [ "$current" -gt 2 ]; then echo inactive; else echo deactivating; fi ;;
+  "--user kill --kill-whom=all --signal=SIGKILL agents-server.service") exit 99 ;;
+esac
+exit 0
+""",
+            )
+            harness = root / "harness.sh"
+            harness.write_text(
+                "set -euo pipefail\n"
+                "SERVICE_NAME=agents-server\n"
+                "SYSTEMD_MANAGED_STOP_ATTEMPTS=2\n"
+                "SYSTEMD_MANAGED_STOP_DELAY=0\n"
+                "SYSTEMD_MANAGED_KILL_ATTEMPTS=2\n"
+                + functions
+                + "\nrestart_managed_systemd_service_bounded\n"
+            )
+            result = subprocess.run(
+                ["/bin/bash", str(harness)],
+                env={
+                    **os.environ,
+                    "PATH": f"{fake_bin}:/usr/bin:/bin",
+                    "FAKE_EVENT_LOG": str(events),
+                    "FAKE_SHOW_COUNT": str(count),
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            race_lines = events.read_text().splitlines()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(" kill " in f" {line} " for line in race_lines))
+        self.assertEqual(race_lines[-1], "--user start --no-block agents-server.service")
+
+    def test_real_systemd_new_and_first_upgrade_restarts_survive_stubborn_descendant(self):
+        if sys.platform != "linux":
+            self.skipTest("real systemd acceptance requires Linux")
+        if os.environ.get("AGENTSDOCK_RUN_SYSTEMD_ACCEPTANCE") != "1":
+            self.skipTest("set AGENTSDOCK_RUN_SYSTEMD_ACCEPTANCE=1 to run")
+        if shutil.which("systemctl") is None:
+            self.skipTest("systemctl is unavailable")
+        probe = subprocess.run(
+            ["systemctl", "--user", "show-environment"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if probe.returncode != 0:
+            self.skipTest("systemd user manager is unavailable")
+
+        source = INSTALLER.read_text()
+        start = source.index("systemd_service_active_state() {")
+        end = source.index("\nrestart_service() {", start)
+        functions = source[start:end]
+        unit_base = (
+            f"agents-server-update-acceptance-{os.getpid()}-{time.monotonic_ns()}"
+        )
+        self.assertRegex(unit_base, r"^agents-server-update-acceptance-[0-9]+-[0-9]+$")
+        unit_name = f"{unit_base}.service"
+
+        def systemctl(*arguments: str, timeout: float = 10) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                ["systemctl", "--user", *arguments],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+
+        def tasks_current() -> int:
+            result = systemctl(
+                "show", unit_name, "--property=TasksCurrent", "--value"
+            )
+            try:
+                return int(result.stdout.strip()) if result.returncode == 0 else 0
+            except ValueError:
+                return 0
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stubborn = root / "stubborn.py"
+            stubborn.write_text(
+                "import os, signal, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "if os.fork() == 0:\n"
+                "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "while True:\n"
+                "    time.sleep(1)\n"
+            )
+            unit_file = root / unit_name
+            unit_file.write_text(
+                "[Unit]\nDescription=AgentsServer bounded restart acceptance fixture\n"
+                "[Service]\nType=simple\n"
+                f"ExecStart={sys.executable} {stubborn}\n"
+                "KillMode=control-group\nTimeoutStopSec=90s\n"
+            )
+            harness = root / "harness.sh"
+            harness.write_text(
+                "set -euo pipefail\n"
+                f"SERVICE_NAME={unit_base}\n"
+                "SYSTEMD_MANAGED_STOP_ATTEMPTS=50\n"
+                "SYSTEMD_MANAGED_STOP_DELAY=0.1\n"
+                "SYSTEMD_MANAGED_KILL_ATTEMPTS=20\n"
+                + functions
+                + "\nrestart_managed_systemd_service_bounded\n"
+                + "printf 'updater-survived\\n'\n"
+            )
+
+            linked = systemctl("--runtime", "link", str(unit_file))
+            if linked.returncode != 0:
+                self.skipTest(f"could not link transient user unit: {linked.stderr.strip()}")
+            try:
+                self.assertEqual(systemctl("daemon-reload").returncode, 0)
+                started = systemctl("start", unit_name)
+                self.assertEqual(started.returncode, 0, started.stderr)
+                deadline = time.monotonic() + 10
+                while tasks_current() < 2 and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertGreaterEqual(tasks_current(), 2)
+
+                before = time.monotonic()
+                result = subprocess.run(
+                    ["/bin/bash", str(harness)],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                    check=False,
+                )
+                elapsed = time.monotonic() - before
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("updater-survived", result.stdout)
+                self.assertLess(elapsed, 20)
+                deadline = time.monotonic() + 10
+                while tasks_current() < 2 and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertGreaterEqual(tasks_current(), 2)
+
+                # Adoption from 0.1.25 runs its legacy synchronous restart
+                # after this installer has written/reloaded the new unit. The
+                # 10-second unit timeout is therefore the first-upgrade bound,
+                # even though the old runner cannot select the new helper.
+                self.assertIn("TimeoutStopSec=10s", source)
+                unit_file.write_text(
+                    unit_file.read_text().replace(
+                        "TimeoutStopSec=90s",
+                        "TimeoutStopSec=10s",
+                    )
+                )
+                self.assertEqual(systemctl("daemon-reload").returncode, 0)
+                before = time.monotonic()
+                legacy_restart = systemctl("restart", unit_name, timeout=20)
+                legacy_elapsed = time.monotonic() - before
+                self.assertEqual(
+                    legacy_restart.returncode,
+                    0,
+                    legacy_restart.stderr,
+                )
+                self.assertLess(legacy_elapsed, 20)
+                deadline = time.monotonic() + 10
+                while tasks_current() < 2 and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertGreaterEqual(tasks_current(), 2)
+            finally:
+                systemctl("stop", "--no-block", unit_name)
+                systemctl(
+                    "kill",
+                    "--kill-whom=all",
+                    "--signal=SIGKILL",
+                    unit_name,
+                )
+                systemctl("disable", "--runtime", unit_name)
+                systemctl("reset-failed", unit_name)
+                systemctl("daemon-reload")
+
     def test_direct_deploy_includes_scheduler_runtime(self):
         source = DEPLOYER.read_text()
         self.assertIn('"$SCRIPT_DIR/secure_peer_runtime.py"', source)
@@ -476,6 +967,10 @@ exit 0
             )
             self.assertIn(
                 f"agents-server-{version}/agentsdock_team_hub/migrations/0005_tailnet_bootstrap_delegations.sql",
+                members,
+            )
+            self.assertIn(
+                f"agents-server-{version}/agentsdock_team_hub/migrations/0006_team_network_mailbox.sql",
                 members,
             )
             self.assertFalse(
@@ -1347,6 +1842,7 @@ chmod 755 "$project/.venv/bin/python"
             service = (home / ".config" / "systemd" / "user" / "agents-server.service").read_text()
             self.assertIn(f"--port {selected_port}", service)
             self.assertIn("ManagedOOMPreference=avoid", service)
+            self.assertIn("TimeoutStopSec=10s", service)
             result_line = next(
                 line
                 for line in result.stdout.splitlines()
@@ -1855,7 +2351,7 @@ chmod 755 "$project/.venv/bin/python"
             self.assertFalse(store.maintenance_fence_path.exists())
             connection = sqlite3.connect(store.database_path)
             try:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 5)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 6)
                 self.assertEqual(
                     connection.execute(
                         "SELECT hub_id, server_identity FROM managed_host_bindings"
@@ -4076,6 +4572,17 @@ exit 0
             connection.execute("PRAGMA foreign_keys = OFF")
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DROP TRIGGER network_agents_limit_per_server")
+            connection.execute("DROP TRIGGER network_bulletin_body_limit_on_insert")
+            connection.execute("DROP TRIGGER network_bulletin_body_limit_on_update")
+            for table in (
+                "network_passive_requests",
+                "network_deliveries",
+                "network_mailbox_items",
+                "network_boards",
+                "network_peer_bindings",
+            ):
+                connection.execute(f"DROP TABLE {table}")
             for trigger in (
                 "bootstrap_delegation_is_immutable",
                 "bootstrap_delegations_cannot_be_deleted",
@@ -4084,7 +4591,7 @@ exit 0
             ):
                 connection.execute(f"DROP TRIGGER {trigger}")
             connection.execute("DROP TABLE bootstrap_delegations")
-            connection.execute("DELETE FROM schema_migrations WHERE version = 5")
+            connection.execute("DELETE FROM schema_migrations WHERE version > 4")
             connection.execute("PRAGMA user_version = 4")
             connection.execute("COMMIT")
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")

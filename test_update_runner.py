@@ -483,6 +483,50 @@ class UpdateRunnerTests(unittest.TestCase):
                 self.assertNotIn(name, captured)
             self.assertEqual(captured.get("PATH"), os.environ.get("PATH"))
 
+    def test_private_managed_update_environment_keeps_legacy_cli_compatible(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            legacy_installer = root / "legacy-install.sh"
+            captured_path = root / "legacy-arguments.txt"
+            captured_environment_path = root / "managed-environment.txt"
+            legacy_installer.write_text(
+                "#!/bin/sh\n"
+                "for argument in \"$@\"; do\n"
+                "  case \"$argument\" in\n"
+                "    --managed-update-id|--expected-service-cgroup) exit 2 ;;\n"
+                "  esac\n"
+                "done\n"
+                f"printf '%s\\n' \"$@\" > {str(captured_path)!r}\n"
+                "printf '%s\\n%s\\n' "
+                '"$AGENTSDOCK_MANAGED_UPDATE_ID" '
+                '"$AGENTSDOCK_EXPECTED_SERVICE_CGROUP" '
+                f"> {str(captured_environment_path)!r}\n"
+            )
+            legacy_installer.chmod(0o755)
+
+            update_runner.run_installer(
+                [str(legacy_installer), "--non-interactive"],
+                cwd=root,
+                status_path=root / "server-update.json",
+                log_path=root / "server-update.log",
+                version="1.2.3",
+                managed_update_id="update-test-legacy",
+                expected_service_cgroup=(
+                    "/user.slice/user@1000.service/app.slice/agents-server.service"
+                ),
+                timeout_seconds=2,
+                heartbeat_seconds=0.02,
+            )
+
+            self.assertEqual(captured_path.read_text(), "--non-interactive\n")
+            self.assertEqual(
+                captured_environment_path.read_text().splitlines(),
+                [
+                    "update-test-legacy",
+                    "/user.slice/user@1000.service/app.slice/agents-server.service",
+                ],
+            )
+
     def test_detached_runner_rejects_downgrades_before_download(self):
         args = argparse.Namespace(
             status_file="unused-status.json",
@@ -537,6 +581,9 @@ class UpdateRunnerTests(unittest.TestCase):
                 current_version="1.2.3",
                 expected_server_identity="server-test-identity",
                 update_id="update-test-stable",
+                expected_service_cgroup=(
+                    "/user.slice/user@1000.service/app.slice/agents-server.service"
+                ),
             )
             statuses: list[dict] = []
 
@@ -555,8 +602,23 @@ class UpdateRunnerTests(unittest.TestCase):
         self.assertEqual(statuses[-1]["phase"], "complete")
         self.assertEqual(statuses[-1]["installed_version"], "1.2.4")
         self.assertEqual(statuses[-1]["track"], "stable")
-        idle_check.assert_called_once_with(7850, token="")
+        idle_check.assert_called_once_with(
+            7850,
+            token="",
+            require_verified_service_cgroup=True,
+        )
         install.assert_called_once()
+        install_command = install.call_args.args[0]
+        self.assertNotIn("--managed-update-id", install_command)
+        self.assertNotIn("--expected-service-cgroup", install_command)
+        self.assertEqual(
+            install.call_args.kwargs["managed_update_id"],
+            "update-test-stable",
+        )
+        self.assertEqual(
+            install.call_args.kwargs["expected_service_cgroup"],
+            "/user.slice/user@1000.service/app.slice/agents-server.service",
+        )
         identity_check.assert_called_once_with(
             7850,
             token="",
@@ -743,9 +805,20 @@ class UpdateRunnerTests(unittest.TestCase):
     def test_detached_runner_allows_explicit_beta_to_latest_stable_switch(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            legacy_installer_ran = root / "legacy-installer-ran"
             archive_buffer = io.BytesIO()
             with tarfile.open(fileobj=archive_buffer, mode="w:gz") as archive:
-                installer = b"#!/bin/sh\nexit 0\n"
+                installer = (
+                    "#!/bin/sh\n"
+                    "for argument in \"$@\"; do\n"
+                    "  case \"$argument\" in\n"
+                    "    --managed-update-id|--expected-service-cgroup) exit 2 ;;\n"
+                    "  esac\n"
+                    "done\n"
+                    "[ -z \"${AGENTSDOCK_MANAGED_UPDATE_ID:-}\" ] || exit 3\n"
+                    "[ -z \"${AGENTSDOCK_EXPECTED_SERVICE_CGROUP:-}\" ] || exit 4\n"
+                    f": > {str(legacy_installer_ran)!r}\n"
+                ).encode()
                 entry = tarfile.TarInfo("agents-server-1.2.4/install.sh")
                 entry.mode = 0o755
                 entry.size = len(installer)
@@ -776,13 +849,17 @@ class UpdateRunnerTests(unittest.TestCase):
                  patch.object(update_runner, "download_bytes", return_value=archive_bytes), \
                  patch.object(update_runner, "update_status", side_effect=lambda _path, **changes: statuses.append(changes) or changes), \
                  patch.object(update_runner, "assert_server_idle") as idle_check, \
-                 patch.object(update_runner, "assert_post_update_identity") as identity_check, \
-                 patch.object(update_runner, "run_installer") as install:
+                 patch.object(update_runner, "assert_post_update_identity") as identity_check:
                 update_runner.run_update(args)
+            legacy_installer_completed = legacy_installer_ran.is_file()
 
         check.assert_called_once_with(Path(args.public_key).resolve(), "stable")
-        idle_check.assert_called_once_with(7850, token="")
-        install.assert_called_once()
+        idle_check.assert_called_once_with(
+            7850,
+            token="",
+            require_verified_service_cgroup=False,
+        )
+        self.assertTrue(legacy_installer_completed)
         identity_check.assert_called_once()
         self.assertEqual(statuses[-1]["phase"], "complete")
         self.assertEqual(statuses[-1]["installed_version"], "1.2.4")
@@ -844,6 +921,85 @@ class UpdateRunnerTests(unittest.TestCase):
             snapshot = update_runner.server_work_snapshot(7850)
 
         self.assertEqual(snapshot, (0, 2))
+
+    def test_pre_restart_check_rejects_a_nonempty_service_cgroup(self):
+        payload = json.dumps({
+            "ok": True,
+            "active_count": 0,
+            "queued": {},
+            "update_blocking_queued_count": 0,
+            "update_service_cgroup": {
+                "safe": False,
+                "unknown_descendant_count": 1,
+                "inspection": "verified",
+            },
+        }).encode()
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                return payload
+
+        with patch.object(update_runner.urllib.request, "urlopen", return_value=Response()):
+            with self.assertRaisesRegex(RuntimeError, "nonempty service cgroup"):
+                update_runner.assert_server_idle(7850)
+
+    def test_pre_restart_check_requires_verified_systemd_ownership_when_bound(self):
+        payload = json.dumps({
+            "ok": True,
+            "active_count": 0,
+            "queued": {},
+            "update_blocking_queued_count": 0,
+            "update_service_cgroup": {
+                "safe": True,
+                "unknown_descendant_count": 0,
+                "inspection": "not-systemd-managed",
+            },
+        }).encode()
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                return payload
+
+        with patch.object(update_runner.urllib.request, "urlopen", return_value=Response()):
+            with self.assertRaisesRegex(RuntimeError, "verified systemd"):
+                update_runner.assert_server_idle(
+                    7850,
+                    require_verified_service_cgroup=True,
+                )
+
+    def test_pre_restart_check_reports_tracked_work_before_cgroup_proof(self):
+        payload = json.dumps({
+            "ok": True,
+            "active_count": 1,
+            "queued": {},
+            "update_blocking_queued_count": 0,
+        }).encode()
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                return payload
+
+        with patch.object(update_runner.urllib.request, "urlopen", return_value=Response()):
+            with self.assertRaisesRegex(RuntimeError, "1 active agent run"):
+                update_runner.assert_server_idle(7850)
 
     def test_one_time_health_credential_is_consumed(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -241,7 +241,9 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["job_event_count"], expected_job_events)
         self.assertTrue(summary["job_history_truncated"])
         self.assertEqual(page["next_semantic_before"], summary["seq"])
-        self.assertNotEqual(page["next_semantic_before"], min(event["seq"] for event in page["events"]))
+        self.assertEqual(summary["job_start_seq"], 3)
+        self.assertEqual(summary["job_end_seq"], seq - 2)
+        self.assertEqual(summary["job_timeline_group_id"], "job:job-1")
 
         representative_runs = {
             event["run_id"]
@@ -454,7 +456,7 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
             + agent_server.SEMANTIC_TIMELINE_ESSENTIAL_PAGE_OVERFLOW_LIMIT,
         )
 
-    def test_semantic_cursor_keeps_each_job_global_and_does_not_repeat_old_runs(self) -> None:
+    def test_semantic_cursor_keeps_interleaved_job_segments_chronological(self) -> None:
         events: list[dict[str, object]] = []
         seq = 0
         for job_id, run_id in (
@@ -476,9 +478,19 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
 
         latest = agent_server.read_semantic_timeline_page(self.session_id, limit=1, tail=True)
         latest_summary = next(event for event in latest["events"] if event["type"] == "job_summary")
-        self.assertEqual(latest["semantic_total"], 2)
+        self.assertEqual(latest["semantic_total"], 3)
         self.assertEqual(latest_summary["job_id"], "job-1")
-        self.assertEqual(latest_summary["job_run_count"], 2)
+        self.assertEqual(latest_summary["job_run_count"], 1)
+        self.assertEqual(
+            latest_summary["job_timeline_group_id"],
+            "job:job-1:segment:5",
+        )
+        self.assertTrue(all(
+            event.get("job_timeline_group_id")
+            == latest_summary["job_timeline_group_id"]
+            for event in latest["events"]
+            if event.get("purpose") == "scheduled_job"
+        ))
 
         older = agent_server.read_semantic_timeline_page(
             self.session_id,
@@ -489,6 +501,263 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
         older_summary = next(event for event in older["events"] if event["type"] == "job_summary")
         self.assertEqual(older_summary["job_id"], "job-2")
         self.assertFalse(any(event.get("job_id") == "job-1" for event in older["events"]))
+
+        oldest = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            semantic_before=older["next_semantic_before"],
+            limit=1,
+            tail=True,
+        )
+        oldest_summary = next(
+            event for event in oldest["events"] if event["type"] == "job_summary"
+        )
+        self.assertEqual(oldest_summary["job_id"], "job-1")
+        self.assertEqual(oldest_summary["job_timeline_group_id"], "job:job-1")
+
+    def test_reused_job_run_id_still_respects_an_intervening_chat_boundary(self) -> None:
+        common = {
+            "run_id": "reused-run",
+            "purpose": "scheduled_job",
+            "job_id": "job-1",
+            "job_title": "Monitor",
+        }
+        self.write_events([
+            self.event(1, "turn_started", prompt="First poll", **common),
+            self.event(2, "turn_finished", result_text="First result", **common),
+            self.event(3, "turn_started", run_id="human", prompt="Question"),
+            self.event(4, "turn_finished", run_id="human", result_text="Answer"),
+            self.event(5, "turn_started", prompt="Second poll", **common),
+            self.event(6, "turn_finished", result_text="Second result", **common),
+        ])
+
+        page = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            limit=10,
+            tail=True,
+        )
+        summaries = [
+            event for event in page["events"] if event["type"] == "job_summary"
+        ]
+
+        self.assertEqual(page["semantic_total"], 3)
+        self.assertEqual(
+            [summary["job_timeline_group_id"] for summary in summaries],
+            ["job:job-1", "job:job-1:segment:5"],
+        )
+        self.assertEqual(
+            [summary.get("result_text") for summary in summaries],
+            ["First result", "Second result"],
+        )
+
+    def test_provisional_job_start_keeps_its_segment_when_run_id_is_reused(self) -> None:
+        self.write_events([
+            self.event(1, "turn_started", run_id="reused-run", prompt="First poll"),
+            self.event(2, "job_ran", run_id="reused-run", job_id="job-1"),
+            self.event(
+                3,
+                "turn_finished",
+                run_id="reused-run",
+                job_id="job-1",
+                result_text="First result",
+            ),
+            self.event(4, "turn_started", run_id="human", prompt="Question"),
+            self.event(5, "turn_finished", run_id="human", result_text="Answer"),
+            self.event(6, "turn_started", run_id="reused-run", prompt="Second poll"),
+            self.event(7, "job_ran", run_id="reused-run", job_id="job-1"),
+            self.event(
+                8,
+                "turn_finished",
+                run_id="reused-run",
+                job_id="job-1",
+                result_text="Second result",
+            ),
+        ])
+
+        page = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            limit=10,
+            tail=True,
+        )
+        summaries = [
+            event for event in page["events"] if event["type"] == "job_summary"
+        ]
+
+        self.assertEqual(page["semantic_total"], 3)
+        self.assertEqual(
+            [summary["job_timeline_group_id"] for summary in summaries],
+            ["job:job-1", "job:job-1:segment:6"],
+        )
+        self.assertEqual(
+            [summary["job_run_count"] for summary in summaries],
+            [1, 1],
+        )
+        self.assertEqual(
+            [summary.get("result_text") for summary in summaries],
+            ["First result", "Second result"],
+        )
+
+    def test_recycled_run_late_completion_stays_with_its_occurrence_segment(self) -> None:
+        common = {
+            "run_id": "reused-run",
+            "purpose": "scheduled_job",
+            "job_id": "job-1",
+            "job_title": "Monitor",
+        }
+        first = {**common, "job_scheduled_run_at": 1_700_000_000.0}
+        second = {**common, "job_scheduled_run_at": 1_700_000_060.0}
+        self.write_events([
+            self.event(1, "turn_started", prompt="First poll", **first),
+            self.event(2, "turn_started", run_id="human", prompt="Question"),
+            self.event(3, "turn_finished", run_id="human", result_text="Answer"),
+            self.event(4, "turn_started", prompt="Second poll", **second),
+        ])
+
+        # Seed the append-only cache while both recycled-ID attempts are live.
+        agent_server.read_semantic_timeline_page(
+            self.session_id,
+            limit=10,
+            tail=True,
+        )
+        path = agent_server.events_path(self.session_id)
+        with path.open("a", encoding="utf-8") as destination:
+            destination.write("".join(json.dumps(event) + "\n" for event in [
+                self.event(5, "assistant_text", text="First late output", **first),
+                self.event(6, "turn_finished", result_text="First late result", **first),
+                self.event(7, "turn_finished", result_text="Second result", **second),
+            ]))
+
+        latest = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            limit=1,
+            tail=True,
+        )
+        latest_summary = next(
+            event for event in latest["events"] if event["type"] == "job_summary"
+        )
+        self.assertEqual(
+            latest_summary["job_timeline_group_id"],
+            "job:job-1:segment:4",
+        )
+        self.assertEqual(latest_summary.get("result_text"), "Second result")
+        self.assertEqual([
+            event.get("result_text")
+            for event in latest["events"]
+            if event["type"] == "turn_finished"
+        ], ["Second result"])
+
+        middle = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            semantic_before=latest["next_semantic_before"],
+            limit=1,
+            tail=True,
+        )
+        oldest = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            semantic_before=middle["next_semantic_before"],
+            limit=1,
+            tail=True,
+        )
+        oldest_summary = next(
+            event for event in oldest["events"] if event["type"] == "job_summary"
+        )
+        self.assertEqual(oldest_summary["job_timeline_group_id"], "job:job-1")
+        self.assertEqual(oldest_summary.get("result_text"), "First late result")
+        self.assertEqual([
+            event.get("result_text")
+            for event in oldest["events"]
+            if event["type"] == "turn_finished"
+        ], ["First late result"])
+
+        first_history = agent_server.read_scheduled_job_runs(
+            self.session_id,
+            "job-1",
+            timeline_group_id="job:job-1",
+        )
+        second_history = agent_server.read_scheduled_job_runs(
+            self.session_id,
+            "job-1",
+            timeline_group_id="job:job-1:segment:4",
+        )
+        self.assertEqual(first_history["total"], 1)
+        self.assertEqual(second_history["total"], 1)
+        self.assertEqual(first_history["runs"][0].get("result_text"), "First late result")
+        self.assertEqual(second_history["runs"][0].get("result_text"), "Second result")
+
+        incremental_cards = [
+            (
+                event["job_timeline_group_id"],
+                event.get("result_text"),
+                event["job_run_count"],
+            )
+            for event in agent_server.read_semantic_timeline_page(
+                self.session_id,
+                limit=10,
+                tail=True,
+            )["events"]
+            if event["type"] == "job_summary"
+        ]
+        agent_server.TIMELINE_INDEX_CACHE.pop(self.session_id, None)
+        rebuilt_cards = [
+            (
+                event["job_timeline_group_id"],
+                event.get("result_text"),
+                event["job_run_count"],
+            )
+            for event in agent_server.read_semantic_timeline_page(
+                self.session_id,
+                limit=10,
+                tail=True,
+            )["events"]
+            if event["type"] == "job_summary"
+        ]
+        self.assertEqual(rebuilt_cards, incremental_cards)
+        self.assertEqual(
+            rebuilt_cards,
+            [
+                ("job:job-1", "First late result", 1),
+                ("job:job-1:segment:4", "Second result", 1),
+            ],
+        )
+
+    def test_consecutive_recycled_run_id_counts_and_retains_each_attempt(self) -> None:
+        common = {
+            "run_id": "reused-run",
+            "purpose": "scheduled_job",
+            "job_id": "job-1",
+            "job_title": "Monitor",
+        }
+        self.write_events([
+            self.event(1, "turn_started", prompt="First poll", **common),
+            self.event(2, "turn_finished", result_text="First result", **common),
+            self.event(3, "turn_started", prompt="Second poll", **common),
+            self.event(4, "turn_finished", result_text="Second result", **common),
+        ])
+
+        page = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            limit=10,
+            tail=True,
+        )
+        summary = next(
+            event for event in page["events"] if event["type"] == "job_summary"
+        )
+        history = agent_server.read_scheduled_job_runs(
+            self.session_id,
+            "job-1",
+            timeline_group_id="job:job-1",
+        )
+        representative_results = [
+            event.get("result_text")
+            for event in page["events"]
+            if event["type"] == "turn_finished"
+        ]
+
+        self.assertEqual(summary["job_run_count"], history["total"])
+        self.assertEqual(summary["job_run_count"], 2)
+        self.assertEqual(
+            representative_results,
+            ["First result", "Second result"],
+        )
 
     def test_semantic_job_summary_uses_a_newer_runless_error_as_latest_status(self) -> None:
         common = {
@@ -998,7 +1267,9 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(summaries), 1)
         self.assertEqual(first_summary["id"], "job_summary:job-1")
         self.assertEqual(summaries[0]["id"], first_summary["id"])
-        self.assertGreater(summaries[0]["seq"], first_summary["seq"])
+        self.assertEqual(summaries[0]["seq"], first_summary["seq"])
+        self.assertEqual(summaries[0]["job_start_seq"], 1)
+        self.assertEqual(summaries[0]["job_end_seq"], 4)
         self.assertEqual(summaries[0]["job_run_count"], 2)
         self.assertEqual(summaries[0]["job_event_count"], 4)
 
@@ -1021,7 +1292,8 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(page["semantic_total"], 2)
         self.assertEqual(page["semantic_item_count"], 2)
-        self.assertEqual(summary["seq"], 4)
+        self.assertEqual(summary["seq"], 3)
+        self.assertEqual(summary["job_end_seq"], 4)
         self.assertEqual(summary["job_event_count"], 2)
         self.assertFalse({
             "turn_queue_updated",

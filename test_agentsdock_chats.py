@@ -1,11 +1,79 @@
 import argparse
+import io
+import json
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 import agentsdock_chats
 
 
 class AgentsDockChatsCLITests(unittest.TestCase):
+    def test_post_retries_only_the_native_promotion_window(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self):
+                return json.dumps({"ok": True}).encode("utf-8")
+
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def open(self, request, timeout):
+                self.requests.append((request, timeout))
+                if len(self.requests) == 1:
+                    raise urllib.error.HTTPError(
+                        request.full_url,
+                        409,
+                        "Conflict",
+                        {},
+                        io.BytesIO(json.dumps({
+                            "detail": (
+                                "agent chat access is waiting for turn "
+                                "promotion"
+                            ),
+                        }).encode("utf-8")),
+                    )
+                return FakeResponse()
+
+        opener = FakeOpener()
+        payload = {
+            "body": "hello",
+            "idempotency_key": "stable-key",
+        }
+        with (
+            patch.object(
+                agentsdock_chats,
+                "environment",
+                return_value="http://127.0.0.1:7850",
+            ),
+            patch.object(
+                agentsdock_chats.urllib.request,
+                "build_opener",
+                return_value=opener,
+            ),
+            patch.object(agentsdock_chats.time, "sleep") as sleep,
+        ):
+            result = agentsdock_chats.post_json(
+                "/api/agent/cross-chat/routes/route/handoffs",
+                payload,
+                "capability",
+            )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(len(opener.requests), 2)
+        self.assertIs(opener.requests[0][0], opener.requests[1][0])
+        self.assertEqual(
+            json.loads(opener.requests[0][0].data.decode("utf-8")),
+            payload,
+        )
+        sleep.assert_called_once_with(0.05)
+
     def test_list_uses_capability_scoped_route_endpoint(self) -> None:
         args = argparse.Namespace(authority_file="authority.json")
         with (
@@ -24,9 +92,10 @@ class AgentsDockChatsCLITests(unittest.TestCase):
         )
 
     def test_ask_uses_request_reply_wire_and_stable_retry_key(self) -> None:
+        handle = "grant_" + "a" * 64
         args = argparse.Namespace(
             authority_file="authority.json",
-            target="sess_target",
+            target=handle,
             message="  investigate this  ",
             idempotency_key=None,
         )
@@ -34,7 +103,11 @@ class AgentsDockChatsCLITests(unittest.TestCase):
 
         def post(path, payload, capability):
             calls.append((path, payload, capability))
-            return {"exchange": {"id": "exchange_one"}, "leg": {"id": "leg_one"}}
+            return {
+                "ok": True,
+                "action": "request_reply",
+                "accepted": True,
+            }
 
         with (
             patch.object(agentsdock_chats, "authority", return_value="capability"),
@@ -46,7 +119,31 @@ class AgentsDockChatsCLITests(unittest.TestCase):
         self.assertEqual(calls[0][0], "/api/agent/cross-chat/handoffs")
         self.assertEqual(calls[0][1]["action"], "request_reply")
         self.assertEqual(calls[0][1]["body"], "investigate this")
+        self.assertEqual(calls[0][1]["target_session_id"], handle)
         self.assertEqual(calls[0][1]["idempotency_key"], calls[1][1]["idempotency_key"])
+
+    def test_direct_send_rejects_receipt_with_internal_identifiers(self) -> None:
+        args = argparse.Namespace(
+            authority_file="authority.json",
+            target="grant_" + "b" * 64,
+            message="check",
+            idempotency_key=None,
+        )
+        with (
+            patch.object(agentsdock_chats, "authority", return_value="capability"),
+            patch.object(
+                agentsdock_chats,
+                "post_json",
+                return_value={
+                    "ok": True,
+                    "action": "instruction",
+                    "accepted": True,
+                    "target_session_id": "must-not-leak",
+                },
+            ),
+        ):
+            with self.assertRaises(agentsdock_chats.ChatsCLIError):
+                agentsdock_chats.send(args)
 
     def test_respond_has_no_target_and_request_response_changes_stable_key(self) -> None:
         base = dict(
@@ -60,7 +157,7 @@ class AgentsDockChatsCLITests(unittest.TestCase):
 
         def post(_path, payload, _capability):
             payloads.append(payload)
-            return {"exchange": {"id": "exchange_one"}, "leg": {"id": "leg_two"}}
+            return {"ok": True, "action": "response", "accepted": True}
 
         with (
             patch.object(agentsdock_chats, "authority", return_value="capability"),

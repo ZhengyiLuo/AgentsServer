@@ -27,8 +27,12 @@ class SessionSummaryTests(unittest.TestCase):
         self.assertNotIn("codex_thread_id", summary)
         self.assertEqual(summary["cwd"], "/workspace")
         self.assertEqual(summary["latest_agent_event_seq"], 42)
+        self.assertNotIn("emergency_alert", summary)
+        self.assertNotIn("unacknowledged_emergency_count", summary)
         self.assertEqual(full["system_prompt"], session["system_prompt"])
         self.assertEqual(full["codex_thread_id"], "provider-codex")
+        self.assertIsNone(full["emergency_alert"])
+        self.assertEqual(full["unacknowledged_emergency_count"], 0)
 
     def test_summary_keeps_large_session_lists_bounded(self):
         raw_sessions = [

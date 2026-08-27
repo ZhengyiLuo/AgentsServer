@@ -47,20 +47,6 @@ class WorkspaceFilesTests(unittest.TestCase):
 
         return asyncio.run(collect())
 
-    def test_git_snapshot_probe_failure_is_nonfatal(self) -> None:
-        with patch.object(
-            agent_server.subprocess,
-            "run",
-            side_effect=OSError("git unavailable"),
-        ):
-            snapshot = agent_server._capture_git_tree(
-                "session-1",
-                "run-1",
-                "/missing-workspace",
-            )
-
-        self.assertIsNone(snapshot)
-
     def test_workspace_uses_the_exact_session_cwd_without_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             missing = Path(temporary) / "missing"

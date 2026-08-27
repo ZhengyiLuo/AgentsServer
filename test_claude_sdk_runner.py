@@ -2851,7 +2851,42 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         )
         agent_server.CLAUDE_SDK_MANAGER = manager
         predecessor_run_id = "run_claude"
+        predecessor_route = {
+            "route_id": "route_" + "5" * 32,
+            "revision": "rev_" + "6" * 32,
+            "alias": "chat1",
+            "target_session_id": "ambient-claude-old",
+            "actions": ["instruction"],
+            "route_kind": (
+                agent_server.PROVIDER_CROSS_CHAT_ROUTE_KIND_AMBIENT
+            ),
+        }
+        candidate_route = {
+            "route_id": "route_" + "7" * 32,
+            "revision": "rev_" + "8" * 32,
+            "alias": "chat1",
+            "target_session_id": "ambient-claude-new",
+            "actions": ["instruction"],
+            "route_kind": (
+                agent_server.PROVIDER_CROSS_CHAT_ROUTE_KIND_AMBIENT
+            ),
+        }
+        agent_server.STORE.sessions.update({
+            "ambient-claude-old": {
+                "id": "ambient-claude-old",
+                "title": "Ambient Claude old",
+                "backend": agent_server.BACKEND_CLAUDE,
+            },
+            "ambient-claude-new": {
+                "id": "ambient-claude-new",
+                "title": "Ambient Claude new",
+                "backend": agent_server.BACKEND_CLAUDE,
+            },
+        })
         agent_server.CURRENT_TURNS["chat-claude"]["run_id"] = predecessor_run_id
+        agent_server.CURRENT_TURNS["chat-claude"][
+            "provider_cross_chat_route_snapshot"
+        ] = [predecessor_route]
         predecessor_path = await agent_server.issue_cross_chat_capability(
             "chat-claude",
             predecessor_run_id,
@@ -3073,6 +3108,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                     "queued_id": "queued-next",
                     "prompt": "Steer",
                     "file_ids": [],
+                    "provider_cross_chat_route_snapshot": [candidate_route],
                 },
                 "remaining": 0,
                 "future": steer_future,
@@ -3120,6 +3156,16 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                 if capability.get("source_run_id") == candidate_run_id
             ]
             self.assertEqual(len(candidate_records), 1)
+            self.assertEqual(
+                list(candidate_records[0]["provider_route_grants"].values()),
+                [candidate_route],
+            )
+            self.assertEqual(
+                agent_server.CURRENT_TURNS["chat-claude"][
+                    "provider_cross_chat_route_snapshot"
+                ],
+                [candidate_route],
+            )
             candidate_path = Path(str(
                 candidate_records[0]["authority_path"]
             ))

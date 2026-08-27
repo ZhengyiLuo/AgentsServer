@@ -1,0 +1,831 @@
+import asyncio
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
+
+from fastapi import HTTPException
+
+import agent_server
+
+
+class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.sessions = {
+            "source-private-id": {
+                "id": "source-private-id",
+                "title": "Source",
+                "backend": agent_server.BACKEND_CODEX,
+            },
+            "target-private-id": {
+                "id": "target-private-id",
+                "title": "Target",
+                "backend": agent_server.BACKEND_CODEX,
+            },
+        }
+
+    def reference(self, action: str) -> agent_server.ChatReference:
+        marker = "@@Target" if action == "route" else "@Target"
+        return agent_server.ChatReference(
+            session_id="target-private-id",
+            display_title_snapshot="Target",
+            source_text_start=0,
+            source_text_end=len(marker),
+            action=action,
+        )
+
+    def test_direct_and_route_mentions_require_distinct_exact_sigils(self) -> None:
+        with (
+            patch.object(agent_server, "AGENT_TOKEN", "token"),
+            patch.object(agent_server.STORE, "sessions", self.sessions),
+            patch.object(
+                agent_server,
+                "cross_chat_delivery_client_capabilities",
+                return_value=[agent_server.CODEX_INTERACTIVE_CLIENT_CAPABILITY],
+            ),
+        ):
+            direct = self.reference("direct_message")
+            route = self.reference("route")
+            self.assertEqual(
+                agent_server.validate_chat_references(
+                    "source-private-id", "@Target do it", [direct]
+                ),
+                [direct],
+            )
+            self.assertEqual(
+                agent_server.validate_chat_references(
+                    "source-private-id", "@@Target ask it", [route]
+                ),
+                [route],
+            )
+            with self.assertRaisesRegex(HTTPException, "does not match"):
+                agent_server.validate_chat_references(
+                    "source-private-id", "@@Target do it", [direct]
+                )
+            with self.assertRaisesRegex(HTTPException, "does not match"):
+                agent_server.validate_chat_references(
+                    "source-private-id", "@Target ask it", [route]
+                )
+
+    def test_direct_message_rejects_a_prompt_larger_than_the_handoff_limit(self) -> None:
+        prompt = "@Target " + (
+            "x" * agent_server.CROSS_CHAT_HANDOFF_BODY_MAX_CHARS
+        )
+        with patch.object(agent_server, "AGENT_TOKEN", "token"):
+            with self.assertRaises(HTTPException) as raised:
+                agent_server.validate_chat_references(
+                    "source-private-id",
+                    prompt,
+                    [self.reference("direct_message")],
+                )
+        self.assertEqual(raised.exception.status_code, 413)
+
+    def test_route_reference_becomes_a_fresh_opaque_run_route(self) -> None:
+        route_reference = self.reference("route")
+        with (
+            patch.object(agent_server, "AGENT_TOKEN", "token"),
+            patch.object(agent_server.STORE, "sessions", self.sessions),
+            patch.object(
+                agent_server,
+                "cross_chat_target_backend_supported",
+                return_value=True,
+            ),
+        ):
+            first = agent_server.provider_cross_chat_route_snapshot_for_authority(
+                [],
+                [route_reference],
+                source_session_id="source-private-id",
+            )
+            second = agent_server.provider_cross_chat_route_snapshot_for_authority(
+                [],
+                [route_reference],
+                source_session_id="source-private-id",
+            )
+            self.assertEqual(len(first), 1)
+            self.assertEqual(
+                first[0]["route_kind"],
+                agent_server.PROVIDER_CROSS_CHAT_ROUTE_KIND_REFERENCE,
+            )
+            self.assertEqual(first[0]["target_session_id"], "target-private-id")
+            self.assertEqual(first[0]["actions"], ["instruction", "request_reply"])
+            self.assertNotEqual(first[0]["route_id"], second[0]["route_id"])
+            block = agent_server.cross_chat_provider_authority_block(
+                [route_reference],
+                Path("/tmp/run_example-0123456789abcdef0123456789abcdef.json"),
+                "source-private-id",
+                {"agent_cross_chat_routes"},
+                provider_route_snapshot=first,
+            )
+        self.assertIn("@@ reference 1", block)
+        self.assertIn(first[0]["route_id"], block)
+        self.assertNotIn("target-private-id", block)
+        self.assertIn("do not send anything by themselves", block)
+
+    def test_direct_mention_keeps_ambient_access_while_route_replaces_it(self) -> None:
+        ambient = {
+            "route_id": "route_" + ("1" * 32),
+            "revision": "rev_" + ("2" * 32),
+            "alias": "chat1",
+            "target_session_id": "target-private-id",
+            "actions": ["instruction", "request_reply"],
+            "route_kind": agent_server.PROVIDER_CROSS_CHAT_ROUTE_KIND_AMBIENT,
+        }
+        with (
+            patch.object(agent_server.STORE, "sessions", self.sessions),
+            patch.object(
+                agent_server,
+                "cross_chat_target_backend_supported",
+                return_value=True,
+            ),
+        ):
+            direct_routes = (
+                agent_server.provider_cross_chat_route_snapshot_for_authority(
+                    [ambient],
+                    [self.reference("direct_message")],
+                    source_session_id="source-private-id",
+                )
+            )
+            explicit_routes = (
+                agent_server.provider_cross_chat_route_snapshot_for_authority(
+                    [ambient],
+                    [self.reference("route")],
+                    source_session_id="source-private-id",
+                )
+            )
+        self.assertEqual(direct_routes, [ambient])
+        self.assertEqual(len(explicit_routes), 1)
+        self.assertEqual(
+            explicit_routes[0]["route_kind"],
+            agent_server.PROVIDER_CROSS_CHAT_ROUTE_KIND_REFERENCE,
+        )
+        self.assertEqual(
+            explicit_routes[0]["target_session_id"],
+            "target-private-id",
+        )
+
+    def test_provider_job_route_conversion_persists_double_at_route(self) -> None:
+        issued = {
+            "route_id": "route_" + ("1" * 32),
+            "revision": "rev_" + ("2" * 32),
+            "alias": "chat1",
+            "target_session_id": "target-private-id",
+            "actions": ["instruction", "request_reply"],
+            "route_kind": agent_server.PROVIDER_CROSS_CHAT_ROUTE_KIND_AMBIENT,
+        }
+        capability = {"provider_route_grants": {issued["route_id"]: issued}}
+        selection = agent_server.AgentJobChatRouteSelection(
+            route_id=issued["route_id"],
+            action="instruction",
+        )
+        with (
+            patch.object(agent_server, "AGENT_TOKEN", "token"),
+            patch.object(agent_server.STORE, "sessions", self.sessions),
+            patch.object(
+                agent_server,
+                "cross_chat_target_backend_supported",
+                return_value=True,
+            ),
+            patch.object(
+                agent_server,
+                "cross_chat_delivery_client_capabilities",
+                return_value=[agent_server.CODEX_INTERACTIVE_CLIENT_CAPABILITY],
+            ),
+        ):
+            references = agent_server.provider_job_chat_references(
+                capability,
+                "source-private-id",
+                "@@Target check later",
+                [selection],
+            )
+        self.assertEqual(len(references), 1)
+        self.assertEqual(references[0].action, "route")
+        self.assertEqual(
+            agent_server.chat_reference_marker(references[0]), "@@Target"
+        )
+
+    async def test_direct_registration_creates_effect_but_route_does_not(self) -> None:
+        original_cross_chat = agent_server.CROSS_CHAT
+        original_cache = agent_server.CROSS_CHAT_EVENT_TYPE_CACHE
+        with tempfile.TemporaryDirectory() as temporary:
+            agent_server.CROSS_CHAT = agent_server.CrossChatStore(
+                Path(temporary) / "cross-chat.sqlite3"
+            )
+            agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = agent_server.OrderedDict()
+            await agent_server.CROSS_CHAT.initialize()
+            try:
+                direct_ids = await agent_server.register_direct_message_handoffs(
+                    "source-private-id",
+                    "run_direct",
+                    "@Target please handle this",
+                    [self.reference("direct_message"), self.reference("route")],
+                )
+                self.assertEqual(len(direct_ids), 1)
+                record = await agent_server.CROSS_CHAT.get(direct_ids[0])
+                self.assertEqual(record["status"], "waiting_admission")
+                self.assertEqual(record["target_session_id"], "target-private-id")
+                self.assertEqual(record["body"], "@Target please handle this")
+            finally:
+                agent_server.CROSS_CHAT = original_cross_chat
+                agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = original_cache
+
+    async def test_admission_atomically_promotes_and_schedules_direct_messages(self) -> None:
+        original_cross_chat = agent_server.CROSS_CHAT
+        original_cache = agent_server.CROSS_CHAT_EVENT_TYPE_CACHE
+        with tempfile.TemporaryDirectory() as temporary:
+            agent_server.CROSS_CHAT = agent_server.CrossChatStore(
+                Path(temporary) / "cross-chat.sqlite3"
+            )
+            agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = agent_server.OrderedDict()
+            await agent_server.CROSS_CHAT.initialize()
+            try:
+                direct_ids = await agent_server.register_direct_message_handoffs(
+                    "source-private-id",
+                    "run_direct",
+                    "@Target please handle this",
+                    [self.reference("direct_message")],
+                )
+                schedule = Mock()
+                with patch.object(
+                    agent_server,
+                    "schedule_direct_message_handoffs_after_unlock",
+                    schedule,
+                ):
+                    await agent_server.admit_direct_message_handoffs(
+                        "source-private-id",
+                        "run_direct",
+                        direct_ids,
+                    )
+                record = await agent_server.CROSS_CHAT.get(direct_ids[0])
+                self.assertEqual(record["status"], "ready")
+                schedule.assert_called_once_with(
+                    "source-private-id",
+                    direct_ids,
+                )
+            finally:
+                agent_server.CROSS_CHAT = original_cross_chat
+                agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = original_cache
+
+    async def test_cancel_after_fsynced_turn_start_still_admits_direct_message(self) -> None:
+        original_cross_chat = agent_server.CROSS_CHAT
+        original_cache = agent_server.CROSS_CHAT_EVENT_TYPE_CACHE
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            event_path = root / "source-private-id.jsonl"
+            agent_server.CROSS_CHAT = agent_server.CrossChatStore(
+                root / "cross-chat.sqlite3"
+            )
+            agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = agent_server.OrderedDict()
+            await agent_server.CROSS_CHAT.initialize()
+            try:
+                direct_ids = await agent_server.register_direct_message_handoffs(
+                    "source-private-id",
+                    "run_direct",
+                    "@Target please handle this",
+                    [self.reference("direct_message")],
+                )
+                metadata_entered = asyncio.Event()
+                release_metadata = asyncio.Event()
+
+                async def delayed_metadata(_session_id: str, _event: dict) -> None:
+                    metadata_entered.set()
+                    await release_metadata.wait()
+
+                async def commit_boundary() -> dict:
+                    event = await agent_server.append_durable_event(
+                        "source-private-id",
+                        "turn_started",
+                        {"run_id": "run_direct"},
+                    )
+                    await agent_server.admit_direct_message_handoffs(
+                        "source-private-id",
+                        "run_direct",
+                        direct_ids,
+                    )
+                    return event
+
+                schedule = Mock()
+                with (
+                    patch.object(
+                        agent_server,
+                        "events_path",
+                        return_value=event_path,
+                    ),
+                    patch.object(
+                        agent_server,
+                        "update_session_event_metadata",
+                        side_effect=delayed_metadata,
+                    ),
+                    patch.object(
+                        agent_server.HUB,
+                        "broadcast",
+                        new_callable=AsyncMock,
+                    ),
+                    patch.object(
+                        agent_server,
+                        "schedule_direct_message_handoffs_after_unlock",
+                        schedule,
+                    ),
+                ):
+                    task = asyncio.create_task(commit_boundary())
+                    await asyncio.wait_for(metadata_entered.wait(), timeout=2)
+                    task.cancel()
+                    await asyncio.sleep(0)
+                    release_metadata.set()
+                    event = await asyncio.wait_for(task, timeout=2)
+                    source_started, _source_terminal = (
+                        agent_server.cross_chat_source_run_state(
+                            "source-private-id",
+                            "run_direct",
+                        )
+                    )
+
+                self.assertEqual(event["type"], "turn_started")
+                self.assertEqual(source_started["run_id"], "run_direct")
+                record = await agent_server.CROSS_CHAT.get(direct_ids[0])
+                self.assertEqual(record["status"], "ready")
+                schedule.assert_called_once_with(
+                    "source-private-id",
+                    direct_ids,
+                )
+            finally:
+                agent_server.CROSS_CHAT = original_cross_chat
+                agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = original_cache
+
+    async def test_recovery_never_dispatches_an_unadmitted_direct_message(self) -> None:
+        original_cross_chat = agent_server.CROSS_CHAT
+        original_cache = agent_server.CROSS_CHAT_EVENT_TYPE_CACHE
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            agent_server.CROSS_CHAT = agent_server.CrossChatStore(
+                root / "cross-chat.sqlite3"
+            )
+            agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = agent_server.OrderedDict()
+            await agent_server.CROSS_CHAT.initialize()
+            try:
+                direct_ids = await agent_server.register_direct_message_handoffs(
+                    "source-private-id",
+                    "run_direct",
+                    "@Target please handle this",
+                    [self.reference("direct_message")],
+                )
+                submit = AsyncMock()
+                with (
+                    patch.object(agent_server.STORE, "sessions", self.sessions),
+                    patch.object(
+                        agent_server,
+                        "events_path",
+                        side_effect=lambda session_id: root / f"{session_id}.jsonl",
+                    ),
+                    patch.object(
+                        agent_server,
+                        "append_cross_chat_terminal_lifecycle",
+                        AsyncMock(),
+                    ),
+                    patch.object(
+                        agent_server,
+                        "submit_cross_chat_delivery",
+                        submit,
+                    ),
+                ):
+                    await agent_server.reconcile_cross_chat_handoffs()
+                record = await agent_server.CROSS_CHAT.get(direct_ids[0])
+                self.assertEqual(record["status"], "failed")
+                submit.assert_not_awaited()
+            finally:
+                agent_server.CROSS_CHAT = original_cross_chat
+                agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = original_cache
+
+    async def test_recovery_dispatches_direct_message_only_after_durable_admission(self) -> None:
+        original_cross_chat = agent_server.CROSS_CHAT
+        original_cache = agent_server.CROSS_CHAT_EVENT_TYPE_CACHE
+        original_locks = agent_server.SESSION_LIFECYCLE_LOCKS
+        original_tasks = agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS
+        original_tasks_by_envelope = (
+            agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            agent_server.CROSS_CHAT = agent_server.CrossChatStore(
+                root / "cross-chat.sqlite3"
+            )
+            agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = agent_server.OrderedDict()
+            agent_server.SESSION_LIFECYCLE_LOCKS = {}
+            agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS = set()
+            agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE = {}
+            await agent_server.CROSS_CHAT.initialize()
+            try:
+                direct_ids = await agent_server.register_direct_message_handoffs(
+                    "source-private-id",
+                    "run_direct",
+                    "@Target please handle this",
+                    [self.reference("direct_message")],
+                )
+                (root / "source-private-id.jsonl").write_text(
+                    '{"type":"turn_started","run_id":"run_direct"}\n',
+                    encoding="utf-8",
+                )
+                attempts = 0
+
+                async def transient_then_start(record: dict) -> dict:
+                    nonlocal attempts
+                    attempts += 1
+                    if attempts == 1:
+                        raise RuntimeError("target temporarily busy")
+                    updated = await agent_server.CROSS_CHAT.update(
+                        str(record["id"]),
+                        expected={"ready"},
+                        status="running",
+                        target_run_id="run_target",
+                    )
+                    assert updated is not None
+                    return updated
+
+                submit = AsyncMock(side_effect=transient_then_start)
+                with (
+                    patch.object(agent_server.STORE, "sessions", self.sessions),
+                    patch.object(
+                        agent_server,
+                        "events_path",
+                        side_effect=lambda session_id: root / f"{session_id}.jsonl",
+                    ),
+                    patch.object(
+                        agent_server,
+                        "append_cross_chat_terminal_lifecycle",
+                        AsyncMock(),
+                    ),
+                    patch.object(
+                        agent_server,
+                        "submit_cross_chat_delivery",
+                        submit,
+                    ),
+                    patch.object(
+                        agent_server,
+                        "CROSS_CHAT_DIRECT_RETRY_DELAYS_SECONDS",
+                        (0.0,),
+                    ),
+                ):
+                    await agent_server.reconcile_cross_chat_handoffs()
+                    await asyncio.gather(
+                        *tuple(agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS)
+                    )
+                record = await agent_server.CROSS_CHAT.get(direct_ids[0])
+                self.assertEqual(record["status"], "running")
+                self.assertEqual(submit.await_count, 2)
+                self.assertEqual(
+                    submit.await_args.args[0]["id"],
+                    direct_ids[0],
+                )
+            finally:
+                agent_server.CROSS_CHAT = original_cross_chat
+                agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = original_cache
+                agent_server.SESSION_LIFECYCLE_LOCKS = original_locks
+                agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS = original_tasks
+                agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE = (
+                    original_tasks_by_envelope
+                )
+
+    async def test_direct_dispatch_waits_until_source_lock_is_released(self) -> None:
+        source_id = "source-private-id"
+        original_locks = agent_server.SESSION_LIFECYCLE_LOCKS
+        original_tasks = agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS
+        original_tasks_by_envelope = (
+            agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE
+        )
+        agent_server.SESSION_LIFECYCLE_LOCKS = {}
+        agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS = set()
+        agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE = {}
+        record = {"id": "handoff_direct", "status": "ready"}
+        submit = AsyncMock(
+            return_value={"id": "handoff_direct", "status": "running"}
+        )
+        try:
+            with (
+                patch.object(agent_server.CROSS_CHAT, "get", AsyncMock(return_value=record)),
+                patch.object(agent_server, "submit_cross_chat_delivery", submit),
+            ):
+                async with agent_server.session_lifecycle_lock(source_id):
+                    agent_server.schedule_direct_message_handoffs_after_unlock(
+                        source_id, ["handoff_direct"]
+                    )
+                    await asyncio.sleep(0)
+                    submit.assert_not_awaited()
+                await asyncio.gather(
+                    *tuple(agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS)
+                )
+                submit.assert_awaited_once_with(record)
+        finally:
+            agent_server.SESSION_LIFECYCLE_LOCKS = original_locks
+            agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS = original_tasks
+            agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE = (
+                original_tasks_by_envelope
+            )
+
+    async def test_direct_dispatch_retries_transient_failure_without_restart(self) -> None:
+        source_id = "source-private-id"
+        original_locks = agent_server.SESSION_LIFECYCLE_LOCKS
+        original_tasks = agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS
+        original_tasks_by_envelope = (
+            agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE
+        )
+        agent_server.SESSION_LIFECYCLE_LOCKS = {}
+        agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS = set()
+        agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE = {}
+        record = {"id": "handoff_retry", "status": "ready"}
+        submitted = {"id": "handoff_retry", "status": "running"}
+        submit = AsyncMock(
+            side_effect=[RuntimeError("target temporarily busy"), submitted]
+        )
+        archived_source_sessions = {
+            session_id: dict(session)
+            for session_id, session in self.sessions.items()
+        }
+        archived_source_sessions[source_id]["archived"] = True
+        try:
+            with (
+                # Source archive does not revoke a direct-message effect after
+                # the source turn's durable admission boundary.
+                patch.object(
+                    agent_server.STORE,
+                    "sessions",
+                    archived_source_sessions,
+                ),
+                patch.object(
+                    agent_server.CROSS_CHAT,
+                    "get",
+                    AsyncMock(return_value=record),
+                ),
+                patch.object(
+                    agent_server,
+                    "submit_cross_chat_delivery",
+                    submit,
+                ),
+                patch.object(
+                    agent_server,
+                    "CROSS_CHAT_DIRECT_RETRY_DELAYS_SECONDS",
+                    (0.0,),
+                ),
+            ):
+                agent_server.schedule_direct_message_handoffs_after_unlock(
+                    source_id, ["handoff_retry"]
+                )
+                # Reconciliation/admission can race to schedule the same
+                # durable row. It must still have exactly one retry owner.
+                agent_server.schedule_direct_message_handoffs_after_unlock(
+                    source_id, ["handoff_retry"]
+                )
+                self.assertEqual(
+                    len(agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE),
+                    1,
+                )
+                await asyncio.gather(
+                    *tuple(agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS)
+                )
+            self.assertEqual(submit.await_count, 2)
+        finally:
+            agent_server.SESSION_LIFECYCLE_LOCKS = original_locks
+            agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS = original_tasks
+            agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE = (
+                original_tasks_by_envelope
+            )
+
+    async def test_direct_retry_stops_when_terminal_cas_wins(self) -> None:
+        source_id = "source-private-id"
+        original_locks = agent_server.SESSION_LIFECYCLE_LOCKS
+        original_tasks = agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS
+        original_tasks_by_envelope = (
+            agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE
+        )
+        agent_server.SESSION_LIFECYCLE_LOCKS = {}
+        agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS = set()
+        agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE = {}
+        ready = {"id": "handoff_cancelled", "status": "ready"}
+        cancelled = {"id": "handoff_cancelled", "status": "cancelled"}
+        submit = AsyncMock(side_effect=RuntimeError("target temporarily busy"))
+        terminal = AsyncMock()
+        try:
+            with (
+                patch.object(
+                    agent_server.CROSS_CHAT,
+                    "get",
+                    AsyncMock(side_effect=[ready, cancelled]),
+                ),
+                patch.object(
+                    agent_server,
+                    "submit_cross_chat_delivery",
+                    submit,
+                ),
+                patch.object(
+                    agent_server,
+                    "append_cross_chat_terminal_lifecycle",
+                    terminal,
+                ),
+                patch.object(
+                    agent_server,
+                    "CROSS_CHAT_DIRECT_RETRY_DELAYS_SECONDS",
+                    (0.0,),
+                ),
+            ):
+                agent_server.schedule_direct_message_handoffs_after_unlock(
+                    source_id, ["handoff_cancelled"]
+                )
+                await asyncio.gather(
+                    *tuple(agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS)
+                )
+            submit.assert_awaited_once_with(ready)
+            terminal.assert_awaited_once_with(
+                cancelled,
+                "Direct @chat delivery was cancelled.",
+            )
+        finally:
+            agent_server.SESSION_LIFECYCLE_LOCKS = original_locks
+            agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS = original_tasks
+            agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE = (
+                original_tasks_by_envelope
+            )
+
+    async def test_direct_retry_exhaustion_terminalizes_visibly(self) -> None:
+        source_id = "source-private-id"
+        original_locks = agent_server.SESSION_LIFECYCLE_LOCKS
+        original_tasks = agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS
+        original_tasks_by_envelope = (
+            agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE
+        )
+        agent_server.SESSION_LIFECYCLE_LOCKS = {}
+        agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS = set()
+        agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE = {}
+        ready = {"id": "handoff_exhausted", "status": "ready"}
+        failed = {"id": "handoff_exhausted", "status": "failed"}
+        submit = AsyncMock(side_effect=RuntimeError("target temporarily busy"))
+        update = AsyncMock(return_value=failed)
+        terminal = AsyncMock()
+        try:
+            with (
+                patch.object(
+                    agent_server.CROSS_CHAT,
+                    "get",
+                    AsyncMock(return_value=ready),
+                ),
+                patch.object(agent_server.CROSS_CHAT, "update", update),
+                patch.object(
+                    agent_server,
+                    "submit_cross_chat_delivery",
+                    submit,
+                ),
+                patch.object(
+                    agent_server,
+                    "append_cross_chat_terminal_lifecycle",
+                    terminal,
+                ),
+                patch.object(
+                    agent_server,
+                    "CROSS_CHAT_DIRECT_RETRY_DELAYS_SECONDS",
+                    (0.0,),
+                ),
+            ):
+                agent_server.schedule_direct_message_handoffs_after_unlock(
+                    source_id, ["handoff_exhausted"]
+                )
+                await asyncio.gather(
+                    *tuple(agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS)
+                )
+            self.assertEqual(submit.await_count, 2)
+            update.assert_awaited_once_with(
+                "handoff_exhausted",
+                expected={"ready"},
+                status="failed",
+                error=(
+                    "direct message delivery remained unavailable after "
+                    "bounded retries"
+                ),
+            )
+            terminal.assert_awaited_once_with(
+                failed,
+                "Direct @chat delivery failed after repeated transient "
+                "submission errors.",
+            )
+        finally:
+            agent_server.SESSION_LIFECYCLE_LOCKS = original_locks
+            agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS = original_tasks
+            agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE = (
+                original_tasks_by_envelope
+            )
+
+    async def test_direct_retry_cancellation_leaves_ready_row_recoverable(self) -> None:
+        source_id = "source-private-id"
+        original_locks = agent_server.SESSION_LIFECYCLE_LOCKS
+        original_tasks = agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS
+        original_tasks_by_envelope = (
+            agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE
+        )
+        agent_server.SESSION_LIFECYCLE_LOCKS = {}
+        agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS = set()
+        agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE = {}
+        ready = {"id": "handoff_shutdown", "status": "ready"}
+        attempted = asyncio.Event()
+
+        async def transient_failure(_record: dict) -> dict:
+            attempted.set()
+            raise RuntimeError("target temporarily busy")
+
+        update = AsyncMock()
+        try:
+            with (
+                patch.object(
+                    agent_server.CROSS_CHAT,
+                    "get",
+                    AsyncMock(return_value=ready),
+                ),
+                patch.object(agent_server.CROSS_CHAT, "update", update),
+                patch.object(
+                    agent_server,
+                    "submit_cross_chat_delivery",
+                    side_effect=transient_failure,
+                ),
+                patch.object(
+                    agent_server,
+                    "CROSS_CHAT_DIRECT_RETRY_DELAYS_SECONDS",
+                    (60.0,),
+                ),
+            ):
+                agent_server.schedule_direct_message_handoffs_after_unlock(
+                    source_id, ["handoff_shutdown"]
+                )
+                await asyncio.wait_for(attempted.wait(), timeout=1)
+                await asyncio.sleep(0)
+                task = (
+                    agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE[
+                        "handoff_shutdown"
+                    ]
+                )
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                await asyncio.sleep(0)
+            update.assert_not_awaited()
+            self.assertNotIn(
+                "handoff_shutdown",
+                agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE,
+            )
+        finally:
+            agent_server.SESSION_LIFECYCLE_LOCKS = original_locks
+            agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS = original_tasks
+            agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE = (
+                original_tasks_by_envelope
+            )
+
+    async def test_unavailable_endpoint_check_cannot_overwrite_terminal_cas(self) -> None:
+        original_cross_chat = agent_server.CROSS_CHAT
+        original_cache = agent_server.CROSS_CHAT_EVENT_TYPE_CACHE
+        with tempfile.TemporaryDirectory() as temporary:
+            agent_server.CROSS_CHAT = agent_server.CrossChatStore(
+                Path(temporary) / "cross-chat.sqlite3"
+            )
+            agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = agent_server.OrderedDict()
+            await agent_server.CROSS_CHAT.initialize()
+            try:
+                stale, _created = await agent_server.CROSS_CHAT.create_instruction(
+                    envelope_id="handoff_terminal_race",
+                    source_session_id="source-private-id",
+                    source_run_id="run_source",
+                    target_session_id="target-private-id",
+                    body="already cancelled",
+                    idempotency_key="terminal-race-key",
+                )
+                await agent_server.CROSS_CHAT.update(
+                    str(stale["id"]),
+                    expected={"ready"},
+                    status="cancelled",
+                )
+                with (
+                    patch.object(
+                        agent_server.STORE,
+                        "sessions",
+                        {"target-private-id": self.sessions["target-private-id"]},
+                    ),
+                    self.assertRaises(HTTPException),
+                ):
+                    await agent_server.submit_cross_chat_delivery(stale)
+                refreshed = await agent_server.CROSS_CHAT.get(str(stale["id"]))
+                self.assertEqual(refreshed["status"], "cancelled")
+            finally:
+                agent_server.CROSS_CHAT = original_cross_chat
+                agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = original_cache
+
+    def test_capability_advertises_new_mention_contract(self) -> None:
+        with (
+            patch.object(agent_server, "AGENT_TOKEN", "token"),
+            patch.object(
+                agent_server,
+                "cross_chat_supported_target_backends",
+                return_value=[agent_server.BACKEND_CODEX],
+            ),
+        ):
+            capability = agent_server.cross_chat_handoffs_capability()
+        self.assertEqual(capability["version"], 5)
+        self.assertEqual(capability["default_action"], "direct_message")
+        self.assertIn("direct_message", capability["actions"])
+        self.assertIn("route", capability["actions"])
+
+
+if __name__ == "__main__":
+    unittest.main()

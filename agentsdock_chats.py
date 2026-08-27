@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capability-scoped cross-chat handoff CLI for AgentsDock agent turns."""
+"""Capability-scoped same-server chat contact CLI for AgentsDock agents."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import ipaddress
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -83,18 +84,34 @@ def post_json(
         urllib.request.ProxyHandler({}),
         NoRedirectHandler(),
     )
-    try:
-        with opener.open(request, timeout=30) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
+    promotion_deadline = time.monotonic() + 10.0
+    while True:
         try:
-            detail = json.loads(raw).get("detail") or raw
-        except json.JSONDecodeError:
-            detail = raw
-        raise ChatsCLIError(f"server rejected handoff ({exc.code}): {detail or exc.reason}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise ChatsCLIError(f"could not reach AgentsServer: {getattr(exc, 'reason', exc)}") from exc
+            with opener.open(request, timeout=30) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            try:
+                detail = json.loads(raw).get("detail") or raw
+            except json.JSONDecodeError:
+                detail = raw
+            if (
+                exc.code == 409
+                and detail == "agent chat access is waiting for turn promotion"
+                and time.monotonic() < promotion_deadline
+            ):
+                # The body and idempotency key are identical on every attempt.
+                # Promotion has made no durable target effect yet.
+                time.sleep(0.05)
+                continue
+            raise ChatsCLIError(
+                f"server rejected handoff ({exc.code}): {detail or exc.reason}"
+            ) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise ChatsCLIError(
+                f"could not reach AgentsServer: {getattr(exc, 'reason', exc)}"
+            ) from exc
     if not isinstance(result, dict):
         raise ChatsCLIError("AgentsServer returned an invalid response")
     return result
@@ -187,11 +204,13 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
         ):
             raise ChatsCLIError("AgentsServer returned an invalid route handoff response")
     else:
-        expected = "exchange" if action == "request_reply" else "handoff"
-        if not isinstance(result.get(expected), dict):
-            raise ChatsCLIError(f"AgentsServer returned an invalid {expected} response")
-        if action == "request_reply" and not isinstance(result.get("leg"), dict):
-            raise ChatsCLIError("AgentsServer returned an invalid exchange leg response")
+        if (
+            set(result) != {"ok", "action", "accepted"}
+            or result.get("ok") is not True
+            or result.get("action") != action
+            or result.get("accepted") is not True
+        ):
+            raise ChatsCLIError("AgentsServer returned an invalid direct handoff response")
     return result
 
 
@@ -225,28 +244,27 @@ def respond(args: argparse.Namespace) -> dict[str, Any]:
         },
         capability,
     )
-    if result.get("action") == "response":
-        if (
-            set(result) != {"ok", "action", "accepted"}
-            or result.get("ok") is not True
-            or result.get("accepted") is not True
-        ):
-            raise ChatsCLIError(
-                "AgentsServer returned an invalid configured-route response"
-            )
-        return result
-    if not isinstance(result.get("exchange"), dict) or not isinstance(result.get("leg"), dict):
-        raise ChatsCLIError("AgentsServer returned an invalid exchange response")
+    if (
+        set(result) != {"ok", "action", "accepted"}
+        or result.get("ok") is not True
+        or result.get("action") != "response"
+        or result.get("accepted") is not True
+    ):
+        raise ChatsCLIError(
+            "AgentsServer returned an invalid cross-chat response"
+        )
     return result
 
 
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(description="Send a user-authorized message to another AgentsDock chat.")
+    root = argparse.ArgumentParser(
+        description="Contact an eligible chat on this AgentsDock server."
+    )
     root.add_argument("--authority-file", required=True)
     commands = root.add_subparsers(dest="command", required=True)
     list_command = commands.add_parser(
         "list",
-        help="list configured routes issued to this live turn",
+        help="list eligible same-server chats for this live run",
     )
     list_command.set_defaults(handler=list_routes)
     command = commands.add_parser("send", help="send one authorized instruction")

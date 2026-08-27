@@ -5013,16 +5013,26 @@ class SecurePeerClient:
         connection_type = _NoSNIHTTPSConnection if no_sni else http.client.HTTPSConnection
         connection = connection_type(host, port, timeout=self.timeout_seconds, context=context)
         encoded: bytes | None
-        request_headers = dict(headers or {})
+        # ``http.client`` treats header names case-insensitively, while a Python
+        # dict does not.  Normalize caller-provided names before adding our
+        # required headers so a forwarded ``accept`` cannot become a duplicate
+        # wire-level header when we enforce the JSON accept header below.
+        request_headers: dict[str, str] = {}
+        for raw_name, raw_value in (headers or {}).items():
+            name = str(raw_name).strip().lower()
+            value = str(raw_value)
+            if not name or name in request_headers:
+                raise ValueError("client request headers are invalid")
+            request_headers[name] = value
         if isinstance(body, Mapping):
             encoded = canonical_json(dict(body))
-            request_headers["Content-Type"] = "application/json"
+            request_headers["content-type"] = "application/json"
         else:
             encoded = body
         if encoded is not None:
-            request_headers["Content-Length"] = str(len(encoded))
-        request_headers["Accept"] = "application/json"
-        request_headers["Connection"] = "close"
+            request_headers["content-length"] = str(len(encoded))
+        request_headers["accept"] = "application/json"
+        request_headers["connection"] = "close"
         if len(request_headers) > MAX_HEADERS or any(
             len(name) > 80 or len(value.encode("utf-8")) > MAX_HEADER_VALUE_BYTES
             or "\r" in value or "\n" in value

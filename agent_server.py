@@ -108,7 +108,7 @@ from team_hub_host import (
 )
 from agentsdock_team_hub.store import HubError
 from agentsdock_team_hub.secure_peer import SecurePeerError
-from secure_peer_runtime import SecurePeerRuntime
+from secure_peer_runtime import SECURE_PEER_HEARTBEAT_SECONDS, SecurePeerRuntime
 
 try:
     import tomllib
@@ -670,7 +670,7 @@ PROVIDER_SECRET_ENV_NAMES = (
 SERVER_BIND_ADDRESS = agentsdock_setting("AGENT_BIND", "0.0.0.0")
 SERVER_PORT = int(agentsdock_setting("AGENT_PORT", "7850"))
 SERVER_INSTANCE_ID = uuid.uuid4().hex
-API_CONTRACT_VERSION = 17
+API_CONTRACT_VERSION = 18
 SESSION_ORDER_STEP = 1000.0
 SECURE_PEER_DELIVERY_PURPOSE = "secure_peer_handoff_delivery"
 CROSS_CHAT_DELIVERY_PURPOSES = {
@@ -45535,7 +45535,7 @@ async def lifespan(app: FastAPI):
                     "secure peer maintenance deferred error=%s",
                     concise_error_message(exc),
                 )
-            await asyncio.sleep(30)
+            await asyncio.sleep(SECURE_PEER_HEARTBEAT_SECONDS)
 
     secure_peer_task = asyncio.create_task(secure_peer_maintenance_loop())
 

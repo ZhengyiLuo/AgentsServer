@@ -17,6 +17,8 @@ from agentsdock_team_hub.secure_peer_hub import SecurePeerHubAdapter
 from agentsdock_team_hub.store import (
     MAX_NETWORK_BODY_BYTES,
     MAX_NETWORK_PAGE_RESPONSE_BYTES,
+    MAX_SECURE_PEER_BINDING_LOOKUP_IDS,
+    HubError,
     HubStore,
 )
 
@@ -68,6 +70,9 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
             },
             display_name=self.peer.peer_display_name,
         )
+        # Direct adapter tests bypass the gateway callback that records an
+        # authenticated heartbeat before forwarding each request.
+        self.adapter.record_peer_heartbeat(self.peer_id, self.team_id)
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -139,6 +144,248 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
         denied = self.request("GET", "/v1/teams")
         self.assertEqual(denied.status, 401)
         self.assertEqual(json.loads(denied.body)["error"]["code"], "authentication_required")
+
+    def test_active_binding_lookup_is_exact_bounded_and_presence_independent(self) -> None:
+        unknown_peer_id = str(uuid.uuid4())
+        self.assertEqual(
+            self.adapter.active_binding_peer_ids(
+                [unknown_peer_id, self.peer_id, self.peer_id],
+                self.peer.peer_server_identity,
+            ),
+            {self.peer_id},
+        )
+        self.assertEqual(
+            self.adapter.active_binding_peer_ids(
+                [self.peer_id],
+                "different-peer-server-identity",
+            ),
+            set(),
+        )
+
+        connection = self.store.connect()
+        try:
+            connection.execute(
+                """
+                UPDATE nodes SET status='offline'
+                WHERE id=(
+                    SELECT node_id FROM network_peer_bindings WHERE peer_id=?
+                )
+                """,
+                (self.peer_id,),
+            )
+        finally:
+            connection.close()
+        self.assertEqual(
+            self.adapter.active_binding_peer_ids(
+                [self.peer_id],
+                self.peer.peer_server_identity,
+            ),
+            {self.peer_id},
+        )
+
+        with self.assertRaises(ValueError):
+            self.adapter.active_binding_peer_ids(
+                [self.peer_id] * (MAX_SECURE_PEER_BINDING_LOOKUP_IDS + 1),
+                self.peer.peer_server_identity,
+            )
+        with self.assertRaises(HubError):
+            self.adapter.active_binding_peer_ids(
+                ["not-a-peer-id"],
+                self.peer.peer_server_identity,
+            )
+
+        self.adapter.revoke_peer(peer_id=self.peer_id, team_id=self.team_id)
+        self.assertEqual(
+            self.adapter.active_binding_peer_ids(
+                [self.peer_id],
+                self.peer.peer_server_identity,
+            ),
+            set(),
+        )
+        with self.assertRaises(HubError) as raised:
+            self.adapter.record_peer_heartbeat(self.peer_id, self.team_id)
+        self.assertEqual(raised.exception.code, "peer_unavailable")
+
+    def test_peer_heartbeat_reactivates_only_exact_live_binding(self) -> None:
+        connection = self.store.connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT n.id,n.enrolled_at,n.last_seen_at
+                FROM nodes AS n JOIN network_peer_bindings AS b
+                  ON b.team_id=n.team_id AND b.node_id=n.id
+                WHERE b.peer_id=? AND b.team_id=?
+                """,
+                (self.peer_id, self.team_id),
+            ).fetchone()
+            assert row is not None
+            heartbeat_at = max(int(row["enrolled_at"]), int(row["last_seen_at"] or 0)) + 60
+            connection.execute(
+                "UPDATE nodes SET status='offline' WHERE id=?",
+                (row["id"],),
+            )
+        finally:
+            connection.close()
+
+        with mock.patch(
+            "agentsdock_team_hub.store._now",
+            return_value=heartbeat_at,
+        ):
+            self.adapter.record_peer_heartbeat(self.peer_id, self.team_id)
+            self.adapter.record_peer_heartbeat(self.peer_id, self.team_id)
+        connection = self.store.connect()
+        try:
+            current = connection.execute(
+                """
+                SELECT n.status,n.last_seen_at,b.status AS binding_status
+                FROM nodes AS n JOIN network_peer_bindings AS b
+                  ON b.team_id=n.team_id AND b.node_id=n.id
+                WHERE b.peer_id=? AND b.team_id=?
+                """,
+                (self.peer_id, self.team_id),
+            ).fetchone()
+            assert current is not None
+            self.assertEqual(current["status"], "active")
+            self.assertEqual(current["last_seen_at"], heartbeat_at)
+            self.assertEqual(current["binding_status"], "active")
+            connection.execute(
+                """
+                UPDATE nodes SET status='suspended'
+                WHERE id=(
+                    SELECT node_id FROM network_peer_bindings WHERE peer_id=?
+                )
+                """,
+                (self.peer_id,),
+            )
+        finally:
+            connection.close()
+
+        with self.assertRaises(HubError) as raised:
+            self.adapter.record_peer_heartbeat(self.peer_id, self.team_id)
+        self.assertEqual(raised.exception.code, "peer_unavailable")
+        connection = self.store.connect()
+        try:
+            status = connection.execute(
+                """
+                SELECT status FROM nodes WHERE id=(
+                    SELECT node_id FROM network_peer_bindings WHERE peer_id=?
+                )
+                """,
+                (self.peer_id,),
+            ).fetchone()
+            assert status is not None
+            self.assertEqual(status["status"], "suspended")
+        finally:
+            connection.close()
+
+    def test_provisioning_does_not_claim_transport_presence(self) -> None:
+        peer_id = str(uuid.uuid4())
+        self.store.ensure_secure_peer_service(
+            peer_id=peer_id,
+            peer_server_identity="provisioned-offline-peer",
+            team_id=self.team_id,
+            display_name="Provisioned offline peer",
+        )
+        # Replaying startup projection is also not a heartbeat.
+        self.store.ensure_secure_peer_service(
+            peer_id=peer_id,
+            peer_server_identity="provisioned-offline-peer",
+            team_id=self.team_id,
+            display_name="Provisioned offline peer",
+        )
+        connection = self.store.connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT n.status,n.last_seen_at,n.display_name
+                FROM nodes AS n JOIN network_peer_bindings AS b
+                  ON b.team_id=n.team_id AND b.node_id=n.id
+                WHERE b.peer_id=?
+                """,
+                (peer_id,),
+            ).fetchone()
+            assert row is not None
+            self.assertEqual(row["status"], "offline")
+            self.assertIsNone(row["last_seen_at"])
+            self.assertEqual(row["display_name"], "Provisioned offline peer")
+        finally:
+            connection.close()
+
+        self.adapter.record_peer_heartbeat(peer_id, self.team_id)
+        connection = self.store.connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT n.status,n.last_seen_at
+                FROM nodes AS n JOIN network_peer_bindings AS b
+                  ON b.team_id=n.team_id AND b.node_id=n.id
+                WHERE b.peer_id=?
+                """,
+                (peer_id,),
+            ).fetchone()
+            assert row is not None
+            self.assertEqual(row["status"], "active")
+            self.assertIsInstance(row["last_seen_at"], int)
+        finally:
+            connection.close()
+
+    def test_expire_peer_leases_is_idempotent_and_preserves_trust(self) -> None:
+        fresh_peer_id = str(uuid.uuid4())
+        self.store.ensure_secure_peer_service(
+            peer_id=fresh_peer_id,
+            peer_server_identity="fresh-peer-server-identity",
+            team_id=self.team_id,
+            display_name="Fresh paired server",
+        )
+        connection = self.store.connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT b.peer_id,n.id,n.enrolled_at
+                FROM network_peer_bindings AS b JOIN nodes AS n
+                  ON n.team_id=b.team_id AND n.id=b.node_id
+                WHERE b.peer_id IN (?,?)
+                """,
+                (self.peer_id, fresh_peer_id),
+            ).fetchall()
+            by_peer = {str(row["peer_id"]): row for row in rows}
+            base = max(int(row["enrolled_at"]) for row in rows)
+            cutoff = base + 100
+            connection.execute(
+                "UPDATE nodes SET status='active',last_seen_at=? WHERE id=?",
+                (cutoff - 1, by_peer[self.peer_id]["id"]),
+            )
+            connection.execute(
+                "UPDATE nodes SET status='active',last_seen_at=? WHERE id=?",
+                (cutoff, by_peer[fresh_peer_id]["id"]),
+            )
+        finally:
+            connection.close()
+
+        self.assertEqual(self.adapter.expire_peer_leases(cutoff), 1)
+        self.assertEqual(self.adapter.expire_peer_leases(cutoff), 0)
+        connection = self.store.connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT b.peer_id,b.status AS binding_status,n.status AS node_status
+                FROM network_peer_bindings AS b JOIN nodes AS n
+                  ON n.team_id=b.team_id AND n.id=b.node_id
+                WHERE b.peer_id IN (?,?)
+                """,
+                (self.peer_id, fresh_peer_id),
+            ).fetchall()
+            by_peer = {str(row["peer_id"]): row for row in rows}
+            self.assertEqual(by_peer[self.peer_id]["node_status"], "offline")
+            self.assertEqual(by_peer[fresh_peer_id]["node_status"], "active")
+            self.assertEqual(by_peer[self.peer_id]["binding_status"], "active")
+            self.assertEqual(by_peer[fresh_peer_id]["binding_status"], "active")
+        finally:
+            connection.close()
+
+        for invalid in (-1, True, 1.5, "100"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                self.adapter.expire_peer_leases(invalid)  # type: ignore[arg-type]
 
     def test_team_network_mailbox_receipts_and_passive_reply(self) -> None:
         network = self.request("GET", f"/v1/teams/{self.team_id}/network")
@@ -813,6 +1060,7 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
             team_id=self.team_id,
             display_name="Other paired server",
         )
+        self.adapter.record_peer_heartbeat(other_peer_id, self.team_id)
         other_claims = self.store.secure_peer_claims(
             peer_id=other_peer_id,
             peer_server_identity="other-peer-server-identity",

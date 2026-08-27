@@ -516,7 +516,7 @@ class TimelinePinsTests(unittest.IsolatedAsyncioTestCase):
         capability = health["capabilities"]["pinned_items"]
         # This endpoint is additive and capability-gated; legacy clients keep
         # the current global contract while opting clients inspect this key.
-        self.assertEqual(health["api_contract_version"], 17)
+        self.assertEqual(health["api_contract_version"], 18)
         self.assertEqual(capability["version"], 1)
         self.assertEqual(capability["max_items_per_session"], 500)
         self.assertEqual(capability["max_body_chars"], 24_000)

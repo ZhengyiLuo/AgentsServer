@@ -249,6 +249,175 @@ class TeamNetworkHarness:
 
 
 class TeamNetworkE2EAcceptanceTests(unittest.TestCase):
+    def test_offline_forget_preserves_credential_until_remote_revocation_ack(self) -> None:
+        host_ip = _nonloopback_ipv4()
+        if host_ip is None:
+            self.skipTest("no non-loopback IPv4 address is available")
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        network = TeamNetworkHarness(self, Path(temporary.name), host_ip)
+        network.pair_approve_and_activate()
+        connection = next(
+            item
+            for item in network.member.status()["pairings"]
+            if item["connection_id"] == network.connection_id
+        )
+        network.host.configure_host(
+            enabled=False,
+            advertised_host=None,
+            listen_port=network.port,
+        )
+        with self.assertRaises(SecurePeerError) as offline:
+            network.member.forget_connection(
+                network.connection_id,
+                expected_host_server_identity=connection["host_server_identity"],
+                expected_hub_id=connection["hub_id"],
+                expected_certificate_fingerprint=connection[
+                    "certificate_fingerprint"
+                ],
+            )
+        self.assertEqual(offline.exception.code, "transport_failed")
+        preserved = network.member.client.get_connection(network.connection_id)
+        self.assertEqual(preserved["certificate_fingerprint"], connection["certificate_fingerprint"])
+
+        network.host.configure_host(
+            enabled=True,
+            advertised_host=host_ip,
+            listen_port=network.port,
+        )
+        forgotten = network.member.forget_connection(
+            network.connection_id,
+            expected_host_server_identity=connection["host_server_identity"],
+            expected_hub_id=connection["hub_id"],
+            expected_certificate_fingerprint=connection[
+                "certificate_fingerprint"
+            ],
+        )
+        self.assertFalse(
+            any(
+                item.get("connection_id") == network.connection_id
+                for item in forgotten["pairings"]
+            )
+        )
+
+    def test_disconnect_reconnect_forget_and_repair_have_one_logical_peer(self) -> None:
+        host_ip = _nonloopback_ipv4()
+        if host_ip is None:
+            self.skipTest("no non-loopback IPv4 address is available")
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        network = TeamNetworkHarness(self, Path(temporary.name), host_ip)
+        network.pair_approve_and_activate()
+
+        online = next(
+            item
+            for item in network.member.status()["pairings"]
+            if item["connection_id"] == network.connection_id
+        )
+        self.assertEqual(online["trust_state"], "approved")
+        self.assertEqual(online["transport_state"], "online")
+        incoming = next(
+            item
+            for item in network.host.status()["pairings"]
+            if item.get("peer_server_identity") == MEMBER_SERVER_IDENTITY
+            and item.get("trust_state") == "approved"
+        )
+        self.assertEqual(incoming["transport_state"], "online")
+        self.assertIsNotNone(incoming["last_seen_at"])
+
+        # Presence expires independently of certificate trust, then the next
+        # pinned health heartbeat reactivates the same logical node.
+        self.assertEqual(
+            network.hub.expire_secure_peer_leases(int(time.time()) + 1),
+            1,
+        )
+        member_node = next(
+            server
+            for server in network.hub.get_network(
+                network.owner, network.team_id
+            )["servers"]
+            if server["server_identity"] == MEMBER_SERVER_IDENTITY
+        )
+        self.assertEqual(member_node["status"], "offline")
+        heartbeat = network.member.maintenance_once()
+        self.assertTrue(heartbeat["healthy"])
+        member_node = next(
+            server
+            for server in network.hub.get_network(
+                network.owner, network.team_id
+            )["servers"]
+            if server["server_identity"] == MEMBER_SERVER_IDENTITY
+        )
+        self.assertEqual(member_node["status"], "active")
+
+        disconnected = network.member.deactivate_connection(
+            network.connection_id,
+            expected_host_server_identity=online["host_server_identity"],
+            expected_hub_id=online["hub_id"],
+        )
+        inactive = next(
+            item
+            for item in disconnected["pairings"]
+            if item["connection_id"] == network.connection_id
+        )
+        self.assertEqual(inactive["trust_state"], "approved")
+        self.assertEqual(inactive["transport_state"], "disconnected")
+
+        reconnected = network.member.activate_pairing(
+            inactive["id"],
+            expected_connection_id=network.connection_id,
+            expected_host_server_identity=inactive["host_server_identity"],
+            expected_hub_id=inactive["hub_id"],
+        )
+        restored = next(
+            item
+            for item in reconnected["pairings"]
+            if item["connection_id"] == network.connection_id
+        )
+        self.assertEqual(restored["transport_state"], "online")
+
+        forgotten = network.member.forget_connection(
+            network.connection_id,
+            expected_host_server_identity=restored["host_server_identity"],
+            expected_hub_id=restored["hub_id"],
+            expected_certificate_fingerprint=restored["certificate_fingerprint"],
+        )
+        self.assertFalse(
+            any(
+                item.get("connection_id") == network.connection_id
+                for item in forgotten["pairings"]
+            )
+        )
+        host_peer = next(
+            item
+            for item in network.host.list_peers(team_id=network.team_id)["peers"]
+            if item["connection_id"] == network.peer_id
+        )
+        self.assertEqual(host_peer["trust_state"], "revoked")
+
+        # Re-pairing the same stable server identity creates one successor,
+        # never a second simultaneously active logical binding.
+        network.pair_approve_and_activate()
+        active_peers = [
+            item
+            for item in network.host.list_peers(team_id=network.team_id)["peers"]
+            if item["peer_server_identity"] == MEMBER_SERVER_IDENTITY
+            and item["trust_state"] == "approved"
+        ]
+        self.assertEqual(len(active_peers), 1)
+        connection = network.hub.connect()
+        try:
+            active_bindings = connection.execute(
+                """SELECT COUNT(*) AS count FROM network_peer_bindings
+                WHERE team_id=? AND peer_server_identity=? AND status='active'""",
+                (network.team_id, MEMBER_SERVER_IDENTITY),
+            ).fetchone()["count"]
+        finally:
+            connection.close()
+        self.assertEqual(int(active_bindings), 1)
+
     def test_two_servers_use_passive_team_network_and_converge_after_revocation(self) -> None:
         host_ip = _nonloopback_ipv4()
         if host_ip is None:

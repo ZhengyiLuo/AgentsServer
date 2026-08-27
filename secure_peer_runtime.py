@@ -18,6 +18,8 @@ import uuid
 
 from agentsdock_team_hub.secure_peer import (
     PAIRING_STATUS_LIMIT,
+    PEER_HEARTBEAT_LEASE_SECONDS,
+    PeerAuthorization,
     SecurePeerClient,
     SecurePeerError,
     SecurePeerGateway,
@@ -31,8 +33,11 @@ from agentsdock_team_hub.store import HubError, HubStore
 from secure_peer_delivery import SecurePeerDeliveryLedger
 
 
-SECURE_PEER_CONTROL_VERSION = 1
+SECURE_PEER_CONTROL_VERSION = 2
 SECURE_PEER_PROXY_PREFIX = "/api/team-hub-secure"
+SECURE_PEER_HEARTBEAT_SECONDS = 30
+SECURE_PEER_LEASE_SECONDS = PEER_HEARTBEAT_LEASE_SECONDS
+SECURE_PEER_OFFLINE_FAILURES = 3
 _PAIRING_ACTIONABLE_STATUSES = frozenset(
     {"requesting", "pending_approval", "approved", "connected"}
 )
@@ -144,8 +149,17 @@ class SecurePeerRuntime:
         self._host_store: SecurePeerStore | None = None
         self._adapter: SecurePeerHubAdapter | None = None
         self._gateway: SecurePeerGateway | None = None
+        # Keep the authoritative Hub attachment recoverable when startup hits
+        # a transient projection or listener failure.  The maintenance loop
+        # retries this exact object identity instead of leaving a permanently
+        # dead Retry button until the whole service is restarted.
+        self._pending_host_attachment: tuple[str, Path, HubStore] | None = None
         self._host_error: str | None = None
+        self._host_error_code: str | None = None
+        self._host_action: str | None = None
+        self._delivery_error: str | None = None
         self._client_error: str | None = None
+        self._client_failure_counts: dict[str, int] = {}
         self._initialization_error: str | None = None
         # Cross-server chat authority is deliberately opened only after the
         # connector, both route-revision CAS boundaries, and the durable local
@@ -287,9 +301,17 @@ class SecurePeerRuntime:
         finally:
             os.close(directory)
 
-    def mark_host_unavailable(self, message: str) -> None:
+    def mark_host_unavailable(
+        self,
+        message: str,
+        *,
+        error_code: str = "secure_peer_host_unavailable",
+        action: str = "Retry after the Team Hub host finishes recovery.",
+    ) -> None:
         with self._guard:
             self._host_error = _safe_status_error(message)
+            self._host_error_code = str(error_code)[:64]
+            self._host_action = _safe_status_error(action)
 
     def _host_actionable_pairing_count(self) -> int:
         store = self._host_store
@@ -307,14 +329,23 @@ class SecurePeerRuntime:
     ) -> None:
         """Attach after the authoritative Hub has acquired its runtime lease."""
 
-        del hub_data_dir
         if self._initialization_error is not None:
             return
         if hub_store is None:
             raise RuntimeError("secure peer host attachment requires the live Hub store")
+        attachment = (str(hub_id), Path(hub_data_dir), hub_store)
         with self._guard:
             if self._hub_store is not None and self._hub_store is not hub_store:
                 raise RuntimeError("secure peer host is already attached")
+            self._pending_host_attachment = attachment
+            if (
+                self._hub_store is hub_store
+                and self._host_store is not None
+                and self._adapter is not None
+                and self._host_error_code is None
+            ):
+                self._pending_host_attachment = None
+                return
             host_store = SecurePeerStore(
                 self.data_dir / "host",
                 self.server_identity,
@@ -343,31 +374,101 @@ class SecurePeerRuntime:
                     activated_by="agentsserver-runtime-v1",
                 )
             adapter = SecurePeerHubAdapter(hub_store)
+            initial_peers = host_store.list_peers(team_id=None)
+            preferred_peer_ids: set[str] = set()
+            logical_groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            for peer in initial_peers:
+                if peer.get("status") != "active":
+                    continue
+                logical_groups.setdefault(
+                    (
+                        str(peer.get("team_id") or ""),
+                        str(peer.get("peer_server_identity") or ""),
+                    ),
+                    [],
+                ).append(peer)
+            for (_team_id, peer_identity), peers in logical_groups.items():
+                preferred_peer_ids.update(
+                    adapter.active_binding_peer_ids(
+                        tuple(str(peer["peer_id"]) for peer in peers),
+                        peer_identity,
+                    )
+                )
+            reconciliation = host_store.reconcile_active_logical_peers(
+                preferred_peer_ids
+            )
+            if reconciliation.get("superseded_peer_ids") and self.logger is not None:
+                self.logger.warning(
+                    "reconciled duplicate secure peer credentials count=%s",
+                    len(reconciliation["superseded_peer_ids"]),
+                )
+            # Install the control plane before projection replay.  A later
+            # structural Hub error must not hide every peer record and make
+            # administrative recovery impossible.
+            self._hub_store = hub_store
+            self._host_store = host_store
+            self._adapter = adapter
             # Recover the approval -> service-principal transaction boundary.
             pairings = {
                 item.get("pairing_id"): item
                 for item in host_store.list_pairings(status=None)
             }
-            for peer in host_store.list_peers(team_id=None):
+            recovered_peers = host_store.list_peers(team_id=None)
+            # Revocations always replay first.  This ordering closes the
+            # cross-database replacement boundary before a successor binding
+            # is provisioned.
+            for peer in recovered_peers:
+                if peer.get("status") != "active" and peer.get("team_id"):
+                    peer_id = str(peer["peer_id"])
+                    if peer_id in adapter.active_binding_peer_ids(
+                        (peer_id,),
+                        str(peer.get("peer_server_identity") or ""),
+                    ):
+                        adapter.revoke_peer(
+                            peer_id=peer_id,
+                            team_id=str(peer["team_id"]),
+                        )
+            for peer in recovered_peers:
                 if peer.get("status") == "active":
                     pairing = pairings.get(peer.get("pairing_id")) or {}
-                    adapter.provision_peer(
-                        peer,
-                        display_name=str(
-                            peer.get("peer_display_name")
-                            or pairing.get("peer_display_name")
-                            or peer.get("peer_server_identity")
-                        )[:160],
-                    )
-                elif peer.get("team_id"):
-                    adapter.revoke_peer(
-                        peer_id=str(peer["peer_id"]),
-                        team_id=str(peer["team_id"]),
-                    )
-            self._hub_store = hub_store
-            self._host_store = host_store
-            self._adapter = adapter
+                    try:
+                        adapter.provision_peer(
+                            peer,
+                            display_name=str(
+                                peer.get("peer_display_name")
+                                or pairing.get("peer_display_name")
+                                or peer.get("peer_server_identity")
+                            )[:160],
+                        )
+                    except HubError as exc:
+                        if exc.code != "peer_identity_conflict":
+                            raise
+                        # A single orphan/corrupt peer cannot disable invites
+                        # and administrative recovery for every other peer.
+                        host_store.revoke_peer(
+                            str(peer["peer_id"]),
+                            str(peer["team_id"]),
+                            str(peer["certificate_fingerprint"]),
+                            _stable_uuid4(
+                                "secure-peer-startup-quarantine\0"
+                                + self.server_identity
+                                + "\0"
+                                + str(peer["peer_id"])
+                            ),
+                            "agentsserver-startup-quarantine",
+                        )
+                        adapter.revoke_peer(
+                            peer_id=str(peer["peer_id"]),
+                            team_id=str(peer["team_id"]),
+                        )
+                        if self.logger is not None:
+                            self.logger.warning(
+                                "quarantined conflicting secure peer peer_id=%s",
+                                peer["peer_id"],
+                            )
             self._host_error = None
+            self._host_error_code = None
+            self._host_action = None
             if self._config["enabled"]:
                 gateway = SecurePeerGateway(
                     host_store,
@@ -376,12 +477,47 @@ class SecurePeerRuntime:
                     forwarder=self._forward_peer_request,
                     resource_team_resolver=adapter.resource_team,
                     relay_enabled=lambda: self._relay_enabled,
+                    peer_heartbeat=self._record_authenticated_peer_heartbeat,
+                    peer_revoker=self._revoke_authenticated_peer,
                 )
                 gateway.start()
                 self._gateway = gateway
             with self._peer_admission:
                 self._peer_accepting = self._gateway is not None
                 self._peer_admission.notify_all()
+            self._pending_host_attachment = None
+
+    def retry_host_attachment(self) -> bool:
+        """Retry the exact designated Hub attachment after a transient failure."""
+
+        with self._guard:
+            pending = self._pending_host_attachment
+            if pending is None:
+                return bool(
+                    self._host_store is not None
+                    and self._adapter is not None
+                    and self._host_error_code is None
+                )
+        hub_id, hub_data_dir, hub_store = pending
+        try:
+            self.attach_host_hub(
+                hub_id=hub_id,
+                hub_data_dir=hub_data_dir,
+                hub_store=hub_store,
+            )
+        except Exception as exc:
+            self.mark_host_unavailable(
+                "Secure peer host could not be initialized",
+                error_code="secure_peer_host_initialization_failed",
+                action="Retry secure peer host initialization.",
+            )
+            if self.logger is not None:
+                self.logger.warning(
+                    "secure peer host attachment retry deferred error_type=%s",
+                    type(exc).__name__,
+                )
+            return False
+        return True
 
     def configure_host(
         self,
@@ -402,8 +538,14 @@ class SecurePeerRuntime:
         port = canonical_peer_port(listen_port)
         if enabled != (host is not None):
             raise SecurePeerError("invalid_request", "Advertised IP is required exactly when hosting", 422)
+        if enabled:
+            self.retry_host_attachment()
         with self._guard:
-            if enabled and (self._host_store is None or self._adapter is None):
+            if enabled and (
+                self._host_store is None
+                or self._adapter is None
+                or self._host_error_code is not None
+            ):
                 raise SecurePeerError(
                     "host_unavailable",
                     "Secure hosting requires the active designated Team Hub",
@@ -437,6 +579,8 @@ class SecurePeerRuntime:
                         forwarder=self._forward_peer_request,
                         resource_team_resolver=self._adapter.resource_team,
                         relay_enabled=lambda: self._relay_enabled,
+                        peer_heartbeat=self._record_authenticated_peer_heartbeat,
+                        peer_revoker=self._revoke_authenticated_peer,
                     )
                     new_gateway.start()
                 next_config = {
@@ -450,6 +594,8 @@ class SecurePeerRuntime:
                 self._config = next_config
                 self._gateway = new_gateway
                 self._host_error = None
+                self._host_error_code = None
+                self._host_action = None
             except BaseException:
                 if new_gateway is not None:
                     new_gateway.stop()
@@ -462,6 +608,8 @@ class SecurePeerRuntime:
                         forwarder=self._forward_peer_request,
                         resource_team_resolver=self._adapter.resource_team,
                         relay_enabled=lambda: self._relay_enabled,
+                        peer_heartbeat=self._record_authenticated_peer_heartbeat,
+                        peer_revoker=self._revoke_authenticated_peer,
                     )
                     restored.start()
                     self._gateway = restored
@@ -551,6 +699,7 @@ class SecurePeerRuntime:
                 expected_connection_id,
                 expected_current=active_id or None,
             )
+            self._client_failure_counts.pop(expected_connection_id, None)
         return self.status()
 
     def deactivate_connection(
@@ -567,6 +716,7 @@ class SecurePeerRuntime:
                 expected_host_server_identity=expected_host_server_identity,
                 expected_hub_id=expected_hub_id,
             )
+            self._client_failure_counts.pop(connection_id, None)
         return self.status()
 
     def forget_connection(
@@ -579,13 +729,57 @@ class SecurePeerRuntime:
     ) -> dict[str, Any]:
         with self._outbound_guard:
             self._require_connection_delivery_quiescent(connection_id)
-            self._retire_client_routes_for_connection(connection_id)
+            connection = next(
+                (
+                    item
+                    for item in self.client.list_connections()
+                    if item.get("connection_id") == connection_id
+                ),
+                None,
+            )
+            if (
+                connection is None
+                or connection.get("host_server_identity")
+                != expected_host_server_identity
+                or connection.get("hub_id") != expected_hub_id
+                or connection.get("certificate_fingerprint")
+                != expected_certificate_fingerprint
+            ):
+                raise SecurePeerError(
+                    "connection_changed",
+                    "Secure peer connection identity changed",
+                    409,
+                )
+            self.client.revoke_remote_connection(
+                connection_id,
+                idempotency_key=_stable_uuid4(
+                    "secure-peer-connection-forget\0"
+                    + self.server_identity
+                    + "\0"
+                    + connection_id
+                    + "\0"
+                    + expected_certificate_fingerprint
+                ),
+            )
+            # The authenticated host revocation atomically retires every
+            # route and envelope for this logical peer.  Convert the exact
+            # receipt into local route tombstones before deleting the key.
+            # This also recovers a response lost after the remote commit.
+            self.client.retire_remote_revoked_connection(
+                connection_id,
+                expected_host_server_identity=expected_host_server_identity,
+                expected_hub_id=expected_hub_id,
+                expected_certificate_fingerprint=(
+                    expected_certificate_fingerprint
+                ),
+            )
             self.client.forget_connection(
                 connection_id,
                 expected_host_server_identity=expected_host_server_identity,
                 expected_hub_id=expected_hub_id,
                 expected_certificate_fingerprint=expected_certificate_fingerprint,
             )
+            self._client_failure_counts.pop(connection_id, None)
         return self.status()
 
     def _require_connection_delivery_quiescent(self, connection_id: str) -> None:
@@ -607,47 +801,6 @@ class SecurePeerRuntime:
                 "Wait for encrypted peer deliveries to finish before changing this connection",
                 409,
             )
-
-    def _retire_client_routes_for_connection(self, connection_id: str) -> None:
-        try:
-            # A previous offline attempt may already have created local
-            # tombstones. They must be acknowledged remotely before any key or
-            # connection row can be deleted, or the remote route could remain
-            # usable forever with no local outbox able to revoke it.
-            self.client.flush_pending_route_revocations_for_connection(
-                connection_id
-            )
-        except SecurePeerError as exc:
-            self._client_error = _safe_status_error(exc.message)
-            raise
-        routes = [
-            route
-            for route in self.client.list_published_routes()
-            if str(route.get("connection_id") or "") == connection_id
-            and route.get("status") in {"publishing", "active"}
-        ]
-        for route in routes:
-            route_id = str(route.get("route_id") or "")
-            revision = str(route.get("revision") or "")
-            try:
-                self.client.revoke_published_route(
-                    connection_id,
-                    route_id,
-                    revision,
-                    _stable_uuid4(
-                        "secure-peer-connection-retire\0"
-                        + self.server_identity
-                        + "\0"
-                        + connection_id
-                        + "\0"
-                        + route_id
-                        + "\0"
-                        + revision
-                    ),
-                )
-            except SecurePeerError as exc:
-                self._client_error = _safe_status_error(exc.message)
-                raise
 
     def _outgoing_for_pairing(self, pairing_id: str) -> dict[str, Any]:
         matches = [
@@ -678,16 +831,74 @@ class SecurePeerRuntime:
             "error": "error",
         }.get(str(value), "error")
 
+    @staticmethod
+    def _trust_state(value: Any) -> str:
+        raw = str(value)
+        if raw == "revoked":
+            return "revoked"
+        if raw in {"requesting", "pending", "pending_approval"}:
+            return "pending"
+        if raw in {"rejected", "cancelled", "expired", "error"}:
+            return raw
+        if raw in {"approved", "connected", "deactivated", "active"}:
+            return "approved"
+        return "error"
+
+    def _transport_state(
+        self,
+        item: Mapping[str, Any],
+        *,
+        direction: str,
+        active: bool,
+    ) -> str:
+        raw = str(item.get("status") or "")
+        if raw == "revoked":
+            return "revoked"
+        if direction == "outgoing" and not active:
+            return "disconnected"
+        if direction == "incoming" and raw != "active":
+            return "disconnected"
+        last_seen = int(
+            item.get("last_validated_at")
+            or item.get("last_seen_at")
+            or 0
+        )
+        now = int(time.time())
+        if direction == "incoming":
+            return (
+                "online"
+                if last_seen >= now - SECURE_PEER_LEASE_SECONDS
+                else "offline"
+            )
+        connection_id = str(item.get("connection_id") or "")
+        failures = self._client_failure_counts.get(connection_id, 0)
+        if failures == 0 and last_seen >= now - SECURE_PEER_LEASE_SECONDS:
+            return "online"
+        if (
+            failures < SECURE_PEER_OFFLINE_FAILURES
+            and last_seen >= now - SECURE_PEER_LEASE_SECONDS
+        ):
+            return "reconnecting"
+        return "offline"
+
     def _incoming_pairing(self, item: Mapping[str, Any]) -> dict[str, Any]:
         endpoint = str(item.get("source_endpoint") or item.get("remote_endpoint") or "")
         public_fp = item.get("peer_public_key_fingerprint") or _fingerprint_public_key_pem(
             item.get("peer_public_key_pem")
         )
         peer_id = item.get("peer_id")
+        trust_state = self._trust_state(item.get("status"))
+        transport_state = self._transport_state(
+            item,
+            direction="incoming",
+            active=item.get("status") == "active",
+        )
         return {
             "id": item.get("pairing_id"),
             "direction": "incoming",
             "status": self._status(item.get("status")),
+            "trust_state": trust_state,
+            "transport_state": transport_state,
             "peer_server_identity": item.get("peer_server_identity"),
             "peer_display_name": item.get("peer_display_name") or item.get("peer_server_identity"),
             "remote_endpoint": endpoint,
@@ -716,10 +927,18 @@ class SecurePeerRuntime:
     def _outgoing_pairing(self, item: Mapping[str, Any]) -> dict[str, Any]:
         connection_id = str(item.get("connection_id"))
         active = bool(item.get("active"))
+        trust_state = self._trust_state(item.get("status"))
+        transport_state = self._transport_state(
+            item,
+            direction="outgoing",
+            active=active,
+        )
         return {
             "id": item.get("pairing_id"),
             "direction": "outgoing",
             "status": self._status(item.get("status"), active=active),
+            "trust_state": trust_state,
+            "transport_state": transport_state,
             "peer_server_identity": item.get("host_server_identity"),
             "peer_display_name": item.get("host_display_name") or item.get("host_server_identity"),
             "remote_endpoint": f"{item.get('host_ip')}:{item.get('port')}",
@@ -830,6 +1049,21 @@ class SecurePeerRuntime:
                     for item in all_pairings
                     if item.get("pairing_id") == values["pairing_id"]
                 )
+            # The secure-peer database atomically supersedes the prior
+            # credential for this logical server.  Replay those revocations
+            # into Team Hub before provisioning the successor so a crash at
+            # either database boundary remains recoverable and idempotent.
+            for prior_peer in store.list_peers(team_id=values["team_id"]):
+                if (
+                    prior_peer.get("status") == "revoked"
+                    and prior_peer.get("peer_server_identity")
+                    == values["expected_peer_server_identity"]
+                    and prior_peer.get("peer_id") != result.get("peer_id")
+                ):
+                    adapter.revoke_peer(
+                        peer_id=str(prior_peer["peer_id"]),
+                        team_id=str(prior_peer["team_id"]),
+                    )
             peer = next(
                 item for item in store.list_peers(team_id=values["team_id"])
                 if item.get("peer_id") == result.get("peer_id")
@@ -1339,6 +1573,8 @@ class SecurePeerRuntime:
             store = self._host_store
             gateway = self._gateway
             host_error = self._host_error
+            host_error_code = self._host_error_code
+            host_action = self._host_action
             connections = self.client.list_connections()
             incoming_items: list[dict[str, Any]] = []
             if store is not None:
@@ -1355,13 +1591,19 @@ class SecurePeerRuntime:
                     for pairing_id, item in pairings.items()
                 ]
             status_pairings = self._status_pairings(incoming_items, connections)
-        host_available = store is not None and self._initialization_error is None
+        host_available = bool(
+            store is not None
+            and self._initialization_error is None
+            and host_error_code is None
+        )
         host = config.get("advertised_host")
         port = int(config["listen_port"])
         ca_fingerprint = store.ca_fingerprint if store is not None else None
         route_delivery_available = self.remote_route_delivery_available()
         return {
             "version": SECURE_PEER_CONTROL_VERSION,
+            "heartbeat_interval_seconds": SECURE_PEER_HEARTBEAT_SECONDS,
+            "lease_seconds": SECURE_PEER_LEASE_SECONDS,
             "server_identity": self.server_identity,
             "server_instance_id": self.server_instance_id,
             "active_connection_id": next(
@@ -1388,6 +1630,15 @@ class SecurePeerRuntime:
                     else None
                 ),
                 "error": host_error or self._initialization_error,
+                "error_code": (
+                    host_error_code
+                    or (
+                        "secure_peer_state_unavailable"
+                        if self._initialization_error
+                        else None
+                    )
+                ),
+                "action": host_action,
             },
             "pairings": status_pairings,
             "remote_routes": (
@@ -1398,6 +1649,7 @@ class SecurePeerRuntime:
             ),
             "remote_route_delivery_available": route_delivery_available,
             "connection_error": self._client_error,
+            "delivery_error": self._delivery_error,
         }
 
     def state_available(self) -> bool:
@@ -1457,6 +1709,7 @@ class SecurePeerRuntime:
         with self._guard:
             self._remote_routes_cache.pop(connection_id, None)
             self._remote_routes_refreshed_at.pop(connection_id, None)
+        self._client_failure_counts.pop(connection_id, None)
         self._client_error = None
         return {
             "active": replacement_active,
@@ -1468,8 +1721,30 @@ class SecurePeerRuntime:
             "pairing_recovery": dict(pairing_recovery),
         }
 
+    @staticmethod
+    def _is_unconfirmed_peer_revocation(exc: BaseException | None) -> bool:
+        return bool(
+            isinstance(exc, SecurePeerError)
+            and exc.code == "peer_revoked"
+            and exc.status_code == 401
+        )
+
+    def _remote_revocation_confirmed(self, connection_id: str) -> bool | None:
+        """Return terminal trust state only from the pinned status receipt."""
+
+        try:
+            status = self.client.remote_revocation_status(connection_id)
+        except Exception as exc:
+            if self.logger is not None:
+                self.logger.warning(
+                    "secure peer revocation confirmation deferred error_type=%s",
+                    type(exc).__name__,
+                )
+            return None
+        return status.get("status") == "revoked"
+
     def maintenance_once(self) -> dict[str, Any]:
-        """Renew and revalidate the one explicitly active peer connection."""
+        """Reconcile host leases and heartbeat the active peer independently."""
 
         if self._initialization_error is not None:
             return {
@@ -1478,7 +1753,67 @@ class SecurePeerRuntime:
                 "healthy": False,
                 "error": "secure_peer_state_unavailable",
             }
-        pairing_recovery = self.client.recover_pairing_attempts(limit=2)
+        # A failed first attachment must be recoverable without restarting the
+        # service.  This is intentionally independent of client maintenance.
+        self.retry_host_attachment()
+        with self._guard:
+            adapter = self._adapter
+            host_store = self._host_store
+        if adapter is not None and host_store is not None:
+            # Replay each trust tombstone independently.  Already-retired Hub
+            # bindings are skipped so a permanent tombstone does not generate
+            # writes forever, and one malformed peer cannot suppress leases.
+            try:
+                host_peers = host_store.list_peers(team_id=None)
+            except Exception as exc:
+                host_peers = []
+                if self.logger is not None:
+                    self.logger.warning(
+                        "secure peer host tombstone scan deferred error_type=%s",
+                        type(exc).__name__,
+                    )
+            for peer in host_peers:
+                if peer.get("status") == "active" or not peer.get("team_id"):
+                    continue
+                try:
+                    peer_id = str(peer["peer_id"])
+                    active_ids = adapter.active_binding_peer_ids(
+                        (peer_id,),
+                        str(peer.get("peer_server_identity") or ""),
+                    )
+                    if peer_id in active_ids:
+                        adapter.revoke_peer(
+                            peer_id=peer_id,
+                            team_id=str(peer["team_id"]),
+                        )
+                except Exception as exc:
+                    if self.logger is not None:
+                        self.logger.warning(
+                            "secure peer revocation replay deferred peer_id=%s error_type=%s",
+                            peer.get("peer_id"),
+                            type(exc).__name__,
+                        )
+            try:
+                adapter.expire_peer_leases(
+                    stale_before=int(time.time()) - SECURE_PEER_LEASE_SECONDS
+                )
+            except Exception as exc:
+                if self.logger is not None:
+                    self.logger.warning(
+                        "secure peer lease expiry deferred error_type=%s",
+                        type(exc).__name__,
+                    )
+        try:
+            pairing_recovery = self.client.recover_pairing_attempts(limit=2)
+        except Exception as exc:
+            pairing_recovery = {
+                "remaining": 0,
+                "error": (
+                    exc.code
+                    if isinstance(exc, SecurePeerError)
+                    else "pairing_recovery_deferred"
+                ),
+            }
         recovery_error = pairing_recovery.get("error")
         active = next(
             (item for item in self.client.list_connections() if item.get("active")),
@@ -1496,78 +1831,149 @@ class SecurePeerRuntime:
             }
         connection_id = str(active.get("connection_id") or "")
         revocation_observation = active
+        renewal: dict[str, Any] = {"renewed": False}
+        renewal_error: BaseException | None = None
         try:
+            renewal = self.client.renew_if_due(connection_id)
+            renewed_connection = renewal.get("connection")
+            if (
+                isinstance(renewed_connection, Mapping)
+                and renewed_connection.get("connection_id") == connection_id
+            ):
+                revocation_observation = renewed_connection
+        except Exception as exc:
+            renewal_error = exc
+
+        health: Mapping[str, Any] | None = None
+        health_error: BaseException | None = None
+        try:
+            # This heartbeat always runs even when renewal or route maintenance
+            # failed.  Presence is a transport signal, not an ancillary job.
+            health = self.client.peer_health(connection_id)
+        except Exception as exc:
+            health_error = exc
+
+        if health_error is not None:
+            revocation_signal = next(
+                (
+                    exc
+                    for exc in (health_error, renewal_error)
+                    if self._is_unconfirmed_peer_revocation(exc)
+                ),
+                None,
+            )
+            if (
+                revocation_signal is not None
+                and self._remote_revocation_confirmed(connection_id) is True
+            ):
+                return self._retire_remote_revoked_active_connection(
+                    revocation_observation,
+                    pairing_recovery,
+                )
+            self._client_failure_counts[connection_id] = min(
+                SECURE_PEER_OFFLINE_FAILURES,
+                self._client_failure_counts.get(connection_id, 0) + 1,
+            )
+            self._client_error = _safe_status_error(
+                health_error.message
+                if isinstance(health_error, SecurePeerError)
+                else health_error
+            )
+            return {
+                "active": True,
+                "renewed": bool(renewal.get("renewed")),
+                "healthy": False,
+                "error": (
+                    health_error.code
+                    if isinstance(health_error, SecurePeerError)
+                    else "secure_peer_maintenance_failed"
+                ),
+                "pairing_recovery": pairing_recovery,
+            }
+
+        assert health is not None
+        # The heartbeat succeeded, so ancillary failures must not make the
+        # transport appear offline or increment its reconnect counter.
+        self._client_failure_counts.pop(connection_id, None)
+        retired_routes = 0
+        ancillary_error = renewal_error
+        try:
+            retired_routes = (
+                self.client.flush_pending_route_revocations_for_connection(
+                    connection_id,
+                    limit=8,
+                )
+            )
+        except Exception as exc:
+            ancillary_error = ancillary_error or exc
+            if (
+                self._is_unconfirmed_peer_revocation(exc)
+                and self._remote_revocation_confirmed(connection_id) is True
+            ):
+                return self._retire_remote_revoked_active_connection(
+                    revocation_observation,
+                    pairing_recovery,
+                )
+
+        scope_values = (
+            revocation_observation.get("scopes")
+            or revocation_observation.get("granted_scopes")
+            or ()
+        )
+        granted_scopes = {
+            str(scope) for scope in scope_values if isinstance(scope, str)
+        }
+        cross_chat_scoped = bool(
+            granted_scopes.intersection(
+                {"cross_chat.instruction", "cross_chat.request_reply"}
+            )
+        )
+        remote_routes: list[dict[str, Any]] | None = []
+        if self._relay_enabled and cross_chat_scoped:
             try:
-                retired_routes = (
-                    self.client.flush_pending_route_revocations_for_connection(
-                        connection_id,
-                        limit=8,
-                    )
-                )
-                renewal = self.client.renew_if_due(connection_id)
-                renewed_connection = renewal.get("connection")
+                remote_routes = self.client.list_remote_routes(connection_id)
+            except Exception as exc:
+                ancillary_error = ancillary_error or exc
+                remote_routes = None
                 if (
-                    isinstance(renewed_connection, Mapping)
-                    and renewed_connection.get("connection_id") == connection_id
+                    self._is_unconfirmed_peer_revocation(exc)
+                    and self._remote_revocation_confirmed(connection_id) is True
                 ):
-                    revocation_observation = renewed_connection
-                health = self.client.peer_health(connection_id)
-                scope_values = (
-                    active.get("scopes")
-                    or active.get("granted_scopes")
-                    or ()
-                )
-                granted_scopes = {
-                    str(scope)
-                    for scope in scope_values
-                    if isinstance(scope, str)
-                }
-                cross_chat_scoped = bool(
-                    granted_scopes.intersection(
-                        {"cross_chat.instruction", "cross_chat.request_reply"}
-                    )
-                )
-                remote_routes = (
-                    self.client.list_remote_routes(connection_id)
-                    if self._relay_enabled and cross_chat_scoped
-                    else []
-                )
-            except SecurePeerError as exc:
-                if exc.code == "peer_revoked" and exc.status_code == 401:
                     return self._retire_remote_revoked_active_connection(
                         revocation_observation,
                         pairing_recovery,
                     )
-                raise
+        if remote_routes is not None:
             with self._guard:
                 self._remote_routes_cache[connection_id] = [
                     dict(item) for item in remote_routes
                 ]
                 self._remote_routes_refreshed_at[connection_id] = int(time.time())
-            self._client_error = None
-            return {
-                "active": True,
-                "renewed": bool(renewal.get("renewed")),
-                "healthy": True,
-                "hub_id": health.get("hub_id"),
-                "retired_routes": retired_routes,
-                "pairing_recovery": pairing_recovery,
-            }
-        except Exception as exc:
-            self._client_error = _safe_status_error(
-                exc.message if isinstance(exc, SecurePeerError) else exc
+
+        self._client_error = (
+            _safe_status_error(
+                ancillary_error.message
+                if isinstance(ancillary_error, SecurePeerError)
+                else ancillary_error
             )
-            return {
-                "active": True,
-                "renewed": False,
-                "healthy": False,
-                "error": (
-                    exc.code
-                    if isinstance(exc, SecurePeerError)
-                    else "secure_peer_maintenance_failed"
-                ),
-                "pairing_recovery": pairing_recovery,
-            }
+            if ancillary_error is not None
+            else None
+        )
+        result = {
+            "active": True,
+            "renewed": bool(renewal.get("renewed")),
+            "healthy": True,
+            "hub_id": health.get("hub_id"),
+            "retired_routes": retired_routes,
+            "pairing_recovery": pairing_recovery,
+        }
+        if ancillary_error is not None:
+            result["error"] = (
+                ancillary_error.code
+                if isinstance(ancillary_error, SecurePeerError)
+                else "secure_peer_maintenance_degraded"
+            )
+        return result
 
     def remote_route_delivery_available(self) -> bool:
         """Return true only when both relay-side route CAS gates are live."""
@@ -2096,6 +2502,7 @@ class SecurePeerRuntime:
                         lease_owner,
                         limit=remaining,
                     )
+                    self._delivery_error = None
                     token = str(response.get("lease_token") or "")
                     for envelope in response.get("envelopes") or []:
                         claims.append((
@@ -2105,7 +2512,7 @@ class SecurePeerRuntime:
                             dict(envelope),
                         ))
                 except Exception as exc:
-                    self._host_error = _safe_status_error(
+                    self._delivery_error = _safe_status_error(
                         exc.message if isinstance(exc, SecurePeerError) else exc
                     )
         ready: list[dict[str, Any]] = []
@@ -2596,6 +3003,39 @@ class SecurePeerRuntime:
                 if self._peer_in_flight == 0:
                     self._peer_admission.notify_all()
 
+    def _record_authenticated_peer_heartbeat(
+        self,
+        peer: PeerAuthorization,
+    ) -> None:
+        with self._guard:
+            adapter = self._adapter
+        if adapter is None:
+            raise SecurePeerError(
+                "hub_unavailable",
+                "Team Hub is unavailable",
+                503,
+            )
+        adapter.record_peer_heartbeat(peer.peer_id, peer.team_id)
+
+    def _revoke_authenticated_peer(
+        self,
+        peer: PeerAuthorization,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        with self._guard:
+            store, adapter = self._host_store, self._adapter
+        if store is None or adapter is None:
+            raise SecurePeerError(
+                "host_unavailable",
+                "Secure peer revocation is unavailable",
+                503,
+            )
+        result = store.revoke_peer_for_self(peer, idempotency_key)
+        # Replayed after a cached core response as well, closing the
+        # secure-peer DB -> Team Hub DB crash boundary.
+        adapter.revoke_peer(peer_id=peer.peer_id, team_id=peer.team_id)
+        return result
+
     def close_host_admission(self) -> None:
         with self._peer_admission:
             self._peer_accepting = False
@@ -2648,8 +3088,18 @@ class SecurePeerRuntime:
                     body=body,
                 )
             except SecurePeerError as exc:
-                if exc.code == "peer_revoked" and exc.status_code == 401:
-                    self._retire_remote_revoked_active_connection(active, {})
+                if (
+                    self._is_unconfirmed_peer_revocation(exc)
+                    and self._remote_revocation_confirmed(connection_id) is True
+                ):
+                    try:
+                        self._retire_remote_revoked_active_connection(active, {})
+                    except Exception as retire_error:
+                        if self.logger is not None:
+                            self.logger.warning(
+                                "secure peer local revocation retirement deferred error_type=%s",
+                                type(retire_error).__name__,
+                            )
                 raise
 
     def shutdown(self) -> None:

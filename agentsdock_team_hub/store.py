@@ -74,6 +74,8 @@ MAX_BOOTSTRAP_DELEGATION_LEDGER_ROWS = 256
 MAX_NETWORK_AGENTS_PER_SERVER = 256
 MAX_NETWORK_BODY_BYTES = 8_192
 MAX_NETWORK_PAGE_ITEMS = 100
+MAX_SECURE_PEER_BINDING_LOOKUP_IDS = 512
+SECURE_PEER_HEARTBEAT_WRITE_INTERVAL_SECONDS = 15
 # Secure-peer responses are hard-capped at 2 MiB. Keep paged network payloads
 # below that transport ceiling, including JSON escaping and envelope fields.
 MAX_NETWORK_PAGE_RESPONSE_BYTES = 1_900_000
@@ -2146,7 +2148,7 @@ class HubStore:
                         INSERT INTO nodes(
                             id,team_id,principal_id,server_identity,display_name,
                             status,enrolled_at,last_seen_at
-                        ) VALUES (?,?,?,?,?,'active',?,?)
+                        ) VALUES (?,?,?,?,?,'offline',?,NULL)
                         """,
                         (
                             node_id,
@@ -2154,7 +2156,6 @@ class HubStore:
                             node_principal_id,
                             identity,
                             label,
-                            timestamp,
                             timestamp,
                         ),
                     )
@@ -2173,14 +2174,14 @@ class HubStore:
                             409,
                         )
                     node_id = str(node["id"])
-                    if node["display_name"] != label or node["status"] != "active":
+                    if node["display_name"] != label:
                         connection.execute(
                             """
                             UPDATE nodes
-                            SET display_name=?,status='active',last_seen_at=?
+                            SET display_name=?
                             WHERE id=?
                             """,
-                            (label, timestamp, node_id),
+                            (label, node_id),
                         )
                         connection.execute(
                             """
@@ -2281,6 +2282,199 @@ class HubStore:
                         timestamp,
                     )
             return principal_id
+        finally:
+            connection.close()
+
+    def active_secure_peer_binding_ids(
+        self,
+        peer_ids: list[str] | tuple[str, ...],
+        peer_server_identity: str,
+    ) -> set[str]:
+        """Return exact, live trust bindings for one logical peer identity.
+
+        Presence is deliberately not part of this lookup: an offline logical
+        node still owns its active trust binding and must win restart
+        reconciliation over an unbound duplicate peer record.
+        """
+
+        identity = _identity(peer_server_identity)
+        if not isinstance(peer_ids, (list, tuple)):
+            raise ValueError("peer_ids must be a bounded list")
+        if len(peer_ids) > MAX_SECURE_PEER_BINDING_LOOKUP_IDS:
+            raise ValueError("too many secure peer binding candidates")
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for value in peer_ids:
+            self._secure_peer_principal_id(value)
+            if value not in seen:
+                candidates.append(value)
+                seen.add(value)
+        if not candidates:
+            return set()
+
+        placeholders = ",".join("?" for _value in candidates)
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                f"""
+                SELECT b.peer_id
+                FROM network_peer_bindings AS b
+                JOIN nodes AS n
+                  ON n.team_id=b.team_id AND n.id=b.node_id
+                JOIN principals AS np ON np.id=n.principal_id
+                JOIN principals AS sp ON sp.id=b.service_principal_id
+                JOIN service_accounts AS sa
+                  ON sa.principal_id=b.service_principal_id
+                JOIN memberships AS m
+                  ON m.team_id=b.team_id
+                 AND m.principal_id=b.service_principal_id
+                WHERE b.peer_id IN ({placeholders})
+                  AND b.peer_server_identity=?
+                  AND b.status='active'
+                  AND n.server_identity=b.peer_server_identity
+                  AND n.status<>'revoked'
+                  AND np.kind='node'
+                  AND np.scope_team_id=b.team_id
+                  AND np.status='active'
+                  AND sp.kind='service'
+                  AND sp.scope_team_id IS NULL
+                  AND sp.status='active'
+                  AND sa.service_identifier='agentsdock.secure-peer.' || b.peer_id
+                  AND m.role='automation'
+                  AND m.status='active'
+                """,
+                (*candidates, identity),
+            ).fetchall()
+            return {str(row["peer_id"]) for row in rows}
+        finally:
+            connection.close()
+
+    def record_secure_peer_heartbeat(self, peer_id: str, team_id: str) -> None:
+        """Mark one exactly bound logical node online and advance its lease."""
+
+        principal_id = self._secure_peer_principal_id(peer_id)
+        team = _identity(team_id)
+        timestamp = _now()
+        binding_query = """
+                    SELECT b.node_id,n.status,n.last_seen_at
+                    FROM network_peer_bindings AS b
+                    JOIN nodes AS n
+                      ON n.team_id=b.team_id AND n.id=b.node_id
+                    JOIN principals AS np ON np.id=n.principal_id
+                    JOIN principals AS sp ON sp.id=b.service_principal_id
+                    JOIN service_accounts AS sa
+                      ON sa.principal_id=b.service_principal_id
+                    JOIN memberships AS m
+                      ON m.team_id=b.team_id
+                     AND m.principal_id=b.service_principal_id
+                    WHERE b.peer_id=? AND b.team_id=?
+                      AND b.service_principal_id=?
+                      AND b.status='active'
+                      AND n.server_identity=b.peer_server_identity
+                      AND n.status IN ('active','offline')
+                      AND np.kind='node'
+                      AND np.scope_team_id=b.team_id
+                      AND np.status='active'
+                      AND sp.kind='service'
+                      AND sp.scope_team_id IS NULL
+                      AND sp.status='active'
+                      AND sa.service_identifier='agentsdock.secure-peer.' || b.peer_id
+                      AND m.role='automation'
+                      AND m.status='active'
+                    """
+        connection = self.connect()
+        try:
+            binding = connection.execute(
+                binding_query,
+                (peer_id, team, principal_id),
+            ).fetchone()
+            if binding is None:
+                raise HubError(
+                    "peer_unavailable",
+                    "Secure peer is unavailable",
+                    404,
+                )
+            last_seen_at = (
+                int(binding["last_seen_at"])
+                if binding["last_seen_at"] is not None
+                else None
+            )
+            if (
+                binding["status"] == "active"
+                and last_seen_at is not None
+                and last_seen_at
+                > timestamp - SECURE_PEER_HEARTBEAT_WRITE_INTERVAL_SECONDS
+            ):
+                return
+            with _write_transaction(connection):
+                binding = connection.execute(
+                    binding_query,
+                    (peer_id, team, principal_id),
+                ).fetchone()
+                if binding is None:
+                    raise HubError(
+                        "peer_unavailable",
+                        "Secure peer is unavailable",
+                        404,
+                    )
+                last_seen_at = (
+                    int(binding["last_seen_at"])
+                    if binding["last_seen_at"] is not None
+                    else None
+                )
+                if (
+                    binding["status"] == "active"
+                    and last_seen_at is not None
+                    and last_seen_at
+                    > timestamp
+                    - SECURE_PEER_HEARTBEAT_WRITE_INTERVAL_SECONDS
+                ):
+                    return
+                changed = connection.execute(
+                    """
+                    UPDATE nodes
+                    SET status='active',
+                        last_seen_at=CASE
+                            WHEN last_seen_at IS NULL OR last_seen_at < ? THEN ?
+                            ELSE last_seen_at
+                        END
+                    WHERE team_id=? AND id=? AND status IN ('active','offline')
+                    """,
+                    (timestamp, timestamp, team, binding["node_id"]),
+                ).rowcount
+                if changed != 1:
+                    raise HubError(
+                        "peer_unavailable",
+                        "Secure peer is unavailable",
+                        404,
+                    )
+        finally:
+            connection.close()
+
+    def expire_secure_peer_leases(self, stale_before: int) -> int:
+        """Mark stale active peer nodes offline without changing trust rows."""
+
+        if type(stale_before) is not int or stale_before < 0:
+            raise ValueError("stale_before must be a non-negative integer")
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                return connection.execute(
+                    """
+                    UPDATE nodes AS n
+                    SET status='offline'
+                    WHERE n.status='active'
+                      AND (n.last_seen_at IS NULL OR n.last_seen_at < ?)
+                      AND EXISTS (
+                          SELECT 1 FROM network_peer_bindings AS b
+                          WHERE b.team_id=n.team_id
+                            AND b.node_id=n.id
+                            AND b.peer_server_identity=n.server_identity
+                            AND b.status='active'
+                      )
+                    """,
+                    (stale_before,),
+                ).rowcount
         finally:
             connection.close()
 

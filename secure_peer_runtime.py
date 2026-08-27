@@ -1512,9 +1512,24 @@ class SecurePeerRuntime:
                 ):
                     revocation_observation = renewed_connection
                 health = self.client.peer_health(connection_id)
+                scope_values = (
+                    active.get("scopes")
+                    or active.get("granted_scopes")
+                    or ()
+                )
+                granted_scopes = {
+                    str(scope)
+                    for scope in scope_values
+                    if isinstance(scope, str)
+                }
+                cross_chat_scoped = bool(
+                    granted_scopes.intersection(
+                        {"cross_chat.instruction", "cross_chat.request_reply"}
+                    )
+                )
                 remote_routes = (
                     self.client.list_remote_routes(connection_id)
-                    if self._relay_enabled
+                    if self._relay_enabled and cross_chat_scoped
                     else []
                 )
             except SecurePeerError as exc:

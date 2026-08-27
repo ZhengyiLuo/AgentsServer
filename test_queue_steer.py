@@ -753,6 +753,99 @@ class QueuedTurnPresentationTests(unittest.TestCase):
         self.assertEqual(uncertain["pause_reason"], "delivery_uncertain")
 
 
+class QueuedTurnEditTests(unittest.IsolatedAsyncioTestCase):
+    async def test_edit_updates_visible_prompt_lineage_and_recovery(self) -> None:
+        original_sessions = agent_server.STORE.sessions
+        original_queue = agent_server.QUEUED_TURNS
+        item = {
+            "queued_id": "queued-edit",
+            "prompt": "Old raw prompt",
+            "display_prompt": "Old visible prompt",
+            "steering_prompt": "Old visible prompt",
+            "steering_lineage": [
+                {"prompt": "Original interrupted prompt", "file_ids": []},
+                {"prompt": "Old visible prompt", "file_ids": []},
+            ],
+            "file_ids": [],
+            "backend": "codex",
+            "position": 1,
+        }
+        original_event = {
+            "type": "turn_queued",
+            "queued_id": "queued-edit",
+            "prompt": "Old raw prompt",
+            "request_prompt": "Old raw prompt",
+            "display_prompt": "Old visible prompt",
+            "steering_lineage": list(item["steering_lineage"]),
+            "file_ids": [],
+            "backend": "codex",
+            "position": 1,
+            "ts": "2026-08-26T00:00:00Z",
+        }
+        append = AsyncMock()
+        try:
+            agent_server.STORE.sessions = {
+                "chat-edit": {"id": "chat-edit", "title": "Edit", "backend": "codex"}
+            }
+            agent_server.QUEUED_TURNS = {"chat-edit": deque([item])}
+            with (
+                patch.object(agent_server, "managed_server_update_blocker", return_value=None),
+                patch.object(agent_server, "append_durable_event", append),
+            ):
+                response = await agent_server.update_queued_turn(
+                    "chat-edit",
+                    "queued-edit",
+                    agent_server.UpdateQueuedTurnRequest(prompt="New visible prompt"),
+                )
+                snapshot = await agent_server.queued_turns_snapshot("chat-edit")
+
+            updated = response["item"]
+            self.assertEqual(updated["prompt"], "New visible prompt")
+            self.assertEqual(updated["display_prompt"], "New visible prompt")
+            self.assertEqual(updated["steering_prompt"], "New visible prompt")
+            self.assertEqual(
+                updated["steering_lineage"][-1]["prompt"],
+                "New visible prompt",
+            )
+            self.assertEqual(snapshot[0]["prompt"], "New visible prompt")
+            self.assertEqual(snapshot[0]["display_prompt"], "New visible prompt")
+            provider_prompt = agent_server.build_turn_provider_prompt(
+                "chat-edit",
+                updated["prompt"],
+                updated["file_ids"],
+                updated["steering_lineage"],
+            )
+            self.assertIn("New visible prompt", provider_prompt)
+            self.assertNotIn("Old visible prompt", provider_prompt)
+
+            update_payload = append.await_args.args[2]
+            self.assertEqual(update_payload["request_prompt"], "New visible prompt")
+            self.assertEqual(update_payload["display_prompt"], "New visible prompt")
+            self.assertEqual(
+                update_payload["steering_lineage"][-1]["prompt"],
+                "New visible prompt",
+            )
+            with tempfile.TemporaryDirectory() as tmp:
+                event_file = Path(tmp) / "events.jsonl"
+                event_file.write_text(
+                    json.dumps(original_event) + "\n"
+                    + json.dumps({"type": "turn_queue_updated", **update_payload}) + "\n"
+                )
+                with patch.object(agent_server, "events_path", return_value=event_file):
+                    recovered = agent_server.scan_queued_turns_from_events([
+                        ("chat-edit", agent_server.STORE.sessions["chat-edit"]),
+                    ])["chat-edit"][0]
+            self.assertEqual(recovered["prompt"], "New visible prompt")
+            self.assertEqual(recovered["display_prompt"], "New visible prompt")
+            self.assertEqual(
+                recovered["steering_lineage"][-1]["prompt"],
+                "New visible prompt",
+            )
+        finally:
+            agent_server.STORE.sessions = original_sessions
+            agent_server.QUEUED_TURNS = original_queue
+
+
 class ProviderTurnTaskRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_delayed_provider_bind_cannot_replace_successor_for_any_transport(
         self,

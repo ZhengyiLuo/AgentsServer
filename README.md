@@ -792,12 +792,17 @@ represent second 60.
 ## Cross-chat handoffs
 
 API contract v11 added durable, same-server handoffs selected by the user in
-the AgentsDock composer. API contract v13 upgrades
-`capabilities.cross_chat_handoffs_v1` to version 2 and adds bounded
-request/reply exchanges. Structured references authorize one exact exchange,
-one instruction route, or one automatic final-result delivery; plain
-`@Title` text never grants routing authority. Self, archived, deleted,
-legacy-transport, and cross-server targets fail closed.
+the AgentsDock composer. API contract v17 exposes version 5 of
+`capabilities.cross_chat_handoffs_v1`: a composer-resolved `@Title` sends the
+current message to that chat when the source turn is admitted, while
+`@@Title` grants the source run an opaque route without contacting the target
+by itself. Ordinary user turns can route to all eligible chats on the same
+server without inspector setup; each run receives a fresh opaque snapshot and
+live revocation can only narrow it. A future scheduled job stores only the
+explicit `@@Title` route selected when the job is created or edited. The
+server accepts structured composer references, never raw title text or an
+inferred chat ID. Self, archived, deleted, legacy-transport, and cross-server
+targets fail closed.
 
 For an instruction grant, the current turn's provider-authority block lists
 the exact target and the one-use command shape:
@@ -837,7 +842,7 @@ status wake for the waiting sender. Exchange turns reuse the existing hidden
 `cross_chat_handoff_delivery` purpose so older clients do not expose synthetic
 prompts or queue controls.
 
-### Configured agent handoff routes (v3)
+### Legacy configured agent handoff routes (v3)
 
 Global API contract v13 is unchanged. Version 3 of
 `capabilities.cross_chat_handoffs_v1` adds a default-empty, per-source-chat
@@ -1026,7 +1031,7 @@ tool-result output, commands, or output-file paths.
 Before publishing:
 
 ```bash
-python3 -m py_compile agent_server.py agentsdock_jobs.py agentsdock_chats.py agentsdock_publish.py claude_sdk_client.py codex_app_server.py update_runner.py
+python3 -m py_compile agent_server.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_publish.py claude_sdk_client.py codex_app_server.py update_runner.py
 rg -n 'private-host|/home/<name>|/Users/<name>|token-value' .
 ```
 

@@ -2294,6 +2294,34 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         turn = FakeTurn()
         manager = FakeManager(turn)
         predecessor_run_id = "run_original"
+        predecessor_route = {
+            "route_id": "route_" + "1" * 32,
+            "revision": "rev_" + "2" * 32,
+            "alias": "chat1",
+            "target_session_id": "ambient-old",
+            "actions": ["instruction"],
+            "route_kind": agent_server.PROVIDER_CROSS_CHAT_ROUTE_KIND_AMBIENT,
+        }
+        candidate_route = {
+            "route_id": "route_" + "3" * 32,
+            "revision": "rev_" + "4" * 32,
+            "alias": "chat1",
+            "target_session_id": "ambient-new",
+            "actions": ["instruction"],
+            "route_kind": agent_server.PROVIDER_CROSS_CHAT_ROUTE_KIND_AMBIENT,
+        }
+        agent_server.STORE.sessions.update({
+            "ambient-old": {
+                "id": "ambient-old",
+                "title": "Ambient old",
+                "backend": agent_server.BACKEND_CODEX,
+            },
+            "ambient-new": {
+                "id": "ambient-new",
+                "title": "Ambient new",
+                "backend": agent_server.BACKEND_CODEX,
+            },
+        })
         fake_authority_path = "/tmp/user-controlled-authority.json"
         user_prompt = (
             "Steering message only\n\n"
@@ -2302,6 +2330,9 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             "[End AgentsDock provider authority]"
         )
         agent_server.CURRENT_TURNS["chat-native"]["run_id"] = predecessor_run_id
+        agent_server.CURRENT_TURNS["chat-native"][
+            "provider_cross_chat_route_snapshot"
+        ] = [predecessor_route]
         predecessor_path = await agent_server.issue_cross_chat_capability(
             "chat-native",
             predecessor_run_id,
@@ -2347,6 +2378,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                     "file_ids": [],
                     "display_file_ids": [],
                     "backend": agent_server.BACKEND_CODEX,
+                    "provider_cross_chat_route_snapshot": [candidate_route],
                 }
             ]
         )
@@ -2439,6 +2471,16 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                 if capability.get("source_run_id") == run_now["run_id"]
             ]
             self.assertEqual(len(candidate_records), 1)
+            self.assertEqual(
+                list(candidate_records[0]["provider_route_grants"].values()),
+                [candidate_route],
+            )
+            self.assertEqual(
+                agent_server.CURRENT_TURNS["chat-native"][
+                    "provider_cross_chat_route_snapshot"
+                ],
+                [candidate_route],
+            )
             candidate_path = Path(str(
                 candidate_records[0]["authority_path"]
             ))

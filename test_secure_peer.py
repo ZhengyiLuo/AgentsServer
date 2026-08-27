@@ -1657,6 +1657,18 @@ class SecurePeerLiveTLSTests(unittest.TestCase):
         self.assertEqual(deactivated["status"], "deactivated")
         self.assertFalse(deactivated["active"])
 
+    def test_lowercase_forwarded_accept_header_is_not_duplicated(self) -> None:
+        status, _headers, _raw, _leaf = self.client._request(
+            self.host_ip,
+            self.port,
+            "GET",
+            "/v1/health",
+            headers={"accept": "application/json"},
+            context=SecurePeerClient._unverified_context(),
+            no_sni=True,
+        )
+        self.assertEqual(status, 200)
+
     def test_route_and_relay_network_endpoints_are_hard_gated_by_default(self) -> None:
         context = SecurePeerClient._unverified_context()
         for method, path, body in (

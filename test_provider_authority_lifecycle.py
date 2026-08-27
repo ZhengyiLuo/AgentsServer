@@ -89,6 +89,28 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ).hexdigest()
         return agent_server.CROSS_CHAT_CAPABILITIES[token_hash]
 
+    @classmethod
+    def direct_handle_for_token(
+        cls,
+        token: str,
+        *,
+        target_session_id: str,
+        action: str = "instruction",
+    ) -> str:
+        matches = [
+            grant_id
+            for grant_id, grant in cls.record_for_token(token)[
+                "provider_direct_grants"
+            ].items()
+            if grant == {
+                "target_session_id": target_session_id,
+                "action": action,
+            }
+        ]
+        if len(matches) != 1:
+            raise AssertionError("expected one exact provider direct grant")
+        return matches[0]
+
     async def issue(
         self,
         run_id: str,
@@ -120,7 +142,7 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(raised.exception.status_code, 403)
 
-    async def test_exact_native_transition_allows_only_candidate_jobs_until_promotion(
+    async def test_exact_native_transition_allows_candidate_jobs_and_read_only_ambient_access(
         self,
     ) -> None:
         predecessor_reference = agent_server.ChatReference(
@@ -136,6 +158,10 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
             [predecessor_reference],
         )
         predecessor_token = self.token_for_path(predecessor_path)
+        predecessor_handle = self.direct_handle_for_token(
+            predecessor_token,
+            target_session_id="neighbor",
+        )
         transition_nonce = "1" * 32
         transition_ready = asyncio.Event()
         agent_server.CURRENT_TURNS = {
@@ -161,11 +187,23 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(predecessor["source_run_id"], "run_old")
 
+        ambient_route = {
+            "route_id": "route_" + "a" * 32,
+            "revision": "rev_" + "b" * 32,
+            "alias": "chat1",
+            "target_session_id": "neighbor",
+            "actions": ["instruction"],
+            "route_kind": agent_server.PROVIDER_CROSS_CHAT_ROUTE_KIND_AMBIENT,
+        }
         candidate_prompt, candidate_path = (
             await agent_server.issue_native_steer_provider_authority(
                 "source",
                 "run_new",
-                {"prompt": "replacement", "file_ids": []},
+                {
+                    "prompt": "replacement",
+                    "file_ids": [],
+                    "provider_cross_chat_route_snapshot": [ambient_route],
+                },
                 "replacement",
                 transition_nonce,
             )
@@ -191,16 +229,43 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await agent_server.create_authorized_cross_chat_instruction(
                 predecessor_token,
                 agent_server.CrossChatHandoffRequest(
-                    target_session_id="neighbor",
+                    target_session_id=predecessor_handle,
                     body="must not cross the logical-run boundary",
                     idempotency_key="pending-boundary",
                 ),
             )
         self.assertEqual(cross_chat_denied.exception.status_code, 403)
+        ambient_access = await agent_server.authorize_provider_action(
+            self.provider_request(candidate_token),
+            action="agent_cross_chat_routes",
+            session_id="source",
+        )
+        self.assertEqual(ambient_access["source_run_id"], "run_new")
+        self.assertEqual(
+            await agent_server.provider_route_capability_source(
+                self.provider_request(candidate_token)
+            ),
+            "source",
+        )
+        with self.assertRaises(HTTPException) as promotion_pending:
+            await agent_server.reserve_provider_route_handoff(
+                self.provider_request(candidate_token),
+                source_session_id="source",
+                route_id=ambient_route["route_id"],
+                action="instruction",
+                body="must wait for durable promotion",
+                idempotency_key="pending-promotion",
+            )
+        self.assertEqual(promotion_pending.exception.status_code, 409)
+        self.assertEqual(
+            promotion_pending.exception.detail,
+            "agent chat access is waiting for turn promotion",
+        )
         # Codex updates ACTIVE and CURRENT within one lock, but authorization can
         # still observe either projection in a deterministic test. The old
-        # authority stays suspended while exact candidate Jobs remain usable;
-        # Publish never opens before the durable release boundary.
+        # authority stays suspended while exact candidate Jobs and read-only
+        # ambient discovery remain usable. Publish and target effects never open
+        # before the durable release boundary.
         agent_server.ACTIVE["source"]["run_id"] = "run_new"
         await self.assert_denied(predecessor_token, action="jobs")
         await self.assert_denied(predecessor_token, action="publish")
@@ -228,6 +293,22 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
 
         candidate_record = self.record_for_token(candidate_token)
+        self.assertTrue(
+            agent_server.provider_capability_has_ambient_native_routes(
+                candidate_record
+            )
+        )
+        self.assertFalse(
+            agent_server.provider_capability_has_ambient_native_routes({
+                "actions": {"agent_cross_chat_routes"},
+                "provider_route_grants": {
+                    ambient_route["route_id"]: {
+                        **ambient_route,
+                        "route_kind": "legacy_configured",
+                    },
+                },
+            })
+        )
         candidate_record["native_transition_nonce"] = "2" * 32
         await self.assert_denied(candidate_token, action="jobs")
         candidate_record["native_transition_nonce"] = transition_nonce
@@ -246,6 +327,10 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         transition_ready.set()
         await self.assert_denied(candidate_token, action="jobs")
+        await self.assert_denied(
+            candidate_token,
+            action="agent_cross_chat_routes",
+        )
         transition_ready.clear()
         await agent_server.authorize_provider_jobs_operation(
             self.provider_request(candidate_token),
@@ -272,7 +357,7 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await self.assert_denied(predecessor_token, action="publish")
 
         # In-memory promotion happens before the lifecycle batch is durable.
-        # Keep the exact candidate on Jobs-only authority until the Event marks
+        # Keep the exact candidate on transition authority until the Event marks
         # that commit; CURRENT must not activate Publish early.
         agent_server.CURRENT_TURNS["source"] = {"run_id": "run_new"}
         agent_server.ACTIVE["source"]["run_id"] = "run_new"
@@ -282,6 +367,11 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
             operation="write",
         )
         await self.assert_denied(candidate_token, action="publish")
+        await agent_server.authorize_provider_action(
+            self.provider_request(candidate_token),
+            action="agent_cross_chat_routes",
+            session_id="source",
+        )
         await self.assert_denied(predecessor_token, action="jobs")
 
         # The durable commit/release closes the overlap. The new capability now

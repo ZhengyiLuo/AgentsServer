@@ -343,6 +343,107 @@ class SecurePeerRuntimeTests(unittest.TestCase):
                 self.assertIsNotNone(runtime._client_error)
                 runtime.shutdown()
 
+    def test_teamspace_only_connection_skips_cross_chat_route_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            active = self.outgoing_pairing(123)
+            connection_id = active["connection_id"]
+            with (
+                mock.patch.object(
+                    runtime.client,
+                    "recover_pairing_attempts",
+                    return_value={"remaining": 0},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "list_connections",
+                    return_value=[active],
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "flush_pending_route_revocations_for_connection",
+                    return_value=0,
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "renew_if_due",
+                    return_value={"renewed": False},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "peer_health",
+                    return_value={"hub_id": "hub-remote"},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "list_remote_routes",
+                ) as list_remote_routes,
+            ):
+                result = runtime.maintenance_once()
+            list_remote_routes.assert_not_called()
+            self.assertTrue(result["healthy"])
+            self.assertEqual(runtime._remote_routes_cache[connection_id], [])
+            self.assertIsNone(runtime._client_error)
+            runtime.shutdown()
+
+    def test_cross_chat_connection_still_refreshes_remote_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            active = {
+                **self.outgoing_pairing(123),
+                "scopes": ["teamspace.read", "cross_chat.instruction"],
+            }
+            connection_id = active["connection_id"]
+            routes = [{"route_id": "remote-route"}]
+            with (
+                mock.patch.object(
+                    runtime.client,
+                    "recover_pairing_attempts",
+                    return_value={"remaining": 0},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "list_connections",
+                    return_value=[active],
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "flush_pending_route_revocations_for_connection",
+                    return_value=0,
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "renew_if_due",
+                    return_value={"renewed": False},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "peer_health",
+                    return_value={"hub_id": "hub-remote"},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "list_remote_routes",
+                    return_value=routes,
+                ) as list_remote_routes,
+            ):
+                result = runtime.maintenance_once()
+            list_remote_routes.assert_called_once_with(connection_id)
+            self.assertTrue(result["healthy"])
+            self.assertEqual(runtime._remote_routes_cache[connection_id], routes)
+            self.assertIsNone(runtime._client_error)
+            runtime.shutdown()
+
     def test_revocation_retires_exact_deactivated_connection_not_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             runtime = SecurePeerRuntime(

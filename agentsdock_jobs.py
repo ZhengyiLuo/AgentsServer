@@ -7,6 +7,7 @@ import argparse
 import ipaddress
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -39,6 +40,23 @@ def nonempty_chat_id(value: str) -> str:
     if not chat_id:
         raise argparse.ArgumentTypeError("--chat-id must not be empty")
     return chat_id
+
+
+def chat_route_selection(value: str) -> dict[str, str]:
+    """Parse an opaque live route without accepting an internal chat id."""
+
+    raw = value.strip()
+    route_id, separator, action = raw.partition("=")
+    if not re.fullmatch(r"route_[0-9a-f]{32}", route_id):
+        raise argparse.ArgumentTypeError(
+            "--chat-route must use an opaque route ID returned by the chats helper"
+        )
+    selected_action = action.strip() if separator else "instruction"
+    if selected_action not in {"instruction", "request_reply"}:
+        raise argparse.ArgumentTypeError(
+            "--chat-route action must be instruction or request_reply"
+        )
+    return {"route_id": route_id, "action": selected_action}
 
 
 def provider_authority() -> tuple[str, str]:
@@ -113,6 +131,62 @@ def api_request(method: str, path: str, payload: dict[str, Any] | None = None) -
     return decoded
 
 
+def safe_job_projection(job: dict[str, Any]) -> dict[str, Any]:
+    """Defensively omit exact saved chat references from agent CLI output."""
+
+    projected = dict(job)
+    raw_references = projected.pop("chat_references", None)
+    if "chat_target_count" not in projected and isinstance(raw_references, list):
+        projected["chat_target_count"] = len(raw_references)
+    return projected
+
+
+PROVIDER_PRIVATE_CROSS_CHAT_RUN_FIELDS = {
+    "chat_references",
+    "target_session_id",
+    "source_session_id",
+    "source_run_id",
+    "authorization_source_run_id",
+    "authorization_route_id",
+    "cross_chat_envelope_id",
+    "cross_chat_exchange_id",
+    "cross_chat_exchange_leg_id",
+    "exchange_id",
+    "exchange_leg_id",
+    "inbound_leg_id",
+    "envelope_id",
+    "leg_id",
+    "parent_leg_id",
+    "cross_chat_obligation_ids",
+    "cross_chat_exchange_ids",
+    "cross_chat_direct_message_ids",
+    "secure_peer_envelope_id",
+    "requester_session_id",
+    "responder_session_id",
+    "target_chat_id",
+}
+
+
+def contains_private_chat_target_fields(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(
+            key in PROVIDER_PRIVATE_CROSS_CHAT_RUN_FIELDS
+            or (
+                key == "id"
+                and isinstance(nested, str)
+                and re.fullmatch(
+                    r"(?:handoff|exchange|leg)_[A-Za-z0-9_-]+",
+                    nested,
+                )
+            )
+            or contains_private_chat_target_fields(nested)
+            for key, nested in value.items()
+        )
+    if isinstance(value, list):
+        return any(contains_private_chat_target_fields(nested) for nested in value)
+    return False
+
+
 def scoped_jobs() -> list[dict[str, Any]]:
     _server_url, chat_id, _token = required_environment()
     encoded_chat_id = urllib.parse.quote(chat_id, safe="")
@@ -123,7 +197,7 @@ def scoped_jobs() -> list[dict[str, Any]]:
     foreign = [str(job.get("id") or "unknown") for job in jobs if job.get("session_id") != chat_id]
     if foreign:
         raise JobsCLIError("AgentsServer returned jobs outside the active chat scope")
-    return jobs
+    return [safe_job_projection(job) for job in jobs]
 
 
 def owned_job(job_id: str) -> dict[str, Any]:
@@ -140,7 +214,7 @@ def checked_job(response: dict[str, Any]) -> dict[str, Any]:
         raise JobsCLIError("AgentsServer returned an invalid job")
     if job.get("session_id") != chat_id:
         raise JobsCLIError("AgentsServer returned a job outside the active chat scope")
-    return job
+    return safe_job_projection(job)
 
 
 def command_list(_args: argparse.Namespace) -> Any:
@@ -178,6 +252,8 @@ def command_runs(args: argparse.Namespace) -> Any:
         or response.get("job_id") != args.job_id
     ):
         raise JobsCLIError("AgentsServer returned history outside the active chat scope")
+    if contains_private_chat_target_fields(response):
+        raise JobsCLIError("AgentsServer returned private chat target data in job history")
     return response
 
 
@@ -203,6 +279,7 @@ def command_create(args: argparse.Namespace) -> Any:
         "enabled": not args.disabled,
         "backend": args.backend,
         "context_mode": args.context_mode,
+        "chat_routes": list(args.chat_route or []),
     }
     encoded_chat_id = urllib.parse.quote(chat_id, safe="")
     return {"job": checked_job(api_request("POST", f"/api/agent/sessions/{encoded_chat_id}/jobs", payload))}
@@ -251,6 +328,10 @@ def command_update(args: argparse.Namespace) -> Any:
         patch["loop"] = args.loop
     if args.enabled is not None:
         patch["enabled"] = args.enabled
+    if args.chat_route is not None:
+        patch["chat_routes"] = list(args.chat_route)
+    elif args.clear_chat_routes:
+        patch["chat_routes"] = []
     if not patch:
         raise JobsCLIError("update requires at least one changed field")
     encoded_chat_id = urllib.parse.quote(chat_id, safe="")
@@ -320,6 +401,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="chat",
         help="continue in the parent chat (default) or use a fresh provider context",
     )
+    create_parser.add_argument(
+        "--chat-route",
+        action="append",
+        type=chat_route_selection,
+        metavar="ROUTE_ID[=ACTION]",
+        help=(
+            "persist an exact chat target from the current chats-helper list; "
+            "the prompt must contain that chat's exact @@title (repeatable)"
+        ),
+    )
     create_parser.set_defaults(handler=command_create)
 
     update_parser = subparsers.add_parser("update", help="update a job owned by the active chat")
@@ -346,7 +437,29 @@ def build_parser() -> argparse.ArgumentParser:
     enabled_group = update_parser.add_mutually_exclusive_group()
     enabled_group.add_argument("--enable", dest="enabled", action="store_true")
     enabled_group.add_argument("--disable", dest="enabled", action="store_false")
-    update_parser.set_defaults(handler=command_update, loop=None, enabled=None)
+    update_routes = update_parser.add_mutually_exclusive_group()
+    update_routes.add_argument(
+        "--chat-route",
+        action="append",
+        type=chat_route_selection,
+        metavar="ROUTE_ID[=ACTION]",
+        help=(
+            "replace persisted chat targets using opaque routes from the "
+            "current chats-helper list (repeatable)"
+        ),
+    )
+    update_routes.add_argument(
+        "--clear-chat-routes",
+        action="store_true",
+        help="revoke every persisted chat target from this job",
+    )
+    update_parser.set_defaults(
+        handler=command_update,
+        loop=None,
+        enabled=None,
+        chat_route=None,
+        clear_chat_routes=False,
+    )
 
     delete_parser = subparsers.add_parser("delete", help="delete a job owned by the active chat")
     delete_parser.add_argument("job_id")

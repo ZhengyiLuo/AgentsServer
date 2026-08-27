@@ -785,7 +785,7 @@ class VendoredTeamHubParityTests(unittest.TestCase):
             "migrations/0006_team_network_mailbox.sql": "c215068c903b4b65cd7a0e52506f859b5301d7e7d5ac9a66ad1636e6efd84d63",
             "migrations/__init__.py": "aaf340c45c8d39c2939814977ba4cef8eb6b3bd0671b0f7542ebe06f5431d6ec",
             "security.py": "0c1895c7443e7be07a2f53c7e4c4228e3ee04c65d6cd36f039b7bbba1813e4fa",
-            "secure_peer.py": "122cb05f19d836c7b607feabe6edf45672c20398d8367d7d60cee7606d7a40ed",
+            "secure_peer.py": "9d578d0508b9015cf1dd1783261afaa60e90977222681abe29ef9ead7b6b1c20",
             "secure_peer_hub.py": "74275b8dcdd09b0f09e7b58e55714ed1fc5afa1a1600c2665f7e9283bcc5aba8",
             "service.py": "659a741aa598763eaa4a4541e6676020e6fd5cf529c906ae1da35cf1f9a8f303",
             "store.py": "c44ba273ad783da69f1e67226a34f69c30bebd41b7953e217ae0bc1f36bf3cd5",

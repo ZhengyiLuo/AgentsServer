@@ -640,6 +640,7 @@ exit 0
         self.assertIn('"$SCRIPT_DIR/secure_peer_delivery.py"', source)
         self.assertIn('"$SCRIPT_DIR/agentsdock_jobs.py"', source)
         self.assertIn('"$SCRIPT_DIR/agentsdock_chats.py"', source)
+        self.assertIn('"$SCRIPT_DIR/agentsdock_emergency.py"', source)
         self.assertIn('"$SCRIPT_DIR/agentsdock_publish.py"', source)
         self.assertIn('"$SCRIPT_DIR/claude_sdk_client.py"', source)
         self.assertIn('"$SCRIPT_DIR/codex_app_server.py"', source)
@@ -895,11 +896,12 @@ exit 0
         installer_source = INSTALLER.read_text()
         packager_source = PACKAGER.read_text()
         self.assertIn(
-            "RELEASE_FILES=(agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py agentsdock_publish.py claude_sdk_client.py codex_app_server.py",
+            "RELEASE_FILES=(agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_publish.py claude_sdk_client.py codex_app_server.py",
             installer_source,
         )
         self.assertIn("RELEASE_DIRECTORIES=(agentsdock_team_hub)", installer_source)
         self.assertIn('"$STAGE_DIR/agentsdock_chats.py"', installer_source)
+        self.assertIn('"$STAGE_DIR/agentsdock_emergency.py"', installer_source)
         self.assertIn('"$STAGE_DIR/agentsdock_publish.py"', installer_source)
         self.assertIn('"$STAGE_DIR/claude_sdk_client.py"', installer_source)
         self.assertIn('"$STAGE_DIR/codex_app_server.py"', installer_source)
@@ -908,6 +910,7 @@ exit 0
         self.assertIn('"$STAGE_DIR/uninstall.sh"', installer_source)
         self.assertIn('"agentsdock_publish.py"', packager_source)
         self.assertIn('"agentsdock_chats.py"', packager_source)
+        self.assertIn('"agentsdock_emergency.py"', packager_source)
         self.assertIn('"claude_sdk_client.py"', packager_source)
         self.assertIn('"codex_app_server.py"', packager_source)
         self.assertIn('"secure_peer_runtime.py"', packager_source)
@@ -937,11 +940,18 @@ exit 0
                 publisher = archive.getmember(
                     f"agents-server-{version}/agentsdock_publish.py"
                 )
+                emergency = archive.getmember(
+                    f"agents-server-{version}/agentsdock_emergency.py"
+                )
                 uninstaller = archive.getmember(
                     f"agents-server-{version}/uninstall.sh"
                 )
             self.assertIn(
                 f"agents-server-{version}/agentsdock_publish.py",
+                members,
+            )
+            self.assertIn(
+                f"agents-server-{version}/agentsdock_emergency.py",
                 members,
             )
             self.assertIn(
@@ -984,13 +994,14 @@ exit 0
                 any("__pycache__" in name or name.endswith((".pyc", ".pyo")) for name in members)
             )
             self.assertNotEqual(publisher.mode & 0o111, 0)
+            self.assertNotEqual(emergency.mode & 0o111, 0)
             self.assertNotEqual(uninstaller.mode & 0o111, 0)
             self.assertEqual(
                 manifest["track"],
                 "beta" if "-" in version.split("+", 1)[0] else "stable",
             )
             self.assertEqual(manifest["prerelease"], manifest["track"] == "beta")
-            self.assertEqual(manifest["api_contract_version"], 15)
+            self.assertEqual(manifest["api_contract_version"], 17)
 
     def test_installer_preserves_state_and_emits_private_result(self):
         source = INSTALLER.read_text()

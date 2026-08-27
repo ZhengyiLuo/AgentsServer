@@ -1,6 +1,7 @@
 import asyncio
 import json
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -404,6 +405,791 @@ class JobStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 409)
         self.assertIn("unarchive", str(raised.exception.detail).lower())
         self.assertEqual(store.jobs, {})
+
+    async def test_job_chat_references_persist_update_atomically_and_revoke(
+        self,
+    ) -> None:
+        store = agent_server.JobStore()
+        prompt = "@Target ask for status"
+        reference = agent_server.ChatReference(
+            session_id="target",
+            display_title_snapshot="Target",
+            source_text_start=0,
+            source_text_end=7,
+            action="request_reply",
+        )
+        sessions = {
+            "source": {
+                "id": "source",
+                "title": "Source",
+                "backend": agent_server.BACKEND_CODEX,
+            },
+            "target": {
+                "id": "target",
+                "title": "Target",
+                "backend": agent_server.BACKEND_CODEX,
+            },
+        }
+        with (
+            patch.object(agent_server.STORE, "sessions", sessions),
+            patch.object(agent_server, "AGENT_TOKEN", "test-token"),
+            patch.object(
+                agent_server,
+                "cross_chat_delivery_client_capabilities",
+                return_value=[agent_server.CODEX_INTERACTIVE_CLIENT_CAPABILITY],
+            ),
+            patch.object(store, "save", new_callable=AsyncMock),
+            patch.object(agent_server, "append_event", new_callable=AsyncMock),
+        ):
+            created = await store.create(agent_server.CreateJobRequest(
+                session_id="source",
+                title="Ask target",
+                prompt=prompt,
+                chat_references=[reference],
+            ))
+            self.assertEqual(
+                created["chat_references"],
+                [agent_server.chat_reference_dict(reference)],
+            )
+
+            metadata_only = await store.update(
+                created["id"],
+                {"title": "Ask target later"},
+            )
+            self.assertEqual(
+                metadata_only["chat_references"],
+                [agent_server.chat_reference_dict(reference)],
+            )
+
+            before_invalid_edit = dict(store.jobs[created["id"]])
+            with self.assertRaisesRegex(
+                HTTPException,
+                "does not match",
+            ):
+                await store.update(
+                    created["id"],
+                    {"prompt": "Mention removed"},
+                )
+            self.assertEqual(store.jobs[created["id"]], before_invalid_edit)
+
+            shifted = reference.model_copy(update={
+                "source_text_start": 7,
+                "source_text_end": 14,
+            })
+            shifted_job = await store.update(created["id"], {
+                "prompt": "Please @Target ask for status",
+                "chat_references": [shifted],
+            })
+            self.assertEqual(
+                shifted_job["chat_references"],
+                [agent_server.chat_reference_dict(shifted)],
+            )
+
+            revoked = await store.update(
+                created["id"],
+                {"chat_references": []},
+            )
+            self.assertEqual(revoked["chat_references"], [])
+
+    async def test_revocation_revision_fences_stale_dispatch_and_pause(self) -> None:
+        store = agent_server.JobStore()
+        reference = agent_server.ChatReference(
+            session_id="target",
+            display_title_snapshot="Target",
+            source_text_start=0,
+            source_text_end=7,
+            action="instruction",
+        )
+        old_revision = agent_server.new_job_revision()
+        store.jobs["job_race"] = {
+            "id": "job_race",
+            "session_id": "source",
+            "title": "Routed job",
+            "prompt": "@Target check now",
+            "chat_references": [agent_server.chat_reference_dict(reference)],
+            "schedule_kind": "interval",
+            "interval_seconds": 60,
+            "timezone": "UTC",
+            "loop": True,
+            "enabled": True,
+            "next_run_at": 100.0,
+            "scheduled_run_at": 100.0,
+            "run_count": 0,
+            "_revision": old_revision,
+        }
+        sessions = {
+            "source": {"id": "source", "backend": agent_server.BACKEND_CODEX},
+            "target": {"id": "target", "backend": agent_server.BACKEND_CODEX},
+        }
+        with (
+            patch.object(agent_server.STORE, "sessions", sessions),
+            patch.object(agent_server, "AGENT_TOKEN", "test-token"),
+            patch.object(store, "save", new_callable=AsyncMock),
+            patch.object(agent_server, "append_event", new_callable=AsyncMock),
+        ):
+            revoked = await store.update(
+                "job_race",
+                {"chat_references": []},
+            )
+            self.assertNotEqual(revoked["_revision"], old_revision)
+
+            with self.assertRaises(agent_server.ScheduledJobRevisionChanged):
+                await store.assert_dispatch_revision(
+                    "job_race",
+                    "source",
+                    old_revision,
+                )
+
+            paused = await store.pause_for_chat_reference_repair(
+                "job_race",
+                agent_server.ScheduledJobChatReferenceRepairRequired(
+                    status_code=409,
+                    detail="stale target",
+                ),
+                expected_revision=old_revision,
+            )
+
+        self.assertFalse(paused)
+        self.assertTrue(store.jobs["job_race"]["enabled"])
+        self.assertEqual(store.jobs["job_race"]["chat_references"], [])
+
+    async def test_admitted_old_occurrence_does_not_advance_edited_schedule(
+        self,
+    ) -> None:
+        store = agent_server.JobStore()
+        old_revision = agent_server.new_job_revision()
+        old_occurrence = 100.0
+        edited_occurrence = time.time() + 3_600
+        store.jobs["job_schedule_edit_race"] = {
+            "id": "job_schedule_edit_race",
+            "session_id": "source",
+            "title": "Old schedule",
+            "prompt": "Run the old occurrence",
+            "schedule_kind": "interval",
+            "interval_seconds": 60,
+            "timezone": "UTC",
+            "loop": True,
+            "enabled": True,
+            "next_run_at": old_occurrence,
+            "scheduled_run_at": old_occurrence,
+            "run_count": 0,
+            "_revision": old_revision,
+        }
+
+        async def admit_then_edit(*_args: object, **_kwargs: object) -> dict[str, str]:
+            current = store.jobs["job_schedule_edit_race"]
+            current.update({
+                "title": "Edited cron schedule",
+                "schedule_kind": "cron",
+                "interval_seconds": None,
+                "cron_expression": "0 * * * *",
+                "loop": True,
+                "next_run_at": edited_occurrence,
+                "scheduled_run_at": edited_occurrence,
+                "_revision": agent_server.new_job_revision(),
+            })
+            return {"run_id": "run_old_occurrence"}
+
+        sessions = {
+            "source": {
+                "id": "source",
+                "backend": agent_server.BACKEND_CODEX,
+            },
+        }
+        events = AsyncMock()
+        with (
+            patch.object(agent_server.STORE, "sessions", sessions),
+            patch.object(agent_server, "start_turn", side_effect=admit_then_edit),
+            patch.object(store, "save", new_callable=AsyncMock),
+            patch.object(agent_server, "append_event", events),
+        ):
+            result = await store.run_job("job_schedule_edit_race")
+
+        self.assertEqual(result["run_id"], "run_old_occurrence")
+        current = store.jobs["job_schedule_edit_race"]
+        self.assertEqual(current["run_count"], 1)
+        self.assertEqual(current["last_scheduled_run_at"], old_occurrence)
+        self.assertEqual(current["next_run_at"], edited_occurrence)
+        self.assertEqual(current["scheduled_run_at"], edited_occurrence)
+        self.assertEqual(current["cron_expression"], "0 * * * *")
+        self.assertTrue(current["enabled"])
+        self.assertEqual(
+            events.await_args.args[2]["job_scheduled_run_at"],
+            old_occurrence,
+        )
+
+    async def test_restart_recovers_admitted_direct_job_without_redispatch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            event_path = root / "source.jsonl"
+            jobs_file = root / "jobs.json"
+            revision = agent_server.new_job_revision()
+            occurrence = 1_000.0
+            reference = {
+                "session_id": "target-private-id",
+                "display_title_snapshot": "Target",
+                "source_text_start": 0,
+                "source_text_end": 7,
+                "action": "direct_message",
+            }
+            event_path.write_text(json.dumps({
+                "seq": 1,
+                "type": "turn_started",
+                "run_id": "run_admitted_before_crash",
+                "purpose": "scheduled_job",
+                "job_id": "job_direct_restart",
+                "job_revision": revision,
+                "job_scheduled_run_at": occurrence,
+                "chat_references": [reference],
+                "cross_chat_direct_message_ids": ["handoff_admitted"],
+            }) + "\n")
+            store = agent_server.JobStore()
+            store.jobs["job_direct_restart"] = {
+                "id": "job_direct_restart",
+                "session_id": "source",
+                "title": "Direct check",
+                "prompt": "@Target check",
+                "chat_references": [reference],
+                "schedule_kind": "interval",
+                "interval_seconds": 60,
+                "timezone": "UTC",
+                "schedule_start_at": occurrence,
+                "scheduled_run_at": occurrence,
+                "next_run_at": occurrence,
+                "loop": True,
+                "max_runs": None,
+                "enabled": True,
+                "run_count": 0,
+                "_revision": revision,
+            }
+
+            with (
+                patch.object(agent_server, "STATE_DIR", root),
+                patch.object(agent_server, "JOBS_FILE", jobs_file),
+                patch.object(
+                    agent_server,
+                    "events_path",
+                    return_value=event_path,
+                ),
+                patch.object(agent_server.time, "time", return_value=1_001.0),
+            ):
+                self.assertEqual(
+                    await store.reconcile_admitted_runs_after_restart(),
+                    1,
+                )
+                current = store.jobs["job_direct_restart"]
+                self.assertEqual(current["run_count"], 1)
+                self.assertEqual(current["last_scheduled_run_at"], occurrence)
+                self.assertEqual(current["next_run_at"], 1_060.0)
+                self.assertEqual(current["scheduled_run_at"], 1_060.0)
+                self.assertEqual(current["chat_references"], [reference])
+                self.assertEqual(
+                    await store.reconcile_admitted_runs_after_restart(),
+                    0,
+                )
+                self.assertEqual(current["run_count"], 1)
+
+                run_job = AsyncMock()
+                sleep_count = 0
+
+                async def one_scheduler_iteration(_delay: float) -> None:
+                    nonlocal sleep_count
+                    sleep_count += 1
+                    if sleep_count > 1:
+                        raise asyncio.CancelledError
+
+                with (
+                    patch.object(
+                        agent_server.asyncio,
+                        "sleep",
+                        side_effect=one_scheduler_iteration,
+                    ),
+                    patch.object(store, "run_job", run_job),
+                ):
+                    with self.assertRaises(asyncio.CancelledError):
+                        await store.scheduler_loop()
+                run_job.assert_not_awaited()
+
+            persisted = json.loads(jobs_file.read_text())
+            self.assertEqual(
+                persisted["job_direct_restart"]["run_count"],
+                1,
+            )
+
+    async def test_restart_recovers_manual_run_without_consuming_future_cron(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            event_path = root / "source.jsonl"
+            jobs_file = root / "jobs.json"
+            revision = agent_server.new_job_revision()
+            manual_occurrence = 1_000.0
+            future_occurrence = 2_000.0
+            event_path.write_text(json.dumps({
+                "seq": 1,
+                "type": "turn_started",
+                "run_id": "run_manual_admitted_before_crash",
+                "purpose": "scheduled_job",
+                "job_id": "job_manual_restart",
+                "job_revision": revision,
+                "job_scheduled_run_at": manual_occurrence,
+                "manual_run": True,
+            }) + "\n")
+            store = agent_server.JobStore()
+            store.jobs["job_manual_restart"] = {
+                "id": "job_manual_restart",
+                "session_id": "source",
+                "title": "Manual cron recovery",
+                "prompt": "Run one extra check",
+                "schedule_kind": "cron",
+                "cron_expression": "0 9 * * *",
+                "timezone": "UTC",
+                "schedule_start_at": future_occurrence,
+                "scheduled_run_at": future_occurrence,
+                "next_run_at": future_occurrence,
+                "enabled": True,
+                "run_count": 0,
+                "manual_run_pending": True,
+                "manual_run_requested_at": "2026-08-27T00:00:00Z",
+                "_revision": revision,
+            }
+
+            with (
+                patch.object(agent_server, "STATE_DIR", root),
+                patch.object(agent_server, "JOBS_FILE", jobs_file),
+                patch.object(
+                    agent_server,
+                    "events_path",
+                    return_value=event_path,
+                ),
+                patch.object(agent_server.time, "time", return_value=1_001.0),
+            ):
+                self.assertEqual(
+                    await store.reconcile_admitted_runs_after_restart(),
+                    1,
+                )
+                current = store.jobs["job_manual_restart"]
+                self.assertEqual(current["run_count"], 1)
+                self.assertFalse(current["manual_run_pending"])
+                self.assertEqual(current["next_run_at"], future_occurrence)
+                self.assertEqual(
+                    current["scheduled_run_at"],
+                    future_occurrence,
+                )
+                self.assertEqual(
+                    await store.reconcile_admitted_runs_after_restart(),
+                    0,
+                )
+                self.assertEqual(current["run_count"], 1)
+
+            persisted = json.loads(jobs_file.read_text())
+            self.assertEqual(
+                persisted["job_manual_restart"]["next_run_at"],
+                future_occurrence,
+            )
+            self.assertFalse(
+                persisted["job_manual_restart"]["manual_run_pending"],
+            )
+
+    async def test_restart_recovery_preserves_edited_job_revision_or_occurrence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            event_path = Path(temporary) / "source.jsonl"
+            admitted_revision = agent_server.new_job_revision()
+            admitted_occurrence = 1_000.0
+            event_path.write_text(json.dumps({
+                "seq": 1,
+                "type": "turn_started",
+                "run_id": "run_old_schedule",
+                "purpose": "scheduled_job",
+                "job_id": "job_edited_restart",
+                "job_revision": admitted_revision,
+                "job_scheduled_run_at": admitted_occurrence,
+            }) + "\n")
+
+            for label, current_revision, current_occurrence in (
+                (
+                    "revision",
+                    agent_server.new_job_revision(),
+                    admitted_occurrence,
+                ),
+                ("occurrence", admitted_revision, 2_000.0),
+            ):
+                with self.subTest(edit=label):
+                    store = agent_server.JobStore()
+                    store.jobs["job_edited_restart"] = {
+                        "id": "job_edited_restart",
+                        "session_id": "source",
+                        "title": "Edited schedule",
+                        "prompt": "Run edited schedule",
+                        "schedule_kind": "interval",
+                        "interval_seconds": 60,
+                        "timezone": "UTC",
+                        "schedule_start_at": current_occurrence,
+                        "scheduled_run_at": current_occurrence,
+                        "next_run_at": current_occurrence,
+                        "loop": True,
+                        "enabled": True,
+                        "run_count": 0,
+                        "_revision": current_revision,
+                    }
+                    save = AsyncMock()
+                    with (
+                        patch.object(
+                            agent_server,
+                            "events_path",
+                            return_value=event_path,
+                        ),
+                        patch.object(store, "save", save),
+                    ):
+                        self.assertEqual(
+                            await store.reconcile_admitted_runs_after_restart(),
+                            0,
+                        )
+                    current = store.jobs["job_edited_restart"]
+                    self.assertEqual(current["_revision"], current_revision)
+                    self.assertEqual(
+                        current["scheduled_run_at"],
+                        current_occurrence,
+                    )
+                    self.assertEqual(current["run_count"], 0)
+                    save.assert_not_awaited()
+
+    async def test_run_job_revalidates_and_forwards_exact_chat_references(
+        self,
+    ) -> None:
+        for context_mode in ("chat", "standalone"):
+            with self.subTest(context_mode=context_mode):
+                store = agent_server.JobStore()
+                reference = agent_server.ChatReference(
+                    session_id="target",
+                    display_title_snapshot="Target",
+                    source_text_start=0,
+                    source_text_end=7,
+                    action="request_reply",
+                )
+                store.jobs["job_handoff"] = {
+                    "id": "job_handoff",
+                    "session_id": "source",
+                    "title": "Ask target",
+                    "prompt": "@Target check now",
+                    "chat_references": [
+                        agent_server.chat_reference_dict(reference)
+                    ],
+                    "schedule_kind": "interval",
+                    "context_mode": context_mode,
+                    "enabled": False,
+                    "run_count": 0,
+                }
+                sessions = {
+                    "source": {
+                        "id": "source",
+                        "backend": agent_server.BACKEND_CODEX,
+                    },
+                    "target": {
+                        "id": "target",
+                        "backend": agent_server.BACKEND_CODEX,
+                    },
+                }
+                start_turn = AsyncMock(return_value={"run_id": "run_handoff"})
+                with (
+                    patch.object(agent_server.STORE, "sessions", sessions),
+                    patch.object(agent_server, "AGENT_TOKEN", "test-token"),
+                    patch.object(
+                        agent_server,
+                        "cross_chat_delivery_client_capabilities",
+                        return_value=[
+                            agent_server.CODEX_INTERACTIVE_CLIENT_CAPABILITY
+                        ],
+                    ),
+                    patch.object(agent_server, "start_turn", start_turn),
+                    patch.object(store, "mark_ran", new_callable=AsyncMock),
+                    patch.object(store, "save", new_callable=AsyncMock),
+                    patch.object(
+                        agent_server,
+                        "append_event",
+                        new_callable=AsyncMock,
+                    ),
+                ):
+                    await store.run_job("job_handoff")
+                    turn_request = start_turn.await_args.args[1]
+                    self.assertEqual(turn_request.chat_references, [reference])
+                    self.assertEqual(
+                        turn_request.client_capabilities,
+                        [agent_server.CROSS_CHAT_HANDOFFS_V2_CLIENT_CAPABILITY],
+                    )
+                    self.assertEqual(turn_request.purpose, "scheduled_job")
+                    self.assertFalse(start_turn.await_args.kwargs["queue_if_busy"])
+                    self.assertEqual(
+                        start_turn.await_args.kwargs["provider_context_mode"],
+                        context_mode,
+                    )
+                    self.assertTrue(
+                        start_turn.await_args.kwargs[
+                            "scheduled_job_chat_references"
+                        ]
+                    )
+                    self.assertEqual(
+                        start_turn.await_args.kwargs[
+                            "scheduled_job_revision"
+                        ],
+                        store.jobs["job_handoff"]["_revision"],
+                    )
+
+                    sessions["target"]["archived"] = True
+                    start_turn.reset_mock()
+                    with self.assertRaisesRegex(HTTPException, "archived"):
+                        await store.run_job("job_handoff")
+                    start_turn.assert_not_awaited()
+
+    async def test_invalid_stored_chat_target_is_durably_paused_for_repair(
+        self,
+    ) -> None:
+        store = agent_server.JobStore()
+        store.jobs["job_repair"] = {
+            "id": "job_repair",
+            "session_id": "source",
+            "title": "Recurring handoff",
+            "prompt": "@Target check now",
+            "chat_references": [{
+                "session_id": "target",
+                "display_title_snapshot": "Target",
+                "source_text_start": 0,
+                "source_text_end": 7,
+                "action": "instruction",
+            }],
+            "schedule_kind": "interval",
+            "interval_seconds": 60,
+            "loop": True,
+            "enabled": True,
+            "next_run_at": 100.0,
+            "scheduled_run_at": 100.0,
+            "run_count": 3,
+        }
+        sessions = {
+            "source": {
+                "id": "source",
+                "backend": agent_server.BACKEND_CODEX,
+            },
+            "target": {
+                "id": "target",
+                "backend": agent_server.BACKEND_CODEX,
+                "archived": True,
+            },
+        }
+        events = AsyncMock()
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs_file = Path(temporary) / "jobs.json"
+            with (
+                patch.object(agent_server.STORE, "sessions", sessions),
+                patch.object(agent_server, "AGENT_TOKEN", "test-token"),
+                patch.object(agent_server, "JOBS_FILE", jobs_file),
+                patch.object(agent_server, "ensure_dirs"),
+                patch.object(agent_server, "append_event", events),
+                patch.object(
+                    agent_server,
+                    "start_turn",
+                    new_callable=AsyncMock,
+                ) as start_turn,
+            ):
+                with self.assertRaises(
+                    agent_server.ScheduledJobChatReferenceRepairRequired
+                ):
+                    await store.run_job("job_repair")
+
+            paused = store.jobs["job_repair"]
+            self.assertFalse(paused["enabled"])
+            self.assertIsNone(paused["next_run_at"])
+            self.assertIsNone(paused["scheduled_run_at"])
+            self.assertEqual(paused["run_count"], 3)
+            persisted = json.loads(jobs_file.read_text())
+            self.assertFalse(persisted["job_repair"]["enabled"])
+            self.assertIsNone(persisted["job_repair"]["next_run_at"])
+            self.assertIsNone(persisted["job_repair"]["scheduled_run_at"])
+
+        start_turn.assert_not_awaited()
+        events.assert_awaited_once()
+        self.assertEqual(events.await_args.args[1], "job_error")
+        payload = events.await_args.args[2]
+        self.assertEqual(
+            payload["error_code"],
+            "scheduled_chat_reference_invalid",
+        )
+        self.assertTrue(payload["repair_required"])
+        self.assertFalse(payload["job"]["enabled"])
+        self.assertIn("Edit or remove the target", payload["message"])
+        self.assertIn("re-enable the job", payload["message"])
+
+    async def test_admission_race_does_not_persist_target_session_id(self) -> None:
+        secret_target_id = "internal-target-session-secret"
+        store = agent_server.JobStore()
+        reference = agent_server.ChatReference(
+            session_id=secret_target_id,
+            display_title_snapshot="Mobile",
+            source_text_start=0,
+            source_text_end=7,
+            action="instruction",
+        )
+        revision = agent_server.new_job_revision()
+        store.jobs["job_race_repair"] = {
+            "id": "job_race_repair",
+            "session_id": "source",
+            "title": "Race repair",
+            "prompt": "@Mobile check now",
+            "chat_references": [agent_server.chat_reference_dict(reference)],
+            "schedule_kind": "interval",
+            "interval_seconds": 60,
+            "timezone": "UTC",
+            "loop": True,
+            "enabled": True,
+            "next_run_at": 100.0,
+            "scheduled_run_at": 100.0,
+            "run_count": 0,
+            "_revision": revision,
+        }
+        sessions = {
+            "source": {
+                "id": "source",
+                "title": "Source",
+                "backend": agent_server.BACKEND_CODEX,
+            },
+            secret_target_id: {
+                "id": secret_target_id,
+                "title": "Mobile",
+                "backend": agent_server.BACKEND_CODEX,
+            },
+        }
+        events = AsyncMock()
+
+        async def archive_target_at_admission(
+            session_id: str,
+            req: agent_server.TurnRequest,
+            **kwargs,
+        ) -> dict:
+            sessions[secret_target_id]["archived"] = True
+            return await agent_server._start_turn_locked(
+                session_id,
+                req,
+                **kwargs,
+            )
+
+        with (
+            patch.object(agent_server.STORE, "sessions", sessions),
+            patch.object(agent_server, "AGENT_TOKEN", "test-token"),
+            patch.object(agent_server, "JOBS", store),
+            patch.object(store, "save", new_callable=AsyncMock),
+            patch.object(agent_server, "append_event", events),
+            patch.object(
+                agent_server,
+                "start_turn",
+                AsyncMock(side_effect=archive_target_at_admission),
+            ),
+        ):
+            with self.assertRaises(
+                agent_server.ScheduledJobChatReferenceRepairRequired
+            ) as raised:
+                await store.run_job("job_race_repair")
+
+        self.assertEqual(str(raised.exception.detail), "saved chat target is archived")
+        self.assertNotIn(secret_target_id, str(raised.exception.detail))
+        events.assert_awaited_once()
+        self.assertEqual(events.await_args.args[1], "job_error")
+        durable_payload = events.await_args.args[2]
+        self.assertNotIn(secret_target_id, json.dumps(durable_payload))
+        self.assertNotIn("chat_references", durable_payload["job"])
+        self.assertEqual(durable_payload["job"]["chat_target_count"], 1)
+
+    async def test_deleted_and_unsupported_stored_targets_pause_without_launch(
+        self,
+    ) -> None:
+        cases = {
+            "deleted": None,
+            "unsupported": {
+                "id": "target",
+                "backend": "legacy-provider",
+            },
+        }
+        for case, target in cases.items():
+            with self.subTest(case=case):
+                store = agent_server.JobStore()
+                store.jobs["job_repair"] = {
+                    "id": "job_repair",
+                    "session_id": "source",
+                    "title": "Recurring handoff",
+                    "prompt": "@Target check now",
+                    "chat_references": [{
+                        "session_id": "target",
+                        "display_title_snapshot": "Target",
+                        "source_text_start": 0,
+                        "source_text_end": 7,
+                        "action": "instruction",
+                    }],
+                    "schedule_kind": "interval",
+                    "interval_seconds": 60,
+                    "loop": True,
+                    "enabled": True,
+                    "next_run_at": 100.0,
+                    "scheduled_run_at": 100.0,
+                    "run_count": 0,
+                }
+                sessions = {
+                    "source": {
+                        "id": "source",
+                        "backend": agent_server.BACKEND_CODEX,
+                    },
+                }
+                if target is not None:
+                    sessions["target"] = target
+                with (
+                    patch.object(agent_server.STORE, "sessions", sessions),
+                    patch.object(agent_server, "AGENT_TOKEN", "test-token"),
+                    patch.object(store, "save", new_callable=AsyncMock) as save,
+                    patch.object(
+                        agent_server,
+                        "append_event",
+                        new_callable=AsyncMock,
+                    ) as events,
+                    patch.object(
+                        agent_server,
+                        "start_turn",
+                        new_callable=AsyncMock,
+                    ) as start_turn,
+                ):
+                    with self.assertRaises(
+                        agent_server.ScheduledJobChatReferenceRepairRequired
+                    ):
+                        await store.run_job("job_repair")
+
+                self.assertFalse(store.jobs["job_repair"]["enabled"])
+                self.assertIsNone(store.jobs["job_repair"]["next_run_at"])
+                save.assert_awaited_once()
+                events.assert_awaited_once()
+                start_turn.assert_not_awaited()
+
+    def test_scheduled_job_chat_references_reject_secure_peer_targets(self) -> None:
+        reference = agent_server.ChatReference(
+            session_id="00000000-0000-4000-8000-000000000002",
+            display_title_snapshot="Remote/Target",
+            source_text_start=0,
+            source_text_end=14,
+            action="instruction",
+            target_kind="secure_peer",
+            target_server_identity="remote-server",
+            target_connection_id="00000000-0000-4000-8000-000000000001",
+            target_route_id="00000000-0000-4000-8000-000000000002",
+            target_route_revision="rev_0123456789abcdef0123456789abcdef",
+        )
+        with patch.object(agent_server.STORE, "sessions", {"source": {"id": "source"}}):
+            with self.assertRaisesRegex(HTTPException, "same-server"):
+                agent_server.validate_scheduled_job_chat_references(
+                    "source",
+                    "@Remote/Target do work",
+                    [reference],
+                )
 
     async def test_archived_session_job_cannot_be_enabled_but_can_be_edited(
         self,

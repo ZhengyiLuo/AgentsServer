@@ -793,7 +793,7 @@ if [[ "$TEAM_HUB_MODE" == "host" && "$TEAM_HUB_OPERATION_PENDING" != "true" ]]; 
   fi
 fi
 
-RELEASE_FILES=(agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py agentsdock_publish.py claude_sdk_client.py codex_app_server.py install.sh uninstall.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem)
+RELEASE_FILES=(agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_publish.py claude_sdk_client.py codex_app_server.py install.sh uninstall.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem)
 RELEASE_DIRECTORIES=(agentsdock_team_hub)
 TEAM_HUB_RELEASE_FILES=(
   __init__.py
@@ -1465,6 +1465,7 @@ validate_staged_release_runtime() (
     "$STAGE_DIR/secure_peer_delivery.py" \
     "$STAGE_DIR/agentsdock_jobs.py" \
     "$STAGE_DIR/agentsdock_chats.py" \
+    "$STAGE_DIR/agentsdock_emergency.py" \
     "$STAGE_DIR/agentsdock_publish.py" \
     "$STAGE_DIR/claude_sdk_client.py" \
     "$STAGE_DIR/codex_app_server.py" \
@@ -1529,7 +1530,7 @@ for name in "${TEAM_HUB_RELEASE_FILES[@]}"; do
     "$SOURCE_DIR/agentsdock_team_hub/$name" \
     "$STAGE_DIR/agentsdock_team_hub/$name"
 done
-chmod 755 "$STAGE_DIR/agent_server.py" "$STAGE_DIR/agentsdock_jobs.py" "$STAGE_DIR/agentsdock_chats.py" "$STAGE_DIR/agentsdock_publish.py" "$STAGE_DIR/install.sh" "$STAGE_DIR/uninstall.sh" "$STAGE_DIR/update_runner.py"
+chmod 755 "$STAGE_DIR/agent_server.py" "$STAGE_DIR/agentsdock_jobs.py" "$STAGE_DIR/agentsdock_chats.py" "$STAGE_DIR/agentsdock_emergency.py" "$STAGE_DIR/agentsdock_publish.py" "$STAGE_DIR/install.sh" "$STAGE_DIR/uninstall.sh" "$STAGE_DIR/update_runner.py"
 
 echo "[2/7] Resolving the release dependencies with uv"
 if run_timed_stage \

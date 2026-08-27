@@ -5,6 +5,7 @@ import ipaddress
 import json
 from pathlib import Path
 import socket
+import sqlite3
 import ssl
 import tempfile
 import threading
@@ -22,6 +23,8 @@ from agentsdock_team_hub.secure_peer import (
     PAIRING_ATTEMPT_RETENTION_SECONDS,
     PAIRING_STATUS_LIMIT,
     PAIRING_TTL_SECONDS,
+    PEER_HEARTBEAT_COALESCE_SECONDS,
+    PEER_HEARTBEAT_LEASE_SECONDS,
     PEER_BINDING_OID,
     PeerAuthorization,
     ProxyResponse,
@@ -319,6 +322,225 @@ class SecurePeerStoreTests(unittest.TestCase):
         routes = self.store.list_local_routes(peer.peer_id)
         self.assertEqual(routes[0]["route_id"], local_route["route_id"])
         self.assertEqual(routes[0]["status"], "revoked")
+
+    def test_reapproval_atomically_supersedes_all_old_peer_authority(self) -> None:
+        _key, submitted, approved, peer = self.approve_peer()
+        certificate = x509.load_pem_x509_certificate(
+            self.store.poll_pairing(
+                submitted["pairing_id"], submitted["poll_token"]
+            )["client_certificate_pem"].encode("ascii")
+        )
+        local_route = self.store.publish_local_route(
+            peer.team_id,
+            peer.peer_id,
+            "chat-reapproval-001",
+            "reapproval-local",
+            "Reapproval local",
+            ["instruction"],
+            idempotency_key=_uuid(),
+            published_by="owner-admin",
+        )
+        remote_route = self.store.publish_peer_route(
+            peer,
+            {
+                "route_id": _uuid(),
+                "revision": "rev_" + uuid.uuid4().hex,
+                "alias": "reapproval-remote",
+                "display_title": "Reapproval remote",
+                "actions": ["instruction"],
+            },
+        )
+        queued = self.store.submit_local_envelope(
+            peer.team_id,
+            local_route["route_id"],
+            {
+                "request_id": _uuid(),
+                "source_route_id": local_route["route_id"],
+                "target_route_id": remote_route["route_id"],
+                "target_route_revision": remote_route["revision"],
+                "kind": "instruction",
+                "exchange_id": None,
+                "parent_envelope_id": None,
+                "expires_at": self.clock.value + 600,
+                "body": {"message": "must not survive reapproval"},
+            },
+        )
+
+        self.clock.value += 1
+        _new_key, _new_submitted, replacement, replacement_peer = (
+            self.approve_peer()
+        )
+        self.assertEqual(
+            replacement["superseded_peer_ids"], [approved["peer_id"]]
+        )
+        self.assertNotEqual(replacement_peer.peer_id, peer.peer_id)
+        with self.assertRaises(SecurePeerError) as retired:
+            self.store.authenticate_peer(
+                certificate.public_bytes(serialization.Encoding.DER)
+            )
+        self.assertEqual(retired.exception.code, "peer_revoked")
+
+        connection = self.store._connect()
+        try:
+            old_peer = connection.execute(
+                "SELECT * FROM peers WHERE id=?", (peer.peer_id,)
+            ).fetchone()
+            certificate_states = connection.execute(
+                """SELECT revoked_at,valid_until FROM peer_certificates
+                WHERE peer_id=?""",
+                (peer.peer_id,),
+            ).fetchall()
+            route_states = connection.execute(
+                """SELECT status FROM peer_routes
+                WHERE peer_id=? OR audience_peer_id=?""",
+                (peer.peer_id, peer.peer_id),
+            ).fetchall()
+            envelope = connection.execute(
+                "SELECT status FROM relay_envelopes WHERE id=?",
+                (queued["envelope_id"],),
+            ).fetchone()
+            audit = connection.execute(
+                """SELECT detail_json FROM audit_events
+                WHERE action='peer.supersede' AND object_id=?""",
+                (peer.peer_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(old_peer["status"], "revoked")
+        self.assertEqual(old_peer["revoked_by"], "owner-admin")
+        self.assertTrue(certificate_states)
+        self.assertTrue(
+            all(
+                row["revoked_at"] == self.clock.value
+                and row["valid_until"] <= self.clock.value
+                for row in certificate_states
+            )
+        )
+        self.assertTrue(route_states)
+        self.assertTrue(all(row["status"] == "revoked" for row in route_states))
+        self.assertEqual(envelope["status"], "expired")
+        self.assertEqual(
+            json.loads(audit["detail_json"])["successor_peer_id"],
+            replacement_peer.peer_id,
+        )
+
+    def test_startup_reconciliation_prefers_hub_binding_then_is_idempotent(self) -> None:
+        _key, _submitted, first, _peer = self.approve_peer(
+            server_identity="duplicate-peer-001"
+        )
+        connection = self.store._connect()
+        try:
+            connection.execute(
+                "UPDATE peers SET status='revoked' WHERE id=?", (first["peer_id"],)
+            )
+        finally:
+            connection.close()
+        self.clock.value += 1
+        _key, _submitted, preferred, _peer = self.approve_peer(
+            server_identity="duplicate-peer-001"
+        )
+        connection = self.store._connect()
+        try:
+            connection.execute(
+                "UPDATE peers SET status='active',revoked_at=NULL,revoked_by=NULL WHERE id=?",
+                (first["peer_id"],),
+            )
+        finally:
+            connection.close()
+
+        self.clock.value += 1
+        _key, _submitted, oldest, _peer = self.approve_peer(
+            server_identity="fallback-peer-001"
+        )
+        connection = self.store._connect()
+        try:
+            connection.execute(
+                "UPDATE peers SET status='revoked' WHERE id=?", (oldest["peer_id"],)
+            )
+        finally:
+            connection.close()
+        self.clock.value += 1
+        _key, _submitted, newest, _peer = self.approve_peer(
+            server_identity="fallback-peer-001"
+        )
+        connection = self.store._connect()
+        try:
+            connection.execute(
+                "UPDATE peers SET status='active',revoked_at=NULL,revoked_by=NULL WHERE id=?",
+                (oldest["peer_id"],),
+            )
+        finally:
+            connection.close()
+
+        reconciled = self.store.reconcile_active_logical_peers(
+            {preferred["peer_id"]}
+        )
+        self.assertEqual(
+            set(reconciled["superseded_peer_ids"]),
+            {first["peer_id"], newest["peer_id"]},
+        )
+        self.assertIn(preferred["peer_id"], reconciled["retained_peer_ids"])
+        self.assertIn(oldest["peer_id"], reconciled["retained_peer_ids"])
+
+        connection = self.store._connect()
+        try:
+            audit_count = connection.execute(
+                """SELECT COUNT(*) AS count FROM audit_events
+                WHERE action='peer.supersede'
+                AND object_id IN (?,?)""",
+                (first["peer_id"], newest["peer_id"]),
+            ).fetchone()["count"]
+        finally:
+            connection.close()
+        repeated = self.store.reconcile_active_logical_peers(
+            {preferred["peer_id"]}
+        )
+        self.assertEqual(repeated["superseded_peer_ids"], [])
+        connection = self.store._connect()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    """SELECT COUNT(*) AS count FROM audit_events
+                    WHERE action='peer.supersede'
+                    AND object_id IN (?,?)""",
+                    (first["peer_id"], newest["peer_id"]),
+                ).fetchone()["count"],
+                audit_count,
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE peers SET status='active' WHERE id=?",
+                    (first["peer_id"],),
+                )
+        finally:
+            connection.close()
+
+    def test_peer_heartbeat_is_coalesced_and_exposed(self) -> None:
+        _key, _submitted, _approved, peer = self.approve_peer()
+        listed = self.store.list_peers(team_id=peer.team_id)
+        self.assertIsNone(listed[0]["last_seen_at"])
+        self.assertIsNone(listed[0]["lease_expires_at"])
+
+        first = self.store.record_peer_heartbeat(peer.peer_id)
+        self.assertTrue(first["recorded"])
+        self.assertEqual(first["last_seen_at"], self.clock.value)
+        self.assertEqual(
+            first["lease_expires_at"],
+            self.clock.value + PEER_HEARTBEAT_LEASE_SECONDS,
+        )
+        coalesced = self.store.record_peer_heartbeat(peer.peer_id)
+        self.assertFalse(coalesced["recorded"])
+        self.assertEqual(coalesced, {**first, "recorded": False})
+
+        self.clock.value += PEER_HEARTBEAT_COALESCE_SECONDS
+        extended = self.store.record_peer_heartbeat(peer.peer_id)
+        self.assertTrue(extended["recorded"])
+        self.assertEqual(extended["last_seen_at"], self.clock.value)
+        listed = self.store.list_peers(team_id=peer.team_id)
+        self.assertEqual(listed[0]["last_seen_at"], extended["last_seen_at"])
+        self.assertEqual(
+            listed[0]["lease_expires_at"], extended["lease_expires_at"]
+        )
 
     def test_proxy_allowlist_team_scope_and_header_stripping(self) -> None:
         peer = PeerAuthorization(

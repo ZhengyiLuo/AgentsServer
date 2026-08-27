@@ -52,6 +52,8 @@ CLIENT_CERT_OVERLAP_SECONDS = 10 * 60
 MAX_RELAY_TTL_SECONDS = 72 * 60 * 60
 MAX_RELAY_LEGS = 6
 RELAY_LEASE_SECONDS = 60
+PEER_HEARTBEAT_LEASE_SECONDS = 90
+PEER_HEARTBEAT_COALESCE_SECONDS = 15
 PAIRING_STATUS_LIMIT = 512
 PAIRING_TERMINAL_RETAINED_LIMIT = 512
 ROUTE_ACTIVE_PER_PEER_LIMIT = 128
@@ -680,6 +682,7 @@ class SecurePeerStore:
                     scopes_json TEXT NOT NULL, transcript_hash TEXT NOT NULL,
                     public_key_pem TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('active','revoked')),
                     cross_chat_grant_epoch INTEGER,
+                    last_seen_at INTEGER, lease_expires_at INTEGER,
                     created_at INTEGER NOT NULL, revoked_at INTEGER, revoked_by TEXT,
                     FOREIGN KEY(pairing_id) REFERENCES pairing_requests(id)
                 );
@@ -796,6 +799,14 @@ class SecurePeerStore:
             if "cross_chat_grant_epoch" not in peer_columns:
                 connection.execute(
                     "ALTER TABLE peers ADD COLUMN cross_chat_grant_epoch INTEGER"
+                )
+            if "last_seen_at" not in peer_columns:
+                connection.execute(
+                    "ALTER TABLE peers ADD COLUMN last_seen_at INTEGER"
+                )
+            if "lease_expires_at" not in peer_columns:
+                connection.execute(
+                    "ALTER TABLE peers ADD COLUMN lease_expires_at INTEGER"
                 )
             migration_timestamp = self._timestamp()
             duplicate_host_routes = connection.execute(
@@ -1706,6 +1717,140 @@ class SecurePeerStore:
         )
         return certificate, binding
 
+    def _revoke_peer_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        peer_id: str,
+        timestamp: int,
+        actor: str,
+        action: str,
+        detail: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Revoke every authority derived from one peer in the caller's transaction."""
+
+        changed = connection.execute(
+            """UPDATE peers SET status='revoked',revoked_at=?,revoked_by=?
+            WHERE id=? AND status='active'""",
+            (timestamp, actor, peer_id),
+        ).rowcount
+        if changed != 1:
+            return False
+        connection.execute(
+            """UPDATE peer_certificates SET revoked_at=COALESCE(revoked_at,?),
+            valid_until=CASE WHEN valid_until>? THEN ? ELSE valid_until END
+            WHERE peer_id=?""",
+            (timestamp, timestamp, timestamp, peer_id),
+        )
+        connection.execute(
+            """UPDATE peer_routes SET status='revoked',revoked_at=?,updated_at=?,revision=?
+            WHERE (peer_id=? OR audience_peer_id=?) AND status='active'""",
+            (
+                timestamp,
+                timestamp,
+                "rev_" + uuid.uuid4().hex,
+                peer_id,
+                peer_id,
+            ),
+        )
+        connection.execute(
+            """UPDATE relay_envelopes SET status='expired',lease_owner=NULL,
+            lease_token_hash=NULL,lease_expires_at=NULL
+            WHERE status IN ('queued','claimed') AND (
+                source_peer_id=? OR target_peer_id=? OR
+                source_route_id IN (
+                    SELECT id FROM peer_routes
+                    WHERE peer_id=? OR audience_peer_id=?
+                ) OR target_route_id IN (
+                    SELECT id FROM peer_routes
+                    WHERE peer_id=? OR audience_peer_id=?
+                )
+            )""",
+            (peer_id, peer_id, peer_id, peer_id, peer_id, peer_id),
+        )
+        self._audit(connection, timestamp, actor, action, peer_id, detail)
+        return True
+
+    def reconcile_active_logical_peers(
+        self,
+        preferred_peer_ids: Iterable[str],
+        *,
+        actor: str = "agentsserver-startup-reconciliation",
+    ) -> dict[str, Any]:
+        """Collapse duplicate active logical peers before enforcing uniqueness.
+
+        A Hub-bound peer is authoritative when exactly one preferred peer is
+        present in a duplicate group.  Corrupt input containing more than one
+        preferred peer remains deterministic by retaining the oldest preferred
+        record.  Without a preferred peer, the oldest record is retained.
+        """
+
+        if isinstance(preferred_peer_ids, (str, bytes)):
+            raise SecurePeerError(
+                "invalid_request", "preferred peer ids are invalid", 422
+            )
+        preferred = {
+            _uuid(peer_id, "preferred_peer_id") for peer_id in preferred_peer_ids
+        }
+        canonical_actor = _identifier(actor, "reconciliation actor")
+        timestamp = self._timestamp()
+        retained_peer_ids: list[str] = []
+        superseded_peer_ids: list[str] = []
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """SELECT id,team_id,peer_server_identity,created_at
+                FROM peers WHERE status='active'
+                ORDER BY team_id,peer_server_identity,created_at,id"""
+            ).fetchall()
+            groups: dict[tuple[str, str], list[sqlite3.Row]] = {}
+            for row in rows:
+                groups.setdefault(
+                    (row["team_id"], row["peer_server_identity"]), []
+                ).append(row)
+            for members in groups.values():
+                if len(members) == 1:
+                    retained_peer_ids.append(members[0]["id"])
+                    continue
+                preferred_members = [
+                    member for member in members if member["id"] in preferred
+                ]
+                retained = preferred_members[0] if preferred_members else members[0]
+                retained_peer_ids.append(retained["id"])
+                for member in members:
+                    if member["id"] == retained["id"]:
+                        continue
+                    if self._revoke_peer_in_transaction(
+                        connection,
+                        peer_id=member["id"],
+                        timestamp=timestamp,
+                        actor=canonical_actor,
+                        action="peer.supersede",
+                        detail={
+                            "reason": "duplicate_active_logical_peer",
+                            "retained_peer_id": retained["id"],
+                            "retained_peer_was_preferred": retained["id"]
+                            in preferred,
+                        },
+                    ):
+                        superseded_peer_ids.append(member["id"])
+            connection.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS active_peer_logical_identity
+                ON peers(team_id,peer_server_identity) WHERE status='active'"""
+            )
+            connection.execute("COMMIT")
+            return {
+                "retained_peer_ids": retained_peer_ids,
+                "superseded_peer_ids": superseded_peer_ids,
+            }
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
     def approve_pairing(
         self,
         pairing_id: str,
@@ -1774,6 +1919,26 @@ class SecurePeerStore:
             certificate_pem = certificate.public_bytes(serialization.Encoding.PEM).decode("ascii")
             certificate_fp = _certificate_fingerprint(certificate)
             expires_at = int(certificate.not_valid_after_utc.timestamp())
+            superseded_peer_ids: list[str] = []
+            prior_peers = connection.execute(
+                """SELECT id FROM peers WHERE team_id=? AND peer_server_identity=?
+                AND status='active' ORDER BY created_at,id""",
+                (canonical_team, row["peer_server_identity"]),
+            ).fetchall()
+            for prior_peer in prior_peers:
+                if self._revoke_peer_in_transaction(
+                    connection,
+                    peer_id=prior_peer["id"],
+                    timestamp=timestamp,
+                    actor=canonical_actor,
+                    action="peer.supersede",
+                    detail={
+                        "reason": "logical_peer_reapproved",
+                        "successor_peer_id": peer_id,
+                        "successor_pairing_id": pairing_id,
+                    },
+                ):
+                    superseded_peer_ids.append(prior_peer["id"])
             connection.execute(
                 """INSERT INTO peers(
                 id,pairing_id,peer_server_identity,team_id,scopes_json,transcript_hash,
@@ -1826,6 +1991,7 @@ class SecurePeerStore:
                 "certificate_fingerprint": certificate_fp,
                 "certificate_expires_at": expires_at,
                 "cross_chat_grant_epoch": grant_epoch,
+                "superseded_peer_ids": superseded_peer_ids,
             }
             self._record_operation(connection, "pairing-approve", idempotency_key, digest, response, timestamp)
             self._audit(connection, timestamp, canonical_actor, "pairing.approve", pairing_id, response)
@@ -1930,10 +2096,107 @@ class SecurePeerStore:
                     "certificate_fingerprint": row["fingerprint"],
                     "certificate_expires_at": int(row["certificate_expires_at"]),
                     "cross_chat_grant_epoch": row["cross_chat_grant_epoch"],
+                    "last_seen_at": (
+                        int(row["last_seen_at"])
+                        if row["last_seen_at"] is not None
+                        else None
+                    ),
+                    "lease_expires_at": (
+                        int(row["lease_expires_at"])
+                        if row["lease_expires_at"] is not None
+                        else None
+                    ),
                     "revoked_at": row["revoked_at"],
                 }
                 for row in rows
             ]
+        finally:
+            connection.close()
+
+    def record_peer_heartbeat(self, peer_id: str) -> dict[str, Any]:
+        """Extend an active peer lease while coalescing rapid health checks."""
+
+        canonical_peer_id = _uuid(peer_id, "peer_id")
+        timestamp = self._timestamp()
+
+        def snapshot(row: sqlite3.Row) -> tuple[int | None, int | None]:
+            return (
+                int(row["last_seen_at"])
+                if row["last_seen_at"] is not None
+                else None,
+                int(row["lease_expires_at"])
+                if row["lease_expires_at"] is not None
+                else None,
+            )
+
+        def write_due(last_seen_at: int | None, lease_expires_at: int | None) -> bool:
+            return (
+                last_seen_at is None
+                or lease_expires_at is None
+                or lease_expires_at <= timestamp
+                or timestamp - last_seen_at >= PEER_HEARTBEAT_COALESCE_SECONDS
+            )
+
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """SELECT status,last_seen_at,lease_expires_at FROM peers
+                WHERE id=?""",
+                (canonical_peer_id,),
+            ).fetchone()
+            if row is None:
+                raise SecurePeerError("peer_unavailable", "Peer is unavailable", 404)
+            if row["status"] != "active":
+                raise SecurePeerError(
+                    "peer_revoked", "Peer authentication is unavailable", 401
+                )
+            last_seen_at, lease_expires_at = snapshot(row)
+            if not write_due(last_seen_at, lease_expires_at):
+                return {
+                    "peer_id": canonical_peer_id,
+                    "last_seen_at": last_seen_at,
+                    "lease_expires_at": lease_expires_at,
+                    "recorded": False,
+                }
+
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT status,last_seen_at,lease_expires_at FROM peers
+                WHERE id=?""",
+                (canonical_peer_id,),
+            ).fetchone()
+            if row is None:
+                raise SecurePeerError("peer_unavailable", "Peer is unavailable", 404)
+            if row["status"] != "active":
+                raise SecurePeerError(
+                    "peer_revoked", "Peer authentication is unavailable", 401
+                )
+            last_seen_at, lease_expires_at = snapshot(row)
+            if write_due(last_seen_at, lease_expires_at):
+                last_seen_at = timestamp
+                lease_expires_at = timestamp + PEER_HEARTBEAT_LEASE_SECONDS
+                if connection.execute(
+                    """UPDATE peers SET last_seen_at=?,lease_expires_at=?
+                    WHERE id=? AND status='active'""",
+                    (last_seen_at, lease_expires_at, canonical_peer_id),
+                ).rowcount != 1:
+                    raise SecurePeerError(
+                        "peer_revoked", "Peer authentication is unavailable", 401
+                    )
+                recorded = True
+            else:
+                recorded = False
+            connection.execute("COMMIT")
+            return {
+                "peer_id": canonical_peer_id,
+                "last_seen_at": last_seen_at,
+                "lease_expires_at": lease_expires_at,
+                "recorded": recorded,
+            }
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
         finally:
             connection.close()
 
@@ -2035,42 +2298,18 @@ class SecurePeerStore:
                 row["fingerprint"], expected_certificate_fingerprint
             ):
                 raise SecurePeerError("peer_changed", "Peer certificate confirmation failed", 409)
-            connection.execute(
-                "UPDATE peers SET status='revoked',revoked_at=?,revoked_by=? WHERE id=? AND status='active'",
-                (timestamp, actor, peer_id),
-            )
-            connection.execute(
-                "UPDATE peer_certificates SET revoked_at=?,valid_until=? WHERE peer_id=? AND revoked_at IS NULL",
-                (timestamp, timestamp, peer_id),
-            )
-            connection.execute(
-                """UPDATE peer_routes SET status='revoked',revoked_at=?,updated_at=?,revision=?
-                WHERE (peer_id=? OR audience_peer_id=?) AND status='active'""",
-                (
-                    timestamp,
-                    timestamp,
-                    "rev_" + uuid.uuid4().hex,
-                    peer_id,
-                    peer_id,
-                ),
-            )
-            connection.execute(
-                """UPDATE relay_envelopes SET status='expired',lease_owner=NULL,
-                lease_token_hash=NULL,lease_expires_at=NULL
-                WHERE status IN ('queued','claimed') AND (
-                    source_route_id IN (
-                        SELECT id FROM peer_routes
-                        WHERE peer_id=? OR audience_peer_id=?
-                    ) OR target_route_id IN (
-                        SELECT id FROM peer_routes
-                        WHERE peer_id=? OR audience_peer_id=?
-                    )
-                )""",
-                (peer_id, peer_id, peer_id, peer_id),
-            )
+            if not self._revoke_peer_in_transaction(
+                connection,
+                peer_id=peer_id,
+                timestamp=timestamp,
+                actor=actor,
+                action="peer.revoke",
+            ):
+                raise SecurePeerError(
+                    "peer_changed", "Peer certificate confirmation failed", 409
+                )
             response = {"peer_id": peer_id, "status": "revoked", "revoked_at": timestamp}
             self._record_operation(connection, "peer-revoke", idempotency_key, digest, response, timestamp)
-            self._audit(connection, timestamp, actor, "peer.revoke", peer_id)
             connection.execute("COMMIT")
             return response
         except BaseException:

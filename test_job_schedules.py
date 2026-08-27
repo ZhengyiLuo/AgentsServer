@@ -235,6 +235,16 @@ class JobStoreTests(unittest.IsolatedAsyncioTestCase):
                 "next_run_at": None,
                 "scheduled_run_at": None,
             },
+            "job_manual_pending": {
+                "id": "job_manual_pending",
+                "session_id": "sess_archived",
+                "title": "Pending manual run",
+                "enabled": False,
+                "next_run_at": 150.0,
+                "scheduled_run_at": 150.0,
+                "manual_run_pending": True,
+                "manual_run_requested_at": "2026-08-26T00:00:00Z",
+            },
             "job_other_chat": {
                 "id": "job_other_chat",
                 "session_id": "sess_active",
@@ -252,11 +262,17 @@ class JobStoreTests(unittest.IsolatedAsyncioTestCase):
         ):
             paused = await store.pause_for_session("sess_archived")
 
-        self.assertEqual(paused, 3)
-        for job_id in ("job_interval", "job_cron", "job_rrule"):
+        self.assertEqual(paused, 4)
+        for job_id in (
+            "job_interval",
+            "job_cron",
+            "job_rrule",
+            "job_manual_pending",
+        ):
             self.assertFalse(store.jobs[job_id]["enabled"])
             self.assertIsNone(store.jobs[job_id]["next_run_at"])
             self.assertIsNone(store.jobs[job_id]["scheduled_run_at"])
+        self.assertFalse(store.jobs["job_manual_pending"]["manual_run_pending"])
         self.assertEqual(store.jobs["job_interval"]["interval_seconds"], 60)
         self.assertEqual(store.jobs["job_interval"]["run_count"], 7)
         self.assertEqual(store.jobs["job_cron"]["cron_expression"], "0 9 * * *")
@@ -265,10 +281,10 @@ class JobStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(store.jobs["job_other_chat"]["enabled"])
         self.assertEqual(store.jobs["job_other_chat"]["next_run_at"], 180.0)
         save.assert_awaited_once()
-        self.assertEqual(events.await_count, 3)
+        self.assertEqual(events.await_count, 4)
         self.assertEqual(
             {call.args[2]["job_id"] for call in events.await_args_list},
-            {"job_interval", "job_cron", "job_rrule"},
+            {"job_interval", "job_cron", "job_rrule", "job_manual_pending"},
         )
         for call in events.await_args_list:
             self.assertEqual(call.args[0], "sess_archived")
@@ -625,11 +641,427 @@ class JobStoreTests(unittest.IsolatedAsyncioTestCase):
             patch.object(agent_server, "start_turn", new_callable=AsyncMock) as start,
         ):
             with self.assertRaises(HTTPException) as raised:
-                await store.run_job("job_run")
+                await store.request_manual_run("job_run")
 
         self.assertEqual(raised.exception.status_code, 409)
         pause.assert_awaited_once_with(session_id)
         start.assert_not_awaited()
+
+    async def test_manual_run_is_durably_deferred_while_chat_is_busy(
+        self,
+    ) -> None:
+        store = agent_server.JobStore()
+        session_id = "sess_busy_manual"
+        store.jobs["job_manual"] = {
+            "id": "job_manual",
+            "session_id": session_id,
+            "title": "Busy manual run",
+            "prompt": "Run once chat is free",
+            "enabled": False,
+            "next_run_at": None,
+            "scheduled_run_at": None,
+            "run_count": 0,
+        }
+        events = AsyncMock()
+
+        with (
+            patch.object(agent_server.STORE, "sessions", {
+                session_id: {"id": session_id, "archived": False},
+            }),
+            patch.object(store, "save", new_callable=AsyncMock),
+            patch.object(
+                agent_server,
+                "scheduled_job_blocker",
+                new_callable=AsyncMock,
+                return_value="chat already has a running turn",
+            ),
+            patch.object(agent_server, "start_turn", new_callable=AsyncMock) as start,
+            patch.object(agent_server, "append_event", events),
+        ):
+            result = await store.request_manual_run("job_manual")
+            repeated_result = await store.request_manual_run("job_manual")
+
+        self.assertTrue(result["deferred"])
+        self.assertTrue(repeated_result["deferred"])
+        self.assertTrue(result["queued"])
+        self.assertIsNone(result["run_id"])
+        self.assertIn("start automatically", result["message"])
+        self.assertTrue(result["job"]["manual_run_pending"])
+        self.assertTrue(store.jobs["job_manual"]["manual_run_pending"])
+        self.assertTrue(agent_server.public_job(
+            store.jobs["job_manual"],
+        )["manual_run_pending"])
+        start.assert_not_awaited()
+        self.assertEqual(
+            [call.args[1] for call in events.await_args_list],
+            ["job_updated", "job_deferred"],
+        )
+        self.assertTrue(events.await_args_list[1].args[2]["job"]["manual_run_pending"])
+
+    async def test_permanent_manual_run_error_clears_pending_and_emits_error(
+        self,
+    ) -> None:
+        store = agent_server.JobStore()
+        session_id = "sess_invalid_manual"
+        store.jobs["job_manual"] = {
+            "id": "job_manual",
+            "session_id": session_id,
+            "title": "Invalid manual run",
+            "prompt": "Cannot be admitted",
+            "enabled": False,
+            "next_run_at": None,
+            "scheduled_run_at": None,
+            "run_count": 0,
+        }
+        events = AsyncMock()
+
+        with (
+            patch.object(agent_server.STORE, "sessions", {
+                session_id: {"id": session_id, "archived": False},
+            }),
+            patch.object(store, "save", new_callable=AsyncMock),
+            patch.object(
+                agent_server,
+                "scheduled_job_blocker",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch.object(
+                agent_server,
+                "start_turn",
+                new_callable=AsyncMock,
+                side_effect=HTTPException(
+                    status_code=400,
+                    detail="invalid scheduled job",
+                ),
+            ),
+            patch.object(agent_server, "append_event", events),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await store.request_manual_run("job_manual")
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertFalse(store.jobs["job_manual"]["manual_run_pending"])
+        self.assertIn("invalid scheduled job", store.jobs["job_manual"][
+            "last_manual_run_error"
+        ])
+        self.assertEqual(
+            [call.args[1] for call in events.await_args_list],
+            ["job_updated", "job_error"],
+        )
+
+    async def test_scheduler_drops_permanently_invalid_pending_manual_run(
+        self,
+    ) -> None:
+        store = agent_server.JobStore()
+        session_id = "sess_corrupt_pending_manual"
+        store.jobs["job_manual"] = {
+            "id": "job_manual",
+            "session_id": session_id,
+            "title": "Corrupt pending run",
+            "prompt": "Cannot run",
+            "enabled": False,
+            "next_run_at": None,
+            "scheduled_run_at": None,
+            "run_count": 0,
+            "manual_run_pending": True,
+        }
+        sleep_count = 0
+
+        async def one_scheduler_iteration(_delay: float) -> None:
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count > 1:
+                raise asyncio.CancelledError
+
+        events = AsyncMock()
+        with (
+            patch.object(agent_server.STORE, "sessions", {
+                session_id: {"id": session_id, "archived": False},
+            }),
+            patch.object(agent_server.time, "time", return_value=2.0),
+            patch.object(
+                agent_server.asyncio,
+                "sleep",
+                side_effect=one_scheduler_iteration,
+            ),
+            patch.object(store, "save", new_callable=AsyncMock),
+            patch.object(
+                agent_server,
+                "scheduled_job_blocker",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch.object(
+                agent_server,
+                "start_turn",
+                new_callable=AsyncMock,
+                side_effect=ValueError("corrupt scheduled job"),
+            ) as start,
+            patch.object(agent_server, "append_event", events),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await store.scheduler_loop()
+
+        start.assert_awaited_once()
+        self.assertFalse(store.jobs["job_manual"]["manual_run_pending"])
+        self.assertEqual(
+            [call.args[1] for call in events.await_args_list],
+            ["job_error"],
+        )
+
+    async def test_duplicate_manual_run_taps_coalesce_during_admission(
+        self,
+    ) -> None:
+        store = agent_server.JobStore()
+        session_id = "sess_duplicate_manual"
+        store.jobs["job_manual"] = {
+            "id": "job_manual",
+            "session_id": session_id,
+            "title": "One manual run",
+            "prompt": "Run only once",
+            "enabled": False,
+            "next_run_at": None,
+            "scheduled_run_at": None,
+            "run_count": 0,
+        }
+        admission_started = asyncio.Event()
+        release_admission = asyncio.Event()
+
+        async def delayed_start(*_args, **_kwargs):
+            admission_started.set()
+            await release_admission.wait()
+            return {"run_id": "run_once", "queued": False}
+
+        with (
+            patch.object(agent_server.STORE, "sessions", {
+                session_id: {"id": session_id, "archived": False},
+            }),
+            patch.object(store, "save", new_callable=AsyncMock),
+            patch.object(
+                agent_server,
+                "scheduled_job_blocker",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch.object(agent_server, "start_turn", side_effect=delayed_start) as start,
+            patch.object(agent_server, "append_event", new_callable=AsyncMock),
+        ):
+            first_request = asyncio.create_task(
+                store.request_manual_run("job_manual"),
+            )
+            await admission_started.wait()
+            duplicate_result = await store.request_manual_run("job_manual")
+            release_admission.set()
+            first_result = await first_request
+
+        self.assertTrue(duplicate_result["deferred"])
+        self.assertTrue(duplicate_result["queued"])
+        self.assertEqual(first_result["run_id"], "run_once")
+        self.assertFalse(first_result["deferred"])
+        self.assertEqual(start.await_count, 1)
+        self.assertEqual(store.jobs["job_manual"]["run_count"], 1)
+        self.assertFalse(store.jobs["job_manual"]["manual_run_pending"])
+
+    async def test_scheduler_dispatches_pending_manual_run_for_disabled_job(
+        self,
+    ) -> None:
+        store = agent_server.JobStore()
+        session_id = "sess_deferred_manual"
+        store.jobs["job_manual"] = {
+            "id": "job_manual",
+            "session_id": session_id,
+            "title": "Deferred manual run",
+            "prompt": "Run after blocker clears",
+            "enabled": False,
+            "next_run_at": None,
+            "scheduled_run_at": None,
+            "run_count": 0,
+            "manual_run_pending": True,
+            "manual_run_requested_at": "2026-08-26T00:00:00Z",
+        }
+        sleep_count = 0
+
+        async def one_scheduler_iteration(_delay: float) -> None:
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count > 1:
+                raise asyncio.CancelledError
+
+        with (
+            patch.object(agent_server.STORE, "sessions", {
+                session_id: {"id": session_id, "archived": False},
+            }),
+            patch.object(agent_server.time, "time", return_value=2.0),
+            patch.object(
+                agent_server.asyncio,
+                "sleep",
+                side_effect=one_scheduler_iteration,
+            ),
+            patch.object(store, "save", new_callable=AsyncMock),
+            patch.object(
+                agent_server,
+                "scheduled_job_blocker",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch.object(
+                agent_server,
+                "start_turn",
+                new_callable=AsyncMock,
+                return_value={"run_id": "run_deferred", "queued": False},
+            ) as start,
+            patch.object(agent_server, "append_event", new_callable=AsyncMock),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await store.scheduler_loop()
+
+        start.assert_awaited_once()
+        self.assertEqual(store.jobs["job_manual"]["run_count"], 1)
+        self.assertFalse(store.jobs["job_manual"]["manual_run_pending"])
+        self.assertFalse(store.jobs["job_manual"]["enabled"])
+
+    async def test_manual_run_starts_immediately_when_chat_is_idle(
+        self,
+    ) -> None:
+        store = agent_server.JobStore()
+        session_id = "sess_idle_manual"
+        store.jobs["job_manual"] = {
+            "id": "job_manual",
+            "session_id": session_id,
+            "title": "Immediate manual run",
+            "prompt": "Run now",
+            "enabled": False,
+            "next_run_at": None,
+            "scheduled_run_at": None,
+            "run_count": 0,
+        }
+        start = AsyncMock(return_value={
+            "run_id": "run_immediate",
+            "queued": False,
+        })
+        events = AsyncMock()
+
+        with (
+            patch.object(agent_server.STORE, "sessions", {
+                session_id: {"id": session_id, "archived": False},
+            }),
+            patch.object(store, "save", new_callable=AsyncMock),
+            patch.object(
+                agent_server,
+                "scheduled_job_blocker",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch.object(agent_server, "start_turn", start),
+            patch.object(agent_server, "append_event", events),
+        ):
+            result = await store.request_manual_run("job_manual")
+
+        self.assertEqual(result["run_id"], "run_immediate")
+        self.assertFalse(result["deferred"])
+        self.assertFalse(result["queued"])
+        self.assertFalse(result["manual_run_pending"])
+        self.assertFalse(result["job"]["manual_run_pending"])
+        self.assertEqual(start.await_args.args[1].purpose, "scheduled_job")
+        self.assertTrue(events.await_args.args[2]["manual_run"])
+
+    async def test_early_manual_run_preserves_future_cron_occurrence(
+        self,
+    ) -> None:
+        store = agent_server.JobStore()
+        session_id = "sess_future_cron"
+        future_occurrence = 2_000.0
+        store.jobs["job_cron"] = {
+            "id": "job_cron",
+            "session_id": session_id,
+            "title": "Future cron",
+            "prompt": "Run an extra check now",
+            "schedule_kind": "cron",
+            "cron_expression": "0 9 * * *",
+            "timezone": "UTC",
+            "enabled": True,
+            "next_run_at": future_occurrence,
+            "scheduled_run_at": future_occurrence,
+            "run_count": 0,
+        }
+        start = AsyncMock(return_value={
+            "run_id": "run_early",
+            "queued": False,
+        })
+
+        with (
+            patch.object(agent_server.STORE, "sessions", {
+                session_id: {"id": session_id, "archived": False},
+            }),
+            patch.object(agent_server.time, "time", return_value=1_000.0),
+            patch.object(store, "save", new_callable=AsyncMock),
+            patch.object(
+                agent_server,
+                "scheduled_job_blocker",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch.object(agent_server, "start_turn", start),
+            patch.object(agent_server, "append_event", new_callable=AsyncMock),
+        ):
+            result = await store.request_manual_run("job_cron")
+
+        self.assertFalse(result["deferred"])
+        self.assertEqual(store.jobs["job_cron"]["next_run_at"], future_occurrence)
+        self.assertEqual(
+            store.jobs["job_cron"]["scheduled_run_at"],
+            future_occurrence,
+        )
+        self.assertTrue(store.jobs["job_cron"]["enabled"])
+        self.assertEqual(
+            start.await_args.args[1].job_scheduled_run_at,
+            1_000.0,
+        )
+
+    async def test_manual_run_honors_max_runs_limit(self) -> None:
+        store = agent_server.JobStore()
+        session_id = "sess_manual_limit"
+        store.jobs["job_limited"] = {
+            "id": "job_limited",
+            "session_id": session_id,
+            "title": "Limited run",
+            "prompt": "Run the final allowed time",
+            "schedule_kind": "interval",
+            "interval_seconds": 60,
+            "loop": False,
+            "max_runs": 1,
+            "enabled": True,
+            "next_run_at": 2_000.0,
+            "scheduled_run_at": 2_000.0,
+            "run_count": 0,
+        }
+
+        with (
+            patch.object(agent_server.STORE, "sessions", {
+                session_id: {"id": session_id, "archived": False},
+            }),
+            patch.object(agent_server.time, "time", return_value=1_000.0),
+            patch.object(store, "save", new_callable=AsyncMock),
+            patch.object(
+                agent_server,
+                "scheduled_job_blocker",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch.object(
+                agent_server,
+                "start_turn",
+                new_callable=AsyncMock,
+                return_value={"run_id": "run_limited", "queued": False},
+            ),
+            patch.object(agent_server, "append_event", new_callable=AsyncMock),
+        ):
+            await store.request_manual_run("job_limited")
+
+        self.assertEqual(store.jobs["job_limited"]["run_count"], 1)
+        self.assertFalse(store.jobs["job_limited"]["enabled"])
+        self.assertIsNone(store.jobs["job_limited"]["next_run_at"])
 
     async def test_delete_for_session_restores_jobs_when_persistence_fails(
         self,

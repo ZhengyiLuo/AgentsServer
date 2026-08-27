@@ -5281,6 +5281,10 @@ class JobStore:
         self._lock = asyncio.Lock()
         self.jobs: dict[str, dict[str, Any]] = {}
         self._scheduler_task: asyncio.Task | None = None
+        # Durable intent lives on the job itself.  This set only claims the
+        # short admission window so an HTTP retry and the scheduler cannot
+        # launch the same pending manual run twice in one process.
+        self._manual_runs_in_flight: set[str] = set()
 
     async def load(self) -> None:
         ensure_dirs()
@@ -5292,6 +5296,9 @@ class JobStore:
                 logger.warning("failed to load jobs: %s", e)
                 self.jobs = {}
         for job in self.jobs.values():
+            if "manual_run_pending" not in job:
+                job["manual_run_pending"] = False
+                changed = True
             if job.get("schedule_kind") not in VALID_JOB_SCHEDULE_KINDS:
                 job["schedule_kind"] = job_schedule_kind(job)
                 changed = True
@@ -5335,9 +5342,9 @@ class JobStore:
                 changed = True
             parent_session = STORE.sessions.get(str(job.get("session_id") or ""))
             if (
-                job.get("enabled")
-                and parent_session
+                parent_session
                 and parent_session.get("archived")
+                and (job.get("enabled") or job.get("manual_run_pending"))
             ):
                 # Archiving is a durable pause boundary. Reconcile legacy job
                 # files written before that invariant existed before the
@@ -5345,6 +5352,10 @@ class JobStore:
                 job["enabled"] = False
                 job["next_run_at"] = None
                 job["scheduled_run_at"] = None
+                job["manual_run_pending"] = False
+                job.pop("manual_run_requested_at", None)
+                job.pop("manual_run_defer_reason", None)
+                job.pop("_last_manual_defer_event_at", None)
                 job["updated_at"] = now_iso()
                 changed = True
         if changed:
@@ -5425,6 +5436,7 @@ class JobStore:
             "last_run_at": None,
             "next_run_at": None,
             "run_count": 0,
+            "manual_run_pending": False,
         }
         if req.enabled:
             if first_run_at is not None:
@@ -5733,11 +5745,20 @@ class JobStore:
         async with self._lock:
             updated_at = now_iso()
             for job in self.jobs.values():
-                if job.get("session_id") != session_id or not job.get("enabled"):
+                if job.get("session_id") != session_id:
+                    continue
+                enabled = bool(job.get("enabled"))
+                manual_pending = bool(job.get("manual_run_pending"))
+                if not enabled and not manual_pending:
                     continue
                 job["enabled"] = False
                 job["next_run_at"] = None
                 job["scheduled_run_at"] = None
+                if manual_pending:
+                    job["manual_run_pending"] = False
+                    job.pop("manual_run_requested_at", None)
+                    job.pop("manual_run_defer_reason", None)
+                    job.pop("_last_manual_defer_event_at", None)
                 job["updated_at"] = updated_at
                 paused_jobs.append(dict(job))
             if not paused_jobs and not persist_unchanged:
@@ -5768,7 +5789,7 @@ class JobStore:
                 )
         return len(paused_jobs)
 
-    async def mark_ran(self, jid: str) -> None:
+    async def mark_ran(self, jid: str, *, manual: bool = False) -> None:
         async with self._lock:
             job = self.jobs.get(jid)
             if not job:
@@ -5780,7 +5801,16 @@ class JobStore:
                 or completed_at
             )
             job["last_run_at"] = now_iso()
-            job["last_scheduled_run_at"] = scheduled_at
+            if manual:
+                job["last_manual_run_at"] = job["last_run_at"]
+                job["manual_run_pending"] = False
+                job.pop("manual_run_requested_at", None)
+                job.pop("manual_run_defer_reason", None)
+                job.pop("_last_manual_defer_event_at", None)
+                job.pop("last_manual_run_error", None)
+                job.pop("last_manual_run_error_at", None)
+            else:
+                job["last_scheduled_run_at"] = scheduled_at
             job["run_count"] = int(job.get("run_count") or 0) + 1
             run_count = int(job.get("run_count") or 0)
             max_runs = job.get("max_runs")
@@ -5790,7 +5820,18 @@ class JobStore:
                 or bool(job.get("loop"))
                 or (job.get("interval_seconds") is not None and max_runs is not None and run_count < int(max_runs))
             )
-            if job.get("enabled") and recurring and not limit_reached:
+            # A manual run requested before the next occurrence is additive:
+            # it must not consume or move that future scheduled occurrence.
+            preserve_future_schedule = (
+                manual
+                and bool(job.get("enabled"))
+                and scheduled_at > completed_at
+                and recurring
+                and not limit_reached
+            )
+            if preserve_future_schedule:
+                pass
+            elif job.get("enabled") and recurring and not limit_reached:
                 next_occurrence = next_job_occurrence(
                     job,
                     max(scheduled_at, completed_at),
@@ -5833,7 +5874,113 @@ class JobStore:
                 "message": f"Scheduled job deferred: {event_job.get('title') or jid} — {reason}",
             })
 
-    async def run_job(self, jid: str) -> dict[str, Any]:
+    def _manual_run_deferred_result(
+        self,
+        jid: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        job = self.jobs.get(jid) or {}
+        title = str(job.get("title") or jid)
+        clean_reason = str(reason or "the chat is temporarily unavailable")
+        return {
+            "ok": True,
+            "job_id": jid,
+            "job": public_job(job),
+            "run_id": None,
+            "queued": True,
+            "deferred": True,
+            "manual_run_pending": True,
+            "message": (
+                f"Run now is queued for {title}: {clean_reason}. "
+                "It will start automatically when the chat is available."
+            ),
+        }
+
+    async def _record_manual_run_deferred(
+        self,
+        jid: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        deferred_job: dict[str, Any] | None = None
+        async with self._lock:
+            job = self.jobs.get(jid)
+            if not job:
+                raise HTTPException(status_code=404, detail="job not found")
+            if job.get("manual_run_pending"):
+                clean_reason = str(reason or "the chat is temporarily unavailable")
+                if job.get("manual_run_defer_reason") != clean_reason:
+                    job["manual_run_defer_reason"] = clean_reason
+                    job["updated_at"] = now_iso()
+                    now = time.time()
+                    last_emit = float(job.get("_last_manual_defer_event_at") or 0)
+                    if (
+                        JOB_DEFER_EVENT_MIN_SECONDS <= 0
+                        or now - last_emit >= JOB_DEFER_EVENT_MIN_SECONDS
+                    ):
+                        job["_last_manual_defer_event_at"] = now
+                        deferred_job = event_job(job)
+                    await self.save()
+        if deferred_job and deferred_job.get("session_id"):
+            try:
+                await append_event(str(deferred_job["session_id"]), "job_deferred", {
+                    "job": deferred_job,
+                    "job_id": jid,
+                    "message": (
+                        f"Manual run deferred: {deferred_job.get('title') or jid} "
+                        f"— {reason}"
+                    ),
+                })
+            except Exception as event_error:
+                logger.warning(
+                    "could not append manual job deferred event job=%s: %s",
+                    jid,
+                    concise_error_message(event_error),
+                )
+        return self._manual_run_deferred_result(jid, reason)
+
+    async def _clear_failed_manual_run(
+        self,
+        jid: str,
+        error: Exception,
+    ) -> None:
+        failed_job: dict[str, Any] | None = None
+        error_message = concise_error_message(error)
+        async with self._lock:
+            job = self.jobs.get(jid)
+            if not job or not job.get("manual_run_pending"):
+                return
+            job["manual_run_pending"] = False
+            job.pop("manual_run_requested_at", None)
+            job.pop("manual_run_defer_reason", None)
+            job.pop("_last_manual_defer_event_at", None)
+            job["last_manual_run_error"] = error_message
+            job["last_manual_run_error_at"] = now_iso()
+            job["updated_at"] = now_iso()
+            failed_job = event_job(job)
+            await self.save()
+        if failed_job and failed_job.get("session_id"):
+            try:
+                await append_event(str(failed_job["session_id"]), "job_error", {
+                    "job": failed_job,
+                    "job_id": jid,
+                    "message": (
+                        f"Manual run failed: {failed_job.get('title') or jid} "
+                        f"— {error_message}"
+                    ),
+                })
+            except Exception as event_error:
+                logger.warning(
+                    "could not append manual job error event job=%s: %s",
+                    jid,
+                    concise_error_message(event_error),
+                )
+
+    async def _start_job_run(
+        self,
+        jid: str,
+        *,
+        manual: bool,
+    ) -> dict[str, Any]:
         job = self.jobs.get(jid)
         if not job:
             raise HTTPException(status_code=404, detail="job not found")
@@ -5845,10 +5992,14 @@ class JobStore:
                 status_code=409,
                 detail="unarchive this chat before running scheduled jobs",
             )
-        scheduled_run_at = float(
-            job.get("scheduled_run_at")
-            or job.get("next_run_at")
-            or time.time()
+        scheduled_run_at = (
+            time.time()
+            if manual
+            else float(
+                job.get("scheduled_run_at")
+                or job.get("next_run_at")
+                or time.time()
+            )
         )
         req = TurnRequest(
             prompt=job["prompt"],
@@ -5866,17 +6017,162 @@ class JobStore:
             queue_if_busy=False,
             provider_context_mode=context_mode,
         )
-        await self.mark_ran(jid)
+        await self.mark_ran(jid, manual=manual)
         ran_job = public_job(self.jobs[jid])
         await append_event(session_id, "job_ran", {
             "job": ran_job,
             "job_id": jid,
             "run_id": result["run_id"],
             "job_scheduled_run_at": scheduled_run_at,
+            "manual_run": manual,
             "context_mode": context_mode,
-            "message": f"Scheduled job ran: {ran_job.get('title') or jid}",
+            "message": (
+                f"Scheduled job ran{' manually' if manual else ''}: "
+                f"{ran_job.get('title') or jid}"
+            ),
         })
         return result
+
+    async def run_job(self, jid: str) -> dict[str, Any]:
+        return await self._start_job_run(jid, manual=False)
+
+    async def _dispatch_pending_manual_run(
+        self,
+        jid: str,
+        *,
+        blocker_checked: bool = False,
+    ) -> dict[str, Any]:
+        job = self.jobs.get(jid)
+        if not job:
+            raise HTTPException(status_code=404, detail="job not found")
+        if not job.get("manual_run_pending"):
+            return {
+                "ok": True,
+                "job_id": jid,
+                "job": public_job(job),
+                "run_id": None,
+                "queued": False,
+                "deferred": False,
+                "manual_run_pending": False,
+                "message": "The pending manual run has already been admitted.",
+            }
+        if jid in self._manual_runs_in_flight:
+            return self._manual_run_deferred_result(
+                jid,
+                "manual run admission is already in progress",
+            )
+
+        # No await occurs between the membership check and add, so this is an
+        # atomic claim within the event loop. Persistence is the durable layer;
+        # this claim only coalesces concurrent dispatch attempts.
+        self._manual_runs_in_flight.add(jid)
+        try:
+            job = self.jobs.get(jid)
+            if not job:
+                raise HTTPException(status_code=404, detail="job not found")
+            session_id = str(job.get("session_id") or "")
+            parent_session = STORE.sessions.get(session_id)
+            if parent_session and parent_session.get("archived"):
+                await self.pause_for_session(session_id)
+                raise HTTPException(
+                    status_code=409,
+                    detail="unarchive this chat before running scheduled jobs",
+                )
+
+            try:
+                if not blocker_checked:
+                    blocker = await scheduled_job_blocker(session_id)
+                    if blocker:
+                        return await self._record_manual_run_deferred(jid, blocker)
+                result = await self._start_job_run(jid, manual=True)
+            except Exception as exc:
+                parent_session = STORE.sessions.get(session_id)
+                archived_rejection = (
+                    isinstance(exc, HTTPException)
+                    and exc.status_code == 409
+                    and "archiv" in str(exc.detail).lower()
+                )
+                if (
+                    (parent_session and parent_session.get("archived"))
+                    or archived_rejection
+                ):
+                    await self.pause_for_session(session_id)
+                    raise
+                if (
+                    isinstance(exc, HTTPException)
+                    and exc.status_code in {409, 423, 429, 503}
+                ):
+                    return await self._record_manual_run_deferred(
+                        jid,
+                        str(exc.detail or "the chat is temporarily unavailable"),
+                    )
+                await self._clear_failed_manual_run(jid, exc)
+                raise
+
+            return {
+                **result,
+                "ok": True,
+                "job_id": jid,
+                "job": public_job(self.jobs[jid]),
+                "queued": False,
+                "deferred": False,
+                "manual_run_pending": False,
+                "message": f"Run now started for {job.get('title') or jid}.",
+            }
+        finally:
+            self._manual_runs_in_flight.discard(jid)
+
+    async def request_manual_run(self, jid: str) -> dict[str, Any]:
+        job = self.jobs.get(jid)
+        if not job:
+            raise HTTPException(status_code=404, detail="job not found")
+        session_id = str(job.get("session_id") or "")
+        parent_session = STORE.sessions.get(session_id)
+        if parent_session and parent_session.get("archived"):
+            await self.pause_for_session(session_id)
+            raise HTTPException(
+                status_code=409,
+                detail="unarchive this chat before running scheduled jobs",
+            )
+
+        pending_event_job: dict[str, Any] | None = None
+        async with self._lock:
+            job = self.jobs.get(jid)
+            if not job:
+                raise HTTPException(status_code=404, detail="job not found")
+            if not job.get("manual_run_pending"):
+                job["manual_run_pending"] = True
+                job["manual_run_requested_at"] = now_iso()
+                job.pop("manual_run_defer_reason", None)
+                job.pop("_last_manual_defer_event_at", None)
+                job.pop("last_manual_run_error", None)
+                job.pop("last_manual_run_error_at", None)
+                job["updated_at"] = now_iso()
+                pending_event_job = event_job(job)
+                await self.save()
+
+        if pending_event_job and pending_event_job.get("session_id"):
+            try:
+                await append_event(
+                    str(pending_event_job["session_id"]),
+                    "job_updated",
+                    {
+                        "job": pending_event_job,
+                        "job_id": jid,
+                        "message": (
+                            "Manual run requested: "
+                            f"{pending_event_job.get('title') or jid}"
+                        ),
+                    },
+                )
+            except Exception as event_error:
+                logger.warning(
+                    "could not append manual job pending event job=%s: %s",
+                    jid,
+                    concise_error_message(event_error),
+                )
+
+        return await self._dispatch_pending_manual_run(jid)
 
     def start_scheduler(self) -> None:
         if self._scheduler_task is None or self._scheduler_task.done():
@@ -5889,12 +6185,18 @@ class JobStore:
             now = time.time()
             due = [
                 job["id"] for job in list(self.jobs.values())
-                if job.get("enabled") and job.get("next_run_at") and float(job["next_run_at"]) <= now
+                if job.get("manual_run_pending")
+                or (
+                    job.get("enabled")
+                    and job.get("next_run_at")
+                    and float(job["next_run_at"]) <= now
+                )
             ]
             for jid in due:
                 job = self.jobs.get(jid)
                 if not job:
                     continue
+                manual_run_pending = bool(job.get("manual_run_pending"))
                 job_session_id = str(job.get("session_id") or "")
                 if (
                     not job_session_id
@@ -5923,13 +6225,24 @@ class JobStore:
                     continue
                 blocker = await scheduled_job_blocker(job_session_id)
                 if blocker:
-                    await self.defer(jid, blocker, JOB_BUSY_RETRY_SECONDS)
+                    if manual_run_pending:
+                        await self._record_manual_run_deferred(jid, blocker)
+                    else:
+                        await self.defer(jid, blocker, JOB_BUSY_RETRY_SECONDS)
                     continue
                 # The blocker check yields. Archive/pause or a user edit may
                 # have changed this due item while it was in flight; never
                 # dispatch from the stale due-list snapshot.
                 job = self.jobs.get(jid)
-                if not job or not job.get("enabled"):
+                if not job:
+                    continue
+                manual_run_pending = bool(job.get("manual_run_pending"))
+                scheduled_run_due = bool(
+                    job.get("enabled")
+                    and job.get("next_run_at")
+                    and float(job["next_run_at"]) <= time.time()
+                )
+                if not manual_run_pending and not scheduled_run_due:
                     continue
                 if STORE.sessions[job_session_id].get("archived"):
                     try:
@@ -5942,7 +6255,13 @@ class JobStore:
                         )
                     continue
                 try:
-                    await self.run_job(jid)
+                    if manual_run_pending:
+                        await self._dispatch_pending_manual_run(
+                            jid,
+                            blocker_checked=True,
+                        )
+                    else:
+                        await self.run_job(jid)
                 except Exception as e:
                     parent_session = STORE.sessions.get(job_session_id)
                     archived_rejection = (
@@ -5962,6 +6281,14 @@ class JobStore:
                                 job_session_id,
                                 concise_error_message(exc),
                             )
+                        continue
+                    if manual_run_pending:
+                        logger.warning(
+                            "pending manual job %s failed permanently: %s",
+                            jid,
+                            e,
+                        )
+                        await self._clear_failed_manual_run(jid, e)
                         continue
                     logger.warning("scheduled job %s failed: %s", jid, e)
                     if job.get("session_id"):
@@ -27223,6 +27550,7 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
 
 def public_job(job: dict[str, Any]) -> dict[str, Any]:
     out = {k: v for k, v in job.items() if not str(k).startswith("_")}
+    out["manual_run_pending"] = bool(job.get("manual_run_pending"))
     out["schedule_kind"] = job_schedule_kind(out)
     out["context_mode"] = job_context_mode(out)
     out["timezone"] = str(out.get("timezone") or "UTC")
@@ -49468,7 +49796,7 @@ async def delete_agent_session_job(
 
 @app.post("/api/jobs/{job_id}/run")
 async def run_job(job_id: str) -> dict[str, Any]:
-    return await JOBS.run_job(job_id)
+    return await JOBS.request_manual_run(job_id)
 
 
 @app.websocket("/api/sessions/{session_id}/terminal/ws")

@@ -230,7 +230,7 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             display_title_snapshot="Target",
             source_text_start=0,
             source_text_end=6,
-            action="instruction",
+            action="route",
         )
         request = agent_server.TurnRequest(
             prompt="Target",
@@ -270,11 +270,18 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             agent_server.provider_cross_chat_route_snapshot_for_authority(
                 snapshot,
                 [explicit],
+                source_session_id="source",
             )
         )
-        self.assertNotIn(
-            "target",
-            {route["target_session_id"] for route in authority_snapshot},
+        target_routes = [
+            route
+            for route in authority_snapshot
+            if route["target_session_id"] == "target"
+        ]
+        self.assertEqual(len(target_routes), 1)
+        self.assertEqual(
+            target_routes[0]["route_kind"],
+            agent_server.PROVIDER_CROSS_CHAT_ROUTE_KIND_REFERENCE,
         )
         self.assertEqual(
             agent_server.provider_cross_chat_route_snapshot_for_authority(

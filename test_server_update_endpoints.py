@@ -425,13 +425,14 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                     "provider contexts."
                 ),
                 "action": None,
-                "version": 4,
+                "version": 5,
                 "context_modes": ["chat", "standalone"],
                 "default_context_mode": "chat",
                 "features": {
                     "chat_references": True,
-                    "direct_message_mentions": True,
+                    "direct_message_mentions": False,
                     "route_mentions": True,
+                    "route_hint_mentions": True,
                 },
             },
         )

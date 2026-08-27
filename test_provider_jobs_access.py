@@ -247,7 +247,7 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
             },
         ):
             response = await agent_server.health()
-        self.assertEqual(response["api_contract_version"], 18)
+        self.assertEqual(response["api_contract_version"], 19)
         self.assertEqual(
             response["capabilities"]["provider_jobs_access_control_v1"],
             {
@@ -778,7 +778,7 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
         route_id = "route_" + "a" * 32
         create = agent_server.AgentCreateScopedJobRequest(
             title="Escalate",
-            prompt="@@Target do work",
+            prompt="@Target do work",
             interval_seconds=300,
             chat_routes=[{
                 "route_id": route_id,
@@ -803,8 +803,8 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
             target_title="Mobile 📱",
         )
         request = self.provider_request(token, method="POST")
-        prompt = "Before 🧪 @@Mobile 📱 investigate"
-        marker = "@@Mobile 📱"
+        prompt = "Before 🧪 @Mobile 📱 investigate"
+        marker = "@Mobile 📱"
         marker_start = prompt.index(marker)
         create = AsyncMock(return_value={
             "id": "job_routed",
@@ -1065,7 +1065,7 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
         })
         req = agent_server.AgentCreateScopedJobRequest(
             title="Escalate",
-            prompt="@@Target do work",
+            prompt="@Target do work",
             interval_seconds=300,
             chat_routes=[{
                 "route_id": route["route_id"],
@@ -1094,7 +1094,7 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
         request = self.provider_request(token, method="POST")
         req = agent_server.AgentCreateScopedJobRequest(
             title="Retry safe route",
-            prompt="@@Target do work",
+            prompt="@Target do work",
             interval_seconds=300,
             chat_routes=[{
                 "route_id": route["route_id"],
@@ -1164,7 +1164,7 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
         create = AsyncMock(return_value=committed_job)
         req = agent_server.AgentCreateScopedJobRequest(
             title="Committed route",
-            prompt="@@Target do work",
+            prompt="@Target do work",
             interval_seconds=300,
             chat_routes=[{
                 "route_id": route["route_id"],
@@ -1220,7 +1220,7 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
         create = AsyncMock(return_value=self.routed_job(reference))
         req = agent_server.AgentCreateScopedJobRequest(
             title="Committed route",
-            prompt="@@Target do work",
+            prompt="@Target do work",
             interval_seconds=300,
             chat_routes=[{
                 "route_id": route["route_id"],
@@ -1274,7 +1274,7 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
         agent_server.JOBS.jobs[job["id"]] = job
         request = self.provider_request(token, method="PATCH")
         req = agent_server.AgentUpdateJobRequest(
-            prompt="@@Replacement take over",
+            prompt="@Replacement take over",
             chat_routes=[{
                 "route_id": route["route_id"],
                 "action": "instruction",
@@ -1481,7 +1481,7 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
                 "source",
                 job["id"],
                 agent_server.AgentUpdateJobRequest(
-                    prompt="@@Replacement take over",
+                    prompt="@Replacement take over",
                     chat_routes=[{
                         "route_id": route["route_id"],
                         "action": "request_reply",
@@ -1565,7 +1565,7 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
             provider_route_snapshot=[ambient_route],
         )
 
-        self.assertIn("include the exact `@@title` in the job prompt", block)
+        self.assertIn("include the exact `@title` in the job prompt", block)
         self.assertIn(
             "--chat-route ROUTE_ID",
             block,

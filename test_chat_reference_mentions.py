@@ -24,17 +24,24 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
             },
         }
 
-    def reference(self, action: str) -> agent_server.ChatReference:
-        marker = "@@Target" if action == "route" else "@Target"
+    def reference(
+        self,
+        action: str = "route",
+        *,
+        marker: str = "@Target",
+        route_action: str | None = None,
+        start: int = 0,
+    ) -> agent_server.ChatReference:
         return agent_server.ChatReference(
             session_id="target-private-id",
             display_title_snapshot="Target",
-            source_text_start=0,
-            source_text_end=len(marker),
+            source_text_start=start,
+            source_text_end=start + len(marker),
             action=action,
+            route_action=route_action,
         )
 
-    def test_direct_and_route_mentions_require_distinct_exact_sigils(self) -> None:
+    def test_single_at_is_current_route_and_legacy_values_normalize_safely(self) -> None:
         with (
             patch.object(agent_server, "AGENT_TOKEN", "token"),
             patch.object(agent_server.STORE, "sessions", self.sessions),
@@ -44,41 +51,43 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
                 return_value=[agent_server.CODEX_INTERACTIVE_CLIENT_CAPABILITY],
             ),
         ):
-            direct = self.reference("direct_message")
-            route = self.reference("route")
-            self.assertEqual(
-                agent_server.validate_chat_references(
-                    "source-private-id", "@Target do it", [direct]
-                ),
-                [direct],
+            current = agent_server.validate_chat_references(
+                "source-private-id", "@Target do it", [self.reference()]
             )
-            self.assertEqual(
-                agent_server.validate_chat_references(
-                    "source-private-id", "@@Target ask it", [route]
-                ),
-                [route],
+            legacy_direct = agent_server.validate_chat_references(
+                "source-private-id",
+                "@Target do it",
+                [self.reference("direct_message")],
             )
-            with self.assertRaisesRegex(HTTPException, "does not match"):
-                agent_server.validate_chat_references(
-                    "source-private-id", "@@Target do it", [direct]
-                )
-            with self.assertRaisesRegex(HTTPException, "does not match"):
-                agent_server.validate_chat_references(
-                    "source-private-id", "@Target ask it", [route]
-                )
+            legacy_route = agent_server.validate_chat_references(
+                "source-private-id",
+                "@@Target ask it",
+                [self.reference("route", marker="@@Target")],
+            )
+        self.assertEqual(current[0].action, "route")
+        self.assertEqual(legacy_direct[0].action, "route")
+        self.assertEqual(legacy_route[0].action, "route")
+        self.assertEqual(agent_server.chat_reference_marker(legacy_route[0]), "@Target")
 
-    def test_direct_message_rejects_a_prompt_larger_than_the_handoff_limit(self) -> None:
+    def test_legacy_direct_large_prompt_is_only_a_route_hint(self) -> None:
         prompt = "@Target " + (
             "x" * agent_server.CROSS_CHAT_HANDOFF_BODY_MAX_CHARS
         )
-        with patch.object(agent_server, "AGENT_TOKEN", "token"):
-            with self.assertRaises(HTTPException) as raised:
-                agent_server.validate_chat_references(
-                    "source-private-id",
-                    prompt,
-                    [self.reference("direct_message")],
-                )
-        self.assertEqual(raised.exception.status_code, 413)
+        with (
+            patch.object(agent_server, "AGENT_TOKEN", "token"),
+            patch.object(agent_server.STORE, "sessions", self.sessions),
+            patch.object(
+                agent_server,
+                "cross_chat_delivery_client_capabilities",
+                return_value=[agent_server.CODEX_INTERACTIVE_CLIENT_CAPABILITY],
+            ),
+        ):
+            normalized = agent_server.validate_chat_references(
+                "source-private-id",
+                prompt,
+                [self.reference("direct_message")],
+            )
+        self.assertEqual(normalized[0].action, "route")
 
     def test_route_reference_becomes_a_fresh_opaque_run_route(self) -> None:
         route_reference = self.reference("route")
@@ -116,12 +125,14 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
                 {"agent_cross_chat_routes"},
                 provider_route_snapshot=first,
             )
-        self.assertIn("@@ reference 1", block)
+        self.assertIn("@ route hint 1", block)
         self.assertIn(first[0]["route_id"], block)
         self.assertNotIn("target-private-id", block)
-        self.assertIn("do not send anything by themselves", block)
+        self.assertIn("never auto-sends the source prompt", block)
+        self.assertIn("Decide whether to use", block)
+        self.assertIn("or no cross-chat contact", block)
 
-    def test_direct_mention_keeps_ambient_access_while_route_replaces_it(self) -> None:
+    def test_legacy_direct_and_current_route_both_become_optional_hints(self) -> None:
         ambient = {
             "route_id": "route_" + ("1" * 32),
             "revision": "rev_" + ("2" * 32),
@@ -152,7 +163,14 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
                     source_session_id="source-private-id",
                 )
             )
-        self.assertEqual(direct_routes, [ambient])
+        self.assertEqual(len(direct_routes), 1)
+        self.assertEqual(
+            direct_routes[0]["route_kind"],
+            agent_server.PROVIDER_CROSS_CHAT_ROUTE_KIND_REFERENCE,
+        )
+        self.assertEqual(
+            direct_routes[0]["actions"], ["instruction", "request_reply"]
+        )
         self.assertEqual(len(explicit_routes), 1)
         self.assertEqual(
             explicit_routes[0]["route_kind"],
@@ -163,7 +181,7 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
             "target-private-id",
         )
 
-    def test_provider_job_route_conversion_persists_double_at_route(self) -> None:
+    def test_provider_job_route_conversion_requires_and_persists_single_at(self) -> None:
         issued = {
             "route_id": "route_" + ("1" * 32),
             "revision": "rev_" + ("2" * 32),
@@ -194,16 +212,32 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
             references = agent_server.provider_job_chat_references(
                 capability,
                 "source-private-id",
-                "@@Target check later",
+                "@Target check later",
                 [selection],
             )
         self.assertEqual(len(references), 1)
         self.assertEqual(references[0].action, "route")
         self.assertEqual(
-            agent_server.chat_reference_marker(references[0]), "@@Target"
+            agent_server.chat_reference_marker(references[0]), "@Target"
         )
+        with (
+            patch.object(agent_server, "AGENT_TOKEN", "token"),
+            patch.object(agent_server.STORE, "sessions", self.sessions),
+            patch.object(
+                agent_server,
+                "cross_chat_target_backend_supported",
+                return_value=True,
+            ),
+        ):
+            with self.assertRaisesRegex(HTTPException, "must include"):
+                agent_server.provider_job_chat_references(
+                    capability,
+                    "source-private-id",
+                    "@@Target check later",
+                    [selection],
+                )
 
-    async def test_direct_registration_creates_effect_but_route_does_not(self) -> None:
+    async def test_legacy_direct_registration_is_a_noop(self) -> None:
         original_cross_chat = agent_server.CROSS_CHAT
         original_cache = agent_server.CROSS_CHAT_EVENT_TYPE_CACHE
         with tempfile.TemporaryDirectory() as temporary:
@@ -219,270 +253,191 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
                     "@Target please handle this",
                     [self.reference("direct_message"), self.reference("route")],
                 )
-                self.assertEqual(len(direct_ids), 1)
-                record = await agent_server.CROSS_CHAT.get(direct_ids[0])
-                self.assertEqual(record["status"], "waiting_admission")
-                self.assertEqual(record["target_session_id"], "target-private-id")
-                self.assertEqual(record["body"], "@Target please handle this")
+                self.assertEqual(direct_ids, [])
+                self.assertEqual(await agent_server.CROSS_CHAT.recoverable(), [])
             finally:
                 agent_server.CROSS_CHAT = original_cross_chat
                 agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = original_cache
 
-    async def test_admission_atomically_promotes_and_schedules_direct_messages(self) -> None:
-        original_cross_chat = agent_server.CROSS_CHAT
-        original_cache = agent_server.CROSS_CHAT_EVENT_TYPE_CACHE
-        with tempfile.TemporaryDirectory() as temporary:
-            agent_server.CROSS_CHAT = agent_server.CrossChatStore(
-                Path(temporary) / "cross-chat.sqlite3"
+    def test_dual_beta_mentions_collapse_but_current_duplicates_fail(self) -> None:
+        prompt = "@Target then @@Target"
+        legacy_direct = self.reference("direct_message")
+        legacy_route = self.reference("route", marker="@@Target", start=13)
+        with (
+            patch.object(agent_server, "AGENT_TOKEN", "token"),
+            patch.object(agent_server.STORE, "sessions", self.sessions),
+            patch.object(
+                agent_server,
+                "cross_chat_delivery_client_capabilities",
+                return_value=[agent_server.CODEX_INTERACTIVE_CLIENT_CAPABILITY],
+            ),
+        ):
+            collapsed = agent_server.validate_chat_references(
+                "source-private-id", prompt, [legacy_direct, legacy_route]
             )
-            agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = agent_server.OrderedDict()
-            await agent_server.CROSS_CHAT.initialize()
-            try:
-                direct_ids = await agent_server.register_direct_message_handoffs(
-                    "source-private-id",
-                    "run_direct",
-                    "@Target please handle this",
-                    [self.reference("direct_message")],
-                )
-                schedule = Mock()
-                with patch.object(
-                    agent_server,
-                    "schedule_direct_message_handoffs_after_unlock",
-                    schedule,
-                ):
-                    await agent_server.admit_direct_message_handoffs(
-                        "source-private-id",
-                        "run_direct",
-                        direct_ids,
-                    )
-                record = await agent_server.CROSS_CHAT.get(direct_ids[0])
-                self.assertEqual(record["status"], "ready")
-                schedule.assert_called_once_with(
-                    "source-private-id",
-                    direct_ids,
-                )
-            finally:
-                agent_server.CROSS_CHAT = original_cross_chat
-                agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = original_cache
+            self.assertEqual(len(collapsed), 1)
+            self.assertEqual(collapsed[0].action, "route")
+            self.assertEqual(collapsed[0].source_text_start, 0)
 
-    async def test_cancel_after_fsynced_turn_start_still_admits_direct_message(self) -> None:
-        original_cross_chat = agent_server.CROSS_CHAT
-        original_cache = agent_server.CROSS_CHAT_EVENT_TYPE_CACHE
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            event_path = root / "source-private-id.jsonl"
-            agent_server.CROSS_CHAT = agent_server.CrossChatStore(
-                root / "cross-chat.sqlite3"
+            with self.assertRaisesRegex(HTTPException, "duplicate"):
+                agent_server.validate_chat_references(
+                    "source-private-id",
+                    "@Target then @Target",
+                    [self.reference(), self.reference(start=13)],
+                )
+
+    async def test_job_store_load_collapses_dual_legacy_target(self) -> None:
+        prompt = "@Target then @@Target"
+        raw_direct = agent_server.chat_reference_dict(
+            self.reference("direct_message")
+        )
+        raw_route = agent_server.chat_reference_dict(
+            self.reference(
+                "route",
+                marker="@@Target",
+                route_action="instruction",
+                start=13,
             )
-            agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = agent_server.OrderedDict()
-            await agent_server.CROSS_CHAT.initialize()
-            try:
-                direct_ids = await agent_server.register_direct_message_handoffs(
-                    "source-private-id",
-                    "run_direct",
-                    "@Target please handle this",
-                    [self.reference("direct_message")],
-                )
-                metadata_entered = asyncio.Event()
-                release_metadata = asyncio.Event()
-
-                async def delayed_metadata(_session_id: str, _event: dict) -> None:
-                    metadata_entered.set()
-                    await release_metadata.wait()
-
-                async def commit_boundary() -> dict:
-                    event = await agent_server.append_durable_event(
-                        "source-private-id",
-                        "turn_started",
-                        {"run_id": "run_direct"},
-                    )
-                    await agent_server.admit_direct_message_handoffs(
-                        "source-private-id",
-                        "run_direct",
-                        direct_ids,
-                    )
-                    return event
-
-                schedule = Mock()
-                with (
-                    patch.object(
-                        agent_server,
-                        "events_path",
-                        return_value=event_path,
-                    ),
-                    patch.object(
-                        agent_server,
-                        "update_session_event_metadata",
-                        side_effect=delayed_metadata,
-                    ),
-                    patch.object(
-                        agent_server.HUB,
-                        "broadcast",
-                        new_callable=AsyncMock,
-                    ),
-                    patch.object(
-                        agent_server,
-                        "schedule_direct_message_handoffs_after_unlock",
-                        schedule,
-                    ),
-                ):
-                    task = asyncio.create_task(commit_boundary())
-                    await asyncio.wait_for(metadata_entered.wait(), timeout=2)
-                    task.cancel()
-                    await asyncio.sleep(0)
-                    release_metadata.set()
-                    event = await asyncio.wait_for(task, timeout=2)
-                    source_started, _source_terminal = (
-                        agent_server.cross_chat_source_run_state(
-                            "source-private-id",
-                            "run_direct",
-                        )
-                    )
-
-                self.assertEqual(event["type"], "turn_started")
-                self.assertEqual(source_started["run_id"], "run_direct")
-                record = await agent_server.CROSS_CHAT.get(direct_ids[0])
-                self.assertEqual(record["status"], "ready")
-                schedule.assert_called_once_with(
-                    "source-private-id",
-                    direct_ids,
-                )
-            finally:
-                agent_server.CROSS_CHAT = original_cross_chat
-                agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = original_cache
-
-    async def test_recovery_never_dispatches_an_unadmitted_direct_message(self) -> None:
-        original_cross_chat = agent_server.CROSS_CHAT
-        original_cache = agent_server.CROSS_CHAT_EVENT_TYPE_CACHE
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            agent_server.CROSS_CHAT = agent_server.CrossChatStore(
-                root / "cross-chat.sqlite3"
-            )
-            agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = agent_server.OrderedDict()
-            await agent_server.CROSS_CHAT.initialize()
-            try:
-                direct_ids = await agent_server.register_direct_message_handoffs(
-                    "source-private-id",
-                    "run_direct",
-                    "@Target please handle this",
-                    [self.reference("direct_message")],
-                )
-                submit = AsyncMock()
-                with (
-                    patch.object(agent_server.STORE, "sessions", self.sessions),
-                    patch.object(
-                        agent_server,
-                        "events_path",
-                        side_effect=lambda session_id: root / f"{session_id}.jsonl",
-                    ),
-                    patch.object(
-                        agent_server,
-                        "append_cross_chat_terminal_lifecycle",
-                        AsyncMock(),
-                    ),
-                    patch.object(
-                        agent_server,
-                        "submit_cross_chat_delivery",
-                        submit,
-                    ),
-                ):
-                    await agent_server.reconcile_cross_chat_handoffs()
-                record = await agent_server.CROSS_CHAT.get(direct_ids[0])
-                self.assertEqual(record["status"], "failed")
-                submit.assert_not_awaited()
-            finally:
-                agent_server.CROSS_CHAT = original_cross_chat
-                agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = original_cache
-
-    async def test_recovery_dispatches_direct_message_only_after_durable_admission(self) -> None:
-        original_cross_chat = agent_server.CROSS_CHAT
-        original_cache = agent_server.CROSS_CHAT_EVENT_TYPE_CACHE
-        original_locks = agent_server.SESSION_LIFECYCLE_LOCKS
-        original_tasks = agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS
-        original_tasks_by_envelope = (
-            agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE
         )
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            agent_server.CROSS_CHAT = agent_server.CrossChatStore(
-                root / "cross-chat.sqlite3"
+            jobs_file = Path(temporary) / "jobs.json"
+            jobs_file.write_text(
+                agent_server.json.dumps({
+                    "job_legacy": {
+                        "id": "job_legacy",
+                        "session_id": "source-private-id",
+                        "title": "Legacy",
+                        "prompt": prompt,
+                        "chat_references": [raw_direct, raw_route],
+                        "enabled": False,
+                        "next_run_at": None,
+                    }
+                }),
+                encoding="utf-8",
             )
-            agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = agent_server.OrderedDict()
-            agent_server.SESSION_LIFECYCLE_LOCKS = {}
-            agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS = set()
-            agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE = {}
-            await agent_server.CROSS_CHAT.initialize()
-            try:
-                direct_ids = await agent_server.register_direct_message_handoffs(
-                    "source-private-id",
-                    "run_direct",
-                    "@Target please handle this",
-                    [self.reference("direct_message")],
-                )
-                (root / "source-private-id.jsonl").write_text(
-                    '{"type":"turn_started","run_id":"run_direct"}\n',
-                    encoding="utf-8",
-                )
-                attempts = 0
+            store = agent_server.JobStore()
+            with patch.object(agent_server, "JOBS_FILE", jobs_file):
+                await store.load()
+            references = store.jobs["job_legacy"]["chat_references"]
+        self.assertEqual(len(references), 1)
+        self.assertEqual(references[0]["action"], "route")
+        self.assertEqual(references[0]["route_action"], "instruction")
+        self.assertEqual(references[0]["source_text_start"], 13)
 
-                async def transient_then_start(record: dict) -> dict:
-                    nonlocal attempts
-                    attempts += 1
-                    if attempts == 1:
-                        raise RuntimeError("target temporarily busy")
-                    updated = await agent_server.CROSS_CHAT.update(
-                        str(record["id"]),
-                        expected={"ready"},
-                        status="running",
-                        target_run_id="run_target",
-                    )
-                    assert updated is not None
-                    return updated
+    async def test_store_initialize_quarantines_only_legacy_raw_direct_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "cross-chat.sqlite3"
+            store = agent_server.CrossChatStore(path)
+            await store.initialize()
+            legacy, _ = await store.create_instruction(
+                envelope_id="handoff_legacy",
+                source_session_id="source-private-id",
+                source_run_id="run_legacy",
+                target_session_id="target-private-id",
+                body="raw source prompt",
+                idempotency_key="direct:0:target-private-id",
+            )
+            configured, _ = await store.create_instruction(
+                envelope_id="handoff_configured",
+                source_session_id="source-private-id",
+                source_run_id="run_configured",
+                target_session_id="target-private-id",
+                body="agent prepared message",
+                idempotency_key="configured-send-key",
+                authorization_kind="configured_route",
+                authorization_route_id="route_" + ("1" * 32),
+            )
+            self.assertEqual(legacy["status"], "ready")
+            self.assertEqual(configured["status"], "ready")
+            restarted = agent_server.CrossChatStore(path)
+            await restarted.initialize()
+            self.assertEqual(
+                (await restarted.get("handoff_legacy"))["status"], "failed"
+            )
+            self.assertEqual(
+                (await restarted.get("handoff_configured"))["status"], "ready"
+            )
 
-                submit = AsyncMock(side_effect=transient_then_start)
-                with (
-                    patch.object(agent_server.STORE, "sessions", self.sessions),
-                    patch.object(
-                        agent_server,
-                        "events_path",
-                        side_effect=lambda session_id: root / f"{session_id}.jsonl",
-                    ),
-                    patch.object(
-                        agent_server,
-                        "append_cross_chat_terminal_lifecycle",
-                        AsyncMock(),
-                    ),
-                    patch.object(
-                        agent_server,
-                        "submit_cross_chat_delivery",
-                        submit,
-                    ),
-                    patch.object(
-                        agent_server,
-                        "CROSS_CHAT_DIRECT_RETRY_DELAYS_SECONDS",
-                        (0.0,),
-                    ),
-                ):
-                    await agent_server.reconcile_cross_chat_handoffs()
-                    await asyncio.gather(
-                        *tuple(agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS)
-                    )
-                record = await agent_server.CROSS_CHAT.get(direct_ids[0])
-                self.assertEqual(record["status"], "running")
-                self.assertEqual(submit.await_count, 2)
-                self.assertEqual(
-                    submit.await_args.args[0]["id"],
-                    direct_ids[0],
-                )
-            finally:
-                agent_server.CROSS_CHAT = original_cross_chat
-                agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = original_cache
-                agent_server.SESSION_LIFECYCLE_LOCKS = original_locks
-                agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS = original_tasks
-                agent_server.CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE = (
-                    original_tasks_by_envelope
-                )
+    async def test_legacy_reconcile_cancels_queue_and_fails_ownerless_submit(self) -> None:
+        base = {
+            "kind": "instruction",
+            "authorization_kind": "explicit_prompt",
+            "idempotency_key": "direct:0:target-private-id",
+            "target_session_id": "target-private-id",
+        }
+        queued = {**base, "id": "handoff_queued", "status": "queued"}
+        cancel = AsyncMock(return_value={**queued, "status": "cancelled"})
+        with patch.object(
+            agent_server,
+            "cancel_queued_cross_chat_handoff",
+            cancel,
+        ):
+            await agent_server.reconcile_legacy_raw_direct_message_envelope(
+                queued
+            )
+        cancel.assert_awaited_once_with("handoff_queued")
+
+        submitting = {
+            **base,
+            "id": "handoff_submitting",
+            "status": "submitting",
+        }
+        failed = {**submitting, "status": "failed"}
+        update = AsyncMock(return_value=failed)
+        with (
+            patch.object(agent_server.CROSS_CHAT, "update", update),
+            patch.object(
+                agent_server,
+                "live_cross_chat_delivery_state",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(
+                agent_server,
+                "cross_chat_delivery_state",
+                Mock(return_value=None),
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_terminal_lifecycle",
+                AsyncMock(),
+            ),
+        ):
+            await agent_server.reconcile_legacy_raw_direct_message_envelope(
+                submitting
+            )
+        self.assertEqual(update.await_args.kwargs["status"], "failed")
+
+    async def test_legacy_reconcile_never_submits_and_preserves_live_owner(self) -> None:
+        ready = {
+            "id": "handoff_ready",
+            "kind": "instruction",
+            "authorization_kind": "explicit_prompt",
+            "idempotency_key": "direct:0:target-private-id",
+            "status": "ready",
+            "target_session_id": "target-private-id",
+        }
+        running = {**ready, "id": "handoff_running", "status": "running"}
+        failed = {**ready, "status": "failed"}
+        submit = AsyncMock()
+        update = AsyncMock(side_effect=[failed, running])
+        with (
+            patch.object(agent_server.CROSS_CHAT, "pending_terminal_lifecycle", AsyncMock(return_value=[])),
+            patch.object(agent_server.CROSS_CHAT, "recoverable", AsyncMock(return_value=[ready, running])),
+            patch.object(agent_server.CROSS_CHAT, "update", update),
+            patch.object(agent_server.CROSS_CHAT, "get", AsyncMock(return_value=running)),
+            patch.object(agent_server, "append_cross_chat_terminal_lifecycle", AsyncMock()),
+            patch.object(
+                agent_server,
+                "live_cross_chat_delivery_state",
+                AsyncMock(return_value={"status": "running", "target_run_id": "run_target"}),
+            ),
+            patch.object(agent_server, "submit_cross_chat_delivery", submit),
+        ):
+            recovered = await agent_server.reconcile_cross_chat_handoffs()
+        self.assertEqual(recovered, 2)
+        submit.assert_not_awaited()
+        self.assertEqual(update.await_args_list[0].kwargs["status"], "failed")
+        self.assertEqual(update.await_args_list[1].kwargs["status"], "running")
 
     async def test_direct_dispatch_waits_until_source_lock_is_released(self) -> None:
         source_id = "source-private-id"
@@ -821,10 +776,12 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             capability = agent_server.cross_chat_handoffs_capability()
-        self.assertEqual(capability["version"], 5)
-        self.assertEqual(capability["default_action"], "direct_message")
-        self.assertIn("direct_message", capability["actions"])
+        self.assertEqual(capability["version"], 6)
+        self.assertEqual(capability["default_action"], "route")
+        self.assertNotIn("direct_message", capability["actions"])
         self.assertIn("route", capability["actions"])
+        self.assertTrue(capability["features"]["route_hint_mentions"])
+        self.assertFalse(capability["features"]["direct_message_mentions"])
 
 
 if __name__ == "__main__":

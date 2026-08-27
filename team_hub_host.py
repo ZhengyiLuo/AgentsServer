@@ -309,11 +309,27 @@ class ManagedTeamHubHost:
                 )
             except Exception as exc:
                 self.logger.error(
-                    "secure peer host attachment failed error_type=%s",
+                    "secure peer host attachment failed error_type=%s error_code=%s",
                     type(exc).__name__,
+                    getattr(exc, "code", "secure_peer_host_recovery_failed"),
+                )
+                error_code = str(
+                    getattr(exc, "code", "secure_peer_host_recovery_failed")
                 )
                 self.secure_peer_manager.mark_host_unavailable(
-                    "The secure peer host could not be initialized."
+                    (
+                        "An existing secure peer connection could not be "
+                        "reconciled safely."
+                        if error_code == "peer_identity_conflict"
+                        else "The secure peer host could not finish recovery."
+                    ),
+                    error_code=error_code,
+                    action=(
+                        "Review or remove the conflicting logical server "
+                        "connection, then retry host recovery."
+                        if error_code == "peer_identity_conflict"
+                        else "Retry after the Team Hub database is available."
+                    ),
                 )
 
     def capability(self) -> dict[str, Any]:

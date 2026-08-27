@@ -70,6 +70,9 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
             },
             display_name=self.peer.peer_display_name,
         )
+        # Direct adapter tests bypass the gateway callback that records an
+        # authenticated heartbeat before forwarding each request.
+        self.adapter.record_peer_heartbeat(self.peer_id, self.team_id)
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -272,6 +275,57 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
             ).fetchone()
             assert status is not None
             self.assertEqual(status["status"], "suspended")
+        finally:
+            connection.close()
+
+    def test_provisioning_does_not_claim_transport_presence(self) -> None:
+        peer_id = str(uuid.uuid4())
+        self.store.ensure_secure_peer_service(
+            peer_id=peer_id,
+            peer_server_identity="provisioned-offline-peer",
+            team_id=self.team_id,
+            display_name="Provisioned offline peer",
+        )
+        # Replaying startup projection is also not a heartbeat.
+        self.store.ensure_secure_peer_service(
+            peer_id=peer_id,
+            peer_server_identity="provisioned-offline-peer",
+            team_id=self.team_id,
+            display_name="Provisioned offline peer",
+        )
+        connection = self.store.connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT n.status,n.last_seen_at,n.display_name
+                FROM nodes AS n JOIN network_peer_bindings AS b
+                  ON b.team_id=n.team_id AND b.node_id=n.id
+                WHERE b.peer_id=?
+                """,
+                (peer_id,),
+            ).fetchone()
+            assert row is not None
+            self.assertEqual(row["status"], "offline")
+            self.assertIsNone(row["last_seen_at"])
+            self.assertEqual(row["display_name"], "Provisioned offline peer")
+        finally:
+            connection.close()
+
+        self.adapter.record_peer_heartbeat(peer_id, self.team_id)
+        connection = self.store.connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT n.status,n.last_seen_at
+                FROM nodes AS n JOIN network_peer_bindings AS b
+                  ON b.team_id=n.team_id AND b.node_id=n.id
+                WHERE b.peer_id=?
+                """,
+                (peer_id,),
+            ).fetchone()
+            assert row is not None
+            self.assertEqual(row["status"], "active")
+            self.assertIsInstance(row["last_seen_at"], int)
         finally:
             connection.close()
 
@@ -1006,6 +1060,7 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
             team_id=self.team_id,
             display_name="Other paired server",
         )
+        self.adapter.record_peer_heartbeat(other_peer_id, self.team_id)
         other_claims = self.store.secure_peer_claims(
             peer_id=other_peer_id,
             peer_server_identity="other-peer-server-identity",

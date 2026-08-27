@@ -323,6 +323,68 @@ class SecurePeerStoreTests(unittest.TestCase):
         self.assertEqual(routes[0]["route_id"], local_route["route_id"])
         self.assertEqual(routes[0]["status"], "revoked")
 
+    def test_publish_rechecks_authenticated_peer_after_revoke_commits(self) -> None:
+        _key, _submitted, _approved, authenticated_peer = self.approve_peer()
+        route_id = _uuid()
+        original_require_cross_chat = self.store._require_cross_chat
+        revoke_results: list[dict] = []
+
+        def revoke_after_preflight(
+            peer: PeerAuthorization | None = None,
+            *,
+            connection=None,
+        ) -> int:
+            epoch = original_require_cross_chat(peer, connection=connection)
+            if (
+                peer is authenticated_peer
+                and connection is None
+                and not revoke_results
+            ):
+                revoke_results.append(
+                    self.store.revoke_peer(
+                        authenticated_peer.peer_id,
+                        authenticated_peer.team_id,
+                        authenticated_peer.certificate_fingerprint,
+                        _uuid(),
+                        "owner-admin",
+                    )
+                )
+            return epoch
+
+        with mock.patch.object(
+            self.store,
+            "_require_cross_chat",
+            side_effect=revoke_after_preflight,
+        ):
+            with self.assertRaises(SecurePeerError) as denied:
+                self.store.publish_peer_route(
+                    authenticated_peer,
+                    {
+                        "route_id": route_id,
+                        "revision": "rev_" + uuid.uuid4().hex,
+                        "alias": "revoked-race",
+                        "display_title": "Revoked race",
+                        "actions": ["instruction"],
+                    },
+                )
+
+        self.assertEqual(revoke_results[0]["status"], "revoked")
+        self.assertEqual(denied.exception.code, "peer_revoked")
+        connection = self.store._connect()
+        try:
+            active = connection.execute(
+                """SELECT COUNT(*) AS count FROM peer_routes
+                WHERE peer_id=? AND status='active'""",
+                (authenticated_peer.peer_id,),
+            ).fetchone()
+            route = connection.execute(
+                "SELECT id FROM peer_routes WHERE id=?", (route_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(int(active["count"]), 0)
+        self.assertIsNone(route)
+
     def test_reapproval_atomically_supersedes_all_old_peer_authority(self) -> None:
         _key, submitted, approved, peer = self.approve_peer()
         certificate = x509.load_pem_x509_certificate(
@@ -2027,6 +2089,126 @@ class SecurePeerLiveTLSTests(unittest.TestCase):
             paired["certificate_fingerprint"],
         )
         self.client.peer_health(paired["connection_id"])
+
+    def test_superseded_certificate_can_revoke_forget_and_cleanly_repair(self) -> None:
+        paired = self.pair_and_approve()
+        connection_id = paired["connection_id"]
+        self.gateway.relay_enabled = True
+        self.gateway.peer_revoker = self.store.revoke_peer_for_self
+        self.client.peer_health(connection_id)
+        self.client.set_active_connection(connection_id, expected_current=None)
+        route = self.client.publish_route(
+            connection_id,
+            "chat-to-forget",
+            "forgetme",
+            "Forget me",
+            ["instruction"],
+        )
+
+        # Simulate the exact response-loss boundary: the host activated the new
+        # certificate, while the client still has the old certificate selected.
+        now = int(time.time())
+        host_db = self.store._connect()
+        try:
+            host_db.execute(
+                "UPDATE peer_certificates SET expires_at=? WHERE fingerprint=?",
+                (now + 60, paired["certificate_fingerprint"]),
+            )
+        finally:
+            host_db.close()
+        client_db = self.client._connect()
+        try:
+            client_db.execute(
+                "UPDATE client_connections SET certificate_expires_at=? WHERE connection_id=?",
+                (now + 60, connection_id),
+            )
+        finally:
+            client_db.close()
+
+        original_decode = self.client._decode_json_response
+        calls = 0
+
+        def lose_activation_response(status, headers, body):
+            nonlocal calls
+            value = original_decode(status, headers, body)
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("activation response lost")
+            return value
+
+        with mock.patch.object(
+            self.client,
+            "_decode_json_response",
+            side_effect=lose_activation_response,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "activation response lost"):
+                self.client.renew_if_due(connection_id)
+
+        self.assertEqual(
+            self.client.remote_revocation_status(connection_id)["status"],
+            "active",
+        )
+        operation_id = _uuid()
+        first = self.client.revoke_remote_connection(
+            connection_id,
+            idempotency_key=operation_id,
+        )
+        repeated = self.client.revoke_remote_connection(
+            connection_id,
+            idempotency_key=operation_id,
+        )
+        self.assertEqual(first, repeated)
+        self.assertTrue(first["acknowledged"])
+        self.assertEqual(
+            first["presented_certificate_fingerprint"],
+            paired["certificate_fingerprint"],
+        )
+        self.assertEqual(
+            self.client.remote_revocation_status(connection_id)["status"],
+            "revoked",
+        )
+        host_routes = self.store.list_remote_routes_for_peer(paired["peer_id"])
+        self.assertEqual(len(host_routes), 1)
+        self.assertEqual(host_routes[0]["route_id"], route["route_id"])
+        self.assertEqual(host_routes[0]["status"], "revoked")
+
+        self.client.retire_remote_revoked_connection(
+            connection_id,
+            expected_host_server_identity=paired["host_server_identity"],
+            expected_hub_id=paired["hub_id"],
+            expected_certificate_fingerprint=paired["certificate_fingerprint"],
+        )
+        forgotten = self.client.forget_connection(
+            connection_id,
+            expected_host_server_identity=paired["host_server_identity"],
+            expected_hub_id=paired["hub_id"],
+            expected_certificate_fingerprint=paired["certificate_fingerprint"],
+        )
+        self.assertEqual(forgotten["status"], "forgotten")
+        self.assertEqual(self.client.list_connections(), [])
+
+    def test_generic_revoked_error_is_not_a_self_revoke_acknowledgment(self) -> None:
+        paired = self.pair_and_approve()
+        failure = SecurePeerError(
+            "peer_revoked",
+            "Peer authentication is unavailable",
+            401,
+        )
+        with mock.patch.object(
+            self.client,
+            "_mutual_json",
+            side_effect=failure,
+        ):
+            with self.assertRaises(SecurePeerError) as raised:
+                self.client.revoke_remote_connection(
+                    paired["connection_id"],
+                    idempotency_key=_uuid(),
+                )
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(
+            self.client.get_connection(paired["connection_id"])["status"],
+            "approved",
+        )
 
     def test_live_route_relay_claim_resolves_only_local_chat_ledger(self) -> None:
         paired = self.pair_and_approve()

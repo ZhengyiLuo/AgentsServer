@@ -75,6 +75,7 @@ MAX_NETWORK_AGENTS_PER_SERVER = 256
 MAX_NETWORK_BODY_BYTES = 8_192
 MAX_NETWORK_PAGE_ITEMS = 100
 MAX_SECURE_PEER_BINDING_LOOKUP_IDS = 512
+SECURE_PEER_HEARTBEAT_WRITE_INTERVAL_SECONDS = 15
 # Secure-peer responses are hard-capped at 2 MiB. Keep paged network payloads
 # below that transport ceiling, including JSON escaping and envelope fields.
 MAX_NETWORK_PAGE_RESPONSE_BYTES = 1_900_000
@@ -2147,7 +2148,7 @@ class HubStore:
                         INSERT INTO nodes(
                             id,team_id,principal_id,server_identity,display_name,
                             status,enrolled_at,last_seen_at
-                        ) VALUES (?,?,?,?,?,'active',?,?)
+                        ) VALUES (?,?,?,?,?,'offline',?,NULL)
                         """,
                         (
                             node_id,
@@ -2155,7 +2156,6 @@ class HubStore:
                             node_principal_id,
                             identity,
                             label,
-                            timestamp,
                             timestamp,
                         ),
                     )
@@ -2174,14 +2174,14 @@ class HubStore:
                             409,
                         )
                     node_id = str(node["id"])
-                    if node["display_name"] != label or node["status"] != "active":
+                    if node["display_name"] != label:
                         connection.execute(
                             """
                             UPDATE nodes
-                            SET display_name=?,status='active',last_seen_at=?
+                            SET display_name=?
                             WHERE id=?
                             """,
-                            (label, timestamp, node_id),
+                            (label, node_id),
                         )
                         connection.execute(
                             """
@@ -2355,11 +2355,7 @@ class HubStore:
         principal_id = self._secure_peer_principal_id(peer_id)
         team = _identity(team_id)
         timestamp = _now()
-        connection = self.connect()
-        try:
-            with _write_transaction(connection):
-                binding = connection.execute(
-                    """
+        binding_query = """
                     SELECT b.node_id,n.status,n.last_seen_at
                     FROM network_peer_bindings AS b
                     JOIN nodes AS n
@@ -2385,7 +2381,34 @@ class HubStore:
                       AND sa.service_identifier='agentsdock.secure-peer.' || b.peer_id
                       AND m.role='automation'
                       AND m.status='active'
-                    """,
+                    """
+        connection = self.connect()
+        try:
+            binding = connection.execute(
+                binding_query,
+                (peer_id, team, principal_id),
+            ).fetchone()
+            if binding is None:
+                raise HubError(
+                    "peer_unavailable",
+                    "Secure peer is unavailable",
+                    404,
+                )
+            last_seen_at = (
+                int(binding["last_seen_at"])
+                if binding["last_seen_at"] is not None
+                else None
+            )
+            if (
+                binding["status"] == "active"
+                and last_seen_at is not None
+                and last_seen_at
+                > timestamp - SECURE_PEER_HEARTBEAT_WRITE_INTERVAL_SECONDS
+            ):
+                return
+            with _write_transaction(connection):
+                binding = connection.execute(
+                    binding_query,
                     (peer_id, team, principal_id),
                 ).fetchone()
                 if binding is None:
@@ -2394,6 +2417,19 @@ class HubStore:
                         "Secure peer is unavailable",
                         404,
                     )
+                last_seen_at = (
+                    int(binding["last_seen_at"])
+                    if binding["last_seen_at"] is not None
+                    else None
+                )
+                if (
+                    binding["status"] == "active"
+                    and last_seen_at is not None
+                    and last_seen_at
+                    > timestamp
+                    - SECURE_PEER_HEARTBEAT_WRITE_INTERVAL_SECONDS
+                ):
+                    return
                 changed = connection.execute(
                     """
                     UPDATE nodes

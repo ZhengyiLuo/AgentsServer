@@ -85,6 +85,22 @@ class SecurePeerHubAdapter:
     def preflight_team(self, team_id: str) -> None:
         self.store.require_secure_peer_target_team(team_id)
 
+    def active_binding_peer_ids(
+        self,
+        peer_ids: list[str] | tuple[str, ...],
+        peer_server_identity: str,
+    ) -> set[str]:
+        return self.store.active_secure_peer_binding_ids(
+            peer_ids,
+            peer_server_identity,
+        )
+
+    def record_peer_heartbeat(self, peer_id: str, team_id: str) -> None:
+        self.store.record_secure_peer_heartbeat(peer_id, team_id)
+
+    def expire_peer_leases(self, stale_before: int) -> int:
+        return self.store.expire_secure_peer_leases(stale_before)
+
     def revoke_peer(self, *, peer_id: str, team_id: str) -> None:
         self.store.revoke_secure_peer_service(peer_id=peer_id, team_id=team_id)
 

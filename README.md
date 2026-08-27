@@ -791,33 +791,82 @@ represent second 60.
 
 ## Cross-chat handoffs
 
-API contract v11 added durable, same-server handoffs selected by the user in
-the AgentsDock composer. API contract v17 exposes version 5 of
-`capabilities.cross_chat_handoffs_v1`: a composer-resolved `@Title` sends the
-current message to that chat when the source turn is admitted, while
-`@@Title` grants the source run an opaque route without contacting the target
-by itself. Ordinary user turns can route to all eligible chats on the same
-server without inspector setup; each run receives a fresh opaque snapshot and
-live revocation can only narrow it. A future scheduled job stores only the
-explicit `@@Title` route selected when the job is created or edited. The
-server accepts structured composer references, never raw title text or an
-inferred chat ID. Self, archived, deleted, legacy-transport, and cross-server
-targets fail closed.
+### Current route-hint contract (API contract 19, capability v6)
 
-For an instruction grant, the current turn's provider-authority block lists
-the exact target and the one-use command shape:
+An inline structured `@Chat` is an optional target hint. It never forwards the
+raw user prompt. An ordinary same-server user turn still receives a fresh
+opaque ambient snapshot of all eligible chats, and its agent decides whether
+to `send` a prepared one-way message, `ask` for an asynchronous correlated
+reply, or make no contact. `/chat` is a composer alias for selecting the same
+structured hint.
+
+Ambient discovery remains same-server only. An explicitly paired Team Network
+route may appear as `@Remote`; new desktop authoring grants only its exact
+instruction action and revalidates the connection, route, revision, and action
+at admission and delivery. Unpaired or arbitrary foreign-server targets fail
+closed, and secure routes are never persisted into scheduled jobs.
+
+Scheduled runs do not receive ambient all-chat access. Jobs persist only exact
+structured `@Chat` targets explicitly selected during an authorized source
+turn, and revalidate each target/action on every firing. The health surface
+advertises cross-chat version 6 plus `route_hint_mentions`, scheduled Jobs
+version 5, and global API contract 19.
+
+Beta-era local `direct_message` and `@@` references remain readable only for
+safe migration to route hints. They never create a new raw-prompt delivery;
+nonterminal legacy UI envelopes are failed/cancelled during upgrade before
+they can be resubmitted. Existing configured-route Send/Ask effects,
+action-specific secure-peer hints, and final-result obligations retain their
+separate exact authorization and lifecycle fences.
+
+For a current ordinary turn, the provider-authority block exposes only opaque
+route IDs. The agent lists the available routes, then decides whether to Send,
+Ask, or make no contact:
+
+```bash
+"$AGENTSDOCK_CHATS_CLI" --authority-file /path/from/turn.json list
+"$AGENTSDOCK_CHATS_CLI" --authority-file /path/from/turn.json \
+  send --route route_opaque --message "Verify the API contract."
+"$AGENTSDOCK_CHATS_CLI" --authority-file /path/from/turn.json \
+  ask --route route_opaque --message "Which rollout is blocked?"
+```
+
+The helper never exposes or accepts an inferred chat ID. It accepts only the
+opaque IDs in that run's authority snapshot, uses loopback AgentsServer URLs,
+disables redirects and proxies, and submits one bounded agent-authored
+message. Send creates no reply obligation. Ask creates a correlated exchange;
+the terminal answer or failure status returns asynchronously to the source
+chat.
+
+### Historical beta behavior (migration context only)
+
+API contract v11 added durable, same-server handoffs selected by the user in
+the AgentsDock composer. API contract v17 briefly exposed version 5 of
+`capabilities.cross_chat_handoffs_v1`: in that beta, a composer-resolved
+`@Title` sent the current message to that chat when the source turn was
+admitted, while `@@Title` granted an opaque route without contacting the
+target by itself. API contract 19 supersedes that behavior with the single-`@`
+route-hint contract above. Persisted beta records remain migration inputs only.
+
+Ordinary user turns can route to all eligible chats on the same server without
+Inspector setup; each run receives a fresh opaque snapshot and live revocation
+can only narrow it. The server accepts structured composer references, never
+raw title text or an inferred chat ID. Self, archived, deleted,
+legacy-transport, and unpaired foreign-server targets fail closed.
+
+When a stored action-specific grant is replayed, the provider-authority block
+may print a one-use opaque target handle:
 
 ```bash
 "$AGENTSDOCK_CHATS_CLI" --authority-file /path/from/turn.json \
-  send --target sess_authorized_target --message "Verify the API contract."
+  send --target OPAQUE_HANDLE --message "Verify the API contract."
 ```
 
-The helper accepts only loopback AgentsServer URLs, disables redirects and
-proxies, and sends the per-run capability to an agent-only endpoint. Delivery
-is a normal durable target turn using the target chat's own provider,
-permission policy, queue, and timeline. A server restart reconciles the ledger
-and lifecycle outbox without silently duplicating a handoff. The desktop
-bearer remains required to inspect or cancel handoffs.
+`OPAQUE_HANDLE` is capability data, never a session ID. Delivery is a normal
+durable target turn using the target chat's own provider, permission policy,
+queue, and timeline. A server restart reconciles the ledger and lifecycle
+outbox without silently duplicating a handoff. The desktop bearer remains
+required to inspect or cancel handoffs.
 
 Request/reply grants use the exact exchange ID reserved when the source turn
 is admitted. The source agent starts it with `ask`; a recipient may answer or
@@ -826,7 +875,7 @@ turn's provider-authority block:
 
 ```bash
 "$AGENTSDOCK_CHATS_CLI" --authority-file /path/from/turn.json \
-  ask --target sess_authorized_target --message "Which rollout is blocked?"
+  ask --target OPAQUE_HANDLE --message "Which rollout is blocked?"
 "$AGENTSDOCK_CHATS_CLI" --authority-file /path/from/turn.json \
   respond --exchange exchange_exact --inbound-leg leg_exact \
   --message "Do you mean the desktop or server rollout?" --request-response
@@ -842,12 +891,12 @@ status wake for the waiting sender. Exchange turns reuse the existing hidden
 `cross_chat_handoff_delivery` purpose so older clients do not expose synthetic
 prompts or queue controls.
 
-### Legacy configured agent handoff routes (v3)
+### Historical configured-route management (v3-v5 compatibility)
 
-Global API contract v13 is unchanged. Version 3 of
-`capabilities.cross_chat_handoffs_v1` adds a default-empty, per-source-chat
-allowlist for agent-initiated handoffs. Authenticated desktop clients manage
-it through:
+Version 3 added a default-empty, per-source-chat allowlist for agent-initiated
+handoffs. These endpoints remain for stored-route compatibility and
+administration, but API contract 19 ordinary user turns use the ambient opaque
+snapshot above and require no Inspector route setup:
 
 ```text
 GET    /api/sessions/{source_session_id}/agent-handoff-routes
@@ -859,13 +908,13 @@ DELETE /api/sessions/{source_session_id}/agent-handoff-routes/{route_id}
 `PATCH` uses the route revision as a compare-and-swap precondition. A chat can
 hold at most 16 routes, aliases and targets are unique, routes cannot point to
 their source chat, and forks inherit neither routes nor their private mutation
-journal. Only an ordinary direct user turn whose client opts into
-`agent_cross_chat_routes_v1` receives an admission-time route snapshot.
-Scheduled, internal, digest, standalone, and cross-chat delivery turns receive
-none. Every helper call intersects that snapshot with the exact live route
-revision and allowed actions, so a removal or policy edit blocks future
-acceptance immediately; an already accepted ledger item remains visible and
-cancelable through the authenticated desktop APIs.
+journal. Under this historical configured-route mode, only an ordinary direct
+user turn whose client opts into `agent_cross_chat_routes_v1` receives that
+configured snapshot. Scheduled, internal, digest, standalone, and cross-chat
+delivery turns receive none. Every helper call intersects the snapshot with
+the exact live route revision and allowed actions, so a removal or policy edit
+blocks future acceptance immediately; an already accepted ledger item remains
+visible and cancelable through the authenticated desktop APIs.
 
 The turn-scoped helper surface accepts only opaque issued route IDs:
 

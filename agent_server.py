@@ -670,7 +670,7 @@ PROVIDER_SECRET_ENV_NAMES = (
 SERVER_BIND_ADDRESS = agentsdock_setting("AGENT_BIND", "0.0.0.0")
 SERVER_PORT = int(agentsdock_setting("AGENT_PORT", "7850"))
 SERVER_INSTANCE_ID = uuid.uuid4().hex
-API_CONTRACT_VERSION = 18
+API_CONTRACT_VERSION = 19
 SESSION_ORDER_STEP = 1000.0
 SECURE_PEER_DELIVERY_PURPOSE = "secure_peer_handoff_delivery"
 CROSS_CHAT_DELIVERY_PURPOSES = {
@@ -745,7 +745,7 @@ Scheduled jobs:
   jobs API directly, pass alternate credentials, expose authority, or attempt
   a run-now action.
 - To save a same-server route for a future job run, first list chats, put that
-  chat's exact `@@title` in the job prompt, and pass its opaque route as
+  chat's exact `@title` in the job prompt, and pass its opaque route as
   `--chat-route ROUTE_ID`. Saving or updating the job does not contact the
   target. Each admitted run receives a fresh opaque route; use
   `--clear-chat-routes` to revoke saved targets from an existing job.
@@ -3737,10 +3737,11 @@ class ChatReference(BaseModel):
         "instruction",
         "final_result",
     ]
-    # Provider-created scheduled ``@@`` references bind the future route to
+    # Provider-created scheduled route references bind the future route to
     # the exact action selected from the live opaque grant.  Ordinary
-    # user-created route references leave this unset and retain their existing
-    # action-neutral semantics.
+    # user-created ``@`` route hints leave this unset and retain their
+    # action-neutral semantics. ``direct_message`` remains accepted only as a
+    # legacy wire/storage value and is normalized to ``route`` at admission.
     route_action: Literal["instruction", "request_reply"] | None = None
     target_kind: Literal["secure_peer"] | None = None
     target_server_identity: str | None = Field(default=None, min_length=8, max_length=240)
@@ -5992,6 +5993,90 @@ class JobStore:
                 logger.warning("failed to load jobs: %s", e)
                 self.jobs = {}
         for job in self.jobs.values():
+            raw_chat_references = job.get("chat_references")
+            if isinstance(raw_chat_references, list):
+                prompt = str(job.get("prompt") or "")
+                prompt_bytes = prompt.encode("utf-16-le")
+
+                def stored_marker(raw_reference: Any) -> str:
+                    if not isinstance(raw_reference, dict):
+                        return ""
+                    try:
+                        start = int(raw_reference.get("source_text_start"))
+                        end = int(raw_reference.get("source_text_end"))
+                        if start < 0 or end <= start:
+                            return ""
+                        return prompt_bytes[start * 2:end * 2].decode(
+                            "utf-16-le"
+                        )
+                    except (TypeError, ValueError, UnicodeDecodeError):
+                        return ""
+
+                legacy_route_by_target: dict[tuple[str, str], list[int]] = {}
+                for index, raw_reference in enumerate(raw_chat_references):
+                    if (
+                        not isinstance(raw_reference, dict)
+                        or raw_reference.get("target_kind") is not None
+                        or raw_reference.get("action") != "route"
+                    ):
+                        continue
+                    title = str(
+                        raw_reference.get("display_title_snapshot") or ""
+                    )
+                    if stored_marker(raw_reference) != f"@@{title}":
+                        continue
+                    target_key = (
+                        str(raw_reference.get("session_id") or ""),
+                        title,
+                    )
+                    legacy_route_by_target.setdefault(target_key, []).append(
+                        index
+                    )
+
+                migrated_chat_references: list[Any] = []
+                references_changed = False
+                for index, raw_reference in enumerate(raw_chat_references):
+                    if (
+                        isinstance(raw_reference, dict)
+                        and raw_reference.get("target_kind") is None
+                        and raw_reference.get("action") == "direct_message"
+                    ):
+                        title = str(
+                            raw_reference.get("display_title_snapshot") or ""
+                        )
+                        target_key = (
+                            str(raw_reference.get("session_id") or ""),
+                            title,
+                        )
+                        matching_routes = legacy_route_by_target.get(
+                            target_key, []
+                        )
+                        if (
+                            len(matching_routes) == 1
+                            and matching_routes[0] != index
+                            and stored_marker(raw_reference) == f"@{title}"
+                        ):
+                            # Beta 5 could persist both @ direct delivery and
+                            # @@ route entries for one target. Keep the already
+                            # action-scoped route (important for unattended
+                            # jobs) and leave the old @ occurrence as text.
+                            references_changed = True
+                            continue
+                        migrated_reference = dict(raw_reference)
+                        migrated_reference["action"] = "route"
+                        migrated_reference.pop("route_action", None)
+                        migrated_chat_references.append(migrated_reference)
+                        references_changed = True
+                    else:
+                        migrated_chat_references.append(raw_reference)
+                if references_changed:
+                    # @ no longer creates a raw delivery. Migrate the durable
+                    # job grant before the scheduler can inspect it; its exact
+                    # prompt span and target id are retained as a route hint.
+                    job["chat_references"] = migrated_chat_references
+                    job["updated_at"] = now_iso()
+                    job["_revision"] = new_job_revision()
+                    changed = True
             if "manual_run_pending" not in job:
                 job["manual_run_pending"] = False
                 changed = True
@@ -6304,7 +6389,7 @@ class JobStore:
                             status_code=403,
                             detail=(
                                 "agent jobs access cannot rewrite, accelerate, "
-                                "or re-enable a job with saved @/@@ chat targets; "
+                                "or re-enable a job with saved @ chat targets; "
                                 "supply a current opaque chat route or revoke "
                                 "the saved targets first"
                             ),
@@ -6669,7 +6754,7 @@ class JobStore:
 
         message = (
             f"Scheduled job paused: {paused_job.get('title') or jid} — "
-            f"its saved @/@@ chat target is invalid ({detail}). "
+            f"its saved @ chat target is invalid ({detail}). "
             "Edit or remove the target, then re-enable the job."
         )
         try:
@@ -7949,6 +8034,29 @@ class CrossChatStore:
                         "ALTER TABLE cross_chat_exchanges ADD COLUMN "
                         "authorization_route_id TEXT"
                     )
+                # A short-lived beta interpreted an inline @Chat as an
+                # instruction to forward the source prompt verbatim. Current
+                # @ mentions are route hints only. Retire any nonterminal
+                # envelope created by that UI contract before queue recovery
+                # can restore or start its target turn. Configured-route
+                # Send/Ask effects and final-result obligations use different
+                # authorization/idempotency shapes and are untouched.
+                connection.execute(
+                    """
+                    UPDATE cross_chat_envelopes
+                    SET status='failed',
+                        error='legacy raw @chat delivery retired during route-hint migration',
+                        lifecycle_status='',
+                        updated_at=?
+                    WHERE kind='instruction'
+                      AND authorization_kind='explicit_prompt'
+                      AND substr(idempotency_key, 1, 7)='direct:'
+                      AND status IN (
+                          'waiting_admission', 'ready', 'submitting', 'queued'
+                      )
+                    """,
+                    (now_iso(),),
+                )
                 connection.execute(
                     "DELETE FROM cross_chat_route_rate_events "
                     "WHERE accepted_at_epoch < ?",
@@ -10805,10 +10913,113 @@ def utf16_slice(text: str, start: int, end: int) -> str:
 
 
 def chat_reference_marker(reference: ChatReference) -> str:
-    """Return the exact prompt token represented by a structured reference."""
+    """Return the canonical prompt token represented by a reference."""
 
-    sigil = "@@" if reference.action == "route" else "@"
-    return f"{sigil}{reference.display_title_snapshot}"
+    return f"@{reference.display_title_snapshot}"
+
+
+def chat_reference_marker_candidates(reference: ChatReference) -> tuple[str, ...]:
+    """Return canonical and safely accepted legacy prompt tokens.
+
+    ``@@`` was briefly used for an optional route while ``@`` auto-forwarded
+    the raw source prompt.  Current references use one ``@`` route hint and
+    never auto-forward.  Persisted ``route`` records may still point at the
+    older two-sigil span, so accept that exact span without advertising or
+    creating new ``@@`` references.
+    """
+
+    canonical = chat_reference_marker(reference)
+    if reference.target_kind is None and reference.action == "route":
+        return canonical, f"@@{reference.display_title_snapshot}"
+    return (canonical,)
+
+
+def canonical_chat_reference(reference: ChatReference) -> ChatReference:
+    """Normalize legacy local direct-message intent into an optional hint."""
+
+    if reference.target_kind is not None or reference.action != "direct_message":
+        return reference
+    copier = getattr(reference, "model_copy", None)
+    if callable(copier):
+        return copier(update={"action": "route", "route_action": None})
+    return reference.copy(update={"action": "route", "route_action": None})
+
+
+def collapse_legacy_dual_local_references(
+    prompt: str,
+    references: list[ChatReference],
+    prompt_units: int,
+) -> list[ChatReference]:
+    """Collapse beta-era @ direct + @@ route pairs for one local target.
+
+    Only the exact old two-entry shape is collapsed. Two current @ route
+    references remain a duplicate error. When the old route is action-scoped
+    (scheduled jobs), retain it so migration cannot widen its grant; otherwise
+    retain the single-@ entry and normalize it to the current route action.
+    The dropped marker remains ordinary prompt text.
+    """
+
+    groups: dict[tuple[str, str], list[int]] = {}
+    for index, reference in enumerate(references):
+        if reference.target_kind is not None:
+            continue
+        key = (
+            reference.session_id.strip(),
+            reference.display_title_snapshot,
+        )
+        groups.setdefault(key, []).append(index)
+
+    dropped: set[int] = set()
+    for indexes in groups.values():
+        if len(indexes) != 2:
+            continue
+        direct_indexes = [
+            index
+            for index in indexes
+            if references[index].action == "direct_message"
+        ]
+        route_indexes = [
+            index
+            for index in indexes
+            if references[index].action == "route"
+        ]
+        if len(direct_indexes) != 1 or len(route_indexes) != 1:
+            continue
+        direct_index = direct_indexes[0]
+        route_index = route_indexes[0]
+        direct = references[direct_index]
+        route = references[route_index]
+        if any(
+            reference.source_text_start < 0
+            or reference.source_text_end <= reference.source_text_start
+            or reference.source_text_end > prompt_units
+            for reference in (direct, route)
+        ):
+            continue
+        if (
+            utf16_slice(
+                prompt, direct.source_text_start, direct.source_text_end
+            )
+            != f"@{direct.display_title_snapshot}"
+            or utf16_slice(
+                prompt, route.source_text_start, route.source_text_end
+            )
+            != f"@@{route.display_title_snapshot}"
+        ):
+            continue
+        if not all(
+            chat_reference_has_token_boundaries(prompt, reference, prompt_units)
+            for reference in (direct, route)
+        ):
+            continue
+        dropped.add(
+            direct_index if route.route_action is not None else route_index
+        )
+    return [
+        reference
+        for index, reference in enumerate(references)
+        if index not in dropped
+    ]
 
 
 def chat_reference_has_token_boundaries(
@@ -10836,24 +11047,22 @@ def validate_chat_references(
 ) -> list[ChatReference]:
     if not references:
         return []
-    if (
-        any(reference.action == "direct_message" for reference in references)
-        and len(prompt) > CROSS_CHAT_HANDOFF_BODY_MAX_CHARS
-    ):
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                "a direct @chat message cannot exceed "
-                f"{CROSS_CHAT_HANDOFF_BODY_MAX_CHARS} characters"
-            ),
-        )
     if not AGENT_TOKEN:
         raise HTTPException(
             status_code=503,
             detail="cross-chat handoffs require authenticated AgentsServer mode",
         )
     prompt_units = utf16_length(prompt)
-    if any(reference.action == "request_reply" for reference in references):
+    references = collapse_legacy_dual_local_references(
+        prompt,
+        references,
+        prompt_units,
+    )
+    if any(
+        reference.action == "request_reply"
+        or reference.route_action == "request_reply"
+        for reference in references
+    ):
         if CROSS_CHAT_HANDOFFS_V2_CLIENT_CAPABILITY not in {
             str(value) for value in (client_capabilities or [])
         }:
@@ -10872,6 +11081,7 @@ def validate_chat_references(
     seen: set[tuple[str, ...]] = set()
     destination_namespaces: dict[tuple[str, str], str] = {}
     ranges: list[tuple[int, int]] = []
+    normalized_references: list[ChatReference] = []
     for reference in references:
         if reference.display_title_snapshot.startswith("@"):
             raise HTTPException(
@@ -10887,7 +11097,7 @@ def validate_chat_references(
             reference.source_text_start,
             reference.source_text_end,
         )
-        if annotated_text != chat_reference_marker(reference):
+        if annotated_text not in chat_reference_marker_candidates(reference):
             raise HTTPException(
                 status_code=400,
                 detail="chat reference range does not match its display-title snapshot",
@@ -10936,8 +11146,10 @@ def validate_chat_references(
                 )
             destination_namespaces[destination] = "secure_peer"
             ranges.append((reference.source_text_start, reference.source_text_end))
+            normalized_references.append(reference)
             continue
-        target_id = reference.session_id.strip()
+        normalized_reference = canonical_chat_reference(reference)
+        target_id = normalized_reference.session_id.strip()
         if target_id == source_session_id:
             raise HTTPException(status_code=400, detail="a chat cannot hand off to itself")
         target = STORE.sessions.get(target_id)
@@ -10953,11 +11165,11 @@ def validate_chat_references(
         # at source admission instead of accepting a grant that can never
         # preserve the target chat's permission/approval semantics.
         cross_chat_delivery_client_capabilities(target)
-        key = (target_id, reference.action)
+        key = (target_id, normalized_reference.action)
         if key in seen:
             raise HTTPException(status_code=400, detail="duplicate chat reference grant")
         seen.add(key)
-        destination = (target_id, reference.action)
+        destination = (target_id, normalized_reference.action)
         if destination_namespaces.get(destination) == "secure_peer":
             raise HTTPException(
                 status_code=400,
@@ -10965,11 +11177,15 @@ def validate_chat_references(
             )
         destination_namespaces[destination] = "local"
         ranges.append((reference.source_text_start, reference.source_text_end))
+        normalized_references.append(normalized_reference)
     ordered_ranges = sorted(ranges)
     for previous, current in zip(ordered_ranges, ordered_ranges[1:]):
         if current[0] < previous[1]:
             raise HTTPException(status_code=400, detail="chat reference ranges overlap")
-    return references
+    # Secure-peer references retain their exact action-specific grant. Local
+    # legacy direct-message references are returned as optional route hints,
+    # ensuring every caller persists and executes the safe current contract.
+    return normalized_references
 
 
 class ScheduledJobChatReferenceRepairRequired(HTTPException):
@@ -11070,7 +11286,7 @@ def provider_job_chat_references(
 
     Provider callers never submit or learn an internal chat id.  Each opaque
     route must belong to the current run's immutable route ceiling, remain
-    live, permit the requested action, and have an exact visible ``@@title``
+    live, permit the requested action, and have an exact visible ``@title``
     in the stored prompt. The resulting durable reference grants the future
     agent a route; saving the job never contacts the target.
     """
@@ -11116,7 +11332,7 @@ def provider_job_chat_references(
                 detail="scheduled job chat target is no longer available",
             )
         display_title = sanitized_provider_route_label(target.get("title"))
-        marker = f"@@{display_title}"
+        marker = f"@{display_title}"
         search_from = 0
         selected_range: tuple[int, int] | None = None
         while True:
@@ -11124,6 +11340,16 @@ def provider_job_chat_references(
             if start < 0:
                 break
             end = start + len(marker)
+            before = prompt[start - 1:start] if start else ""
+            after = prompt[end:end + 1]
+            if (
+                (before and not before.isspace() and before not in "([{")
+                or (after and not after.isspace())
+            ):
+                # In particular, do not treat the second @ in a legacy
+                # @@Title occurrence as a current exact @Title grant.
+                search_from = start + 1
+                continue
             candidate = (
                 utf16_length(prompt[:start]),
                 utf16_length(prompt[:end]),
@@ -11215,7 +11441,7 @@ def normalized_provider_cross_chat_route_snapshot(value: Any) -> list[dict[str, 
         ):
             # Live rollback fence for ambient snapshots already persisted in
             # queued events or attached to an active capability. An explicit
-            # @@ reference remains valid because the user selected it.
+            # Explicit @ reference remains valid because the user selected it.
             continue
         route_id = str(raw.get("route_id") or "")
         revision = str(raw.get("revision") or "")
@@ -11474,13 +11700,13 @@ def provider_cross_chat_route_snapshot_for_authority(
     *,
     source_session_id: str = "",
 ) -> list[dict[str, Any]]:
-    """Suppress ambient duplicates without shrinking the durable turn ceiling.
+    """Project explicit local ``@`` hints as exact run-local routes.
 
-    Explicit ``@@`` references select one exact route while the source turn
-    keeps its normal admission timing. The admission snapshot still contains
-    every eligible target so a queued edit that removes or adds a reference
-    can safely derive the right run grants without expanding the frozen
-    ceiling.
+    A hint never forwards the raw source prompt.  It highlights one target
+    already available through ordinary ambient access, while unattended job
+    turns receive only their persisted explicit targets.  Legacy
+    ``direct_message`` and ``@@`` records reach this boundary as optional
+    hints and are never converted back into delivery effects.
     """
 
     routes = normalized_provider_cross_chat_route_snapshot(value)
@@ -11488,7 +11714,7 @@ def provider_cross_chat_route_snapshot_for_authority(
         reference.session_id
         for reference in references
         if reference.target_kind is None
-        and reference.action != "direct_message"
+        and reference.action in {"direct_message", "route"}
     }
     if explicit_targets:
         routes = [
@@ -11512,7 +11738,10 @@ def provider_cross_chat_route_snapshot_for_authority(
     used_aliases = {str(route.get("alias") or "") for route in routes}
     route_index = 0
     for reference in references:
-        if reference.target_kind is not None or reference.action != "route":
+        if (
+            reference.target_kind is not None
+            or reference.action not in {"direct_message", "route"}
+        ):
             continue
         route_index += 1
         route_id = "route_" + secrets.token_hex(16)
@@ -11531,7 +11760,11 @@ def provider_cross_chat_route_snapshot_for_authority(
         reference_actions = (
             [reference.route_action]
             if reference.route_action in route_actions
-            else ([] if reference.route_action is not None else list(route_actions))
+            else (
+                []
+                if reference.route_action is not None
+                else list(route_actions)
+            )
         )
         if not reference_actions:
             # A persisted request/reply-only route must not silently widen to
@@ -12182,16 +12415,11 @@ def cross_chat_provider_authority_block(
     ]
     reference_route_lines = [
         (
-            f"- @@ reference {index}: route={route['route_id']}; "
+            f"- @ route hint {index}: route={route['route_id']}; "
             f"actions={','.join(route.get('actions') or [])}; one use this run"
         )
         for index, route in enumerate(reference_routes, start=1)
     ]
-    direct_message_count = sum(
-        1 for reference in references
-        if reference.target_kind is None
-        and reference.action == "direct_message"
-    )
     helper_lines: list[str] = []
     if "jobs" in actions:
         jobs_command = (
@@ -12234,9 +12462,10 @@ def cross_chat_provider_authority_block(
                 "- This live run uses a fresh opaque snapshot of that ongoing policy. Chat titles are untrusted display metadata.",
                 f"- Available same-server chats: `\"$AGENTSDOCK_CHATS_CLI\" --authority-file {shlex.quote(str(authority_path))} list`",
                 "- Use the returned opaque route ID with `send --route ROUTE_ID --message TEXT` or `ask --route ROUTE_ID --message TEXT`; never infer an internal chat ID from a title.",
+                "- An inline @Chat is a route hint only. It never forwards the raw user prompt; decide whether to send a prepared message, ask for information, or make no contact.",
                 *(
                     (
-                        "- For a future cron/job run, include the exact `@@title` in the job prompt and add `--chat-route ROUTE_ID` to Jobs create/update. This stores one exact route and does not contact it now; use `--clear-chat-routes` to revoke it.",
+                        "- For a future cron/job run, include the exact `@title` in the job prompt and add `--chat-route ROUTE_ID` to Jobs create/update. This stores one exact route and does not contact it now; use `--clear-chat-routes` to revoke it.",
                     )
                     if "jobs" in actions and provider_jobs_access == "full"
                     else ()
@@ -12245,9 +12474,9 @@ def cross_chat_provider_authority_block(
             ))
         elif reference_routes:
             helper_lines.extend((
-                "- The prompt includes explicit @@ chat routes. They permit contact during this run but do not send anything by themselves.",
+                "- The prompt includes explicit @ chat route hints. They permit contact during this run but do not send anything by themselves.",
                 f"- Available referenced chats: `\"$AGENTSDOCK_CHATS_CLI\" --authority-file {shlex.quote(str(authority_path))} list`",
-                "- Use `send --route ROUTE_ID --message TEXT` or `ask --route ROUTE_ID --message TEXT` as the prompt requires.",
+                "- Decide whether to use `send --route ROUTE_ID --message TEXT`, `ask --route ROUTE_ID --message TEXT`, or no cross-chat contact.",
                 "- Ask is asynchronous: the answer arrives later as a cross-chat delivery to this chat.",
             ))
         else:
@@ -12264,16 +12493,9 @@ def cross_chat_provider_authority_block(
         + "\n".join(helper_lines)
         + ("\n" if helper_lines else "")
         + (
-            f"The {direct_message_count} explicit @chat message"
-            f"{'s were' if direct_message_count != 1 else ' was'} queued automatically when this turn was admitted. "
-            "Do not send the same message again.\n"
-            if direct_message_count
-            else ""
-        )
-        + (
-            "The prompt explicitly granted these opaque @@ routes:\n"
+            "The prompt highlighted these opaque @ route hints:\n"
             + "\n".join(reference_route_lines)
-            + "\nUse only the listed opaque route IDs; never infer or substitute an internal chat ID.\n"
+            + "\nA hint is optional and never auto-sends the source prompt. Use only the listed opaque route IDs; never infer or substitute an internal chat ID.\n"
             if reference_route_lines
             else ""
         )
@@ -12286,13 +12508,14 @@ def cross_chat_provider_authority_block(
             + "Run either through: `\"$AGENTSDOCK_CHATS_CLI\" --authority-file "
             + shlex.quote(str(authority_path))
             + " COMMAND`.\n"
+            + "This is an optional exact route hint; send a prepared message, ask, or make no contact as the task warrants.\n"
             if allowed
             else (
-                "No additional one-use legacy @ destination was included. Built-in same-server chat access above remains available.\n"
+                "No additional action-specific destination was included. Built-in same-server chat access above remains available.\n"
                 if ambient_routes
                 else (
-                    "No additional one-use legacy @ destination was included.\n"
-                    if reference_route_lines or direct_message_count
+                    "No additional action-specific destination was included.\n"
+                    if reference_route_lines
                     else "No user-prompt cross-chat route was granted for this turn.\n"
                 )
             )
@@ -12325,53 +12548,19 @@ async def register_direct_message_handoffs(
     prompt: str,
     references: list[ChatReference],
 ) -> list[str]:
-    """Durably bind every explicit ``@chat`` delivery to an admitted run."""
+    """Compatibility shim that deliberately creates no delivery effect.
 
-    envelope_ids: list[str] = []
-    pending_creation: asyncio.Task[tuple[dict[str, Any], bool]] | None = None
-    try:
-        for index, reference in enumerate(references):
-            if (
-                reference.action != "direct_message"
-                or reference.target_kind is not None
-            ):
-                continue
-            envelope_id = "handoff_" + uuid.uuid4().hex
-            envelope_ids.append(envelope_id)
-            pending_creation = asyncio.create_task(
-                CROSS_CHAT.create_instruction(
-                    envelope_id=envelope_id,
-                    source_session_id=source_session_id,
-                    source_run_id=source_run_id,
-                    target_session_id=reference.session_id,
-                    body=prompt,
-                    idempotency_key=f"direct:{index}:{reference.session_id}",
-                    initial_status="waiting_admission",
-                )
-            )
-            record, _created = await asyncio.shield(pending_creation)
-            pending_creation = None
-            envelope_ids[-1] = str(record["id"])
-            prime_cross_chat_event_cache(record)
-    except BaseException:
-        if pending_creation is not None:
-            with suppress(BaseException):
-                await join_task_despite_caller_cancellation(pending_creation)
-        for envelope_id in envelope_ids:
-            with suppress(BaseException):
-                failed = await CROSS_CHAT.update(
-                    envelope_id,
-                    expected={"waiting_admission"},
-                    status="failed",
-                    error="direct message registration was interrupted",
-                )
-                if failed is not None:
-                    await append_cross_chat_terminal_lifecycle(
-                        failed,
-                        "Direct @chat delivery registration was interrupted.",
-                    )
-        raise
-    return envelope_ids
+    Releases that briefly treated ``@chat`` as a raw direct-message command
+    called this function during source admission.  ``@`` is now only a route
+    hint, and validation normalizes legacy ``direct_message`` records to
+    ``route``.  Keeping this no-op boundary makes the non-delivery guarantee
+    explicit even if a future caller accidentally passes an unnormalized
+    legacy record. Existing nonterminal raw-direct ledger rows are quarantined
+    by startup/reconciliation and are never resubmitted.
+    """
+
+    del source_session_id, source_run_id, prompt, references
+    return []
 
 
 async def admit_direct_message_handoffs(
@@ -12996,7 +13185,7 @@ async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedT
                     references_changed = req.chat_references is not None or req.prompt is not None
                     if references_changed:
                         new_references = list(req.chat_references or [])
-                        validate_chat_references(
+                        new_references = validate_chat_references(
                             session_id,
                             str(candidate.get("prompt") or ""),
                             new_references,
@@ -13057,11 +13246,14 @@ async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedT
                             else ChatReference(**dict(reference))
                             for reference in candidate.get("chat_references") or []
                         ]
-                        validate_chat_references(
+                        existing_references = validate_chat_references(
                             session_id,
                             str(candidate.get("prompt") or ""),
                             existing_references,
                             list(candidate.get("client_capabilities") or []),
+                        )
+                        candidate["chat_references"] = chat_reference_dicts(
+                            existing_references
                         )
                         secure_peer_route_snapshots_for_references(
                             session_id,
@@ -24454,25 +24646,26 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
         "required": False,
         "message": message,
         "action": action,
-        "version": 5,
+        "version": 6,
         "actions": [
-            "direct_message",
             "route",
             "request_reply",
             "instruction",
             "final_result",
         ],
-        # @ sends the admitted message; @@ grants the run a route without
-        # contacting the target by itself. Older actions remain readable for
-        # queued messages and jobs created by development builds.
-        "default_action": "direct_message",
+        # One @ is a structured target hint. It never forwards the source
+        # prompt; the source agent chooses a prepared Send, asynchronous Ask,
+        # or no contact. Legacy direct_message/@@ records remain readable and
+        # normalize to this route-hint contract.
+        "default_action": "route",
         "default_exchange_legs": CROSS_CHAT_EXCHANGE_DEFAULT_LEGS,
         "max_exchange_legs": CROSS_CHAT_EXCHANGE_MAX_LEGS,
         "default_exchange_ttl_seconds": CROSS_CHAT_EXCHANGE_TTL_SECONDS,
         "artifact_grants": False,
         "features": {
-            "direct_message_mentions": True,
+            "direct_message_mentions": False,
             "route_mentions": True,
+            "route_hint_mentions": True,
             "agent_cross_chat_routes": (
                 not AGENT_AMBIENT_LOCAL_HANDOFFS_ENABLED
             ),
@@ -26018,6 +26211,93 @@ async def finish_cross_chat_delivery(event: dict[str, Any]) -> None:
         )
 
 
+def is_legacy_raw_direct_message_envelope(record: dict[str, Any]) -> bool:
+    """Identify only beta-era UI envelopes that copied the source prompt."""
+
+    return (
+        str(record.get("kind") or "") == "instruction"
+        and str(record.get("authorization_kind") or "") == "explicit_prompt"
+        and str(record.get("idempotency_key") or "").startswith("direct:")
+    )
+
+
+async def reconcile_legacy_raw_direct_message_envelope(
+    record: dict[str, Any],
+) -> None:
+    """Retire an old raw-prompt effect without detaching a live target owner."""
+
+    envelope_id = str(record.get("id") or "")
+    target_session_id = str(record.get("target_session_id") or "")
+    status = str(record.get("status") or "")
+
+    if status == "queued":
+        try:
+            await cancel_queued_cross_chat_handoff(envelope_id)
+            return
+        except HTTPException as exc:
+            if exc.status_code != 409:
+                raise
+        refreshed = await CROSS_CHAT.get(envelope_id)
+        if refreshed is not None:
+            record = refreshed
+            status = str(record.get("status") or status)
+
+    if status in {"submitting", "queued", "running"}:
+        live_state = await live_cross_chat_delivery_state(
+            target_session_id,
+            envelope_id,
+        )
+        if live_state is not None:
+            refreshed = await CROSS_CHAT.update(envelope_id, **live_state)
+            current = refreshed or await CROSS_CHAT.get(envelope_id) or record
+            if str(current.get("status") or "") == "queued":
+                await cancel_queued_cross_chat_handoff(envelope_id)
+            # A running owner already received the old payload. Do not detach
+            # it or report a contradictory failure; its normal completion owns
+            # the terminal state. Most importantly, never resubmit it.
+            return
+
+        persisted_state = await asyncio.to_thread(
+            cross_chat_delivery_state,
+            target_session_id,
+            envelope_id,
+            full_scan=True,
+        )
+        persisted_status = str((persisted_state or {}).get("status") or "")
+        if persisted_status in CrossChatStore.TERMINAL_STATUSES:
+            terminal = await CROSS_CHAT.update(
+                envelope_id,
+                expected={status},
+                **dict(persisted_state or {}),
+            )
+            if terminal is not None:
+                await append_cross_chat_terminal_lifecycle(
+                    terminal,
+                    (
+                        "Recovered the completed target state for a legacy "
+                        "raw @chat delivery."
+                    ),
+                    full_scan=True,
+                )
+            return
+
+    terminal = await CROSS_CHAT.update(
+        envelope_id,
+        expected={status},
+        status="failed",
+        error="legacy raw @chat delivery retired during route-hint migration",
+    )
+    if terminal is not None:
+        await append_cross_chat_terminal_lifecycle(
+            terminal,
+            (
+                "Legacy raw @chat delivery was not sent; @Chat is now an "
+                "optional route hint."
+            ),
+            full_scan=True,
+        )
+
+
 async def reconcile_cross_chat_handoffs() -> int:
     recovered = 0
     for terminal in await CROSS_CHAT.pending_terminal_lifecycle():
@@ -26036,6 +26316,10 @@ async def reconcile_cross_chat_handoffs() -> int:
             )
     for record in await CROSS_CHAT.recoverable():
         try:
+            if is_legacy_raw_direct_message_envelope(record):
+                await reconcile_legacy_raw_direct_message_envelope(record)
+                recovered += 1
+                continue
             if record.get("status") == "waiting_admission":
                 source_run_id = str(record.get("source_run_id") or "")
                 source_session_id = str(record.get("source_session_id") or "")
@@ -43463,14 +43747,14 @@ async def _start_turn_locked(
                     session_id,
                     scheduled_job_revision,
                 )
-            validate_scheduled_job_chat_references(
+            req.chat_references = validate_scheduled_job_chat_references(
                 session_id,
                 req.prompt,
                 req.chat_references,
                 redact_target_detail=True,
             )
         else:
-            validate_chat_references(
+            req.chat_references = validate_chat_references(
                 session_id,
                 req.prompt,
                 req.chat_references,
@@ -43896,9 +44180,9 @@ async def _start_turn_locked(
                     detail="cross-chat authorization ended before provider launch",
                 )
             delivery_admitted = True
-        # Direct @chat effects and scheduled occurrences are authorized by
-        # this exact durable source admission marker. Fsync it before ledger
-        # promotion/provider launch so restart recovery cannot duplicate them.
+        # Scheduled occurrences are authorized by this exact durable source
+        # admission marker. Legacy already-admitted direct-message ledger rows
+        # still use the same recovery boundary, but new @ hints create none.
         started_event = await (
             append_durable_event(session_id, "turn_started", started_payload)
             if turn_direct_message_ids or req.purpose == "scheduled_job"
@@ -46677,13 +46961,14 @@ async def health() -> dict[str, Any]:
                     "provider contexts."
                 ),
                 "action": None,
-                "version": 4,
+                "version": 5,
                 "context_modes": ["chat", "standalone"],
                 "default_context_mode": "chat",
                 "features": {
                     "chat_references": True,
-                    "direct_message_mentions": True,
+                    "direct_message_mentions": False,
                     "route_mentions": True,
+                    "route_hint_mentions": True,
                 },
             },
             "provider_jobs_access_control_v1": {

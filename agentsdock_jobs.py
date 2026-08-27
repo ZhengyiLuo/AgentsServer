@@ -408,7 +408,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="ROUTE_ID[=ACTION]",
         help=(
             "persist an exact chat target from the current chats-helper list; "
-            "the prompt must contain that chat's exact @@title (repeatable)"
+            "the prompt must contain that chat's exact @title (repeatable)"
         ),
     )
     create_parser.set_defaults(handler=command_create)

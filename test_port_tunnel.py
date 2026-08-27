@@ -918,7 +918,7 @@ class PortTunnelTests(unittest.IsolatedAsyncioTestCase):
             result = await agent_server.health()
 
         capability = result["capabilities"]["port_forwarding_v1"]
-        self.assertEqual(result["api_contract_version"], 18)
+        self.assertEqual(result["api_contract_version"], 19)
         self.assertTrue(capability["available"])
         self.assertEqual(capability["version"], 1)
         self.assertEqual(

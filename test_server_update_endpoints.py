@@ -520,7 +520,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response["managed_updates"])
         self.assertEqual(
             response["capabilities"]["server_updates"]["version"],
-            5,
+            6,
         )
         self.assertEqual(response["update_service_cgroup"], {
             "safe": True,
@@ -1192,6 +1192,485 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1 active agent run", str(raised.exception.detail))
         quiesce.assert_not_awaited()
         run_tmux.assert_not_called()
+
+    async def test_when_idle_persists_exact_pending_reservation_without_drain(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "update_runner.py"
+            key = root / "release-public-key.pem"
+            runner.write_text("# runner\n")
+            key.write_text("public key\n")
+            quiesce = AsyncMock()
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", root / "status.json"), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server, "BUSY_SESSIONS", {"busy-chat"}), \
+                 patch.object(agent_server, "SERVER_MAINTENANCE_SESSIONS", set()), \
+                 patch.object(agent_server, "QUEUED_TURNS", {}), \
+                 patch.object(agent_server, "RUN_NOW_TURNS", {}), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
+                 patch.object(
+                     agent_server,
+                     "ensure_managed_update_tmux_isolated",
+                     return_value=None,
+                 ), \
+                 patch.object(
+                     agent_server,
+                     "quiesce_managed_update_service_cgroup",
+                     new=quiesce,
+                 ), \
+                 patch.object(agent_server, "run_tmux") as run_tmux:
+                status = await agent_server.start_server_update(
+                    agent_server.ServerUpdateRequest(
+                        version="1.1.0",
+                        when_idle=True,
+                    ),
+                )
+
+        self.assertEqual(status["phase"], "pending")
+        self.assertRegex(status["schedule_id"], r"^[0-9a-f]{32}$")
+        self.assertIsNone(status["update_id"])
+        self.assertEqual(status["target_version"], "1.1.0")
+        self.assertEqual(status["track"], "stable")
+        self.assertTrue(status["when_idle"])
+        self.assertTrue(status["cancelable"])
+        self.assertEqual(status["blocker_counts"], {
+            "active_runs": 1,
+            "queued_turns": 0,
+            "provider_background_tasks": 0,
+            "in_flight_server_changes": 0,
+        })
+        self.assertFalse(agent_server.managed_server_update_blocks_work(status))
+        self.assertTrue(agent_server.managed_server_update_is_pending(status))
+        quiesce.assert_not_awaited()
+        run_tmux.assert_not_called()
+
+    async def test_pending_duplicate_is_idempotent_and_conflicts_cannot_overwrite(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "update_runner.py"
+            key = root / "release-public-key.pem"
+            runner.write_text("# runner\n")
+            key.write_text("public key\n")
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", root / "status.json"), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server, "BUSY_SESSIONS", {"busy-chat"}), \
+                 patch.object(agent_server, "SERVER_MAINTENANCE_SESSIONS", set()), \
+                 patch.object(agent_server, "QUEUED_TURNS", {}), \
+                 patch.object(agent_server, "RUN_NOW_TURNS", {}), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
+                 patch.object(
+                     agent_server,
+                     "ensure_managed_update_tmux_isolated",
+                     return_value=None,
+                 ), \
+                 patch.object(agent_server, "run_tmux") as run_tmux:
+                first = await agent_server.start_server_update(
+                    agent_server.ServerUpdateRequest(
+                        version="1.1.0",
+                        when_idle=True,
+                    ),
+                )
+                duplicate = await agent_server.start_server_update(
+                    agent_server.ServerUpdateRequest(
+                        version="1.1.0",
+                        when_idle=True,
+                    ),
+                )
+                checked = await agent_server.check_server_update()
+                with self.assertRaises(HTTPException) as different:
+                    await agent_server.start_server_update(
+                        agent_server.ServerUpdateRequest(
+                            version="1.2.0",
+                            when_idle=True,
+                        ),
+                    )
+                with self.assertRaises(HTTPException) as immediate:
+                    await agent_server.start_server_update(
+                        agent_server.ServerUpdateRequest(version="1.1.0"),
+                    )
+
+        self.assertEqual(duplicate["schedule_id"], first["schedule_id"])
+        self.assertEqual(duplicate["updated_at"], first["updated_at"])
+        self.assertEqual(checked["schedule_id"], first["schedule_id"])
+        self.assertEqual(different.exception.detail["code"], "server_update_pending")
+        self.assertEqual(immediate.exception.detail["code"], "server_update_pending")
+        run_tmux.assert_not_called()
+
+    async def test_pending_waiter_atomically_starts_after_active_work_finishes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "update_runner.py"
+            key = root / "release-public-key.pem"
+            runner.write_text("# runner\n")
+            key.write_text("public key\n")
+            busy = {"busy-chat"}
+            durable_queue = {
+                "chat": deque([{
+                    "queued_id": "durable-paused",
+                    "_durable": True,
+                    "_paused_after_stop": True,
+                }]),
+            }
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", root / "status.json"), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server, "AGENT_TOKEN", ""), \
+                 patch.object(agent_server, "BUSY_SESSIONS", busy), \
+                 patch.object(agent_server, "SERVER_MAINTENANCE_SESSIONS", set()), \
+                 patch.object(agent_server, "QUEUED_TURNS", durable_queue), \
+                 patch.object(agent_server, "RUN_NOW_TURNS", {}), \
+                 patch.object(agent_server, "active_provider_background_work_labels", return_value=[]), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
+                 patch.object(
+                     agent_server,
+                     "ensure_managed_update_tmux_isolated",
+                     return_value=None,
+                 ), \
+                 patch.object(agent_server, "run_tmux", return_value=None) as run_tmux:
+                pending = await agent_server.start_server_update(
+                    agent_server.ServerUpdateRequest(
+                        version="1.1.0",
+                        when_idle=True,
+                    ),
+                )
+                busy.clear()
+                started = await agent_server.advance_pending_server_update_once()
+
+        self.assertEqual(started["phase"], "starting")
+        self.assertEqual(started["schedule_id"], pending["schedule_id"])
+        self.assertRegex(started["update_id"], r"^[0-9a-f]{32}$")
+        self.assertNotEqual(started["update_id"], pending["schedule_id"])
+        self.assertFalse(started["cancelable"])
+        self.assertEqual(
+            list(durable_queue["chat"])[0]["queued_id"],
+            "durable-paused",
+        )
+        run_tmux.assert_called_once()
+
+    async def test_pending_cancel_is_exact_and_stale_waiter_cannot_restart_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            status_path = Path(temporary) / "status.json"
+            terminal_attachments = MagicMock()
+            terminal_attachments.reopen_if_update_inactive = AsyncMock(
+                return_value=True
+            )
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", status_path), \
+                 patch.object(agent_server, "TERMINAL_ATTACHMENTS", terminal_attachments):
+                schedule_id = "a" * 32
+                agent_server.write_fresh_server_update_status(
+                    phase="pending",
+                    schedule_id=schedule_id,
+                    target_version="1.1.0",
+                    latest_version="1.1.0",
+                    track="stable",
+                    update_available=True,
+                    when_idle=True,
+                    cancelable=True,
+                    blocker_counts={"active_runs": 1},
+                )
+                with self.assertRaises(HTTPException) as mismatch:
+                    await agent_server.cancel_server_update(
+                        agent_server.ServerUpdateCancelRequest(
+                            schedule_id="b" * 32,
+                        )
+                    )
+                cancelled = await agent_server.cancel_server_update(
+                    agent_server.ServerUpdateCancelRequest(
+                        schedule_id=schedule_id,
+                    )
+                )
+                stale = await agent_server._start_server_update(
+                    agent_server.ServerUpdateRequest(
+                        version="1.1.0",
+                        when_idle=True,
+                    ),
+                    expected_schedule_id=schedule_id,
+                )
+
+        self.assertEqual(mismatch.exception.detail["code"], "server_update_changed")
+        self.assertEqual(cancelled["phase"], "available")
+        self.assertIsNone(cancelled["schedule_id"])
+        self.assertIsNone(cancelled["update_id"])
+        self.assertEqual(stale["phase"], "available")
+        terminal_attachments.reopen_if_update_inactive.assert_awaited_once_with(
+            cancelled
+        )
+
+    async def test_cancel_losing_pending_to_start_race_is_not_cancelable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "update_runner.py"
+            key = root / "release-public-key.pem"
+            runner.write_text("# runner\n")
+            key.write_text("public key\n")
+            busy = {"busy-chat"}
+            quiescing = asyncio.Event()
+            release_quiesce = asyncio.Event()
+
+            async def slow_quiesce(*, service_cgroup):
+                self.assertIsNone(service_cgroup)
+                quiescing.set()
+                await release_quiesce.wait()
+
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", root / "status.json"), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server, "AGENT_TOKEN", ""), \
+                 patch.object(agent_server, "BUSY_SESSIONS", busy), \
+                 patch.object(agent_server, "SERVER_MAINTENANCE_SESSIONS", set()), \
+                 patch.object(agent_server, "QUEUED_TURNS", {}), \
+                 patch.object(agent_server, "RUN_NOW_TURNS", {}), \
+                 patch.object(agent_server, "active_provider_background_work_labels", return_value=[]), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
+                 patch.object(
+                     agent_server,
+                     "ensure_managed_update_tmux_isolated",
+                     return_value=None,
+                 ), \
+                 patch.object(
+                     agent_server,
+                     "quiesce_managed_update_service_cgroup",
+                     side_effect=slow_quiesce,
+                 ), \
+                 patch.object(agent_server, "run_tmux", return_value=None):
+                pending = await agent_server.start_server_update(
+                    agent_server.ServerUpdateRequest(
+                        version="1.1.0",
+                        when_idle=True,
+                    ),
+                )
+                busy.clear()
+                transition = asyncio.create_task(
+                    agent_server.advance_pending_server_update_once()
+                )
+                await asyncio.wait_for(quiescing.wait(), timeout=1)
+                cancel = asyncio.create_task(
+                    agent_server.cancel_server_update(
+                        agent_server.ServerUpdateCancelRequest(
+                            schedule_id=pending["schedule_id"],
+                        )
+                    )
+                )
+                await asyncio.sleep(0)
+                self.assertFalse(cancel.done())
+                release_quiesce.set()
+                started = await transition
+                with self.assertRaises(HTTPException) as raised:
+                    await cancel
+
+        self.assertEqual(started["phase"], "starting")
+        self.assertEqual(raised.exception.detail["code"], "server_update_not_cancelable")
+        self.assertEqual(raised.exception.detail["schedule_id"], pending["schedule_id"])
+
+    async def test_pending_allows_completion_controls_but_rejects_new_work(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            status_path = Path(temporary) / "status.json"
+            stop_turn = AsyncMock(return_value={"stopped": True})
+            resolve_codex = AsyncMock(return_value={"status": "resolved"})
+            resolve_claude = AsyncMock(return_value={"status": "resolved"})
+            with patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", status_path), \
+                 patch.object(agent_server, "BUSY_SESSIONS", {"active-chat"}), \
+                 patch.object(agent_server, "stop_turn", new=stop_turn), \
+                 patch.object(agent_server, "resolve_codex_interaction", new=resolve_codex), \
+                 patch.object(agent_server, "resolve_claude_interaction", new=resolve_claude):
+                agent_server.write_fresh_server_update_status(
+                    phase="pending",
+                    schedule_id="c" * 32,
+                    target_version="1.1.0",
+                    track="stable",
+                    when_idle=True,
+                    cancelable=True,
+                    blocker_counts={"active_runs": 1},
+                )
+                self.assertIsNone(agent_server.managed_server_update_blocker())
+                self.assertIn(
+                    "managed update",
+                    str(agent_server.managed_server_update_admission_blocker()),
+                )
+                interactive = await agent_server.turn_start_blocker()
+                scheduled = await agent_server.scheduled_job_blocker("other-chat")
+                stopped = await agent_server.stop_turn_endpoint("active-chat")
+                codex = await agent_server.post_codex_interaction_response(
+                    "active-chat",
+                    "approval-1",
+                    agent_server.CodexInteractionResponseRequest(
+                        response={"decision": "accept"},
+                    ),
+                )
+                claude = await agent_server.post_claude_interaction_response(
+                    "active-chat",
+                    "question-1",
+                    agent_server.ClaudeInteractionResponseRequest(
+                        response={"answer": "continue"},
+                    ),
+                )
+
+        self.assertIn("managed update", str(interactive))
+        self.assertIn("managed update", str(scheduled))
+        self.assertEqual(stopped, {"stopped": True})
+        self.assertEqual(codex["interaction"]["status"], "resolved")
+        self.assertEqual(claude["interaction"]["status"], "resolved")
+        self.assertTrue(
+            agent_server.managed_server_update_pending_completion_route(
+                "POST",
+                "/api/sessions/active-chat/stop",
+            )
+        )
+        self.assertTrue(
+            agent_server.managed_server_update_pending_completion_route(
+                "POST",
+                "/api/sessions/active-chat/codex/interactions/a/resolve",
+            )
+        )
+        self.assertFalse(
+            agent_server.managed_server_update_pending_completion_route(
+                "POST",
+                "/api/sessions/active-chat/turn",
+            )
+        )
+        stop_turn.assert_awaited_once_with("active-chat")
+        resolve_codex.assert_awaited_once()
+        resolve_claude.assert_awaited_once()
+
+    async def test_pending_http_fence_allows_stop_but_blocks_new_mutation(self):
+        def request(path: str):
+            return agent_server.Request({
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "method": "POST",
+                "scheme": "http",
+                "path": path,
+                "raw_path": path.encode(),
+                "query_string": b"",
+                "root_path": "",
+                "headers": [],
+                "client": ("127.0.0.1", 50000),
+                "server": ("127.0.0.1", 7850),
+            })
+
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(agent_server, "AGENT_TOKEN", ""), \
+             patch.object(
+                 agent_server,
+                 "SERVER_UPDATE_STATUS_FILE",
+                 Path(temporary) / "status.json",
+             ):
+            agent_server.write_fresh_server_update_status(
+                phase="pending",
+                schedule_id="f" * 32,
+                target_version="1.1.0",
+                track="stable",
+                when_idle=True,
+                cancelable=True,
+                blocker_counts={"active_runs": 1},
+            )
+            stop_response = agent_server.JSONResponse({"continued": True})
+            stop_next = AsyncMock(return_value=stop_response)
+            allowed = await agent_server.require_agent_token(
+                request("/api/sessions/chat/stop"),
+                stop_next,
+            )
+            check_next = AsyncMock(
+                side_effect=lambda _request: agent_server.JSONResponse(
+                    agent_server.read_server_update_status()
+                )
+            )
+            checked = await agent_server.require_agent_token(
+                request("/api/admin/update/check"),
+                check_next,
+            )
+            blocked_next = AsyncMock()
+            blocked = await agent_server.require_agent_token(
+                request("/api/sessions/chat/turn"),
+                blocked_next,
+            )
+
+        self.assertIs(allowed, stop_response)
+        stop_next.assert_awaited_once()
+        self.assertEqual(checked.status_code, 200)
+        self.assertIn(b'"phase":"pending"', checked.body)
+        self.assertIn(b'"schedule_id":"ffffffffffffffffffffffffffffffff"', checked.body)
+        check_next.assert_awaited_once()
+        self.assertEqual(blocked.status_code, 409)
+        self.assertIn(b"server_update_pending", blocked.body)
+        blocked_next.assert_not_awaited()
+
+    async def test_pending_fences_terminal_reconnect_without_closing_existing_work(self):
+        class Socket:
+            pass
+
+        registry = agent_server.TerminalAttachmentRegistry()
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(
+                 agent_server,
+                 "SERVER_UPDATE_STATUS_FILE",
+                 Path(temporary) / "status.json",
+             ):
+            agent_server.write_fresh_server_update_status(
+                phase="pending",
+                schedule_id="d" * 32,
+                target_version="1.1.0",
+                track="stable",
+                when_idle=True,
+                cancelable=True,
+                blocker_counts={"active_runs": 1},
+            )
+            admitted = await registry.reserve("chat", Socket())
+            snapshot = await registry.snapshot()
+
+        self.assertFalse(admitted)
+        self.assertTrue(snapshot["admission_open"])
+        self.assertEqual(snapshot["active_connections"], 0)
+
+    async def test_startup_preserves_valid_pending_and_fails_malformed_schedule(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+             patch.object(
+                 agent_server,
+                 "SERVER_UPDATE_STATUS_FILE",
+                 Path(temporary) / "status.json",
+             ):
+            original = agent_server.write_fresh_server_update_status(
+                phase="pending",
+                schedule_id="e" * 32,
+                target_version="1.1.0",
+                latest_version="1.1.0",
+                track="stable",
+                when_idle=True,
+                cancelable=True,
+                blocker_counts={"active_runs": 1},
+            )
+            recovered = await agent_server.reconcile_server_update_status_after_startup()
+            agent_server.write_fresh_server_update_status(
+                phase="pending",
+                schedule_id=None,
+                target_version="1.2.0",
+                track="stable",
+                when_idle=True,
+                cancelable=True,
+            )
+            malformed = await agent_server.reconcile_server_update_status_after_startup()
+
+        self.assertEqual(recovered["phase"], "pending")
+        self.assertEqual(recovered["schedule_id"], original["schedule_id"])
+        self.assertEqual(recovered["updated_at"], original["updated_at"])
+        self.assertEqual(malformed["phase"], "failed")
+        self.assertEqual(
+            malformed["error_code"],
+            "server_update_schedule_invalid",
+        )
+        self.assertTrue(malformed["retryable"])
 
     async def test_start_rejects_update_while_queued_turns_are_not_durable(self):
         with tempfile.TemporaryDirectory() as temporary:

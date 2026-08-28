@@ -1815,7 +1815,158 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         terminal.assert_awaited_once()
         received.assert_not_awaited()
 
-    def test_target_delivery_capabilities_require_native_codex_and_claude(self) -> None:
+    async def test_ready_cursor_target_uses_headless_delivery_contract(self) -> None:
+        agent_server.STORE.sessions["target"]["backend"] = "cursor"
+        record, _created = await agent_server.CROSS_CHAT.create_instruction(
+            envelope_id="handoff_cursor_ready",
+            source_session_id="source",
+            source_run_id="run_source",
+            target_session_id="target",
+            body="Inspect the failure and report back.",
+            idempotency_key="cursor-ready-key",
+        )
+        captured: dict[str, object] = {}
+
+        async def start_cursor_delivery(session_id: str, request):
+            captured["session_id"] = session_id
+            captured["request"] = request
+            await agent_server.CROSS_CHAT.update(
+                record["id"],
+                expected={"submitting"},
+                status="running",
+                target_run_id="run_cursor_target",
+            )
+            return {"queued": False, "run_id": "run_cursor_target"}
+
+        with (
+            patch.dict(
+                agent_server.RUNTIME_DIAGNOSTICS,
+                {
+                    agent_server.BACKEND_CURSOR: {
+                        "backend": agent_server.BACKEND_CURSOR,
+                        "status": "ready",
+                        "available": True,
+                        "installed": True,
+                        "authenticated": True,
+                        "_executable": "/test/bin/agent",
+                    }
+                },
+                clear=True,
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_event_once",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_lifecycle",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                agent_server,
+                "start_turn_durably",
+                side_effect=start_cursor_delivery,
+            ),
+        ):
+            result = await agent_server.submit_cross_chat_delivery(record)
+
+        request = captured["request"]
+        self.assertEqual(captured["session_id"], "target")
+        self.assertEqual(request.purpose, "cross_chat_handoff_delivery")
+        self.assertEqual(request.target_session_id, "target")
+        self.assertEqual(request.cross_chat_envelope_id, record["id"])
+        self.assertEqual(request.client_capabilities, [])
+        self.assertEqual(result["status"], "running")
+
+    async def test_cursor_delivery_rechecks_runtime_at_provider_admission(self) -> None:
+        class AdmissionReached(Exception):
+            pass
+
+        agent_server.STORE.sessions["target"]["backend"] = "cursor"
+        record, _created = await agent_server.CROSS_CHAT.create_instruction(
+            envelope_id="handoff_cursor_admission",
+            source_session_id="source",
+            source_run_id="run_source",
+            target_session_id="target",
+            body="Run the admitted Cursor turn.",
+            idempotency_key="cursor-admission-key",
+        )
+        await agent_server.CROSS_CHAT.update(
+            record["id"],
+            expected={"ready"},
+            status="submitting",
+        )
+        request = agent_server.TurnRequest(
+            prompt=agent_server.cross_chat_delivery_prompt(record, "Source"),
+            display_prompt="Agent-authored same-server handoff",
+            purpose="cross_chat_handoff_delivery",
+            source_session_id="source",
+            target_session_id="target",
+            cross_chat_envelope_id=record["id"],
+            client_capabilities=[],
+        )
+        ensure_runtime = AsyncMock(
+            return_value={
+                "backend": agent_server.BACKEND_CURSOR,
+                "status": "ready",
+                "_executable": "/test/bin/agent",
+            }
+        )
+        with (
+            patch.dict(
+                agent_server.RUNTIME_DIAGNOSTICS,
+                {
+                    agent_server.BACKEND_CURSOR: {
+                        "backend": agent_server.BACKEND_CURSOR,
+                        "status": "ready",
+                        "_executable": "/test/bin/agent",
+                    }
+                },
+                clear=True,
+            ),
+            patch.object(
+                agent_server,
+                "managed_server_update_admission_blocker",
+                return_value=None,
+            ),
+            patch.object(
+                agent_server,
+                "turn_start_blocker",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(
+                agent_server,
+                "ensure_runtime_available",
+                ensure_runtime,
+            ),
+            patch.object(
+                agent_server.STORE,
+                "mark_backend_started",
+                AsyncMock(return_value=agent_server.STORE.sessions["target"]),
+            ),
+            patch.object(
+                agent_server,
+                "build_turn_provider_prompt",
+                return_value="relay prompt",
+            ),
+            patch.object(
+                agent_server,
+                "issue_cross_chat_capability",
+                AsyncMock(side_effect=AdmissionReached),
+            ),
+        ):
+            with self.assertRaises(AdmissionReached):
+                await agent_server._start_turn_locked(
+                    "target",
+                    request,
+                    queue_if_busy=False,
+                )
+
+        ensure_runtime.assert_awaited_once_with(agent_server.BACKEND_CURSOR)
+        self.assertNotIn("target", agent_server.BUSY_SESSIONS)
+
+    def test_target_delivery_capabilities_require_native_or_ready_runtimes(self) -> None:
         with patch.object(
             agent_server, "CODEX_TRANSPORT", agent_server.CODEX_TRANSPORT_APP_SERVER
         ):
@@ -1844,11 +1995,51 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(HTTPException):
                 agent_server.cross_chat_delivery_client_capabilities({"backend": "claude"})
 
-    def test_handoff_capability_advertises_only_native_target_backends(self) -> None:
+        with patch.dict(
+            agent_server.RUNTIME_DIAGNOSTICS,
+            {
+                agent_server.BACKEND_CURSOR: {
+                    "backend": agent_server.BACKEND_CURSOR,
+                    "status": "ready",
+                    "available": True,
+                    "installed": True,
+                    "authenticated": True,
+                    "_executable": "/test/bin/agent",
+                }
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                agent_server.cross_chat_delivery_client_capabilities(
+                    {"backend": "cursor"}
+                ),
+                [],
+            )
+        for status in ("unknown", "missing", "unauthenticated", "error"):
+            with self.subTest(cursor_status=status), patch.dict(
+                agent_server.RUNTIME_DIAGNOSTICS,
+                {
+                    agent_server.BACKEND_CURSOR: {
+                        "backend": agent_server.BACKEND_CURSOR,
+                        "status": status,
+                    }
+                },
+                clear=True,
+            ):
+                with self.assertRaisesRegex(
+                    HTTPException,
+                    "compatible authenticated headless Cursor CLI",
+                ):
+                    agent_server.cross_chat_delivery_client_capabilities(
+                        {"backend": "cursor"}
+                    )
+
+    def test_handoff_capability_advertises_only_admitted_target_backends(self) -> None:
         with (
             patch.object(agent_server, "CODEX_TRANSPORT", agent_server.CODEX_TRANSPORT_EXEC),
             patch.object(agent_server, "CLAUDE_TRANSPORT", agent_server.CLAUDE_TRANSPORT_PRINT),
             patch.object(agent_server, "claude_sdk_dependency_available", return_value=False),
+            patch.dict(agent_server.RUNTIME_DIAGNOSTICS, {}, clear=True),
         ):
             unavailable = agent_server.cross_chat_handoffs_capability()
         self.assertFalse(unavailable["available"])
@@ -1866,12 +2057,34 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
                 agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
             ),
             patch.object(agent_server, "claude_sdk_dependency_available", return_value=True),
+            patch.dict(
+                agent_server.RUNTIME_DIAGNOSTICS,
+                {
+                    agent_server.BACKEND_CURSOR: {
+                        "backend": agent_server.BACKEND_CURSOR,
+                        "status": "ready",
+                        "available": True,
+                        "installed": True,
+                        "authenticated": True,
+                        "_executable": "/test/bin/agent",
+                    }
+                },
+                clear=True,
+            ),
         ):
             available = agent_server.cross_chat_handoffs_capability()
         self.assertTrue(available["available"])
         self.assertEqual(
             available["supported_target_backends"],
-            [agent_server.BACKEND_CODEX, agent_server.BACKEND_CLAUDE],
+            [
+                agent_server.BACKEND_CODEX,
+                agent_server.BACKEND_CLAUDE,
+                agent_server.BACKEND_CURSOR,
+            ],
+        )
+        self.assertEqual(
+            available["required_target_transports"][agent_server.BACKEND_CURSOR],
+            "headless-stream-json",
         )
 
     def test_agent_helper_bypass_allowlist_covers_exact_registered_routes(self) -> None:

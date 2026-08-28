@@ -26297,6 +26297,17 @@ def cross_chat_supported_target_backends() -> list[str]:
         and claude_sdk_dependency_available()
     ):
         supported.append(BACKEND_CLAUDE)
+    # Cursor has no separately selectable transport: the compatibility and
+    # authentication probe is the transport gate.  Use only the cached probe
+    # here so /api/health never blocks on CLI subprocesses.  Startup and the
+    # runtime catalog refresh this diagnostic, while actual turn admission
+    # calls ensure_runtime_available() again before any provider launch.
+    with RUNTIME_DIAGNOSTICS_LOCK:
+        cursor_diagnostic = dict(
+            RUNTIME_DIAGNOSTICS.get(BACKEND_CURSOR) or {}
+        )
+    if cursor_diagnostic.get("status") == "ready":
+        supported.append(BACKEND_CURSOR)
     return supported
 
 
@@ -26317,8 +26328,15 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
         message = "Cross-chat handoffs require an authenticated AgentsServer configuration."
         action = "Configure an AgentsServer client token."
     else:
-        message = "Cross-chat handoffs require native Codex app-server or Claude Agent SDK target transport."
-        action = "Enable Codex app-server or install and enable Claude Agent SDK transport."
+        message = (
+            "Cross-chat handoffs require native Codex app-server, Claude "
+            "Agent SDK, or a compatible authenticated Cursor CLI target "
+            "transport."
+        )
+        action = (
+            "Enable Codex app-server, install and enable Claude Agent SDK, "
+            "or install and authenticate a compatible Cursor CLI."
+        )
     return {
         "available": available,
         "required": False,
@@ -26398,6 +26416,7 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
         "required_target_transports": {
             BACKEND_CODEX: CODEX_TRANSPORT_APP_SERVER,
             BACKEND_CLAUDE: CLAUDE_TRANSPORT_AGENT_SDK,
+            BACKEND_CURSOR: "headless-stream-json",
         },
     }
 
@@ -26418,6 +26437,19 @@ def cross_chat_delivery_client_capabilities(target: dict[str, Any]) -> list[str]
                 detail="target Claude chat must use Agent SDK transport for cross-chat delivery",
             )
         return [CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY]
+    if backend == BACKEND_CURSOR:
+        if not cross_chat_target_backend_supported(backend):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "target Cursor chat requires a compatible authenticated "
+                    "headless Cursor CLI for cross-chat delivery"
+                ),
+            )
+        # Cursor's print-mode runner has no renderer-owned interactive bridge.
+        # An empty immutable client-capability set selects that exact headless
+        # path; request/reply final answers are relayed by the server ledger.
+        return []
     raise HTTPException(
         status_code=409,
         detail=f"target backend {backend!r} does not support cross-chat delivery",

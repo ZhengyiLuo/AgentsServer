@@ -111,7 +111,10 @@ class InstallerContractTests(unittest.TestCase):
         self.assertIn("-c 'import websockets'", INSTALLER.read_text())
         self.assertIn("import claude_agent_sdk", INSTALLER.read_text())
         self.assertIn("import croniter, dateutil", INSTALLER.read_text())
-        self.assertIn("import agentsdock_team_hub, secure_peer_delivery, secure_peer_runtime", INSTALLER.read_text())
+        self.assertIn(
+            "import agentsdock_team_hub, cursor_agent_client, secure_peer_delivery, secure_peer_runtime",
+            INSTALLER.read_text(),
+        )
         self.assertIn("from agentsdock_team_hub import secure_peer, secure_peer_hub", INSTALLER.read_text())
         self.assertIn('"state_available": True', INSTALLER.read_text())
         self.assertIn('"state_error_code": None', INSTALLER.read_text())
@@ -644,6 +647,7 @@ exit 0
         self.assertIn('"$SCRIPT_DIR/agentsdock_publish.py"', source)
         self.assertIn('"$SCRIPT_DIR/claude_sdk_client.py"', source)
         self.assertIn('"$SCRIPT_DIR/codex_app_server.py"', source)
+        self.assertIn('"$SCRIPT_DIR/cursor_agent_client.py"', source)
         self.assertIn('"$SCRIPT_DIR/team_hub_host.py"', source)
         self.assertIn('"$SCRIPT_DIR/agentsdock_team_hub/"', source)
         self.assertIn("import claude_agent_sdk, croniter, cryptography, dateutil, tzdata", source)
@@ -654,12 +658,13 @@ exit 0
         self.assertIn("python-dateutil>=2.9,<3", source)
         self.assertIn("'$REMOTE_SERVER_DIR/claude_sdk_client.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/codex_app_server.py'", source)
+        self.assertIn("'$REMOTE_SERVER_DIR/cursor_agent_client.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/team_hub_host.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/secure_peer_runtime.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/secure_peer_delivery.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/agentsdock_team_hub'", source)
         self.assertIn(
-            "import agentsdock_team_hub, claude_agent_sdk, secure_peer_delivery, secure_peer_runtime, team_hub_host",
+            "import agentsdock_team_hub, claude_agent_sdk, cursor_agent_client, secure_peer_delivery, secure_peer_runtime, team_hub_host",
             source,
         )
         self.assertIn("from agentsdock_team_hub import secure_peer, secure_peer_hub", source)
@@ -896,7 +901,7 @@ exit 0
         installer_source = INSTALLER.read_text()
         packager_source = PACKAGER.read_text()
         self.assertIn(
-            "RELEASE_FILES=(agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_publish.py claude_sdk_client.py codex_app_server.py",
+            "RELEASE_FILES=(agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_publish.py claude_sdk_client.py codex_app_server.py cursor_agent_client.py",
             installer_source,
         )
         self.assertIn("RELEASE_DIRECTORIES=(agentsdock_team_hub)", installer_source)
@@ -905,6 +910,11 @@ exit 0
         self.assertIn('"$STAGE_DIR/agentsdock_publish.py"', installer_source)
         self.assertIn('"$STAGE_DIR/claude_sdk_client.py"', installer_source)
         self.assertIn('"$STAGE_DIR/codex_app_server.py"', installer_source)
+        self.assertIn('"$STAGE_DIR/cursor_agent_client.py"', installer_source)
+        self.assertIn(
+            "import agentsdock_team_hub, cursor_agent_client, secure_peer_delivery",
+            installer_source,
+        )
         self.assertIn('"$STAGE_DIR/secure_peer_runtime.py"', installer_source)
         self.assertIn('"$STAGE_DIR/secure_peer_delivery.py"', installer_source)
         self.assertIn('"$STAGE_DIR/uninstall.sh"', installer_source)
@@ -913,6 +923,7 @@ exit 0
         self.assertIn('"agentsdock_emergency.py"', packager_source)
         self.assertIn('"claude_sdk_client.py"', packager_source)
         self.assertIn('"codex_app_server.py"', packager_source)
+        self.assertIn('"cursor_agent_client.py"', packager_source)
         self.assertIn('"secure_peer_runtime.py"', packager_source)
         self.assertIn('"secure_peer_delivery.py"', packager_source)
         self.assertIn('"uninstall.sh"', packager_source)
@@ -962,6 +973,10 @@ exit 0
                 f"agents-server-{version}/claude_sdk_client.py",
                 members,
             )
+            self.assertIn(
+                f"agents-server-{version}/cursor_agent_client.py",
+                members,
+            )
             self.assertIn(f"agents-server-{version}/uninstall.sh", members)
             self.assertIn(f"agents-server-{version}/team_hub_host.py", members)
             self.assertIn(f"agents-server-{version}/secure_peer_runtime.py", members)
@@ -1001,7 +1016,7 @@ exit 0
                 "beta" if "-" in version.split("+", 1)[0] else "stable",
             )
             self.assertEqual(manifest["prerelease"], manifest["track"] == "beta")
-            self.assertEqual(manifest["api_contract_version"], 21)
+            self.assertEqual(manifest["api_contract_version"], 22)
 
     def test_installer_preserves_state_and_emits_private_result(self):
         source = INSTALLER.read_text()

@@ -722,6 +722,7 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
                 "codex_sandbox_mode",
                 "codex_permission_profile",
                 "codex_approvals_reviewer",
+                "cursor_permission_mode",
                 "provider_jobs_access",
                 "archived",
             }),
@@ -2100,6 +2101,134 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(imported[0].args[2]["copied_events"], 17)
         self.assertIn("bounded rough history", imported[0].args[2]["message"])
         self.assertEqual(result["session"]["id"], child_id)
+
+    async def test_cursor_fork_preserves_mode_and_seeds_fresh_bounded_session(
+        self,
+    ) -> None:
+        parent_id = "cursor-parent"
+        child_id = "cursor-child"
+        parent = {
+            "id": parent_id,
+            "title": "Cursor parent",
+            "folder": "General",
+            "cwd": "/tmp",
+            "backend": agent_server.BACKEND_CURSOR,
+            "session_id": "cursor-provider-parent",
+            "cursor_session_id": "cursor-provider-parent",
+            "cursor_permission_mode": "plan",
+            "pinned": False,
+            "archived": False,
+        }
+        child = {
+            "id": child_id,
+            "title": "Fork of Cursor parent",
+            "folder": "General",
+            "cwd": "/tmp",
+            "backend": agent_server.BACKEND_CURSOR,
+            "session_id": None,
+            "cursor_session_id": None,
+            "cursor_permission_mode": "plan",
+            "parent_id": parent_id,
+            "pinned": False,
+            "archived": False,
+            "_fork_initializing": True,
+        }
+        sessions = {parent_id: parent}
+        events = [
+            {
+                "type": "turn_started",
+                "run_id": "parent-run",
+                "prompt": "p" * (agent_server.MAX_FORK_MEMORY_CHARS * 2),
+            },
+            {
+                "type": "turn_finished",
+                "run_id": "parent-run",
+                "result_text": "bounded Cursor parent result",
+            },
+        ]
+
+        async def create_child(req: object, **_kwargs: object) -> dict:
+            self.assertEqual(req.backend, agent_server.BACKEND_CURSOR)
+            self.assertEqual(req.cursor_permission_mode, "plan")
+            self.assertIsNone(req.provider_session_id)
+            sessions[child_id] = child
+            return child
+
+        async def update_child(session_id: str, _patch: dict) -> dict:
+            self.assertEqual(session_id, child_id)
+            child["updated_at"] = "2026-08-28T00:00:00Z"
+            return child
+
+        emitted: list[tuple[str, str, dict]] = []
+
+        async def append_event(
+            session_id: str,
+            event_type: str,
+            payload: dict,
+        ) -> dict:
+            emitted.append((session_id, event_type, payload))
+            return payload
+
+        with patch.object(agent_server.STORE, "sessions", sessions), patch.object(
+            agent_server.STORE,
+            "_lock",
+            asyncio.Lock(),
+        ), patch.object(
+            agent_server.STORE,
+            "create",
+            new_callable=AsyncMock,
+            side_effect=create_child,
+        ), patch.object(
+            agent_server.STORE,
+            "reorder",
+            new_callable=AsyncMock,
+            return_value=[parent, child],
+        ), patch.object(
+            agent_server.STORE,
+            "save",
+            new_callable=AsyncMock,
+        ), patch.object(
+            agent_server.STORE,
+            "update",
+            new_callable=AsyncMock,
+            side_effect=update_child,
+        ), patch.object(
+            agent_server,
+            "iter_session_events",
+            side_effect=lambda _session_id: iter(events),
+        ), patch.object(
+            agent_server,
+            "copy_fork_history",
+            new_callable=AsyncMock,
+            return_value=len(events),
+        ), patch.object(
+            agent_server,
+            "append_event",
+            new_callable=AsyncMock,
+            side_effect=append_event,
+        ):
+            result = await agent_server.fork_session(
+                parent_id,
+                agent_server.ForkSessionRequest(),
+            )
+
+        self.assertEqual(result["session"]["id"], child_id)
+        self.assertEqual(child["cursor_permission_mode"], "plan")
+        self.assertIsNone(child["session_id"])
+        self.assertIsNone(child["cursor_session_id"])
+        self.assertFalse(child["memory_seed_used"])
+        self.assertTrue(child["memory_forked"])
+        self.assertLessEqual(
+            len(child["memory_seed"]),
+            agent_server.MAX_FORK_MEMORY_CHARS,
+        )
+        self.assertIn("bounded Cursor parent result", child["memory_seed"])
+        history_event = next(
+            payload
+            for session_id, event_type, payload in emitted
+            if session_id == child_id and event_type == "history_imported"
+        )
+        self.assertIn("fresh provider session", history_event["message"])
 
     async def test_active_parent_is_rejected_before_provider_fork(self) -> None:
         parent_id = "busy-parent"

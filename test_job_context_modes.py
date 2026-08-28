@@ -13,6 +13,7 @@ class StandaloneProviderContextTests(unittest.IsolatedAsyncioTestCase):
         parent = {
             "id": "sess_parent",
             "backend": agent_server.BACKEND_CODEX,
+            "backend_locked": True,
             "cwd": "/tmp/work",
             "model": "gpt-test",
             "effort": "high",
@@ -36,15 +37,18 @@ class StandaloneProviderContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(isolated["effort"], "high")
         self.assertEqual(isolated["system_prompt"], "Keep this policy")
         self.assertIsNone(agent_server.session_provider_id(isolated))
+        self.assertFalse(isolated["backend_locked"])
         self.assertIsNone(isolated["memory_seed"])
         self.assertIsNone(isolated["fork_from"])
         self.assertIsNone(isolated["codex_goal"])
         self.assertIsNone(isolated["codex_goal_time_budget_seconds"])
         self.assertEqual(parent["codex_thread_id"], "thread_parent")
+        self.assertTrue(parent["backend_locked"])
 
     def test_standalone_ignores_exhausted_parent_goal_budget(self) -> None:
         session = {
             "backend": agent_server.BACKEND_CODEX,
+            "backend_locked": True,
             "codex_goal": {
                 "objective": "Parent goal",
                 "status": "budgetLimited",
@@ -491,6 +495,7 @@ class StandaloneProviderContextTests(unittest.IsolatedAsyncioTestCase):
         parent = {
             "id": "sess_parent",
             "backend": agent_server.BACKEND_CODEX,
+            "backend_locked": True,
             "model": "gpt-5.6-sol",
             "effort": "ultra",
             "session_id": "thread_parent",
@@ -508,6 +513,7 @@ class StandaloneProviderContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(preview["effort"])
         self.assertEqual(parent["model"], "gpt-5.6-sol")
         self.assertEqual(parent["effort"], "ultra")
+        self.assertTrue(parent["backend_locked"])
 
 
 if __name__ == "__main__":

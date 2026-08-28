@@ -46,6 +46,68 @@ class DigestQueuePersistenceTests(unittest.TestCase):
         self.assertEqual(item["model"], "gpt-5.6-sol")
         self.assertEqual(item["effort"], "xhigh")
 
+    def test_cursor_source_pack_includes_provider_without_name_error(self) -> None:
+        source = {
+            "id": "cursor-source",
+            "title": "Cursor source",
+            "backend": agent_server.BACKEND_CURSOR,
+            "cwd": "/tmp/cursor",
+            "session_id": "cursor-provider-1",
+            "cursor_session_id": "cursor-provider-1",
+        }
+        with patch.object(
+            agent_server.STORE,
+            "sessions",
+            {"cursor-source": source},
+        ), patch.object(
+            agent_server,
+            "read_events",
+            return_value=[],
+        ), patch.object(
+            agent_server,
+            "list_session_file_records",
+            return_value=[],
+        ):
+            pack = agent_server.build_handoff_source_pack("cursor-source")
+
+        self.assertIn("Backend: cursor", pack["source_pack"])
+        self.assertIn(
+            "Provider session/thread: cursor-provider-1",
+            pack["source_pack"],
+        )
+
+
+class DigestSummarizerBackendTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cursor_cannot_be_mislabeled_as_digest_summarizer(self) -> None:
+        with patch.object(
+            agent_server,
+            "build_handoff_source_pack",
+            return_value={
+                "source_pack": "source",
+                "source_session": {"id": "source"},
+                "event_count": 0,
+                "file_count": 0,
+                "detail": "normal",
+            },
+        ), patch.object(
+            agent_server,
+            "run_claude_handoff_summarizer",
+            new_callable=AsyncMock,
+        ) as claude, patch.object(
+            agent_server,
+            "run_codex_handoff_summarizer",
+            new_callable=AsyncMock,
+        ) as codex:
+            with self.assertRaises(agent_server.HTTPException) as raised:
+                await agent_server.build_handoff_digest(
+                    "source",
+                    summarizer_backend=agent_server.BACKEND_CURSOR,
+                )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        claude.assert_not_awaited()
+        codex.assert_not_awaited()
+
 
 class ForkHistoryDigestTests(unittest.IsolatedAsyncioTestCase):
     async def test_internal_digest_runs_are_not_copied_into_a_fork(self) -> None:
@@ -204,6 +266,51 @@ class DigestDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(event_type == "handoff_digest_sent" for _, event_type, _ in emitted), 1)
         received = next(payload for session, event_type, payload in emitted if session == "target-1" and event_type == "handoff_digest_received")
         self.assertEqual(received["digest"], digest)
+
+    async def test_logical_cursor_failure_never_delivers_digest(self) -> None:
+        agent_server.HANDOFF_DIGEST_JOBS["digest-1"] = self.job()
+        event = {
+            "type": "turn_finished",
+            "run_id": "cursor-source-run",
+            "backend": agent_server.BACKEND_CURSOR,
+            "purpose": "handoff_digest",
+            "digest_job_id": "digest-1",
+            "source_session_id": "source-1",
+            "target_session_id": "target-1",
+            "exit_code": 0,
+            "is_error": True,
+            "result_text": "# AgentsDock Context Digest\nshould not deliver",
+        }
+        updates: list[dict[str, object]] = []
+
+        async def update_job(
+            _job_id: str,
+            values: dict[str, object],
+        ) -> dict[str, object]:
+            updates.append(values)
+            return {**self.job(), **values}
+
+        with patch.object(
+            agent_server,
+            "update_handoff_digest_job",
+            side_effect=update_job,
+        ), patch.object(
+            agent_server,
+            "digest_event_exists",
+            return_value=False,
+        ), patch.object(
+            agent_server,
+            "append_event",
+            new_callable=AsyncMock,
+        ), patch.object(
+            agent_server,
+            "deliver_handoff_digest",
+            new_callable=AsyncMock,
+        ) as deliver:
+            await finalize_handoff_digest_turn("source-1", event)
+
+        deliver.assert_not_awaited()
+        self.assertEqual(updates[-1]["status"], "failed")
 
     async def test_restart_replays_an_interrupted_target_delivery(self) -> None:
         digest = "# AgentsDock Context Digest\n\nRecovered after restart."

@@ -523,6 +523,30 @@ PORT_TUNNEL_CLOSE_TIMEOUT_SECONDS = max(
     0.1,
     float(agentsdock_setting("PORT_TUNNEL_CLOSE_TIMEOUT_SECONDS", "2")),
 )
+TERMINAL_ATTACHMENT_CLOSE_TIMEOUT_SECONDS = max(
+    1.0,
+    float(agentsdock_setting("TERMINAL_ATTACHMENT_CLOSE_TIMEOUT_SECONDS", "6")),
+)
+MANAGED_UPDATE_PROVIDER_QUIESCE_TIMEOUT_SECONDS = max(
+    1.0,
+    float(agentsdock_setting("MANAGED_UPDATE_PROVIDER_QUIESCE_TIMEOUT_SECONDS", "8")),
+)
+MANAGED_UPDATE_CGROUP_SETTLE_TIMEOUT_SECONDS = max(
+    0.1,
+    float(agentsdock_setting("MANAGED_UPDATE_CGROUP_SETTLE_TIMEOUT_SECONDS", "3")),
+)
+MANAGED_UPDATE_CGROUP_SETTLE_INTERVAL_SECONDS = max(
+    0.01,
+    min(
+        MANAGED_UPDATE_CGROUP_SETTLE_TIMEOUT_SECONDS,
+        float(
+            agentsdock_setting(
+                "MANAGED_UPDATE_CGROUP_SETTLE_INTERVAL_SECONDS",
+                "0.05",
+            )
+        ),
+    ),
+)
 PORT_TUNNEL_READ_CHUNK_BYTES = 64 * 1024
 PORT_TUNNEL_MAX_CLIENT_FRAME_BYTES = 1024 * 1024
 PORT_TUNNEL_CLOSE_INVALID_REQUEST = 4400
@@ -676,7 +700,7 @@ PROVIDER_SECRET_ENV_NAMES = (
 SERVER_BIND_ADDRESS = agentsdock_setting("AGENT_BIND", "0.0.0.0")
 SERVER_PORT = int(agentsdock_setting("AGENT_PORT", "7850"))
 SERVER_INSTANCE_ID = uuid.uuid4().hex
-API_CONTRACT_VERSION = 20
+API_CONTRACT_VERSION = 21
 SESSION_ORDER_STEP = 1000.0
 SECURE_PEER_DELIVERY_PURPOSE = "secure_peer_handoff_delivery"
 CROSS_CHAT_DELIVERY_PURPOSES = {
@@ -17616,6 +17640,367 @@ def stop_terminal_client(process: subprocess.Popen[bytes], master_fd: int) -> No
             os.killpg(process.pid, signal.SIGKILL)
         with suppress(subprocess.TimeoutExpired):
             process.wait(timeout=1)
+
+
+class TerminalAttachmentAdmissionClosed(RuntimeError):
+    """Raised when a terminal reconnect races a managed server drain."""
+
+
+async def await_terminal_task_after_cancellation(
+    task: asyncio.Task[Any],
+) -> Any:
+    """Finish one owned task even if its caller is cancelled repeatedly.
+
+    This helper is used only after the caller has already committed to
+    propagating ``CancelledError``. Temporarily consuming cancellation counts
+    lets it capture and reap a to-thread spawn result before re-raising that
+    original cancellation to the endpoint owner.
+    """
+
+    current = asyncio.current_task()
+
+    def consume_cancellations() -> None:
+        if current is None:
+            return
+        uncancel = getattr(current, "uncancel", None)
+        cancelling = getattr(current, "cancelling", None)
+        if not callable(uncancel) or not callable(cancelling):
+            return
+        for _index in range(max(0, int(cancelling()))):
+            uncancel()
+
+    consume_cancellations()
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            consume_cancellations()
+            continue
+        except BaseException:
+            break
+    return task.result()
+
+
+class TerminalAttachmentRegistry:
+    """Own every tmux attachment transport spawned by this server process.
+
+    The shared tmux daemon and its sessions intentionally live outside the
+    service cgroup.  Only the short-lived ``tmux attach-session`` transports
+    belong here.  Update admission and terminal reservation share one lock so
+    a reconnect is either registered for retirement or rejected before it can
+    spawn an untracked service-cgroup child.
+    """
+
+    def __init__(self) -> None:
+        self._attachments: dict[WebSocket, dict[str, Any]] = {}
+        self._admission_open = True
+        self._permanently_closed = False
+        self._lock = asyncio.Lock()
+
+    async def reserve(self, session_id: str, ws: WebSocket) -> bool:
+        owner_task = asyncio.current_task()
+        if owner_task is None:
+            raise RuntimeError("terminal attachment has no owning task")
+        async with self._lock:
+            update_blocked = managed_server_update_blocks_work()
+            restart_blocked = managed_server_restart_blocks_work()
+            if (
+                not self._permanently_closed
+                and not self._admission_open
+                and not update_blocked
+                and not restart_blocked
+            ):
+                # A detached runner can fail after launch while the original
+                # server remains healthy. Its terminal status is durable, so a
+                # later reconnect may self-heal this in-memory admission gate.
+                self._admission_open = True
+            if (
+                self._permanently_closed
+                or not self._admission_open
+                or update_blocked
+                or restart_blocked
+            ):
+                return False
+            self._attachments[ws] = {
+                "session_id": session_id,
+                "owner_task": owner_task,
+                "spawn_task": None,
+                "cleanup_task": None,
+                "process": None,
+                "master_fd": None,
+            }
+            return True
+
+    async def spawn(
+        self,
+        session_id: str,
+        ws: WebSocket,
+        cwd: str | None,
+        columns: int,
+        rows: int,
+    ) -> tuple[subprocess.Popen[bytes], int, str]:
+        """Spawn and bind one reserved attachment without a cancellation leak."""
+
+        async with self._lock:
+            entry = self._attachments.get(ws)
+            if entry is None or entry.get("session_id") != session_id:
+                raise TerminalAttachmentAdmissionClosed(
+                    "terminal attachment admission is closed"
+                )
+            spawn_task = asyncio.create_task(
+                asyncio.to_thread(
+                    spawn_terminal_client,
+                    session_id,
+                    cwd,
+                    columns,
+                    rows,
+                )
+            )
+            entry["spawn_task"] = spawn_task
+
+        spawned: tuple[subprocess.Popen[bytes], int, str] | None = None
+        try:
+            # Cancelling an asyncio to_thread waiter does not stop its worker.
+            # Shield it and explicitly reap a late result before propagating
+            # cancellation, otherwise an attach client can appear after the
+            # updater has already proven the service cgroup empty.
+            spawned = await asyncio.shield(spawn_task)
+            process, master_fd, _name = spawned
+            async with self._lock:
+                current = self._attachments.get(ws)
+                if current is entry:
+                    current["process"] = process
+                    current["master_fd"] = master_fd
+                admitted = current is entry and self._admission_open
+            if not admitted:
+                await asyncio.to_thread(
+                    stop_terminal_client,
+                    process,
+                    master_fd,
+                )
+                raise TerminalAttachmentAdmissionClosed(
+                    "terminal attachment admission is closed"
+                )
+            return spawned
+        except asyncio.CancelledError:
+            # Hand the non-cancellable worker result to an independent task
+            # before awaiting anything else. A second cancellation of the
+            # WebSocket owner can then interrupt only the shielded wait below,
+            # never ownership of the eventual process/fd pair.
+            cleanup_task = entry.get("cleanup_task")
+            if not isinstance(cleanup_task, asyncio.Task):
+                cleanup_task = asyncio.create_task(
+                    self._reap_cancelled_spawn(
+                        ws,
+                        entry,
+                        spawn_task,
+                        spawned,
+                    ),
+                    name="terminal-attachment-late-spawn-cleanup",
+                )
+                entry["cleanup_task"] = cleanup_task
+            with suppress(BaseException):
+                await await_terminal_task_after_cancellation(cleanup_task)
+            raise
+
+    async def _reap_cancelled_spawn(
+        self,
+        ws: WebSocket,
+        entry: dict[str, Any],
+        spawn_task: asyncio.Task[Any],
+        spawned: tuple[subprocess.Popen[bytes], int, str] | None,
+    ) -> None:
+        if spawned is None:
+            try:
+                spawned = await asyncio.shield(spawn_task)
+            except BaseException:
+                return
+        process, master_fd, _name = spawned
+        async with self._lock:
+            if self._attachments.get(ws) is entry:
+                entry["process"] = process
+                entry["master_fd"] = master_fd
+        try:
+            await asyncio.to_thread(
+                stop_terminal_client,
+                process,
+                master_fd,
+            )
+        finally:
+            async with self._lock:
+                if self._attachments.get(ws) is entry:
+                    entry["process"] = None
+                    entry["master_fd"] = None
+
+    async def release(self, ws: WebSocket) -> None:
+        async with self._lock:
+            entry = self._attachments.get(ws)
+            if entry is None:
+                return
+            owned_tasks = (
+                entry.get("spawn_task"),
+                entry.get("cleanup_task"),
+            )
+            if any(
+                isinstance(task, asyncio.Task) and not task.done()
+                for task in owned_tasks
+            ):
+                return
+            self._attachments.pop(ws, None)
+
+    async def close_admission_and_all(self, *, permanent: bool = False) -> int:
+        """Fence reconnects, close every attachment, and join its owner."""
+
+        async with self._lock:
+            self._admission_open = False
+            if permanent:
+                self._permanently_closed = True
+            entries = list(self._attachments.items())
+
+        await asyncio.gather(
+            *(
+                asyncio.wait_for(
+                    ws.close(code=1012),
+                    timeout=TERMINAL_ATTACHMENT_CLOSE_TIMEOUT_SECONDS,
+                )
+                for ws, _entry in entries
+            ),
+            return_exceptions=True,
+        )
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + TERMINAL_ATTACHMENT_CLOSE_TIMEOUT_SECONDS
+        current_task = asyncio.current_task()
+        owner_tasks = {
+            entry.get("owner_task")
+            for _ws, entry in entries
+            if (
+                isinstance(entry.get("owner_task"), asyncio.Task)
+                and entry.get("owner_task") is not current_task
+                and not entry["owner_task"].done()
+            )
+        }
+        for owner_task in owner_tasks:
+            owner_task.cancel()
+        if owner_tasks:
+            await asyncio.wait(
+                owner_tasks,
+                timeout=max(0.0, deadline - loop.time()),
+            )
+
+        # ``asyncio.to_thread`` keeps running after its waiter is cancelled.
+        # The endpoint owns a shielded spawn task plus an independent cleanup
+        # task, both retained in the registry until their worker has finished.
+        # Join those exact tasks before the updater is allowed to prove the
+        # service cgroup empty. A late spawn can therefore never materialize
+        # after that proof.
+        async with self._lock:
+            tracked_tasks = {
+                task
+                for entry in self._attachments.values()
+                for task in (
+                    entry.get("spawn_task"),
+                    entry.get("cleanup_task"),
+                )
+                if isinstance(task, asyncio.Task) and not task.done()
+            }
+        if tracked_tasks:
+            await asyncio.wait(
+                tracked_tasks,
+                timeout=max(0.0, deadline - loop.time()),
+            )
+
+        async with self._lock:
+            pending = {
+                task
+                for entry in self._attachments.values()
+                for task in (
+                    entry.get("owner_task"),
+                    entry.get("spawn_task"),
+                    entry.get("cleanup_task"),
+                )
+                if (
+                    isinstance(task, asyncio.Task)
+                    and task is not current_task
+                    and not task.done()
+                )
+            }
+
+        if pending:
+            raise RuntimeError(
+                "terminal attachment cleanup did not finish before its deadline"
+            )
+
+        # A second cancellation or a faulty endpoint must not leave a bound
+        # attachment alive.  Directly reap any exact process still registered.
+        async with self._lock:
+            remaining = list(self._attachments.items())
+        bound = [
+            (entry.get("process"), entry.get("master_fd"))
+            for _ws, entry in remaining
+            if entry.get("process") is not None
+            and isinstance(entry.get("master_fd"), int)
+        ]
+        if bound:
+            await asyncio.gather(
+                *(
+                    asyncio.to_thread(stop_terminal_client, process, master_fd)
+                    for process, master_fd in bound
+                ),
+                return_exceptions=True,
+            )
+
+        async with self._lock:
+            for ws, entry in list(self._attachments.items()):
+                owner_task = entry.get("owner_task")
+                tracked = (
+                    entry.get("spawn_task"),
+                    entry.get("cleanup_task"),
+                )
+                if (
+                    isinstance(owner_task, asyncio.Task)
+                    and owner_task.done()
+                    and all(
+                        not isinstance(task, asyncio.Task) or task.done()
+                        for task in tracked
+                    )
+                ):
+                    self._attachments.pop(ws, None)
+
+        return len(entries)
+
+    async def reopen_if_update_inactive(
+        self,
+        status: dict[str, Any] | None = None,
+    ) -> bool:
+        async with self._lock:
+            if self._permanently_closed:
+                return False
+            if (
+                managed_server_update_blocks_work(status)
+                or managed_server_restart_blocks_work()
+            ):
+                return False
+            self._admission_open = True
+            return True
+
+    async def reopen_admission(self) -> None:
+        await self.reopen_if_update_inactive()
+
+    async def snapshot(self) -> dict[str, Any]:
+        async with self._lock:
+            return {
+                "admission_open": self._admission_open,
+                "permanently_closed": self._permanently_closed,
+                "active_connections": len(self._attachments),
+                "active_sessions": len({
+                    str(entry.get("session_id") or "")
+                    for entry in self._attachments.values()
+                }),
+            }
+
+
+TERMINAL_ATTACHMENTS = TerminalAttachmentRegistry()
 
 
 def terminal_snapshot(session_id: str, *, lines: int = 240, created: bool = False) -> dict[str, Any]:
@@ -45540,6 +45925,25 @@ async def _start_turn_locked(
 
 
 SERVER_UPDATE_ACTIVE_PHASES = {"starting", "checking", "downloading", "verifying", "installing", "restarting"}
+SERVER_UPDATE_PER_RUN_STATUS_FIELDS = (
+    "update_id",
+    "target_version",
+    "installed_version",
+    "started_at",
+    "finished_at",
+    "heartbeat_at",
+    "elapsed_seconds",
+    "team_hub_id",
+    "team_hub_host_server_identity",
+    "team_hub_snapshot_generation",
+    "team_hub_transport",
+    "team_hub_url",
+    "team_hub_direct_ip_url",
+    "team_hub_routes",
+    "error_code",
+    "error_action",
+    "retryable",
+)
 SERVER_UPDATE_OPERATION_LOCK = asyncio.Lock()
 SERVER_UPDATE_START_GRACE_SECONDS = 45.0
 SERVER_RESTART_PHASES = {"idle", "accepted", "signaling", "complete", "failed"}
@@ -46346,6 +46750,14 @@ def write_server_update_status(**changes: Any) -> dict[str, Any]:
         return _write_server_update_status_unlocked(**changes)
 
 
+def write_fresh_server_update_status(**changes: Any) -> dict[str, Any]:
+    """Start a new public status row without leaking an older run's fields."""
+
+    clean = {name: None for name in SERVER_UPDATE_PER_RUN_STATUS_FIELDS}
+    clean.update(changes)
+    return write_server_update_status(**clean)
+
+
 def server_update_tmux_name(update_id: str) -> str:
     clean = re.sub(r"[^A-Za-z0-9_-]", "", update_id)[:32]
     return f"agents_server_update_{clean or 'current'}"
@@ -46560,6 +46972,11 @@ def finalize_abandoned_server_update(status: dict[str, Any]) -> dict[str, Any]:
                 update_available=False,
                 installed_version=SERVER_VERSION,
                 message=f"AgentsServer {SERVER_VERSION} is installed and healthy.",
+                heartbeat_at=None,
+                elapsed_seconds=None,
+                error_code=None,
+                error_action=None,
+                retryable=None,
                 finished_at=current.get("finished_at") or update_utc_now(),
             )
         return _write_server_update_status_unlocked(
@@ -46716,6 +47133,47 @@ def unsafe_update_service_cgroup_detail(
     }
 
 
+def public_server_update_launch_error(exc: BaseException) -> dict[str, Any]:
+    """Normalize a prelaunch exception without serializing internal objects."""
+
+    detail = exc.detail if isinstance(exc, HTTPException) else None
+    if isinstance(detail, dict):
+        message = str(detail.get("message") or "").strip()
+        action = str(detail.get("action") or "").strip()
+        code = str(detail.get("code") or "").strip()
+        return {
+            "message": message or "AgentsServer could not safely start the updater.",
+            "error_code": code or None,
+            "error_action": action or None,
+            "retryable": detail.get("retryable") is True,
+        }
+    if isinstance(detail, str) and detail.strip():
+        return {
+            "message": detail.strip()[:1000],
+            "error_code": None,
+            "error_action": None,
+            "retryable": False,
+        }
+    return {
+        "message": "AgentsServer could not start the detached updater.",
+        "error_code": None,
+        "error_action": None,
+        "retryable": False,
+    }
+
+
+def managed_update_provider_quiesce_timeout_detail() -> dict[str, Any]:
+    return {
+        "code": "provider_quiesce_timeout",
+        "message": (
+            "AgentsServer could not finish stopping its idle provider "
+            "supervisors before the update deadline."
+        ),
+        "action": "Retry the update after current provider cleanup finishes.",
+        "retryable": True,
+    }
+
+
 def ensure_managed_update_service_cgroup_clear(
     *,
     service_cgroup: str | None = None,
@@ -46733,22 +47191,84 @@ def ensure_managed_update_service_cgroup_clear(
     )
 
 
+async def wait_for_managed_update_service_cgroup_clear(
+    *,
+    service_cgroup: str,
+) -> dict[str, Any]:
+    """Allow reaped children to leave /proc, then retain the fail-closed proof."""
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + MANAGED_UPDATE_CGROUP_SETTLE_TIMEOUT_SECONDS
+    last_error: HTTPException | None = None
+    while True:
+        try:
+            return await asyncio.to_thread(
+                ensure_managed_update_service_cgroup_clear,
+                service_cgroup=service_cgroup,
+            )
+        except HTTPException as exc:
+            last_error = exc
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            assert last_error is not None
+            raise last_error
+        await asyncio.sleep(
+            min(MANAGED_UPDATE_CGROUP_SETTLE_INTERVAL_SECONDS, remaining)
+        )
+
+
+async def close_managed_update_provider_managers() -> None:
+    """Bound provider retirement so a bad supervisor cannot pin the drain."""
+
+    tasks = {
+        asyncio.create_task(close_claude_sdk_manager()),
+        asyncio.create_task(close_codex_app_server_manager()),
+    }
+    _done, pending = await asyncio.wait(
+        tasks,
+        timeout=MANAGED_UPDATE_PROVIDER_QUIESCE_TIMEOUT_SECONDS,
+    )
+    if pending:
+        for task in pending:
+            task.cancel()
+        await asyncio.wait(
+            pending,
+            timeout=min(1.0, MANAGED_UPDATE_PROVIDER_QUIESCE_TIMEOUT_SECONDS),
+        )
+        for task in tasks:
+            if task.done():
+                with suppress(BaseException):
+                    task.result()
+        raise HTTPException(
+            status_code=504,
+            detail=managed_update_provider_quiesce_timeout_detail(),
+        )
+    for task in tasks:
+        task.result()
+
+
 async def quiesce_managed_update_service_cgroup(
     *,
     service_cgroup: str | None,
 ) -> None:
-    """Retire idle provider supervisors, then prove no descendant is left.
+    """Retire owned transports and supervisors, then prove the cgroup empty.
 
     The caller has already written the durable update drain, so no new turn or
-    unsafe mutation can start while these known server-owned supervisors close.
+    unsafe mutation can start while these known server-owned processes close.
+    Closing an attachment never kills its external tmux daemon, session, pane,
+    or shell; clients reconnect to that preserved session after replacement.
     """
 
     if service_cgroup is None:
         return
-    await close_claude_sdk_manager()
-    await close_codex_app_server_manager()
-    await asyncio.to_thread(
-        ensure_managed_update_service_cgroup_clear,
+    retired_terminals = await TERMINAL_ATTACHMENTS.close_admission_and_all()
+    if retired_terminals:
+        logger.info(
+            "server update retired terminal attachment transports count=%d",
+            retired_terminals,
+        )
+    await close_managed_update_provider_managers()
+    await wait_for_managed_update_service_cgroup_clear(
         service_cgroup=service_cgroup,
     )
 
@@ -46993,6 +47513,8 @@ async def lifespan(app: FastAPI):
         for direct_delivery_task in direct_delivery_tasks:
             with suppress(asyncio.CancelledError, Exception):
                 await direct_delivery_task
+        with suppress(Exception):
+            await TERMINAL_ATTACHMENTS.close_admission_and_all(permanent=True)
         await PORT_TUNNELS.close_all()
         secure_peer_task.cancel()
         secure_peer_connector_task.cancel()
@@ -47998,9 +48520,9 @@ async def health() -> dict[str, Any]:
                 "required": False,
                 "message": "Signed Stable and Beta AgentsServer channels are available.",
                 "action": None,
-                # v4 also exposes a PID-free service-cgroup admission proof
-                # for the detached runner's final pre-restart check.
-                "version": 4,
+                # v5 fences terminal admission and drains every tracked tmux
+                # attachment before the final service-cgroup proof.
+                "version": 5,
                 "tracks": ["stable", "beta"],
             },
             "tmux": tmux,
@@ -48925,6 +49447,11 @@ async def server_update_status() -> dict[str, Any]:
                         "server update finalization failed error_type=%s",
                         type(exc).__name__,
                     )
+        # A detached runner can publish a terminal failure while this original
+        # server process remains alive. Reconcile that durable phase with the
+        # process-local terminal gate so clients need neither a restart nor a
+        # second update attempt before reconnecting.
+        await TERMINAL_ATTACHMENTS.reopen_if_update_inactive(status)
         return status
 
 
@@ -48970,7 +49497,7 @@ async def check_server_update(
         except HTTPException as exc:
             if exc.status_code != 404:
                 raise
-            return write_server_update_status(
+            return write_fresh_server_update_status(
                 phase="unavailable",
                 track=track,
                 update_available=False,
@@ -48993,7 +49520,7 @@ async def check_server_update(
             message = f"AgentsServer {latest} is available."
         else:
             message = f"AgentsServer {SERVER_VERSION} is current on {track}."
-        return write_server_update_status(
+        return write_fresh_server_update_status(
             phase="available" if update_available else "current",
             track=track,
             current_track=current_track,
@@ -49049,7 +49576,7 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                 detail=f"the requested server version is not on the {track} track",
             )
         if not server_release_transition_allowed(requested, SERVER_VERSION, track):
-            return write_server_update_status(
+            return write_fresh_server_update_status(
                 phase="current",
                 track=track,
                 latest_version=requested,
@@ -49225,7 +49752,7 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                             ]
                         )
                     try:
-                        status = write_server_update_status(
+                        status = write_fresh_server_update_status(
                             update_id=update_id,
                             phase="starting",
                             track=track,
@@ -49278,6 +49805,12 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
             if auth_token_file is not None:
                 with suppress(FileNotFoundError):
                     auth_token_file.unlink()
+            public_error = public_server_update_launch_error(exc)
+            logger.warning(
+                "detached server updater prelaunch failed error_type=%s error_code=%s",
+                type(exc).__name__,
+                public_error.get("error_code") or "unclassified",
+            )
             fence_clear_failed = False
             try:
                 if hub_snapshot is not None:
@@ -49291,13 +49824,30 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                 logger.error("Team Hub update fence clear failed after runner launch failure")
             try:
                 if not fence_clear_failed:
-                    write_server_update_status(
-                        phase="failed",
-                        message=f"Could not start detached updater: {exc}",
-                        finished_at=update_utc_now(),
-                    )
+                    if public_error.get("retryable") is True:
+                        write_fresh_server_update_status(
+                            phase="available",
+                            track=track,
+                            current_track=server_release_track(SERVER_VERSION),
+                            channel_switch=channel_switch,
+                            latest_version=requested,
+                            update_available=True,
+                            checked_at=status.get("checked_at"),
+                            **public_error,
+                        )
+                    else:
+                        write_server_update_status(
+                            phase="failed",
+                            message=public_error["message"],
+                            error_code=public_error["error_code"],
+                            error_action=public_error["error_action"],
+                            retryable=False,
+                            finished_at=update_utc_now(),
+                        )
             finally:
                 await TEAM_HUB_RUNTIME.reopen_admission()
+            if not fence_clear_failed:
+                await TERMINAL_ATTACHMENTS.reopen_admission()
 
         # The durable drain is now authoritative. Retire only the known idle
         # provider supervisors, then fail closed if any other process remains
@@ -55386,13 +55936,18 @@ async def session_terminal(
         return
 
     cols, lines = terminal_dimensions(columns, rows)
-    await ws.accept()
+    reserved = await TERMINAL_ATTACHMENTS.reserve(session_id, ws)
+    if not reserved:
+        await ws.accept()
+        await ws.close(code=1012)
+        return
     process: subprocess.Popen[bytes] | None = None
     master_fd: int | None = None
     try:
-        process, master_fd, name = await asyncio.to_thread(
-            spawn_terminal_client,
+        await ws.accept()
+        process, master_fd, name = await TERMINAL_ATTACHMENTS.spawn(
             session_id,
+            ws,
             cwd,
             cols,
             lines,
@@ -55468,7 +56023,7 @@ async def session_terminal(
         for task in done:
             with suppress(WebSocketDisconnect, RuntimeError, OSError):
                 task.result()
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, TerminalAttachmentAdmissionClosed):
         pass
     except Exception as exc:
         logger.warning("terminal websocket failed session=%s error=%s", session_id, exc)
@@ -55477,6 +56032,7 @@ async def session_terminal(
     finally:
         if process is not None and master_fd is not None:
             await asyncio.to_thread(stop_terminal_client, process, master_fd)
+        await TERMINAL_ATTACHMENTS.release(ws)
         with suppress(RuntimeError):
             await ws.close()
 

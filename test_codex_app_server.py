@@ -1,5 +1,6 @@
 import asyncio
 import json
+import signal
 import time
 import unittest
 from collections.abc import Callable
@@ -1795,6 +1796,66 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
             await pending
         self.assertTrue(raised.exception.planned)
         self.assertIn("stopped with AgentsServer", str(raised.exception))
+
+    async def test_planned_close_terminates_the_posix_process_group(self) -> None:
+        factory = FakeProcessFactory()
+        process = factory.process
+        client = self.make_client(factory)
+        await client.start()
+        # Injected factories do not prove new-session ownership. This test
+        # explicitly grants the exact group that the real launcher records.
+        client._process_group_id = process.pid
+        signals: list[tuple[int, int]] = []
+
+        def kill_group(process_group_id: int, requested_signal: int) -> None:
+            signals.append((process_group_id, requested_signal))
+            if requested_signal == signal.SIGTERM:
+                process.crash(-signal.SIGTERM)
+                return
+            if requested_signal == 0:
+                raise ProcessLookupError
+
+        with patch("codex_app_server.os.killpg", side_effect=kill_group), \
+             patch.object(process, "terminate") as terminate:
+            await client.close()
+
+        self.assertEqual(signals, [
+            (process.pid, signal.SIGTERM),
+            (process.pid, 0),
+        ])
+        terminate.assert_not_called()
+
+    async def test_planned_close_kills_owned_group_after_leader_exited(self) -> None:
+        factory = FakeProcessFactory()
+        process = factory.process
+        client = self.make_client(factory)
+        await client.start()
+        client._process_group_id = process.pid
+        # Model Node exiting before its native Codex child. The stream reader
+        # is intentionally still live; close() must use stored group ownership
+        # rather than the leader returncode to retire the orphan.
+        process.returncode = 17
+        process._exited.set()
+        signals: list[tuple[int, int]] = []
+        group_alive = True
+
+        def kill_group(process_group_id: int, requested_signal: int) -> None:
+            nonlocal group_alive
+            signals.append((process_group_id, requested_signal))
+            if requested_signal == signal.SIGTERM:
+                group_alive = False
+            elif requested_signal == 0 and not group_alive:
+                raise ProcessLookupError
+
+        with patch("codex_app_server.os.killpg", side_effect=kill_group), \
+             patch.object(process, "terminate") as terminate:
+            await client.close()
+
+        self.assertEqual(signals, [
+            (process.pid, signal.SIGTERM),
+            (process.pid, 0),
+        ])
+        terminate.assert_not_called()
 
     async def test_manager_is_a_policy_agnostic_single_client_facade(self) -> None:
         factory = FakeProcessFactory()

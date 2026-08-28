@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
+import signal
 import time
 from collections import deque
 from contextlib import suppress
@@ -466,6 +468,10 @@ class CodexAppServerClient:
         # notification instead of relying on sub-second scheduling luck.
         self.fork_cleanup_grace = max(0.0, float(fork_cleanup_grace))
         self._process_factory = process_factory or asyncio.create_subprocess_exec
+        # Only the default launcher proves that ``start_new_session=True`` was
+        # honored by the process we own. Tests and injected factories may use
+        # arbitrary/recycled PIDs, so never derive a signal target from them.
+        self._owns_spawned_process_groups = process_factory is None and os.name == "posix"
         self._server_request_handler = server_request_handler or decline_server_request
         self._initialize_params = initialize_params or {
             "clientInfo": {
@@ -476,6 +482,7 @@ class CodexAppServerClient:
             "capabilities": {"experimentalApi": True},
         }
         self._proc: asyncio.subprocess.Process | None = None
+        self._process_group_id: int | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._start_lock = asyncio.Lock()
@@ -587,6 +594,17 @@ class CodexAppServerClient:
                     safe_to_retry=True,
                 ) from exc
 
+            raw_pid = getattr(proc, "pid", None)
+            self._process_group_id = (
+                raw_pid
+                if (
+                    self._owns_spawned_process_groups
+                    and isinstance(raw_pid, int)
+                    and not isinstance(raw_pid, bool)
+                    and raw_pid > 0
+                )
+                else None
+            )
             self._proc = proc
             self._reader_task = asyncio.create_task(
                 self._reader_loop(proc),
@@ -683,6 +701,8 @@ class CodexAppServerClient:
         self._initialize_result = None
         proc = self._proc
         self._proc = None
+        process_group_id = self._process_group_id
+        self._process_group_id = None
         current = asyncio.current_task()
         reader_task = self._reader_task
         stderr_task = self._stderr_task
@@ -699,16 +719,47 @@ class CodexAppServerClient:
         self._reader_task = None
         self._stderr_task = None
 
-        if proc and proc.returncode is None:
-            with suppress(ProcessLookupError):
-                proc.terminate()
-            with suppress(Exception):
-                await asyncio.wait_for(proc.wait(), timeout=2)
-            if proc.returncode is None:
+        if proc:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 2.0
+            if process_group_id is not None:
+                # start() created this exact new session. The native child can
+                # outlive the Node leader, so signal and verify the owned group
+                # even when the leader's returncode has already been observed.
+                group_alive = True
+                try:
+                    os.killpg(process_group_id, signal.SIGTERM)
+                except ProcessLookupError:
+                    group_alive = False
+                except PermissionError:
+                    # Keep the group target: signal 0/KILL below remain scoped
+                    # to the same exact group and cannot hit a sibling service.
+                    pass
+                while group_alive and loop.time() < deadline:
+                    try:
+                        os.killpg(process_group_id, 0)
+                    except ProcessLookupError:
+                        group_alive = False
+                        break
+                    except PermissionError:
+                        pass
+                    await asyncio.sleep(0.05)
+                if group_alive:
+                    with suppress(ProcessLookupError, PermissionError):
+                        os.killpg(process_group_id, signal.SIGKILL)
+                if proc.returncode is None:
+                    with suppress(Exception):
+                        await asyncio.wait_for(proc.wait(), timeout=1.0)
+            elif proc.returncode is None:
                 with suppress(ProcessLookupError):
-                    proc.kill()
+                    proc.terminate()
                 with suppress(Exception):
-                    await proc.wait()
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                if proc.returncode is None:
+                    with suppress(ProcessLookupError):
+                        proc.kill()
+                    with suppress(Exception):
+                        await asyncio.wait_for(proc.wait(), timeout=1.0)
 
         for task in (reader_task, stderr_task):
             if task and task is not current:

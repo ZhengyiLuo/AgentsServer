@@ -146,6 +146,109 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(state["unknown_descendant_count"])
         self.assertEqual(state["inspection"], "process-cgroup-unavailable")
 
+    async def test_update_quiesce_orders_terminal_drain_before_final_proof(self):
+        cgroup = "/user.slice/user@1000.service/app.slice/agents-server.service"
+        order: list[str] = []
+        terminal_attachments = MagicMock()
+
+        async def close_terminals():
+            order.append("terminals")
+            return 2
+
+        async def close_providers():
+            order.append("providers")
+
+        async def prove_empty(*, service_cgroup):
+            self.assertEqual(service_cgroup, cgroup)
+            order.append("cgroup")
+            return {
+                "safe": True,
+                "unknown_descendant_count": 0,
+                "inspection": "verified",
+            }
+
+        terminal_attachments.close_admission_and_all = close_terminals
+        with patch.object(
+            agent_server,
+            "TERMINAL_ATTACHMENTS",
+            terminal_attachments,
+        ), patch.object(
+            agent_server,
+            "close_managed_update_provider_managers",
+            side_effect=close_providers,
+        ), patch.object(
+            agent_server,
+            "wait_for_managed_update_service_cgroup_clear",
+            side_effect=prove_empty,
+        ):
+            await agent_server.quiesce_managed_update_service_cgroup(
+                service_cgroup=cgroup,
+            )
+
+        self.assertEqual(order, ["terminals", "providers", "cgroup"])
+
+    async def test_service_cgroup_settle_rechecks_until_verified_empty(self):
+        cgroup = "/user.slice/user@1000.service/app.slice/agents-server.service"
+        blocked = HTTPException(
+            status_code=409,
+            detail=agent_server.unsafe_update_service_cgroup_detail({
+                "unknown_descendant_count": 1,
+            }),
+        )
+        verified = {
+            "safe": True,
+            "unknown_descendant_count": 0,
+            "inspection": "verified",
+        }
+        with patch.object(
+            agent_server,
+            "ensure_managed_update_service_cgroup_clear",
+            side_effect=[blocked, verified],
+        ) as proof, patch.object(
+            agent_server,
+            "MANAGED_UPDATE_CGROUP_SETTLE_INTERVAL_SECONDS",
+            0.001,
+        ), patch.object(
+            agent_server,
+            "MANAGED_UPDATE_CGROUP_SETTLE_TIMEOUT_SECONDS",
+            1.0,
+        ):
+            state = await agent_server.wait_for_managed_update_service_cgroup_clear(
+                service_cgroup=cgroup,
+            )
+
+        self.assertEqual(state, verified)
+        self.assertEqual(proof.call_count, 2)
+
+    async def test_provider_quiesce_has_a_bounded_retryable_timeout(self):
+        never = asyncio.Event()
+
+        async def block_forever():
+            await never.wait()
+
+        with patch.object(
+            agent_server,
+            "close_claude_sdk_manager",
+            side_effect=block_forever,
+        ), patch.object(
+            agent_server,
+            "close_codex_app_server_manager",
+            side_effect=block_forever,
+        ), patch.object(
+            agent_server,
+            "MANAGED_UPDATE_PROVIDER_QUIESCE_TIMEOUT_SECONDS",
+            0.01,
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await agent_server.close_managed_update_provider_managers()
+
+        self.assertEqual(raised.exception.status_code, 504)
+        self.assertEqual(
+            raised.exception.detail["code"],
+            "provider_quiesce_timeout",
+        )
+        self.assertTrue(raised.exception.detail["retryable"])
+
     def test_service_cgroup_probe_distinguishes_nonservice_from_unreadable_self_cgroup(self):
         with patch.object(agent_server.sys, "platform", "linux"), \
              patch.object(agent_server, "agents_server_systemd_cgroup", return_value=None), \
@@ -267,6 +370,8 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
             runner.write_text("# runner\n")
             key.write_text("public key\n")
             quiesce = AsyncMock(side_effect=blocker)
+            terminal_attachments = MagicMock()
+            terminal_attachments.reopen_admission = AsyncMock()
             with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
                  patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", status_path), \
                  patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
@@ -283,6 +388,11 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                      "quiesce_managed_update_service_cgroup",
                      new=quiesce,
                  ), \
+                 patch.object(
+                     agent_server,
+                     "TERMINAL_ATTACHMENTS",
+                     terminal_attachments,
+                 ), \
                  patch.object(agent_server, "run_tmux") as run_tmux:
                 with self.assertRaises(HTTPException) as raised:
                     await agent_server.start_server_update(
@@ -296,9 +406,15 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
             raised.exception.detail["code"],
             "unsafe_update_service_cgroup",
         )
-        self.assertEqual(status["phase"], "failed")
+        self.assertEqual(status["phase"], "available")
+        self.assertTrue(status["update_available"])
+        self.assertEqual(status["error_code"], "unsafe_update_service_cgroup")
+        self.assertEqual(status["error_action"], "Retry.")
+        self.assertTrue(status["retryable"])
+        self.assertNotIn("409:", status["message"])
         self.assertIsNone(admission_blocker)
         quiesce.assert_awaited_once_with(service_cgroup=cgroup)
+        terminal_attachments.reopen_admission.assert_awaited_once_with()
         run_tmux.assert_not_called()
 
     async def test_cancelled_prelaunch_quiesce_reopens_admission(self):
@@ -404,7 +520,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response["managed_updates"])
         self.assertEqual(
             response["capabilities"]["server_updates"]["version"],
-            4,
+            5,
         )
         self.assertEqual(response["update_service_cgroup"], {
             "safe": True,
@@ -538,6 +654,37 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(status["update_available"])
         self.assertIn("No signed AgentsServer release", status["message"])
 
+    async def test_fresh_check_clears_every_prior_run_field(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+             patch.object(
+                 agent_server,
+                 "SERVER_UPDATE_STATUS_FILE",
+                 Path(temporary) / "status.json",
+             ), \
+             patch.object(agent_server, "server_update_is_active", return_value=False), \
+             patch.object(
+                 agent_server,
+                 "signed_release_manifest",
+                 new=AsyncMock(return_value={"version": "1.1.0"}),
+             ):
+            agent_server.write_server_update_status(
+                phase="failed",
+                update_id="old-update",
+                target_version="0.9.0",
+                heartbeat_at="old-heartbeat",
+                elapsed_seconds=91,
+                error_code="old_error",
+                error_action="Old action.",
+                retryable=True,
+                team_hub_id="old-hub",
+            )
+            status = await agent_server.check_server_update()
+
+        self.assertEqual(status["phase"], "available")
+        for field in agent_server.SERVER_UPDATE_PER_RUN_STATUS_FIELDS:
+            self.assertIsNone(status[field], field)
+
     async def test_status_keeps_a_just_started_update_active_while_tmux_appears(self):
         with tempfile.TemporaryDirectory() as temporary, \
              patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
@@ -556,6 +703,35 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["phase"], "starting")
         self.assertEqual(status["target_version"], "1.1.0")
         self.assertNotIn("finished_at", status)
+
+    async def test_terminal_update_status_reconciles_terminal_admission(self):
+        terminal_attachments = MagicMock()
+        terminal_attachments.reopen_if_update_inactive = AsyncMock(
+            return_value=True
+        )
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(
+                 agent_server,
+                 "SERVER_UPDATE_STATUS_FILE",
+                 Path(temporary) / "status.json",
+             ), \
+             patch.object(
+                 agent_server,
+                 "TERMINAL_ATTACHMENTS",
+                 terminal_attachments,
+             ):
+            agent_server.write_server_update_status(
+                update_id="late-runner-failure",
+                phase="failed",
+                target_version="1.1.0",
+                message="Detached update failed.",
+            )
+            status = await agent_server.server_update_status()
+
+        self.assertEqual(status["phase"], "failed")
+        terminal_attachments.reopen_if_update_inactive.assert_awaited_once_with(
+            status
+        )
 
     async def test_status_normalizes_an_active_target_that_is_now_current(self):
         with tempfile.TemporaryDirectory() as temporary, \
@@ -958,10 +1134,25 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(agent_server, "signed_release_manifest", new=manifest), \
                  patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
                  patch.object(agent_server, "run_tmux", return_value=None) as run_tmux:
+                agent_server.write_server_update_status(
+                    phase="available",
+                    latest_version="1.1.0",
+                    update_available=True,
+                    heartbeat_at="old-heartbeat",
+                    elapsed_seconds=91,
+                    error_code="old_error",
+                    error_action="Old action.",
+                    retryable=True,
+                )
                 status = await agent_server.start_server_update(agent_server.ServerUpdateRequest(version="1.1.0"))
 
         self.assertEqual(status["phase"], "starting")
         self.assertEqual(status["target_version"], "1.1.0")
+        self.assertIsNone(status["heartbeat_at"])
+        self.assertIsNone(status["elapsed_seconds"])
+        self.assertIsNone(status["error_code"])
+        self.assertIsNone(status["error_action"])
+        self.assertIsNone(status["retryable"])
         manifest.assert_not_awaited()
         command = run_tmux.call_args.args[0]
         self.assertEqual(command[:3], ["new-session", "-d", "-s"])

@@ -539,7 +539,7 @@ class ClaudeMCPManagementTests(unittest.IsolatedAsyncioTestCase):
         capability = health["capabilities"]["claude_controls"]
         self.assertEqual(capability["version"], 3)
         self.assertTrue(capability["features"]["mcp_management"])
-        self.assertEqual(health["api_contract_version"], 21)
+        self.assertEqual(health["api_contract_version"], 22)
         local_import = health["capabilities"]["local_session_import_v1"]
         self.assertTrue(local_import["available"])
         self.assertEqual(local_import["version"], 1)

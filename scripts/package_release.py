@@ -24,6 +24,7 @@ FILES = (
     "agentsdock_publish.py",
     "claude_sdk_client.py",
     "codex_app_server.py",
+    "cursor_agent_client.py",
     "install.sh",
     "uninstall.sh",
     "update_runner.py",
@@ -170,7 +171,7 @@ def main() -> int:
         "version": version,
         "track": "beta" if "-" in version.split("+", 1)[0] else "stable",
         "prerelease": "-" in version.split("+", 1)[0],
-        "api_contract_version": 21,
+        "api_contract_version": 22,
         "commit": commit,
         "archive": {
             "name": archive_name,

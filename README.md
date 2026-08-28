@@ -1087,7 +1087,7 @@ tool-result output, commands, or output-file paths.
 Before publishing:
 
 ```bash
-python3 -m py_compile agent_server.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_publish.py claude_sdk_client.py codex_app_server.py update_runner.py
+python3 -m py_compile agent_server.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_publish.py claude_sdk_client.py codex_app_server.py cursor_agent_client.py update_runner.py
 rg -n 'private-host|/home/<name>|/Users/<name>|token-value' .
 ```
 

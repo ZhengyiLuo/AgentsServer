@@ -104,14 +104,22 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
             "title": target_title,
             "backend": agent_server.BACKEND_CODEX,
         }
-        routes = agent_server.ambient_provider_cross_chat_routes("source")
-        route = next(
-            candidate
-            for candidate in routes
-            if candidate["target_session_id"] == target_id
+        timestamp = agent_server.now_iso()
+        route = {
+            "route_id": "route_" + "a" * 32,
+            "revision": "rev_" + "b" * 32,
+            "alias": "target",
+            "target_session_id": target_id,
+            "actions": list(route_actions or ["instruction", "request_reply"]),
+            "created_at": timestamp,
+            "updated_at": timestamp,
+        }
+        agent_server.STORE.sessions["source"][
+            "provider_cross_chat_routes"
+        ] = [dict(route)]
+        routes = agent_server.provider_cross_chat_routes(
+            agent_server.STORE.sessions["source"]
         )
-        if route_actions is not None:
-            route["actions"] = list(route_actions)
         token, capability = await self.issue(
             "full",
             run_id,
@@ -247,7 +255,7 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
             },
         ):
             response = await agent_server.health()
-        self.assertEqual(response["api_contract_version"], 19)
+        self.assertEqual(response["api_contract_version"], 20)
         self.assertEqual(
             response["capabilities"]["provider_jobs_access_control_v1"],
             {
@@ -797,7 +805,7 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(update.chat_routes[0].route_id, route_id)
         self.assertEqual(update.chat_routes[0].action, "instruction")
 
-    async def test_provider_create_resolves_current_ambient_route_to_exact_reference(self) -> None:
+    async def test_provider_create_resolves_current_durable_route_to_exact_reference(self) -> None:
         token, _capability, route = await self.issue_with_target(
             "run_job_route_create",
             target_title="Mobile 📱",
@@ -853,12 +861,15 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
             agent_server.utf16_length(prompt[:marker_start + len(marker)]),
         )
         # Saving a route is an action-preserving conversion, not a future
-        # authorization upgrade. Even if the run's ambient snapshot offers
-        # Ask, this explicit target remains instruction-only.
+        # authorization upgrade. Even if the source's durable grant offers
+        # Ask, this exact per-job target remains instruction-only.
         snapshot = agent_server.provider_cross_chat_route_snapshot_for_authority(
-            agent_server.ambient_provider_cross_chat_routes("source"),
+            agent_server.provider_cross_chat_routes(
+                agent_server.STORE.sessions["source"]
+            ),
             [reference],
             source_session_id="source",
+            per_job_reference_routes=True,
         )
         target_routes = [
             item
@@ -941,7 +952,7 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
                     }],
                 ),
             )
-        self.assertEqual(raised.exception.status_code, 403)
+        self.assertEqual(raised.exception.status_code, 409)
 
         token, _capability, route = await self.issue_with_target(
             "run_job_route_stale",
@@ -1012,7 +1023,7 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 400)
         create.assert_not_awaited()
 
-    async def test_provider_job_route_rejects_configured_nonambient_grant(self) -> None:
+    async def test_provider_job_route_accepts_configured_durable_grant(self) -> None:
         agent_server.STORE.sessions["target"] = {
             "id": "target",
             "title": "Target",
@@ -1034,12 +1045,12 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
         agent_server.CURRENT_TURNS = {
             "source": {"run_id": "run_job_configured_route"},
         }
-        create = AsyncMock(return_value={})
-        with (
-            patch.object(agent_server.JOBS, "create", create),
-            self.assertRaises(HTTPException) as raised,
-        ):
-            await agent_server.create_agent_session_job(
+        create = AsyncMock(return_value={
+            "id": "job_configured_route",
+            "session_id": "source",
+        })
+        with patch.object(agent_server.JOBS, "create", create):
+            response = await agent_server.create_agent_session_job(
                 self.provider_request(token, method="POST"),
                 "source",
                 agent_server.AgentCreateScopedJobRequest(
@@ -1051,8 +1062,11 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
                     }],
                 ),
             )
-        self.assertEqual(raised.exception.status_code, 403)
-        create.assert_not_awaited()
+        self.assertEqual(response["job"]["id"], "job_configured_route")
+        create.assert_awaited_once()
+        reference = create.await_args.args[0].chat_references[0]
+        self.assertEqual(reference.session_id, "target")
+        self.assertEqual(reference.route_action, "instruction")
 
     async def test_provider_job_route_can_be_converted_only_once(self) -> None:
         token, _capability, route = await self.issue_with_target(
@@ -1548,13 +1562,14 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
 
     def test_full_jobs_authority_explains_future_chat_route_storage(self) -> None:
         authority = self.root / "authority.json"
-        ambient_route = {
+        durable_route = {
             "route_id": "route_" + "d" * 32,
             "revision": "rev_" + "e" * 32,
             "alias": "chat1",
             "target_session_id": "target",
             "actions": ["instruction", "request_reply"],
-            "route_kind": agent_server.PROVIDER_CROSS_CHAT_ROUTE_KIND_AMBIENT,
+            "created_at": "2026-08-27T00:00:00Z",
+            "updated_at": "2026-08-27T00:00:00Z",
         }
         block = agent_server.cross_chat_provider_authority_block(
             [],
@@ -1562,15 +1577,15 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
             "source",
             {"jobs", "agent_cross_chat_routes"},
             "full",
-            provider_route_snapshot=[ambient_route],
+            provider_route_snapshot=[durable_route],
         )
 
-        self.assertIn("include the exact `@title` in the job prompt", block)
+        self.assertIn("include the exact single-@ `@Chat`", block)
         self.assertIn(
             "--chat-route ROUTE_ID",
             block,
         )
-        self.assertIn("does not contact it now", block)
+        self.assertIn("without contacting the target now", block)
         self.assertIn("--clear-chat-routes", block)
 
 

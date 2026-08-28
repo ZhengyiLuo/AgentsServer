@@ -791,33 +791,36 @@ represent second 60.
 
 ## Cross-chat handoffs
 
-### Current route-hint contract (API contract 19, capability v6)
+### Current route-hint contract (API contract 20, capability v7)
 
 An inline structured `@Chat` is an optional target hint. It never forwards the
-raw user prompt. An ordinary same-server user turn still receives a fresh
-opaque ambient snapshot of all eligible chats, and its agent decides whether
-to `send` a prepared one-way message, `ask` for an asynchronous correlated
-reply, or make no contact. `/chat` is a composer alias for selecting the same
-structured hint.
+raw user prompt. On successful ordinary-turn admission, an exact local
+single-`@Chat` reference authored by a v2 client with `grant_intent: true`
+idempotently creates or refreshes a durable directional source-to-target
+grant. Subsequent turns receive only that source chat's current grants; there
+is no ambient all-chat authority. The agent decides whether to `send` a
+prepared one-way message, `ask` for an asynchronous correlated reply, or make
+no contact. Send grants no reverse authority, and Ask's return path is scoped
+to that exact correlated exchange. `/chat` is a composer alias for selecting
+the same structured hint.
 
-Ambient discovery remains same-server only. An explicitly paired Team Network
-route may appear as `@Remote`; new desktop authoring grants only its exact
-instruction action and revalidates the connection, route, revision, and action
-at admission and delivery. Unpaired or arbitrary foreign-server targets fail
-closed, and secure routes are never persisted into scheduled jobs.
-
-Scheduled runs do not receive ambient all-chat access. Jobs persist only exact
-structured `@Chat` targets explicitly selected during an authorized source
-turn, and revalidate each target/action on every firing. The health surface
-advertises cross-chat version 6 plus `route_hint_mentions`, scheduled Jobs
-version 5, and global API contract 19.
+Scheduled runs never inherit the source chat's grants. Each job stores its own
+exact route selection, authorized by route ID in the job editor/helper flow,
+and revalidates its target, revision, and action on every firing. Its prompt
+contains the corresponding exact single `@Chat` marker for display and
+binding; no `@@` authoring syntax is required. The health surface advertises
+cross-chat version 7, `durable_route_grants`,
+`agent_ambient_local_handoffs: false`, scheduled Jobs version 5, and global
+API contract 20.
 
 Beta-era local `direct_message` and `@@` references remain readable only for
-safe migration to route hints. They never create a new raw-prompt delivery;
-nonterminal legacy UI envelopes are failed/cancelled during upgrade before
-they can be resubmitted. Existing configured-route Send/Ask effects,
-action-specific secure-peer hints, and final-result obligations retain their
-separate exact authorization and lifecycle fences.
+safe migration/recovery. They are quarantined from ordinary authority and can
+never mint a durable grant; queued v6 snapshots are narrowed against current
+persisted grants and cannot recreate a revoked route. Nonterminal legacy UI
+envelopes are failed/cancelled during upgrade before they can be resubmitted.
+Existing configured-route Send/Ask effects, action-specific secure-peer hints,
+and final-result obligations retain their separate exact authorization and
+lifecycle fences.
 
 For a current ordinary turn, the provider-authority block exposes only opaque
 route IDs. The agent lists the available routes, then decides whether to Send,
@@ -838,23 +841,18 @@ message. Send creates no reply obligation. Ask creates a correlated exchange;
 the terminal answer or failure status returns asynchronously to the source
 chat.
 
-### Historical beta behavior (migration context only)
+### Historical action-specific grants (v1-v2)
 
 API contract v11 added durable, same-server handoffs selected by the user in
-the AgentsDock composer. API contract v17 briefly exposed version 5 of
-`capabilities.cross_chat_handoffs_v1`: in that beta, a composer-resolved
-`@Title` sent the current message to that chat when the source turn was
-admitted, while `@@Title` granted an opaque route without contacting the
-target by itself. API contract 19 supersedes that behavior with the single-`@`
-route-hint contract above. Persisted beta records remain migration inputs only.
-
-Ordinary user turns can route to all eligible chats on the same server without
-Inspector setup; each run receives a fresh opaque snapshot and live revocation
-can only narrow it. The server accepts structured composer references, never
-raw title text or an inferred chat ID. Self, archived, deleted,
+the AgentsDock composer. API contract v13 upgraded
+`capabilities.cross_chat_handoffs_v1` to version 2 and added bounded
+request/reply exchanges. These historical structured references authorized
+one exact exchange, instruction, or automatic final-result delivery. They are
+retained for readable stored records and secure action-specific compatibility;
+they are not the current `@Chat` authoring model. Self, archived, deleted,
 legacy-transport, and unpaired foreign-server targets fail closed.
 
-When a stored action-specific grant is replayed, the provider-authority block
+When such an action-specific grant is replayed, the provider-authority block
 may print a one-use opaque target handle:
 
 ```bash
@@ -891,30 +889,39 @@ status wake for the waiting sender. Exchange turns reuse the existing hidden
 `cross_chat_handoff_delivery` purpose so older clients do not expose synthetic
 prompts or queue controls.
 
-### Historical configured-route management (v3-v5 compatibility)
+### Durable directional route management (v7)
 
-Version 3 added a default-empty, per-source-chat allowlist for agent-initiated
-handoffs. These endpoints remain for stored-route compatibility and
-administration, but API contract 19 ordinary user turns use the ambient opaque
-snapshot above and require no Inspector route setup:
+The default-empty per-source-chat grant list is the sole ordinary cross-chat
+authority ceiling. Inline `@Chat` admission manages it automatically, while
+these authenticated endpoints support inspection and explicit administration:
 
 ```text
 GET    /api/sessions/{source_session_id}/agent-handoff-routes
 POST   /api/sessions/{source_session_id}/agent-handoff-routes
 PATCH  /api/sessions/{source_session_id}/agent-handoff-routes/{route_id}
-DELETE /api/sessions/{source_session_id}/agent-handoff-routes/{route_id}
+DELETE /api/sessions/{source_session_id}/agent-handoff-routes/{route_id}?expected_revision={revision}
 ```
 
-`PATCH` uses the route revision as a compare-and-swap precondition. A chat can
-hold at most 16 routes, aliases and targets are unique, routes cannot point to
-their source chat, and forks inherit neither routes nor their private mutation
-journal. Under this historical configured-route mode, only an ordinary direct
-user turn whose client opts into `agent_cross_chat_routes_v1` receives that
-configured snapshot. Scheduled, internal, digest, standalone, and cross-chat
-delivery turns receive none. Every helper call intersects the snapshot with
-the exact live route revision and allowed actions, so a removal or policy edit
-blocks future acceptance immediately; an already accepted ledger item remains
-visible and cancelable through the authenticated desktop APIs.
+`PATCH` and `DELETE` use the route revision as a compare-and-swap precondition;
+a stale or missing valid route returns HTTP 409 with
+`code: route_revision_conflict`, a safe message, and the current route or
+`null`. A chat can hold at most 16 routes, aliases and targets are unique,
+routes cannot point to their source chat, and forks inherit neither routes nor
+their private mutation journal. Only v2 `agent_cross_chat_routes_v2`
+submissions carrying exact `grant_intent` provenance may persist an inline
+grant. Older v1/v6 turns and recovered queue hints remain one-run legacy data
+and never become durable policy.
+
+Grant mutation and turn admission cross two durable files. AgentsServer first
+stores a hidden pending route journal, then fsyncs the exact `turn_started` or
+`turn_queued` admission ID, and only then exposes the grant. Startup rolls the
+exact route revisions back when no matching event exists, or finalizes them
+when it does; later edits and revocations are never recreated. Scheduled,
+internal, digest, standalone, and cross-chat delivery turns receive no source
+grant snapshot. Every helper call intersects its issued snapshot with the
+exact live route revision and allowed actions, so removal or policy edits
+block future acceptance immediately; an already accepted ledger item remains
+visible and cancelable through authenticated desktop APIs.
 
 The turn-scoped helper surface accepts only opaque issued route IDs:
 

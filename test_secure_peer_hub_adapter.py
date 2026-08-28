@@ -37,6 +37,7 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
         )
         self.team_id = bootstrap["teams"][0]["id"]
         owner = self.store.verify_access(bootstrap["access_token"])
+        self.owner = owner
         channel = self.store.create_channel(
             owner,
             self.team_id,
@@ -709,6 +710,155 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
                 server["id"] for server in second_value["servers"]
             )
         )
+
+    def test_network_projection_requires_live_authority_before_pagination(self) -> None:
+        for index in range(4):
+            self.store.ensure_secure_peer_service(
+                peer_id=str(uuid.uuid4()),
+                peer_server_identity=f"projection-lifecycle-peer-{index:02d}",
+                team_id=self.team_id,
+                display_name=f"Projection lifecycle peer {index}",
+            )
+        connection = self.store.connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT n.id,n.server_identity,n.status,b.peer_id,b.status AS binding_status
+                FROM nodes AS n
+                JOIN network_peer_bindings AS b
+                  ON b.team_id=n.team_id AND b.node_id=n.id
+                WHERE n.team_id=? ORDER BY n.id
+                """,
+                (self.team_id,),
+            ).fetchall()
+            self.assertGreaterEqual(len(rows), 5)
+            # Model the peer-side Forget completion independently from the
+            # host-side adapter callback below. Both converge on this durable
+            # Team Hub retirement operation.
+            forgotten = rows[0]
+            revoked = rows[1]
+            offline_live = rows[2]
+            connection.execute(
+                "UPDATE nodes SET status='offline' WHERE team_id=? AND id=?",
+                (self.team_id, offline_live["id"]),
+            )
+        finally:
+            connection.close()
+
+        self.store.revoke_secure_peer_service(
+            peer_id=str(forgotten["peer_id"]),
+            team_id=self.team_id,
+        )
+        self.adapter.revoke_peer(
+            peer_id=str(revoked["peer_id"]),
+            team_id=self.team_id,
+        )
+
+        expected_visible = [str(row["id"]) for row in rows[2:]]
+        first_page = self.store.get_network(self.owner, self.team_id, limit=1)
+        self.assertEqual(
+            [server["id"] for server in first_page["servers"]],
+            expected_visible[:1],
+        )
+        self.assertTrue(first_page["has_more"])
+
+        projection = self.store.get_network(self.owner, self.team_id, limit=50)
+        projected = {server["id"]: server for server in projection["servers"]}
+        self.assertNotIn(str(forgotten["id"]), projected)
+        self.assertNotIn(str(revoked["id"]), projected)
+        self.assertEqual(projected[str(offline_live["id"])]["status"], "offline")
+
+        repaired_peer_id = str(uuid.uuid4())
+        self.store.ensure_secure_peer_service(
+            peer_id=repaired_peer_id,
+            peer_server_identity=str(forgotten["server_identity"]),
+            team_id=self.team_id,
+            display_name="Re-paired lifecycle peer",
+        )
+        repaired = self.store.get_network(self.owner, self.team_id, limit=50)
+        repaired_servers = [
+            server
+            for server in repaired["servers"]
+            if server["server_identity"] == forgotten["server_identity"]
+        ]
+        self.assertEqual(len(repaired_servers), 1)
+        self.assertEqual(repaired_servers[0]["id"], forgotten["id"])
+
+    def test_network_projection_retains_managed_host_and_legacy_node(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = HubStore(
+                Path(directory),
+                managed_host_identity="projection-managed-host-identity",
+            )
+            proof = (Path(directory) / "bootstrap-owner.proof").read_text().strip()
+            bootstrap = store.bootstrap(
+                proof,
+                "host-owner@example.com",
+                "Host Owner",
+                "Host Mac",
+            )
+            team_id = bootstrap["teams"][0]["id"]
+            owner = store.verify_access(bootstrap["access_token"])
+            timestamp = int(time.time())
+            principal_id = "node_principal_" + uuid.uuid4().hex
+            node_id = "node_" + uuid.uuid4().hex
+            connection = store.connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    INSERT INTO principals(
+                        id,kind,scope_team_id,display_name,status,created_at,updated_at
+                    ) VALUES (?,'node',?,'Legacy server','active',?,?)
+                    """,
+                    (principal_id, team_id, timestamp, timestamp),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO nodes(
+                        id,team_id,principal_id,server_identity,display_name,status,
+                        enrolled_at,last_seen_at
+                    ) VALUES (?,?,?,?,?,'offline',?,NULL)
+                    """,
+                    (
+                        node_id,
+                        team_id,
+                        principal_id,
+                        "projection-legacy-server-identity",
+                        "Legacy server",
+                        timestamp,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO legacy_server_bindings(
+                        id,team_id,server_identity,node_id,created_at
+                    ) VALUES (?,?,?,?,?)
+                    """,
+                    (
+                        "legacy_binding_" + uuid.uuid4().hex,
+                        team_id,
+                        "projection-legacy-server-identity",
+                        node_id,
+                        timestamp,
+                    ),
+                )
+                connection.execute("COMMIT")
+            finally:
+                connection.close()
+
+            projection = store.get_network(owner, team_id, limit=50)
+            by_identity = {
+                server["server_identity"]: server
+                for server in projection["servers"]
+            }
+            self.assertTrue(
+                by_identity["projection-managed-host-identity"]["is_host"]
+            )
+            self.assertEqual(
+                by_identity["projection-legacy-server-identity"]["status"],
+                "offline",
+            )
 
     def test_network_projection_is_group_paged_below_transport_cap(self) -> None:
         for index in range(3):

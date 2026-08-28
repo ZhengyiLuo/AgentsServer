@@ -1869,7 +1869,7 @@ Restart=always
 RestartSec=2
 # Shutdown normally completes in under a second after provider admission is
 # drained. Bound orphaned cgroup descendants so even a legacy updater invoking
-# synchronous `systemctl restart` cannot be stranded behind systemd's 90s
+# synchronous systemctl restart cannot be stranded behind systemd's 90s
 # default. New managed updaters use the stricter external stop/start path too.
 TimeoutStopSec=10s
 # Keep the coordinator alive long enough to record/recover agent failures

@@ -4394,16 +4394,55 @@ class HubStore:
                 "display_name": team["display_name"],
                 "hub_id": self.hub_id,
             }
+            # Presence and trust are separate: an offline node with an exact
+            # live binding remains visible, while a secure-peer-backed node
+            # whose authority was retired does not. Managed-host and legacy
+            # no-binding nodes are independent of secure-peer authority. Apply
+            # this lifecycle filter before the cursor and LIMIT page boundary.
             server_rows = list(
                 connection.execute(
                     """
-                    SELECT id,server_identity,display_name,status
-                    FROM nodes
-                    WHERE team_id=? AND status<>'revoked' AND id>?
-                    ORDER BY id
+                    SELECT n.id,n.server_identity,n.display_name,n.status
+                    FROM nodes AS n
+                    WHERE n.team_id=? AND n.status<>'revoked' AND n.id>?
+                      AND (
+                        n.server_identity=?
+                        OR NOT EXISTS (
+                            SELECT 1 FROM network_peer_bindings AS history
+                            WHERE history.team_id=n.team_id
+                              AND history.node_id=n.id
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM network_peer_bindings AS live
+                            JOIN principals AS service_principal
+                              ON service_principal.id=live.service_principal_id
+                            JOIN service_accounts AS service_account
+                              ON service_account.principal_id=service_principal.id
+                            JOIN memberships AS service_membership
+                              ON service_membership.team_id=live.team_id
+                             AND service_membership.principal_id=service_principal.id
+                            WHERE live.team_id=n.team_id
+                              AND live.node_id=n.id
+                              AND live.peer_server_identity=n.server_identity
+                              AND live.status='active'
+                              AND service_principal.kind='service'
+                              AND service_principal.status='active'
+                              AND service_account.service_identifier=
+                                  'agentsdock.secure-peer.' || live.peer_id
+                              AND service_membership.role='automation'
+                              AND service_membership.status='active'
+                        )
+                      )
+                    ORDER BY n.id
                     LIMIT ?
                     """,
-                    (team_id, clean_after or "", bounded_limit + 1),
+                    (
+                        team_id,
+                        clean_after or "",
+                        self.managed_host_identity,
+                        bounded_limit + 1,
+                    ),
                 )
             )
             candidate_rows = server_rows[:bounded_limit]

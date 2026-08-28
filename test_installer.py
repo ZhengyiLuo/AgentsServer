@@ -1998,6 +1998,75 @@ chmod 755 "$project/.venv/bin/python"
             self.assertNotIn("AGENTSDOCK_SETUP_RESULT", result.stdout)
             self.assertNotIn(token, result.stdout)
 
+    def test_rendering_systemd_service_does_not_run_restart_from_comment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home, fake_bin, _install_root, environment = (
+                self.fake_linux_preinstall_environment(root)
+            )
+            self.write_exact_health_uv(fake_bin)
+            self.write_json_health_curl(fake_bin)
+            server_identity = "server_service_render_12345678"
+            config_root = root / "config"
+            config_root.mkdir()
+            (config_root / "env").write_text(
+                "AGENTSDOCK_AGENT_TOKEN=preserved_token_abcdefghijklmnopqrstuvwxyz0123456789\n"
+                "AGENTSDOCK_AGENT_PORT=17850\n"
+                "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
+            )
+            systemctl_log = root / "systemctl.log"
+            bare_restart_sentinel = root / "bare-systemctl-restart"
+            self.write_executable(
+                fake_bin / "systemctl",
+                """#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_SYSTEMCTL_LOG"
+if [ "$#" -eq 1 ] && [ "$1" = "restart" ]; then
+  : > "$FAKE_BARE_SYSTEMCTL_RESTART"
+  exit 97
+fi
+exit 0
+""",
+            )
+            environment.update(
+                {
+                    "FAKE_HEALTH_VERSION": self.release_version(),
+                    "FAKE_SERVER_IDENTITY": server_identity,
+                    "FAKE_TEAM_HUB_MODE": "disabled",
+                    "FAKE_SYSTEMCTL_LOG": str(systemctl_log),
+                    "FAKE_BARE_SYSTEMCTL_RESTART": str(bare_restart_sentinel),
+                    "REAL_PYTHON": sys.executable,
+                    "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(INSTALLER),
+                    "--non-interactive",
+                    "--port",
+                    "17850",
+                    "--expected-server-identity",
+                    server_identity,
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            service = (
+                home / ".config" / "systemd" / "user" / "agents-server.service"
+            ).read_text()
+            calls = systemctl_log.read_text().splitlines()
+            self.assertFalse(
+                bare_restart_sentinel.exists(),
+                f"rendering the service ran a bare systemctl restart; calls: {calls}",
+            )
+            self.assertNotIn("restart", calls)
+            self.assertIn("synchronous systemctl restart", service)
+
     def test_candidate_with_quarantined_secure_peer_state_is_not_accepted(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

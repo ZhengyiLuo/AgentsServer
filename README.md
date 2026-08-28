@@ -447,7 +447,7 @@ JSON body containing a UUID `request_id`, the exact
 Replaying the same request ID is idempotent; another pending or recently
 completed request is rejected.
 
-Restart admission is fail-closed while an update, active turn, provisional
+Restart admission is fail-closed while an active update, active turn, provisional
 queue write, provider background task, lifecycle operation, or HTTP mutation
 is in flight. Durable queued turns remain queued for recovery after relaunch.
 There is no force mode and unmanaged processes cannot use this control.
@@ -523,6 +523,13 @@ terminate its own installer. Progress is written to
 `server-update.log` beside it. Chat history, files, jobs, tokens, and tmux
 sessions remain under the persistent state/configuration roots and are never
 placed inside a release directory.
+
+`capabilities.server_updates` v7 defines install-when-idle as a passive,
+durable reservation. Chats, messages, terminal connections, settings changes,
+and manual restart remain available while the reservation is pending. The
+server begins maintenance only when one shared-lock snapshot proves it is
+actually idle; that same atomic transition closes new-work admission. A
+pending reservation survives a manual restart and is re-armed after startup.
 
 ## Uninstalling AgentsServer
 

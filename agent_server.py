@@ -17896,10 +17896,7 @@ class TerminalAttachmentRegistry:
         if owner_task is None:
             raise RuntimeError("terminal attachment has no owning task")
         async with self._lock:
-            update_blocked = (
-                managed_server_update_blocks_work()
-                or managed_server_update_is_pending()
-            )
+            update_blocked = managed_server_update_blocks_work()
             restart_blocked = managed_server_restart_blocks_work()
             if (
                 not self._permanently_closed
@@ -36189,9 +36186,8 @@ async def acquire_codex_control_thread(
     maintenance_reserved = False
     active_thread_id = ""
     async with ACTIVE_LOCK:
-        # Pending reservations may not create provider maintenance or a new
-        # control turn. A control explicitly targeting the already-active
-        # app-server thread remains available so that work can finish.
+        # Active updates/restarts fence provider maintenance and new controls.
+        # A passive update-when-idle reservation does not change admission.
         update_blocker = (
             managed_server_update_blocker()
             if (
@@ -47525,7 +47521,7 @@ def managed_server_update_blocks_work(
 def managed_server_update_is_pending(
     status: dict[str, Any] | None = None,
 ) -> bool:
-    """Return whether a durable update reservation is draining new work."""
+    """Return whether a passive update-when-idle reservation exists."""
 
     current = status if status is not None else read_server_update_status()
     return str(current.get("phase") or "") == SERVER_UPDATE_PENDING_PHASE
@@ -47540,36 +47536,14 @@ def managed_server_update_blocker() -> str | None:
 
 
 def managed_server_update_admission_blocker() -> str | None:
-    """Fence work that would prevent a pending update from reaching idle.
+    """Fence work only after update or restart transition has begun.
 
-    Pending is deliberately separate from the broad active-update fence.
-    Existing turns must retain approval, interaction, and Stop controls so they
-    can finish naturally; only new work reservations use this predicate.
+    A pending install-when-idle reservation is passive. Normal work remains
+    admissible until the updater atomically observes an idle server and writes
+    an active update phase while holding the same admission locks.
     """
 
-    broad_blocker = managed_server_update_blocker()
-    if broad_blocker:
-        return broad_blocker
-    if managed_server_update_is_pending():
-        return "AgentsServer is preparing a managed update"
-    return None
-
-
-def managed_server_update_pending_completion_route(
-    method: str,
-    path: str,
-) -> bool:
-    """Allow controls that help an already-active turn reach idle."""
-
-    if method.upper() != "POST":
-        return False
-    return bool(
-        re.fullmatch(r"/api/sessions/[^/]+/stop", path)
-        or re.fullmatch(
-            r"/api/sessions/[^/]+/(?:codex|claude)/interactions/[^/]+/resolve",
-            path,
-        )
-    )
+    return managed_server_update_blocker()
 
 
 def managed_server_restart_is_planned() -> bool:
@@ -49694,42 +49668,6 @@ async def require_agent_token(request: Request, call_next):
                 {"detail": "AgentsServer is preparing a managed update"},
                 status_code=409,
             )
-        if (
-            managed_server_update_is_pending()
-            and not managed_server_update_pending_completion_route(
-                request.method,
-                request.url.path,
-            )
-        ):
-            if team_hub_route or team_hub_bootstrap_route:
-                return JSONResponse(
-                    {
-                        "error": {
-                            "code": "hub_maintenance",
-                            "message": (
-                                "Team Hub is unavailable while a server "
-                                "update waits for idle"
-                            ),
-                        }
-                    },
-                    status_code=503,
-                )
-            return JSONResponse(
-                {
-                    "detail": server_update_error_detail(
-                        "server_update_pending",
-                        (
-                            "AgentsServer is waiting for current work to finish "
-                            "before a managed update."
-                        ),
-                        action=(
-                            "Let active work finish or cancel the scheduled update."
-                        ),
-                        retryable=True,
-                    )
-                },
-                status_code=409,
-            )
         UNSAFE_HTTP_MUTATIONS_IN_FLIGHT += 1
     try:
         return await call_next(request)
@@ -50295,9 +50233,10 @@ async def health() -> dict[str, Any]:
                 "required": False,
                 "message": "Signed Stable and Beta AgentsServer channels are available.",
                 "action": None,
-                # v6 adds a durable update-when-idle reservation with a narrow
-                # admission fence; v5 already drains tracked terminal clients.
-                "version": 6,
+                # v7 makes durable update-when-idle reservations passive and
+                # begins the active fence only at an atomic idle transition.
+                # v6 already persisted and resumed the reservation.
+                "version": 7,
                 "tracks": ["stable", "beta"],
             },
             "tmux": tmux,
@@ -51006,16 +50945,6 @@ async def restart_server_endpoint(
                     action="Reconnect or reinstall the supported AgentsServer user service.",
                 ),
             )
-        if managed_server_update_is_pending():
-            raise HTTPException(
-                status_code=409,
-                detail=server_restart_error_detail(
-                    "server_update_pending",
-                    "AgentsServer cannot restart while an update is waiting for idle.",
-                    action="Cancel the scheduled update before restarting.",
-                    retryable=True,
-                ),
-            )
         if managed_server_update_blocks_work():
             raise HTTPException(
                 status_code=409,
@@ -51041,21 +50970,6 @@ async def restart_server_endpoint(
                                 "server_restart_in_progress",
                                 "Another AgentsServer restart is already in progress.",
                                 action="Wait for the server to reconnect before retrying.",
-                                retryable=True,
-                            ),
-                        )
-                    if managed_server_update_is_pending():
-                        raise HTTPException(
-                            status_code=409,
-                            detail=server_restart_error_detail(
-                                "server_update_pending",
-                                (
-                                    "AgentsServer cannot restart while an update "
-                                    "is waiting for idle."
-                                ),
-                                action=(
-                                    "Cancel the scheduled update before restarting."
-                                ),
                                 retryable=True,
                             ),
                         )

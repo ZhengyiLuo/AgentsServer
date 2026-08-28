@@ -9,7 +9,7 @@ import uuid
 from collections import deque
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import BackgroundTasks, HTTPException, Request
 from fastapi.responses import Response
@@ -1128,6 +1128,73 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
                     raised.exception.detail["code"],
                     "server_update_in_progress",
                 )
+
+    async def test_pending_update_allows_restart_and_rearms_after_startup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with restart_environment(root), patch.object(
+                agent_server,
+                "SERVER_VERSION",
+                "1.0.0",
+            ):
+                pending = agent_server.write_fresh_server_update_status(
+                    phase="pending",
+                    schedule_id="d" * 32,
+                    target_version="1.1.0",
+                    latest_version="1.1.0",
+                    track="stable",
+                    update_available=True,
+                    when_idle=True,
+                    cancelable=True,
+                    blocker_counts={"active_runs": 1},
+                )
+                tasks = BackgroundTasks()
+                accepted = await agent_server.restart_server_endpoint(
+                    restart_body(),
+                    http_request(method="POST"),
+                    tasks,
+                )
+                preserved = agent_server.read_server_update_status()
+                with patch.object(
+                    agent_server,
+                    "SERVER_INSTANCE_ID",
+                    "b" * 32,
+                ):
+                    restarted = (
+                        agent_server.reconcile_server_restart_status_after_startup()
+                    )
+                    rearmed = await (
+                        agent_server.reconcile_server_update_status_after_startup()
+                    )
+                    resume_start = AsyncMock(return_value=rearmed)
+                    with patch.object(
+                        agent_server,
+                        "_start_server_update",
+                        new=resume_start,
+                    ):
+                        resumed = await (
+                            agent_server.advance_pending_server_update_once()
+                        )
+
+        self.assertEqual(accepted["phase"], "accepted")
+        self.assertEqual(len(tasks.tasks), 1)
+        self.assertEqual(preserved["phase"], "pending")
+        self.assertEqual(preserved["schedule_id"], pending["schedule_id"])
+        self.assertEqual(preserved["updated_at"], pending["updated_at"])
+        self.assertEqual(restarted["phase"], "complete")
+        self.assertEqual(rearmed["phase"], "pending")
+        self.assertEqual(rearmed["schedule_id"], pending["schedule_id"])
+        self.assertEqual(rearmed["updated_at"], pending["updated_at"])
+        self.assertEqual(resumed, rearmed)
+        resume_start.assert_awaited_once()
+        resume_request = resume_start.await_args.args[0]
+        self.assertEqual(resume_request.version, "1.1.0")
+        self.assertEqual(resume_request.track, "stable")
+        self.assertTrue(resume_request.when_idle)
+        self.assertEqual(
+            resume_start.await_args.kwargs["expected_schedule_id"],
+            pending["schedule_id"],
+        )
 
     async def test_active_queue_and_provider_work_are_forceable_blockers(self):
         scenarios = (

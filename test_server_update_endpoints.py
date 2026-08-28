@@ -520,7 +520,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response["managed_updates"])
         self.assertEqual(
             response["capabilities"]["server_updates"]["version"],
-            6,
+            7,
         )
         self.assertEqual(response["update_service_cgroup"], {
             "safe": True,
@@ -1355,6 +1355,96 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
         run_tmux.assert_called_once()
 
+    async def test_pending_waiter_defers_for_admitted_mutation_then_transitions(self):
+        def request(path: str):
+            return agent_server.Request({
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "method": "POST",
+                "scheme": "http",
+                "path": path,
+                "raw_path": path.encode(),
+                "query_string": b"",
+                "root_path": "",
+                "headers": [],
+                "client": ("127.0.0.1", 50000),
+                "server": ("127.0.0.1", 7850),
+            })
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "update_runner.py"
+            key = root / "release-public-key.pem"
+            runner.write_text("# runner\n")
+            key.write_text("public key\n")
+            busy = {"busy-chat"}
+            mutation_entered = asyncio.Event()
+            release_mutation = asyncio.Event()
+
+            async def slow_mutation(_request):
+                mutation_entered.set()
+                await release_mutation.wait()
+                return agent_server.JSONResponse({"saved": True})
+
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", root / "status.json"), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server, "AGENT_TOKEN", ""), \
+                 patch.object(agent_server, "BUSY_SESSIONS", busy), \
+                 patch.object(agent_server, "SERVER_MAINTENANCE_SESSIONS", set()), \
+                 patch.object(agent_server, "QUEUED_TURNS", {}), \
+                 patch.object(agent_server, "RUN_NOW_TURNS", {}), \
+                 patch.object(agent_server, "UNSAFE_HTTP_MUTATIONS_IN_FLIGHT", 0), \
+                 patch.object(agent_server, "active_provider_background_work_labels", return_value=[]), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
+                 patch.object(
+                     agent_server,
+                     "ensure_managed_update_tmux_isolated",
+                     return_value=None,
+                 ), \
+                 patch.object(agent_server, "run_tmux", return_value=None) as run_tmux:
+                pending = await agent_server.start_server_update(
+                    agent_server.ServerUpdateRequest(
+                        version="1.1.0",
+                        when_idle=True,
+                    ),
+                )
+                busy.clear()
+                mutation_task = asyncio.create_task(
+                    agent_server.require_agent_token(
+                        request("/api/sessions/chat/unread"),
+                        slow_mutation,
+                    )
+                )
+                await asyncio.wait_for(mutation_entered.wait(), timeout=1)
+                still_pending = await agent_server.advance_pending_server_update_once()
+                self.assertEqual(agent_server.UNSAFE_HTTP_MUTATIONS_IN_FLIGHT, 1)
+                release_mutation.set()
+                mutation_response = await mutation_task
+                started = await agent_server.advance_pending_server_update_once()
+                blocked_next = AsyncMock()
+                blocked_mutation = await agent_server.require_agent_token(
+                    request("/api/sessions/chat/unread"),
+                    blocked_next,
+                )
+
+        self.assertEqual(pending["phase"], "pending")
+        self.assertEqual(still_pending["phase"], "pending")
+        self.assertEqual(
+            still_pending["blocker_counts"]["in_flight_server_changes"],
+            1,
+        )
+        self.assertEqual(mutation_response.status_code, 200)
+        self.assertEqual(agent_server.UNSAFE_HTTP_MUTATIONS_IN_FLIGHT, 0)
+        self.assertEqual(started["phase"], "starting")
+        self.assertEqual(started["schedule_id"], pending["schedule_id"])
+        self.assertEqual(blocked_mutation.status_code, 409)
+        self.assertIn(b"preparing a managed update", blocked_mutation.body)
+        blocked_next.assert_not_awaited()
+        run_tmux.assert_called_once()
+
     async def test_pending_cancel_is_exact_and_stale_waiter_cannot_restart_it(self):
         with tempfile.TemporaryDirectory() as temporary:
             status_path = Path(temporary) / "status.json"
@@ -1473,7 +1563,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.detail["code"], "server_update_not_cancelable")
         self.assertEqual(raised.exception.detail["schedule_id"], pending["schedule_id"])
 
-    async def test_pending_allows_completion_controls_but_rejects_new_work(self):
+    async def test_pending_is_passive_for_new_and_existing_agent_work(self):
         with tempfile.TemporaryDirectory() as temporary:
             status_path = Path(temporary) / "status.json"
             stop_turn = AsyncMock(return_value={"stopped": True})
@@ -1481,6 +1571,13 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
             resolve_claude = AsyncMock(return_value={"status": "resolved"})
             with patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", status_path), \
                  patch.object(agent_server, "BUSY_SESSIONS", {"active-chat"}), \
+                 patch.object(agent_server, "MAX_ACTIVE_AGENT_RUNS", 0), \
+                 patch.object(agent_server, "JOB_MAX_ACTIVE_RUNS", 0), \
+                 patch.object(
+                     agent_server,
+                     "host_pressure_snapshot",
+                     return_value={"available_mem_mb": 1_000_000},
+                 ), \
                  patch.object(agent_server, "stop_turn", new=stop_turn), \
                  patch.object(agent_server, "resolve_codex_interaction", new=resolve_codex), \
                  patch.object(agent_server, "resolve_claude_interaction", new=resolve_claude):
@@ -1494,9 +1591,8 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                     blocker_counts={"active_runs": 1},
                 )
                 self.assertIsNone(agent_server.managed_server_update_blocker())
-                self.assertIn(
-                    "managed update",
-                    str(agent_server.managed_server_update_admission_blocker()),
+                self.assertIsNone(
+                    agent_server.managed_server_update_admission_blocker()
                 )
                 interactive = await agent_server.turn_start_blocker()
                 scheduled = await agent_server.scheduled_job_blocker("other-chat")
@@ -1516,39 +1612,21 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
 
-        self.assertIn("managed update", str(interactive))
-        self.assertIn("managed update", str(scheduled))
+        self.assertIsNone(interactive)
+        self.assertIsNone(scheduled)
         self.assertEqual(stopped, {"stopped": True})
         self.assertEqual(codex["interaction"]["status"], "resolved")
         self.assertEqual(claude["interaction"]["status"], "resolved")
-        self.assertTrue(
-            agent_server.managed_server_update_pending_completion_route(
-                "POST",
-                "/api/sessions/active-chat/stop",
-            )
-        )
-        self.assertTrue(
-            agent_server.managed_server_update_pending_completion_route(
-                "POST",
-                "/api/sessions/active-chat/codex/interactions/a/resolve",
-            )
-        )
-        self.assertFalse(
-            agent_server.managed_server_update_pending_completion_route(
-                "POST",
-                "/api/sessions/active-chat/turn",
-            )
-        )
         stop_turn.assert_awaited_once_with("active-chat")
         resolve_codex.assert_awaited_once()
         resolve_claude.assert_awaited_once()
 
-    async def test_pending_http_fence_allows_stop_but_blocks_new_mutation(self):
-        def request(path: str):
+    async def test_pending_allows_messages_and_normal_http_mutations(self):
+        def request(method: str, path: str):
             return agent_server.Request({
                 "type": "http",
                 "asgi": {"version": "3.0"},
-                "method": "POST",
+                "method": method,
                 "scheme": "http",
                 "path": path,
                 "raw_path": path.encode(),
@@ -1561,6 +1639,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as temporary, \
              patch.object(agent_server, "AGENT_TOKEN", ""), \
+             patch.object(agent_server, "UNSAFE_HTTP_MUTATIONS_IN_FLIGHT", 0), \
              patch.object(
                  agent_server,
                  "SERVER_UPDATE_STATUS_FILE",
@@ -1575,38 +1654,41 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                 cancelable=True,
                 blocker_counts={"active_runs": 1},
             )
-            stop_response = agent_server.JSONResponse({"continued": True})
-            stop_next = AsyncMock(return_value=stop_response)
-            allowed = await agent_server.require_agent_token(
-                request("/api/sessions/chat/stop"),
-                stop_next,
-            )
-            check_next = AsyncMock(
-                side_effect=lambda _request: agent_server.JSONResponse(
-                    agent_server.read_server_update_status()
+            observed: list[tuple[str, str, int]] = []
+
+            async def mutation_next(incoming):
+                observed.append((
+                    incoming.method,
+                    incoming.url.path,
+                    agent_server.UNSAFE_HTTP_MUTATIONS_IN_FLIGHT,
+                ))
+                return agent_server.JSONResponse({"accepted": True})
+
+            for method, path in (
+                ("POST", "/api/sessions/chat/turn"),
+                ("POST", "/api/sessions/chat/unread"),
+                ("PATCH", "/api/sessions/chat"),
+            ):
+                response = await agent_server.require_agent_token(
+                    request(method, path),
+                    mutation_next,
                 )
-            )
-            checked = await agent_server.require_agent_token(
-                request("/api/admin/update/check"),
-                check_next,
-            )
-            blocked_next = AsyncMock()
-            blocked = await agent_server.require_agent_token(
-                request("/api/sessions/chat/turn"),
-                blocked_next,
-            )
+                self.assertEqual(response.status_code, 200)
+            pending = agent_server.read_server_update_status()
 
-        self.assertIs(allowed, stop_response)
-        stop_next.assert_awaited_once()
-        self.assertEqual(checked.status_code, 200)
-        self.assertIn(b'"phase":"pending"', checked.body)
-        self.assertIn(b'"schedule_id":"ffffffffffffffffffffffffffffffff"', checked.body)
-        check_next.assert_awaited_once()
-        self.assertEqual(blocked.status_code, 409)
-        self.assertIn(b"server_update_pending", blocked.body)
-        blocked_next.assert_not_awaited()
+        self.assertEqual(
+            observed,
+            [
+                ("POST", "/api/sessions/chat/turn", 1),
+                ("POST", "/api/sessions/chat/unread", 1),
+                ("PATCH", "/api/sessions/chat", 1),
+            ],
+        )
+        self.assertEqual(agent_server.UNSAFE_HTTP_MUTATIONS_IN_FLIGHT, 0)
+        self.assertEqual(pending["phase"], "pending")
+        self.assertEqual(pending["schedule_id"], "f" * 32)
 
-    async def test_pending_fences_terminal_reconnect_without_closing_existing_work(self):
+    async def test_pending_allows_terminal_reconnect(self):
         class Socket:
             pass
 
@@ -1627,11 +1709,20 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                 blocker_counts={"active_runs": 1},
             )
             admitted = await registry.reserve("chat", Socket())
+            agent_server.write_fresh_server_update_status(
+                phase="starting",
+                update_id="e" * 32,
+                target_version="1.1.0",
+                track="stable",
+                cancelable=False,
+            )
+            blocked_after_transition = await registry.reserve("chat", Socket())
             snapshot = await registry.snapshot()
 
-        self.assertFalse(admitted)
+        self.assertTrue(admitted)
+        self.assertFalse(blocked_after_transition)
         self.assertTrue(snapshot["admission_open"])
-        self.assertEqual(snapshot["active_connections"], 0)
+        self.assertEqual(snapshot["active_connections"], 1)
 
     async def test_startup_preserves_valid_pending_and_fails_malformed_schedule(self):
         with tempfile.TemporaryDirectory() as temporary, \

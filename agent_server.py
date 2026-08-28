@@ -303,11 +303,11 @@ CODEX_TRANSPORT_EXEC = "exec"
 CODEX_INTERACTIVE_CLIENT_CAPABILITY = "codex_interactive_v1"
 CROSS_CHAT_HANDOFFS_V1_CLIENT_CAPABILITY = "cross_chat_handoffs_v1"
 CROSS_CHAT_HANDOFFS_V2_CLIENT_CAPABILITY = "cross_chat_handoffs_v2"
-AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY = "agent_cross_chat_routes_v1"
-AGENT_AMBIENT_LOCAL_HANDOFFS_ENABLED = boolean_setting(
-    "AMBIENT_LOCAL_HANDOFFS_ENABLED",
-    True,
-)
+AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY = "agent_cross_chat_routes_v2"
+# Ambient all-chat authority was a beta-only policy. Keep the symbol as a
+# hard-false migration fence so persisted beta snapshots are discarded even
+# if an older deployment still carries the former environment variable.
+AGENT_AMBIENT_LOCAL_HANDOFFS_ENABLED = False
 CLAUDE_TRANSPORT_AUTO = "auto"
 CLAUDE_TRANSPORT_AGENT_SDK = "agent-sdk"
 CLAUDE_TRANSPORT_PRINT = "print"
@@ -364,6 +364,12 @@ PROVIDER_CROSS_CHAT_ROUTE_ALIAS_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 PROVIDER_CROSS_CHAT_ROUTE_ID_RE = re.compile(r"^route_[0-9a-f]{32}$")
 PROVIDER_CROSS_CHAT_ROUTE_REVISION_RE = re.compile(r"^rev_[0-9a-f]{32}$")
 PROVIDER_CROSS_CHAT_ROUTE_AUDIT_ID_RE = re.compile(r"^audit_[0-9a-f]{32}$")
+PROVIDER_CROSS_CHAT_GRANT_ADMISSION_ID_RE = re.compile(
+    r"^grant_admission_[0-9a-f]{32}$"
+)
+PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY = (
+    "_pending_provider_cross_chat_route_grant"
+)
 PROVIDER_DIRECT_GRANT_ID_RE = re.compile(r"^grant_[0-9a-f]{64}$")
 CODEX_APPROVAL_POLICIES = {"never", "on-request", "untrusted"}
 CODEX_SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
@@ -670,7 +676,7 @@ PROVIDER_SECRET_ENV_NAMES = (
 SERVER_BIND_ADDRESS = agentsdock_setting("AGENT_BIND", "0.0.0.0")
 SERVER_PORT = int(agentsdock_setting("AGENT_PORT", "7850"))
 SERVER_INSTANCE_ID = uuid.uuid4().hex
-API_CONTRACT_VERSION = 19
+API_CONTRACT_VERSION = 20
 SESSION_ORDER_STEP = 1000.0
 SECURE_PEER_DELIVERY_PURPOSE = "secure_peer_handoff_delivery"
 CROSS_CHAT_DELIVERY_PURPOSES = {
@@ -3743,6 +3749,11 @@ class ChatReference(BaseModel):
     # action-neutral semantics. ``direct_message`` remains accepted only as a
     # legacy wire/storage value and is normalized to ``route`` at admission.
     route_action: Literal["instruction", "request_reply"] | None = None
+    # v7 clients set this only for a canonical local single-@ route hint. Its
+    # absence is a compatibility fence: beta-era route/direct-message records
+    # may be read or run from an already accepted queue snapshot, but can never
+    # silently become durable policy.
+    grant_intent: Literal[True] | None = None
     target_kind: Literal["secure_peer"] | None = None
     target_server_identity: str | None = Field(default=None, min_length=8, max_length=240)
     target_connection_id: str | None = None
@@ -3774,7 +3785,15 @@ class ChatReference(BaseModel):
                 )
             if self.route_action is not None and self.action != "route":
                 raise ValueError("route_action requires action=route")
+            if self.grant_intent is not None and (
+                self.action != "route" or self.route_action is not None
+            ):
+                raise ValueError(
+                    "grant_intent requires an action=route reference without route_action"
+                )
             return self
+        if self.grant_intent is not None:
+            raise ValueError("secure peer references cannot contain grant_intent")
         if self.route_action is not None:
             raise ValueError("secure peer references cannot contain route_action")
         if self.action not in {"instruction", "request_reply"}:
@@ -4266,10 +4285,214 @@ def normalized_provider_cross_chat_routes(value: Any) -> list[dict[str, Any]]:
     return routes
 
 
-def provider_cross_chat_routes(sess: dict[str, Any] | None) -> list[dict[str, Any]]:
+def stored_provider_cross_chat_routes(
+    sess: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Return the raw persisted route projection, including a pending grant."""
+
     return normalized_provider_cross_chat_routes(
         (sess or {}).get("provider_cross_chat_routes")
     )
+
+
+def normalized_pending_provider_cross_chat_grant(
+    value: Any,
+) -> dict[str, Any] | None:
+    """Validate the crash-recovery journal for one route-grant admission."""
+
+    if not isinstance(value, dict):
+        return None
+    admission_id = str(value.get("admission_id") or "")
+    event_type = str(value.get("event_type") or "")
+    raw_changes = value.get("rollback_changes")
+    raw_displaced_audit_entries = value.get("displaced_audit_entries", [])
+    audit_count_after_stage = value.get("audit_count_after_stage")
+    mutation_timestamp = str(value.get("mutation_timestamp") or "")
+    try:
+        parsed_mutation_timestamp = datetime.fromisoformat(
+            mutation_timestamp[:-1] + "+00:00"
+            if mutation_timestamp.endswith("Z")
+            else mutation_timestamp
+        )
+    except ValueError:
+        parsed_mutation_timestamp = None
+    if (
+        not PROVIDER_CROSS_CHAT_GRANT_ADMISSION_ID_RE.fullmatch(admission_id)
+        or event_type not in {"turn_started", "turn_queued"}
+        or not isinstance(raw_changes, list)
+        or not 1 <= len(raw_changes) <= PROVIDER_CROSS_CHAT_ROUTE_LIMIT
+        or not isinstance(raw_displaced_audit_entries, list)
+        or not isinstance(audit_count_after_stage, int)
+        or isinstance(audit_count_after_stage, bool)
+        or not len(raw_changes) <= audit_count_after_stage <= (
+            PROVIDER_CROSS_CHAT_ROUTE_AUDIT_LIMIT
+        )
+        or parsed_mutation_timestamp is None
+        or parsed_mutation_timestamp.tzinfo is None
+    ):
+        return None
+    changes: list[dict[str, Any]] = []
+    seen_route_ids: set[str] = set()
+    seen_audit_ids: set[str] = set()
+    for raw_change in raw_changes:
+        if not isinstance(raw_change, dict):
+            return None
+        after_values = normalized_provider_cross_chat_routes([
+            raw_change.get("after")
+        ])
+        if len(after_values) != 1:
+            return None
+        after = after_values[0]
+        route_id = str(after.get("route_id") or "")
+        audit_id = str(raw_change.get("audit_id") or "")
+        try:
+            parsed_after_created = datetime.fromisoformat(
+                str(after.get("created_at") or "").replace("Z", "+00:00")
+            )
+            parsed_after_updated = datetime.fromisoformat(
+                str(after.get("updated_at") or "").replace("Z", "+00:00")
+            )
+        except ValueError:
+            return None
+        if (
+            parsed_after_created.tzinfo is None
+            or parsed_after_updated.tzinfo is None
+            or parsed_after_created > parsed_after_updated
+            or str(after.get("updated_at") or "") != mutation_timestamp
+        ):
+            return None
+        before_value = raw_change.get("before")
+        before: dict[str, Any] | None = None
+        if before_value is not None:
+            before_values = normalized_provider_cross_chat_routes([
+                before_value
+            ])
+            if (
+                len(before_values) != 1
+                or before_values[0].get("route_id") != route_id
+            ):
+                return None
+            before = before_values[0]
+            try:
+                parsed_before_updated = datetime.fromisoformat(
+                    str(before.get("updated_at") or "").replace("Z", "+00:00")
+                )
+            except ValueError:
+                return None
+            if (
+                any(
+                    before.get(key) != after.get(key)
+                    for key in (
+                        "route_id",
+                        "alias",
+                        "target_session_id",
+                        "created_at",
+                    )
+                )
+                or before.get("revision") == after.get("revision")
+                or parsed_before_updated.tzinfo is None
+                or parsed_before_updated > parsed_after_updated
+            ):
+                return None
+        elif str(after.get("created_at") or "") != mutation_timestamp:
+            return None
+        if (
+            route_id in seen_route_ids
+            or not PROVIDER_CROSS_CHAT_ROUTE_AUDIT_ID_RE.fullmatch(audit_id)
+            or audit_id in seen_audit_ids
+        ):
+            return None
+        seen_route_ids.add(route_id)
+        seen_audit_ids.add(audit_id)
+        changes.append({
+            "after": after,
+            "before": before,
+            "audit_id": audit_id,
+        })
+    displaced_audit_entries = normalized_provider_cross_chat_route_audit(
+        raw_displaced_audit_entries
+    )
+    displaced_audit_ids = {
+        str(entry.get("audit_id") or "")
+        for entry in displaced_audit_entries
+    }
+    if (
+        len(displaced_audit_entries) != len(raw_displaced_audit_entries)
+        or any(
+            normalized != raw
+            for normalized, raw in zip(
+                displaced_audit_entries,
+                raw_displaced_audit_entries,
+                strict=True,
+            )
+        )
+        or len(displaced_audit_entries) > len(changes)
+        or len(displaced_audit_ids) != len(displaced_audit_entries)
+        or displaced_audit_ids.intersection(seen_audit_ids)
+    ):
+        return None
+    previous_audit_count = (
+        audit_count_after_stage
+        - len(changes)
+        + len(displaced_audit_entries)
+    )
+    if (
+        not 0 <= previous_audit_count <= (
+            PROVIDER_CROSS_CHAT_ROUTE_AUDIT_LIMIT
+        )
+        or len(displaced_audit_entries) != max(
+            0,
+            previous_audit_count
+            + len(changes)
+            - PROVIDER_CROSS_CHAT_ROUTE_AUDIT_LIMIT,
+        )
+    ):
+        return None
+    return {
+        "admission_id": admission_id,
+        "event_type": event_type,
+        "rollback_changes": changes,
+        "displaced_audit_entries": displaced_audit_entries,
+        "audit_count_after_stage": audit_count_after_stage,
+        "mutation_timestamp": mutation_timestamp,
+        "previous_updated_at": value.get("previous_updated_at"),
+    }
+
+
+def provider_cross_chat_routes(sess: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Return the live durable route ceiling, hiding unaccepted admissions."""
+
+    routes = stored_provider_cross_chat_routes(sess)
+    raw_pending = (sess or {}).get(PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY)
+    if raw_pending is None:
+        return routes
+    pending = normalized_pending_provider_cross_chat_grant(raw_pending)
+    if pending is None:
+        # A malformed recovery marker cannot prove which stored route state is
+        # authorized. Quarantine the entire ceiling instead of guessing.
+        return []
+    for change in pending["rollback_changes"]:
+        after = change["after"]
+        route_index = next((
+            index
+            for index, route in enumerate(routes)
+            if route.get("route_id") == after.get("route_id")
+        ), None)
+        current = routes[route_index] if route_index is not None else None
+        if (
+            current is None
+            or current.get("revision") != after.get("revision")
+        ):
+            # A later exact-CAS mutation owns this route and is not pending.
+            continue
+        before = change.get("before")
+        if before is None:
+            assert route_index is not None
+            routes.pop(route_index)
+        else:
+            assert route_index is not None
+            routes[route_index] = dict(before)
+    return normalized_provider_cross_chat_routes(routes)
 
 
 def normalized_provider_cross_chat_route_audit(value: Any) -> list[dict[str, Any]]:
@@ -4347,6 +4570,411 @@ def provider_cross_chat_route_audit_entry(
         "target_session_id": str(route.get("target_session_id") or ""),
         "actions": list(route.get("actions") or []),
     }
+
+
+def durable_provider_cross_chat_route_actions(
+    source_session: dict[str, Any],
+) -> list[str]:
+    """Return the actions an explicit local @ grant may persist."""
+
+    actions = ["instruction"]
+    if cross_chat_target_backend_supported(
+        str(source_session.get("backend") or DEFAULT_BACKEND)
+    ):
+        actions.append("request_reply")
+    return actions
+
+
+def next_durable_provider_cross_chat_route_alias(
+    routes: list[dict[str, Any]],
+) -> str:
+    """Allocate a private stable alias without trusting display metadata."""
+
+    used = {str(route.get("alias") or "") for route in routes}
+    for index in range(1, PROVIDER_CROSS_CHAT_ROUTE_LIMIT + 1):
+        alias = f"chat{index}"
+        if alias not in used:
+            return alias
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "this chat already has the maximum number of durable "
+            "cross-chat grants"
+        ),
+    )
+
+
+def local_route_hint_target_ids(
+    references: list[ChatReference],
+) -> list[str]:
+    targets: list[str] = []
+    seen: set[str] = set()
+    for reference in references:
+        if (
+            reference.target_kind is not None
+            or reference.action != "route"
+            or reference.grant_intent is not True
+            or reference.session_id in seen
+        ):
+            continue
+        seen.add(reference.session_id)
+        targets.append(reference.session_id)
+    return targets
+
+
+async def persist_durable_provider_cross_chat_reference_grants(
+    source_session_id: str,
+    references: list[ChatReference],
+    *,
+    admission_id: str,
+    event_type: Literal["turn_started", "turn_queued"],
+) -> dict[str, Any] | None:
+    """Stage directional source->target grants selected by @.
+
+    The caller owns the source lifecycle lock. All selected targets are staged
+    with one crash journal and saved together, so a multi-reference admission
+    cannot leave a partial policy mutation. The journal keeps the staged route
+    ceiling hidden until the matching fsynced admission event exists. Existing
+    exact grants are reused; a narrower grant is refreshed with a new revision.
+    """
+
+    if not PROVIDER_CROSS_CHAT_GRANT_ADMISSION_ID_RE.fullmatch(admission_id):
+        raise ValueError("invalid route grant admission id")
+    if event_type not in {"turn_started", "turn_queued"}:
+        raise ValueError("invalid route grant admission event type")
+    target_session_ids = local_route_hint_target_ids(references)
+    if not target_session_ids:
+        return None
+    async with STORE._lock:
+        source = STORE.sessions.get(source_session_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        if source.get("archived"):
+            raise HTTPException(
+                status_code=409,
+                detail="archived chats cannot grant cross-chat routes",
+            )
+        if source.get(PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY) is not None:
+            raise HTTPException(
+                status_code=503,
+                detail="a prior cross-chat route grant is still reconciling",
+            )
+        routes = [dict(route) for route in provider_cross_chat_routes(source)]
+        desired_actions = durable_provider_cross_chat_route_actions(source)
+        changes: list[tuple[str, dict[str, Any]]] = []
+        rollback_changes: list[dict[str, Any]] = []
+        timestamp = now_iso()
+        for target_session_id in target_session_ids:
+            if target_session_id == source_session_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="a chat cannot grant a route to itself",
+                )
+            reject_unavailable_route_target(source_session_id, target_session_id)
+            existing_index = next(
+                (
+                    index
+                    for index, route in enumerate(routes)
+                    if route.get("target_session_id") == target_session_id
+                ),
+                None,
+            )
+            if existing_index is not None:
+                current = routes[existing_index]
+                if current.get("actions") == desired_actions:
+                    continue
+                refreshed = {
+                    **current,
+                    "revision": "rev_" + uuid.uuid4().hex,
+                    "actions": list(desired_actions),
+                    "updated_at": timestamp,
+                }
+                routes[existing_index] = refreshed
+                changes.append(("updated", refreshed))
+                rollback_changes.append({
+                    "after": dict(refreshed),
+                    "before": dict(current),
+                })
+                continue
+            if len(routes) >= PROVIDER_CROSS_CHAT_ROUTE_LIMIT:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "this chat already has the maximum number of durable "
+                        "cross-chat grants"
+                    ),
+                )
+            route = {
+                "route_id": "route_" + uuid.uuid4().hex,
+                "revision": "rev_" + uuid.uuid4().hex,
+                "alias": next_durable_provider_cross_chat_route_alias(routes),
+                "target_session_id": target_session_id,
+                "actions": list(desired_actions),
+                "created_at": timestamp,
+                "updated_at": timestamp,
+            }
+            routes.append(route)
+            changes.append(("created", route))
+            rollback_changes.append({
+                "after": dict(route),
+                "before": None,
+            })
+        if not changes:
+            return {
+                "committed": False,
+                "routes": routes,
+                "changes": [],
+            }
+        previous_routes = source.get("provider_cross_chat_routes")
+        previous_audit = source.get("provider_cross_chat_route_audit")
+        previous_updated_at = source.get("updated_at")
+        previous_pending = source.get(PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY)
+        updated_audit = normalized_provider_cross_chat_route_audit(previous_audit)
+        audit_entries = [
+            provider_cross_chat_route_audit_entry(
+                event,
+                route,
+                timestamp=timestamp,
+            )
+            for event, route in changes
+        ]
+        for rollback_change, audit_entry in zip(
+            rollback_changes,
+            audit_entries,
+            strict=True,
+        ):
+            rollback_change["audit_id"] = str(audit_entry["audit_id"])
+        combined_audit = updated_audit + audit_entries
+        displaced_audit_entries = combined_audit[
+            :max(
+                0,
+                len(combined_audit)
+                - PROVIDER_CROSS_CHAT_ROUTE_AUDIT_LIMIT,
+            )
+        ]
+        staged_audit = combined_audit[
+            -PROVIDER_CROSS_CHAT_ROUTE_AUDIT_LIMIT:
+        ]
+        source["provider_cross_chat_routes"] = [dict(route) for route in routes]
+        source["provider_cross_chat_route_audit"] = staged_audit
+        source["updated_at"] = timestamp
+        pending = {
+            "admission_id": admission_id,
+            "event_type": event_type,
+            "rollback_changes": rollback_changes,
+            "displaced_audit_entries": displaced_audit_entries,
+            "audit_count_after_stage": len(staged_audit),
+            "mutation_timestamp": timestamp,
+            "previous_updated_at": previous_updated_at,
+        }
+        source[PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY] = pending
+        try:
+            await STORE.save(durable=True)
+        except BaseException:
+            if previous_routes is None:
+                source.pop("provider_cross_chat_routes", None)
+            else:
+                source["provider_cross_chat_routes"] = previous_routes
+            if previous_audit is None:
+                source.pop("provider_cross_chat_route_audit", None)
+            else:
+                source["provider_cross_chat_route_audit"] = previous_audit
+            source["updated_at"] = previous_updated_at
+            if previous_pending is None:
+                source.pop(PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY, None)
+            else:
+                source[PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY] = previous_pending
+            raise
+        return {
+            "committed": True,
+            "admission_id": admission_id,
+            "event_type": event_type,
+            "routes": [dict(route) for route in routes],
+            "changes": [(event, dict(route)) for event, route in changes],
+            "rollback_changes": rollback_changes,
+            "displaced_audit_entries": displaced_audit_entries,
+            "audit_count_after_stage": len(staged_audit),
+            "mutation_timestamp": timestamp,
+            "previous_updated_at": previous_updated_at,
+        }
+
+
+async def rollback_durable_provider_cross_chat_reference_grants(
+    source_session_id: str,
+    mutation: dict[str, Any] | None,
+) -> None:
+    if not mutation or mutation.get("committed") is not True:
+        return
+    async with STORE._lock:
+        source = STORE.sessions.get(source_session_id)
+        if source is None:
+            return
+        pending = normalized_pending_provider_cross_chat_grant(
+            source.get(PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY)
+        )
+        if (
+            pending is None
+            or pending.get("admission_id") != mutation.get("admission_id")
+        ):
+            return
+        routes = [dict(route) for route in stored_provider_cross_chat_routes(source)]
+        changed = False
+        rollback_fully_applied = True
+        rolled_back_audit_ids: set[str] = set()
+        for rollback_change in mutation.get("rollback_changes") or []:
+            after = normalized_provider_cross_chat_routes([
+                rollback_change.get("after")
+            ])
+            if len(after) != 1:
+                rollback_fully_applied = False
+                continue
+            after_route = after[0]
+            route_index = next(
+                (
+                    index
+                    for index, route in enumerate(routes)
+                    if route.get("route_id") == after_route.get("route_id")
+                ),
+                None,
+            )
+            current = routes[route_index] if route_index is not None else None
+            if (
+                current is None
+                or current.get("revision") != after_route.get("revision")
+            ):
+                # A concurrent/current mutation owns this route now. Exact
+                # revision CAS deliberately leaves it untouched.
+                rollback_fully_applied = False
+                continue
+            before = rollback_change.get("before")
+            if before is None:
+                assert route_index is not None
+                routes.pop(route_index)
+            else:
+                normalized_before = normalized_provider_cross_chat_routes([
+                    before
+                ])
+                if len(normalized_before) != 1:
+                    rollback_fully_applied = False
+                    continue
+                assert route_index is not None
+                routes[route_index] = normalized_before[0]
+            changed = True
+            audit_id = str(rollback_change.get("audit_id") or "")
+            if audit_id:
+                rolled_back_audit_ids.add(audit_id)
+
+        current_audit = normalized_provider_cross_chat_route_audit(
+            source.get("provider_cross_chat_route_audit")
+        )
+        staged_audit_ids = [
+            str(change.get("audit_id") or "")
+            for change in pending["rollback_changes"]
+        ]
+        audit_unchanged_since_stage = (
+            len(current_audit) == pending["audit_count_after_stage"]
+            and [
+                str(entry.get("audit_id") or "")
+                for entry in current_audit[-len(staged_audit_ids):]
+            ] == staged_audit_ids
+        )
+        rolled_back_audit = [
+            entry
+            for entry in current_audit
+            if str(entry.get("audit_id") or "")
+            not in rolled_back_audit_ids
+        ]
+        if rollback_fully_applied and audit_unchanged_since_stage:
+            rolled_back_audit = [
+                *pending["displaced_audit_entries"],
+                *rolled_back_audit,
+            ]
+        audit_changed = rolled_back_audit != current_audit
+        source["provider_cross_chat_routes"] = routes
+        source["provider_cross_chat_route_audit"] = rolled_back_audit
+        source.pop(PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY, None)
+        if (
+            rollback_fully_applied
+            and source.get("updated_at") == mutation.get("mutation_timestamp")
+        ):
+            source["updated_at"] = mutation.get("previous_updated_at")
+        rollback_error: BaseException | None = None
+        for _attempt in range(3):
+            try:
+                await STORE.save(durable=True)
+                return
+            except BaseException as exc:
+                rollback_error = exc
+                await asyncio.sleep(0)
+        # Keep the in-memory ceiling rolled back even when durable storage is
+        # unavailable. Restoring the post-grant value here would immediately
+        # expose authority for a request whose message was never accepted.
+        # The caller remains failed and server health/storage recovery must
+        # succeed before a restart can safely proceed.
+        logger.critical(
+            "durable cross-chat admission rollback could not be persisted "
+            "source=%s",
+            source_session_id,
+        )
+        assert rollback_error is not None
+        raise rollback_error
+
+
+async def commit_durable_provider_cross_chat_reference_grants(
+    source_session_id: str,
+    mutation: dict[str, Any] | None,
+) -> None:
+    """Expose a staged grant after its exact admission event is durable."""
+
+    if not mutation or mutation.get("committed") is not True:
+        return
+    async with STORE._lock:
+        source = STORE.sessions.get(source_session_id)
+        if source is None:
+            return
+        pending = normalized_pending_provider_cross_chat_grant(
+            source.get(PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY)
+        )
+        if (
+            pending is None
+            or pending.get("admission_id") != mutation.get("admission_id")
+        ):
+            return
+        source.pop(PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY, None)
+        commit_error: BaseException | None = None
+        for _attempt in range(3):
+            try:
+                await STORE.save(durable=True)
+                return
+            except BaseException as exc:
+                commit_error = exc
+                await asyncio.sleep(0)
+        # The admission event is already fsynced. Keep the route exposed in
+        # memory; the persisted marker will be finalized from that exact event
+        # on restart, and any later successful session save also converges it.
+        logger.error(
+            "durable cross-chat grant commit marker could not be persisted "
+            "source=%s admission=%s error=%s",
+            source_session_id,
+            mutation.get("admission_id"),
+            concise_error_message(commit_error),
+        )
+
+
+async def append_durable_provider_cross_chat_grant_audits(
+    source_session_id: str,
+    mutation: dict[str, Any] | None,
+) -> None:
+    for event, route in list((mutation or {}).get("changes") or []):
+        await append_agent_handoff_route_audit(
+            source_session_id,
+            (
+                "agent_handoff_route_created"
+                if event == "created"
+                else "agent_handoff_route_updated"
+            ),
+            route,
+        )
 
 
 def clean_session_system_prompt(value: Any) -> str | None:
@@ -5000,9 +5628,159 @@ def reconcile_session_emergency_alerts(
     return alerts != before or reconciled_through != previous_through
 
 
+def provider_cross_chat_grant_admission_event_exists(
+    session_id: str,
+    pending: dict[str, Any],
+) -> bool:
+    """Return whether the journal's exact admission boundary was fsynced."""
+
+    admission_id = str(pending.get("admission_id") or "")
+    expected_type = str(pending.get("event_type") or "")
+    for event in reversed_jsonl_events(events_path(session_id)):
+        if (
+            str(event.get("provider_cross_chat_grant_admission_id") or "")
+            != admission_id
+        ):
+            continue
+        return str(event.get("type") or "") == expected_type
+    return False
+
+
+def reconcile_pending_provider_cross_chat_grant(
+    session_id: str,
+    sess: dict[str, Any],
+) -> bool:
+    """Resolve a route grant left across the sessions/event crash boundary."""
+
+    raw_pending = sess.get(PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY)
+    if raw_pending is None:
+        return False
+    pending = normalized_pending_provider_cross_chat_grant(raw_pending)
+    if pending is None:
+        # The server cannot safely infer which route revisions a malformed
+        # marker staged. Quarantine all route authority rather than exposing a
+        # potentially unaccepted grant.
+        sess["provider_cross_chat_routes"] = []
+        sess["provider_cross_chat_route_audit"] = []
+        sess.pop(PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY, None)
+        sess["_provider_cross_chat_route_quarantine"] = {
+            "reason": "invalid_pending_grant_admission",
+            "recorded_at": now_iso(),
+        }
+        logger.error(
+            "quarantined malformed pending cross-chat grant source=%s",
+            session_id,
+        )
+        return True
+    if provider_cross_chat_grant_admission_event_exists(session_id, pending):
+        # The fsynced event is the acceptance boundary. Preserve current route
+        # state exactly (including a later edit/revoke) and only clear the
+        # stale marker.
+        sess.pop(PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY, None)
+        logger.info(
+            "finalized pending cross-chat grant source=%s admission=%s",
+            session_id,
+            pending.get("admission_id"),
+        )
+        return True
+
+    routes = [dict(route) for route in stored_provider_cross_chat_routes(sess)]
+    audit = normalized_provider_cross_chat_route_audit(
+        sess.get("provider_cross_chat_route_audit")
+    )
+    staged_audit_ids = [
+        str(change.get("audit_id") or "")
+        for change in pending["rollback_changes"]
+    ]
+    audit_unchanged_since_stage = (
+        len(audit) == pending["audit_count_after_stage"]
+        and [
+            str(entry.get("audit_id") or "")
+            for entry in audit[-len(staged_audit_ids):]
+        ] == staged_audit_ids
+    )
+    rolled_back_audit_ids: set[str] = set()
+    rollback_fully_applied = True
+    for change in pending["rollback_changes"]:
+        after = change["after"]
+        route_index = next((
+            index
+            for index, route in enumerate(routes)
+            if route.get("route_id") == after.get("route_id")
+        ), None)
+        current = routes[route_index] if route_index is not None else None
+        if (
+            current is None
+            or current.get("revision") != after.get("revision")
+        ):
+            # Never recreate or overwrite a later revision/revocation.
+            rollback_fully_applied = False
+            continue
+        before = change.get("before")
+        if before is None:
+            assert route_index is not None
+            routes.pop(route_index)
+        else:
+            assert route_index is not None
+            routes[route_index] = dict(before)
+        rolled_back_audit_ids.add(str(change.get("audit_id") or ""))
+    sess["provider_cross_chat_routes"] = routes
+    rolled_back_audit = [
+        entry
+        for entry in audit
+        if str(entry.get("audit_id") or "") not in rolled_back_audit_ids
+    ]
+    if rollback_fully_applied and audit_unchanged_since_stage:
+        rolled_back_audit = [
+            *pending["displaced_audit_entries"],
+            *rolled_back_audit,
+        ]
+    sess["provider_cross_chat_route_audit"] = rolled_back_audit
+    if (
+        rollback_fully_applied
+        and sess.get("updated_at") == pending.get("mutation_timestamp")
+    ):
+        sess["updated_at"] = pending.get("previous_updated_at")
+    sess.pop(PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY, None)
+    logger.warning(
+        "rolled back unaccepted pending cross-chat grant source=%s admission=%s",
+        session_id,
+        pending.get("admission_id"),
+    )
+    return True
+
+
 def emergency_summary(sess: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
     alerts = active_emergency_alerts(sess)
     return (dict(alerts[-1]) if alerts else None, len(alerts))
+
+
+def write_sessions_json_durable(
+    path: Path,
+    sessions: dict[str, dict[str, Any]],
+) -> None:
+    """Atomically replace sessions.json and fsync both file and directory."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as stream:
+        stream.write(json.dumps(sessions, indent=2))
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(tmp, path)
+    # Windows does not support opening/fsyncing a directory handle this way;
+    # FlushFileBuffers on the temporary file plus atomic replace is its
+    # portable boundary. POSIX additionally persists the rename itself.
+    if os.name == "nt":
+        return
+    directory_flags = os.O_RDONLY
+    directory_flags |= getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    directory_fd = os.open(path.parent, directory_flags)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 class SessionStore:
@@ -5013,6 +5791,7 @@ class SessionStore:
     async def load(self) -> None:
         ensure_dirs()
         runtime_changed = False
+        durable_route_reconciliation = False
         DELETING_SESSIONS.clear()
         DELETED_SESSION_TOMBSTONES.clear()
         CODEX_THREAD_SESSION_INDEX.clear()
@@ -5117,6 +5896,9 @@ class SessionStore:
                 removed_abandoned_forks,
             )
         for session_id, sess in self.sessions.items():
+            if reconcile_pending_provider_cross_chat_grant(session_id, sess):
+                runtime_changed = True
+                durable_route_reconciliation = True
             if reconcile_session_emergency_alerts(session_id, sess):
                 runtime_changed = True
             backend = str(sess.get("backend") or DEFAULT_BACKEND).strip().lower()
@@ -5219,10 +6001,13 @@ class SessionStore:
         await self.ensure_sort_orders()
         rebuild_codex_subagent_indexes()
         if runtime_changed:
-            await self.save()
+            await self.save(durable=durable_route_reconciliation)
 
-    async def save(self) -> None:
+    async def save(self, *, durable: bool = False) -> None:
         ensure_dirs()
+        if durable:
+            write_sessions_json_durable(SESSIONS_FILE, self.sessions)
+            return
         tmp = SESSIONS_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.sessions, indent=2))
         tmp.replace(SESSIONS_FILE)
@@ -10245,6 +11030,11 @@ async def enqueue_turn(
     queued_id = f"queued_{uuid.uuid4().hex[:16]}"
     obligation_ids: list[str] = []
     exchange_ids: list[str] = []
+    route_grant_mutation: dict[str, Any] | None = None
+    route_grant_admission_id = (
+        "grant_admission_" + uuid.uuid4().hex
+    )
+    queue_event_committed = False
     item: dict[str, Any]
     display_prompt = req.display_prompt if req.display_prompt is not None else req.prompt
     secure_snapshots = (
@@ -10270,6 +11060,27 @@ async def enqueue_turn(
                 queued_id,
                 req.chat_references,
             )
+            if req.purpose is None:
+                route_grant_mutation = (
+                    await persist_durable_provider_cross_chat_reference_grants(
+                        session_id,
+                        req.chat_references,
+                        admission_id=route_grant_admission_id,
+                        event_type="turn_queued",
+                    )
+                )
+                provider_route_snapshot = (
+                    normalized_provider_cross_chat_route_snapshot(
+                        route_grant_mutation.get("routes") or []
+                    )
+                    if route_grant_mutation
+                    and route_grant_mutation.get("committed") is True
+                    else initial_provider_cross_chat_route_snapshot(
+                        session_id,
+                        req,
+                        "chat",
+                    )
+                )
         except BaseException:
             for envelope_id in obligation_ids:
                 with suppress(BaseException):
@@ -10288,6 +11099,10 @@ async def enqueue_turn(
                         error_code="source_failed",
                         error="source queue admission was interrupted",
                     )
+            await rollback_durable_provider_cross_chat_reference_grants(
+                session_id,
+                route_grant_mutation,
+            )
             raise
         item = {
             "queued_id": queued_id,
@@ -10361,6 +11176,12 @@ async def enqueue_turn(
                 "cross_chat_obligation_ids": obligation_ids,
                 "cross_chat_exchange_ids": exchange_ids,
                 "client_capabilities": list(req.client_capabilities),
+                "provider_cross_chat_grant_admission_id": (
+                    route_grant_admission_id
+                    if route_grant_mutation
+                    and route_grant_mutation.get("committed") is True
+                    else None
+                ),
                 "provider_cross_chat_route_snapshot": [
                     dict(route)
                     for route in normalized_provider_cross_chat_route_snapshot(
@@ -10368,6 +11189,11 @@ async def enqueue_turn(
                     )
                 ],
             })
+            queue_event_committed = True
+            await commit_durable_provider_cross_chat_reference_grants(
+                session_id,
+                route_grant_mutation,
+            )
             if req.purpose == "cross_chat_handoff_delivery":
                 bind_task = asyncio.create_task(
                     update_cross_chat_delivery_record(
@@ -10521,8 +11347,18 @@ async def enqueue_turn(
                     error_code="source_failed",
                     error="source turn could not be durably queued",
                 )
+            if not queue_event_committed:
+                await rollback_durable_provider_cross_chat_reference_grants(
+                    session_id,
+                    route_grant_mutation,
+                )
             raise
         item["_durable"] = True
+    if queue_event_committed:
+        await append_durable_provider_cross_chat_grant_audits(
+            session_id,
+            route_grant_mutation,
+        )
     async with ACTIVE_LOCK:
         still_busy = session_id in BUSY_SESSIONS
     if not still_busy:
@@ -11053,6 +11889,42 @@ def validate_chat_references(
             detail="cross-chat handoffs require authenticated AgentsServer mode",
         )
     prompt_units = utf16_length(prompt)
+    client_capability_set = {
+        str(value) for value in (client_capabilities or [])
+    }
+    for reference in references:
+        if reference.grant_intent is not True:
+            continue
+        if (
+            reference.target_kind is not None
+            or reference.action != "route"
+            or reference.route_action is not None
+            or utf16_slice(
+                prompt,
+                reference.source_text_start,
+                reference.source_text_end,
+            )
+            != f"@{reference.display_title_snapshot}"
+            or not chat_reference_has_token_boundaries(
+                prompt,
+                reference,
+                prompt_units,
+            )
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "durable route grant intent requires an exact canonical "
+                    "local @Chat reference"
+                ),
+            )
+        if AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY not in client_capability_set:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "durable cross-chat grants require an updated client"
+                ),
+            )
     references = collapse_legacy_dual_local_references(
         prompt,
         references,
@@ -11063,9 +11935,7 @@ def validate_chat_references(
         or reference.route_action == "request_reply"
         for reference in references
     ):
-        if CROSS_CHAT_HANDOFFS_V2_CLIENT_CAPABILITY not in {
-            str(value) for value in (client_capabilities or [])
-        }:
+        if CROSS_CHAT_HANDOFFS_V2_CLIENT_CAPABILITY not in client_capability_set:
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -11398,14 +12268,9 @@ def initial_provider_cross_chat_route_snapshot(
     session = STORE.sessions.get(session_id)
     if not AGENT_TOKEN or not session or session.get("archived"):
         return []
-    # Ambient same-server access is a server policy, not a per-message grant
-    # negotiated by the client. Every ordinary future user turn gets a fresh
-    # opaque snapshot while this default-on policy is enabled.
-    if AGENT_AMBIENT_LOCAL_HANDOFFS_ENABLED:
-        return ambient_provider_cross_chat_routes(session_id)
-    capabilities = set(req.client_capabilities)
-    if AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY not in capabilities:
-        return []
+    # Durable source->target grants are server policy state. Client capability
+    # v2 gates creation through an inline @ reference, not use of grants the
+    # user already persisted on this source chat.
     return [dict(route) for route in provider_cross_chat_routes(session)]
 
 
@@ -11577,6 +12442,56 @@ def live_provider_cross_chat_route(
     return {**current, "actions": allowed_actions}
 
 
+def pending_admission_provider_cross_chat_route(
+    source_session_id: str,
+    admission_id: str,
+    issued_route: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Resolve one staged route only for its exact in-flight admission."""
+
+    source = STORE.sessions.get(source_session_id)
+    if (
+        not source
+        or source.get("archived")
+        or source_session_id in DELETING_SESSIONS
+        or source_session_id in DELETED_SESSION_TOMBSTONES
+    ):
+        return None
+    pending = normalized_pending_provider_cross_chat_grant(
+        source.get(PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY)
+    )
+    if pending is None or pending.get("admission_id") != admission_id:
+        return None
+    route_id = str(issued_route.get("route_id") or "")
+    staged = next((
+        change["after"]
+        for change in pending["rollback_changes"]
+        if change["after"].get("route_id") == route_id
+    ), None)
+    if staged is None or any(
+        staged.get(key) != issued_route.get(key)
+        for key in ("revision", "alias", "target_session_id")
+    ):
+        return None
+    target_session_id = str(staged.get("target_session_id") or "")
+    available, _reason = provider_cross_chat_route_availability(
+        source_session_id,
+        target_session_id,
+    )
+    if not available:
+        return None
+    issued_actions = set(issued_route.get("actions") or [])
+    staged_actions = set(staged.get("actions") or [])
+    allowed_actions = [
+        action
+        for action in PROVIDER_CROSS_CHAT_ROUTE_ACTIONS
+        if action in issued_actions and action in staged_actions
+    ]
+    if not allowed_actions:
+        return None
+    return {**staged, "actions": allowed_actions}
+
+
 def provider_cross_chat_route_availability(
     source_session_id: str,
     target_session_id: str,
@@ -11629,9 +12544,9 @@ def sanitized_provider_route_label(
 def ambient_provider_cross_chat_routes(
     source_session_id: str,
 ) -> list[dict[str, Any]]:
-    """Create one opaque, complete same-server target snapshot for a turn."""
+    """Create the quarantined legacy ambient snapshot only when enabled."""
 
-    if not AGENT_TOKEN:
+    if not AGENT_AMBIENT_LOCAL_HANDOFFS_ENABLED or not AGENT_TOKEN:
         return []
     source = STORE.sessions.get(source_session_id)
     if (
@@ -11699,34 +12614,45 @@ def provider_cross_chat_route_snapshot_for_authority(
     references: list[ChatReference],
     *,
     source_session_id: str = "",
+    per_job_reference_routes: bool = False,
+    pending_grant_admission_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Project explicit local ``@`` hints as exact run-local routes.
+    """Project the durable live ceiling or exact unattended-job grants.
 
-    A hint never forwards the raw source prompt.  It highlights one target
-    already available through ordinary ambient access, while unattended job
-    turns receive only their persisted explicit targets.  Legacy
-    ``direct_message`` and ``@@`` records reach this boundary as optional
-    hints and are never converted back into delivery effects.
+    Ordinary admissions persist validated v2 ``@`` hints before reaching this
+    boundary and freeze only the source chat's durable directional grants.
+    Scheduled jobs intentionally start from an empty source ceiling and mint
+    only their own persisted exact references as run-local routes.
     """
 
     routes = normalized_provider_cross_chat_route_snapshot(value)
-    explicit_targets = {
-        reference.session_id
-        for reference in references
-        if reference.target_kind is None
-        and reference.action in {"direct_message", "route"}
-    }
-    if explicit_targets:
-        routes = [
-            route
-            for route in routes
-            if not (
-                route.get("route_kind")
-                == PROVIDER_CROSS_CHAT_ROUTE_KIND_AMBIENT
-                and route.get("target_session_id") in explicit_targets
+    if not per_job_reference_routes:
+        configured_routes: list[dict[str, Any]] = []
+        for issued_route in routes:
+            # Recovered beta ambient/prompt-reference snapshots are an
+            # explicitly quarantined legacy ceiling. They can never cross the
+            # v7 default-deny authority boundary or mint a durable grant.
+            if issued_route.get("route_kind") is not None:
+                continue
+            live_route = live_provider_cross_chat_route(
+                source_session_id,
+                issued_route,
             )
-        ]
+            if live_route is None and pending_grant_admission_id:
+                # Only the request that owns this exact crash journal may use
+                # its staged post-grant ceiling before the admission event is
+                # fsynced. Every other reader sees provider_cross_chat_routes'
+                # fail-closed pre-grant projection.
+                live_route = pending_admission_provider_cross_chat_route(
+                    source_session_id,
+                    pending_grant_admission_id,
+                    issued_route,
+                )
+            if live_route is not None:
+                configured_routes.append(live_route)
+        return normalized_provider_cross_chat_route_snapshot(configured_routes)
 
+    routes = []
     source = STORE.sessions.get(source_session_id) or {}
     route_actions = ["instruction"]
     if cross_chat_target_backend_supported(
@@ -12413,12 +13339,34 @@ def cross_chat_provider_authority_block(
         if route.get("route_kind")
         == PROVIDER_CROSS_CHAT_ROUTE_KIND_REFERENCE
     ]
+    durable_routes = [
+        route for route in normalized_routes if route.get("route_kind") is None
+    ]
+    hinted_target_ids = {
+        reference.session_id
+        for reference in references
+        if (
+            reference.target_kind is None
+            and reference.action in {"direct_message", "route"}
+        )
+    }
+    hinted_routes = [
+        route
+        for route in normalized_routes
+        if route.get("target_session_id") in hinted_target_ids
+    ]
     reference_route_lines = [
         (
             f"- @ route hint {index}: route={route['route_id']}; "
-            f"actions={','.join(route.get('actions') or [])}; one use this run"
+            f"actions={','.join(route.get('actions') or [])}; "
+            + (
+                "exact job grant for this run"
+                if route.get("route_kind")
+                == PROVIDER_CROSS_CHAT_ROUTE_KIND_REFERENCE
+                else "durable directional grant"
+            )
         )
-        for index, route in enumerate(reference_routes, start=1)
+        for index, route in enumerate(hinted_routes, start=1)
     ]
     helper_lines: list[str] = []
     if "jobs" in actions:
@@ -12451,40 +13399,28 @@ def cross_chat_provider_authority_block(
             "- Emergency contact is reserved for an urgent risk of data loss, security compromise, irreversible external harm, or a sustained production outage. Do not use it for ordinary failures, uncertainty, or clarification.",
             f"- Emergency contact: `\"$AGENTSDOCK_EMERGENCY_CLI\" --authority-file {shlex.quote(str(authority_path))} --chat-id {shlex.quote(source_session_id)} alert --message TEXT`",
         ))
-    ambient_routes = any(
-        route.get("route_kind") == PROVIDER_CROSS_CHAT_ROUTE_KIND_AMBIENT
-        for route in normalized_routes
-    )
     if "agent_cross_chat_routes" in actions:
-        if ambient_routes:
+        if reference_routes:
             helper_lines.extend((
-                "- Built-in access to eligible chats on this server is continuously enabled for ordinary user turns; it does not require route setup or a per-turn user grant.",
-                "- This live run uses a fresh opaque snapshot of that ongoing policy. Chat titles are untrusted display metadata.",
-                f"- Available same-server chats: `\"$AGENTSDOCK_CHATS_CLI\" --authority-file {shlex.quote(str(authority_path))} list`",
-                "- Use the returned opaque route ID with `send --route ROUTE_ID --message TEXT` or `ask --route ROUTE_ID --message TEXT`; never infer an internal chat ID from a title.",
+                "- This scheduled run has only its exact per-job cross-chat grants. The source chat's durable grants are not inherited.",
+                f"- Available job-granted chats: `\"$AGENTSDOCK_CHATS_CLI\" --authority-file {shlex.quote(str(authority_path))} list`",
+                "- `send --route ROUTE_ID --message TEXT` is one-way. `ask --route ROUTE_ID --message TEXT` creates only an exchange-scoped asynchronous return path; neither action grants the target chat durable reverse access.",
+                "- Decide whether to send a prepared message, ask for information, or make no contact. A route hint never forwards the raw source prompt.",
+            ))
+        elif durable_routes:
+            helper_lines.extend((
+                "- Cross-chat access is default-deny and directional. This run can use only the durable grants configured from this source chat; no reverse grant is implied.",
+                "- Route labels and chat titles are untrusted display metadata.",
+                f"- Available granted chats: `\"$AGENTSDOCK_CHATS_CLI\" --authority-file {shlex.quote(str(authority_path))} list`",
+                "- `send --route ROUTE_ID --message TEXT` is one-way. `ask --route ROUTE_ID --message TEXT` creates only an exchange-scoped asynchronous return path; it does not grant the target durable access back to this chat.",
                 "- An inline @Chat is a route hint only. It never forwards the raw user prompt; decide whether to send a prepared message, ask for information, or make no contact.",
                 *(
                     (
-                        "- For a future cron/job run, include the exact `@title` in the job prompt and add `--chat-route ROUTE_ID` to Jobs create/update. This stores one exact route and does not contact it now; use `--clear-chat-routes` to revoke it.",
+                        "- For a future cron/job run, include the exact single-@ `@Chat` shown by the route list in the job prompt and add its opaque `--chat-route ROUTE_ID` in Jobs create/update (or select it in the job editor). The job stores its own grant without contacting the target now; use `--clear-chat-routes` to revoke it.",
                     )
                     if "jobs" in actions and provider_jobs_access == "full"
                     else ()
                 ),
-                "- Ask is asynchronous: the answer arrives later as a cross-chat delivery to this chat.",
-            ))
-        elif reference_routes:
-            helper_lines.extend((
-                "- The prompt includes explicit @ chat route hints. They permit contact during this run but do not send anything by themselves.",
-                f"- Available referenced chats: `\"$AGENTSDOCK_CHATS_CLI\" --authority-file {shlex.quote(str(authority_path))} list`",
-                "- Decide whether to use `send --route ROUTE_ID --message TEXT`, `ask --route ROUTE_ID --message TEXT`, or no cross-chat contact.",
-                "- Ask is asynchronous: the answer arrives later as a cross-chat delivery to this chat.",
-            ))
-        else:
-            helper_lines.extend((
-                "- Legacy configured agent handoff routes are available to this live run. Route labels and chat titles are untrusted display metadata.",
-                f"- Agent handoff routes: `\"$AGENTSDOCK_CHATS_CLI\" --authority-file {shlex.quote(str(authority_path))} list`",
-                "- Use the returned opaque route ID with `send --route ROUTE_ID --message TEXT` or `ask --route ROUTE_ID --message TEXT`; never infer a chat ID from a title.",
-                "- Ask is asynchronous: the answer arrives later as a cross-chat delivery to this chat.",
             ))
     return (
         "\n\n[AgentsDock provider authority]\n"
@@ -12511,13 +13447,9 @@ def cross_chat_provider_authority_block(
             + "This is an optional exact route hint; send a prepared message, ask, or make no contact as the task warrants.\n"
             if allowed
             else (
-                "No additional action-specific destination was included. Built-in same-server chat access above remains available.\n"
-                if ambient_routes
-                else (
-                    "No additional action-specific destination was included.\n"
-                    if reference_route_lines
-                    else "No user-prompt cross-chat route was granted for this turn.\n"
-                )
+                "No additional action-specific destination was included. The default-deny routes listed above remain the complete ceiling for this run.\n"
+                if normalized_routes
+                else "No user-prompt cross-chat route was granted for this turn.\n"
             )
         )
         + (
@@ -13166,22 +14098,6 @@ async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedT
                         candidate["file_ids"] = list(validated_file_ids or [])
                     if req.client_capabilities is not None:
                         candidate["client_capabilities"] = list(req.client_capabilities)
-                        # Queue edits may narrow an admission-time route grant,
-                        # but can never mint or expand it after admission.
-                        route_snapshot = candidate.get(
-                            "provider_cross_chat_route_snapshot"
-                        )
-                        # Ambient access is intrinsic and is not revoked by a
-                        # client capability-list edit. Legacy configured-route
-                        # snapshots still require the old negotiated token.
-                        if (
-                            not provider_cross_chat_snapshot_is_ambient(
-                                route_snapshot
-                            )
-                            and AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY
-                            not in set(req.client_capabilities)
-                        ):
-                            candidate["provider_cross_chat_route_snapshot"] = []
                     references_changed = req.chat_references is not None or req.prompt is not None
                     if references_changed:
                         new_references = list(req.chat_references or [])
@@ -13190,6 +14106,89 @@ async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedT
                             str(candidate.get("prompt") or ""),
                             new_references,
                             list(candidate.get("client_capabilities") or []),
+                        )
+                        if any(
+                            reference.target_kind is None
+                            and reference.action in {"direct_message", "route"}
+                            and reference.grant_intent is not True
+                            for reference in new_references
+                        ):
+                            raise HTTPException(
+                                status_code=409,
+                                detail=(
+                                    "queued cross-chat route edits require an "
+                                    "updated client and a current durable grant"
+                                ),
+                            )
+                        current_source = STORE.sessions.get(session_id) or {}
+                        current_routes = provider_cross_chat_routes(
+                            current_source
+                        )
+                        selected_routes: list[dict[str, Any]] = []
+                        for target_session_id in local_route_hint_target_ids(
+                            new_references
+                        ):
+                            current_route = next(
+                                (
+                                    route
+                                    for route in current_routes
+                                    if route.get("target_session_id")
+                                    == target_session_id
+                                ),
+                                None,
+                            )
+                            if (
+                                current_route is None
+                                or live_provider_cross_chat_route(
+                                    session_id,
+                                    current_route,
+                                )
+                                is None
+                            ):
+                                raise HTTPException(
+                                    status_code=409,
+                                    detail=(
+                                        "queued @Chat target does not have a "
+                                        "current durable grant"
+                                    ),
+                                )
+                            selected_routes.append(dict(current_route))
+
+                        # Editing a queued message never mints a grant. Keep
+                        # only still-current durable routes from its admission
+                        # ceiling, then permit newly referenced targets only
+                        # when their durable source grant already exists.
+                        edited_route_snapshot: list[dict[str, Any]] = []
+                        seen_route_ids: set[str] = set()
+                        for issued_route in original.get(
+                            "provider_cross_chat_route_snapshot", []
+                        ):
+                            if issued_route.get("route_kind") in {
+                                PROVIDER_CROSS_CHAT_ROUTE_KIND_AMBIENT,
+                                PROVIDER_CROSS_CHAT_ROUTE_KIND_REFERENCE,
+                            }:
+                                continue
+                            live_route = live_provider_cross_chat_route(
+                                session_id,
+                                issued_route,
+                            )
+                            if live_route is None:
+                                continue
+                            route_id = str(live_route.get("route_id") or "")
+                            if route_id in seen_route_ids:
+                                continue
+                            seen_route_ids.add(route_id)
+                            edited_route_snapshot.append(live_route)
+                        for current_route in selected_routes:
+                            route_id = str(current_route.get("route_id") or "")
+                            if route_id in seen_route_ids:
+                                continue
+                            seen_route_ids.add(route_id)
+                            edited_route_snapshot.append(current_route)
+                        candidate["provider_cross_chat_route_snapshot"] = (
+                            normalized_provider_cross_chat_route_snapshot(
+                                edited_route_snapshot
+                            )
                         )
                         replaced_obligation_ids = list(original.get("cross_chat_obligation_ids") or [])
                         replaced_exchange_ids = list(original.get("cross_chat_exchange_ids") or [])
@@ -24646,7 +25645,7 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
         "required": False,
         "message": message,
         "action": action,
-        "version": 6,
+        "version": 7,
         "actions": [
             "route",
             "request_reply",
@@ -24655,8 +25654,9 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
         ],
         # One @ is a structured target hint. It never forwards the source
         # prompt; the source agent chooses a prepared Send, asynchronous Ask,
-        # or no contact. Legacy direct_message/@@ records remain readable and
-        # normalize to this route-hint contract.
+        # or no contact. Legacy direct_message/@@ records remain readable only
+        # for migration/recovery and are quarantined from ordinary authority;
+        # they can never mint a durable route grant.
         "default_action": "route",
         "default_exchange_legs": CROSS_CHAT_EXCHANGE_DEFAULT_LEGS,
         "max_exchange_legs": CROSS_CHAT_EXCHANGE_MAX_LEGS,
@@ -24666,17 +25666,14 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
             "direct_message_mentions": False,
             "route_mentions": True,
             "route_hint_mentions": True,
-            "agent_cross_chat_routes": (
-                not AGENT_AMBIENT_LOCAL_HANDOFFS_ENABLED
-            ),
-            "agent_ambient_local_handoffs": (
-                AGENT_AMBIENT_LOCAL_HANDOFFS_ENABLED
-            ),
+            "durable_route_grants": True,
+            "agent_cross_chat_routes": True,
+            "agent_ambient_local_handoffs": False,
         },
         "ambient_local_handoffs": {
-            "enabled": AGENT_AMBIENT_LOCAL_HANDOFFS_ENABLED,
-            "policy": "automatic",
-            "scope": "all_same_server_chats",
+            "enabled": False,
+            "policy": "default_deny",
+            "scope": "explicit_source_grants",
             "setup_required": False,
             "max_handoffs_per_run": PROVIDER_CROSS_CHAT_ROUTE_HANDOFF_LIMIT,
             "actions": list(PROVIDER_CROSS_CHAT_ROUTE_ACTIONS),
@@ -24696,7 +25693,11 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
             "transcript_access": False,
         },
         "agent_routes": {
+            "policy": "default_deny",
             "client_capability": AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY,
+            "durable": True,
+            "directional": True,
+            "revoke_requires_revision": True,
             "max_routes_per_chat": PROVIDER_CROSS_CHAT_ROUTE_LIMIT,
             "max_handoffs_per_run": PROVIDER_CROSS_CHAT_ROUTE_HANDOFF_LIMIT,
             "actions": list(PROVIDER_CROSS_CHAT_ROUTE_ACTIONS),
@@ -27662,15 +28663,12 @@ async def reserve_provider_job_route_conversions(
                 (capability.get("provider_route_grants") or {}).get(route_id)
                 or {}
             )
-            if (
-                issued.get("route_kind")
-                != PROVIDER_CROSS_CHAT_ROUTE_KIND_AMBIENT
-            ):
+            if issued.get("route_kind") is not None:
                 raise HTTPException(
                     status_code=403,
                     detail=(
-                        "only a fresh built-in same-server chat route can be "
-                        "saved for scheduled runs"
+                        "only a current durable source-chat grant can be "
+                        "saved as an independent scheduled-job grant"
                     ),
                 )
             live = live_provider_cross_chat_route(source_session_id, issued)
@@ -43593,6 +44591,7 @@ async def _start_turn_locked(
     )
     secure_route_snapshots: list[dict[str, Any]] = []
     secure_delivery_record: dict[str, Any] | None = None
+    scheduled_references_authorized = False
     if req.purpose == "secure_peer_handoff_delivery":
         if (
             not req.secure_peer_envelope_id
@@ -43760,6 +44759,23 @@ async def _start_turn_locked(
                 req.chat_references,
                 req.client_capabilities,
             )
+            if (
+                provider_context_mode == "chat"
+                and accepted_provider_route_snapshot is None
+                and any(
+                    reference.target_kind is None
+                    and reference.action in {"direct_message", "route"}
+                    and reference.grant_intent is not True
+                    for reference in req.chat_references
+                )
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "legacy cross-chat route hints require an updated "
+                        "client before a new turn can be admitted"
+                    ),
+                )
         secure_route_snapshots = secure_peer_route_snapshots_for_references(
             session_id,
             req.chat_references,
@@ -43913,6 +44929,15 @@ async def _start_turn_locked(
     started_payload: dict[str, Any] | None = None
     provider_task_committed = False
     delivery_admitted = False
+    route_grant_mutation: dict[str, Any] | None = None
+    route_grant_admission_id = "grant_admission_" + uuid.uuid4().hex
+    route_grant_event_committed = False
+    grant_bearing_admission = bool(
+        req.purpose is None
+        and provider_context_mode == "chat"
+        and accepted_provider_route_snapshot is None
+        and local_route_hint_target_ids(req.chat_references)
+    )
     try:
         fields_set = request_fields_set(req)
         runtime_patch: dict[str, Any] = {}
@@ -43945,6 +44970,34 @@ async def _start_turn_locked(
         await ensure_runtime_available(backend)
         if provider_context_mode == "chat":
             sess = await STORE.mark_backend_started(session_id, str(backend))
+
+        if grant_bearing_admission:
+            route_grant_mutation = (
+                await persist_durable_provider_cross_chat_reference_grants(
+                    session_id,
+                    req.chat_references,
+                    admission_id=route_grant_admission_id,
+                    event_type="turn_started",
+                )
+            )
+            provider_route_snapshot = (
+                normalized_provider_cross_chat_route_snapshot(
+                    route_grant_mutation.get("routes") or []
+                )
+                if route_grant_mutation
+                and route_grant_mutation.get("committed") is True
+                else initial_provider_cross_chat_route_snapshot(
+                    session_id,
+                    req,
+                    provider_context_mode,
+                )
+            )
+            async with ACTIVE_LOCK:
+                current_turn = CURRENT_TURNS.get(session_id)
+                if current_turn is not None:
+                    current_turn["provider_cross_chat_route_snapshot"] = [
+                        dict(route) for route in provider_route_snapshot
+                    ]
 
         run_id = f"run_{uuid.uuid4().hex[:16]}"
         async with ACTIVE_LOCK:
@@ -43985,6 +45038,13 @@ async def _start_turn_locked(
                 provider_route_snapshot,
                 req.chat_references,
                 source_session_id=session_id,
+                per_job_reference_routes=scheduled_references_authorized,
+                pending_grant_admission_id=(
+                    route_grant_admission_id
+                    if route_grant_mutation
+                    and route_grant_mutation.get("committed") is True
+                    else None
+                ),
             )
         )
         exchange_response_grant: tuple[str, str] | None = None
@@ -44118,6 +45178,12 @@ async def _start_turn_locked(
             "prompt": display_prompt,
             "file_ids": display_file_ids if display_file_ids is not None else req.file_ids,
             "chat_references": chat_reference_dicts(req.chat_references),
+            "provider_cross_chat_grant_admission_id": (
+                route_grant_admission_id
+                if route_grant_mutation
+                and route_grant_mutation.get("committed") is True
+                else None
+            ),
         }
         if req.cross_chat_envelope_id:
             started_payload["cross_chat_envelope_id"] = req.cross_chat_envelope_id
@@ -44185,8 +45251,21 @@ async def _start_turn_locked(
         # still use the same recovery boundary, but new @ hints create none.
         started_event = await (
             append_durable_event(session_id, "turn_started", started_payload)
-            if turn_direct_message_ids or req.purpose == "scheduled_job"
+            if (
+                grant_bearing_admission
+                or turn_direct_message_ids
+                or req.purpose == "scheduled_job"
+            )
             else append_event(session_id, "turn_started", started_payload)
+        )
+        route_grant_event_committed = True
+        await commit_durable_provider_cross_chat_reference_grants(
+            session_id,
+            route_grant_mutation,
+        )
+        await append_durable_provider_cross_chat_grant_audits(
+            session_id,
+            route_grant_mutation,
         )
         await admit_direct_message_handoffs(
             session_id,
@@ -44336,7 +45415,16 @@ async def _start_turn_locked(
         else:
             await STORE.update(session_id, {})
         return {"run_id": run_id, "queued": False, "session": public_session(STORE.sessions[session_id]), "event": started_event}
-    except BaseException:
+    except BaseException as start_error:
+        route_grant_rollback_error: BaseException | None = None
+        if not route_grant_event_committed:
+            try:
+                await rollback_durable_provider_cross_chat_reference_grants(
+                    session_id,
+                    route_grant_mutation,
+                )
+            except BaseException as rollback_error:
+                route_grant_rollback_error = rollback_error
         if started_event is not None and not provider_task_committed and started_payload is not None:
             with suppress(BaseException):
                 await append_event(session_id, "turn_stopped", {
@@ -44446,6 +45534,8 @@ async def _start_turn_locked(
                     )
         if reserved:
             await release_turn_slot(session_id)
+        if route_grant_rollback_error is not None:
+            raise route_grant_rollback_error from start_error
         raise
 
 
@@ -51895,7 +52985,7 @@ async def create_agent_handoff_route(
                 ),
             ][-PROVIDER_CROSS_CHAT_ROUTE_AUDIT_LIMIT:]
             try:
-                await STORE.save()
+                await STORE.save(durable=True)
             except BaseException:
                 if previous_routes is None:
                     source.pop("provider_cross_chat_routes", None)
@@ -52003,7 +53093,7 @@ async def update_agent_handoff_route(
             ][-PROVIDER_CROSS_CHAT_ROUTE_AUDIT_LIMIT:]
             source["updated_at"] = timestamp
             try:
-                await STORE.save()
+                await STORE.save(durable=True)
             except BaseException:
                 source["provider_cross_chat_routes"] = previous_routes
                 if previous_audit is None:
@@ -52028,9 +53118,12 @@ async def update_agent_handoff_route(
 async def delete_agent_handoff_route(
     source_session_id: str,
     route_id: str,
+    expected_revision: str,
 ) -> dict[str, Any]:
+    if not PROVIDER_CROSS_CHAT_ROUTE_REVISION_RE.fullmatch(expected_revision):
+        raise HTTPException(status_code=400, detail="expected_revision is invalid")
     if not PROVIDER_CROSS_CHAT_ROUTE_ID_RE.fullmatch(route_id):
-        return {"ok": True, "deleted": False, "route_id": route_id}
+        raise HTTPException(status_code=400, detail="route_id is invalid")
     deleted_route: dict[str, Any] | None = None
     async with session_lifecycle_lock(source_session_id):
         ensure_session_not_deleting(source_session_id)
@@ -52042,6 +53135,25 @@ async def delete_agent_handoff_route(
             deleted_route = next((
                 route for route in routes if route.get("route_id") == route_id
             ), None)
+            if (
+                deleted_route is None
+                or deleted_route.get("revision") != expected_revision
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "route_revision_conflict",
+                        "message": "route revision conflict",
+                        "current_route": (
+                            admin_provider_cross_chat_route(
+                                source_session_id,
+                                deleted_route,
+                            )
+                            if deleted_route is not None
+                            else None
+                        ),
+                    },
+                )
             if deleted_route is not None:
                 timestamp = now_iso()
                 previous_routes = source.get("provider_cross_chat_routes")
@@ -52060,7 +53172,7 @@ async def delete_agent_handoff_route(
                     ),
                 ][-PROVIDER_CROSS_CHAT_ROUTE_AUDIT_LIMIT:]
                 try:
-                    await STORE.save()
+                    await STORE.save(durable=True)
                 except BaseException:
                     source["provider_cross_chat_routes"] = previous_routes
                     if previous_audit is None:

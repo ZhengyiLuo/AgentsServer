@@ -142,7 +142,7 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(raised.exception.status_code, 403)
 
-    async def test_exact_native_transition_allows_candidate_jobs_and_read_only_ambient_access(
+    async def test_exact_native_transition_allows_candidate_jobs_and_quarantines_ambient_access(
         self,
     ) -> None:
         predecessor_reference = agent_server.ChatReference(
@@ -235,19 +235,16 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 ),
             )
         self.assertEqual(cross_chat_denied.exception.status_code, 403)
-        ambient_access = await agent_server.authorize_provider_action(
-            self.provider_request(candidate_token),
+        await self.assert_denied(
+            candidate_token,
             action="agent_cross_chat_routes",
-            session_id="source",
         )
-        self.assertEqual(ambient_access["source_run_id"], "run_new")
-        self.assertEqual(
+        with self.assertRaises(HTTPException) as route_source_denied:
             await agent_server.provider_route_capability_source(
                 self.provider_request(candidate_token)
-            ),
-            "source",
-        )
-        with self.assertRaises(HTTPException) as promotion_pending:
+            )
+        self.assertEqual(route_source_denied.exception.status_code, 403)
+        with self.assertRaises(HTTPException) as ambient_denied:
             await agent_server.reserve_provider_route_handoff(
                 self.provider_request(candidate_token),
                 source_session_id="source",
@@ -256,15 +253,11 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 body="must wait for durable promotion",
                 idempotency_key="pending-promotion",
             )
-        self.assertEqual(promotion_pending.exception.status_code, 409)
-        self.assertEqual(
-            promotion_pending.exception.detail,
-            "agent chat access is waiting for turn promotion",
-        )
+        self.assertEqual(ambient_denied.exception.status_code, 403)
         # Codex updates ACTIVE and CURRENT within one lock, but authorization can
         # still observe either projection in a deterministic test. The old
-        # authority stays suspended while exact candidate Jobs and read-only
-        # ambient discovery remain usable. Publish and target effects never open
+        # authority stays suspended while exact candidate Jobs remain usable.
+        # Recovered ambient snapshots stay quarantined, and Publish never opens
         # before the durable release boundary.
         agent_server.ACTIVE["source"]["run_id"] = "run_new"
         await self.assert_denied(predecessor_token, action="jobs")
@@ -293,11 +286,12 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
 
         candidate_record = self.record_for_token(candidate_token)
-        self.assertTrue(
+        self.assertFalse(
             agent_server.provider_capability_has_ambient_native_routes(
                 candidate_record
             )
         )
+        self.assertEqual(candidate_record["provider_route_grants"], {})
         self.assertFalse(
             agent_server.provider_capability_has_ambient_native_routes({
                 "actions": {"agent_cross_chat_routes"},
@@ -367,10 +361,9 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
             operation="write",
         )
         await self.assert_denied(candidate_token, action="publish")
-        await agent_server.authorize_provider_action(
-            self.provider_request(candidate_token),
+        await self.assert_denied(
+            candidate_token,
             action="agent_cross_chat_routes",
-            session_id="source",
         )
         await self.assert_denied(predecessor_token, action="jobs")
 

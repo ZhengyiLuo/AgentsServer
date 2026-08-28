@@ -28,6 +28,7 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             "queued_turns": agent_server.QUEUED_TURNS,
             "run_now_turns": agent_server.RUN_NOW_TURNS,
             "active": agent_server.ACTIVE,
+            "busy": set(agent_server.BUSY_SESSIONS),
             "agent_token": agent_server.AGENT_TOKEN,
             "lifecycle_locks": agent_server.SESSION_LIFECYCLE_LOCKS,
             "event_cache": agent_server.CROSS_CHAT_EVENT_TYPE_CACHE,
@@ -60,6 +61,7 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         agent_server.QUEUED_TURNS = {}
         agent_server.RUN_NOW_TURNS = {}
         agent_server.ACTIVE = {}
+        agent_server.BUSY_SESSIONS.clear()
         agent_server.SESSION_LIFECYCLE_LOCKS = {}
         agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = OrderedDict()
         agent_server.DELETING_SESSIONS.clear()
@@ -75,6 +77,8 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         agent_server.QUEUED_TURNS = self.original["queued_turns"]
         agent_server.RUN_NOW_TURNS = self.original["run_now_turns"]
         agent_server.ACTIVE = self.original["active"]
+        agent_server.BUSY_SESSIONS.clear()
+        agent_server.BUSY_SESSIONS.update(self.original["busy"])
         agent_server.AGENT_TOKEN = self.original["agent_token"]
         agent_server.SESSION_LIFECYCLE_LOCKS = self.original["lifecycle_locks"]
         agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = self.original["event_cache"]
@@ -127,6 +131,37 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             "created_at": "2026-08-18T00:00:00Z",
             "updated_at": "2026-08-18T00:00:00Z",
         }
+
+    def grant_reference(
+        self,
+        *,
+        target: str = "target",
+        title: str = "Target",
+        start: int = 0,
+    ) -> agent_server.ChatReference:
+        return agent_server.ChatReference(
+            session_id=target,
+            display_title_snapshot=title,
+            source_text_start=start,
+            source_text_end=start + len(f"@{title}"),
+            action="route",
+            grant_intent=True,
+        )
+
+    def audit_entries(self, count: int = 64) -> list[dict]:
+        return [
+            {
+                "audit_id": "audit_" + f"{index:032x}",
+                "event": "updated",
+                "timestamp": "2026-08-18T00:00:00Z",
+                "route_id": "route_" + "c" * 32,
+                "revision": "rev_" + f"{index:032x}",
+                "alias": "history",
+                "target_session_id": "target",
+                "actions": ["instruction"],
+            }
+            for index in range(count)
+        ]
 
     def provider_request(self, token: str, *, method: str = "GET") -> Request:
         return Request({
@@ -196,7 +231,7 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             agent_server.provider_cross_chat_route_body_exceeds_limit("\ud800")
         )
 
-    def test_ambient_snapshot_is_intrinsic_complete_opaque_and_filters_explicit_targets_at_issue(
+    def test_default_deny_snapshot_contains_only_persisted_source_grants(
         self,
     ) -> None:
         for index in range(20):
@@ -204,91 +239,45 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             agent_server.STORE.sessions[target_id] = {
                 "id": target_id,
                 "title": f"Bulk target {index:02d}",
-                "folder": f"/private/{index}",
                 "backend": "codex",
             }
-        agent_server.STORE.sessions.update({
-            "archived": {
-                "id": "archived", "title": "Archived", "backend": "codex",
-                "archived": True,
-            },
-            "forking": {
-                "id": "forking", "title": "Forking", "backend": "codex",
-                "_fork_initializing": True,
-            },
-            "bad_backend": {
-                "id": "bad_backend", "title": "Bad", "backend": "unknown",
-            },
-            "tombstoned": {
-                "id": "tombstoned", "title": "Tombstoned", "backend": "codex",
-            },
-        })
-        agent_server.DELETING_SESSIONS.add("forking")
-        agent_server.DELETED_SESSION_TOMBSTONES.add("tombstoned")
-        explicit = agent_server.ChatReference(
-            session_id="target",
-            display_title_snapshot="Target",
-            source_text_start=0,
-            source_text_end=6,
-            action="route",
-        )
-        request = agent_server.TurnRequest(
-            prompt="Target",
-            chat_references=[explicit],
-        )
+        route = self.route("a")
+        agent_server.STORE.sessions["source"]["provider_cross_chat_routes"] = [
+            route
+        ]
         with self.native_transports():
             snapshot = agent_server.initial_provider_cross_chat_route_snapshot(
-                "source", request, "chat"
+                "source", agent_server.TurnRequest(prompt="hello"), "chat"
             )
-            second = agent_server.initial_provider_cross_chat_route_snapshot(
-                "source", request, "chat"
+            authority_snapshot = (
+                agent_server.provider_cross_chat_route_snapshot_for_authority(
+                    snapshot,
+                    [],
+                    source_session_id="source",
+                )
             )
-        self.assertEqual(len(snapshot), 21)
+        self.assertEqual(snapshot, [route])
+        self.assertEqual(authority_snapshot, [route])
+        self.assertNotIn("route_kind", snapshot[0])
         self.assertEqual(
-            {route["target_session_id"] for route in snapshot},
-            {"target", *(f"bulk_target_{index}" for index in range(20))},
-        )
-        self.assertEqual(
-            len(agent_server.normalized_provider_cross_chat_route_snapshot(snapshot)),
-            21,
-        )
-        self.assertEqual(len({route["route_id"] for route in snapshot}), 21)
-        self.assertEqual(len({route["alias"] for route in snapshot}), 21)
-        self.assertNotEqual(
-            {route["route_id"] for route in snapshot},
-            {route["route_id"] for route in second},
-        )
-        self.assertTrue(all(
-            route["route_kind"]
-            == agent_server.PROVIDER_CROSS_CHAT_ROUTE_KIND_AMBIENT
-            and route["actions"] == ["instruction", "request_reply"]
-            and "created_at" not in route
-            and "updated_at" not in route
-            for route in snapshot
-        ))
-        authority_snapshot = (
-            agent_server.provider_cross_chat_route_snapshot_for_authority(
-                snapshot,
-                [explicit],
-                source_session_id="source",
-            )
-        )
-        target_routes = [
-            route
-            for route in authority_snapshot
-            if route["target_session_id"] == "target"
-        ]
-        self.assertEqual(len(target_routes), 1)
-        self.assertEqual(
-            target_routes[0]["route_kind"],
-            agent_server.PROVIDER_CROSS_CHAT_ROUTE_KIND_REFERENCE,
-        )
-        self.assertEqual(
-            agent_server.provider_cross_chat_route_snapshot_for_authority(
-                snapshot,
-                [],
+            agent_server.initial_provider_cross_chat_route_snapshot(
+                "target", agent_server.TurnRequest(prompt="hello"), "chat"
             ),
-            snapshot,
+            [],
+        )
+        self.assertEqual(
+            agent_server.ambient_provider_cross_chat_routes("source"),
+            [],
+        )
+        legacy = {
+            **route,
+            "route_kind": agent_server.PROVIDER_CROSS_CHAT_ROUTE_KIND_AMBIENT,
+        }
+        self.assertEqual(
+            agent_server.provider_cross_chat_route_snapshot_for_authority(
+                [legacy], [], source_session_id="source"
+            ),
+            [],
         )
         self.assertEqual(
             agent_server.scoped_provider_cross_chat_route_snapshot(
@@ -297,61 +286,855 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             ),
             [],
         )
+
+    async def test_durable_grant_upsert_is_idempotent_and_directional(self) -> None:
+        reference = self.grant_reference()
+        with (
+            self.native_transports(),
+            patch.object(agent_server.STORE, "save", AsyncMock()) as save,
+        ):
+            first = (
+                await agent_server.persist_durable_provider_cross_chat_reference_grants(
+                    "source",
+                    [reference],
+                    admission_id="grant_admission_" + "1" * 32,
+                    event_type="turn_started",
+                )
+            )
+            self.assertEqual(
+                agent_server.provider_cross_chat_routes(
+                    agent_server.STORE.sessions["source"]
+                ),
+                [],
+            )
+            await agent_server.commit_durable_provider_cross_chat_reference_grants(
+                "source",
+                first,
+            )
+            second = (
+                await agent_server.persist_durable_provider_cross_chat_reference_grants(
+                    "source",
+                    [reference],
+                    admission_id="grant_admission_" + "2" * 32,
+                    event_type="turn_started",
+                )
+            )
+        self.assertTrue(first["committed"])
+        self.assertFalse(second["committed"])
+        self.assertGreaterEqual(save.await_count, 2)
+        self.assertTrue(all(
+            call.kwargs == {"durable": True}
+            for call in save.await_args_list
+        ))
+        routes = agent_server.STORE.sessions["source"][
+            "provider_cross_chat_routes"
+        ]
+        self.assertEqual(len(routes), 1)
+        self.assertEqual(routes[0]["actions"], ["instruction", "request_reply"])
         self.assertEqual(
-            agent_server.scoped_provider_cross_chat_route_snapshot(
-                snapshot,
-                purpose=None,
-                provider_context_mode="standalone",
+            agent_server.STORE.sessions["target"]["provider_cross_chat_routes"],
+            [],
+        )
+        self.assertNotIn(
+            agent_server.PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY,
+            agent_server.STORE.sessions["source"],
+        )
+
+    async def test_pending_grant_restart_reconciles_exact_admission_event(
+        self,
+    ) -> None:
+        reference = self.grant_reference()
+        admission_id = "grant_admission_" + "4" * 32
+        with (
+            self.native_transports(),
+            patch.object(agent_server.STORE, "save", AsyncMock()),
+        ):
+            mutation = (
+                await agent_server.persist_durable_provider_cross_chat_reference_grants(
+                    "source",
+                    [reference],
+                    admission_id=admission_id,
+                    event_type="turn_started",
+                )
+            )
+        staged_sessions = json.loads(json.dumps(agent_server.STORE.sessions))
+        self.assertTrue(mutation["committed"])
+        self.assertEqual(
+            agent_server.provider_cross_chat_routes(
+                agent_server.STORE.sessions["source"]
             ),
             [],
         )
-        self.assertEqual(
-            agent_server.scoped_provider_cross_chat_route_snapshot(
-                snapshot,
-                purpose=None,
-            ),
-            snapshot,
-        )
-        with patch.object(
-            agent_server,
-            "AGENT_AMBIENT_LOCAL_HANDOFFS_ENABLED",
-            False,
-        ):
-            self.assertEqual(
-                agent_server.normalized_provider_cross_chat_route_snapshot(
-                    snapshot
-                ),
-                [],
-            )
-        with patch.object(agent_server, "AGENT_TOKEN", ""):
-            self.assertEqual(
-                agent_server.initial_provider_cross_chat_route_snapshot(
-                    "source", agent_server.TurnRequest(prompt="hello"), "chat"
-                ),
-                [],
-            )
-            with patch.object(
-                agent_server,
-                "AGENT_AMBIENT_LOCAL_HANDOFFS_ENABLED",
-                False,
-            ):
+
+        for accepted in (False, True):
+            with self.subTest(accepted=accepted):
+                state_dir = self.root / f"restart-{accepted}"
+                state_dir.mkdir(parents=True)
+                sessions_file = state_dir / "sessions.json"
+                sessions_file.write_text(
+                    json.dumps(staged_sessions),
+                    encoding="utf-8",
+                )
+                if accepted:
+                    event_path = state_dir / "sessions" / "source" / "events.jsonl"
+                    event_path.parent.mkdir(parents=True)
+                    event_path.write_text(json.dumps({
+                        "seq": 1,
+                        "id": "evt_restart_grant",
+                        "session_id": "source",
+                        "type": "turn_started",
+                        "provider_cross_chat_grant_admission_id": admission_id,
+                    }) + "\n", encoding="utf-8")
+                recovered = agent_server.SessionStore()
+                with (
+                    patch.object(agent_server, "STATE_DIR", state_dir),
+                    patch.object(agent_server, "SESSIONS_FILE", sessions_file),
+                    patch.object(agent_server, "STORE", recovered),
+                ):
+                    await recovered.load()
+                source = recovered.sessions["source"]
+                self.assertNotIn(
+                    agent_server.PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY,
+                    source,
+                )
                 self.assertEqual(
-                    agent_server.initial_provider_cross_chat_route_snapshot(
-                        "source",
-                        agent_server.TurnRequest(
-                            prompt="hello",
-                            client_capabilities=[
-                                agent_server.AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY
-                            ],
-                        ),
-                        "chat",
-                    ),
-                    [],
+                    len(agent_server.provider_cross_chat_routes(source)),
+                    1 if accepted else 0,
                 )
 
-    async def test_ambient_route_list_freezes_ceiling_and_live_state_only_narrows(
+        # A matching admission event finalizes only the journal marker. It
+        # must never recreate a route that a later exact-CAS revoke removed.
+        revoked_sessions = json.loads(json.dumps(staged_sessions))
+        revoked_sessions["source"]["provider_cross_chat_routes"] = []
+        state_dir = self.root / "restart-revoked"
+        state_dir.mkdir(parents=True)
+        sessions_file = state_dir / "sessions.json"
+        sessions_file.write_text(json.dumps(revoked_sessions), encoding="utf-8")
+        event_path = state_dir / "sessions" / "source" / "events.jsonl"
+        event_path.parent.mkdir(parents=True)
+        event_path.write_text(json.dumps({
+            "seq": 1,
+            "id": "evt_restart_revoked_grant",
+            "session_id": "source",
+            "type": "turn_started",
+            "provider_cross_chat_grant_admission_id": admission_id,
+        }) + "\n", encoding="utf-8")
+        recovered = agent_server.SessionStore()
+        with (
+            patch.object(agent_server, "STATE_DIR", state_dir),
+            patch.object(agent_server, "SESSIONS_FILE", sessions_file),
+            patch.object(agent_server, "STORE", recovered),
+        ):
+            await recovered.load()
+        self.assertEqual(
+            agent_server.provider_cross_chat_routes(
+                recovered.sessions["source"]
+            ),
+            [],
+        )
+
+    async def test_grant_widening_and_multi_target_failure_are_atomic(self) -> None:
+        old = self.route("a", actions=["instruction"])
+        agent_server.STORE.sessions["source"]["provider_cross_chat_routes"] = [
+            old
+        ]
+        with (
+            self.native_transports(),
+            patch.object(agent_server.STORE, "save", AsyncMock()),
+        ):
+            mutation = (
+                await agent_server.persist_durable_provider_cross_chat_reference_grants(
+                    "source",
+                    [self.grant_reference()],
+                    admission_id="grant_admission_" + "5" * 32,
+                    event_type="turn_started",
+                )
+            )
+            self.assertEqual(
+                agent_server.provider_cross_chat_routes(
+                    agent_server.STORE.sessions["source"]
+                ),
+                [old],
+            )
+            await agent_server.rollback_durable_provider_cross_chat_reference_grants(
+                "source",
+                mutation,
+            )
+        self.assertEqual(
+            agent_server.STORE.sessions["source"]["provider_cross_chat_routes"],
+            [old],
+        )
+
+        agent_server.STORE.sessions["target2"] = {
+            "id": "target2",
+            "title": "Second",
+            "backend": "codex",
+            "archived": True,
+        }
+        with (
+            self.native_transports(),
+            patch.object(agent_server.STORE, "save", AsyncMock()) as save,
+        ):
+            with self.assertRaisesRegex(HTTPException, "unavailable"):
+                await agent_server.persist_durable_provider_cross_chat_reference_grants(
+                    "source",
+                    [
+                        self.grant_reference(),
+                        self.grant_reference(
+                            target="target2",
+                            title="Second",
+                            start=8,
+                        ),
+                    ],
+                    admission_id="grant_admission_" + "6" * 32,
+                    event_type="turn_queued",
+                )
+        self.assertEqual(save.await_count, 0)
+        self.assertEqual(
+            agent_server.STORE.sessions["source"]["provider_cross_chat_routes"],
+            [old],
+        )
+        self.assertNotIn(
+            agent_server.PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY,
+            agent_server.STORE.sessions["source"],
+        )
+
+    async def test_runtime_rollback_restores_displaced_full_audit_ring(
         self,
     ) -> None:
+        original_audit = self.audit_entries()
+        agent_server.STORE.sessions["source"][
+            "provider_cross_chat_route_audit"
+        ] = json.loads(json.dumps(original_audit))
+        with (
+            self.native_transports(),
+            patch.object(agent_server.STORE, "save", AsyncMock()),
+        ):
+            mutation = (
+                await agent_server.persist_durable_provider_cross_chat_reference_grants(
+                    "source",
+                    [self.grant_reference()],
+                    admission_id="grant_admission_" + "9" * 32,
+                    event_type="turn_started",
+                )
+            )
+            pending = agent_server.STORE.sessions["source"][
+                agent_server.PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY
+            ]
+            self.assertEqual(
+                pending["displaced_audit_entries"],
+                original_audit[:1],
+            )
+            self.assertEqual(pending["audit_count_after_stage"], 64)
+            await agent_server.rollback_durable_provider_cross_chat_reference_grants(
+                "source",
+                mutation,
+            )
+        self.assertEqual(
+            agent_server.STORE.sessions["source"][
+                "provider_cross_chat_route_audit"
+            ],
+            original_audit,
+        )
+
+    async def test_restart_rollback_restores_multi_target_audit_ring_and_quarantines_malformed_prefix(
+        self,
+    ) -> None:
+        original_audit = self.audit_entries()
+        agent_server.STORE.sessions["target2"] = {
+            "id": "target2",
+            "title": "Second",
+            "backend": "codex",
+            "provider_cross_chat_routes": [],
+        }
+        agent_server.STORE.sessions["source"][
+            "provider_cross_chat_route_audit"
+        ] = json.loads(json.dumps(original_audit))
+        with (
+            self.native_transports(),
+            patch.object(agent_server.STORE, "save", AsyncMock()),
+        ):
+            await agent_server.persist_durable_provider_cross_chat_reference_grants(
+                "source",
+                [
+                    self.grant_reference(),
+                    self.grant_reference(target="target2", title="Second", start=8),
+                ],
+                admission_id="grant_admission_" + "a" * 32,
+                event_type="turn_queued",
+            )
+        staged_sessions = json.loads(json.dumps(agent_server.STORE.sessions))
+        pending = staged_sessions["source"][
+            agent_server.PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY
+        ]
+        self.assertEqual(
+            pending["displaced_audit_entries"],
+            original_audit[:2],
+        )
+
+        state_dir = self.root / "restart-audit-ring"
+        state_dir.mkdir(parents=True)
+        sessions_file = state_dir / "sessions.json"
+        sessions_file.write_text(
+            json.dumps(staged_sessions),
+            encoding="utf-8",
+        )
+        recovered = agent_server.SessionStore()
+        with (
+            patch.object(agent_server, "STATE_DIR", state_dir),
+            patch.object(agent_server, "SESSIONS_FILE", sessions_file),
+            patch.object(agent_server, "STORE", recovered),
+        ):
+            await recovered.load()
+        self.assertEqual(
+            recovered.sessions["source"]["provider_cross_chat_route_audit"],
+            original_audit,
+        )
+        self.assertEqual(
+            recovered.sessions["source"]["provider_cross_chat_routes"],
+            [],
+        )
+
+        malformed_sessions = json.loads(json.dumps(staged_sessions))
+        malformed_sessions["source"][
+            agent_server.PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY
+        ]["displaced_audit_entries"][0]["target_session_id"] = ""
+        malformed_source = malformed_sessions["source"]
+        self.assertTrue(
+            agent_server.reconcile_pending_provider_cross_chat_grant(
+                "source",
+                malformed_source,
+            )
+        )
+        self.assertEqual(
+            malformed_source["provider_cross_chat_routes"],
+            [],
+        )
+        self.assertEqual(
+            malformed_source["provider_cross_chat_route_audit"],
+            [],
+        )
+        self.assertEqual(
+            malformed_source["_provider_cross_chat_route_quarantine"]["reason"],
+            "invalid_pending_grant_admission",
+        )
+
+    async def test_grant_rollback_retries_transient_store_failure(self) -> None:
+        save = AsyncMock(side_effect=[None, RuntimeError("transient"), None])
+        with self.native_transports(), patch.object(
+            agent_server.STORE,
+            "save",
+            save,
+        ):
+            mutation = (
+                await agent_server.persist_durable_provider_cross_chat_reference_grants(
+                    "source",
+                    [self.grant_reference()],
+                    admission_id="grant_admission_" + "7" * 32,
+                    event_type="turn_started",
+                )
+            )
+            await agent_server.rollback_durable_provider_cross_chat_reference_grants(
+                "source",
+                mutation,
+            )
+        self.assertEqual(save.await_count, 3)
+        self.assertEqual(
+            agent_server.STORE.sessions["source"]["provider_cross_chat_routes"],
+            [],
+        )
+
+    async def test_durable_session_save_fsyncs_file_rename_and_directory(
+        self,
+    ) -> None:
+        state_dir = self.root / "durable-save"
+        sessions_file = state_dir / "sessions.json"
+        store = agent_server.SessionStore()
+        store.sessions = {"source": {"id": "source"}}
+        ordering: list[str] = []
+        real_fsync = agent_server.os.fsync
+        real_replace = agent_server.os.replace
+
+        def traced_fsync(file_descriptor: int) -> None:
+            ordering.append("fsync")
+            real_fsync(file_descriptor)
+
+        def traced_replace(source: Path, target: Path) -> None:
+            ordering.append("replace")
+            real_replace(source, target)
+
+        with (
+            patch.object(agent_server, "STATE_DIR", state_dir),
+            patch.object(agent_server, "SESSIONS_FILE", sessions_file),
+            patch.object(agent_server.os, "fsync", side_effect=traced_fsync),
+            patch.object(agent_server.os, "replace", side_effect=traced_replace),
+        ):
+            await store.save(durable=True)
+        self.assertEqual(ordering, ["fsync", "replace", "fsync"])
+        self.assertEqual(
+            json.loads(sessions_file.read_text(encoding="utf-8")),
+            store.sessions,
+        )
+
+        windows_sessions_file = state_dir / "sessions-windows.json"
+        ordering.clear()
+        with (
+            patch.object(agent_server, "SESSIONS_FILE", windows_sessions_file),
+            patch.object(agent_server.os, "name", "nt"),
+            patch.object(agent_server.os, "fsync", side_effect=traced_fsync),
+            patch.object(agent_server.os, "replace", side_effect=traced_replace),
+        ):
+            await store.save(durable=True)
+        self.assertEqual(ordering, ["fsync", "replace"])
+
+    async def test_malformed_pending_grant_identity_is_quarantined(self) -> None:
+        old = self.route("a", actions=["instruction"])
+        agent_server.STORE.sessions["source"]["provider_cross_chat_routes"] = [
+            old
+        ]
+        with (
+            self.native_transports(),
+            patch.object(agent_server.STORE, "save", AsyncMock()),
+        ):
+            await agent_server.persist_durable_provider_cross_chat_reference_grants(
+                "source",
+                [self.grant_reference()],
+                admission_id="grant_admission_" + "8" * 32,
+                event_type="turn_started",
+            )
+        source = agent_server.STORE.sessions["source"]
+        pending = source[agent_server.PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY]
+        pending["rollback_changes"][0]["before"]["target_session_id"] = (
+            "attacker-selected-target"
+        )
+        self.assertEqual(agent_server.provider_cross_chat_routes(source), [])
+        self.assertTrue(
+            agent_server.reconcile_pending_provider_cross_chat_grant(
+                "source",
+                source,
+            )
+        )
+        self.assertEqual(agent_server.provider_cross_chat_routes(source), [])
+        self.assertNotIn(
+            agent_server.PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY,
+            source,
+        )
+        self.assertEqual(
+            source["_provider_cross_chat_route_quarantine"]["reason"],
+            "invalid_pending_grant_admission",
+        )
+
+    async def test_job_conversion_requires_configured_grant_and_is_independent(
+        self,
+    ) -> None:
+        route = self.route("a", actions=["instruction", "request_reply"])
+        agent_server.STORE.sessions["source"]["provider_cross_chat_routes"] = [
+            route
+        ]
+        selection = agent_server.AgentJobChatRouteSelection(
+            route_id=route["route_id"],
+            action="instruction",
+        )
+        with self.native_transports():
+            _token, request = await self.issue("run_job_route", [route])
+            capability, reservations = (
+                await agent_server.reserve_provider_job_route_conversions(
+                    request,
+                    source_session_id="source",
+                    selections=[selection],
+                )
+            )
+            references = agent_server.provider_job_chat_references(
+                capability,
+                "source",
+                "@Target scheduled check",
+                [selection],
+            )
+            agent_server.STORE.sessions["source"][
+                "provider_cross_chat_routes"
+            ] = []
+            job_snapshot = (
+                agent_server.provider_cross_chat_route_snapshot_for_authority(
+                    [],
+                    references,
+                    source_session_id="source",
+                    per_job_reference_routes=True,
+                )
+            )
+        self.assertEqual(len(reservations), 1)
+        self.assertEqual(len(job_snapshot), 1)
+        self.assertEqual(job_snapshot[0]["target_session_id"], "target")
+        self.assertEqual(job_snapshot[0]["actions"], ["instruction"])
+
+        legacy_reference_route = {
+            **route,
+            "route_kind": agent_server.PROVIDER_CROSS_CHAT_ROUTE_KIND_REFERENCE,
+        }
+        with self.native_transports():
+            _token, legacy_request = await self.issue(
+                "run_legacy_job_route",
+                [legacy_reference_route],
+            )
+            with self.assertRaisesRegex(HTTPException, "durable source-chat"):
+                await agent_server.reserve_provider_job_route_conversions(
+                    legacy_request,
+                    source_session_id="source",
+                    selections=[selection],
+                )
+
+    async def test_grant_compensation_is_exact_revision_cas(self) -> None:
+        reference = self.grant_reference()
+        with (
+            self.native_transports(),
+            patch.object(agent_server.STORE, "save", AsyncMock()),
+        ):
+            mutation = (
+                await agent_server.persist_durable_provider_cross_chat_reference_grants(
+                    "source",
+                    [reference],
+                    admission_id="grant_admission_" + "3" * 32,
+                    event_type="turn_started",
+                )
+            )
+            route = agent_server.STORE.sessions["source"][
+                "provider_cross_chat_routes"
+            ][0]
+            route["revision"] = "rev_" + "f" * 32
+            await agent_server.rollback_durable_provider_cross_chat_reference_grants(
+                "source",
+                mutation,
+            )
+        self.assertEqual(
+            agent_server.STORE.sessions["source"][
+                "provider_cross_chat_routes"
+            ][0]["revision"],
+            "rev_" + "f" * 32,
+        )
+        self.assertEqual(
+            len(
+                agent_server.STORE.sessions["source"].get(
+                    "provider_cross_chat_route_audit", []
+                )
+            ),
+            1,
+        )
+
+    async def test_immediate_grant_rolls_back_before_durable_turn_commit(
+        self,
+    ) -> None:
+        reference = self.grant_reference()
+        request = agent_server.TurnRequest(
+            prompt="@Target do the work",
+            chat_references=[reference],
+            client_capabilities=[
+                agent_server.AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY
+            ],
+        )
+        original_busy = set(agent_server.BUSY_SESSIONS)
+        agent_server.BUSY_SESSIONS.clear()
+        async def fail_durable_event(
+            _session_id: str,
+            event_type: str,
+            payload: dict,
+        ) -> dict:
+            self.assertEqual(event_type, "turn_started")
+            self.assertRegex(
+                payload["provider_cross_chat_grant_admission_id"],
+                r"^grant_admission_[0-9a-f]{32}$",
+            )
+            self.assertEqual(
+                agent_server.provider_cross_chat_routes(
+                    agent_server.STORE.sessions["source"]
+                ),
+                [],
+            )
+            raise RuntimeError("event fsync failed")
+        try:
+            with (
+                self.native_transports(),
+                patch.object(agent_server.STORE, "save", AsyncMock()),
+                patch.object(
+                    agent_server,
+                    "turn_start_blocker",
+                    AsyncMock(return_value=None),
+                ),
+                patch.object(
+                    agent_server,
+                    "ensure_runtime_available",
+                    AsyncMock(),
+                ),
+                patch.object(
+                    agent_server,
+                    "codex_manifest_path",
+                    return_value=self.root / "manifest.json",
+                ),
+                patch.object(
+                    agent_server,
+                    "append_durable_event",
+                    AsyncMock(side_effect=fail_durable_event),
+                ),
+                patch.object(agent_server, "append_event", AsyncMock()),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "event fsync failed"):
+                    await agent_server._start_turn_locked(
+                        "source",
+                        request,
+                        queue_if_busy=False,
+                        provider_context_mode="chat",
+                        admission_backend="codex",
+                    )
+        finally:
+            agent_server.BUSY_SESSIONS.clear()
+            agent_server.BUSY_SESSIONS.update(original_busy)
+        self.assertEqual(
+            agent_server.STORE.sessions["source"][
+                "provider_cross_chat_routes"
+            ],
+            [],
+        )
+
+    async def test_immediate_grant_survives_failure_after_durable_turn_commit(
+        self,
+    ) -> None:
+        reference = self.grant_reference()
+        request = agent_server.TurnRequest(
+            prompt="@Target do the work",
+            chat_references=[reference],
+            client_capabilities=[
+                agent_server.AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY
+            ],
+        )
+        original_busy = set(agent_server.BUSY_SESSIONS)
+        agent_server.BUSY_SESSIONS.clear()
+        try:
+            with (
+                self.native_transports(),
+                patch.object(agent_server.STORE, "save", AsyncMock()),
+                patch.object(
+                    agent_server,
+                    "turn_start_blocker",
+                    AsyncMock(return_value=None),
+                ),
+                patch.object(
+                    agent_server,
+                    "ensure_runtime_available",
+                    AsyncMock(),
+                ),
+                patch.object(
+                    agent_server,
+                    "codex_manifest_path",
+                    return_value=self.root / "manifest.json",
+                ),
+                patch.object(
+                    agent_server,
+                    "append_durable_event",
+                    AsyncMock(return_value={"type": "durable"}),
+                ),
+                patch.object(agent_server, "append_event", AsyncMock()),
+                patch.object(
+                    agent_server,
+                    "scrub_tmux_global_secret_environment",
+                    side_effect=RuntimeError("provider prelaunch failed"),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "provider prelaunch failed",
+                ):
+                    await agent_server._start_turn_locked(
+                        "source",
+                        request,
+                        queue_if_busy=False,
+                        provider_context_mode="chat",
+                        admission_backend="codex",
+                    )
+        finally:
+            agent_server.BUSY_SESSIONS.clear()
+            agent_server.BUSY_SESSIONS.update(original_busy)
+        self.assertEqual(
+            len(
+                agent_server.STORE.sessions["source"][
+                    "provider_cross_chat_routes"
+                ]
+            ),
+            1,
+        )
+
+    async def test_busy_queue_grant_uses_durable_queue_commit_boundary(self) -> None:
+        reference = self.grant_reference()
+        request = agent_server.TurnRequest(
+            prompt="@Target queue this",
+            chat_references=[reference],
+            client_capabilities=[
+                agent_server.AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY
+            ],
+        )
+        async def fail_queue_event(
+            _session_id: str,
+            event_type: str,
+            payload: dict,
+        ) -> dict:
+            self.assertEqual(event_type, "turn_queued")
+            self.assertRegex(
+                payload["provider_cross_chat_grant_admission_id"],
+                r"^grant_admission_[0-9a-f]{32}$",
+            )
+            self.assertEqual(
+                agent_server.provider_cross_chat_routes(
+                    agent_server.STORE.sessions["source"]
+                ),
+                [],
+            )
+            raise RuntimeError("queue fsync failed")
+        with (
+            self.native_transports(),
+            patch.object(agent_server.STORE, "save", AsyncMock()),
+            patch.object(
+                agent_server,
+                "managed_server_update_blocker",
+                return_value=None,
+            ),
+            patch.object(
+                agent_server,
+                "append_durable_event",
+                AsyncMock(side_effect=fail_queue_event),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "queue fsync failed"):
+                await agent_server.enqueue_turn(
+                    "source",
+                    request,
+                    agent_server.STORE.sessions["source"],
+                    provider_route_snapshot=[],
+                )
+        self.assertEqual(
+            agent_server.STORE.sessions["source"][
+                "provider_cross_chat_routes"
+            ],
+            [],
+        )
+        self.assertNotIn("source", agent_server.QUEUED_TURNS)
+
+        agent_server.BUSY_SESSIONS.add("source")
+        try:
+            with (
+                self.native_transports(),
+                patch.object(agent_server.STORE, "save", AsyncMock()),
+                patch.object(
+                    agent_server,
+                    "managed_server_update_blocker",
+                    return_value=None,
+                ),
+                patch.object(
+                    agent_server,
+                    "append_durable_event",
+                    AsyncMock(return_value={"type": "turn_queued"}),
+                ),
+            ):
+                accepted = await agent_server.enqueue_turn(
+                    "source",
+                    request,
+                    agent_server.STORE.sessions["source"],
+                    provider_route_snapshot=[],
+                )
+        finally:
+            agent_server.BUSY_SESSIONS.discard("source")
+        queued = agent_server.QUEUED_TURNS["source"][0]
+        self.assertTrue(accepted["queued"])
+        self.assertEqual(
+            queued["provider_cross_chat_route_snapshot"],
+            agent_server.STORE.sessions["source"][
+                "provider_cross_chat_routes"
+            ],
+        )
+
+    async def test_queue_edit_requires_current_grant_and_revoke_narrows(
+        self,
+    ) -> None:
+        item = {
+            "queued_id": "queued_edit_grant",
+            "prompt": "plain",
+            "file_ids": [],
+            "chat_references": [],
+            "cross_chat_obligation_ids": [],
+            "cross_chat_exchange_ids": [],
+            "client_capabilities": [
+                agent_server.AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY
+            ],
+            "provider_cross_chat_route_snapshot": [],
+        }
+        agent_server.QUEUED_TURNS = {"source": deque([item])}
+        update = agent_server.UpdateQueuedTurnRequest(
+            prompt="@Target edited",
+            chat_references=[self.grant_reference()],
+            client_capabilities=[
+                agent_server.AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY
+            ],
+        )
+        with (
+            self.native_transports(),
+            patch.object(
+                agent_server,
+                "managed_server_update_blocker",
+                return_value=None,
+            ),
+        ):
+            with self.assertRaisesRegex(HTTPException, "current durable grant"):
+                await agent_server.update_queued_turn(
+                    "source",
+                    "queued_edit_grant",
+                    update,
+                )
+        self.assertEqual(
+            agent_server.STORE.sessions["source"][
+                "provider_cross_chat_routes"
+            ],
+            [],
+        )
+
+        route = self.route("a")
+        agent_server.STORE.sessions["source"]["provider_cross_chat_routes"] = [
+            route
+        ]
+        with (
+            self.native_transports(),
+            patch.object(
+                agent_server,
+                "managed_server_update_blocker",
+                return_value=None,
+            ),
+            patch.object(
+                agent_server,
+                "append_durable_event",
+                AsyncMock(return_value={"type": "turn_queue_updated"}),
+            ),
+        ):
+            edited = await agent_server.update_queued_turn(
+                "source",
+                "queued_edit_grant",
+                update,
+            )
+        self.assertEqual(
+            edited["item"]["provider_cross_chat_route_snapshot"],
+            [route],
+        )
+        agent_server.STORE.sessions["source"]["provider_cross_chat_routes"] = []
+        self.assertEqual(
+            agent_server.provider_cross_chat_route_snapshot_for_authority(
+                edited["item"]["provider_cross_chat_route_snapshot"],
+                [self.grant_reference()],
+                source_session_id="source",
+            ),
+            [],
+        )
+
+    async def test_durable_route_list_freezes_ceiling_and_live_state_only_narrows(
+        self,
+    ) -> None:
+        route = self.route("a")
+        agent_server.STORE.sessions["source"]["provider_cross_chat_routes"] = [
+            route
+        ]
         with self.native_transports():
             snapshot = agent_server.initial_provider_cross_chat_route_snapshot(
                 "source", agent_server.TurnRequest(prompt="hello"), "chat"
@@ -373,87 +1156,40 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
                 source_session_id="source",
                 route_id=route_id,
                 action="instruction",
-                body="hello from ambient access",
-                idempotency_key="ambient-list-reservation",
+                body="hello from durable access",
+                idempotency_key="durable-list-reservation",
             )
             self.assertFalse(replay)
             self.assertEqual(reservation["target_session_id"], "target")
             agent_server.STORE.sessions["target"]["archived"] = True
             narrowed = await agent_server.list_provider_cross_chat_routes(request)
-            self.assertEqual(narrowed["routes"], [])
+            self.assertEqual(len(narrowed["routes"]), 1)
+            self.assertFalse(narrowed["routes"][0]["available"])
             self.assertTrue(token)
 
-    async def test_native_steer_preserves_only_ambient_snapshot(self) -> None:
-        with self.native_transports():
-            snapshot = agent_server.initial_provider_cross_chat_route_snapshot(
-                "source", agent_server.TurnRequest(prompt="hello"), "chat"
-            )
+    async def test_native_steer_cannot_reuse_durable_route_authority(self) -> None:
+        snapshot = [self.route("a")]
         selected = {
             "prompt": "replacement",
             "provider_cross_chat_route_snapshot": snapshot,
         }
-        actions, _jobs_access = agent_server.native_steer_provider_actions(
-            "source", selected
-        )
-        self.assertIn("agent_cross_chat_routes", actions)
-        prompt, authority = await agent_server.issue_native_steer_provider_authority(
-            "source",
-            "run_ambient_steer",
-            selected,
-            "replacement",
-            "a" * 32,
-        )
-        token = json.loads(authority.read_text())["provider_capability"]
-        capability = agent_server.CROSS_CHAT_CAPABILITIES[
-            agent_server.hashlib.sha256(token.encode()).hexdigest()
-        ]
-        self.assertEqual(
-            list(capability["provider_route_grants"].values()),
-            snapshot,
-        )
-        self.assertIn("continuously enabled", prompt)
-        self.assertTrue(
+        with self.assertRaises(agent_server.NativeSteerHandoffError):
+            agent_server.native_steer_provider_actions("source", selected)
+        self.assertFalse(
             agent_server.provider_route_snapshot_allows_native_steer(snapshot)
         )
-        self.assertFalse(
-            agent_server.provider_route_snapshot_allows_native_steer(
-                [self.route("a")]
-            )
+        actions, _jobs_access = agent_server.native_steer_provider_actions(
+            "source",
+            {"prompt": "route-free replacement"},
         )
-        internal_selected = {
-            **selected,
-            "purpose": "scheduled_job",
-        }
-        internal_actions, _jobs_access = (
-            agent_server.native_steer_provider_actions(
-                "source",
-                internal_selected,
-            )
-        )
-        self.assertNotIn("agent_cross_chat_routes", internal_actions)
-        internal_prompt, internal_authority = (
-            await agent_server.issue_native_steer_provider_authority(
-                "source",
-                "run_internal_steer",
-                internal_selected,
-                "scheduled replacement",
-                "b" * 32,
-            )
-        )
-        internal_token = json.loads(
-            internal_authority.read_text()
-        )["provider_capability"]
-        internal_capability = agent_server.CROSS_CHAT_CAPABILITIES[
-            agent_server.hashlib.sha256(internal_token.encode()).hexdigest()
-        ]
-        self.assertEqual(internal_capability["provider_route_grants"], {})
-        self.assertNotIn("Available same-server chats", internal_prompt)
+        self.assertNotIn("agent_cross_chat_routes", actions)
 
-    async def test_admin_crud_uses_revision_cas_and_idempotent_revoke(self) -> None:
+    async def test_admin_crud_uses_revision_cas_for_revoke(self) -> None:
         audit = AsyncMock()
+        save = AsyncMock()
         with (
             self.native_transports(),
-            patch.object(agent_server.STORE, "save", AsyncMock()),
+            patch.object(agent_server.STORE, "save", save),
             patch.object(agent_server, "append_durable_event", audit),
         ):
             created = await agent_server.create_agent_handoff_route(
@@ -501,13 +1237,27 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
                 route["revision"],
             )
             deleted = await agent_server.delete_agent_handoff_route(
-                "source", route["route_id"]
+                "source",
+                route["route_id"],
+                updated["route"]["revision"],
             )
-            replay = await agent_server.delete_agent_handoff_route(
-                "source", route["route_id"]
-            )
+            with self.assertRaises(HTTPException) as replay:
+                await agent_server.delete_agent_handoff_route(
+                    "source",
+                    route["route_id"],
+                    updated["route"]["revision"],
+                )
         self.assertTrue(deleted["deleted"])
-        self.assertFalse(replay["deleted"])
+        self.assertEqual(replay.exception.status_code, 409)
+        self.assertEqual(
+            replay.exception.detail["message"],
+            "route revision conflict",
+        )
+        self.assertEqual(save.await_count, 3)
+        self.assertTrue(all(
+            call.kwargs == {"durable": True}
+            for call in save.await_args_list
+        ))
 
     async def test_exact_create_retry_converges_after_post_commit_cancellation(self) -> None:
         save = AsyncMock()
@@ -674,7 +1424,11 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(
                 "provider_cross_chat_route_audit", queued_projection
             )
-            await agent_server.delete_agent_handoff_route("source", route_id)
+            await agent_server.delete_agent_handoff_route(
+                "source",
+                route_id,
+                route["revision"],
+            )
         source = agent_server.STORE.sessions["source"]
         self.assertEqual(source["provider_cross_chat_routes"], [])
         self.assertEqual(
@@ -1233,8 +1987,10 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         source_copy = agent_server.cross_chat_provider_authority_block(
             [], self.root / "source.json", "source",
             {"agent_cross_chat_routes"},
+            provider_route_snapshot=[route],
         )
-        self.assertIn("Ask is asynchronous", source_copy)
+        self.assertIn("exchange-scoped asynchronous return path", source_copy)
+        self.assertIn("does not grant the target durable access", source_copy)
 
     async def test_configured_route_response_receipt_is_strictly_minimal(self) -> None:
         route = self.route("a", actions=["request_reply"])
@@ -1872,9 +2628,12 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
                 "queued_routes",
                 agent_server.UpdateQueuedTurnRequest(client_capabilities=[]),
             )
-        self.assertEqual(updated["item"]["provider_cross_chat_route_snapshot"], [])
+        self.assertEqual(
+            updated["item"]["provider_cross_chat_route_snapshot"],
+            [route],
+        )
         payload = append.await_args.args[2]
-        self.assertEqual(payload["provider_cross_chat_route_snapshot"], [])
+        self.assertEqual(payload["provider_cross_chat_route_snapshot"], [route])
 
         # Adding the capability later cannot manufacture an admission snapshot.
         with (
@@ -1890,7 +2649,10 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
                     ]
                 ),
             )
-        self.assertEqual(added["item"]["provider_cross_chat_route_snapshot"], [])
+        self.assertEqual(
+            added["item"]["provider_cross_chat_route_snapshot"],
+            [route],
+        )
 
         recovered = agent_server.queued_turn_from_event(
             {
@@ -1906,15 +2668,19 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(recovered["provider_cross_chat_route_snapshot"], [route])
 
-    async def test_queue_capability_edit_does_not_revoke_intrinsic_ambient_snapshot(
+    async def test_queue_capability_edit_does_not_revoke_durable_snapshot(
         self,
     ) -> None:
+        route = self.route("a")
+        agent_server.STORE.sessions["source"]["provider_cross_chat_routes"] = [
+            route
+        ]
         with self.native_transports():
             snapshot = agent_server.initial_provider_cross_chat_route_snapshot(
                 "source", agent_server.TurnRequest(prompt="hello"), "chat"
             )
         item = {
-            "queued_id": "queued_ambient",
+            "queued_id": "queued_durable",
             "prompt": "hello",
             "file_ids": [],
             "chat_references": [],
@@ -1934,37 +2700,32 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         ):
             updated = await agent_server.update_queued_turn(
                 "source",
-                "queued_ambient",
+                "queued_durable",
                 agent_server.UpdateQueuedTurnRequest(client_capabilities=[]),
             )
         self.assertEqual(
             updated["item"]["provider_cross_chat_route_snapshot"],
             snapshot,
         )
-        with patch.object(
-            agent_server,
-            "AGENT_AMBIENT_LOCAL_HANDOFFS_ENABLED",
-            False,
-        ):
-            self.assertIsNone(
-                agent_server.live_provider_cross_chat_route(
-                    "source",
-                    snapshot[0],
-                )
+        self.assertIsNotNone(
+            agent_server.live_provider_cross_chat_route(
+                "source",
+                snapshot[0],
             )
-            recovered = agent_server.queued_turn_from_event(
-                {
-                    "queued_id": "queued_ambient_recovered",
-                    "prompt": "hello",
-                    "provider_cross_chat_route_snapshot": snapshot,
-                },
-                agent_server.STORE.sessions["source"],
-                1,
-            )
-            self.assertEqual(
-                recovered["provider_cross_chat_route_snapshot"],
-                [],
-            )
+        )
+        recovered = agent_server.queued_turn_from_event(
+            {
+                "queued_id": "queued_durable_recovered",
+                "prompt": "hello",
+                "provider_cross_chat_route_snapshot": snapshot,
+            },
+            agent_server.STORE.sessions["source"],
+            1,
+        )
+        self.assertEqual(
+            recovered["provider_cross_chat_route_snapshot"],
+            snapshot,
+        )
 
     async def test_queue_snapshot_rolls_back_and_is_never_client_projected(self) -> None:
         route = self.route("a")
@@ -2074,11 +2835,8 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(len(snapshot), 1)
             self.assertEqual(snapshot[0]["target_session_id"], "target")
-            self.assertEqual(
-                snapshot[0]["route_kind"],
-                agent_server.PROVIDER_CROSS_CHAT_ROUTE_KIND_AMBIENT,
-            )
-            self.assertNotEqual(snapshot[0]["route_id"], route["route_id"])
+            self.assertNotIn("route_kind", snapshot[0])
+            self.assertEqual(snapshot[0]["route_id"], route["route_id"])
             for purpose in (
                 "scheduled_job", "digest", "cross_chat_handoff_delivery", "internal"
             ):

@@ -2473,13 +2473,13 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(candidate_records), 1)
             self.assertEqual(
                 list(candidate_records[0]["provider_route_grants"].values()),
-                [candidate_route],
+                [],
             )
             self.assertEqual(
                 agent_server.CURRENT_TURNS["chat-native"][
                     "provider_cross_chat_route_snapshot"
                 ],
-                [candidate_route],
+                [],
             )
             candidate_path = Path(str(
                 candidate_records[0]["authority_path"]

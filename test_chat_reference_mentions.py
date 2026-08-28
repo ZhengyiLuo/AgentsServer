@@ -30,6 +30,7 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
         *,
         marker: str = "@Target",
         route_action: str | None = None,
+        grant_intent: bool | None = None,
         start: int = 0,
     ) -> agent_server.ChatReference:
         return agent_server.ChatReference(
@@ -39,6 +40,7 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
             source_text_end=start + len(marker),
             action=action,
             route_action=route_action,
+            grant_intent=grant_intent,
         )
 
     def test_single_at_is_current_route_and_legacy_values_normalize_safely(self) -> None:
@@ -69,6 +71,65 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(legacy_route[0].action, "route")
         self.assertEqual(agent_server.chat_reference_marker(legacy_route[0]), "@Target")
 
+    async def test_v2_grant_intent_requires_exact_single_at_and_fences_v1(self) -> None:
+        durable = self.reference("route", grant_intent=True)
+        with (
+            patch.object(agent_server, "AGENT_TOKEN", "token"),
+            patch.object(agent_server.STORE, "sessions", self.sessions),
+            patch.object(
+                agent_server,
+                "cross_chat_delivery_client_capabilities",
+                return_value=[agent_server.CODEX_INTERACTIVE_CLIENT_CAPABILITY],
+            ),
+        ):
+            with self.assertRaisesRegex(HTTPException, "updated client"):
+                agent_server.validate_chat_references(
+                    "source-private-id",
+                    "@Target do it",
+                    [durable],
+                    ["agent_cross_chat_routes_v1"],
+                )
+            accepted = agent_server.validate_chat_references(
+                "source-private-id",
+                "@Target do it",
+                [durable],
+                [agent_server.AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY],
+            )
+            self.assertTrue(accepted[0].grant_intent)
+            with self.assertRaisesRegex(HTTPException, "exact canonical"):
+                agent_server.validate_chat_references(
+                    "source-private-id",
+                    "@@Target do it",
+                    [
+                        self.reference(
+                            "route",
+                            marker="@@Target",
+                            grant_intent=True,
+                        )
+                    ],
+                    [agent_server.AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY],
+                )
+
+            legacy_request = agent_server.TurnRequest(
+                prompt="@Target old client",
+                chat_references=[self.reference("route")],
+                client_capabilities=["agent_cross_chat_routes_v1"],
+            )
+            with self.assertRaisesRegex(HTTPException, "legacy cross-chat"):
+                await agent_server._start_turn_locked(
+                    "source-private-id",
+                    legacy_request,
+                    queue_if_busy=False,
+                    provider_context_mode="chat",
+                    admission_backend=agent_server.BACKEND_CODEX,
+                )
+        self.assertEqual(
+            self.sessions["source-private-id"].get(
+                "provider_cross_chat_routes", []
+            ),
+            [],
+        )
+
     def test_legacy_direct_large_prompt_is_only_a_route_hint(self) -> None:
         prompt = "@Target " + (
             "x" * agent_server.CROSS_CHAT_HANDOFF_BODY_MAX_CHARS
@@ -89,7 +150,7 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(normalized[0].action, "route")
 
-    def test_route_reference_becomes_a_fresh_opaque_run_route(self) -> None:
+    def test_scheduled_route_reference_becomes_a_fresh_opaque_run_route(self) -> None:
         route_reference = self.reference("route")
         with (
             patch.object(agent_server, "AGENT_TOKEN", "token"),
@@ -104,11 +165,13 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
                 [],
                 [route_reference],
                 source_session_id="source-private-id",
+                per_job_reference_routes=True,
             )
             second = agent_server.provider_cross_chat_route_snapshot_for_authority(
                 [],
                 [route_reference],
                 source_session_id="source-private-id",
+                per_job_reference_routes=True,
             )
             self.assertEqual(len(first), 1)
             self.assertEqual(
@@ -128,11 +191,11 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("@ route hint 1", block)
         self.assertIn(first[0]["route_id"], block)
         self.assertNotIn("target-private-id", block)
-        self.assertIn("never auto-sends the source prompt", block)
-        self.assertIn("Decide whether to use", block)
-        self.assertIn("or no cross-chat contact", block)
+        self.assertIn("never forwards the raw source prompt", block)
+        self.assertIn("send a prepared message", block)
+        self.assertIn("make no contact", block)
 
-    def test_legacy_direct_and_current_route_both_become_optional_hints(self) -> None:
+    def test_legacy_ambient_and_route_hints_are_quarantined_for_ordinary_turns(self) -> None:
         ambient = {
             "route_id": "route_" + ("1" * 32),
             "revision": "rev_" + ("2" * 32),
@@ -163,23 +226,8 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
                     source_session_id="source-private-id",
                 )
             )
-        self.assertEqual(len(direct_routes), 1)
-        self.assertEqual(
-            direct_routes[0]["route_kind"],
-            agent_server.PROVIDER_CROSS_CHAT_ROUTE_KIND_REFERENCE,
-        )
-        self.assertEqual(
-            direct_routes[0]["actions"], ["instruction", "request_reply"]
-        )
-        self.assertEqual(len(explicit_routes), 1)
-        self.assertEqual(
-            explicit_routes[0]["route_kind"],
-            agent_server.PROVIDER_CROSS_CHAT_ROUTE_KIND_REFERENCE,
-        )
-        self.assertEqual(
-            explicit_routes[0]["target_session_id"],
-            "target-private-id",
-        )
+        self.assertEqual(direct_routes, [])
+        self.assertEqual(explicit_routes, [])
 
     def test_provider_job_route_conversion_requires_and_persists_single_at(self) -> None:
         issued = {
@@ -188,7 +236,8 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
             "alias": "chat1",
             "target_session_id": "target-private-id",
             "actions": ["instruction", "request_reply"],
-            "route_kind": agent_server.PROVIDER_CROSS_CHAT_ROUTE_KIND_AMBIENT,
+            "created_at": "2026-08-27T00:00:00Z",
+            "updated_at": "2026-08-27T00:00:00Z",
         }
         capability = {"provider_route_grants": {issued["route_id"]: issued}}
         selection = agent_server.AgentJobChatRouteSelection(
@@ -209,6 +258,9 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
                 return_value=[agent_server.CODEX_INTERACTIVE_CLIENT_CAPABILITY],
             ),
         ):
+            self.sessions["source-private-id"][
+                "provider_cross_chat_routes"
+            ] = [dict(issued)]
             references = agent_server.provider_job_chat_references(
                 capability,
                 "source-private-id",
@@ -776,12 +828,22 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             capability = agent_server.cross_chat_handoffs_capability()
-        self.assertEqual(capability["version"], 6)
+        self.assertEqual(capability["version"], 7)
         self.assertEqual(capability["default_action"], "route")
         self.assertNotIn("direct_message", capability["actions"])
         self.assertIn("route", capability["actions"])
         self.assertTrue(capability["features"]["route_hint_mentions"])
         self.assertFalse(capability["features"]["direct_message_mentions"])
+        self.assertTrue(capability["features"]["durable_route_grants"])
+        self.assertTrue(capability["features"]["agent_cross_chat_routes"])
+        self.assertFalse(
+            capability["features"]["agent_ambient_local_handoffs"]
+        )
+        self.assertEqual(capability["agent_routes"]["policy"], "default_deny")
+        self.assertEqual(
+            capability["agent_routes"]["client_capability"],
+            "agent_cross_chat_routes_v2",
+        )
 
 
 if __name__ == "__main__":

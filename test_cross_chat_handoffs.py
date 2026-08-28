@@ -2818,14 +2818,14 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             if lock.locked():
                 lock.release()
 
-    def test_exchange_capability_v6_route_hint_contract_is_exact(self) -> None:
+    def test_exchange_capability_v7_default_deny_contract_is_exact(self) -> None:
         with (
             patch.object(agent_server, "CODEX_TRANSPORT", agent_server.CODEX_TRANSPORT_APP_SERVER),
             patch.object(agent_server, "CLAUDE_TRANSPORT", agent_server.CLAUDE_TRANSPORT_AGENT_SDK),
         ):
             capability = agent_server.cross_chat_handoffs_capability()
         self.assertTrue(capability["available"])
-        self.assertEqual(capability["version"], 6)
+        self.assertEqual(capability["version"], 7)
         self.assertEqual(
             capability["actions"],
             [
@@ -2841,39 +2841,35 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(capability["features"]["direct_message_mentions"])
         self.assertTrue(capability["features"]["route_mentions"])
         self.assertTrue(capability["features"]["route_hint_mentions"])
-        self.assertFalse(capability["features"]["agent_cross_chat_routes"])
-        self.assertTrue(
+        self.assertTrue(capability["features"]["durable_route_grants"])
+        self.assertTrue(capability["features"]["agent_cross_chat_routes"])
+        self.assertFalse(
             capability["features"]["agent_ambient_local_handoffs"]
         )
         self.assertEqual(
             capability["ambient_local_handoffs"]["policy"],
-            "automatic",
+            "default_deny",
         )
         self.assertEqual(
             capability["ambient_local_handoffs"]["scope"],
-            "all_same_server_chats",
+            "explicit_source_grants",
         )
         self.assertFalse(
             capability["ambient_local_handoffs"]["setup_required"]
         )
-        self.assertTrue(capability["ambient_local_handoffs"]["enabled"])
+        self.assertFalse(capability["ambient_local_handoffs"]["enabled"])
         self.assertEqual(
             capability["agent_routes"]["client_capability"],
             agent_server.AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY,
         )
         self.assertEqual(capability["agent_routes"]["max_routes_per_chat"], 16)
         self.assertFalse(capability["agent_routes"]["transcript_access"])
-        with patch.object(
-            agent_server,
-            "AGENT_AMBIENT_LOCAL_HANDOFFS_ENABLED",
-            False,
-        ):
-            rollback = agent_server.cross_chat_handoffs_capability()
-        self.assertTrue(rollback["features"]["agent_cross_chat_routes"])
-        self.assertFalse(
-            rollback["features"]["agent_ambient_local_handoffs"]
+        self.assertEqual(capability["agent_routes"]["policy"], "default_deny")
+        self.assertTrue(capability["agent_routes"]["durable"])
+        self.assertTrue(capability["agent_routes"]["directional"])
+        self.assertTrue(
+            capability["agent_routes"]["revoke_requires_revision"]
         )
-        self.assertFalse(rollback["ambient_local_handoffs"]["enabled"])
 
     async def test_request_reply_capability_uses_exact_exchange_generation(self) -> None:
         reference = agent_server.ChatReference(

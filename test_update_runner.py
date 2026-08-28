@@ -602,6 +602,11 @@ class UpdateRunnerTests(unittest.TestCase):
         self.assertEqual(statuses[-1]["phase"], "complete")
         self.assertEqual(statuses[-1]["installed_version"], "1.2.4")
         self.assertEqual(statuses[-1]["track"], "stable")
+        self.assertIsNone(statuses[-1]["heartbeat_at"])
+        self.assertIsNone(statuses[-1]["elapsed_seconds"])
+        self.assertIsNone(statuses[-1]["error_code"])
+        self.assertIsNone(statuses[-1]["error_action"])
+        self.assertIsNone(statuses[-1]["retryable"])
         idle_check.assert_called_once_with(
             7850,
             token="",

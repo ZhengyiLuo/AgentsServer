@@ -1080,6 +1080,11 @@ def run_update(args: argparse.Namespace) -> None:
         message=f"AgentsServer {version} is installed and healthy.",
         track=track,
         installed_version=version,
+        heartbeat_at=None,
+        elapsed_seconds=None,
+        error_code=None,
+        error_action=None,
+        retryable=None,
         finished_at=utc_now(),
     )
 

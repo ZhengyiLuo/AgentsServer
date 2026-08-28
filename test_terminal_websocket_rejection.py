@@ -1,6 +1,7 @@
 import asyncio
+import threading
 import unittest
-from unittest.mock import ANY, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import agent_server
 
@@ -32,6 +33,23 @@ class ScrollDisconnectWebSocket(RecordingWebSocket):
 
     async def receive(self) -> dict:
         return self.messages.pop(0)
+
+
+class HeldTerminalWebSocket(RecordingWebSocket):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ready = asyncio.Event()
+
+    async def send_json(self, _payload: dict) -> None:
+        self.calls.append(("ready", None))
+        self.ready.set()
+
+    async def send_bytes(self, _payload: bytes) -> None:
+        self.calls.append(("data", None))
+
+    async def receive(self) -> dict:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
 
 
 class TerminalWebSocketRejectionTests(unittest.IsolatedAsyncioTestCase):
@@ -104,6 +122,178 @@ class TerminalWebSocketRejectionTests(unittest.IsolatedAsyncioTestCase):
         scroll.assert_called_once_with(session_id, -4, managed=False)
         exit_scroll.assert_called_once_with(session_id)
         stop_client.assert_called_once_with(ANY, 91)
+
+    async def test_update_fence_drains_attachment_and_rejects_reconnect(self) -> None:
+        session_id = "terminal-update-drain"
+        registry = agent_server.TerminalAttachmentRegistry()
+        first = HeldTerminalWebSocket()
+        reconnect = RecordingWebSocket()
+        process = MagicMock()
+
+        async def wait_for_output(_fd: int) -> bytes:
+            await asyncio.Event().wait()
+            return b""
+
+        with patch.object(agent_server, "TERMINAL_ATTACHMENTS", registry), \
+             patch.object(agent_server, "websocket_authorized", return_value=True), \
+             patch.dict(
+                 agent_server.STORE.sessions,
+                 {session_id: {"id": session_id, "archived": False, "cwd": "/workspace"}},
+                 clear=True,
+             ), \
+             patch.object(
+                 agent_server,
+                 "spawn_terminal_client",
+                 return_value=(process, 91, "zd_terminal-update-drain"),
+             ) as spawn, \
+             patch.object(agent_server, "read_terminal_output", side_effect=wait_for_output), \
+             patch.object(agent_server, "stop_terminal_client") as stop_client, \
+             patch.object(agent_server, "run_tmux") as run_tmux, \
+             patch.object(
+                 agent_server,
+                 "managed_server_update_blocks_work",
+                 side_effect=[False, True],
+             ):
+            owner = asyncio.create_task(
+                agent_server.session_terminal(session_id, first)  # type: ignore[arg-type]
+            )
+            await asyncio.wait_for(first.ready.wait(), timeout=1)
+
+            retired = await registry.close_admission_and_all()
+            await asyncio.gather(owner, return_exceptions=True)
+            await agent_server.session_terminal(  # type: ignore[arg-type]
+                session_id,
+                reconnect,
+            )
+
+        self.assertEqual(retired, 1)
+        spawn.assert_called_once()
+        stop_client.assert_called()
+        run_tmux.assert_not_called()
+        self.assertEqual(reconnect.calls, [
+            ("accept", None),
+            ("close", 1012),
+        ])
+        self.assertEqual(
+            await registry.snapshot(),
+            {
+                "admission_open": False,
+                "permanently_closed": False,
+                "active_connections": 0,
+                "active_sessions": 0,
+            },
+        )
+
+    async def test_update_fence_reaps_cross_device_spawn_after_double_cancel(self) -> None:
+        session_id = "terminal-cross-device-race"
+        registry = agent_server.TerminalAttachmentRegistry()
+        websocket = HeldTerminalWebSocket()
+        process = MagicMock()
+        spawn_entered = threading.Event()
+        release_spawn = threading.Event()
+
+        def slow_spawn(*_args):
+            spawn_entered.set()
+            self.assertTrue(release_spawn.wait(timeout=2))
+            return process, 92, "zd_terminal-cross-device-race"
+
+        async def wait_for_output(_fd: int) -> bytes:
+            await asyncio.Event().wait()
+            return b""
+
+        with patch.object(agent_server, "TERMINAL_ATTACHMENTS", registry), \
+             patch.object(agent_server, "websocket_authorized", return_value=True), \
+             patch.dict(
+                 agent_server.STORE.sessions,
+                 {session_id: {"id": session_id, "archived": False, "cwd": "/workspace"}},
+                 clear=True,
+             ), \
+             patch.object(agent_server, "spawn_terminal_client", side_effect=slow_spawn), \
+             patch.object(agent_server, "read_terminal_output", side_effect=wait_for_output), \
+             patch.object(agent_server, "stop_terminal_client") as stop_client:
+            owner = asyncio.create_task(
+                agent_server.session_terminal(session_id, websocket)  # type: ignore[arg-type]
+            )
+            self.assertTrue(
+                await asyncio.to_thread(spawn_entered.wait, 1),
+            )
+            drain = asyncio.create_task(registry.close_admission_and_all())
+            async def cleanup_task_is_owned() -> bool:
+                async with registry._lock:
+                    entry = registry._attachments.get(websocket)
+                    return bool(
+                        entry
+                        and isinstance(entry.get("cleanup_task"), asyncio.Task)
+                    )
+
+            async def wait_for_cleanup_owner() -> None:
+                while not await cleanup_task_is_owned():
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(wait_for_cleanup_owner(), timeout=1)
+            # Simulate a second device/lifecycle cancellation while the first
+            # cancellation is already waiting for the to-thread spawn result.
+            owner.cancel()
+            release_spawn.set()
+            await asyncio.wait_for(drain, timeout=2)
+            await asyncio.gather(owner, return_exceptions=True)
+
+        stop_client.assert_called_once_with(process, 92)
+        self.assertEqual(
+            (await registry.snapshot())["active_connections"],
+            0,
+        )
+
+    async def test_terminal_admission_self_heals_after_update_is_terminal(self) -> None:
+        registry = agent_server.TerminalAttachmentRegistry()
+        websocket = RecordingWebSocket()
+
+        with patch.object(
+            agent_server,
+            "managed_server_update_blocks_work",
+            return_value=False,
+        ), patch.object(
+            agent_server,
+            "managed_server_restart_blocks_work",
+            return_value=False,
+        ):
+            await registry.close_admission_and_all()
+            reserved = await registry.reserve("recovered-terminal", websocket)  # type: ignore[arg-type]
+
+        self.assertTrue(reserved)
+        self.assertTrue((await registry.snapshot())["admission_open"])
+        await registry.release(websocket)  # type: ignore[arg-type]
+
+    async def test_lifespan_terminal_shutdown_cannot_self_heal(self) -> None:
+        registry = agent_server.TerminalAttachmentRegistry()
+        websocket = RecordingWebSocket()
+
+        with patch.object(
+            agent_server,
+            "managed_server_update_blocks_work",
+            return_value=False,
+        ), patch.object(
+            agent_server,
+            "managed_server_restart_blocks_work",
+            return_value=False,
+        ):
+            await registry.close_admission_and_all(permanent=True)
+            reserved = await registry.reserve("shutdown-terminal", websocket)  # type: ignore[arg-type]
+            reopened = await registry.reopen_if_update_inactive(
+                {"phase": "failed"}
+            )
+
+        self.assertFalse(reserved)
+        self.assertFalse(reopened)
+        self.assertEqual(
+            await registry.snapshot(),
+            {
+                "admission_open": False,
+                "permanently_closed": True,
+                "active_connections": 0,
+                "active_sessions": 0,
+            },
+        )
 
 
 if __name__ == "__main__":

@@ -5042,6 +5042,17 @@ class AgentUpdateJobRequest(UpdateJobRequest):
 class ServerUpdateRequest(BaseModel):
     version: str | None = None
     track: Literal["stable", "beta"] | None = None
+    when_idle: bool = False
+
+
+class ServerUpdateCancelRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    schedule_id: str = Field(
+        min_length=32,
+        max_length=32,
+        pattern=r"^[0-9a-f]{32}$",
+    )
 
 
 class ServerUpdateCheckRequest(BaseModel):
@@ -11070,7 +11081,7 @@ async def enqueue_turn(
         )
     )
     async with QUEUE_LOCK:
-        update_blocker = managed_server_update_blocker()
+        update_blocker = managed_server_update_admission_blocker()
         if update_blocker:
             raise HTTPException(status_code=503, detail=update_blocker)
         try:
@@ -14980,7 +14991,7 @@ async def _run_queued_turn_now_once(
     native_steer_queue = active_turn.get("native_steer_queue")
     remaining: int
     async with QUEUE_LOCK:
-        update_blocker = managed_server_update_blocker()
+        update_blocker = managed_server_update_admission_blocker()
         if update_blocker:
             raise HTTPException(status_code=503, detail=update_blocker)
         if session_id in STEERING_SESSIONS or RUN_NOW_TURNS.get(session_id) is not None:
@@ -17702,7 +17713,10 @@ class TerminalAttachmentRegistry:
         if owner_task is None:
             raise RuntimeError("terminal attachment has no owning task")
         async with self._lock:
-            update_blocked = managed_server_update_blocks_work()
+            update_blocked = (
+                managed_server_update_blocks_work()
+                or managed_server_update_is_pending()
+            )
             restart_blocked = managed_server_restart_blocks_work()
             if (
                 not self._permanently_closed
@@ -32728,7 +32742,7 @@ def host_pressure_snapshot() -> dict[str, Any]:
 
 async def scheduled_job_blocker(session_id: str) -> str | None:
     async with ACTIVE_LOCK:
-        update_blocker = managed_server_update_blocker()
+        update_blocker = managed_server_update_admission_blocker()
         if update_blocker:
             return update_blocker
         if session_id in BUSY_SESSIONS:
@@ -32752,7 +32766,7 @@ async def scheduled_job_blocker(session_id: str) -> str | None:
 
 async def turn_start_blocker(*, ignore_session_id: str | None = None) -> str | None:
     async with ACTIVE_LOCK:
-        update_blocker = managed_server_update_blocker()
+        update_blocker = managed_server_update_admission_blocker()
         if update_blocker:
             return update_blocker
         active_count = len(BUSY_SESSIONS - ({ignore_session_id} if ignore_session_id else set()))
@@ -35849,7 +35863,18 @@ async def acquire_codex_control_thread(
     maintenance_reserved = False
     active_thread_id = ""
     async with ACTIVE_LOCK:
-        update_blocker = managed_server_update_blocker()
+        # Pending reservations may not create provider maintenance or a new
+        # control turn. A control explicitly targeting the already-active
+        # app-server thread remains available so that work can finish.
+        update_blocker = (
+            managed_server_update_blocker()
+            if (
+                session_id in BUSY_SESSIONS
+                and allow_active_goal_mutation
+                and not reserve_session
+            )
+            else managed_server_update_admission_blocker()
+        )
         if update_blocker:
             raise HTTPException(status_code=503, detail=update_blocker)
         if CODEX_GOALS_RECONFIGURING:
@@ -45238,7 +45263,7 @@ async def _start_turn_locked(
                 )
             )
     async with ACTIVE_LOCK:
-        update_blocker = managed_server_update_blocker()
+        update_blocker = managed_server_update_admission_blocker()
         if update_blocker:
             raise HTTPException(status_code=503, detail=update_blocker)
         requested_backend = str(
@@ -45925,14 +45950,21 @@ async def _start_turn_locked(
 
 
 SERVER_UPDATE_ACTIVE_PHASES = {"starting", "checking", "downloading", "verifying", "installing", "restarting"}
+SERVER_UPDATE_PENDING_PHASE = "pending"
+SERVER_UPDATE_PENDING_POLL_SECONDS = 1.0
 SERVER_UPDATE_PER_RUN_STATUS_FIELDS = (
+    "schedule_id",
     "update_id",
     "target_version",
     "installed_version",
+    "pending_at",
     "started_at",
     "finished_at",
     "heartbeat_at",
     "elapsed_seconds",
+    "when_idle",
+    "cancelable",
+    "blocker_counts",
     "team_hub_id",
     "team_hub_host_server_identity",
     "team_hub_snapshot_generation",
@@ -45973,12 +46005,54 @@ def managed_server_update_blocks_work(
     return str(current.get("phase") or "") in SERVER_UPDATE_ACTIVE_PHASES
 
 
+def managed_server_update_is_pending(
+    status: dict[str, Any] | None = None,
+) -> bool:
+    """Return whether a durable update reservation is draining new work."""
+
+    current = status if status is not None else read_server_update_status()
+    return str(current.get("phase") or "") == SERVER_UPDATE_PENDING_PHASE
+
+
 def managed_server_update_blocker() -> str | None:
     if managed_server_update_blocks_work():
         return "AgentsServer is preparing a managed update"
     if managed_server_restart_blocks_work():
         return "AgentsServer is restarting"
     return None
+
+
+def managed_server_update_admission_blocker() -> str | None:
+    """Fence work that would prevent a pending update from reaching idle.
+
+    Pending is deliberately separate from the broad active-update fence.
+    Existing turns must retain approval, interaction, and Stop controls so they
+    can finish naturally; only new work reservations use this predicate.
+    """
+
+    broad_blocker = managed_server_update_blocker()
+    if broad_blocker:
+        return broad_blocker
+    if managed_server_update_is_pending():
+        return "AgentsServer is preparing a managed update"
+    return None
+
+
+def managed_server_update_pending_completion_route(
+    method: str,
+    path: str,
+) -> bool:
+    """Allow controls that help an already-active turn reach idle."""
+
+    if method.upper() != "POST":
+        return False
+    return bool(
+        re.fullmatch(r"/api/sessions/[^/]+/stop", path)
+        or re.fullmatch(
+            r"/api/sessions/[^/]+/(?:codex|claude)/interactions/[^/]+/resolve",
+            path,
+        )
+    )
 
 
 def managed_server_restart_is_planned() -> bool:
@@ -46674,6 +46748,61 @@ def server_update_work_message(
     )
 
 
+def server_update_blocker_counts(
+    active_session_ids: list[str],
+    queued_turn_count: int,
+    provider_work_labels: list[str] | None = None,
+    mutation_count: int = 0,
+) -> dict[str, int]:
+    """Return the bounded public blocker summary for a pending update."""
+
+    return {
+        "active_runs": max(0, len(active_session_ids)),
+        "queued_turns": max(0, int(queued_turn_count)),
+        "provider_background_tasks": max(
+            0,
+            len(provider_work_labels or []),
+        ),
+        "in_flight_server_changes": max(0, int(mutation_count)),
+    }
+
+
+def server_update_has_blockers(blocker_counts: dict[str, int]) -> bool:
+    return any(max(0, int(value)) for value in blocker_counts.values())
+
+
+def server_update_pending_message(
+    target_version: str,
+    blocker_counts: dict[str, int],
+) -> str:
+    waiting = sum(max(0, int(value)) for value in blocker_counts.values())
+    if waiting:
+        return (
+            f"AgentsServer {target_version} is scheduled and will install "
+            "when current work finishes."
+        )
+    return f"AgentsServer {target_version} is scheduled and ready to start."
+
+
+def server_update_error_detail(
+    code: str,
+    message: str,
+    *,
+    action: str | None = None,
+    retryable: bool = False,
+    **details: Any,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "code": code,
+        "message": message[:500],
+        "retryable": retryable,
+    }
+    if action:
+        result["action"] = action[:500]
+    result.update(details)
+    return result
+
+
 def update_blocking_queued_turn_count_locked() -> int:
     """Count only queue entries that are not yet restart-durable.
 
@@ -46989,6 +47118,61 @@ def finalize_abandoned_server_update(status: dict[str, Any]) -> dict[str, Any]:
         )
 
 
+def reconcile_pending_server_update_after_startup(
+    status: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate a durable idle reservation before its waiter is re-armed."""
+
+    if not managed_server_update_is_pending(status):
+        return status
+    schedule_id = str(status.get("schedule_id") or "").strip()
+    target = str(status.get("target_version") or "").strip()
+    track = str(status.get("track") or "").strip()
+    valid = (
+        re.fullmatch(r"[0-9a-f]{32}", schedule_id) is not None
+        and track in {"stable", "beta"}
+        and bool(target)
+        and status.get("when_idle") is True
+    )
+    if valid:
+        try:
+            version_key(target)
+        except ValueError:
+            valid = False
+    if valid and server_release_track(target) != track:
+        valid = False
+    if not valid:
+        return write_fresh_server_update_status(
+            phase="failed",
+            track=(
+                track
+                if track in {"stable", "beta"}
+                else server_release_track(SERVER_VERSION)
+            ),
+            latest_version=(target or None),
+            update_available=bool(target),
+            message=(
+                "The saved update-when-idle reservation was incomplete and "
+                "was not resumed."
+            ),
+            error_code="server_update_schedule_invalid",
+            error_action="Check for updates and schedule the update again.",
+            retryable=True,
+            finished_at=update_utc_now(),
+        )
+    if not server_release_transition_allowed(target, SERVER_VERSION, track):
+        return write_fresh_server_update_status(
+            phase="current",
+            track=track,
+            current_track=server_release_track(SERVER_VERSION),
+            latest_version=target,
+            update_available=False,
+            message=f"AgentsServer {SERVER_VERSION} is current.",
+            checked_at=update_utc_now(),
+        )
+    return status
+
+
 async def reconcile_server_update_status_after_startup() -> dict[str, Any]:
     """Resolve an update phase orphaned by a crash or power loss."""
 
@@ -46999,6 +47183,11 @@ async def reconcile_server_update_status_after_startup() -> dict[str, Any]:
                 _reconcile_server_update_team_hub_fence,
                 status,
             )
+            if managed_server_update_is_pending(status):
+                return await asyncio.to_thread(
+                    reconcile_pending_server_update_after_startup,
+                    status,
+                )
             if str(status.get("phase") or "") not in SERVER_UPDATE_ACTIVE_PHASES:
                 return status
             if await asyncio.to_thread(server_update_is_active, status):
@@ -47401,6 +47590,10 @@ async def lifespan(app: FastAPI):
     )
     JOBS.start_scheduler()
     queue_recovery_task = asyncio.create_task(recover_queued_turns_after_start())
+    server_update_pending_waiter_task = asyncio.create_task(
+        server_update_pending_waiter_loop(),
+        name="server-update-pending-waiter",
+    )
 
     async def reconcile_digests_after_queue_recovery() -> None:
         with suppress(Exception):
@@ -47505,8 +47698,11 @@ async def lifespan(app: FastAPI):
         # snapshot; otherwise it could enqueue a new retry owner after the
         # shutdown cancellation pass.
         cross_chat_recovery_task.cancel()
+        server_update_pending_waiter_task.cancel()
         with suppress(asyncio.CancelledError, Exception):
             await cross_chat_recovery_task
+        with suppress(asyncio.CancelledError, Exception):
+            await server_update_pending_waiter_task
         direct_delivery_tasks = tuple(CROSS_CHAT_DIRECT_DELIVERY_TASKS)
         for direct_delivery_task in direct_delivery_tasks:
             direct_delivery_task.cancel()
@@ -47935,6 +48131,8 @@ async def require_agent_token(request: Request, call_next):
         request.method.upper() in UNSAFE_HTTP_MUTATION_METHODS
         and request.url.path not in {
             "/api/admin/restart",
+            "/api/admin/update/cancel",
+            "/api/admin/update/check",
             "/api/admin/update/start",
         }
     )
@@ -47977,6 +48175,42 @@ async def require_agent_token(request: Request, call_next):
                 )
             return JSONResponse(
                 {"detail": "AgentsServer is preparing a managed update"},
+                status_code=409,
+            )
+        if (
+            managed_server_update_is_pending()
+            and not managed_server_update_pending_completion_route(
+                request.method,
+                request.url.path,
+            )
+        ):
+            if team_hub_route or team_hub_bootstrap_route:
+                return JSONResponse(
+                    {
+                        "error": {
+                            "code": "hub_maintenance",
+                            "message": (
+                                "Team Hub is unavailable while a server "
+                                "update waits for idle"
+                            ),
+                        }
+                    },
+                    status_code=503,
+                )
+            return JSONResponse(
+                {
+                    "detail": server_update_error_detail(
+                        "server_update_pending",
+                        (
+                            "AgentsServer is waiting for current work to finish "
+                            "before a managed update."
+                        ),
+                        action=(
+                            "Let active work finish or cancel the scheduled update."
+                        ),
+                        retryable=True,
+                    )
+                },
                 status_code=409,
             )
         UNSAFE_HTTP_MUTATIONS_IN_FLIGHT += 1
@@ -48520,9 +48754,9 @@ async def health() -> dict[str, Any]:
                 "required": False,
                 "message": "Signed Stable and Beta AgentsServer channels are available.",
                 "action": None,
-                # v5 fences terminal admission and drains every tracked tmux
-                # attachment before the final service-cgroup proof.
-                "version": 5,
+                # v6 adds a durable update-when-idle reservation with a narrow
+                # admission fence; v5 already drains tracked terminal clients.
+                "version": 6,
                 "tracks": ["stable", "beta"],
             },
             "tmux": tmux,
@@ -48846,6 +49080,9 @@ async def reserve_codex_goals_reconfiguration() -> None:
 
     global CODEX_GOALS_RECONFIGURING
     async with ACTIVE_LOCK:
+        update_blocker = managed_server_update_admission_blocker()
+        if update_blocker:
+            raise HTTPException(status_code=503, detail=update_blocker)
         if CODEX_GOALS_RECONFIGURING:
             raise HTTPException(
                 status_code=409,
@@ -49228,6 +49465,16 @@ async def restart_server_endpoint(
                     action="Reconnect or reinstall the supported AgentsServer user service.",
                 ),
             )
+        if managed_server_update_is_pending():
+            raise HTTPException(
+                status_code=409,
+                detail=server_restart_error_detail(
+                    "server_update_pending",
+                    "AgentsServer cannot restart while an update is waiting for idle.",
+                    action="Cancel the scheduled update before restarting.",
+                    retryable=True,
+                ),
+            )
         if managed_server_update_blocks_work():
             raise HTTPException(
                 status_code=409,
@@ -49253,6 +49500,21 @@ async def restart_server_endpoint(
                                 "server_restart_in_progress",
                                 "Another AgentsServer restart is already in progress.",
                                 action="Wait for the server to reconnect before retrying.",
+                                retryable=True,
+                            ),
+                        )
+                    if managed_server_update_is_pending():
+                        raise HTTPException(
+                            status_code=409,
+                            detail=server_restart_error_detail(
+                                "server_update_pending",
+                                (
+                                    "AgentsServer cannot restart while an update "
+                                    "is waiting for idle."
+                                ),
+                                action=(
+                                    "Cancel the scheduled update before restarting."
+                                ),
                                 retryable=True,
                             ),
                         )
@@ -49466,6 +49728,8 @@ async def check_server_update(
                 detail="AgentsServer is restarting",
             )
         status = read_server_update_status()
+        if managed_server_update_is_pending(status):
+            return status
         if str(status.get("phase") or "") in SERVER_UPDATE_ACTIVE_PHASES:
             updater_active = await asyncio.to_thread(server_update_is_active, status)
             if (
@@ -49532,8 +49796,11 @@ async def check_server_update(
         )
 
 
-@app.post("/api/admin/update/start")
-async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
+async def _start_server_update(
+    body: ServerUpdateRequest,
+    *,
+    expected_schedule_id: str | None = None,
+) -> dict[str, Any]:
     async with SERVER_UPDATE_OPERATION_LOCK:
         if managed_server_restart_blocks_work():
             raise HTTPException(
@@ -49562,6 +49829,17 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                     status_code=503,
                     detail="the previous server update could not be safely finalized",
                 ) from exc
+        pending_schedule_id = (
+            str(status.get("schedule_id") or "").strip()
+            if managed_server_update_is_pending(status)
+            else ""
+        )
+        if (
+            expected_schedule_id is not None
+            and pending_schedule_id != expected_schedule_id
+        ):
+            # A stale waiter lost its durable compare-and-swap ownership.
+            return status
         track: Literal["stable", "beta"] = body.track or status["track"]
         requested = str(body.version or status.get("latest_version") or "").strip()
         if not requested:
@@ -49575,6 +49853,26 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                 status_code=400,
                 detail=f"the requested server version is not on the {track} track",
             )
+        if pending_schedule_id:
+            pending_matches = (
+                requested == str(status.get("target_version") or "").strip()
+                and track == status.get("track")
+            )
+            if not pending_matches or (
+                expected_schedule_id is None and not body.when_idle
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=server_update_error_detail(
+                        "server_update_pending",
+                        "A different update is already scheduled for when the server is idle.",
+                        action="Cancel the scheduled update before choosing another release.",
+                        retryable=True,
+                        schedule_id=pending_schedule_id,
+                        target_version=status.get("target_version"),
+                        track=status.get("track"),
+                    ),
+                )
         if not server_release_transition_allowed(requested, SERVER_VERSION, track):
             return write_fresh_server_update_status(
                 phase="current",
@@ -49599,28 +49897,10 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
             ensure_managed_update_tmux_isolated
         )
 
-        update_id = uuid.uuid4().hex
-        tmux_name = server_update_tmux_name(update_id)
-        command = [
-            sys.executable,
-            str(SERVER_UPDATE_RUNNER),
-            "--status-file", str(SERVER_UPDATE_STATUS_FILE),
-            "--public-key", str(SERVER_UPDATE_PUBLIC_KEY),
-            "--port", str(SERVER_PORT),
-            "--bind", SERVER_BIND_ADDRESS,
-            "--expected-version", requested,
-            "--current-version", SERVER_VERSION,
-            "--track", track,
-            "--update-id", update_id,
-        ]
-        if service_cgroup is not None:
-            command.extend(["--expected-service-cgroup", service_cgroup])
+        update_id = ""
+        tmux_name = ""
+        command: list[str] = []
         auth_token_file: Path | None = None
-        if AGENT_TOKEN:
-            auth_token_file = SERVER_UPDATE_STATUS_FILE.with_name(
-                f".server-update-{update_id}.auth.json"
-            )
-            command.extend(["--auth-token-file", str(auth_token_file)])
         channel_switch = track != server_release_track(SERVER_VERSION)
         hub_snapshot: Path | None = None
         # Close admission and establish the durable update phase while holding
@@ -49635,17 +49915,62 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                     )
                     queued_turn_count = update_blocking_queued_turn_count_locked()
                     mutation_count = UNSAFE_HTTP_MUTATIONS_IN_FLIGHT
-                    provider_work_labels = (
-                        []
-                        if active_session_ids or queued_turn_count or mutation_count
-                        else active_provider_background_work_labels()
+                    duplicate_provider_labels = {
+                        *(f"active chat {session_id}" for session_id in BUSY_SESSIONS),
+                        *(
+                            f"Codex maintenance for {session_id}"
+                            for session_id in SERVER_MAINTENANCE_SESSIONS
+                        ),
+                    }
+                    provider_work_labels = [
+                        label
+                        for label in active_provider_background_work_labels()
+                        if label not in duplicate_provider_labels
+                    ]
+                    blocker_counts = server_update_blocker_counts(
+                        active_session_ids,
+                        queued_turn_count,
+                        provider_work_labels,
+                        mutation_count,
                     )
-                    if (
-                        active_session_ids
-                        or queued_turn_count
-                        or provider_work_labels
-                        or mutation_count
-                    ):
+                    if server_update_has_blockers(blocker_counts):
+                        if body.when_idle:
+                            schedule_id = (
+                                expected_schedule_id
+                                or pending_schedule_id
+                                or uuid.uuid4().hex
+                            )
+                            if (
+                                schedule_id == pending_schedule_id
+                                and status.get("blocker_counts")
+                                == blocker_counts
+                            ):
+                                return status
+                            pending_at = (
+                                status.get("pending_at")
+                                if schedule_id == pending_schedule_id
+                                else update_utc_now()
+                            )
+                            pending_status = write_fresh_server_update_status(
+                                schedule_id=schedule_id,
+                                phase=SERVER_UPDATE_PENDING_PHASE,
+                                track=track,
+                                current_track=server_release_track(SERVER_VERSION),
+                                channel_switch=channel_switch,
+                                target_version=requested,
+                                latest_version=requested,
+                                update_available=True,
+                                when_idle=True,
+                                cancelable=True,
+                                pending_at=pending_at,
+                                blocker_counts=blocker_counts,
+                                message=server_update_pending_message(
+                                    requested,
+                                    blocker_counts,
+                                ),
+                                checked_at=status.get("checked_at"),
+                            )
+                            return pending_status
                         raise HTTPException(
                             status_code=409,
                             detail=server_update_work_message(
@@ -49654,6 +49979,31 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                                 provider_work_labels,
                                 mutation_count,
                             ),
+                        )
+                    update_id = uuid.uuid4().hex
+                    tmux_name = server_update_tmux_name(update_id)
+                    command = [
+                        sys.executable,
+                        str(SERVER_UPDATE_RUNNER),
+                        "--status-file", str(SERVER_UPDATE_STATUS_FILE),
+                        "--public-key", str(SERVER_UPDATE_PUBLIC_KEY),
+                        "--port", str(SERVER_PORT),
+                        "--bind", SERVER_BIND_ADDRESS,
+                        "--expected-version", requested,
+                        "--current-version", SERVER_VERSION,
+                        "--track", track,
+                        "--update-id", update_id,
+                    ]
+                    if service_cgroup is not None:
+                        command.extend(
+                            ["--expected-service-cgroup", service_cgroup]
+                        )
+                    if AGENT_TOKEN:
+                        auth_token_file = SERVER_UPDATE_STATUS_FILE.with_name(
+                            f".server-update-{update_id}.auth.json"
+                        )
+                        command.extend(
+                            ["--auth-token-file", str(auth_token_file)]
                         )
                     expected_server_identity = server_identity()
                     hub_capability = TEAM_HUB_RUNTIME.capability()
@@ -49753,6 +50103,7 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                         )
                     try:
                         status = write_fresh_server_update_status(
+                            schedule_id=(pending_schedule_id or None),
                             update_id=update_id,
                             phase="starting",
                             track=track,
@@ -49761,6 +50112,19 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                             target_version=requested,
                             latest_version=requested,
                             update_available=True,
+                            when_idle=bool(pending_schedule_id),
+                            cancelable=False,
+                            pending_at=(
+                                status.get("pending_at")
+                                if pending_schedule_id
+                                else None
+                            ),
+                            blocker_counts=server_update_blocker_counts(
+                                [],
+                                0,
+                                [],
+                                0,
+                            ),
                             team_hub_id=expected_hub_id,
                             team_hub_host_server_identity=(
                                 expected_server_identity
@@ -49912,6 +50276,110 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
             await fail_runner_launch(exc)
             raise HTTPException(status_code=500, detail="could not start detached updater") from exc
         return status
+
+
+@app.post("/api/admin/update/start")
+async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
+    return await _start_server_update(body)
+
+
+@app.post("/api/admin/update/cancel")
+async def cancel_server_update(
+    body: ServerUpdateCancelRequest,
+) -> dict[str, Any]:
+    """Cancel exactly one durable idle reservation before launch begins."""
+
+    async with SERVER_UPDATE_OPERATION_LOCK:
+        status = read_server_update_status()
+        actual_schedule_id = str(status.get("schedule_id") or "").strip()
+        if actual_schedule_id != body.schedule_id:
+            raise HTTPException(
+                status_code=409,
+                detail=server_update_error_detail(
+                    "server_update_changed",
+                    "The scheduled server update changed before cancellation.",
+                    action="Refresh update status before trying again.",
+                    retryable=True,
+                    phase=status.get("phase"),
+                    schedule_id=(actual_schedule_id or None),
+                ),
+            )
+        if not managed_server_update_is_pending(status):
+            raise HTTPException(
+                status_code=409,
+                detail=server_update_error_detail(
+                    "server_update_not_cancelable",
+                    "The server update has already started and cannot be canceled.",
+                    action="Wait for the managed update to finish.",
+                    retryable=False,
+                    phase=status.get("phase"),
+                    schedule_id=actual_schedule_id,
+                    update_id=status.get("update_id"),
+                ),
+            )
+        target = str(status.get("target_version") or "").strip()
+        track: Literal["stable", "beta"] = (
+            "beta" if status.get("track") == "beta" else "stable"
+        )
+        cancelled = write_fresh_server_update_status(
+            phase="available",
+            track=track,
+            current_track=server_release_track(SERVER_VERSION),
+            latest_version=(target or None),
+            update_available=bool(target),
+            channel_switch=(track != server_release_track(SERVER_VERSION)),
+            message=(
+                f"Scheduled update to AgentsServer {target} was canceled."
+                if target
+                else "The scheduled server update was canceled."
+            ),
+            checked_at=status.get("checked_at"),
+        )
+        await TERMINAL_ATTACHMENTS.reopen_if_update_inactive(cancelled)
+        return cancelled
+
+
+async def advance_pending_server_update_once() -> dict[str, Any]:
+    """Advance the exact durable reservation if the server has become idle."""
+
+    status = read_server_update_status()
+    if not managed_server_update_is_pending(status):
+        return status
+    schedule_id = str(status.get("schedule_id") or "").strip()
+    target = str(status.get("target_version") or "").strip()
+    track: Literal["stable", "beta"] = (
+        "beta" if status.get("track") == "beta" else "stable"
+    )
+    if not schedule_id or not target:
+        return await asyncio.to_thread(
+            reconcile_pending_server_update_after_startup,
+            status,
+        )
+    return await _start_server_update(
+        ServerUpdateRequest(
+            version=target,
+            track=track,
+            when_idle=True,
+        ),
+        expected_schedule_id=schedule_id,
+    )
+
+
+async def server_update_pending_waiter_loop() -> None:
+    """Continuously re-arm durable idle reservations across server restarts."""
+
+    while True:
+        try:
+            if managed_server_update_is_pending():
+                await advance_pending_server_update_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "pending server update advance deferred error_type=%s",
+                type(exc).__name__,
+            )
+        await asyncio.sleep(SERVER_UPDATE_PENDING_POLL_SECONDS)
 
 
 @app.get("/api/diagnostics/host")
@@ -51018,6 +51486,9 @@ async def reload_session_provider(session_id: str) -> dict[str, Any]:
         maintenance_reserved = False
         try:
             async with ACTIVE_LOCK:
+                update_blocker = managed_server_update_admission_blocker()
+                if update_blocker:
+                    raise HTTPException(status_code=503, detail=update_blocker)
                 provider_starting = session_registry_has_live_tasks(
                     SESSION_TURN_TASKS,
                     session_id,
@@ -51238,7 +51709,7 @@ async def load_codex_runtime(session_id: str) -> dict[str, Any]:
                     status_code=409,
                     detail="wait for the active Codex turn to finish",
                 )
-            update_blocker = managed_server_update_blocker()
+            update_blocker = managed_server_update_admission_blocker()
             if update_blocker:
                 raise HTTPException(status_code=503, detail=update_blocker)
 
@@ -51265,7 +51736,7 @@ async def load_codex_runtime(session_id: str) -> dict[str, Any]:
                         status_code=409,
                         detail="wait for the active Codex turn to finish",
                     )
-                update_blocker = managed_server_update_blocker()
+                update_blocker = managed_server_update_admission_blocker()
                 if update_blocker:
                     raise HTTPException(status_code=503, detail=update_blocker)
                 SERVER_MAINTENANCE_SESSIONS.add(session_id)
@@ -51671,7 +52142,7 @@ async def manage_claude_mcp(
                             retryable=True,
                         ),
                     )
-                update_blocker = managed_server_update_blocker()
+                update_blocker = managed_server_update_admission_blocker()
                 if update_blocker:
                     raise HTTPException(status_code=503, detail=update_blocker)
                 SERVER_MAINTENANCE_SESSIONS.add(session_id)
@@ -51882,7 +52353,7 @@ async def _get_codex_permission_profiles_locked(
     maintenance_reserved = False
     try:
         async with ACTIVE_LOCK:
-            update_blocker = managed_server_update_blocker()
+            update_blocker = managed_server_update_admission_blocker()
             if update_blocker:
                 raise HTTPException(status_code=503, detail=update_blocker)
             if (

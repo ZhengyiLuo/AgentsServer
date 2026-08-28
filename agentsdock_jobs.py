@@ -394,7 +394,7 @@ def build_parser() -> argparse.ArgumentParser:
     create_parser.add_argument("--loop", action="store_true", help="repeat at the interval")
     create_parser.add_argument("--max-runs", type=int)
     create_parser.add_argument("--disabled", action="store_true")
-    create_parser.add_argument("--backend", choices=("codex", "claude"))
+    create_parser.add_argument("--backend", choices=("codex", "claude", "cursor"))
     create_parser.add_argument(
         "--context-mode",
         choices=("chat", "standalone"),
@@ -426,7 +426,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_limit_group = update_parser.add_mutually_exclusive_group()
     run_limit_group.add_argument("--max-runs", type=int)
     run_limit_group.add_argument("--unlimited", action="store_true", help="clear a finite run limit")
-    update_parser.add_argument("--backend", choices=("codex", "claude"))
+    update_parser.add_argument("--backend", choices=("codex", "claude", "cursor"))
     update_parser.add_argument(
         "--context-mode",
         choices=("chat", "standalone"),

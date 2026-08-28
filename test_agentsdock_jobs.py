@@ -485,6 +485,36 @@ class AgentsDockJobsCLITests(unittest.TestCase):
             ]))
             self.assertEqual(calls[-1][2], {"context_mode": "chat"})
 
+    def test_create_and_update_accept_cursor_backend(self) -> None:
+        parser = agentsdock_jobs.build_parser()
+        calls: list[tuple[str, str, object]] = []
+
+        def request(method: str, path: str, payload=None):
+            calls.append((method, path, payload))
+            if method == "GET":
+                return {"jobs": [{"id": "job_1", "session_id": "sess/chat"}]}
+            return {"job": {"id": "job_1", "session_id": "sess/chat"}}
+
+        with (
+            patch.dict(os.environ, self.environment(), clear=True),
+            patch.object(agentsdock_jobs, "api_request", request),
+        ):
+            agentsdock_jobs.command_create(parser.parse_args([
+                "create",
+                "--title", "Cursor report",
+                "--prompt", "Report",
+                "--interval-seconds", "3600",
+                "--backend", "cursor",
+            ]))
+            self.assertEqual(calls[-1][2]["backend"], "cursor")
+
+            agentsdock_jobs.command_update(parser.parse_args([
+                "update",
+                "job_1",
+                "--backend", "cursor",
+            ]))
+            self.assertEqual(calls[-1][2], {"backend": "cursor"})
+
     def test_update_rrule_uses_scoped_endpoint_and_sets_kind(self) -> None:
         parser = agentsdock_jobs.build_parser()
         args = parser.parse_args([

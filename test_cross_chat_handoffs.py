@@ -2109,7 +2109,7 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             agent_server.is_agent_helper_route("POST", "/api/agent/future-route")
         )
 
-    async def test_internal_target_admission_is_hidden_from_all_client_generations(self) -> None:
+    async def test_internal_target_admission_has_safe_fifo_queue_projection(self) -> None:
         internal = {
             "id": "internal-start",
             "seq": 2,
@@ -2133,8 +2133,14 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         async with agent_server.QUEUE_LOCK:
             agent_server.QUEUED_TURNS["target"] = agent_server.deque([
                 {
+                    "queued_id": "queued_secure_peer",
+                    "prompt": "opaque remote envelope",
+                    "purpose": "secure_peer_handoff_delivery",
+                },
+                {
                     "queued_id": "queued_internal",
-                    "prompt": "internal",
+                    "prompt": "private provider wrapper",
+                    "display_prompt": "Agent-authored same-server handoff",
                     "purpose": "cross_chat_handoff_delivery",
                     "cross_chat_envelope_id": "handoff_hidden",
                 },
@@ -2152,7 +2158,18 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
                 },
             ])
         snapshot = await agent_server.queued_turns_snapshot("target")
-        self.assertEqual([item["queued_id"] for item in snapshot], ["queued_user"])
+        self.assertEqual(
+            [item["queued_id"] for item in snapshot],
+            ["queued_internal", "queued_user", "queued_exchange_internal"],
+        )
+        self.assertEqual([item["position"] for item in snapshot], [2, 3, 4])
+        self.assertEqual(
+            snapshot[0]["prompt"],
+            "Agent-authored same-server handoff",
+        )
+        self.assertEqual(snapshot[2]["prompt"], "Incoming cross-chat message")
+        self.assertNotIn("private provider wrapper", repr(snapshot))
+        self.assertNotIn("internal exchange", repr(snapshot))
 
         event_file = self.root / "client-events.jsonl"
         events = [

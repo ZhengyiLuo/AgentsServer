@@ -771,11 +771,12 @@ PROVIDER_SECRET_ENV_NAMES = (
 SERVER_BIND_ADDRESS = agentsdock_setting("AGENT_BIND", "0.0.0.0")
 SERVER_PORT = int(agentsdock_setting("AGENT_PORT", "7850"))
 SERVER_INSTANCE_ID = uuid.uuid4().hex
-API_CONTRACT_VERSION = 22
+API_CONTRACT_VERSION = 23
 SESSION_ORDER_STEP = 1000.0
+LOCAL_CROSS_CHAT_DELIVERY_PURPOSE = "cross_chat_handoff_delivery"
 SECURE_PEER_DELIVERY_PURPOSE = "secure_peer_handoff_delivery"
 CROSS_CHAT_DELIVERY_PURPOSES = {
-    "cross_chat_handoff_delivery",
+    LOCAL_CROSS_CHAT_DELIVERY_PURPOSE,
     SECURE_PEER_DELIVERY_PURPOSE,
 }
 FORK_INTERNAL_PURPOSES = {
@@ -14169,22 +14170,33 @@ def prepare_steered_turn(selected: dict[str, Any], interrupted: dict[str, Any] |
 def public_queued_turn(session_id: str, item: dict[str, Any], position: int) -> dict[str, Any]:
     display_file_ids = item.get("display_file_ids")
     display_prompt = item.get("display_prompt")
+    purpose = item.get("purpose")
+    # The provider prompt for an internal handoff contains authority metadata
+    # and an untrusted relay wrapper. The queue may expose that a delivery is
+    # waiting, but it must never expose the wrapper itself. Modern producers
+    # persist a safe display label; recovered legacy rows use a generic one.
+    if purpose == LOCAL_CROSS_CHAT_DELIVERY_PURPOSE:
+        public_prompt = str(display_prompt or "Incoming cross-chat message")
+        public_display_prompt: str | None = public_prompt
+    else:
+        public_prompt = str(
+            display_prompt
+            if display_prompt is not None
+            else item.get("steering_prompt") or item.get("prompt") or ""
+        )
+        public_display_prompt = item.get("display_prompt")
     delivery_uncertain = item.get("_native_delivery_fenced") is True
     paused = item.get("_paused_after_stop") is True or delivery_uncertain
     return {
         "queued_id": str(item.get("queued_id") or ""),
         "session_id": session_id,
-        "prompt": str(
-            display_prompt
-            if display_prompt is not None
-            else item.get("steering_prompt") or item.get("prompt") or ""
-        ),
+        "prompt": public_prompt,
         "file_ids": list(display_file_ids if display_file_ids is not None else item.get("file_ids") or []),
         "backend": item.get("backend"),
         "model": item.get("model"),
         "effort": item.get("effort"),
-        "display_prompt": item.get("display_prompt"),
-        "purpose": item.get("purpose"),
+        "display_prompt": public_display_prompt,
+        "purpose": purpose,
         "digest_job_id": item.get("digest_job_id"),
         "digest_detail": item.get("digest_detail"),
         "source_session_id": item.get("source_session_id"),
@@ -14219,7 +14231,10 @@ async def queued_turns_snapshot(session_id: str) -> list[dict[str, Any]]:
         public_queued_turn(session_id, item, idx + 1)
         for idx, item in enumerate(items)
         if str(item.get("queued_id") or "").strip()
-        and item.get("purpose") not in CROSS_CHAT_DELIVERY_PURPOSES
+        # Same-server deliveries are visible as immutable FIFO rows. Secure
+        # peer deliveries remain hidden because their remote envelope is not a
+        # local-chat message and has a separate lifecycle surface.
+        and item.get("purpose") != SECURE_PEER_DELIVERY_PURPOSE
     ]
 
 

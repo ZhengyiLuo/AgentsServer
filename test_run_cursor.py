@@ -882,10 +882,95 @@ while True:
         ]))
         terminal = next(event for event in events if event["type"] == "turn_finished")
         self.assertTrue(terminal["is_error"])
+        # Deltas are buffered into one reasoning block, so the ceiling is
+        # asserted on retained content rather than event count: the two
+        # deltas admitted before the ceiling are published, and the third
+        # one never reaches durable output.
+        reasoning = [
+            event for event in events if event["type"] == "reasoning_summary"
+        ]
+        self.assertEqual(len(reasoning), 1)
+        self.assertEqual(reasoning[0]["text"], "onetwo")
+        self.assertNotIn("three", reasoning[0]["text"])
+
+    async def test_thinking_deltas_publish_one_block_per_completed_thought(
+        self,
+    ) -> None:
+        # Cursor streams reasoning token-by-token. Publishing each delta as
+        # its own durable event made one thought render as a burst of
+        # answer-looking blocks that the timeline then reconciled away
+        # (the "reasoning flashes then disappears" report).
+        def delta(text: str) -> dict:
+            return {
+                "type": "thinking",
+                "subtype": "delta",
+                "text": text,
+                "session_id": "cursor-sess-test",
+            }
+
+        events = await self._run_script(_event_script([
+            _init_event(),
+            delta("The user wants "),
+            delta("a logo, so I "),
+            delta("will draft one."),
+            {
+                "type": "thinking",
+                "subtype": "completed",
+                "session_id": "cursor-sess-test",
+            },
+            delta("Second thought."),
+            {
+                "type": "thinking",
+                "subtype": "completed",
+                "session_id": "cursor-sess-test",
+            },
+            _result_event(),
+        ]))
+
+        reasoning = [
+            event for event in events if event["type"] == "reasoning_summary"
+        ]
+        self.assertEqual(len(reasoning), 2)
         self.assertEqual(
-            len([event for event in events if event["type"] == "reasoning_summary"]),
-            2,
+            reasoning[0]["text"],
+            "The user wants a logo, so I will draft one.",
         )
+        self.assertEqual(reasoning[1]["text"], "Second thought.")
+
+    async def test_buffered_reasoning_is_published_before_the_answer(
+        self,
+    ) -> None:
+        # Cursor does not always send `thinking/completed`; the pending
+        # thought must still reach the timeline, and must stay ordered
+        # before the answer it produced.
+        events = await self._run_script(_event_script([
+            _init_event(),
+            {
+                "type": "thinking",
+                "subtype": "delta",
+                "text": "Working it out.",
+                "session_id": "cursor-sess-test",
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Here it is."}],
+                },
+                "session_id": "cursor-sess-test",
+            },
+            _result_event("Here it is."),
+        ]))
+
+        ordered = [
+            event["type"] for event in events
+            if event["type"] in {"reasoning_summary", "assistant_text"}
+        ]
+        self.assertEqual(ordered, ["reasoning_summary", "assistant_text"])
+        reasoning = next(
+            event for event in events if event["type"] == "reasoning_summary"
+        )
+        self.assertEqual(reasoning["text"], "Working it out.")
 
     async def test_accumulated_assistant_fallback_is_bounded(self) -> None:
         agent_server.CURSOR_ACCUMULATED_TEXT_MAX_CHARS = 10
@@ -1081,6 +1166,41 @@ while True:
         self.assertIn("bounded fork memory sentinel", captured_prompts[1])
         self.assertNotIn("[AgentsDock provider instructions]", captured_prompts[2])
         self.assertNotIn("bounded fork memory sentinel", captured_prompts[2])
+
+
+class CursorFileDeliveryInstructionTests(unittest.TestCase):
+    def test_instructions_route_file_delivery_around_blocked_shell(self) -> None:
+        # Real failure this guards (observed in a live chat): Cursor
+        # generated an image, its publish command was rejected four times by
+        # the permission policy, and it told the user to open the file from
+        # disk instead - the image never reached the chat. Writing the
+        # manifest needs no shell, so it must be named as the route to use
+        # when the publish command cannot run.
+        manifest = Path("/tmp/agentsdock-state/sessions/chat-x/manifest.json")
+        instructions = agent_server.cursor_provider_instructions(
+            "chat-x", {}, manifest
+        )
+
+        self.assertIn(str(manifest), instructions)
+        self.assertIn('{"files":["/absolute/path.ext"]}', instructions)
+        self.assertIn("needs no shell", instructions)
+        self.assertIn("generated images", instructions)
+
+    def test_instruction_hash_changes_so_live_sessions_reinject(self) -> None:
+        # Instructions are only re-sent when their hash changes, so a policy
+        # text change has to move the hash or existing chats keep running on
+        # the old guidance forever.
+        manifest = Path("/tmp/agentsdock-state/sessions/chat-x/manifest.json")
+        with patch.object(
+            agent_server,
+            "CURSOR_FILE_DELIVERY_ADDENDUM",
+            "Delivering files: old guidance.\n",
+        ):
+            previous = agent_server.cursor_instruction_hash(
+                "chat-x", {}, manifest
+            )
+        current = agent_server.cursor_instruction_hash("chat-x", {}, manifest)
+        self.assertNotEqual(previous, current)
 
 
 if __name__ == "__main__":

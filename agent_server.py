@@ -19011,6 +19011,55 @@ def cursor_stderr_diagnostic(stderr_bytes: bytes) -> str:
     )
 
 
+def cursor_plan_mode_escape(permission_mode: str, tool_name: Any) -> bool:
+    """True when a plan-mode turn is trying to leave plan mode and act.
+
+    Reproduced live: with `--mode plan`, the CLI raised its own
+    "switch mode?" interaction, answered it without any input from this
+    headless runner, and then edited a file - so the read-only guarantee
+    the UI shows for plan mode is not enforced by the CLI itself.
+    """
+
+    if str(permission_mode or "").strip().lower() != "plan":
+        return False
+    normalized = re.sub(r"[^a-z]+", "", str(tool_name or "").lower())
+    return normalized.startswith("switchmode")
+
+
+def cursor_launch_failure_message(
+    returncode: int | None,
+    *,
+    model: str | None,
+    provider_started: bool,
+    stderr_diagnostic: str,
+) -> str:
+    """Explain a Cursor exit that produced no turn, without quoting stderr.
+
+    Cursor's stderr can echo the composed prompt, so it is never surfaced.
+    That left "Cursor exited 1. <stderr withheld>" as the entire message,
+    which tells a user nothing. The server already knows the one input most
+    likely to be at fault - the selected model - so name it: an unavailable
+    or misspelled model id fails exactly this way, and free Cursor plans
+    reject every named model outright.
+    """
+
+    base = f"Cursor exited {returncode}."
+    selected = str(model or "").strip()
+    if not provider_started and selected:
+        return (
+            f"{base} The turn never started, which usually means the "
+            f"selected model \"{selected}\" is not available to this "
+            "account - free Cursor plans can only use Auto. Switch the "
+            "model (Auto always works) and send again."
+        )
+    if not provider_started:
+        return (
+            f"{base} The turn never started. Check that the Cursor CLI is "
+            "signed in with `cursor-agent status`, then send again."
+        )
+    return f"{base} {stderr_diagnostic}"
+
+
 def cursor_live_event_summary(event: dict[str, Any]) -> str:
     """Project a Cursor stream event without exposing any event text."""
 
@@ -43949,9 +43998,8 @@ async def run_cursor(
         )
     )
     runner_sess = dict(sess)
-    runner_sess["cursor_permission_mode"] = effective_cursor_permission_mode(
-        sess
-    )
+    effective_permission_mode = effective_cursor_permission_mode(sess)
+    runner_sess["cursor_permission_mode"] = effective_permission_mode
     cmd = build_cursor_cmd(
         runner_sess,
         provider_prompt,
@@ -44044,6 +44092,10 @@ async def run_cursor(
     terminal_event_seen = False
     terminal_exit_forced = False
     stream_error: str | None = None
+    # Set when the provider violated this session's own permission mode, as
+    # opposed to a transport failure. Declared with the loop's other error
+    # slots so it survives past the stream loop.
+    policy_error: str | None = None
     timeout_error: str | None = None
     turn_is_error = False
     result_text = ""
@@ -44276,6 +44328,23 @@ async def run_cursor(
                 await flush_cursor_reasoning()
             elif kind == "tool_started":
                 await flush_cursor_reasoning()
+                if cursor_plan_mode_escape(
+                    effective_permission_mode,
+                    normalized.get("tool"),
+                ):
+                    # Plan mode is advertised as read-only, but the CLI can
+                    # raise its own "leave plan mode?" interaction and answer
+                    # it headlessly, after which it edits files (reproduced
+                    # live). Stop the turn instead of letting a mode the UI
+                    # calls read-only quietly write to the workspace.
+                    policy_error = (
+                        "Cursor tried to leave plan mode and act, which this "
+                        "read-only session does not allow. Switch the chat to "
+                        "an editing permission mode if you want it to make "
+                        "changes."
+                    )
+                    await terminate_process_tree(proc)
+                    break
                 call_id = str(normalized["call_id"])
                 if (
                     call_id not in started_tool_ids
@@ -44424,6 +44493,14 @@ async def run_cursor(
             "exit_code": proc.returncode,
             **run_event_metadata(run_id),
         })
+    elif policy_error and not stopped:
+        await append_event(session_id, "error", {
+            "run_id": run_id,
+            "backend": BACKEND_CURSOR,
+            "message": policy_error,
+            "exit_code": proc.returncode,
+            **run_event_metadata(run_id),
+        })
     elif stream_error and not stopped:
         await append_event(session_id, "error", {"run_id": run_id, "message": f"Cursor stream failed: {stream_error}", **run_event_metadata(run_id)})
     elif protocol_error and not stopped:
@@ -44448,14 +44525,23 @@ async def run_cursor(
     ):
         await append_event(session_id, "error", {
             "run_id": run_id,
-            "message": (
-                f"Cursor exited {proc.returncode}. {stderr_diagnostic}"
+            "message": cursor_launch_failure_message(
+                proc.returncode,
+                model=sess.get("model"),
+                provider_started=provider_started,
+                stderr_diagnostic=stderr_diagnostic,
             ),
             "exit_code": proc.returncode,
             **run_event_metadata(run_id),
         })
 
-    if not stopped and (
+    if policy_error and not stopped:
+        # This server stopped a healthy provider for violating the chat's own
+        # permission mode. The runtime itself is fine, so recording a runtime
+        # failure here would wrongly mark the whole Cursor backend unhealthy
+        # (and the forced SIGTERM's exit code would be the "reason").
+        record_runtime_success(BACKEND_CURSOR)
+    elif not stopped and (
         timeout_error
         or stream_error
         or protocol_error
@@ -44484,6 +44570,7 @@ async def run_cursor(
         not stopped
         and not timeout_error
         and not stream_error
+        and not policy_error
         and not protocol_error
         and not turn_is_error
         and (

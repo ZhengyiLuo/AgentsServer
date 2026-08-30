@@ -856,6 +856,60 @@ while True:
         self.assertTrue(terminal["is_error"])
         self.assertEqual(terminal["result_text"], "")
 
+    async def test_plan_mode_escape_stops_the_turn_before_the_edit(self) -> None:
+        # Live-reproduced sequence: plan mode emits switchMode, then edits.
+        # The runner must stop at switchMode so a session the UI calls
+        # read-only cannot write, and the edit that follows must never run.
+        events = await self._run_script(
+            _event_script([
+                _init_event(),
+                {
+                    "type": "tool_call", "subtype": "started",
+                    "call_id": "call-switch-1",
+                    "tool_call": {"switchModeToolCall": {"args": {"mode": "agent"}}},
+                    "session_id": "cursor-sess-test",
+                },
+                {
+                    "type": "tool_call", "subtype": "started",
+                    "call_id": "call-edit-9",
+                    "tool_call": {"editToolCall": {"args": {"path": "/tmp/nope.txt"}}},
+                    "session_id": "cursor-sess-test",
+                },
+                _result_event(),
+            ]),
+            session_patch={"cursor_permission_mode": "plan"},
+        )
+
+        errors = [e for e in events if e["type"] == "error"]
+        self.assertTrue(errors)
+        self.assertIn("leave plan mode", errors[-1]["message"])
+        terminal = next(e for e in events if e["type"] == "turn_finished")
+        self.assertTrue(terminal["is_error"])
+        # The edit that followed the escape must never have been projected.
+        self.assertEqual(
+            [e for e in events
+             if e["type"] == "tool_started"
+             and (e.get("tool") or {}).get("name") == "edit"],
+            [],
+        )
+
+    async def test_switch_mode_outside_plan_mode_runs_normally(self) -> None:
+        events = await self._run_script(
+            _event_script([
+                _init_event(),
+                {
+                    "type": "tool_call", "subtype": "started",
+                    "call_id": "call-switch-2",
+                    "tool_call": {"switchModeToolCall": {"args": {"mode": "agent"}}},
+                    "session_id": "cursor-sess-test",
+                },
+                _result_event(),
+            ]),
+            session_patch={"cursor_permission_mode": "default"},
+        )
+        terminal = next(e for e in events if e["type"] == "turn_finished")
+        self.assertFalse(terminal["is_error"])
+
     async def test_stream_event_ceiling_bounds_durable_output(self) -> None:
         agent_server.CURSOR_MAX_STREAM_EVENTS = 3
         events = await self._run_script(_event_script([
@@ -1166,6 +1220,65 @@ while True:
         self.assertIn("bounded fork memory sentinel", captured_prompts[1])
         self.assertNotIn("[AgentsDock provider instructions]", captured_prompts[2])
         self.assertNotIn("bounded fork memory sentinel", captured_prompts[2])
+
+
+class CursorLaunchFailureMessageTests(unittest.TestCase):
+    def test_names_the_selected_model_when_the_turn_never_started(self) -> None:
+        # Real report this replaces: picking an unavailable model produced
+        # only "Cursor exited 1. <stderr withheld>", which tells the user
+        # nothing they can act on. Stderr stays withheld (it can echo the
+        # prompt); the model name is something the server already knows.
+        message = agent_server.cursor_launch_failure_message(
+            1,
+            model="claude-sonnet-5-thinking-high",
+            provider_started=False,
+            stderr_diagnostic="Cursor stderr was omitted from diagnostics.",
+        )
+        self.assertIn("claude-sonnet-5-thinking-high", message)
+        self.assertIn("free Cursor plans can only use Auto", message)
+        self.assertNotIn("omitted from diagnostics", message)
+
+    def test_no_model_selected_points_at_sign_in(self) -> None:
+        message = agent_server.cursor_launch_failure_message(
+            1, model=None, provider_started=False, stderr_diagnostic="x",
+        )
+        self.assertIn("never started", message)
+        self.assertIn("cursor-agent status", message)
+
+    def test_failure_after_the_turn_started_keeps_the_stderr_diagnostic(
+        self,
+    ) -> None:
+        # A mid-turn crash is not a model-selection problem, so it must not
+        # blame the model.
+        message = agent_server.cursor_launch_failure_message(
+            9,
+            model="gpt-5.3-codex",
+            provider_started=True,
+            stderr_diagnostic="Cursor stderr was omitted from diagnostics.",
+        )
+        self.assertIn("omitted from diagnostics", message)
+        self.assertNotIn("gpt-5.3-codex", message)
+
+
+class CursorPlanModeEscapeTests(unittest.TestCase):
+    def test_switch_mode_in_plan_mode_is_an_escape(self) -> None:
+        # Reproduced live: with --mode plan the CLI raised its own
+        # "switch mode?" query, answered it headlessly, and then edited a
+        # file - so plan mode's read-only promise is not CLI-enforced.
+        self.assertTrue(agent_server.cursor_plan_mode_escape("plan", "switchMode"))
+        self.assertTrue(agent_server.cursor_plan_mode_escape("plan", "switch_mode"))
+
+    def test_other_tools_in_plan_mode_are_allowed(self) -> None:
+        for tool in ("createPlan", "read", "glob", "grep"):
+            self.assertFalse(
+                agent_server.cursor_plan_mode_escape("plan", tool), tool
+            )
+
+    def test_switch_mode_outside_plan_mode_is_not_policed(self) -> None:
+        for mode in ("default", "full_access", ""):
+            self.assertFalse(
+                agent_server.cursor_plan_mode_escape(mode, "switchMode"), mode
+            )
 
 
 class CursorFileDeliveryInstructionTests(unittest.TestCase):

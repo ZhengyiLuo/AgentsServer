@@ -824,7 +824,21 @@ You are operating through AgentsDock, backed by AgentsServer.
 SYSTEM_PROMPT = CLAUDE_PROMPT_PRELUDE
 
 CODEX_THREAD_POLICY_VERSION = "7"
-CURSOR_PROMPT_POLICY_VERSION = "1"
+CURSOR_PROMPT_POLICY_VERSION = "2"
+# Cursor sessions run under a per-session permission mode, and every mode
+# except "full_access" rejects shell commands outright. The shared prelude
+# presents the publish CLI as the only sanctioned delivery route and frames
+# the manifest as an "older-server fallback", so a shell-blocked Cursor turn
+# would generate a file, fail to publish it, and tell the user to open it
+# from disk themselves. Writing the manifest needs no shell (verified live:
+# `--trust` alone can write outside the workspace), so make that the
+# explicit route whenever the publish command cannot run.
+CURSOR_FILE_DELIVERY_ADDENDUM = """\
+Delivering files in this Cursor session:
+- Shell commands are rejected in every permission mode except full access. If the AgentsDock publish command comes back rejected, the file is still undelivered - never fall back to telling the user to open it from disk themselves.
+- Deliver it instead by writing `{{"files":["/absolute/path.ext"]}}` to `{manifest_path}` with your file-writing tool, which needs no shell, then say only "submitted for attachment".
+- This covers everything produced for the user, including generated images: write the image to a real file first, then list that absolute path in the manifest.
+"""
 CLAUDE_SDK_CONFIGURATION_VERSION = 7
 CODEX_PROMPT_PRELUDE = """\
 You are operating through AgentsDock, backed by AgentsServer.
@@ -43765,6 +43779,9 @@ def cursor_provider_instructions(
                 terminal_session=terminal_session_name(session_id),
                 chat_id=session_id,
             ).rstrip(),
+            CURSOR_FILE_DELIVERY_ADDENDUM.format(
+                manifest_path=str(manifest_path),
+            ).rstrip(),
             session_prompt_addendum(sess).strip(),
         )
         if value
@@ -44048,7 +44065,32 @@ async def run_cursor(
     changed_paths: set[str] = set()
     seen_artifacts: set[str] = set()
     stderr_bytes = b""
+    # Cursor streams reasoning as many token-sized `thinking` deltas, while
+    # Codex publishes exactly one reasoning_summary per reasoning item and
+    # the client renders one event as one block. Emitting every delta turned
+    # a single thought into a burst of answer-looking blocks that the
+    # timeline then reconciled away. Buffer deltas and publish one event per
+    # completed thought instead.
+    reasoning_buffer: list[str] = []
+    reasoning_buffer_chars = 0
     manifest_watch_task = asyncio.create_task(watch_manifest_artifacts(session_id, run_id, manifest_path, seen_artifacts))
+
+    async def flush_cursor_reasoning() -> None:
+        nonlocal reasoning_buffer, reasoning_buffer_chars
+        if not reasoning_buffer:
+            return
+        text = compact_memory_text(
+            "".join(reasoning_buffer).strip(),
+            CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS,
+        )
+        reasoning_buffer = []
+        reasoning_buffer_chars = 0
+        if text:
+            await append_event(session_id, "reasoning_summary", {
+                "run_id": run_id,
+                "text": text,
+                "phase": "commentary",
+            })
 
     async def emit_provider_session(new_provider_id: str) -> None:
         nonlocal provider_id, provider_started
@@ -44218,6 +44260,10 @@ async def run_cursor(
                 await terminate_process_tree(proc)
                 break
             elif kind == "assistant_text":
+                # Publish the thought that led here before the answer itself,
+                # so the timeline keeps provider order even when Cursor never
+                # sends the matching `thinking/completed`.
+                await flush_cursor_reasoning()
                 text = compact_memory_text(
                     clean_assistant_text(str(normalized.get("text") or "")),
                     CURSOR_TEXT_EVENT_MAX_CHARS,
@@ -44234,13 +44280,14 @@ async def run_cursor(
                         accumulated_text_chars += len(retained_text)
                     await append_event(session_id, "assistant_text", {"run_id": run_id, "text": text, **run_event_metadata(run_id)})
             elif kind == "reasoning_delta":
-                text = compact_memory_text(
-                    str(normalized.get("text") or ""),
-                    CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS,
-                )
-                if text:
-                    await append_event(session_id, "reasoning_summary", {"run_id": run_id, "text": text, "phase": "commentary"})
+                delta = str(normalized.get("text") or "")
+                if delta and reasoning_buffer_chars < CODEX_APP_SERVER_TOOL_OUTPUT_MAX_CHARS:
+                    reasoning_buffer.append(delta)
+                    reasoning_buffer_chars += len(delta)
+            elif kind == "reasoning_completed":
+                await flush_cursor_reasoning()
             elif kind == "tool_started":
+                await flush_cursor_reasoning()
                 call_id = str(normalized["call_id"])
                 if (
                     call_id not in started_tool_ids
@@ -44338,6 +44385,10 @@ async def run_cursor(
             type(e).__name__,
         )
     finally:
+        # A turn can end (completed, stopped, or failed) while a thought is
+        # still buffered; publish it rather than dropping it.
+        with suppress(Exception):
+            await flush_cursor_reasoning()
         manifest_watch_task.cancel()
         with suppress(asyncio.CancelledError):
             await manifest_watch_task

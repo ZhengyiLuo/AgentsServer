@@ -515,6 +515,11 @@ class CodexAppServerClient:
         ] = {}
         self._server_request_tasks: dict[Any, asyncio.Task[None]] = {}
         self._stderr_tail: deque[str] = deque(maxlen=40)
+        # Diagnostic-only record of notifications _route_notification could
+        # not match to any live subscription (see its docstring) - these are
+        # otherwise dropped with no trace, which is exactly what makes a
+        # stalled turn look like it hung for no reason.
+        self._unmatched_notifications: deque[dict[str, Any]] = deque(maxlen=40)
         self._closing = False
         self._initialized = False
         self._initialize_result: dict[str, Any] | None = None
@@ -533,6 +538,10 @@ class CodexAppServerClient:
     @property
     def stderr_tail(self) -> list[str]:
         return list(self._stderr_tail)
+
+    @property
+    def unmatched_notifications(self) -> list[dict[str, Any]]:
+        return list(self._unmatched_notifications)
 
     @property
     def process(self) -> asyncio.subprocess.Process | None:
@@ -1032,9 +1041,18 @@ class CodexAppServerClient:
                 active_turn.turn_id = turn_id
                 active_turn._subscription.turn_id = turn_id
 
+        matched = False
         for subscription in tuple(self._subscriptions):
             if subscription._matches(notification):
                 subscription._put(notification)
+                matched = True
+        if not matched:
+            self._unmatched_notifications.append({
+                "method": method,
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "at": time.time(),
+            })
 
         for handler in tuple(self._notification_handlers):
             owner = (handler, thread_id or "")

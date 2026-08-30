@@ -463,6 +463,18 @@ HOST_MONITOR_INTERVAL_SECONDS = float(agentsdock_setting("HOST_MONITOR_INTERVAL_
 HOST_HEALTH_MAX_BYTES = int(agentsdock_setting("HOST_HEALTH_MAX_BYTES", str(20 * 1024 * 1024)))
 IDLE_WARN_SECONDS = int(agentsdock_setting("IDLE_WARN_SECONDS", "1800"))
 IDLE_KILL_SECONDS = int(agentsdock_setting("IDLE_KILL_SECONDS", "21600"))
+# A Codex app-server notification can be silently dropped if it arrives for a
+# subscription that already closed (see _route_notification in
+# codex_app_server.py) - the turn then waits forever with zero visible
+# activity, but IDLE_WARN/IDLE_KILL_SECONDS above are sized for legitimate
+# gaps *between* activity on an already-productive turn, not "nothing has
+# happened since the turn started." This bounds only that first-activity
+# wait, far tighter, so a stalled turn fails fast and (if resuming an
+# existing thread) is picked up by the existing rollover-retry path instead
+# of hanging with no error for up to IDLE_KILL_SECONDS.
+CODEX_APP_SERVER_FIRST_ACTIVITY_TIMEOUT_SECONDS = int(
+    agentsdock_setting("CODEX_APP_SERVER_FIRST_ACTIVITY_TIMEOUT_SECONDS", "180")
+)
 CURSOR_STARTUP_TIMEOUT_SECONDS = max(
     5.0,
     float(agentsdock_setting("CURSOR_STARTUP_TIMEOUT_SECONDS", "120")),
@@ -44586,6 +44598,11 @@ async def run_codex_app_server(
     terminal_status = "failed"
     terminal_error: str | None = None
     error_emitted = False
+    # Set when the turn was accepted but produced no notification at all
+    # within CODEX_APP_SERVER_FIRST_ACTIVITY_TIMEOUT_SECONDS. Treated as a
+    # stalled resume below so a resumed thread gets the same one-shot
+    # rollover-onto-a-fresh-thread recovery the exec transport already has.
+    first_activity_stalled = False
     delivery_unknown = False
     turn_completed = False
     current_run_id = run_id
@@ -45979,6 +45996,7 @@ async def run_codex_app_server(
                     )
                 )
                 last_activity = time.monotonic()
+                first_activity_seen = False
                 notification_task = asyncio.create_task(
                     next_sequenced_notification()
                 )
@@ -46009,6 +46027,40 @@ async def run_codex_app_server(
                         )
                         if not done:
                             idle = time.monotonic() - last_activity
+                            if (
+                                not first_activity_seen
+                                and idle >= CODEX_APP_SERVER_FIRST_ACTIVITY_TIMEOUT_SECONDS
+                            ):
+                                # turn/start was accepted but nothing at all
+                                # has come back since - most likely a
+                                # notification for this turn was dropped by
+                                # _route_notification finding no matching
+                                # subscription (see its docstring). Fail fast
+                                # instead of waiting out the much longer
+                                # IDLE_KILL_SECONDS meant for gaps *between*
+                                # activity on an already-productive turn.
+                                terminal_error = (
+                                    "Codex app-server produced no activity within "
+                                    f"{CODEX_APP_SERVER_FIRST_ACTIVITY_TIMEOUT_SECONDS}s "
+                                    "of accepting this turn."
+                                )
+                                first_activity_stalled = True
+                                dropped = [
+                                    entry for entry in manager.client.unmatched_notifications
+                                    if entry.get("thread_id") == provider_id
+                                ]
+                                logger.warning(
+                                    "codex app-server first-activity timeout session=%s run=%s thread=%s dropped_notifications=%s",
+                                    session_id,
+                                    current_run_id,
+                                    provider_id,
+                                    dropped,
+                                )
+                                if turn.turn_id:
+                                    with suppress(CodexAppServerError):
+                                        await turn.interrupt()
+                                terminal_status = "failed"
+                                break
                             if idle >= IDLE_WARN_SECONDS:
                                 await append_event(session_id, "idle_warning", {
                                     "run_id": current_run_id,
@@ -46032,6 +46084,7 @@ async def run_codex_app_server(
                                 sequence,
                             )
                             last_activity = time.monotonic()
+                            first_activity_seen = True
                             async with logical_state_lock:
                                 completed = await handle_notification(notification)
                             if completed:
@@ -46236,7 +46289,7 @@ async def run_codex_app_server(
             stopped=stopped,
             stream_error=None,
             idle_killed=False,
-            resume_stalled=False,
+            resume_stalled=first_activity_stalled,
             returncode=0 if terminal_status == "completed" else 1,
             produced_activity=produced_activity,
             terminal_error=terminal_error or "",

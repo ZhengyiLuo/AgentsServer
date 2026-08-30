@@ -125,6 +125,14 @@ def normalize_cursor_stream_event(raw_line: str) -> dict[str, Any] | None:
         # AgentsServer already has the prompt it sent; nothing new here.
         return None
 
+    if event_type == "interaction_query":
+        # The CLI raises and immediately answers its own interactive query
+        # (observed live: a `request` is always followed by a `response`
+        # with no input from us). It carries no turn output, and treating it
+        # as unrecognized used to abort otherwise-healthy turns - plan mode
+        # emits one on every run, so every plan turn died on it.
+        return None
+
     if event_type == "thinking":
         subtype = event.get("subtype")
         if subtype == "delta":
@@ -287,7 +295,12 @@ def cursor_permission_flags(mode: str) -> list[str]:
     unavailable because this headless runner cannot answer approval prompts.
     """
     if mode == "plan":
-        return ["--mode", "plan"]
+        # --trust is workspace trust, not an edit grant, and the CLI refuses
+        # to run non-interactively without it in any mode ("Pass --trust,
+        # --yolo, or -f if you trust this directory") - so omitting it made
+        # every plan-mode turn fail to launch. Verified live that
+        # `--trust --mode plan` still refuses to write files.
+        return ["--trust", "--mode", "plan"]
     if mode == "full_access":
         return ["--trust", "--force"]
     # "default" and any unrecognized mode use workspace access: reads and

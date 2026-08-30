@@ -84,6 +84,21 @@ class NormalizeCursorStreamEventTests(unittest.TestCase):
         )
         self.assertIsNone(normalize_cursor_stream_event(line))
 
+    def test_interaction_query_is_dropped_not_fatal(self) -> None:
+        # Real capture: plan mode emits a request/response pair that the CLI
+        # answers itself. Treating it as unrecognized aborted the whole turn
+        # (exit 143), so every plan-mode turn died on this event.
+        request = (
+            '{"type":"interaction_query","subtype":"request",'
+            '"session_id":"%s"}' % SESSION_ID
+        )
+        response = (
+            '{"type":"interaction_query","subtype":"response",'
+            '"session_id":"%s"}' % SESSION_ID
+        )
+        self.assertIsNone(normalize_cursor_stream_event(request))
+        self.assertIsNone(normalize_cursor_stream_event(response))
+
     def test_thinking_delta_and_completed(self) -> None:
         delta = (
             '{"type":"thinking","subtype":"delta","text":"Reading hello.py to ",'
@@ -433,8 +448,14 @@ class CursorPermissionFlagsTests(unittest.TestCase):
             cursor_permission_flags("full_access"), ["--trust", "--force"]
         )
 
-    def test_plan_mode_is_read_only_and_skips_trust(self) -> None:
-        self.assertEqual(cursor_permission_flags("plan"), ["--mode", "plan"])
+    def test_plan_mode_still_passes_workspace_trust(self) -> None:
+        # Without --trust the CLI refuses to run non-interactively in any
+        # mode, so every plan-mode turn failed to launch. --trust is
+        # workspace trust, not an edit grant: verified live that
+        # `--trust --mode plan` still writes no files.
+        self.assertEqual(
+            cursor_permission_flags("plan"), ["--trust", "--mode", "plan"]
+        )
 
 
 class BuildCursorCmdTests(unittest.TestCase):

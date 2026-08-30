@@ -136,6 +136,14 @@ class GatedSteerTurn(FakeTurn):
         self.steer_acknowledged.set()
 
 
+class FakeAppServerClient:
+    """Mirrors the one real attribute run_codex_app_server reads off
+    manager.client: the diagnostic unmatched-notification backlog."""
+
+    def __init__(self) -> None:
+        self.unmatched_notifications: list[dict[str, object]] = []
+
+
 class FakeManager:
     def __init__(
         self,
@@ -146,6 +154,7 @@ class FakeManager:
         read_thread_result: dict[str, object] | None = None,
     ) -> None:
         self.turn = turn or FakeTurn()
+        self.client = FakeAppServerClient()
         self.turns = list(turns or [])
         self.start_turn_error = start_turn_error
         self.read_thread_result = read_thread_result
@@ -3139,6 +3148,174 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(len(finals), 1)
         self.assertEqual(finals[0]["run_id"], run_now["run_id"])
+
+    async def test_first_activity_timeout_fails_fast_instead_of_hanging(self) -> None:
+        # turn/start is accepted (FakeManager.start_turn returns a FakeTurn),
+        # but nothing is ever fed into it - simulating a notification that
+        # _route_notification could not match to any subscription and
+        # silently dropped (GitHub issue #37). Without this timeout, the
+        # turn would only fail after the much longer IDLE_KILL_SECONDS.
+        turn = FakeTurn()
+        manager = FakeManager(turn)
+        real_wait = asyncio.wait
+
+        async def fast_poll(
+            futures: set[asyncio.Future[object] | asyncio.Task[object]],
+            *,
+            timeout: float | None = None,
+            return_when: str = asyncio.ALL_COMPLETED,
+        ) -> tuple[
+            set[asyncio.Future[object] | asyncio.Task[object]],
+            set[asyncio.Future[object] | asyncio.Task[object]],
+        ]:
+            return await real_wait(
+                futures,
+                timeout=min(0.01, timeout) if timeout is not None else 0.01,
+                return_when=return_when,
+            )
+
+        manager.client.unmatched_notifications.append({
+            "method": "item/completed",
+            "thread_id": "thread-native",
+            "turn_id": "turn-native",
+            "at": time.time(),
+        })
+
+        stack, events, finished, _exec_fallback = self.runner_patches(manager)
+        with stack, patch.object(
+            agent_server.asyncio,
+            "wait",
+            fast_poll,
+        ), patch.object(
+            agent_server,
+            "CODEX_APP_SERVER_FIRST_ACTIVITY_TIMEOUT_SECONDS",
+            0.05,
+        ), patch.object(
+            agent_server,
+            "IDLE_WARN_SECONDS",
+            1800,
+        ), patch.object(
+            agent_server,
+            "IDLE_KILL_SECONDS",
+            21600,
+        ):
+            await asyncio.wait_for(
+                agent_server.run_codex_app_server(
+                    "chat-native",
+                    "run-original",
+                    "Original request",
+                    dict(self.session),
+                    Path(self.cwd) / ".runner-test-manifest.json",
+                    allow_exec_fallback=True,
+                    allow_resume_rollover=False,
+                ),
+                timeout=2,
+            )
+
+        self.assertEqual(turn.interrupt_calls, 1)
+        error_calls = [
+            call for call in events.await_args_list
+            if call.args[1] == "error"
+        ]
+        self.assertTrue(error_calls)
+        self.assertIn(
+            "no activity",
+            str(error_calls[-1].args[2].get("message") or ""),
+        )
+        self.assertTrue(finished.await_args)
+
+    async def test_first_activity_timeout_rolls_a_resumed_thread_over_and_retries(
+        self,
+    ) -> None:
+        # The user-visible half of the fix: a resumed thread that goes
+        # completely silent must not just fail - it gets the same one-shot
+        # rollover-onto-a-fresh-thread retry the exec transport already has,
+        # so the chat recovers on its own instead of stopping at an error.
+        silent_turn = FakeTurn()
+        recovered_turn = FakeTurn([
+            agent_message(
+                "msg-after-stall",
+                "Recovered on a fresh thread.",
+                "final_answer",
+            ),
+            completed_notification(),
+        ])
+        manager = FakeManager(turns=[silent_turn, recovered_turn])
+        real_wait = asyncio.wait
+
+        async def fast_poll(
+            futures: set[asyncio.Future[object] | asyncio.Task[object]],
+            *,
+            timeout: float | None = None,
+            return_when: str = asyncio.ALL_COMPLETED,
+        ) -> tuple[
+            set[asyncio.Future[object] | asyncio.Task[object]],
+            set[asyncio.Future[object] | asyncio.Task[object]],
+        ]:
+            return await real_wait(
+                futures,
+                timeout=min(0.01, timeout) if timeout is not None else 0.01,
+                return_when=return_when,
+            )
+
+        fresh_session = {
+            "id": "chat-native",
+            "backend": agent_server.BACKEND_CODEX,
+            "cwd": self.cwd,
+            "memory_seed": "bounded context",
+            "memory_seed_used": False,
+        }
+        rollover = AsyncMock(return_value=(fresh_session, "bounded context"))
+        ensure = AsyncMock(
+            side_effect=[
+                ("thread-native", "old-policy"),
+                ("thread-fresh", "fresh-policy"),
+            ]
+        )
+
+        stack, events, _finished, _exec_fallback = self.runner_patches(manager)
+        with stack, patch.object(
+            agent_server.asyncio,
+            "wait",
+            fast_poll,
+        ), patch.object(
+            agent_server,
+            "CODEX_APP_SERVER_FIRST_ACTIVITY_TIMEOUT_SECONDS",
+            0.05,
+        ), patch.object(
+            agent_server,
+            "ensure_codex_app_server_thread",
+            ensure,
+        ), patch.object(
+            agent_server,
+            "rollover_codex_provider_session",
+            rollover,
+        ):
+            await asyncio.wait_for(
+                agent_server.run_codex_app_server(
+                    "chat-native",
+                    "run-original",
+                    "Original request",
+                    dict(self.session),
+                    Path(self.cwd) / ".runner-test-manifest.json",
+                    allow_exec_fallback=True,
+                    allow_resume_rollover=True,
+                ),
+                timeout=2,
+            )
+
+        rollover.assert_awaited_once()
+        # The stalled thread was interrupted, then the turn was retried.
+        self.assertEqual(silent_turn.interrupt_calls, 1)
+        self.assertEqual(len(manager.turn_calls), 2)
+        # The retry actually produced the reply the first attempt never did.
+        finals = [
+            call.args[2]
+            for call in events.await_args_list
+            if call.args[1] == "assistant_text"
+            and call.args[2].get("item_id") == "msg-after-stall"
+        ]
+        self.assertEqual(len(finals), 1)
 
     async def test_simultaneous_completion_and_steer_settles_force_send(self) -> None:
         turn = FakeTurn([completed_notification()])

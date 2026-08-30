@@ -214,6 +214,57 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(seen, ["item/started"])
 
+    async def test_unmatched_notification_is_recorded_not_silently_dropped(self) -> None:
+        # No subscription exists for "thread-nobody-listens" - previously
+        # this notification just vanished with zero trace, which is what
+        # made a stalled turn look like it hung for no reason.
+        client = self.make_client(FakeProcessFactory())
+        self.addAsyncCleanup(client.close)
+
+        client._route_notification({
+            "method": "item/completed",
+            "params": {"threadId": "thread-nobody-listens", "turnId": "turn-1"},
+        })
+
+        recorded = client.unmatched_notifications
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual(recorded[0]["method"], "item/completed")
+        self.assertEqual(recorded[0]["thread_id"], "thread-nobody-listens")
+        self.assertEqual(recorded[0]["turn_id"], "turn-1")
+
+    async def test_matched_notification_is_not_recorded_as_unmatched(self) -> None:
+        client = self.make_client(FakeProcessFactory())
+        self.addAsyncCleanup(client.close)
+        subscription = client.subscribe_thread("thread-a")
+        self.addCleanup(subscription.close)
+
+        client._route_notification({
+            "method": "item/completed",
+            "params": {"threadId": "thread-a"},
+        })
+
+        self.assertEqual(client.unmatched_notifications, [])
+        _sequence, delivered = await asyncio.wait_for(
+            subscription.next_notification_with_sequence(), timeout=1
+        )
+        self.assertEqual(delivered["method"], "item/completed")
+
+    async def test_unmatched_notification_backlog_is_bounded(self) -> None:
+        client = self.make_client(FakeProcessFactory())
+        self.addAsyncCleanup(client.close)
+
+        for i in range(45):
+            client._route_notification({
+                "method": "item/completed",
+                "params": {"threadId": f"thread-{i}"},
+            })
+
+        recorded = client.unmatched_notifications
+        self.assertEqual(len(recorded), 40)
+        # Only the most recent 40 survive - the oldest 5 were evicted.
+        self.assertEqual(recorded[0]["thread_id"], "thread-5")
+        self.assertEqual(recorded[-1]["thread_id"], "thread-44")
+
     async def test_initialize_once_and_reuse_one_process(self) -> None:
         factory = FakeProcessFactory()
         process = factory.process

@@ -112,7 +112,7 @@ class InstallerContractTests(unittest.TestCase):
         self.assertIn("import claude_agent_sdk", INSTALLER.read_text())
         self.assertIn("import croniter, dateutil", INSTALLER.read_text())
         self.assertIn(
-            "import agentsdock_team_hub, cursor_agent_client, secure_peer_delivery, secure_peer_runtime",
+            "import agentsdock_team_hub, cursor_agent_client, cursor_process_guard, secure_peer_delivery, secure_peer_runtime",
             INSTALLER.read_text(),
         )
         self.assertIn("from agentsdock_team_hub import secure_peer, secure_peer_hub", INSTALLER.read_text())
@@ -664,7 +664,7 @@ exit 0
         self.assertIn("'$REMOTE_SERVER_DIR/secure_peer_delivery.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/agentsdock_team_hub'", source)
         self.assertIn(
-            "import agentsdock_team_hub, claude_agent_sdk, cursor_agent_client, secure_peer_delivery, secure_peer_runtime, team_hub_host",
+            "import agentsdock_team_hub, claude_agent_sdk, cursor_agent_client, cursor_process_guard, secure_peer_delivery, secure_peer_runtime, team_hub_host",
             source,
         )
         self.assertIn("from agentsdock_team_hub import secure_peer, secure_peer_hub", source)
@@ -901,7 +901,7 @@ exit 0
         installer_source = INSTALLER.read_text()
         packager_source = PACKAGER.read_text()
         self.assertIn(
-            "RELEASE_FILES=(agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_publish.py claude_sdk_client.py codex_app_server.py cursor_agent_client.py",
+            "RELEASE_FILES=(agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py claude_sdk_client.py codex_app_server.py cursor_agent_client.py cursor_process_guard.py",
             installer_source,
         )
         self.assertIn("RELEASE_DIRECTORIES=(agentsdock_team_hub)", installer_source)
@@ -912,7 +912,7 @@ exit 0
         self.assertIn('"$STAGE_DIR/codex_app_server.py"', installer_source)
         self.assertIn('"$STAGE_DIR/cursor_agent_client.py"', installer_source)
         self.assertIn(
-            "import agentsdock_team_hub, cursor_agent_client, secure_peer_delivery",
+            "import agentsdock_team_hub, cursor_agent_client, cursor_process_guard, secure_peer_delivery",
             installer_source,
         )
         self.assertIn('"$STAGE_DIR/secure_peer_runtime.py"', installer_source)
@@ -921,9 +921,11 @@ exit 0
         self.assertIn('"agentsdock_publish.py"', packager_source)
         self.assertIn('"agentsdock_chats.py"', packager_source)
         self.assertIn('"agentsdock_emergency.py"', packager_source)
+        self.assertIn('"agentsdock_mail.py"', packager_source)
         self.assertIn('"claude_sdk_client.py"', packager_source)
         self.assertIn('"codex_app_server.py"', packager_source)
         self.assertIn('"cursor_agent_client.py"', packager_source)
+        self.assertIn('"cursor_process_guard.py"', packager_source)
         self.assertIn('"secure_peer_runtime.py"', packager_source)
         self.assertIn('"secure_peer_delivery.py"', packager_source)
         self.assertIn('"uninstall.sh"', packager_source)
@@ -954,6 +956,9 @@ exit 0
                 emergency = archive.getmember(
                     f"agents-server-{version}/agentsdock_emergency.py"
                 )
+                mail = archive.getmember(
+                    f"agents-server-{version}/agentsdock_mail.py"
+                )
                 uninstaller = archive.getmember(
                     f"agents-server-{version}/uninstall.sh"
                 )
@@ -966,6 +971,10 @@ exit 0
                 members,
             )
             self.assertIn(
+                f"agents-server-{version}/agentsdock_mail.py",
+                members,
+            )
+            self.assertIn(
                 f"agents-server-{version}/codex_app_server.py",
                 members,
             )
@@ -975,6 +984,10 @@ exit 0
             )
             self.assertIn(
                 f"agents-server-{version}/cursor_agent_client.py",
+                members,
+            )
+            self.assertIn(
+                f"agents-server-{version}/cursor_process_guard.py",
                 members,
             )
             self.assertIn(f"agents-server-{version}/uninstall.sh", members)
@@ -1005,18 +1018,23 @@ exit 0
                 f"agents-server-{version}/agentsdock_team_hub/migrations/0006_team_network_mailbox.sql",
                 members,
             )
+            self.assertIn(
+                f"agents-server-{version}/agentsdock_team_hub/migrations/0007_local_agent_mail.sql",
+                members,
+            )
             self.assertFalse(
                 any("__pycache__" in name or name.endswith((".pyc", ".pyo")) for name in members)
             )
             self.assertNotEqual(publisher.mode & 0o111, 0)
             self.assertNotEqual(emergency.mode & 0o111, 0)
+            self.assertNotEqual(mail.mode & 0o111, 0)
             self.assertNotEqual(uninstaller.mode & 0o111, 0)
             self.assertEqual(
                 manifest["track"],
                 "beta" if "-" in version.split("+", 1)[0] else "stable",
             )
             self.assertEqual(manifest["prerelease"], manifest["track"] == "beta")
-            self.assertEqual(manifest["api_contract_version"], 23)
+            self.assertEqual(manifest["api_contract_version"], 24)
 
     def test_installer_preserves_state_and_emits_private_result(self):
         source = INSTALLER.read_text()
@@ -2453,7 +2471,7 @@ exit 0
             self.assertFalse(store.maintenance_fence_path.exists())
             connection = sqlite3.connect(store.database_path)
             try:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 6)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 7)
                 self.assertEqual(
                     connection.execute(
                         "SELECT hub_id, server_identity FROM managed_host_bindings"

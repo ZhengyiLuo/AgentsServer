@@ -307,6 +307,17 @@ proofs before replacement; if the candidate cannot prove the same server and
 Hub identities, the installer restores that snapshot before starting the
 previous server release.
 
+### Agent Team Network mail
+
+API contract v24 advertises `capabilities.agent_team_mail_v1`. Agent mail is
+default-deny: only an ordinary user prompt whose first token is exactly
+`/mail` receives a short-lived provider capability. The helper freezes at most
+512 currently visible destinations as opaque run-local routes, accepts at most
+four sends, and reads the UTF-8 body from stdin so message content does not
+appear in process arguments. It creates a passive Team Network Inbox item; it
+never starts or steers a chat or agent. Scheduled jobs, synthetic handoffs, and
+near-matches such as `/mailbox` do not receive this authority.
+
 ## Manual Onboarding
 
 1. Clone this repo on the machine that will run the agents.
@@ -713,6 +724,10 @@ claude --version
 # Codex backend
 command -v codex
 codex --version
+
+# Cursor backend
+command -v cursor-agent || command -v agent
+cursor-agent --version || agent --version
 ```
 
 Run these as the same Unix user that owns the systemd service. If the CLI works
@@ -733,6 +748,9 @@ The health response includes cached `runtimes` entries. The catalog endpoint's
 reports `ready`, `missing`, `unauthenticated`, or probe `error`, plus an
 actionable recovery instruction. It never returns account identity, auth
 output, or tokens.
+
+Cursor capability contract v2 advertises the hardened process guard, bounded
+idle warning/timeout lifecycle, and explicit permission-mode semantics.
 
 A new prompt performs the same preflight before reserving real agent work. If
 the selected CLI is unavailable, the endpoint returns a structured

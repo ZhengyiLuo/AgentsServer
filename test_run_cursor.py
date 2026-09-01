@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import stat
+import subprocess
 import tempfile
 import time
 import unittest
@@ -17,7 +18,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 import agent_server
-import cursor_agent_client
 
 FAKE_AGENT_CLI = """#!/usr/bin/env python3
 import json, os, sys
@@ -137,6 +137,9 @@ class RunCursorTests(unittest.IsolatedAsyncioTestCase):
         self.previous_runtime_diagnostics = dict(
             agent_server.RUNTIME_DIAGNOSTICS
         )
+        self.previous_runtime_diagnostic_generations = dict(
+            agent_server.RUNTIME_DIAGNOSTIC_GENERATIONS
+        )
         self.previous_state_dir = agent_server.STATE_DIR
         self.previous_sessions_file = agent_server.SESSIONS_FILE
         self.previous_cursor_bin = agent_server.CURSOR_BIN
@@ -193,6 +196,10 @@ class RunCursorTests(unittest.IsolatedAsyncioTestCase):
         agent_server.RUNTIME_DIAGNOSTICS.update(
             self.previous_runtime_diagnostics
         )
+        agent_server.RUNTIME_DIAGNOSTIC_GENERATIONS.clear()
+        agent_server.RUNTIME_DIAGNOSTIC_GENERATIONS.update(
+            self.previous_runtime_diagnostic_generations
+        )
         agent_server.STATE_DIR = self.previous_state_dir
         agent_server.SESSIONS_FILE = self.previous_sessions_file
         agent_server.CURSOR_BIN = self.previous_cursor_bin
@@ -222,6 +229,29 @@ class RunCursorTests(unittest.IsolatedAsyncioTestCase):
             "file_ids": [],
             "backend": agent_server.BACKEND_CURSOR,
         }
+
+    def test_cursor_mutation_tool_aliases_are_attributed(self) -> None:
+        self.assertEqual(
+            agent_server.tool_changed_paths({
+                "name": "deleteFile",
+                "input": {"path": "gone.py"},
+            }),
+            {"gone.py"},
+        )
+        self.assertEqual(
+            agent_server.tool_changed_paths({
+                "name": "renameFile",
+                "input": {"old_path": "old.py", "new_path": "new.py"},
+            }),
+            {"old.py", "new.py"},
+        )
+        self.assertEqual(
+            agent_server.tool_changed_paths({
+                "name": "shell",
+                "input": {"command": "apply_patch <<'PATCH'\n*** Update File: app.py\nPATCH"},
+            }),
+            {"app.py"},
+        )
 
     async def _run_script(
         self,
@@ -284,16 +314,175 @@ class RunCursorTests(unittest.IsolatedAsyncioTestCase):
         turn_finished = next(e for e in events if e["type"] == "turn_finished")
         self.assertEqual(turn_finished["backend"], agent_server.BACKEND_CURSOR)
         self.assertEqual(turn_finished["exit_code"], 0)
+        self.assertEqual(turn_finished["input_tokens"], 10)
+        self.assertEqual(turn_finished["output_tokens"], 2)
+        self.assertEqual(turn_finished["total_tokens"], 12)
 
         # persist_run_provider_session should have bound the resumed id.
         self.assertEqual(
             agent_server.STORE.sessions[self.session_id].get("cursor_session_id"),
             "cursor-sess-abc123",
         )
+        self.assertEqual(
+            len([event for event in events if event["type"] == "provider_session"]),
+            1,
+        )
 
         # A successful turn must release the slot it was holding.
         self.assertNotIn(self.session_id, agent_server.BUSY_SESSIONS)
         self.assertNotIn(self.session_id, agent_server.CURRENT_TURNS)
+
+    async def test_composed_prompt_is_delivered_only_over_stdin(self) -> None:
+        secret = "AUTHORITY-SENTINEL-STDIN-CURSOR"
+        captured = Path(self.tempdir.name) / "captured-prompt.txt"
+        script = f'''#!/usr/bin/env python3
+import json, pathlib, sys
+prompt = sys.stdin.read()
+pathlib.Path({str(captured)!r}).write_text(prompt, encoding="utf-8")
+session_id = "cursor-sess-test"
+print(json.dumps({{"type":"system","subtype":"init","session_id":session_id,"cwd":".","model":"Auto"}}), flush=True)
+print(json.dumps({{"type":"result","subtype":"success","is_error":False,"result":"received","session_id":session_id}}), flush=True)
+'''
+        events = await self._run_script(
+            script,
+            prompt=f"--model fake\nUnicode ✓\n{secret}",
+        )
+        started = next(event for event in events if event["type"] == "process_started")
+        self.assertNotIn(secret, json.dumps(started["argv"]))
+        self.assertNotIn("--model fake", started["argv"])
+        written = captured.read_text(encoding="utf-8")
+        self.assertIn(secret, written)
+        self.assertIn("--model fake", written)
+        self.assertIn("Unicode ✓", written)
+
+    async def test_current_lifecycle_events_do_not_abort_or_leak_payloads(self) -> None:
+        secret = "LIFECYCLE-SECRET"
+        events = await self._run_script(_event_script([
+            _init_event(),
+            {"type": "retry", "subtype": "starting", "session_id": "cursor-sess-test", "attempt": 1},
+            {"type": "connection", "subtype": "reconnecting", "session_id": "cursor-sess-test", "attempt": 2, "endpoint_url": secret},
+            {"type": "connection", "subtype": "reconnected", "session_id": "cursor-sess-test"},
+            {"type": "interaction_query", "subtype": "request", "session_id": "cursor-sess-test", "query_type": "permission", "query": {"prompt": secret}},
+            {"type": "interaction_query", "subtype": "response", "session_id": "cursor-sess-test", "query_type": "permission", "response": {"answer": secret}},
+            {"type": "system", "subtype": "task_notification", "session_id": "cursor-sess-test", "title": secret},
+            {"type": "system", "subtype": "background_shell_timeout", "session_id": "cursor-sess-test", "aborted_count": 1, "timeout_ms": 1_000},
+            _result_event("lifecycle complete"),
+        ]))
+        terminal = next(event for event in events if event["type"] == "turn_finished")
+        self.assertFalse(terminal["is_error"])
+        self.assertFalse(any(event["type"] == "raw_event" for event in events))
+        self.assertNotIn(secret, json.dumps(events))
+
+    async def test_nonzero_shell_tool_exit_is_preserved(self) -> None:
+        events = await self._run_script(_event_script([
+            _init_event(),
+            {
+                "type": "tool_call",
+                "subtype": "completed",
+                "call_id": "failed-shell",
+                "tool_call": {"shellToolCall": {
+                    "args": {"command": "false"},
+                    "result": {"failure": {"exitCode": 7, "stderr": "failed"}},
+                }},
+                "session_id": "cursor-sess-test",
+            },
+            _result_event("handled failure"),
+        ]))
+        finished = next(event for event in events if event["type"] == "tool_finished")
+        self.assertEqual(finished["exit_code"], 7)
+        self.assertEqual(finished["tool"]["input"], {"command": "false"})
+
+    async def test_current_tool_timeout_is_not_projected_as_success(self) -> None:
+        events = await self._run_script(_event_script([
+            _init_event(),
+            {
+                "type": "tool_call",
+                "subtype": "completed",
+                "call_id": "timed-out-shell",
+                "tool_call": {"shellToolCall": {
+                    "args": {"command": "sleep 10"},
+                    "result": {"timeout": {
+                        "command": "sleep 10",
+                        "timeoutMs": 1000,
+                    }},
+                }},
+                "session_id": "cursor-sess-test",
+            },
+            _result_event("handled timeout"),
+        ]))
+        finished = next(event for event in events if event["type"] == "tool_finished")
+        self.assertEqual(finished["exit_code"], 1)
+        self.assertIn("timeoutMs", finished["output"])
+
+    async def test_cache_usage_buckets_count_toward_total_tokens(self) -> None:
+        result = _result_event("cached")
+        result["usage"] = {
+            "inputTokens": 5,
+            "outputTokens": 2,
+            "cacheReadTokens": 10,
+            "cacheWriteTokens": 3,
+        }
+        events = await self._run_script(_event_script([
+            _init_event(),
+            result,
+        ]))
+        terminal = next(event for event in events if event["type"] == "turn_finished")
+        self.assertEqual(terminal["input_tokens"], 5)
+        self.assertEqual(terminal["cached_input_tokens"], 10)
+        self.assertEqual(terminal["cache_write_input_tokens"], 3)
+        self.assertEqual(terminal["output_tokens"], 2)
+        self.assertEqual(terminal["total_tokens"], 20)
+
+    async def test_unfinished_tool_is_closed_and_turn_fails_protocol(self) -> None:
+        events = await self._run_script(_event_script([
+            _init_event(),
+            {
+                "type": "tool_call",
+                "subtype": "started",
+                "call_id": "open-edit",
+                "tool_call": {"writeToolCall": {"args": {"path": "hello.py"}}},
+                "session_id": "cursor-sess-test",
+            },
+            _result_event("premature result"),
+        ]))
+        finished = next(event for event in events if event["type"] == "tool_finished")
+        self.assertEqual(finished["tool_id"], "open-edit")
+        self.assertEqual(finished["exit_code"], 1)
+        terminal = next(event for event in events if event["type"] == "turn_finished")
+        self.assertTrue(terminal["is_error"])
+        self.assertEqual(terminal["result_text"], "")
+
+    async def test_write_tool_projects_an_actual_code_diff(self) -> None:
+        target = Path(self.cwd) / "hello.py"
+        target.write_text("print('before')\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q"], cwd=self.cwd, check=True)
+        subprocess.run(["git", "add", "hello.py"], cwd=self.cwd, check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=AgentsDock Test", "-c",
+             "user.email=test@agentsdock.invalid", "commit", "-qm", "baseline"],
+            cwd=self.cwd,
+            check=True,
+        )
+        script = f'''#!/usr/bin/env python3
+import json, pathlib, sys
+sys.stdin.read()
+path = {str(target)!r}
+pathlib.Path(path).write_text("print('after')\\n", encoding="utf-8")
+session_id = "cursor-sess-test"
+events = [
+  {{"type":"system","subtype":"init","session_id":session_id,"cwd":{self.cwd!r},"model":"Auto"}},
+  {{"type":"tool_call","subtype":"started","call_id":"write-1","tool_call":{{"writeToolCall":{{"args":{{"path":path}}}}}},"session_id":session_id}},
+  {{"type":"tool_call","subtype":"completed","call_id":"write-1","tool_call":{{"writeToolCall":{{"args":{{"path":path}},"result":{{"success":{{"path":path}}}}}}}},"session_id":session_id}},
+  {{"type":"result","subtype":"success","is_error":False,"result":"updated","session_id":session_id}},
+]
+for event in events:
+    print(json.dumps(event), flush=True)
+'''
+        events = await self._run_script(script, run_id="run-cursor-code-diff")
+        diff = next(event for event in events if event["type"] == "code_diff")
+        self.assertEqual(diff["attributed_paths"], ["hello.py"])
+        self.assertEqual(diff["files_changed"], 1)
+        self.assertEqual(diff["diff_files"][0]["path"], "hello.py")
 
     async def test_rejected_shell_call_is_reported_as_tool_finished_not_dropped(
         self,
@@ -314,6 +503,64 @@ class RunCursorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tool_finished["tool"]["name"], "shell")
         self.assertEqual(tool_finished["exit_code"], 1)
         self.assertIn("not trusted", tool_finished["output"])
+
+    async def test_cursor_tool_status_is_neutral_not_successful(self) -> None:
+        events = await self._run_script(_event_script([
+            _init_event(),
+            {
+                "type": "tool_call",
+                "subtype": "started",
+                "call_id": "await-1",
+                "tool_call": {"awaitToolCall": {"args": {"task": "job-1"}}},
+                "session_id": "cursor-sess-test",
+            },
+            {
+                "type": "tool_call",
+                "subtype": "completed",
+                "call_id": "await-1",
+                "tool_call": {"awaitToolCall": {
+                    "args": {"task": "job-1"},
+                    "result": {"stillRunning": {}},
+                }},
+                "session_id": "cursor-sess-test",
+            },
+            _result_event("The task is still running."),
+        ]), run_id="run-cursor-neutral-tool-status")
+
+        finished = next(event for event in events if event["type"] == "tool_finished")
+        self.assertIsNone(finished["exit_code"])
+        self.assertIn("still running", finished["output"].lower())
+
+    async def test_confirmation_required_fails_closed_without_bridge(self) -> None:
+        events = await self._run_script(_event_script([
+            _init_event(),
+            {
+                "type": "tool_call",
+                "subtype": "started",
+                "call_id": "pr-1",
+                "tool_call": {"prManagementToolCall": {"args": {}}},
+                "session_id": "cursor-sess-test",
+            },
+            {
+                "type": "tool_call",
+                "subtype": "completed",
+                "call_id": "pr-1",
+                "tool_call": {"prManagementToolCall": {
+                    "args": {},
+                    "result": {"needsConfirmation": {}},
+                }},
+                "session_id": "cursor-sess-test",
+            },
+            _result_event("Done."),
+        ]), run_id="run-cursor-confirmation-required")
+
+        finished = next(event for event in events if event["type"] == "tool_finished")
+        self.assertEqual(finished["exit_code"], 1)
+        self.assertIn("requires confirmation", finished["output"].lower())
+        error = next(event for event in events if event["type"] == "error")
+        self.assertIn("not supported", error["message"].lower())
+        terminal = next(event for event in events if event["type"] == "turn_finished")
+        self.assertTrue(terminal["is_error"])
 
     async def test_logical_error_exit_zero_is_failed_with_empty_result(self) -> None:
         agent_server.RUN_METADATA["run-cursor-1"] = {
@@ -341,6 +588,145 @@ class RunCursorTests(unittest.IsolatedAsyncioTestCase):
             "failed",
         )
         self.assertTrue(any(event["type"] == "error" for event in events))
+
+    async def test_logical_auth_failure_marks_runtime_unauthenticated(self) -> None:
+        secret = "private-account-identity"
+        with patch.object(
+            agent_server,
+            "cursor_auth_probe_state",
+            return_value="unauthenticated",
+        ) as confirm:
+            events = await self._run_script(_event_script([
+                _init_event(),
+                _result_event(
+                    f"Authentication failed. Please sign in. {secret}",
+                    is_error=True,
+                ),
+            ]), run_id="run-cursor-logical-auth")
+
+        diagnostic = agent_server.RUNTIME_DIAGNOSTICS[
+            agent_server.BACKEND_CURSOR
+        ]
+        self.assertEqual(diagnostic["status"], "unauthenticated")
+        self.assertFalse(diagnostic["authenticated"])
+        self.assertNotIn(secret, json.dumps(events))
+        self.assertNotIn(secret, json.dumps(diagnostic))
+        error = next(event for event in events if event["type"] == "error")
+        self.assertIn("authentication failed", error["message"].lower())
+        confirm.assert_called_once()
+
+    async def test_stderr_auth_failure_marks_runtime_unauthenticated(self) -> None:
+        secret = "private-auth-stderr"
+        with patch.object(
+            agent_server,
+            "cursor_auth_probe_state",
+            return_value="unauthenticated",
+        ) as confirm:
+            events = await self._run_script(
+                f'''#!/usr/bin/env python3
+import json, sys
+sys.stdin.read()
+print(json.dumps({{"type":"system","subtype":"init","session_id":"cursor-sess-test","cwd":".","model":"Auto"}}), flush=True)
+sys.stderr.write("Authentication required. Please sign in. {secret}")
+sys.stderr.flush()
+sys.exit(7)
+''',
+                run_id="run-cursor-stderr-auth",
+            )
+
+        diagnostic = agent_server.RUNTIME_DIAGNOSTICS[
+            agent_server.BACKEND_CURSOR
+        ]
+        self.assertEqual(diagnostic["status"], "unauthenticated")
+        self.assertFalse(diagnostic["authenticated"])
+        self.assertNotIn(secret, json.dumps(events))
+        self.assertNotIn(secret, json.dumps(diagnostic))
+        confirm.assert_called_once()
+
+    async def test_project_auth_text_does_not_disable_cursor_without_confirmation(
+        self,
+    ) -> None:
+        agent_server.store_runtime_diagnostic(
+            agent_server.runtime_diagnostic_payload(
+                agent_server.BACKEND_CURSOR,
+                "ready",
+                installed=True,
+                authenticated=True,
+                executable="/bin/agent",
+            )
+        )
+        script = '''#!/usr/bin/env python3
+import json, sys
+sys.stdin.read()
+print(json.dumps({"type":"system","subtype":"init","session_id":"cursor-sess-test","cwd":".","model":"Auto"}), flush=True)
+sys.stderr.write("project says 401 Unauthorized")
+sys.stderr.flush()
+sys.exit(7)
+'''
+        with patch.object(
+            agent_server,
+            "cursor_auth_probe_state",
+            return_value="ready",
+        ) as confirm:
+            events = await self._run_script(
+                script,
+                run_id="run-cursor-project-401",
+            )
+
+        diagnostic = agent_server.RUNTIME_DIAGNOSTICS[
+            agent_server.BACKEND_CURSOR
+        ]
+        self.assertEqual(diagnostic["status"], "ready")
+        self.assertTrue(diagnostic["authenticated"])
+        error = next(event for event in events if event["type"] == "error")
+        self.assertNotIn("authentication failed", error["message"].lower())
+        confirm.assert_called_once()
+
+    async def test_project_auth_result_uses_generic_error_when_login_is_ready(
+        self,
+    ) -> None:
+        with patch.object(
+            agent_server,
+            "cursor_auth_probe_state",
+            return_value="ready",
+        ) as confirm:
+            events = await self._run_script(_event_script([
+                _init_event(),
+                _result_event(
+                    "Project endpoint returned 401 Unauthorized",
+                    is_error=True,
+                ),
+            ]), run_id="run-cursor-project-result-401")
+
+        error = next(event for event in events if event["type"] == "error")
+        self.assertEqual(
+            error["message"],
+            "Cursor reported a logical provider error.",
+        )
+        confirm.assert_called_once()
+
+    async def test_ambiguous_api_key_failure_is_runtime_error_not_auth_failure(
+        self,
+    ) -> None:
+        with patch.object(
+            agent_server,
+            "cursor_auth_probe_state",
+            return_value="error",
+        ) as confirm:
+            events = await self._run_script(_event_script([
+                _init_event(),
+                _result_event("Invalid API key", is_error=True),
+            ]), run_id="run-cursor-ambiguous-api-key")
+
+        diagnostic = agent_server.RUNTIME_DIAGNOSTICS[
+            agent_server.BACKEND_CURSOR
+        ]
+        self.assertEqual(diagnostic["status"], "error")
+        self.assertIsNone(diagnostic["authenticated"])
+        error = next(event for event in events if event["type"] == "error")
+        self.assertIn("could not validate", error["message"].lower())
+        self.assertNotIn("authentication failed", error["message"].lower())
+        confirm.assert_called_once()
 
     async def test_admitted_executable_is_spawned_without_reresolution(self) -> None:
         with patch.object(
@@ -502,8 +888,9 @@ sys.exit(7)
         self.assertFalse(terminal["is_error"])
         self.assertEqual(terminal["result_text"], "drained")
 
-    async def test_terminal_event_with_hung_process_gets_bounded_grace(self) -> None:
+    async def test_terminal_event_with_hung_process_is_not_committed_as_resumable(self) -> None:
         agent_server.CURSOR_POST_TERMINAL_EXIT_SECONDS = 0.05
+        self.session["backend_locked"] = True
         started = time.monotonic()
         events = await self._run_script(
             _event_script(
@@ -513,8 +900,63 @@ sys.exit(7)
         )
         self.assertLess(time.monotonic() - started, 2)
         terminal = next(event for event in events if event["type"] == "turn_finished")
-        self.assertFalse(terminal["is_error"])
-        self.assertEqual(terminal["result_text"], "complete before hang")
+        self.assertTrue(terminal["is_error"])
+        self.assertEqual(terminal["result_text"], "")
+        self.assertNotIn("cursor_session_id", self.session)
+        self.assertTrue(self.session["backend_locked"])
+        error = next(event for event in events if event["type"] == "error")
+        self.assertIn("did not exit cleanly", error["message"])
+
+    async def test_failed_first_turn_never_commits_a_provisional_cursor_session(self) -> None:
+        self.session["backend_locked"] = True
+        events = await self._run_script(_event_script([
+            _init_event("provisional-cursor-id"),
+            _result_event(
+                "provider failure",
+                session_id="provisional-cursor-id",
+                is_error=True,
+            ),
+        ]))
+
+        self.assertTrue(next(
+            event for event in events if event["type"] == "turn_finished"
+        )["is_error"])
+        self.assertNotIn("cursor_session_id", self.session)
+        self.assertNotIn("session_id", self.session)
+        self.assertTrue(self.session["backend_locked"])
+        self.assertFalse(any(
+            event["type"] == "provider_session" for event in events
+        ))
+
+    async def test_failed_resumed_turn_preserves_original_cursor_binding(self) -> None:
+        self.session.update({
+            "backend_locked": True,
+            "cursor_session_id": "existing-cursor-id",
+            "session_id": "existing-cursor-id",
+            "cursor_instruction_hash": "existing-hash",
+            "cursor_instruction_version": "existing-version",
+        })
+        before = dict(self.session)
+        events = await self._run_script(_event_script([
+            _init_event("existing-cursor-id"),
+            _result_event(
+                "provider failure",
+                session_id="existing-cursor-id",
+                is_error=True,
+            ),
+        ]), session_patch=self.session)
+
+        self.assertTrue(next(
+            event for event in events if event["type"] == "turn_finished"
+        )["is_error"])
+        for key in (
+            "backend_locked",
+            "cursor_session_id",
+            "session_id",
+            "cursor_instruction_hash",
+            "cursor_instruction_version",
+        ):
+            self.assertEqual(self.session.get(key), before.get(key))
 
     async def test_active_cursor_turn_stops_and_releases_process(self) -> None:
         script = _write_fake_cli(
@@ -583,7 +1025,7 @@ while True:
             Path(self.tempdir.name),
             """#!/usr/bin/env python3
 import json, sys, time
-prompt = sys.argv[2]
+prompt = sys.stdin.read()
 session_id = "cursor-sess-test"
 print(json.dumps({"type":"system","subtype":"init","session_id":session_id,"cwd":".","model":"Auto"}), flush=True)
 print(json.dumps({"type":"user","message":{"role":"user","content":prompt},"session_id":session_id}), flush=True)
@@ -617,10 +1059,7 @@ while True:
 
             pid = int(active["pid"])
             pgid = int(active["pgid"])
-            leaked_args = (
-                f"{script} -p '[AgentsDock provider instructions] "
-                f"{secret}' --output-format stream-json"
-            )
+            leaked_args = f"{script} -p --output-format stream-json --trust"
             process_row = {
                 "pid": pid,
                 "ppid": 1,
@@ -663,7 +1102,7 @@ while True:
         serialized = json.dumps(snapshot)
         self.assertNotIn(secret, serialized)
         self.assertNotIn("AgentsDock provider instructions", serialized)
-        self.assertIn("<prompt>", serialized)
+        self.assertNotIn("<prompt>", serialized)
         self.assertTrue(snapshot["processes"][0]["args_redacted"])
         self.assertNotIn(secret, snapshot["stdout_tail"]["text"])
         self.assertNotIn("Current user prompt", snapshot["stdout_tail"]["text"])
@@ -705,6 +1144,119 @@ while True:
         )
         self.assertEqual(stopped["backend"], agent_server.BACKEND_CURSOR)
 
+    async def test_cursor_does_not_deliver_prompt_when_binding_is_stale(self) -> None:
+        script = _write_fake_cli(
+            Path(self.tempdir.name),
+            "#!/usr/bin/env python3\nimport sys, time\nsys.stdin.read()\ntime.sleep(60)\n",
+        )
+        runner_session = {**self.session, "_cursor_executable": str(script)}
+        self._arm_run("run-cursor-stale-bind", "do not deliver")
+
+        with patch.object(
+            agent_server,
+            "bind_active_turn",
+            return_value=(False, False),
+        ), patch.object(
+            agent_server,
+            "write_cursor_process_stdin",
+        ) as write_stdin:
+            await asyncio.wait_for(
+                agent_server.run_cursor(
+                    self.session_id,
+                    "run-cursor-stale-bind",
+                    "do not deliver",
+                    runner_session,
+                    Path(self.tempdir.name) / "manifest.json",
+                ),
+                timeout=3,
+            )
+
+        write_stdin.assert_not_awaited()
+
+    async def test_cursor_cancelled_during_binding_cleans_up_without_prompt(self) -> None:
+        child_pid_file = Path(self.tempdir.name) / "prebind-child.pid"
+        script = _write_fake_cli(
+            Path(self.tempdir.name),
+            "#!/usr/bin/env python3\n"
+            "import os, pathlib, sys, time\n"
+            f"pathlib.Path({str(child_pid_file)!r}).write_text(str(os.getpid()))\n"
+            "sys.stdin.read()\n"
+            "time.sleep(60)\n",
+        )
+        runner_session = {**self.session, "_cursor_executable": str(script)}
+        self._arm_run("run-cursor-cancelled-bind", "do not deliver")
+        bind_entered = asyncio.Event()
+
+        async def blocked_bind(*_args: object, **_kwargs: object) -> tuple[bool, bool]:
+            bind_entered.set()
+            await asyncio.Future()
+
+        with patch.object(
+            agent_server,
+            "bind_active_turn",
+            side_effect=blocked_bind,
+        ), patch.object(
+            agent_server,
+            "write_cursor_process_stdin",
+        ) as write_stdin:
+            task = asyncio.create_task(agent_server.run_cursor(
+                self.session_id,
+                "run-cursor-cancelled-bind",
+                "do not deliver",
+                runner_session,
+                Path(self.tempdir.name) / "manifest.json",
+            ))
+            await asyncio.wait_for(bind_entered.wait(), timeout=2)
+            deadline = time.monotonic() + 2
+            while not child_pid_file.exists() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            self.assertTrue(child_pid_file.exists())
+            child_pid = int(child_pid_file.read_text())
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=3)
+
+        write_stdin.assert_not_awaited()
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            await asyncio.sleep(0.02)
+        else:
+            try:
+                os.kill(child_pid, 9)
+            except ProcessLookupError:
+                pass
+            self.fail("Cursor child survived cancellation during bind")
+
+    async def test_cursor_does_not_deliver_prompt_for_a_preexisting_stop(self) -> None:
+        script = _write_fake_cli(
+            Path(self.tempdir.name),
+            "#!/usr/bin/env python3\nimport sys, time\nsys.stdin.read()\ntime.sleep(60)\n",
+        )
+        runner_session = {**self.session, "_cursor_executable": str(script)}
+        self._arm_run("run-cursor-prestopped", "do not deliver")
+        agent_server.STOP_REQUESTS.add(self.session_id)
+
+        with patch.object(
+            agent_server,
+            "write_cursor_process_stdin",
+        ) as write_stdin:
+            await asyncio.wait_for(
+                agent_server.run_cursor(
+                    self.session_id,
+                    "run-cursor-prestopped",
+                    "do not deliver",
+                    runner_session,
+                    Path(self.tempdir.name) / "manifest.json",
+                ),
+                timeout=3,
+            )
+
+        write_stdin.assert_not_awaited()
+
     async def test_startup_timeout_fails_and_releases_turn(self) -> None:
         agent_server.CURSOR_STARTUP_TIMEOUT_SECONDS = 0.05
         agent_server.CURSOR_TURN_TIMEOUT_SECONDS = 1
@@ -735,6 +1287,22 @@ while True:
         self.assertTrue(terminal["is_error"])
         error = next(event for event in events if event["type"] == "error")
         self.assertIn("absolute turn timeout", error["message"])
+
+    async def test_idle_warning_is_emitted_once_per_idle_period(self) -> None:
+        agent_server.CURSOR_IDLE_WARN_SECONDS = 0.02
+        agent_server.CURSOR_IDLE_TIMEOUT_SECONDS = 0.12
+        events = await self._run_script(
+            """#!/usr/bin/env python3
+import json, sys, time
+sys.stdin.read()
+print(json.dumps({"type":"system","subtype":"init","session_id":"cursor-sess-test","cwd":".","model":"Auto"}), flush=True)
+time.sleep(5)
+"""
+        )
+        warnings = [event for event in events if event["type"] == "idle_warning"]
+        self.assertEqual(len(warnings), 1)
+        terminal = next(event for event in events if event["type"] == "turn_finished")
+        self.assertTrue(terminal["is_error"])
 
     async def test_missing_runtime_is_a_failed_terminal(self) -> None:
         self._arm_run("run-cursor-1")
@@ -1024,6 +1592,58 @@ while True:
         ):
             self.assertEqual(parent.get(key), before.get(key))
 
+    async def test_start_turn_pins_the_compatibility_probed_cursor_executable(self) -> None:
+        pinned = str(Path(self.tempdir.name) / "verified-cursor-agent")
+        captured_session: dict = {}
+
+        async def capture_cursor(
+            _session_id: str,
+            _run_id: str,
+            _prompt: str,
+            runner_session: dict,
+            _manifest_path: Path,
+            **_kwargs: object,
+        ) -> None:
+            captured_session.update(runner_session)
+
+        agent_server.BUSY_SESSIONS.clear()
+        agent_server.CURRENT_TURNS.clear()
+        with patch.object(
+            agent_server,
+            "ensure_runtime_available",
+            return_value={"status": "ready", "_executable": pinned},
+        ), patch.object(
+            agent_server,
+            "run_cursor",
+            side_effect=capture_cursor,
+        ), patch.object(
+            agent_server,
+            "resolve_cursor_executable",
+        ) as resolve_cursor, patch.object(
+            agent_server,
+            "scrub_tmux_global_secret_environment",
+        ):
+            await agent_server.start_turn(
+                self.session_id,
+                agent_server.TurnRequest(
+                    prompt="Use the admitted Cursor executable",
+                    backend=agent_server.BACKEND_CURSOR,
+                ),
+            )
+            for _ in range(300):
+                if captured_session:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                self.fail("Cursor runner was not scheduled")
+            for _ in range(300):
+                if self.session_id not in agent_server.BUSY_SESSIONS:
+                    break
+                await asyncio.sleep(0.01)
+
+        self.assertEqual(captured_session.get("_cursor_executable"), pinned)
+        resolve_cursor.assert_not_called()
+
     async def test_start_turn_scheduled_standalone_cursor_override_isolated_from_parent(
         self,
     ) -> None:
@@ -1114,16 +1734,16 @@ while True:
             "memory_seed_used": False,
         })
         captured_prompts: list[str] = []
-        real_build_cursor_cmd = cursor_agent_client.build_cursor_cmd
+        real_write_cursor_stdin = agent_server.write_cursor_process_stdin
 
-        def capture_cmd(sess: dict, provider_prompt: str, **kwargs: object) -> list[str]:
+        async def capture_stdin(proc: object, provider_prompt: str) -> None:
             captured_prompts.append(provider_prompt)
-            return real_build_cursor_cmd(sess, provider_prompt, **kwargs)
+            await real_write_cursor_stdin(proc, provider_prompt)
 
         with patch.object(
-            cursor_agent_client,
-            "build_cursor_cmd",
-            side_effect=capture_cmd,
+            agent_server,
+            "write_cursor_process_stdin",
+            side_effect=capture_stdin,
         ):
             failed = await self._run_script(
                 _event_script([

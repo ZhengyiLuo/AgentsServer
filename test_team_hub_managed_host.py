@@ -389,7 +389,7 @@ class ManagedHostTests(unittest.TestCase):
             self.assertEqual(migrated.bootstrap_proof_path.read_bytes(), expected_proof)
             connection = migrated.connect()
             try:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 6)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 7)
                 self.assertEqual(
                     connection.execute(
                         "SELECT count(*) FROM bootstrap_delegations"
@@ -483,7 +483,7 @@ class ManagedHostTests(unittest.TestCase):
                 try:
                     self.assertEqual(
                         connection.execute("PRAGMA user_version").fetchone()[0],
-                        6,
+                        7,
                     )
                     preserved = connection.execute(
                         "SELECT * FROM channels WHERE id=?", (old_board_id,)

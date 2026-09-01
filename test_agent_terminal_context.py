@@ -39,6 +39,10 @@ class AgentTerminalContextTests(unittest.TestCase):
             env["AGENTSDOCK_CHATS_CLI"],
             str(agent_server.SERVER_ROOT / "agentsdock_chats.py"),
         )
+        self.assertEqual(
+            env["AGENTSDOCK_MAIL_CLI"],
+            str(agent_server.SERVER_ROOT / "agentsdock_mail.py"),
+        )
         for name in agent_server.PROVIDER_SECRET_ENV_NAMES:
             self.assertNotIn(name, env)
 
@@ -48,6 +52,10 @@ class AgentTerminalContextTests(unittest.TestCase):
         self.assertEqual(
             env["AGENTSDOCK_PUBLISH_CLI"],
             str(agent_server.SERVER_ROOT / "agentsdock_publish.py"),
+        )
+        self.assertEqual(
+            env["AGENTSDOCK_MAIL_CLI"],
+            str(agent_server.SERVER_ROOT / "agentsdock_mail.py"),
         )
         for name in agent_server.PROVIDER_SECRET_ENV_NAMES:
             self.assertNotIn(name, env)

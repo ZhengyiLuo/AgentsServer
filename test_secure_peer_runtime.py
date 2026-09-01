@@ -11,11 +11,126 @@ from agentsdock_team_hub.secure_peer import (
     SecurePeerError,
     SecurePeerStore,
 )
-from agentsdock_team_hub.store import HubStore
+from agentsdock_team_hub.store import HubError, HubStore
 from secure_peer_runtime import SecurePeerRuntime
 
 
 class SecurePeerRuntimeTests(unittest.TestCase):
+    def test_agent_mail_receipt_rejects_remote_mismatch(self) -> None:
+        valid = {
+            "item": {
+                "id": "item_1",
+                "kind": "message",
+                "body": "prepared body",
+                "body_format": "markdown",
+                "to": {"kind": "server", "id": "node_1"},
+            },
+            "delivery": {"id": "delivery_1", "state": "available"},
+        }
+        accepted = SecurePeerRuntime._validated_agent_mail_receipt(
+            valid,
+            kind="message",
+            target_kind="server",
+            target_id="node_1",
+            message="prepared body",
+        )
+        self.assertEqual(accepted["item"]["id"], "item_1")
+        for mismatch in (
+            {},
+            {**valid, "delivery": {}},
+            {
+                **valid,
+                "item": {
+                    **valid["item"],
+                    "to": {"kind": "server", "id": "wrong_node"},
+                },
+            },
+            {**valid, "item": {**valid["item"], "body": "wrong body"}},
+        ):
+            with self.assertRaises(SecurePeerError):
+                SecurePeerRuntime._validated_agent_mail_receipt(
+                    mismatch,
+                    kind="message",
+                    target_kind="server",
+                    target_id="node_1",
+                    message="prepared body",
+                )
+
+    def test_agent_mail_send_rejects_stale_connection_certificate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="source_server",
+                server_instance_id="source_instance",
+                display_name="Source",
+            )
+            connection_id = str(uuid.uuid4())
+            profile = {
+                "realm": "secure_peer",
+                "connection_id": connection_id,
+                "team_id": "team_1",
+                "hub_id": "hub_1",
+                "host_server_identity": "host_1",
+                "certificate_fingerprint": "sha256:" + "a" * 64,
+                "destination_kind": "server",
+                "destination_id": "node_1",
+            }
+            active = {
+                "active": True,
+                "status": "connected",
+                "connection_id": connection_id,
+                "team_id": "team_1",
+                "hub_id": "hub_1",
+                "host_server_identity": "host_1",
+                "certificate_fingerprint": "sha256:" + "b" * 64,
+                "scopes": ["teamspace.read", "teamspace.write"],
+            }
+            with (
+                mock.patch.object(
+                    runtime.client, "list_connections", return_value=[active]
+                ),
+                mock.patch.object(runtime, "proxy") as proxy,
+            ):
+                with self.assertRaises(SecurePeerError):
+                    runtime.send_agent_mail(
+                        profile,
+                        kind="message",
+                        message="prepared body",
+                        idempotency_key="mail_stale_1",
+                    )
+            proxy.assert_not_called()
+            runtime.shutdown()
+
+    def test_agent_mail_host_listing_fails_closed_on_one_team_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="source_server",
+                server_instance_id="source_instance",
+                display_name="Source",
+            )
+
+            class FailingHost:
+                hub_id = "hub_1"
+
+                @staticmethod
+                def local_agent_mail_team_ids():
+                    return ["team_1", "team_2"]
+
+                @staticmethod
+                def local_agent_mail_claims(team_id):
+                    return {"team_id": team_id}
+
+                @staticmethod
+                def get_network(*_args, **_kwargs):
+                    raise HubError("unavailable", "private host detail", 409)
+
+            runtime._hub_store = FailingHost()
+            with mock.patch.object(runtime.client, "list_connections", return_value=[]):
+                with self.assertRaises(HubError):
+                    runtime.agent_mail_route_profiles()
+            runtime.shutdown()
+
     @staticmethod
     def incoming_pairing(status: str, created_at: int) -> dict:
         return {

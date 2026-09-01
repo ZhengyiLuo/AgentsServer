@@ -19,9 +19,11 @@ RUNTIME_FILES=(
   "$SCRIPT_DIR/agentsdock_chats.py"
   "$SCRIPT_DIR/agentsdock_emergency.py"
   "$SCRIPT_DIR/agentsdock_publish.py"
+  "$SCRIPT_DIR/agentsdock_mail.py"
   "$SCRIPT_DIR/claude_sdk_client.py"
   "$SCRIPT_DIR/codex_app_server.py"
   "$SCRIPT_DIR/cursor_agent_client.py"
+  "$SCRIPT_DIR/cursor_process_guard.py"
   "$SCRIPT_DIR/update_runner.py"
   "$SCRIPT_DIR/release-public-key.pem"
   "$SCRIPT_DIR/VERSION"
@@ -166,11 +168,11 @@ ssh "$REMOTE_HOST" "
         'claude-agent-sdk==0.2.130' 'croniter>=6,<7' 'cryptography>=44,<47' 'python-dateutil>=2.9,<3' 'tzdata>=2025.2'
     fi
   fi
-  PYTHONPATH='$REMOTE_SERVER_DIR' '$REMOTE_PYTHON' -c 'from importlib.metadata import version; import agentsdock_team_hub, claude_agent_sdk, cursor_agent_client, secure_peer_delivery, secure_peer_runtime, team_hub_host; from agentsdock_team_hub import secure_peer, secure_peer_hub; sdk_version = version(\"claude-agent-sdk\"); raise SystemExit(0 if sdk_version == \"0.2.130\" else f\"expected claude-agent-sdk 0.2.130, got {sdk_version}\")'
+  PYTHONPATH='$REMOTE_SERVER_DIR' '$REMOTE_PYTHON' -c 'from importlib.metadata import version; import agentsdock_team_hub, claude_agent_sdk, cursor_agent_client, cursor_process_guard, secure_peer_delivery, secure_peer_runtime, team_hub_host, agentsdock_mail; from agentsdock_team_hub import secure_peer, secure_peer_hub; sdk_version = version(\"claude-agent-sdk\"); raise SystemExit(0 if sdk_version == \"0.2.130\" else f\"expected claude-agent-sdk 0.2.130, got {sdk_version}\")'
 "
 
 echo "Compiling server on $REMOTE_HOST"
-ssh "$REMOTE_HOST" "chmod 755 '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/agentsdock_chats.py' '$REMOTE_SERVER_DIR/agentsdock_emergency.py' '$REMOTE_SERVER_DIR/agentsdock_publish.py' && '$REMOTE_PYTHON' -m compileall -q '$REMOTE_SERVER_DIR/agentsdock_team_hub' && '$REMOTE_PYTHON' -m py_compile '$REMOTE_SERVER_PATH' '$REMOTE_SERVER_DIR/team_hub_host.py' '$REMOTE_SERVER_DIR/secure_peer_runtime.py' '$REMOTE_SERVER_DIR/secure_peer_delivery.py' '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/agentsdock_chats.py' '$REMOTE_SERVER_DIR/agentsdock_emergency.py' '$REMOTE_SERVER_DIR/agentsdock_publish.py' '$REMOTE_SERVER_DIR/claude_sdk_client.py' '$REMOTE_SERVER_DIR/codex_app_server.py' '$REMOTE_SERVER_DIR/cursor_agent_client.py' '$REMOTE_SERVER_DIR/update_runner.py'"
+ssh "$REMOTE_HOST" "chmod 755 '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/agentsdock_chats.py' '$REMOTE_SERVER_DIR/agentsdock_emergency.py' '$REMOTE_SERVER_DIR/agentsdock_publish.py' '$REMOTE_SERVER_DIR/agentsdock_mail.py' && '$REMOTE_PYTHON' -m compileall -q '$REMOTE_SERVER_DIR/agentsdock_team_hub' && '$REMOTE_PYTHON' -m py_compile '$REMOTE_SERVER_PATH' '$REMOTE_SERVER_DIR/team_hub_host.py' '$REMOTE_SERVER_DIR/secure_peer_runtime.py' '$REMOTE_SERVER_DIR/secure_peer_delivery.py' '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/agentsdock_chats.py' '$REMOTE_SERVER_DIR/agentsdock_emergency.py' '$REMOTE_SERVER_DIR/agentsdock_publish.py' '$REMOTE_SERVER_DIR/agentsdock_mail.py' '$REMOTE_SERVER_DIR/claude_sdk_client.py' '$REMOTE_SERVER_DIR/codex_app_server.py' '$REMOTE_SERVER_DIR/cursor_agent_client.py' '$REMOTE_SERVER_DIR/cursor_process_guard.py' '$REMOTE_SERVER_DIR/update_runner.py'"
 
 echo "Restarting $SERVICE_NAME"
 ssh "$REMOTE_HOST" "systemctl --user restart '$SERVICE_NAME'"

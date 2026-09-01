@@ -22,9 +22,11 @@ FILES = (
     "agentsdock_chats.py",
     "agentsdock_emergency.py",
     "agentsdock_publish.py",
+    "agentsdock_mail.py",
     "claude_sdk_client.py",
     "codex_app_server.py",
     "cursor_agent_client.py",
+    "cursor_process_guard.py",
     "install.sh",
     "uninstall.sh",
     "update_runner.py",
@@ -52,6 +54,7 @@ DIRECTORY_FILES = {
         "migrations/0004_managed_host_binding.sql",
         "migrations/0005_tailnet_bootstrap_delegations.sql",
         "migrations/0006_team_network_mailbox.sql",
+        "migrations/0007_local_agent_mail.sql",
     ),
 }
 DIRECTORIES = tuple(DIRECTORY_FILES)
@@ -159,6 +162,7 @@ def main() -> int:
         (package_root / "agentsdock_chats.py").chmod(0o755)
         (package_root / "agentsdock_emergency.py").chmod(0o755)
         (package_root / "agentsdock_publish.py").chmod(0o755)
+        (package_root / "agentsdock_mail.py").chmod(0o755)
         (package_root / "update_runner.py").chmod(0o755)
         with tarfile.open(archive_path, "w:gz", format=tarfile.PAX_FORMAT) as archive:
             archive.add(package_root, arcname=package_root.name)
@@ -171,7 +175,7 @@ def main() -> int:
         "version": version,
         "track": "beta" if "-" in version.split("+", 1)[0] else "stable",
         "prerelease": "-" in version.split("+", 1)[0],
-        "api_contract_version": 23,
+        "api_contract_version": 24,
         "commit": commit,
         "archive": {
             "name": archive_name,

@@ -51,7 +51,7 @@ class DatabaseTests(unittest.TestCase):
         connection = open_database()
         self.addCleanup(connection.close)
 
-        self.assertEqual(LATEST_SCHEMA_VERSION, 6)
+        self.assertEqual(LATEST_SCHEMA_VERSION, 7)
         self.assertEqual(
             connection.execute("PRAGMA user_version").fetchone()[0],
             LATEST_SCHEMA_VERSION,
@@ -120,7 +120,7 @@ class DatabaseTests(unittest.TestCase):
             )
             connection.execute(f"PRAGMA user_version = {migration.version}")
 
-        self.assertEqual(apply_migrations(connection), 6)
+        self.assertEqual(apply_migrations(connection), 7)
         self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
         objects = {
             row[0]

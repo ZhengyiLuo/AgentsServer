@@ -141,6 +141,8 @@ def send(args: argparse.Namespace) -> dict[str, Any]:
         raise MailCLIError("Team Network mail body on stdin must not be empty")
     route_id = str(args.route or "").strip()
     kind = str(args.kind or "message")
+    if kind != "message":
+        raise MailCLIError("AgentsDock agent mail permits messages only")
     stable_key = "mail_cli_" + hashlib.sha256(
         f"{capability}\0{route_id}\0{kind}\0{message}".encode("utf-8")
     ).hexdigest()
@@ -185,7 +187,7 @@ def parser() -> argparse.ArgumentParser:
     send_command.add_argument("--route", required=True, help="opaque route from list")
     send_command.add_argument(
         "--kind",
-        choices=("message", "request"),
+        choices=("message",),
         default="message",
     )
     send_command.add_argument("--idempotency-key", help=argparse.SUPPRESS)

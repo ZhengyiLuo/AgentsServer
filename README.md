@@ -316,7 +316,23 @@ default-deny: only an ordinary user prompt whose first token is exactly
 four sends, and reads the UTF-8 body from stdin so message content does not
 appear in process arguments. It creates a passive Team Network Inbox item; it
 never starts or steers a chat or agent. Scheduled jobs, synthetic handoffs, and
-near-matches such as `/mailbox` do not receive this authority.
+near-matches such as `/mailbox` do not receive this authority. The provider
+mail harness creates message items only; it cannot create new Team Network
+requests. Existing request records and the separate Team Hub request lifecycle
+remain readable for backward data compatibility.
+
+The additive strict form `/mail server NAME MESSAGE` treats `NAME` as one
+case-sensitive token and the remainder as the exact normalized message body.
+AgentsServer filters the private route snapshot to active server destinations
+whose raw display name exactly equals `NAME`. Zero matches fail as not found;
+multiple matches, including equal names on different Team Networks, fail as
+ambiguous. A successful strict command exposes only that one opaque route and
+permits exactly one idempotent `kind=message` effect with the exact body. It
+cannot fall back to an agent destination, a case-insensitive name, a request,
+rewritten content, or a second send. Legacy `/mail` remains available for
+older clients. Health advertises the strict syntax and feature flags inside
+`agent_team_mail_v1`, so clients can discover it without a global API-contract
+revision.
 
 ## Manual Onboarding
 

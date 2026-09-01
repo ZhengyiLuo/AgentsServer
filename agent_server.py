@@ -46,7 +46,7 @@ import threading
 import time
 import unicodedata
 import uuid
-from collections import OrderedDict, defaultdict, deque
+from collections import Counter, OrderedDict, defaultdict, deque
 from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
@@ -643,6 +643,12 @@ MAX_ARTIFACT_PUBLISH_FILES = int(agentsdock_setting("ARTIFACT_PUBLISH_MAX_FILES"
 MAX_ARTIFACT_TITLE_CHARS = int(agentsdock_setting("ARTIFACT_TITLE_MAX_CHARS", "1000"))
 MAX_ARTIFACT_TEXT_CHARS = int(agentsdock_setting("ARTIFACT_TEXT_MAX_CHARS", "12000"))
 MAX_IMPORT_MESSAGES = int(agentsdock_setting("HISTORY_IMPORT_LIMIT", "400"))
+# How far back to look for messages already on the timeline when deciding
+# what a provider transcript added elsewhere. Bounded so opening a very long
+# chat cannot turn into an unbounded scan.
+HISTORY_SYNC_EVENT_SCAN_LIMIT = int(
+    agentsdock_setting("HISTORY_SYNC_EVENT_SCAN_LIMIT", "20000")
+)
 MAX_IMPORTED_TEXT_CHARS = int(agentsdock_setting("HISTORY_IMPORT_TEXT_CHARS", "12000"))
 MAX_LOCAL_SESSION_LIST_ITEMS = 500
 MAX_LOCAL_SESSION_SCAN_FILES = 10_000
@@ -8759,6 +8765,9 @@ async def broadcast_committed_emergency_removal(session_id: str) -> None:
 
 ACTIVE: dict[str, dict[str, Any]] = {}
 BUSY_SESSIONS: set[str] = set()
+# Chats with a provider-transcript catch-up already queued or running, so a
+# burst of opens cannot start overlapping syncs of the same chat.
+HISTORY_SYNC_SCHEDULED: set[str] = set()
 # Short provider-maintenance requests (for example, loading a selected Codex
 # thread) participate in update admission without impersonating a user turn in
 # runtime/status responses.
@@ -31642,6 +31651,138 @@ def provider_history(sess: dict[str, Any], limit: int | None) -> tuple[Path | No
     return None, []
 
 
+def history_dedup_key(kind: str, text: Any) -> tuple[str, str]:
+    """Compare a transcript message to a timeline message by shape, not bytes.
+
+    The same message reaches the two sides by different paths (import
+    compaction on one, assistant-text cleaning on the other), so whitespace
+    is normalized before comparing.
+    """
+
+    return str(kind or ""), " ".join(str(text or "").split())
+
+
+def unsynced_history_items(
+    session_id: str,
+    items: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Return only the transcript tail this chat's timeline has not shown.
+
+    A provider transcript holds the whole conversation, including turns this
+    server itself ran, so re-importing it wholesale duplicates everything.
+    This walks the transcript against messages already on the timeline and
+    keeps only what follows the last message we recognize.
+
+    Deliberately anchored to the *last* match rather than to every unmatched
+    item: if one mid-history message fails to match (cleaning differences, an
+    edited transcript), the safe outcome is importing nothing extra rather
+    than splicing a duplicate into the middle of the conversation.
+    """
+
+    seen: Counter[tuple[str, str]] = Counter()
+    for event in read_events(session_id, limit=HISTORY_SYNC_EVENT_SCAN_LIMIT):
+        event_type = event.get("type")
+        if event_type == "turn_started":
+            seen[history_dedup_key("user", event.get("prompt"))] += 1
+        elif event_type == "assistant_text":
+            seen[history_dedup_key("assistant", event.get("text"))] += 1
+
+    last_matched = -1
+    for index, item in enumerate(items):
+        key = history_dedup_key(item.get("kind", ""), item.get("text", ""))
+        if seen.get(key):
+            seen[key] -= 1
+            last_matched = index
+    return items[last_matched + 1:]
+
+
+async def sync_provider_history(
+    sess: dict[str, Any],
+    *,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Append provider messages added outside this chat since the last sync.
+
+    AgentsDock drives the real provider CLI, so anything sent from here is
+    already in the provider transcript - but the reverse was not true. A
+    conversation continued in the provider's own CLI (or on another machine
+    sharing that transcript) grew silently: the next AgentsDock turn resumed
+    the thread and the model answered with full context the timeline never
+    showed, which reads as the assistant knowing things the user never said.
+    """
+
+    session_id = str(sess["id"])
+    if not session_provider_id(sess):
+        return {
+            "imported": 0,
+            "source_path": None,
+            "message": "No provider session ID set.",
+        }
+    source_path, items = await asyncio.to_thread(provider_history, sess, limit)
+    if not source_path or not items:
+        return {
+            "imported": 0,
+            "source_path": None,
+            "message": "No provider transcript found.",
+        }
+    fresh = await asyncio.to_thread(unsynced_history_items, session_id, items)
+    if not fresh:
+        return {
+            "imported": 0,
+            "source_path": str(source_path),
+            "message": "Already up to date with the provider transcript.",
+        }
+    return await append_imported_history(sess, source_path, fresh)
+
+
+async def run_provider_history_sync(session_id: str) -> None:
+    """Sync one chat in the background; never surface failure to the opener."""
+
+    try:
+        sess = STORE.sessions.get(session_id)
+        if not sess:
+            return
+        result = await sync_provider_history(dict(sess))
+        if result.get("imported"):
+            logger.info(
+                "synced %d provider message(s) added outside session=%s",
+                result["imported"],
+                session_id,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # A read-only catch-up must never break opening a chat.
+        logger.warning(
+            "provider history sync failed session=%s error=%s",
+            session_id,
+            type(exc).__name__,
+        )
+    finally:
+        HISTORY_SYNC_SCHEDULED.discard(session_id)
+
+
+def schedule_provider_history_sync(sess: dict[str, Any]) -> None:
+    """Catch one chat's transcript up when opened, without blocking the open.
+
+    Opening a chat must stay fast, and the client is already subscribed to
+    the event stream, so recovered messages arrive live instead of delaying
+    the response.
+    """
+
+    session_id = str(sess.get("id") or "")
+    if not session_id or session_id in HISTORY_SYNC_SCHEDULED:
+        return
+    if not session_provider_id(sess):
+        return
+    # A turn in flight is already streaming the provider's own output and its
+    # transcript writes are still landing.
+    if session_id in BUSY_SESSIONS or ACTIVE.get(session_id) is not None:
+        return
+    HISTORY_SYNC_SCHEDULED.add(session_id)
+    asyncio.create_task(run_provider_history_sync(session_id))
+
+
 async def append_imported_history(
     sess: dict[str, Any],
     source_path: Path,
@@ -52513,6 +52654,11 @@ async def get_session(
     sess = STORE.sessions.get(session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="session not found")
+    # Opening a chat is the moment to notice that its provider transcript grew
+    # somewhere else (the provider's own CLI, or another machine sharing it).
+    # Scheduled rather than awaited so the open stays fast; the client's event
+    # stream delivers whatever it recovers.
+    schedule_provider_history_sync(sess)
     normalized_page_mode = str(page_mode or "").strip().lower()
     if normalized_page_mode not in {"", "semantic"}:
         raise HTTPException(status_code=400, detail="page_mode must be semantic")

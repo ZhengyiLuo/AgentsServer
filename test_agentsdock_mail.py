@@ -107,7 +107,7 @@ class AgentsDockMailCLITests(unittest.TestCase):
             return {
                 "ok": True,
                 "route_id": route_id,
-                "kind": "request",
+                "kind": "message",
                 "accepted": True,
                 "duplicate": False,
             }
@@ -115,7 +115,7 @@ class AgentsDockMailCLITests(unittest.TestCase):
         args = argparse.Namespace(
             authority_file=self.authority(),
             route=route_id,
-            kind="request",
+            kind="message",
             idempotency_key=None,
         )
         with (
@@ -139,6 +139,16 @@ class AgentsDockMailCLITests(unittest.TestCase):
             calls[0][3]["idempotency_key"],
             calls[1][3]["idempotency_key"],
         )
+
+    def test_send_rejects_request_kind_even_when_called_without_parser(self) -> None:
+        with patch.object(agentsdock_mail.sys, "stdin", io.StringIO("body")):
+            with self.assertRaises(agentsdock_mail.MailCLIError):
+                agentsdock_mail.send(argparse.Namespace(
+                    authority_file=self.authority(),
+                    route="mail_" + "a" * 32,
+                    kind="request",
+                    idempotency_key=None,
+                ))
 
     def test_send_rejects_tty_invalid_utf8_and_oversize_stdin(self) -> None:
         route_id = "mail_" + "a" * 32
@@ -226,6 +236,24 @@ class ProviderTeamMailTests(unittest.IsolatedAsyncioTestCase):
             "server": ("127.0.0.1", 7850),
             "client": ("127.0.0.1", 41000),
         })
+
+    async def activate_strict_command(self, prompt: str) -> Path:
+        command = agent_server.provider_team_mail_strict_command(None, prompt)
+        self.assertIsNotNone(command)
+        path = await agent_server.issue_cross_chat_capability(
+            "source",
+            "run_mail",
+            [],
+            actions={"team_mail"},
+            team_mail_enabled=True,
+            team_mail_command=command,
+        )
+        payload = json.loads(path.read_text())
+        self.token = payload["provider_capability"]
+        self.token_hash = agent_server.hashlib.sha256(
+            self.token.encode()
+        ).hexdigest()
+        return path
 
     @staticmethod
     def profile() -> dict:
@@ -333,6 +361,265 @@ class ProviderTeamMailTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len({route["route_id"] for route in listed["routes"]}), 2)
 
+    async def test_strict_server_command_matches_one_exact_case_sensitive_server(self) -> None:
+        authority_path = await self.activate_strict_command(
+            "/mail server MBA exact private body"
+        )
+        self.assertNotIn("MBA", authority_path.read_text())
+        self.assertNotIn("exact private body", authority_path.read_text())
+        server = {
+            **self.profile(),
+            "display_name": "MBA",
+            "network_display_name": "Alpha",
+        }
+        agent = {
+            **self.profile(),
+            "destination_kind": "agent",
+            "destination_id": "agent_private",
+            "display_name": "MBA",
+            "backend": "codex",
+        }
+        wrong_case = {
+            **self.profile(),
+            "destination_id": "node_wrong_case",
+            "display_name": "mba",
+            "network_display_name": "Beta",
+        }
+        with patch.object(
+            agent_server.SECURE_PEER_RUNTIME,
+            "agent_mail_route_profiles",
+            return_value=[agent, wrong_case, server],
+        ):
+            listed = await agent_server.list_provider_team_mail_routes(self.request())
+        self.assertEqual(len(listed["routes"]), 1)
+        self.assertEqual(listed["routes"][0]["kind"], "server")
+        self.assertEqual(listed["routes"][0]["display_name"], "MBA")
+        self.assertEqual(listed["routes"][0]["network_display_name"], "Alpha")
+
+    async def test_strict_server_command_fails_closed_on_zero_or_duplicate_matches(self) -> None:
+        await self.activate_strict_command("/mail server MBA exact body")
+        with patch.object(
+            agent_server.SECURE_PEER_RUNTIME,
+            "agent_mail_route_profiles",
+            return_value=[{**self.profile(), "display_name": "mba"}],
+        ):
+            with self.assertRaises(HTTPException) as missing:
+                await agent_server.list_provider_team_mail_routes(self.request())
+        self.assertEqual(missing.exception.status_code, 404)
+        capability = agent_server.CROSS_CHAT_CAPABILITIES[self.token_hash]
+        self.assertEqual(capability["team_mail_routes"], {})
+
+        await self.activate_strict_command("/mail server MBA exact body")
+        first = {
+            **self.profile(),
+            "destination_id": "node_alpha",
+            "display_name": "MBA",
+            "network_display_name": "Alpha",
+        }
+        second = {
+            **self.profile(),
+            "destination_id": "node_beta",
+            "display_name": "MBA",
+            "network_display_name": "Beta",
+        }
+        with patch.object(
+            agent_server.SECURE_PEER_RUNTIME,
+            "agent_mail_route_profiles",
+            return_value=[first, second],
+        ):
+            with self.assertRaises(HTTPException) as ambiguous:
+                await agent_server.list_provider_team_mail_routes(self.request())
+        self.assertEqual(ambiguous.exception.status_code, 409)
+        with self.assertRaises(HTTPException) as frozen_ambiguous:
+            await agent_server.list_provider_team_mail_routes(self.request())
+        self.assertEqual(frozen_ambiguous.exception.status_code, 409)
+
+    async def test_strict_server_command_enforces_body_kind_and_one_effect(self) -> None:
+        await self.activate_strict_command("/mail server MBA exact body")
+        profile = {**self.profile(), "display_name": "MBA"}
+        with patch.object(
+            agent_server.SECURE_PEER_RUNTIME,
+            "agent_mail_route_profiles",
+            return_value=[profile],
+        ):
+            listed = await agent_server.list_provider_team_mail_routes(self.request())
+        route_id = listed["routes"][0]["route_id"]
+        request = self.request("POST", f"/api/agent/team-mail/routes/{route_id}")
+
+        with self.assertRaises(HTTPException) as wrong_kind:
+            await agent_server.send_provider_team_mail(
+                route_id,
+                agent_server.AgentTeamMailRequest.model_construct(
+                    kind="request",
+                    message="exact body",
+                    idempotency_key="strict.kind.0001",
+                ),
+                request,
+            )
+        self.assertEqual(wrong_kind.exception.status_code, 422)
+        with self.assertRaises(HTTPException) as wrong_body:
+            await agent_server.send_provider_team_mail(
+                route_id,
+                agent_server.AgentTeamMailRequest(
+                    kind="message",
+                    message="rewritten body",
+                    idempotency_key="strict.body.0001",
+                ),
+                request,
+            )
+        self.assertEqual(wrong_body.exception.status_code, 422)
+
+        exact = agent_server.AgentTeamMailRequest(
+            kind="message",
+            message="exact body",
+            idempotency_key="strict.send.0001",
+        )
+        with patch.object(
+            agent_server.SECURE_PEER_RUNTIME,
+            "send_agent_mail",
+            return_value={"item": {"id": "private_item"}},
+        ) as send:
+            accepted = await agent_server.send_provider_team_mail(
+                route_id, exact, request
+            )
+            replay = await agent_server.send_provider_team_mail(
+                route_id, exact, request
+            )
+            with self.assertRaises(HTTPException) as second_send:
+                await agent_server.send_provider_team_mail(
+                    route_id,
+                    agent_server.AgentTeamMailRequest(
+                        kind="message",
+                        message="exact body",
+                        idempotency_key="strict.send.0002",
+                    ),
+                    request,
+                )
+        self.assertTrue(accepted["accepted"])
+        self.assertFalse(accepted["duplicate"])
+        self.assertTrue(replay["duplicate"])
+        self.assertEqual(second_send.exception.status_code, 429)
+        send.assert_called_once()
+
+    async def test_send_rejects_authority_expiring_after_route_snapshot(self) -> None:
+        with patch.object(
+            agent_server.SECURE_PEER_RUNTIME,
+            "agent_mail_route_profiles",
+            return_value=[self.profile()],
+        ):
+            snapshot = await agent_server.provider_team_mail_routes(self.request())
+        route_id = next(iter(snapshot[2]))
+        request = self.request("POST", f"/api/agent/team-mail/routes/{route_id}")
+
+        async def expire_in_gap(_request):
+            capability = agent_server.CROSS_CHAT_CAPABILITIES[self.token_hash]
+            capability["expires_at"] = 0
+            return snapshot
+
+        with (
+            patch.object(
+                agent_server,
+                "provider_team_mail_routes",
+                side_effect=expire_in_gap,
+            ),
+            patch.object(
+                agent_server.SECURE_PEER_RUNTIME,
+                "send_agent_mail",
+            ) as send,
+        ):
+            with self.assertRaises(HTTPException) as expired:
+                await agent_server.send_provider_team_mail(
+                    route_id,
+                    agent_server.AgentTeamMailRequest(
+                        message="must not send",
+                        idempotency_key="expired.gap.0001",
+                    ),
+                    request,
+                )
+        self.assertEqual(expired.exception.status_code, 403)
+        send.assert_not_called()
+        capability = agent_server.CROSS_CHAT_CAPABILITIES[self.token_hash]
+        self.assertNotIn("team_mail", capability["actions"])
+        self.assertEqual(capability["team_mail_routes"], {})
+
+    async def test_send_rejects_route_generation_or_strict_binding_relaxation(self) -> None:
+        await self.activate_strict_command("/mail server MBA exact body")
+        profile = {**self.profile(), "display_name": "MBA"}
+        with patch.object(
+            agent_server.SECURE_PEER_RUNTIME,
+            "agent_mail_route_profiles",
+            return_value=[profile],
+        ):
+            snapshot = await agent_server.provider_team_mail_routes(self.request())
+        route_id = next(iter(snapshot[2]))
+        request = self.request("POST", f"/api/agent/team-mail/routes/{route_id}")
+
+        async def relax_strict_binding(_request):
+            capability = agent_server.CROSS_CHAT_CAPABILITIES[self.token_hash]
+            capability["team_mail_command"] = None
+            return snapshot
+
+        with (
+            patch.object(
+                agent_server,
+                "provider_team_mail_routes",
+                side_effect=relax_strict_binding,
+            ),
+            patch.object(
+                agent_server.SECURE_PEER_RUNTIME,
+                "send_agent_mail",
+            ) as send,
+        ):
+            with self.assertRaises(HTTPException) as relaxed:
+                await agent_server.send_provider_team_mail(
+                    route_id,
+                    agent_server.AgentTeamMailRequest(
+                        message="rewritten body",
+                        idempotency_key="strict.relax.0001",
+                    ),
+                    request,
+                )
+        self.assertEqual(relaxed.exception.status_code, 409)
+        send.assert_not_called()
+
+        await self.activate_strict_command("/mail server MBA exact body")
+        with patch.object(
+            agent_server.SECURE_PEER_RUNTIME,
+            "agent_mail_route_profiles",
+            return_value=[profile],
+        ):
+            snapshot = await agent_server.provider_team_mail_routes(self.request())
+        route_id = next(iter(snapshot[2]))
+        request = self.request("POST", f"/api/agent/team-mail/routes/{route_id}")
+
+        async def replace_generation(_request):
+            capability = agent_server.CROSS_CHAT_CAPABILITIES[self.token_hash]
+            capability["team_mail_profile_generation"] = "replacement"
+            return snapshot
+
+        with (
+            patch.object(
+                agent_server,
+                "provider_team_mail_routes",
+                side_effect=replace_generation,
+            ),
+            patch.object(
+                agent_server.SECURE_PEER_RUNTIME,
+                "send_agent_mail",
+            ) as send,
+        ):
+            with self.assertRaises(HTTPException) as changed:
+                await agent_server.send_provider_team_mail(
+                    route_id,
+                    agent_server.AgentTeamMailRequest(
+                        message="exact body",
+                        idempotency_key="generation.gap.0001",
+                    ),
+                    request,
+                )
+        self.assertEqual(changed.exception.status_code, 409)
+        send.assert_not_called()
+
     async def test_expiry_revokes_frozen_routes_and_action(self) -> None:
         await self.routes()
         capability = agent_server.CROSS_CHAT_CAPABILITIES[self.token_hash]
@@ -383,6 +670,26 @@ class ProviderTeamMailTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(raised.exception.status_code, 409)
         self.assertNotIn("private", str(raised.exception.detail))
+
+    async def test_legacy_provider_harness_rejects_request_kind(self) -> None:
+        route_id, _route = await self.routes()
+        request = self.request("POST", f"/api/agent/team-mail/routes/{route_id}")
+        with patch.object(
+            agent_server.SECURE_PEER_RUNTIME,
+            "send_agent_mail",
+        ) as send:
+            with self.assertRaises(HTTPException) as rejected:
+                await agent_server.send_provider_team_mail(
+                    route_id,
+                    agent_server.AgentTeamMailRequest.model_construct(
+                        kind="request",
+                        message="legacy request",
+                        idempotency_key="legacy.request.0001",
+                    ),
+                    request,
+                )
+        self.assertEqual(rejected.exception.status_code, 422)
+        send.assert_not_called()
 
     async def test_concurrent_same_key_has_one_effect_and_duplicate_receipt(self) -> None:
         route_id, _route = await self.routes()
@@ -546,6 +853,34 @@ class ProviderTeamMailTests(unittest.IsolatedAsyncioTestCase):
                 "", "  /mail send a prepared update"
             )
         )
+        strict = agent_server.provider_team_mail_strict_command(
+            None,
+            "  /mail server MBA preserve   internal spacing  ",
+        )
+        self.assertEqual(strict, {
+            "destination_kind": "server",
+            "display_name": "MBA",
+            "message": "preserve   internal spacing",
+        })
+        self.assertTrue(
+            agent_server.provider_turn_may_send_team_mail(
+                None,
+                "/mail server MBA exact body",
+            )
+        )
+        for malformed in (
+            "/mail server",
+            "/mail server MBA",
+            "/mail server MBA   ",
+            "/mail server " + ("x" * 161) + " body",
+            "/mail server MBA " + ("é" * 4_097),
+        ):
+            self.assertIsNone(
+                agent_server.provider_team_mail_strict_command(None, malformed)
+            )
+            self.assertFalse(
+                agent_server.provider_turn_may_send_team_mail(None, malformed)
+            )
         for prompt in (
             "ordinary prompt",
             "/mailbox",
@@ -578,6 +913,18 @@ class ProviderTeamMailTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(capability["available"])
         self.assertEqual(capability["version"], 1)
         self.assertEqual(capability["explicit_command"], "/mail")
+        self.assertEqual(
+            capability["command_syntax"],
+            "/mail server <name> <message>",
+        )
+        self.assertTrue(
+            capability["features"]["deterministic_server_message_command"]
+        )
+        self.assertTrue(
+            capability["features"]["exact_case_sensitive_server_name"]
+        )
+        self.assertTrue(capability["features"]["single_committed_send"])
+        self.assertTrue(capability["features"]["message_only"])
         self.assertEqual(capability["max_sends_per_run"], 4)
         self.assertEqual(capability["max_body_bytes"], 8_192)
 
@@ -611,7 +958,7 @@ class ProviderTeamMailTests(unittest.IsolatedAsyncioTestCase):
                 "source",
                 "run_native_allowed",
                 {**base, "prompt": "ordinary stale queued prompt"},
-                "/mail prepared new prompt",
+                "/mail server MBA exact body",
                 "nonce-allowed",
             )
         )
@@ -623,7 +970,20 @@ class ProviderTeamMailTests(unittest.IsolatedAsyncioTestCase):
             "team_mail",
             agent_server.CROSS_CHAT_CAPABILITIES[allowed_hash]["actions"],
         )
+        self.assertEqual(
+            agent_server.CROSS_CHAT_CAPABILITIES[allowed_hash][
+                "team_mail_command"
+            ],
+            {
+                "destination_kind": "server",
+                "display_name": "MBA",
+                "message": "exact body",
+            },
+        )
+        self.assertNotIn("MBA", allowed_path.read_text())
+        self.assertNotIn("exact body", allowed_path.read_text())
         self.assertIn("explicitly opened this turn", provider_prompt)
+        self.assertIn("pre-bound by AgentsServer", provider_prompt)
 
 
 class LocalAgentMailClaimsTests(unittest.TestCase):

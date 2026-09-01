@@ -197,7 +197,7 @@ class RuntimeDiagnosticTests(unittest.TestCase):
                 agent_server.cursor_executable_resolution()
             )
         self.assertIsNone(compatible)
-        self.assertEqual(installed, "/bin/agent")
+        self.assertEqual(installed, str(Path("/bin/agent").resolve()))
         self.assertEqual(missing, ())
         self.assertEqual(error, "identity probe did not identify Cursor CLI")
         self.assertNotIn("Grok", error)

@@ -169,8 +169,12 @@ class CursorProcessGuardTests(unittest.TestCase):
             )
             leader = root / "normal-leader.py"
             leader.write_text(
-                "import subprocess, sys\n"
-                f"subprocess.Popen([sys.executable, {str(descendant)!r}])\n",
+                "import pathlib, subprocess, sys, time\n"
+                f"pid_file = pathlib.Path({str(pid_file)!r})\n"
+                f"subprocess.Popen([sys.executable, {str(descendant)!r}])\n"
+                "deadline = time.monotonic() + 3\n"
+                "while not pid_file.exists() and time.monotonic() < deadline:\n"
+                "    time.sleep(0.02)\n",
                 encoding="utf-8",
             )
             guard_script = Path(__file__).with_name("cursor_process_guard.py")

@@ -2100,7 +2100,11 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
                     .replace("{job_id}", "job")
                     .replace(
                         "{route_id}",
-                        "route_0123456789abcdef0123456789abcdef",
+                        (
+                            "mail_0123456789abcdef0123456789abcdef"
+                            if path.startswith("/api/agent/team-mail/")
+                            else "route_0123456789abcdef0123456789abcdef"
+                        ),
                     )
                 )
                 self.assertTrue(agent_server.is_agent_helper_route(method, sample))

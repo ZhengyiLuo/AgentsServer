@@ -7,8 +7,9 @@ an authenticated Cursor CLI, and the server independently probes the selected
 executable before advertising this backend.
 
 Permission names describe headless behavior, not an interactive approval UI:
-``default`` allows workspace reads and edits while rejecting shell commands,
-``full_access`` forces commands, and ``plan`` requests planning mode. Cursor's
+``default`` uses Cursor's configured permissions without forcing tools,
+``full_access`` force-allows commands except explicit Cursor deny rules, and
+``plan`` requests planning mode. Cursor's
 interactive auto-review mode is intentionally not exposed until AgentsServer
 has a bounded approval bridge. The
 server also owns wall-clock/startup timeouts and bounded concurrent stderr
@@ -30,6 +31,47 @@ CURSOR_SESSION_IDENTIFIER_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
 )
 CURSOR_CALL_ID_MAX_CHARS = 240
+CURSOR_LIFECYCLE_VALUE_MAX = 2_147_483_647
+CURSOR_ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+CURSOR_TOOL_SUCCESS_OUTCOMES = (
+    "success",
+    "complete",
+    "registered",
+    "startSuccess",
+    "saveSuccess",
+    "discardSuccess",
+)
+CURSOR_TOOL_STATUS_OUTCOMES = (
+    # These current protobuf-JSON oneofs describe a valid tool response, but
+    # not completion of the underlying work. Project them as neutral status
+    # instead of the green/successful tool completion used for real outcomes.
+    "approved",
+    "async",
+    "stillRunning",
+)
+CURSOR_TOOL_CONFIRMATION_OUTCOMES = (
+    # AgentsServer has no Cursor approval bridge. This must fail closed rather
+    # than claim that the requested PR-management action completed.
+    "needsConfirmation",
+)
+CURSOR_TOOL_FAILURE_OUTCOMES = (
+    "failure",
+    "error",
+    "timeout",
+    "spawnError",
+    "permissionDenied",
+    "readPermissionDenied",
+    "writePermissionDenied",
+    "fileNotFound",
+    "invalidFile",
+    "notFile",
+    "fileBusy",
+    "noSpace",
+    "sandboxUnsupported",
+    "notFound",
+    "serverNotFound",
+    "toolNotFound",
+)
 
 
 def canonical_cursor_session_id(value: Any) -> str | None:
@@ -62,6 +104,93 @@ def canonical_cursor_call_id(value: Any) -> str:
             "tool_call call_id must be a bounded nonempty identifier"
         )
     return value
+
+
+def _cursor_lifecycle_session_id(event: dict[str, Any], event_name: str) -> str:
+    session_id = canonical_cursor_session_id(event.get("session_id"))
+    if not session_id:
+        raise CursorEventParseError(f"{event_name} missing session_id")
+    return session_id
+
+
+def _bounded_cursor_lifecycle_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 0 or value > CURSOR_LIFECYCLE_VALUE_MAX:
+        return None
+    return value
+
+
+def _cursor_tool_exit_code(value: Any, *, default: int) -> int:
+    """Return a bounded tool exit status from a Cursor result envelope."""
+
+    if not isinstance(value, dict):
+        return default
+    exit_code = value.get("exitCode", value.get("exit_code"))
+    if (
+        isinstance(exit_code, bool)
+        or not isinstance(exit_code, int)
+        or exit_code < -CURSOR_LIFECYCLE_VALUE_MAX
+        or exit_code > CURSOR_LIFECYCLE_VALUE_MAX
+    ):
+        return default
+    return exit_code
+
+
+def _cursor_tool_result_outcome(
+    value: Any,
+) -> tuple[str, dict[str, Any]]:
+    """Extract one protobuf-JSON tool result outcome and fail on drift."""
+
+    if not isinstance(value, dict):
+        raise CursorEventParseError(
+            "completed tool_call result must be an object"
+        )
+    outcome_keys = (
+        *CURSOR_TOOL_SUCCESS_OUTCOMES,
+        *CURSOR_TOOL_STATUS_OUTCOMES,
+        *CURSOR_TOOL_CONFIRMATION_OUTCOMES,
+        "rejected",
+        *CURSOR_TOOL_FAILURE_OUTCOMES,
+    )
+    present = [key for key in outcome_keys if key in value]
+    if len(present) != 1:
+        raise CursorEventParseError(
+            "completed tool_call result must contain exactly one supported "
+            "outcome"
+        )
+    outcome = present[0]
+    payload = value.get(outcome)
+    if not isinstance(payload, dict):
+        raise CursorEventParseError(
+            f"{outcome} tool_call result must be an object"
+        )
+    return outcome, payload
+
+
+def _bounded_cursor_query_type(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    clean = value.strip()
+    if len(clean) > 80 or not re.fullmatch(r"[A-Za-z0-9_.:-]+", clean):
+        return None
+    return clean
+
+
+def _normalize_cursor_usage(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, int] = {}
+    for source, target in (
+        ("inputTokens", "input_tokens"),
+        ("outputTokens", "output_tokens"),
+        ("cacheReadTokens", "cache_read_tokens"),
+        ("cacheWriteTokens", "cache_write_tokens"),
+    ):
+        bounded = _bounded_cursor_lifecycle_int(value.get(source))
+        if bounded is not None:
+            normalized[target] = bounded
+    return normalized
 
 
 def cursor_approval_request_text(value: str) -> bool:
@@ -111,19 +240,81 @@ def normalize_cursor_stream_event(raw_line: str) -> dict[str, Any] | None:
     event_type = event.get("type")
     session_id = canonical_cursor_session_id(event.get("session_id"))
 
-    if event_type == "system" and event.get("subtype") == "init":
-        if not session_id:
-            raise CursorEventParseError("system init missing session_id")
-        return {
-            "kind": "session_started",
-            "session_id": session_id,
-            "cwd": event.get("cwd"),
-            "model": event.get("model"),
-        }
+    if event_type == "system":
+        subtype = event.get("subtype")
+        if subtype == "init":
+            if not session_id:
+                raise CursorEventParseError("system init missing session_id")
+            return {
+                "kind": "session_started",
+                "session_id": session_id,
+                "cwd": event.get("cwd"),
+                "model": event.get("model"),
+            }
+        if subtype == "task_notification":
+            return {
+                "kind": "background_task_notice",
+                "session_id": _cursor_lifecycle_session_id(
+                    event, "system task_notification"
+                ),
+            }
+        if subtype == "background_shell_timeout":
+            return {
+                "kind": "background_task_timeout",
+                "session_id": _cursor_lifecycle_session_id(
+                    event, "system background_shell_timeout"
+                ),
+                "aborted_count": _bounded_cursor_lifecycle_int(
+                    event.get("aborted_count")
+                ),
+                "timeout_ms": _bounded_cursor_lifecycle_int(
+                    event.get("timeout_ms")
+                ),
+            }
+        raise CursorEventParseError("unrecognized system subtype")
 
     if event_type == "user":
         # AgentsServer already has the prompt it sent; nothing new here.
         return None
+
+    if event_type == "retry":
+        subtype = event.get("subtype")
+        if subtype not in {"starting", "resuming"}:
+            raise CursorEventParseError("unrecognized retry subtype")
+        return {
+            "kind": "provider_status",
+            "session_id": _cursor_lifecycle_session_id(event, "retry"),
+            "status": f"retry_{subtype}",
+            "attempt": _bounded_cursor_lifecycle_int(event.get("attempt")),
+        }
+
+    if event_type == "connection":
+        subtype = event.get("subtype")
+        if subtype not in {"reconnecting", "reconnected"}:
+            raise CursorEventParseError("unrecognized connection subtype")
+        return {
+            "kind": "provider_status",
+            "session_id": _cursor_lifecycle_session_id(event, "connection"),
+            "status": subtype,
+            "attempt": _bounded_cursor_lifecycle_int(event.get("attempt")),
+        }
+
+    if event_type == "interaction_query":
+        subtype = event.get("subtype")
+        if subtype not in {"request", "response"}:
+            raise CursorEventParseError("unrecognized interaction_query subtype")
+        # The query/response objects can contain prompts, commands, URLs, and
+        # provider permission decisions. Cursor headless mode resolves these
+        # internally, so retain only a schema marker and never project either
+        # payload into AgentsDock history or logs.
+        return {
+            "kind": "provider_interaction",
+            "session_id": _cursor_lifecycle_session_id(
+                event, "interaction_query"
+            ),
+            "phase": subtype,
+            "query_type": _bounded_cursor_query_type(event.get("query_type")),
+        }
 
     if event_type == "thinking":
         subtype = event.get("subtype")
@@ -153,34 +344,79 @@ def normalize_cursor_stream_event(raw_line: str) -> dict[str, Any] | None:
                 "args": body.get("args"),
             }
         if subtype == "completed":
-            result = body.get("result") or {}
-            if not isinstance(result, dict):
-                raise CursorEventParseError(
-                    "completed tool_call result must be an object"
-                )
+            outcome, outcome_payload = _cursor_tool_result_outcome(
+                body.get("result")
+            )
+            if outcome in CURSOR_TOOL_STATUS_OUTCOMES:
+                status_messages = {
+                    "approved": (
+                        "Cursor approved the requested action; any underlying "
+                        "execution is reported separately."
+                    ),
+                    "async": "Cursor queued an asynchronous question.",
+                    "stillRunning": (
+                        "Cursor reports that the underlying task is still "
+                        "running."
+                    ),
+                }
+                return {
+                    "kind": "tool_status",
+                    "session_id": session_id,
+                    "call_id": call_id,
+                    "tool": name,
+                    "args": body.get("args"),
+                    "status": outcome,
+                    "message": status_messages[outcome],
+                }
+            if outcome in CURSOR_TOOL_CONFIRMATION_OUTCOMES:
+                return {
+                    "kind": "tool_confirmation_required",
+                    "session_id": session_id,
+                    "call_id": call_id,
+                    "tool": name,
+                    "args": body.get("args"),
+                    "message": (
+                        "Cursor requires confirmation before this action can "
+                        "continue."
+                    ),
+                }
             # Shell calls can come back as {"rejected": {...}} instead of
             # {"success": {...}} - approval/sandbox policy declined the
             # call rather than it failing. Surface that distinctly; it is
             # not the same thing as a tool erroring.
-            if "rejected" in result:
-                rejected = result.get("rejected")
-                if not isinstance(rejected, dict):
-                    raise CursorEventParseError(
-                        "rejected tool_call result must be an object"
-                    )
+            if outcome == "rejected":
                 return {
                     "kind": "tool_rejected",
                     "session_id": session_id,
                     "call_id": call_id,
                     "tool": name,
-                    "reason": rejected.get("reason") or None,
+                    "args": body.get("args"),
+                    "reason": outcome_payload.get("reason") or None,
+                }
+            if outcome in CURSOR_TOOL_FAILURE_OUTCOMES:
+                return {
+                    "kind": "tool_finished",
+                    "session_id": session_id,
+                    "call_id": call_id,
+                    "tool": name,
+                    "args": body.get("args"),
+                    "result": outcome_payload,
+                    "exit_code": _cursor_tool_exit_code(
+                        outcome_payload,
+                        default=1,
+                    ),
                 }
             return {
                 "kind": "tool_finished",
                 "session_id": session_id,
                 "call_id": call_id,
                 "tool": name,
-                "result": result.get("success", result),
+                "args": body.get("args"),
+                "result": outcome_payload,
+                "exit_code": _cursor_tool_exit_code(
+                    outcome_payload,
+                    default=0,
+                ),
             }
         raise CursorEventParseError("unrecognized tool_call subtype")
 
@@ -224,7 +460,7 @@ def normalize_cursor_stream_event(raw_line: str) -> dict[str, Any] | None:
             "is_error": is_error,
             "result_text": result_text,
             "duration_ms": event.get("duration_ms"),
-            "usage": event.get("usage"),
+            "usage": _normalize_cursor_usage(event.get("usage")),
         }
 
     raise CursorEventParseError("unrecognized Cursor stream event type")
@@ -281,39 +517,35 @@ def cursor_permission_flags(mode: str) -> list[str]:
     AgentsDock's ClaudePermissionMenu.tsx - one user-chosen mode per session,
     not a server-hardcoded default) into real Cursor CLI flags.
 
-    Verified live against the actual `agent` CLI: --trust alone permits file
-    reads/edits but shell calls come back rejected; --force/--yolo allows
-    every command unconditionally. Interactive auto-review is deliberately
-    unavailable because this headless runner cannot answer approval prompts.
+    ``--trust`` acknowledges workspace trust but does not override Cursor's
+    global/project permission configuration. ``--force`` auto-allows commands
+    except operations explicitly denied by Cursor configuration. Interactive
+    auto-review is deliberately unavailable because this headless runner
+    cannot answer approval prompts.
     """
     if mode == "plan":
-        return ["--mode", "plan"]
+        return ["--trust", "--mode", "plan"]
     if mode == "full_access":
         return ["--trust", "--force"]
-    # "default" and any unrecognized mode use workspace access: reads and
-    # edits are allowed, while shell commands are rejected. This is not an
-    # interactive "ask" mode and clients must not label it as one.
+    # "default" and any unrecognized mode use Cursor's configured permissions
+    # without force. This is not an interactive "ask" mode and clients must
+    # not label it as one.
     return ["--trust"]
 
 
 def build_cursor_cmd(
     sess: dict[str, Any],
-    prompt: str,
     *,
     cursor_bin: str = "cursor-agent",
 ) -> list[str]:
     """Build one Cursor CLI argv from a session dict and composed prompt.
 
-    Verified live: `agent -p "<prompt>" --output-format json --trust` runs
-    non-interactively and returns a result event with a `session_id`; passing
-    that id back via `--resume <session_id>` on a later call correctly
-    resumes conversation context (both confirmed by hand against the real
-    CLI, not inferred from --help text alone). The prompt remains a positional
-    argument for this beta because the exact compatible CLI build has not yet
-    been authenticated and proven to preserve resume + stream-json semantics
-    when the prompt is supplied over stdin.
+    The prompt is deliberately supplied over stdin by the runner. Cursor's
+    documented headless mode accepts piped input, and keeping generated policy,
+    user text, and scoped authority out of argv prevents same-user process
+    listings from exposing the complete composed prompt.
     """
-    cmd = [cursor_bin, "-p", prompt, "--output-format", "stream-json"]
+    cmd = [cursor_bin, "-p", "--output-format", "stream-json"]
     resume_id = sess.get("cursor_session_id")
     if resume_id:
         cmd += ["--resume", str(resume_id)]
@@ -338,7 +570,7 @@ def parse_cursor_auth_status(
     shape matching the vocabulary /api/runtime/catalog already reports for
     Claude and Codex (ready, missing, unauthenticated, error).
     """
-    text = status_output.strip()
+    text = CURSOR_ANSI_ESCAPE_RE.sub("", status_output).strip()
     lower = text.lower()
     if any(marker in lower for marker in (
         "not logged in",
@@ -352,24 +584,36 @@ def parse_cursor_auth_status(
                 f"Run '{executable_name} login', or set CURSOR_API_KEY."
             ),
         }
-    logged_in_match = re.search(r"(?:✓\s*)?logged in as\s+(.+)$", text, re.IGNORECASE)
+    if re.search(
+        r"(?:is_?authenticated|authenticated)\s*[\":=]*\s*false\b",
+        lower,
+    ):
+        return {
+            "state": "unauthenticated",
+            "action": (
+                f"Run '{executable_name} login', or set CURSOR_API_KEY."
+            ),
+        }
+    logged_in_match = re.search(
+        r"(?:^|\n)\s*(?:✓\s*)?logged in as\s+([^\r\n]+)",
+        text,
+        re.IGNORECASE,
+    )
     if logged_in_match:
         email = logged_in_match.group(1).strip()
         return {"state": "ready", "email": email or None}
-    if "authenticated" in lower and not any(
-        marker in lower for marker in ("not authenticated", "unauthenticated")
-    ):
+    if re.search(
+        r"(?:is_?authenticated|authenticated)\s*[\":=]*\s*true\b",
+        lower,
+    ) or re.search(r"(?:^|\n)\s*authenticated\s*$", lower):
         return {"state": "ready", "email": None}
     return {"state": "error", "message": text}
 
 
-# Real captured `agent about` output only ever showed a single free-form
-# "Subscription Tier" value (e.g. "Pro"). Any tier that isn't recognized as a
-# paid one is treated as free/unknown by cursor_account_is_free_tier() below,
-# so a future tier name we haven't seen yet still locks named models rather
-# than silently allowing turns that would fail server-side - failing toward
-# the safer (if less convenient) UI state.
-CURSOR_KNOWN_PAID_TIERS = {"pro", "pro+", "ultra", "business", "enterprise", "teams"}
+# Cursor reports a free-form "Subscription Tier" value. Only explicit free
+# labels lock named models; unknown/future paid labels remain usable and Cursor
+# itself returns the authoritative model-access error when necessary.
+CURSOR_EXPLICIT_FREE_TIERS = {"free", "hobby", "individual free"}
 
 
 def parse_cursor_account_tier(about_output: str) -> str | None:
@@ -388,22 +632,23 @@ def parse_cursor_account_tier(about_output: str) -> str | None:
     isn't present (older CLI, or output shape changed).
     """
     for raw_line in about_output.splitlines():
-        line = raw_line.strip()
-        if not line.lower().startswith("subscription tier"):
-            continue
-        _, _, value = line.partition("Subscription Tier")
-        return value.strip() or None
+        match = re.match(
+            r"^\s*subscription\s+tier\s*(?::\s*|\s+)(.*?)\s*$",
+            raw_line,
+            re.IGNORECASE,
+        )
+        if match:
+            return match.group(1).strip() or None
     return None
 
 
 def cursor_account_is_free_tier(tier: str | None) -> bool:
-    """True unless the tier is recognized as a paid one.
+    """True only for an explicit Cursor free-tier label.
 
-    Deliberately fails toward "free" (locks named models in the picker) for
-    an unparseable/unrecognized/missing tier, rather than toward "paid" -
-    picking a named model that then fails server-side with
-    ActionRequiredError is worse UX than a model staying locked one CLI
-    release longer than strictly necessary.
+    ``agent about`` may report service accounts, API-key users, or future paid
+    plans with an unfamiliar label. Treating every unknown as free silently
+    disabled named models for paying users; Cursor remains the final authority
+    if an account cannot use a selected model.
     """
-    clean = str(tier or "").strip().lower()
-    return clean not in CURSOR_KNOWN_PAID_TIERS
+    clean = re.sub(r"[^a-z0-9]+", " ", str(tier or "").strip().lower()).strip()
+    return clean in CURSOR_EXPLICIT_FREE_TIERS

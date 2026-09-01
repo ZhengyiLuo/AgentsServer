@@ -333,6 +333,7 @@ class SecurePeerRuntime:
             return
         if hub_store is None:
             raise RuntimeError("secure peer host attachment requires the live Hub store")
+        hub_store.provision_local_agent_mail()
         attachment = (str(hub_id), Path(hub_data_dir), hub_store)
         with self._guard:
             if self._hub_store is not None and self._hub_store is not hub_store:
@@ -3101,6 +3102,390 @@ class SecurePeerRuntime:
                                 type(retire_error).__name__,
                             )
                 raise
+
+    @staticmethod
+    def _agent_mail_destinations(
+        projection: Mapping[str, Any],
+        *,
+        realm: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        servers = [
+            dict(item)
+            for item in projection.get("servers", [])
+            if isinstance(item, Mapping)
+        ]
+        agents = [
+            dict(item)
+            for item in projection.get("agents", [])
+            if isinstance(item, Mapping)
+        ]
+        owned_server_ids = {
+            str(item.get("id") or "")
+            for item in servers
+            if item.get("owned_by_caller") is True
+        }
+        labels = {
+            str(item.get("id") or ""): str(item.get("display_name") or "Server")
+            for item in servers
+        }
+        network = projection.get("network")
+        network_display_name = (
+            str(network.get("display_name") or "Team Network")[:160]
+            if isinstance(network, Mapping)
+            else "Team Network"
+        )
+        destinations: list[dict[str, Any]] = []
+        for server in servers:
+            server_id = str(server.get("id") or "")
+            if (
+                not server_id
+                or server_id in owned_server_ids
+                or server.get("status") != "active"
+            ):
+                continue
+            destinations.append({
+                **dict(realm),
+                "destination_kind": "server",
+                "destination_id": server_id,
+                "display_name": str(server.get("display_name") or "Server")[:160],
+                "backend": None,
+                "network_display_name": network_display_name,
+            })
+        for agent in agents:
+            agent_id = str(agent.get("id") or "")
+            server_id = str(agent.get("server_id") or "")
+            if (
+                not agent_id
+                or not server_id
+                or server_id in owned_server_ids
+                or agent.get("status") != "active"
+            ):
+                continue
+            agent_name = str(agent.get("display_name") or "Agent")[:160]
+            server_name = labels.get(server_id, "Server")[:160]
+            destinations.append({
+                **dict(realm),
+                "destination_kind": "agent",
+                "destination_id": agent_id,
+                "display_name": f"{agent_name} — {server_name}"[:321],
+                "backend": str(agent.get("backend") or "other")[:32],
+                "network_display_name": network_display_name,
+            })
+        return destinations
+
+    @staticmethod
+    def _decoded_proxy_json(response: Any) -> dict[str, Any]:
+        if int(response.status) != 200:
+            raise SecurePeerError(
+                "team_mail_unavailable",
+                "Team Network mail is unavailable",
+                409,
+            )
+        try:
+            decoded = json.loads(response.body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SecurePeerError(
+                "team_mail_unavailable",
+                "Team Network mail returned an invalid response",
+                502,
+            ) from exc
+        if not isinstance(decoded, dict):
+            raise SecurePeerError(
+                "team_mail_unavailable",
+                "Team Network mail returned an invalid response",
+                502,
+            )
+        return decoded
+
+    @staticmethod
+    def _validated_agent_mail_receipt(
+        value: Any,
+        *,
+        kind: str,
+        target_kind: str,
+        target_id: str,
+        message: str,
+    ) -> dict[str, Any]:
+        """Validate the remote Hub's committed receipt before reporting success."""
+
+        item = value.get("item") if isinstance(value, Mapping) else None
+        delivery = value.get("delivery") if isinstance(value, Mapping) else None
+        recipient = item.get("to") if isinstance(item, Mapping) else None
+        expected_kind = "request" if kind == "request" else "message"
+        if not (
+            isinstance(item, Mapping)
+            and isinstance(delivery, Mapping)
+            and isinstance(item.get("id"), str)
+            and item.get("id")
+            and item.get("kind") == expected_kind
+            and item.get("body") == message
+            and item.get("body_format") == "markdown"
+            and isinstance(recipient, Mapping)
+            and recipient.get("kind") == target_kind
+            and recipient.get("id") == target_id
+            and isinstance(delivery.get("id"), str)
+            and delivery.get("id")
+            and delivery.get("state") == "available"
+        ):
+            raise SecurePeerError(
+                "team_mail_invalid_receipt",
+                "Team Network mail returned an invalid receipt",
+                502,
+            )
+        return dict(value)
+
+    def agent_mail_route_profiles(self) -> list[dict[str, Any]]:
+        """Snapshot exact passive-mail destinations without exposing credentials."""
+
+        profiles: list[dict[str, Any]] = []
+        maximum_pages = 100
+        maximum_destinations = 512
+        with self._guard:
+            host_store = self._hub_store
+            active = next(
+                (
+                    dict(item)
+                    for item in self.client.list_connections()
+                    if item.get("active")
+                    and item.get("status") == "connected"
+                    and "teamspace.read" in set(item.get("scopes") or [])
+                    and "teamspace.write" in set(item.get("scopes") or [])
+                ),
+                None,
+            )
+        if host_store is not None:
+            for team_id in host_store.local_agent_mail_team_ids():
+                team_profiles: list[dict[str, Any]] = []
+                try:
+                    claims = host_store.local_agent_mail_claims(team_id)
+                    after_server_id: str | None = None
+                    seen_cursors: set[str] = set()
+                    for _page in range(maximum_pages):
+                        projection = host_store.get_network(
+                            claims,
+                            team_id,
+                            after_server_id=after_server_id,
+                            limit=100,
+                        )
+                        team_profiles.extend(self._agent_mail_destinations(
+                            projection,
+                            realm={
+                                "realm": "host",
+                                "team_id": team_id,
+                                "hub_id": host_store.hub_id,
+                                "server_identity": self.server_identity,
+                            },
+                        ))
+                        if len(profiles) + len(team_profiles) > maximum_destinations:
+                            raise HubError(
+                                "team_mail_unavailable",
+                                "Team Network mail destination limit was exceeded",
+                                409,
+                            )
+                        if projection.get("has_more") is not True:
+                            break
+                        cursor = str(
+                            projection.get("next_after_server_id") or ""
+                        )
+                        if not cursor or cursor in seen_cursors:
+                            raise HubError(
+                                "team_mail_unavailable",
+                                "Team Network mail pagination changed",
+                                409,
+                            )
+                        seen_cursors.add(cursor)
+                        after_server_id = cursor
+                    else:
+                        raise HubError(
+                            "team_mail_unavailable",
+                            "Team Network mail page limit was exceeded",
+                            409,
+                        )
+                except HubError:
+                    # A route list is one exact snapshot, not a best-effort
+                    # merge. Never disguise one unavailable host team as a
+                    # complete list of the remaining teams.
+                    raise
+                profiles.extend(team_profiles)
+        if active is not None:
+            team_id = str(active.get("team_id") or "")
+            connection_id = str(active.get("connection_id") or "")
+            after_server_id: str | None = None
+            seen_cursors: set[str] = set()
+            realm = {
+                "realm": "secure_peer",
+                "connection_id": connection_id,
+                "team_id": team_id,
+                "hub_id": str(active.get("hub_id") or ""),
+                "host_server_identity": str(
+                    active.get("host_server_identity") or ""
+                ),
+                "certificate_fingerprint": str(
+                    active.get("certificate_fingerprint") or ""
+                ),
+            }
+            for _page in range(maximum_pages):
+                query = "limit=100"
+                if after_server_id is not None:
+                    query += "&after_server_id=" + quote(
+                        after_server_id,
+                        safe="",
+                    )
+                response = self.proxy(
+                    connection_id,
+                    "GET",
+                    f"/v1/teams/{quote(team_id, safe='')}/network",
+                    query=query,
+                    headers={"accept": "application/json"},
+                    body=None,
+                )
+                projection = self._decoded_proxy_json(response)
+                profiles.extend(self._agent_mail_destinations(
+                    projection,
+                    realm=realm,
+                ))
+                if len(profiles) > maximum_destinations:
+                    raise SecurePeerError(
+                        "team_mail_unavailable",
+                        "Team Network mail destination limit was exceeded",
+                        409,
+                    )
+                if projection.get("has_more") is not True:
+                    break
+                cursor = str(projection.get("next_after_server_id") or "")
+                if not cursor or cursor in seen_cursors:
+                    raise SecurePeerError(
+                        "team_mail_unavailable",
+                        "Team Network mail pagination changed",
+                        409,
+                    )
+                seen_cursors.add(cursor)
+                after_server_id = cursor
+            else:
+                raise SecurePeerError(
+                    "team_mail_unavailable",
+                    "Team Network mail page limit was exceeded",
+                    409,
+                )
+        return profiles
+
+    def send_agent_mail(
+        self,
+        profile: Mapping[str, Any],
+        *,
+        kind: str,
+        message: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Send through one exact, freshly revalidated destination profile."""
+
+        if kind not in {"message", "request"}:
+            raise SecurePeerError("invalid_request", "Mail kind is invalid", 422)
+        team_id = str(profile.get("team_id") or "")
+        target_kind = str(profile.get("destination_kind") or "")
+        target_id = str(profile.get("destination_id") or "")
+        if target_kind not in {"server", "agent"} or not target_id or not team_id:
+            raise SecurePeerError(
+                "team_mail_route_changed",
+                "Team Network mail route is no longer available",
+                409,
+            )
+        request_body = {
+            "to": {"kind": target_kind, "id": target_id},
+            "from_agent_id": None,
+            "body": message,
+            "body_format": "markdown",
+            "idempotency_key": idempotency_key,
+        }
+        if kind == "request":
+            request_body["expires_in_seconds"] = 86_400
+
+        if profile.get("realm") == "host":
+            with self._guard:
+                store = self._hub_store
+            if (
+                store is None
+                or store.hub_id != profile.get("hub_id")
+                or self.server_identity != profile.get("server_identity")
+            ):
+                raise SecurePeerError(
+                    "team_mail_route_changed",
+                    "Team Network mail route is no longer available",
+                    409,
+                )
+            claims = store.local_agent_mail_claims(team_id)
+            if kind == "request":
+                result = store.create_network_request(claims, team_id, request_body)
+            else:
+                result = store.create_network_mailbox_item(
+                    claims, team_id, request_body
+                )
+            return self._validated_agent_mail_receipt(
+                result,
+                kind=kind,
+                target_kind=target_kind,
+                target_id=target_id,
+                message=message,
+            )
+
+        if profile.get("realm") != "secure_peer":
+            raise SecurePeerError(
+                "team_mail_route_changed",
+                "Team Network mail route is no longer available",
+                409,
+            )
+        connection_id = str(profile.get("connection_id") or "")
+        with self._guard:
+            active = next(
+                (
+                    dict(item)
+                    for item in self.client.list_connections()
+                    if item.get("active")
+                    and item.get("status") == "connected"
+                    and item.get("connection_id") == connection_id
+                ),
+                None,
+            )
+        if (
+            active is None
+            or active.get("team_id") != team_id
+            or active.get("hub_id") != profile.get("hub_id")
+            or active.get("host_server_identity")
+            != profile.get("host_server_identity")
+            or active.get("certificate_fingerprint")
+            != profile.get("certificate_fingerprint")
+            or "teamspace.write" not in set(active.get("scopes") or [])
+        ):
+            raise SecurePeerError(
+                "team_mail_route_changed",
+                "Team Network mail route is no longer available",
+                409,
+            )
+        response = self.proxy(
+            connection_id,
+            "POST",
+            (
+                f"/v1/teams/{quote(team_id, safe='')}/network/"
+                + ("requests" if kind == "request" else "mailbox")
+            ),
+            query="",
+            headers={
+                "accept": "application/json",
+                "content-type": "application/json",
+            },
+            body=json.dumps(
+                request_body,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8"),
+        )
+        return self._validated_agent_mail_receipt(
+            self._decoded_proxy_json(response),
+            kind=kind,
+            target_kind=target_kind,
+            target_id=target_id,
+            message=message,
+        )
 
     def shutdown(self) -> None:
         self.close_host_admission()

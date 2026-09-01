@@ -783,12 +783,13 @@ class VendoredTeamHubParityTests(unittest.TestCase):
             "migrations/0004_managed_host_binding.sql": "6984cc095f23059c38c68092217254eb1419bae45287b4e3ab1217c60eb78696",
             "migrations/0005_tailnet_bootstrap_delegations.sql": "e47d25ea16353d023355cf875d008808cd3742cd038569abfb9607556cdbd09b",
             "migrations/0006_team_network_mailbox.sql": "c215068c903b4b65cd7a0e52506f859b5301d7e7d5ac9a66ad1636e6efd84d63",
+            "migrations/0007_local_agent_mail.sql": "a01c33ef0d66de486e45bc3470a438ac0dd41edb5007eb6c12c26c240b4ca883",
             "migrations/__init__.py": "aaf340c45c8d39c2939814977ba4cef8eb6b3bd0671b0f7542ebe06f5431d6ec",
             "security.py": "0c1895c7443e7be07a2f53c7e4c4228e3ee04c65d6cd36f039b7bbba1813e4fa",
             "secure_peer.py": "f6a8d4f8a9ead94ef1fd6478eecdb31dc6da7c2ca9468d2beaac95590f4a2da0",
             "secure_peer_hub.py": "f74ab0eb6bf7705147b6e4ec10596751c40efeaabb3d0df71409bee9731e9fb8",
             "service.py": "659a741aa598763eaa4a4541e6676020e6fd5cf529c906ae1da35cf1f9a8f303",
-            "store.py": "b44d1f27725d9c1af600e63f656d89da1f471d8fe1eb55cc1daf61f6dc901055",
+            "store.py": "379e17c586de433cfaefc85ec5c760e3d5e769a80bb89596635321944bdaee6a",
         }
         entries = list(vendored.rglob("*"))
         for path in entries:

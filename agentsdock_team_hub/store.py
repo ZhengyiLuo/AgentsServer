@@ -1773,10 +1773,145 @@ class HubStore:
             str(payload["sub"]), str(payload["sid"]), str(payload["jti"]), int(payload["exp"])
         )
 
+    def local_agent_mail_team_ids(self) -> list[str]:
+        """Return active local teams for the in-process agent-mail broker.
+
+        This is deliberately not exposed through the HTTP service. The caller
+        must already own this ``HubStore`` object inside the managed
+        AgentsServer process.
+        """
+
+        connection = self.connect()
+        try:
+            return [
+                str(row["team_id"])
+                for row in connection.execute(
+                    """
+                    SELECT m.team_id
+                    FROM memberships AS m
+                    JOIN nodes AS n ON n.team_id=m.team_id
+                    WHERE m.principal_id=? AND m.role='automation'
+                      AND m.status='active' AND n.server_identity=?
+                      AND n.status='active'
+                    ORDER BY m.team_id
+                    """,
+                    (LOCAL_CONTROL_PRINCIPAL_ID, self.managed_host_identity),
+                )
+            ]
+        finally:
+            connection.close()
+
+    def provision_local_agent_mail(self) -> None:
+        """Provision the in-process mail actor during managed Hub setup."""
+
+        timestamp = _now()
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                for row in connection.execute(
+                    """
+                    SELECT team_id FROM nodes
+                    WHERE server_identity=? AND status='active'
+                    ORDER BY team_id
+                    """,
+                    (self.managed_host_identity,),
+                ):
+                    team_id = str(row["team_id"])
+                    self._local_control_principal(connection, team_id, timestamp)
+        finally:
+            connection.close()
+
+    def local_agent_mail_claims(self, team_id: str) -> AccessClaims:
+        """Return narrow, process-local claims for the managed host mailbox.
+
+        These claims are never serialized or accepted by the public auth
+        layer. They can read Team Network projection and send passive mailbox
+        items as this installation's designated server, and nothing else.
+        """
+
+        clean_team_id = _identity(team_id)
+        timestamp = _now()
+        connection = self.connect()
+        try:
+            provisioned = connection.execute(
+                """
+                SELECT 1
+                FROM memberships AS m
+                JOIN principals AS p ON p.id=m.principal_id
+                JOIN service_accounts AS s ON s.principal_id=p.id
+                JOIN nodes AS n ON n.team_id=m.team_id
+                WHERE m.team_id=? AND m.principal_id=?
+                  AND m.role='automation' AND m.status='active'
+                  AND p.kind='service' AND p.status='active'
+                  AND s.service_identifier='agentsdock.team-hub.local-control'
+                  AND n.server_identity=? AND n.status='active'
+                """,
+                (
+                    clean_team_id,
+                    LOCAL_CONTROL_PRINCIPAL_ID,
+                    self.managed_host_identity,
+                ),
+            ).fetchone()
+            if provisioned is None:
+                raise HubError(
+                    "network_host_unavailable",
+                    "Designated host server identity is unavailable",
+                    409,
+                )
+        finally:
+            connection.close()
+        return AccessClaims(
+            principal_id=LOCAL_CONTROL_PRINCIPAL_ID,
+            session_id=f"local_agent_mail_session_{clean_team_id}",
+            jti=f"local_agent_mail_{clean_team_id}",
+            expires_at=timestamp + 60,
+            auth_kind="local_agent_mail",
+            team_id=clean_team_id,
+            scopes=frozenset({"teamspace.read", "teamspace.write"}),
+        )
+
     @staticmethod
     def _require_session(
         connection: sqlite3.Connection, claims: AccessClaims, timestamp: int
     ) -> sqlite3.Row:
+        if claims.auth_kind == "local_agent_mail":
+            if (
+                claims.principal_id != LOCAL_CONTROL_PRINCIPAL_ID
+                or claims.team_id is None
+                or claims.expires_at <= timestamp
+                or claims.session_id
+                != f"local_agent_mail_session_{claims.team_id}"
+                or claims.scopes
+                != frozenset({"teamspace.read", "teamspace.write"})
+                or claims.peer_id is not None
+            ):
+                raise HubError("authentication_required", "Authentication required", 401)
+            row = connection.execute(
+                """
+                SELECT ? AS id, p.id AS human_principal_id,
+                       ? AS device_label, ? AS expires_at,
+                       NULL AS email_normalized, p.display_name,
+                       p.kind AS principal_kind
+                FROM principals AS p
+                JOIN service_accounts AS s ON s.principal_id=p.id
+                JOIN memberships AS m ON m.principal_id=p.id
+                WHERE p.id=? AND p.kind='service'
+                  AND p.scope_team_id IS NULL AND p.status='active'
+                  AND s.service_identifier='agentsdock.team-hub.local-control'
+                  AND m.team_id=? AND m.role='automation'
+                  AND m.status='active'
+                """,
+                (
+                    claims.session_id,
+                    "AgentsDock agent mail",
+                    claims.expires_at,
+                    LOCAL_CONTROL_PRINCIPAL_ID,
+                    claims.team_id,
+                ),
+            ).fetchone()
+            if row is None:
+                raise HubError("authentication_required", "Authentication required", 401)
+            return row
         if claims.auth_kind == "secure_peer":
             if (
                 claims.team_id is None
@@ -2783,6 +2918,9 @@ class HubStore:
                     connection, email, display_name, now=timestamp
                 )
                 self._ensure_managed_host_node(
+                    connection, result.team_id, timestamp
+                )
+                self._local_control_principal(
                     connection, result.team_id, timestamp
                 )
                 self._ensure_network_board(
@@ -4230,7 +4368,7 @@ class HubStore:
         write: bool,
     ) -> sqlite3.Row:
         HubStore._require_session(connection, claims, _now())
-        if claims.auth_kind == "secure_peer":
+        if claims.auth_kind in {"secure_peer", "local_agent_mail"}:
             expected_scope = "teamspace.write" if write else "teamspace.read"
             if claims.team_id != team_id or expected_scope not in claims.scopes:
                 raise HubError("forbidden", "Operation is not permitted", 403)
@@ -4299,7 +4437,11 @@ class HubStore:
                 connection,
                 team_id,
                 claims.principal_id,
-                ("owner", "admin", "member"),
+                (
+                    ("automation",)
+                    if claims.auth_kind == "local_agent_mail"
+                    else ("owner", "admin", "member")
+                ),
             )
         except (AuthorizationError, AuthenticationError) as exc:
             raise HubError("not_found", "Resource not found", 404) from exc
@@ -4375,9 +4517,9 @@ class HubStore:
             if team is None:
                 raise HubError("not_found", "Resource not found", 404)
             owned_node_id: str | None = None
-            if claims.auth_kind == "secure_peer":
+            if claims.auth_kind in {"secure_peer", "local_agent_mail"}:
                 owned_node_id = str(
-                    self._bound_network_node(connection, claims, team_id)["node_id"]
+                    self._caller_network_node(connection, claims, team_id)["node_id"]
                 )
             elif membership["role"] in {"owner", "admin", "member"}:
                 try:
@@ -5345,9 +5487,12 @@ class HubStore:
         body_bytes: int,
         timestamp: int,
     ) -> None:
-        if claims.auth_kind != "secure_peer":
+        if claims.auth_kind == "secure_peer":
+            subject = f"secure-peer:{claims.peer_id or claims.principal_id}"
+        elif claims.auth_kind == "local_agent_mail":
+            subject = f"local-agent-mail:{claims.principal_id}"
+        else:
             return
-        subject = f"secure-peer:{claims.peer_id or claims.principal_id}"
         self._charge_rate_bucket(
             connection,
             team_id=team_id,

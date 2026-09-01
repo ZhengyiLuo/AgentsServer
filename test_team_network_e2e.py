@@ -541,6 +541,15 @@ class TeamNetworkE2EAcceptanceTests(unittest.TestCase):
             [peer_message["id"], owner_message["id"]],
         )
         self.assertEqual(peer_view[-1]["body"], "Reply from the host owner")
+        empty_member_mailbox = network.peer_proxy_json(
+            "GET",
+            f"/v1/teams/{network.team_id}/network/mailbox",
+            query=(
+                f"address_kind=server&address_id={member_node_id}"
+                "&after_sequence=0&limit=100"
+            ),
+        )
+        self.assertEqual(empty_member_mailbox["items"], [])
 
         host_to_peer = network.hub.create_network_mailbox_item(
             network.owner,
@@ -566,6 +575,15 @@ class TeamNetworkE2EAcceptanceTests(unittest.TestCase):
         self.assertEqual(
             [entry["item"]["id"] for entry in member_mailbox["items"]],
             [host_to_peer["item"]["id"]],
+        )
+        bulletin_after_mail = network.peer_bulletin()
+        self.assertEqual(
+            [post["id"] for post in bulletin_after_mail],
+            [peer_message["id"], owner_message["id"]],
+        )
+        self.assertNotIn(
+            host_to_peer["item"]["id"],
+            {post["id"] for post in bulletin_after_mail},
         )
         host_delivery_id = host_to_peer["delivery"]["id"]
         delivered = network.peer_proxy_json(

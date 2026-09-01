@@ -3,14 +3,14 @@
 This document describes the production Cursor backend contract introduced in
 the AgentsServer `0.1.26-beta.12` release line. Cursor is an optional third
 backend alongside Claude and Codex. The server contract is versioned as
-`capabilities.cursor_backend.version = 1`.
+`capabilities.cursor_backend.version = 2`.
 
 ## Availability and executable discovery
 
 Clients must require both signals before showing Cursor as selectable:
 
 - `GET /api/health`: `capabilities.cursor_backend.available == true` and
-  `version == 1` mean this server understands the Cursor contract.
+  `version == 2` mean this server understands the hardened Cursor contract.
 - `GET /api/runtime/catalog`: `backends.cursor.available == true` means a
   compatible, authenticated CLI is ready on this host.
 
@@ -66,6 +66,12 @@ Each turn launches the exact admitted executable in print mode with
 - preserves normal AgentsDock stop, queue, artifact, diff, and lifecycle
   events.
 
+Contract v2 additionally launches Cursor through a small process guard. The
+guard isolates the CLI in its own process group, forwards stop signals, closes
+stdin, and ensures descendant processes are reaped. The server also emits a
+bounded idle warning before enforcing the idle timeout, so a genuinely stalled
+CLI cannot leave a chat permanently busy.
+
 The provider session identifier is bounded/validated before persistence or
 resume. It is stored when the CLI emits a valid initialization event, even if
 that turn later fails, so a retry can resume the provider-created session.
@@ -120,7 +126,8 @@ chats. Logical Cursor failures leave the digest job failed rather than sent.
 
 ## Packaging and validation
 
-`cursor_agent_client.py` is a required runtime file in all three transports:
+`cursor_agent_client.py` and `cursor_process_guard.py` are required runtime
+files in all three transports:
 
 - `scripts/package_release.py` archive packaging;
 - `install.sh` archive/staging install and import/compile validation;

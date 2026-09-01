@@ -255,7 +255,7 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
             },
         ):
             response = await agent_server.health()
-        self.assertEqual(response["api_contract_version"], 23)
+        self.assertEqual(response["api_contract_version"], 24)
         self.assertEqual(
             response["capabilities"]["provider_jobs_access_control_v1"],
             {

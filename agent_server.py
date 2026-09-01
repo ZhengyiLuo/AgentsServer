@@ -142,6 +142,75 @@ def agentsdock_setting(suffix: str, default: str) -> str:
     return value if value is not None else default
 
 
+CONFIG_ENV_FILE = (
+    Path(
+        os.environ.get("AGENTS_SERVER_CONFIG_DIR")
+        or (Path.home() / ".config" / "agents-server")
+    )
+    / "env"
+)
+CONFIG_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def parse_config_env_file(text: str) -> dict[str, str]:
+    """Parse the installer's `KEY=VALUE` config file, systemd-style.
+
+    Deliberately forgiving: a malformed line is skipped rather than raised,
+    because this runs during import and must never stop the server from
+    starting over one stray hand-edited line.
+    """
+
+    values: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        name, separator, value = line.partition("=")
+        name = name.strip()
+        if not separator or not CONFIG_ENV_NAME_RE.fullmatch(name):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[name] = value
+    return values
+
+
+def load_config_env_file(path: Path | None = None) -> list[str]:
+    """Apply installer config-file variables the process does not already have.
+
+    install.sh writes this file and deliberately preserves any extra lines an
+    operator adds to it, and the Linux unit loads it via `EnvironmentFile`.
+    launchd has no equivalent, so on macOS those extra lines - a company
+    provider's `COMPANY_API_KEY`, for example - silently never reached the
+    provider CLI, with nothing reporting that the file was ignored. Reading
+    it here makes both platforms behave the same.
+
+    Existing process variables always win, so values injected by the service
+    manager (access token, state dir, port, PATH) can never be overridden by
+    a stale copy left behind in the file. Returns the names applied, for
+    logging; values are never logged.
+    """
+
+    target = CONFIG_ENV_FILE if path is None else path
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return []
+    applied: list[str] = []
+    for name, value in parse_config_env_file(text).items():
+        if name in os.environ:
+            continue
+        os.environ[name] = value
+        applied.append(name)
+    return sorted(applied)
+
+
+CONFIG_ENV_APPLIED = load_config_env_file()
+
+
 def resolve_state_dir() -> Path:
     configured = env_setting(
         "AGENTSDOCK_STATE_DIR",
@@ -49290,6 +49359,14 @@ async def lifespan(app: FastAPI):
     host_monitor_task = asyncio.create_task(host_monitor_loop())
     history_search_task = asyncio.create_task(history_search_index_loop())
     runtime_probe_task = asyncio.create_task(asyncio.to_thread(refresh_runtime_diagnostics, force=True))
+    if CONFIG_ENV_APPLIED:
+        # Names only - these can be provider credentials.
+        logger.info(
+            "loaded %d config-file environment variable(s) from %s: %s",
+            len(CONFIG_ENV_APPLIED),
+            CONFIG_ENV_FILE,
+            ", ".join(CONFIG_ENV_APPLIED),
+        )
     logger.info(
         "agent server ready state=%s sessions=%d jobs=%d digests=%d recovered_scheduled_runs=%d abandoned_turns=%d abandoned_compactions=%d authority_removed=%d queue_recovery=background",
         STATE_DIR,

@@ -828,7 +828,7 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             capability = agent_server.cross_chat_handoffs_capability()
-        self.assertEqual(capability["version"], 7)
+        self.assertEqual(capability["version"], 8)
         self.assertEqual(capability["default_action"], "route")
         self.assertNotIn("direct_message", capability["actions"])
         self.assertIn("route", capability["actions"])

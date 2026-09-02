@@ -3052,14 +3052,14 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             if lock.locked():
                 lock.release()
 
-    def test_exchange_capability_v7_default_deny_contract_is_exact(self) -> None:
+    def test_exchange_capability_v8_default_deny_contract_is_exact(self) -> None:
         with (
             patch.object(agent_server, "CODEX_TRANSPORT", agent_server.CODEX_TRANSPORT_APP_SERVER),
             patch.object(agent_server, "CLAUDE_TRANSPORT", agent_server.CLAUDE_TRANSPORT_AGENT_SDK),
         ):
             capability = agent_server.cross_chat_handoffs_capability()
         self.assertTrue(capability["available"])
-        self.assertEqual(capability["version"], 7)
+        self.assertEqual(capability["version"], 8)
         self.assertEqual(
             capability["actions"],
             [
@@ -3080,6 +3080,8 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(
             capability["features"]["agent_ambient_local_handoffs"]
         )
+        self.assertNotIn("instruction_reply_once", capability["features"])
+        self.assertNotIn("instruction_reply_policy", capability["features"])
         self.assertEqual(
             capability["ambient_local_handoffs"]["policy"],
             "default_deny",
@@ -3103,6 +3105,11 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(capability["agent_routes"]["directional"])
         self.assertTrue(
             capability["agent_routes"]["revoke_requires_revision"]
+        )
+        self.assertTrue(capability["agent_routes"]["instruction_reply_once"])
+        self.assertEqual(
+            capability["agent_routes"]["instruction_reply_policy"],
+            "exchange_scoped_terminal_once",
         )
 
     async def test_request_reply_capability_uses_exact_exchange_generation(self) -> None:

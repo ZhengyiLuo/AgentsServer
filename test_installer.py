@@ -1034,7 +1034,7 @@ exit 0
                 "beta" if "-" in version.split("+", 1)[0] else "stable",
             )
             self.assertEqual(manifest["prerelease"], manifest["track"] == "beta")
-            self.assertEqual(manifest["api_contract_version"], 24)
+            self.assertEqual(manifest["api_contract_version"], 25)
 
     def test_installer_preserves_state_and_emits_private_result(self):
         source = INSTALLER.read_text()

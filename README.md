@@ -832,7 +832,7 @@ represent second 60.
 
 ## Cross-chat handoffs
 
-### Current route-hint contract (API contract 20, capability v7)
+### Current route-hint contract (API contract 25, capability v8)
 
 An inline structured `@Chat` is an optional target hint. It never forwards the
 raw user prompt. On successful ordinary-turn admission, an exact local
@@ -840,19 +840,30 @@ single-`@Chat` reference authored by a v2 client with `grant_intent: true`
 idempotently creates or refreshes a durable directional source-to-target
 grant. Subsequent turns receive only that source chat's current grants; there
 is no ambient all-chat authority. The agent decides whether to `send` a
-prepared one-way message, `ask` for an asynchronous correlated reply, or make
-no contact. Send grants no reverse authority, and Ask's return path is scoped
-to that exact correlated exchange. `/chat` is a composer alias for selecting
-the same structured hint.
+prepared instruction, `ask` for an asynchronous correlated reply, or make no
+contact. Every accepted configured-route Send carries one optional terminal
+reply path back to its immutable source; it creates no reply obligation, never
+automatically relays the target's ordinary final answer, cannot request a
+follow-up, and grants no durable reverse route. Ask explicitly requests one
+asynchronous terminal answer over the same exchange-scoped return mechanism.
+`/chat` is a composer alias for selecting the same structured hint.
 
 Scheduled runs never inherit the source chat's grants. Each job stores its own
 exact route selection, authorized by route ID in the job editor/helper flow,
 and revalidates its target, revision, and action on every firing. Its prompt
 contains the corresponding exact single `@Chat` marker for display and
 binding; no `@@` authoring syntax is required. The health surface advertises
-cross-chat version 7, `durable_route_grants`,
+cross-chat version 8, `durable_route_grants`, configured-route
+`instruction_reply_once`,
 `agent_ambient_local_handoffs: false`, scheduled Jobs version 5, and global
-API contract 20.
+API contract 25.
+
+Capability v8 intentionally applies this reply-once behavior to existing
+configured `instruction` grants as well as newly created ones. The return path
+is a property of each accepted delivery, not a new durable target grant: it is
+bound to the original source, delivery run, exchange generation, two-leg
+budget, and expiry. Revoking or revising the source route still blocks future
+deliveries immediately.
 
 Beta-era local `direct_message` and `@@` references remain readable only for
 safe migration/recovery. They are quarantined from ordinary authority and can
@@ -878,9 +889,12 @@ Ask, or make no contact:
 The helper never exposes or accepts an inferred chat ID. It accepts only the
 opaque IDs in that run's authority snapshot, uses loopback AgentsServer URLs,
 disables redirects and proxies, and submits one bounded agent-authored
-message. Send creates no reply obligation. Ask creates a correlated exchange;
-the terminal answer or failure status returns asynchronously to the source
-chat.
+message. Send creates a correlated two-leg exchange with one optional terminal
+reply capability available only to its exact delivery run. If the target does
+not deliberately use that capability, its ordinary final stays local and the
+exchange closes without sending anything back. Ask creates the same bounded
+exchange but explicitly requests that the terminal answer or failure status
+return asynchronously to the source chat.
 
 ### Historical action-specific grants (v1-v2)
 
@@ -930,7 +944,7 @@ status wake for the waiting sender. Exchange turns reuse the existing hidden
 `cross_chat_handoff_delivery` purpose so older clients do not expose synthetic
 prompts or queue controls.
 
-### Durable directional route management (v7)
+### Durable directional route management (v8)
 
 The default-empty per-source-chat grant list is the sole ordinary cross-chat
 authority ceiling. Inline `@Chat` admission manages it automatically, while
@@ -977,11 +991,12 @@ The turn-scoped helper surface accepts only opaque issued route IDs:
 `list` is capability-scoped; there is no provider chat search or arbitrary
 target parameter. `Ask` is not transcript access: it creates a normal target
 turn containing only the bounded relayed message, then returns one asynchronous
-terminal answer to the source chat. Configured-route Ask is limited to two
-legs and 24 hours, with no follow-up. Route bodies and answers are limited to
-16,000 characters and 64 KiB UTF-8. A live run can accept at most one effect
-per route and four route handoffs total; durable source and target limits are
-12 accepted route effects per rolling hour.
+terminal answer to the source chat. Configured-route Send and Ask are limited
+to two legs and 24 hours. A Send reply is always terminal; Ask also has no
+follow-up under the configured-route contract. Route bodies and answers are
+limited to 16,000 characters and 64 KiB UTF-8. A live run can accept at most
+one effect per route and four route handoffs total; durable source and target
+limits are 12 accepted route effects per rolling hour.
 
 Provider projections contain only the opaque route ID, safe alias, sanitized
 bounded title, backend, allowed actions, and generic availability. They never

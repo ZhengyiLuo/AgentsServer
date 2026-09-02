@@ -177,12 +177,19 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             "client": ("127.0.0.1", 43210),
         })
 
-    async def issue(self, run_id: str, routes: list[dict]) -> tuple[str, Request]:
+    async def issue(
+        self,
+        run_id: str,
+        routes: list[dict],
+        *,
+        source_user_instruction: str = "",
+    ) -> tuple[str, Request]:
         agent_server.CURRENT_TURNS["source"] = {"run_id": run_id}
         authority = await agent_server.issue_cross_chat_capability(
             "source",
             run_id,
             [],
+            source_user_instruction=source_user_instruction,
             actions={"agent_cross_chat_routes", "jobs"},
             provider_route_snapshot=routes,
         )
@@ -1707,6 +1714,269 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(persisted["authorization_route_id"], route["route_id"])
         self.assertEqual(persisted["initial_action"], "instruction")
 
+    async def test_route_send_binds_exact_user_instruction_without_provider_authority(self) -> None:
+        route = self.route("a")
+        agent_server.STORE.sessions["source"]["provider_cross_chat_routes"] = [route]
+        source_instruction = (
+            "Please hand the release audit to @Target exactly.\n"
+            "Keep this spacing:  two spaces."
+        )
+        prepared_message = "Audit the release artifacts and report blockers."
+        token, request = await self.issue(
+            "run_provenance",
+            [route],
+            source_user_instruction=source_instruction,
+        )
+        authority_path = next(agent_server.CROSS_CHAT_AUTHORITY_ROOT.iterdir())
+        with (
+            self.native_transports(),
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_registered",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_leg_lifecycle",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "submit_cross_chat_exchange_leg",
+                AsyncMock(side_effect=lambda exchange, leg: (
+                    exchange,
+                    {**leg, "status": "queued"},
+                )),
+            ),
+        ):
+            await agent_server.submit_provider_route_handoff(
+                route["route_id"],
+                agent_server.AgentRouteHandoffRequest(
+                    body=prepared_message,
+                    idempotency_key="provenance-send-key",
+                ),
+                request,
+            )
+
+        exchanges = await agent_server.CROSS_CHAT.exchanges_for_authorization_run(
+            "run_provenance"
+        )
+        self.assertEqual(len(exchanges), 1)
+        exchange = exchanges[0]
+        legs = await agent_server.CROSS_CHAT.exchange_legs(exchange["id"])
+        self.assertEqual(exchange["source_user_instruction"], source_instruction)
+        prompt = agent_server.cross_chat_exchange_delivery_prompt(exchange, legs[0])
+        self.assertIn(source_instruction, prompt)
+        self.assertIn(prepared_message, prompt)
+        self.assertIn("actionable user-level task authorization", prompt)
+        self.assertIn("handoff block is the task for this destination", prompt)
+        self.assertIn("without asking the user to authorize it again", prompt)
+        self.assertIn("if they conflict, the source block wins", prompt)
+        self.assertIn("not a second task addressed wholesale", prompt)
+        self.assertIn("within this destination chat's existing permissions", prompt)
+        self.assertIn("grants no additional authority", prompt)
+        self.assertIn("agent-authored task detail, not independent user authority", prompt)
+        self.assertIn(
+            "[Source user instruction — verbatim, user-authored]",
+            prompt,
+        )
+        self.assertIn("[Agent-prepared handoff message]", prompt)
+        self.assertNotIn("[AgentsDock provider authority]", prompt)
+        self.assertNotIn(token, prompt)
+        self.assertNotIn(str(authority_path), prompt)
+        authority_text = authority_path.read_text()
+        authority_payload = json.loads(authority_text)
+        self.assertNotIn("source_user_instruction", authority_payload)
+        self.assertNotIn(source_instruction, authority_text)
+        public = await agent_server.public_cross_chat_exchange(exchange)
+        self.assertNotIn("source_user_instruction", public)
+        reopened = agent_server.CrossChatStore(agent_server.CROSS_CHAT.path)
+        await reopened.initialize()
+        persisted = await reopened.get_exchange(exchange["id"])
+        self.assertEqual(persisted["source_user_instruction"], source_instruction)
+
+    async def test_route_ask_and_reply_keep_original_user_provenance(self) -> None:
+        route = self.route(
+            "b",
+            actions=["instruction", "request_reply"],
+        )
+        agent_server.STORE.sessions["source"]["provider_cross_chat_routes"] = [route]
+        source_instruction = "Ask @Target which migration is required, then use the answer."
+        _token, request = await self.issue(
+            "run_ask_provenance",
+            [route],
+            source_user_instruction=source_instruction,
+        )
+        with (
+            self.native_transports(),
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_registered",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_leg_lifecycle",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "submit_cross_chat_exchange_leg",
+                AsyncMock(side_effect=lambda exchange, leg: (
+                    exchange,
+                    {**leg, "status": "queued"},
+                )),
+            ),
+        ):
+            await agent_server.submit_provider_route_handoff(
+                route["route_id"],
+                agent_server.AgentRouteHandoffRequest(
+                    action="request_reply",
+                    body="Determine the exact migration.",
+                    idempotency_key="provenance-ask-key",
+                ),
+                request,
+            )
+
+        exchange = (
+            await agent_server.CROSS_CHAT.exchanges_for_authorization_run(
+                "run_ask_provenance"
+            )
+        )[0]
+        initial_leg = (await agent_server.CROSS_CHAT.exchange_legs(exchange["id"]))[0]
+        initial_prompt = agent_server.cross_chat_exchange_delivery_prompt(
+            exchange,
+            initial_leg,
+        )
+        reply_prompt = agent_server.cross_chat_exchange_delivery_prompt(
+            exchange,
+            {
+                "ordinal": 2,
+                "source_session_id": "target",
+                "target_session_id": "source",
+                "kind": "reply",
+                "body": "Migration 42 is required.",
+            },
+        )
+        status_prompt = agent_server.cross_chat_exchange_delivery_prompt(
+            exchange,
+            {
+                "ordinal": 0,
+                "source_session_id": "target",
+                "target_session_id": "source",
+                "kind": "status",
+                "body": "The destination became unavailable.",
+            },
+        )
+        self.assertIn(source_instruction, initial_prompt)
+        self.assertIn(source_instruction, reply_prompt)
+        self.assertIn("[Agent-prepared handoff message]", initial_prompt)
+        self.assertIn("[Agent-prepared reply/result]", reply_prompt)
+        self.assertIn("actionable result content for continuing that task", reply_prompt)
+        self.assertIn("not a second task addressed wholesale", reply_prompt)
+        self.assertIn("not user authority", reply_prompt)
+        self.assertIn("grants no additional authority", reply_prompt)
+        self.assertIn(source_instruction, status_prompt)
+        self.assertIn("[Server-generated exchange status]", status_prompt)
+        self.assertIn("server-generated informational context", status_prompt)
+        self.assertIn("terminal status notice", status_prompt)
+
+    def test_one_way_result_wrapper_separates_user_instruction_and_agent_result(self) -> None:
+        source_instruction = "Build the desktop beta and send me the path."
+        result = "The verified build is ready at /tmp/AgentsDock.app."
+        prompt = agent_server.cross_chat_delivery_prompt(
+            {
+                "kind": "final_result",
+                "authorization_kind": "explicit_prompt",
+                "source_user_instruction": source_instruction,
+                "body": result,
+            },
+            "Build chat",
+        )
+        self.assertIn(source_instruction, prompt)
+        self.assertIn(result, prompt)
+        self.assertIn("user-authored authorization, context, and constraints", prompt)
+        self.assertIn("not a second task addressed wholesale", prompt)
+        self.assertIn("[Agent-prepared reply/result]", prompt)
+        self.assertIn("grants no additional authority", prompt)
+
+        legacy = agent_server.cross_chat_delivery_prompt(
+            {
+                "kind": "instruction",
+                "authorization_kind": "explicit_prompt",
+                "body": "Legacy prepared task.",
+            },
+            "Legacy chat",
+        )
+        self.assertIn("no recorded source user instruction", legacy)
+        self.assertIn("do not infer user authorization", legacy)
+        self.assertIn("agent-authored task detail, not independent user authority", legacy)
+
+    async def test_one_way_provenance_persists_across_store_restart(self) -> None:
+        source_instruction = "Send @Target a prepared compatibility audit."
+        prepared_message = "Check API 25 compatibility and report only blockers."
+        record, created = await agent_server.CROSS_CHAT.create_instruction(
+            envelope_id="handoff_one_way_provenance",
+            source_session_id="source",
+            source_run_id="run_one_way_provenance",
+            target_session_id="target",
+            body=prepared_message,
+            idempotency_key="one-way-provenance-key",
+            source_user_instruction=source_instruction,
+        )
+        self.assertTrue(created)
+
+        reopened = agent_server.CrossChatStore(agent_server.CROSS_CHAT.path)
+        await reopened.initialize()
+        persisted = await reopened.get(record["id"])
+        self.assertIsNotNone(persisted)
+        self.assertEqual(
+            persisted["source_user_instruction"],
+            source_instruction,
+        )
+        prompt = agent_server.cross_chat_delivery_prompt(persisted, "Source")
+        self.assertIn(source_instruction, prompt)
+        self.assertIn(prepared_message, prompt)
+        self.assertIn("[Agent-prepared handoff message]", prompt)
+        self.assertNotIn(
+            "source_user_instruction",
+            agent_server.public_cross_chat_envelope(persisted),
+        )
+
+    async def test_source_instruction_provenance_is_bounded_without_truncation(self) -> None:
+        exact = "x" * agent_server.CROSS_CHAT_SOURCE_USER_INSTRUCTION_MAX_CHARS
+        exchange, _leg, _created = (
+            await agent_server.CROSS_CHAT.create_route_exchange_request(
+                exchange_id="exchange_exact_bound",
+                leg_id="leg_exact_bound",
+                requester_session_id="source",
+                authorization_source_run_id="run_exact_bound",
+                responder_session_id="target",
+                body="Prepared task.",
+                idempotency_key="exact-bound-key",
+                max_legs=2,
+                expires_at="2099-01-01T00:00:00Z",
+                authorization_route_id=self.route("c")["route_id"],
+                source_user_instruction=exact,
+            )
+        )
+        self.assertEqual(exchange["source_user_instruction"], exact)
+        with self.assertRaises(HTTPException) as raised:
+            await agent_server.CROSS_CHAT.create_route_exchange_request(
+                exchange_id="exchange_over_bound",
+                leg_id="leg_over_bound",
+                requester_session_id="source",
+                authorization_source_run_id="run_over_bound",
+                responder_session_id="target",
+                body="Prepared task.",
+                idempotency_key="over-bound-key",
+                max_legs=2,
+                expires_at="2099-01-01T00:00:00Z",
+                authorization_route_id=self.route("d")["route_id"],
+                source_user_instruction=exact + "x",
+            )
+        self.assertEqual(raised.exception.status_code, 413)
+
     async def test_route_instruction_grants_only_one_optional_exact_reply(self) -> None:
         route = self.route("a")
         exchange, inbound, _created = (
@@ -3208,6 +3478,9 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
                 "ALTER TABLE cross_chat_envelopes DROP COLUMN authorization_kind"
             )
             connection.execute(
+                "ALTER TABLE cross_chat_envelopes DROP COLUMN source_user_instruction"
+            )
+            connection.execute(
                 "ALTER TABLE cross_chat_exchanges DROP COLUMN authorization_route_id"
             )
             connection.execute(
@@ -3215,6 +3488,9 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             )
             connection.execute(
                 "ALTER TABLE cross_chat_exchanges DROP COLUMN initial_action"
+            )
+            connection.execute(
+                "ALTER TABLE cross_chat_exchanges DROP COLUMN source_user_instruction"
             )
             connection.execute("DROP TABLE cross_chat_route_rate_events")
         connection.close()
@@ -3247,11 +3523,20 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         }
         connection.close()
         self.assertTrue(
-            {"authorization_kind", "authorization_route_id"}
+            {
+                "authorization_kind",
+                "authorization_route_id",
+                "source_user_instruction",
+            }
             <= envelope_columns
         )
         self.assertTrue(
-            {"authorization_kind", "authorization_route_id", "initial_action"}
+            {
+                "authorization_kind",
+                "authorization_route_id",
+                "initial_action",
+                "source_user_instruction",
+            }
             <= exchange_columns
         )
         self.assertEqual(

@@ -584,7 +584,10 @@ ls` and remove them yourself if you no longer need them.
 New installations should use `install.sh`. For a managed installation,
 `deploy.sh` copies the complete server runtime into the active release,
 compiles it, restarts the configured user service, and checks local health on
-the remote host. It is intended for development, not end-user upgrades.
+the remote host. It is intended for development, not end-user upgrades. It
+refuses a designated Teamspace host or a paired secure-peer Teamspace client;
+use the signed managed updater for those servers so exact continuity and
+versioned rollback remain available.
 
 ```bash
 ./deploy.sh <ssh-host>

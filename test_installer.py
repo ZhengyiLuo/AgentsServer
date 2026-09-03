@@ -670,6 +670,381 @@ exit 0
         self.assertIn("from agentsdock_team_hub import secure_peer, secure_peer_hub", source)
         self.assertIn('"state_available": True', source)
         self.assertIn('"state_error_code": None', source)
+        self.assertIn("/api/admin/secure-peers/v1/status", source)
+        self.assertIn("-H 'X-AgentsDock-Token: ${HEALTH_TOKEN}'", source)
+        self.assertIn('"$TARGET_PEER_STATE" == "client"', source)
+        self.assertNotIn("EXPECTED_CLIENT_BINDING", source)
+
+    def run_direct_deploy_secure_peer_client(
+        self,
+        *,
+        health_visible=True,
+        active_connection=True,
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            ssh_log = root / "ssh.log"
+            copy_log = root / "copy.log"
+            self.write_executable(
+                fake_bin / "ssh",
+                """#!/usr/bin/env python3
+import json
+import os
+import sys
+
+command = " ".join(sys.argv[1:])
+with open(os.environ["FAKE_SSH_LOG"], "a", encoding="utf-8") as stream:
+    stream.write(command + "\\n")
+if "team_hub_host.py" in command:
+    print("present", end="")
+    raise SystemExit(0)
+connection_id = "11111111-2222-4333-8444-555555555555"
+hub_id = "hub_deploy_client_12345678"
+host_identity = "server_teamspace_host_12345678"
+if "/api/admin/secure-peers/v1/status" in command:
+    expected_header = (
+        "X-AgentsDock-Token: "
+        "deploy_token_abcdefghijklmnopqrstuvwxyz0123456789"
+    )
+    if expected_header not in command or "Authorization:" in command:
+        raise SystemExit(91)
+    print(json.dumps({
+        "version": 2,
+        "server_identity": "server_deploy_client_12345678",
+        "active_connection_id": (
+            connection_id
+            if os.environ["FAKE_ACTIVE_CONNECTION"] == "true"
+            else None
+        ),
+        "pairings": [{
+            "id": "22222222-3333-4444-8555-666666666666",
+            "direction": "outgoing",
+            "status": "connected",
+            "trust_state": "approved",
+            "transport_state": (
+                "online" if os.environ["FAKE_HEALTH_VISIBLE"] == "true" else "offline"
+            ),
+            "connection_id": connection_id,
+            "hub_id": hub_id,
+            "host_server_identity": host_identity,
+        }],
+    }, separators=(",", ":")))
+    raise SystemExit(0)
+if "/api/health" not in command:
+    raise SystemExit(0)
+base_path = f"/api/team-hub-secure/{connection_id}"
+route = {
+    "transport": "secure_peer",
+    "hub_url": None,
+    "base_path": base_path,
+    "connection_id": connection_id,
+    "host_server_identity": host_identity,
+    "hub_id": hub_id,
+}
+team_hub = {
+    "available": False,
+    "designated_host": False,
+    "version": 1,
+    "base_path": None,
+    "transport": None,
+    "hub_url": None,
+    "routes": [],
+    "hub_id": None,
+    "host_server_identity": None,
+}
+if os.environ["FAKE_HEALTH_VISIBLE"] == "true":
+    team_hub = {
+        "available": True,
+        "designated_host": False,
+        "version": 1,
+        "base_path": base_path,
+        "transport": "secure_peer",
+        "hub_url": None,
+        "routes": [route],
+        "hub_id": hub_id,
+        "host_server_identity": host_identity,
+        "connection_id": connection_id,
+    }
+health = {
+    "ok": True,
+    "server_version": "0.1.25-beta.1",
+    "server_identity": "server_deploy_client_12345678",
+    "capabilities": {
+        "team_hub_v1": team_hub,
+        "secure_peer_v1": {
+            "available": True,
+            "state_available": True,
+            "state_error_code": None,
+            "required": False,
+            "version": 1,
+            "control_path": "/api/admin/secure-peers/v1/status",
+            "proxy_prefix": "/api/team-hub-secure",
+        },
+    },
+}
+print(json.dumps(health, separators=(",", ":")))
+""",
+            )
+            for name in ("scp", "rsync"):
+                self.write_executable(
+                    fake_bin / name,
+                    "#!/bin/sh\nprintf '%s:%s\\n' \"$0\" \"$*\" >> \"$FAKE_COPY_LOG\"\n",
+                )
+            self.write_executable(fake_bin / "sleep", "#!/bin/sh\nexit 0\n")
+            environment = {
+                **os.environ,
+                "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+                "AGENTSDOCK_REMOTE_HOST": "fake-host",
+                "AGENTSDOCK_AGENT_TOKEN": "deploy_token_abcdefghijklmnopqrstuvwxyz0123456789",
+                "AGENTSDOCK_HEALTH_ATTEMPTS": "1",
+                "FAKE_SSH_LOG": str(ssh_log),
+                "FAKE_COPY_LOG": str(copy_log),
+                "FAKE_HEALTH_VISIBLE": "true" if health_visible else "false",
+                "FAKE_ACTIVE_CONNECTION": (
+                    "true" if active_connection else "false"
+                ),
+            }
+
+            result = subprocess.run(
+                ["/bin/bash", str(DEPLOYER)],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return (
+                result,
+                copy_log.is_file(),
+                ssh_log.read_text().splitlines(),
+            )
+
+    def test_direct_deploy_refuses_connected_secure_peer_client_before_mutation(self):
+        result, copied, ssh_lines = self.run_direct_deploy_secure_peer_client()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("paired secure-peer Teamspace client", result.stderr)
+        self.assertFalse(copied)
+        self.assertFalse(any("systemctl" in line for line in ssh_lines))
+
+    def test_direct_deploy_refuses_offline_active_client_before_mutation(self):
+        result, copied, ssh_lines = self.run_direct_deploy_secure_peer_client(
+            health_visible=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("paired secure-peer Teamspace client", result.stderr)
+        self.assertFalse(copied)
+        self.assertFalse(any("systemctl" in line for line in ssh_lines))
+
+    def test_direct_deploy_refuses_inactive_approved_client_before_mutation(self):
+        result, copied, ssh_lines = self.run_direct_deploy_secure_peer_client(
+            health_visible=False,
+            active_connection=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("paired secure-peer Teamspace client", result.stderr)
+        self.assertFalse(copied)
+        self.assertFalse(any("systemctl" in line for line in ssh_lines))
+
+    def run_direct_deploy_unpaired(
+        self,
+        *,
+        status_payload,
+        secure_state_available=True,
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            ssh_log = root / "ssh.log"
+            copy_log = root / "copy.log"
+            health_count = root / "health-count"
+            self.write_executable(
+                fake_bin / "ssh",
+                """#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import sys
+
+command = " ".join(sys.argv[1:])
+with open(os.environ["FAKE_SSH_LOG"], "a", encoding="utf-8") as stream:
+    stream.write(command + "\\n")
+if "team_hub_host.py" in command:
+    print("present", end="")
+    raise SystemExit(0)
+if "/api/admin/secure-peers/v1/status" in command:
+    expected_header = (
+        "X-AgentsDock-Token: "
+        "deploy_token_abcdefghijklmnopqrstuvwxyz0123456789"
+    )
+    if expected_header not in command or "Authorization:" in command:
+        raise SystemExit(91)
+    print(os.environ["FAKE_STATUS_PAYLOAD"])
+    raise SystemExit(0)
+if "/api/health" in command:
+    counter = pathlib.Path(os.environ["FAKE_HEALTH_COUNT"])
+    if counter.exists():
+        version = pathlib.Path(os.environ["FAKE_RELEASE_VERSION"]).read_text().strip()
+    else:
+        counter.touch()
+        version = "0.1.25-beta.1"
+    secure_state_available = os.environ["FAKE_SECURE_STATE_AVAILABLE"] == "true"
+    print(json.dumps({
+        "ok": True,
+        "server_version": version,
+        "server_identity": "server_deploy_unpaired_12345678",
+        "capabilities": {
+            "team_hub_v1": {
+                "available": False,
+                "designated_host": False,
+                "version": 1,
+                "base_path": None,
+                "hub_id": None,
+                "host_server_identity": None,
+                "transport": None,
+                "hub_url": None,
+                "routes": [],
+            },
+            "secure_peer_v1": {
+                "available": True,
+                "state_available": secure_state_available,
+                "state_error_code": (
+                    None
+                    if secure_state_available
+                    else "secure_peer_state_unavailable"
+                ),
+                "required": False,
+                "version": 1,
+                "control_path": "/api/admin/secure-peers/v1/status",
+                "proxy_prefix": "/api/team-hub-secure",
+            },
+        },
+    }, separators=(",", ":")))
+raise SystemExit(0)
+""",
+            )
+            for name in ("scp", "rsync"):
+                self.write_executable(
+                    fake_bin / name,
+                    "#!/bin/sh\nprintf '%s:%s\\n' \"$0\" \"$*\" >> \"$FAKE_COPY_LOG\"\n",
+                )
+            self.write_executable(fake_bin / "sleep", "#!/bin/sh\nexit 0\n")
+            environment = {
+                **os.environ,
+                "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+                "AGENTSDOCK_REMOTE_HOST": "fake-host",
+                "AGENTSDOCK_AGENT_TOKEN": "deploy_token_abcdefghijklmnopqrstuvwxyz0123456789",
+                "AGENTSDOCK_HEALTH_ATTEMPTS": "1",
+                "FAKE_SSH_LOG": str(ssh_log),
+                "FAKE_COPY_LOG": str(copy_log),
+                "FAKE_HEALTH_COUNT": str(health_count),
+                "FAKE_RELEASE_VERSION": str(ROOT / "VERSION"),
+                "FAKE_STATUS_PAYLOAD": status_payload,
+                "FAKE_SECURE_STATE_AVAILABLE": (
+                    "true" if secure_state_available else "false"
+                ),
+            }
+
+            result = subprocess.run(
+                ["/bin/bash", str(DEPLOYER)],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return (
+                result,
+                copy_log.is_file(),
+                ssh_log.read_text().splitlines(),
+            )
+
+    def test_direct_deploy_accepts_authenticated_unpaired_disabled_target(self):
+        status_payload = json.dumps(
+            {
+                "version": 2,
+                "server_identity": "server_deploy_unpaired_12345678",
+                "active_connection_id": None,
+                "pairings": [],
+            },
+            separators=(",", ":"),
+        )
+        result, copied, ssh_lines = self.run_direct_deploy_unpaired(
+            status_payload=status_payload,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(copied)
+        self.assertTrue(any("systemctl --user restart" in line for line in ssh_lines))
+
+    def test_direct_deploy_rejects_malformed_secure_peer_status_before_mutation(self):
+        result, copied, ssh_lines = self.run_direct_deploy_unpaired(
+            status_payload="{",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("malformed or quarantined secure-peer status", result.stderr)
+        self.assertFalse(copied)
+        self.assertFalse(any("systemctl" in line for line in ssh_lines))
+
+    def test_direct_deploy_rejects_status_missing_active_connection_field(self):
+        status_payload = json.dumps(
+            {
+                "version": 2,
+                "server_identity": "server_deploy_unpaired_12345678",
+                "pairings": [],
+            },
+            separators=(",", ":"),
+        )
+        result, copied, ssh_lines = self.run_direct_deploy_unpaired(
+            status_payload=status_payload,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("malformed or quarantined secure-peer status", result.stderr)
+        self.assertFalse(copied)
+        self.assertFalse(any("systemctl" in line for line in ssh_lines))
+
+    def test_direct_deploy_rejects_unknown_outgoing_pairing_state_before_mutation(self):
+        status_payload = json.dumps(
+            {
+                "version": 2,
+                "server_identity": "server_deploy_unpaired_12345678",
+                "active_connection_id": None,
+                "pairings": [
+                    {
+                        "direction": "outgoing",
+                        "connection_id": "11111111-2222-4333-8444-555555555555",
+                    }
+                ],
+            },
+            separators=(",", ":"),
+        )
+        result, copied, ssh_lines = self.run_direct_deploy_unpaired(
+            status_payload=status_payload,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("malformed or quarantined secure-peer status", result.stderr)
+        self.assertFalse(copied)
+        self.assertFalse(any("systemctl" in line for line in ssh_lines))
+
+    def test_direct_deploy_rejects_quarantined_peer_state_before_mutation(self):
+        result, copied, ssh_lines = self.run_direct_deploy_unpaired(
+            status_payload="should-not-be-read",
+            secure_state_available=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("malformed or quarantined Teamspace capability", result.stderr)
+        self.assertFalse(copied)
+        self.assertFalse(any("systemctl" in line for line in ssh_lines))
+        self.assertFalse(
+            any("/api/admin/secure-peers/v1/status" in line for line in ssh_lines)
+        )
 
     def test_direct_deploy_refuses_designated_hub_before_copy_or_restart(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -785,6 +1160,15 @@ exit 0
 printf '%s\n' "$*" >> "$FAKE_SSH_LOG"
 case "$*" in
   *"team_hub_host.py"*) printf 'present'; exit 0 ;;
+  *"/api/admin/secure-peers/v1/status"*)
+    case "$*" in
+      *"X-AgentsDock-Token: deploy_token_abcdefghijklmnopqrstuvwxyz0123456789"*) ;;
+      *) exit 91 ;;
+    esac
+    case "$*" in *"Authorization:"*) exit 92 ;; esac
+    printf '%s\n' '{"version":2,"server_identity":"server_deploy_before_12345678","active_connection_id":null,"pairings":[]}'
+    exit 0
+    ;;
   *"/api/health"*)
     if [ ! -f "$FAKE_HEALTH_COUNT" ]; then
       : > "$FAKE_HEALTH_COUNT"
@@ -794,7 +1178,7 @@ case "$*" in
       identity="server_deploy_after_wrong_12345678"
       version="$(cat "$FAKE_RELEASE_VERSION")"
     fi
-    printf '{"ok":true,"server_version":"%s","server_identity":"%s","capabilities":{"team_hub_v1":{"available":false,"designated_host":false,"version":1,"base_path":null,"hub_id":null,"host_server_identity":null}}}\n' "$version" "$identity"
+    printf '{"ok":true,"server_version":"%s","server_identity":"%s","capabilities":{"team_hub_v1":{"available":false,"designated_host":false,"version":1,"base_path":null,"hub_id":null,"host_server_identity":null,"transport":null,"hub_url":null,"routes":[]},"secure_peer_v1":{"available":true,"state_available":true,"state_error_code":null,"required":false,"version":1,"control_path":"/api/admin/secure-peers/v1/status","proxy_prefix":"/api/team-hub-secure"}}}\n' "$version" "$identity"
     exit 0
     ;;
 esac
@@ -848,16 +1232,25 @@ exit 0
 printf '%s\n' "$*" >> "$FAKE_SSH_LOG"
 case "$*" in
   *"team_hub_host.py"*) printf 'present'; exit 0 ;;
+  *"/api/admin/secure-peers/v1/status"*)
+    case "$*" in
+      *"X-AgentsDock-Token: deploy_token_abcdefghijklmnopqrstuvwxyz0123456789"*) ;;
+      *) exit 91 ;;
+    esac
+    case "$*" in *"Authorization:"*) exit 92 ;; esac
+    printf '%s\n' '{"version":2,"server_identity":"server_deploy_stable_12345678","active_connection_id":null,"pairings":[]}'
+    exit 0
+    ;;
   *"/api/health"*)
     if [ ! -f "$FAKE_HEALTH_COUNT" ]; then
       : > "$FAKE_HEALTH_COUNT"
       version="0.1.25-beta.1"
-      secure_capability=""
+      secure_capability=',"secure_peer_v1":{"available":true,"state_available":true,"state_error_code":null,"required":false,"version":1,"control_path":"/api/admin/secure-peers/v1/status","proxy_prefix":"/api/team-hub-secure"}'
     else
       version="$(cat "$FAKE_RELEASE_VERSION")"
       secure_capability=',"secure_peer_v1":{"available":true,"state_available":false,"state_error_code":"secure_peer_state_unavailable","required":false,"version":1,"control_path":"/api/admin/secure-peers/v1/status","proxy_prefix":"/api/team-hub-secure"}'
     fi
-    printf '{"ok":true,"server_version":"%s","server_identity":"server_deploy_stable_12345678","capabilities":{"team_hub_v1":{"available":false,"designated_host":false,"version":1,"base_path":null,"hub_id":null,"host_server_identity":null}%s}}\n' "$version" "$secure_capability"
+    printf '{"ok":true,"server_version":"%s","server_identity":"server_deploy_stable_12345678","capabilities":{"team_hub_v1":{"available":false,"designated_host":false,"version":1,"base_path":null,"hub_id":null,"host_server_identity":null,"transport":null,"hub_url":null,"routes":[]}%s}}\n' "$version" "$secure_capability"
     exit 0
     ;;
 esac
@@ -2035,6 +2428,544 @@ chmod 755 "$project/.venv/bin/python"
             self.assertNotIn("AGENTSDOCK_SETUP_RESULT", result.stdout)
             self.assertNotIn(token, result.stdout)
 
+    def test_managed_disabled_install_preserves_exact_secure_peer_client(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_exact_health_uv(fake_bin)
+            self.write_json_health_curl(fake_bin)
+            self.write_event_systemctl(fake_bin)
+            server_identity = "server_client_update_12345678"
+            hub_id = "hub_client_update_12345678"
+            connection_id = "11111111-2222-4333-8444-555555555555"
+            host_identity = "server_teamspace_host_12345678"
+            token = "preserved_token_abcdefghijklmnopqrstuvwxyz0123456789"
+            event_log = root / "events.log"
+            config_root = root / "config"
+            config_root.mkdir()
+            (config_root / "env").write_text(
+                f"AGENTSDOCK_AGENT_TOKEN={token}\n"
+                "AGENTSDOCK_AGENT_PORT=17850\n"
+                "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
+            )
+            environment.update(
+                {
+                    "FAKE_EVENT_LOG": str(event_log),
+                    "FAKE_HEALTH_VERSION": self.release_version(),
+                    "FAKE_SERVER_IDENTITY": server_identity,
+                    # An active pairing is durable even while its fresh health
+                    # projection is disabled because the peer is offline.
+                    "FAKE_TEAM_HUB_MODE": "disabled",
+                    "FAKE_TEAM_HUB_ID": hub_id,
+                    "FAKE_TEAM_HUB_CONNECTION_ID": connection_id,
+                    "FAKE_TEAM_HUB_HOST_SERVER_IDENTITY": host_identity,
+                    "FAKE_SECURE_PEER_ACTIVE": "true",
+                    "FAKE_SECURE_PEER_TRANSPORT_STATE": "offline",
+                    "FAKE_SECURE_PEER_EXTRA_APPROVED": "true",
+                    # The source beta exposes the v1 status schema; the
+                    # candidate upgrades that same binding to v2.
+                    "FAKE_SECURE_PEER_STATUS_VERSION_BEFORE_RESTART": "1",
+                    "REAL_PYTHON": sys.executable,
+                    "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(INSTALLER),
+                    "--non-interactive",
+                    "--port",
+                    "17850",
+                    "--expected-server-identity",
+                    server_identity,
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                (install_root / "current" / "VERSION").read_text().strip(),
+                self.release_version(),
+            )
+            self.assertIn("Binding current Teamspace client state", result.stdout)
+
+    def test_managed_disabled_install_preserves_inactive_approved_secure_peer_client(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_exact_health_uv(fake_bin)
+            self.write_json_health_curl(fake_bin)
+            self.write_event_systemctl(fake_bin)
+            server_identity = "server_inactive_client_update_12345678"
+            token = "preserved_token_abcdefghijklmnopqrstuvwxyz0123456789"
+            event_log = root / "events.log"
+            config_root = root / "config"
+            config_root.mkdir()
+            (config_root / "env").write_text(
+                f"AGENTSDOCK_AGENT_TOKEN={token}\n"
+                "AGENTSDOCK_AGENT_PORT=17850\n"
+                "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
+            )
+            environment.update(
+                {
+                    "FAKE_EVENT_LOG": str(event_log),
+                    "FAKE_HEALTH_VERSION": self.release_version(),
+                    "FAKE_SERVER_IDENTITY": server_identity,
+                    "FAKE_TEAM_HUB_MODE": "disabled",
+                    "FAKE_TEAM_HUB_ID": "hub_inactive_client_update_12345678",
+                    "FAKE_TEAM_HUB_CONNECTION_ID": "11111111-2222-4333-8444-555555555555",
+                    "FAKE_TEAM_HUB_HOST_SERVER_IDENTITY": "server_inactive_host_12345678",
+                    "FAKE_SECURE_PEER_ACTIVE": "true",
+                    "FAKE_SECURE_PEER_ACTIVE_CONNECTION": "false",
+                    "REAL_PYTHON": sys.executable,
+                    "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(INSTALLER),
+                    "--non-interactive",
+                    "--port",
+                    "17850",
+                    "--expected-server-identity",
+                    server_identity,
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                (install_root / "current" / "VERSION").read_text().strip(),
+                self.release_version(),
+            )
+            self.assertIn("Binding current Teamspace client state", result.stdout)
+
+    def test_managed_disabled_install_rejects_pending_pairing_before_takeover(self):
+        for status_version in ("1", "2"):
+            with self.subTest(status_version=status_version), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                _home, fake_bin, _install_root, environment = self.fake_linux_preinstall_environment(root)
+                self.write_exact_health_uv(fake_bin)
+                self.write_json_health_curl(fake_bin)
+                self.write_event_systemctl(fake_bin)
+                server_identity = f"server_pending_client_v{status_version}_12345678"
+                token = "preserved_token_abcdefghijklmnopqrstuvwxyz0123456789"
+                event_log = root / "events.log"
+                config_root = root / "config"
+                config_root.mkdir()
+                (config_root / "env").write_text(
+                    f"AGENTSDOCK_AGENT_TOKEN={token}\n"
+                    "AGENTSDOCK_AGENT_PORT=17850\n"
+                    "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
+                )
+                environment.update(
+                    {
+                        "FAKE_EVENT_LOG": str(event_log),
+                        "FAKE_HEALTH_VERSION": self.release_version(),
+                        "FAKE_SERVER_IDENTITY": server_identity,
+                        "FAKE_TEAM_HUB_MODE": "disabled",
+                        "FAKE_TEAM_HUB_ID": "hub_pending_client_12345678",
+                        "FAKE_TEAM_HUB_CONNECTION_ID": "11111111-2222-4333-8444-555555555555",
+                        "FAKE_TEAM_HUB_HOST_SERVER_IDENTITY": "server_pending_host_12345678",
+                        "FAKE_SECURE_PEER_ACTIVE": "true",
+                        "FAKE_SECURE_PEER_PENDING": "true",
+                        "FAKE_SECURE_PEER_STATUS_VERSION": status_version,
+                        "REAL_PYTHON": sys.executable,
+                        "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                    }
+                )
+
+                result = subprocess.run(
+                    [
+                        "/bin/bash",
+                        str(INSTALLER),
+                        "--non-interactive",
+                        "--port",
+                        "17850",
+                        "--expected-server-identity",
+                        server_identity,
+                    ],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "Could not bind the current authenticated Teamspace client",
+                    result.stderr,
+                )
+                self.assertNotIn("restart", event_log.read_text())
+
+    def test_managed_disabled_install_rejects_changed_secure_peer_pairing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_exact_health_uv(fake_bin)
+            self.write_json_health_curl(fake_bin)
+            self.write_event_systemctl(fake_bin)
+            old_version = "0.0.9"
+            self.prepare_managed_runtime_fixture(
+                install_root,
+                old_version=old_version,
+            )
+            server_identity = "server_client_change_12345678"
+            token = "preserved_token_abcdefghijklmnopqrstuvwxyz0123456789"
+            event_log = root / "events.log"
+            config_root = root / "config"
+            config_root.mkdir()
+            (config_root / "env").write_text(
+                f"AGENTSDOCK_AGENT_TOKEN={token}\n"
+                "AGENTSDOCK_AGENT_PORT=17850\n"
+                "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
+            )
+            environment.update(
+                {
+                    "FAKE_EVENT_LOG": str(event_log),
+                    "FAKE_HEALTH_VERSION": self.release_version(),
+                    "FAKE_HEALTH_VERSION_AFTER_RESTORE": old_version,
+                    "FAKE_SERVER_IDENTITY": server_identity,
+                    "FAKE_TEAM_HUB_MODE": "disabled",
+                    "FAKE_TEAM_HUB_ID": "hub_client_original_12345678",
+                    "FAKE_TEAM_HUB_CONNECTION_ID": "11111111-2222-4333-8444-555555555555",
+                    "FAKE_TEAM_HUB_HOST_SERVER_IDENTITY": "server_host_original_12345678",
+                    "FAKE_SECURE_PEER_ACTIVE": "true",
+                    "FAKE_TEAM_HUB_CONNECTION_ID_AFTER_RESTART": "99999999-8888-4777-8666-555555555555",
+                    "REAL_PYTHON": sys.executable,
+                    "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(INSTALLER),
+                    "--non-interactive",
+                    "--port",
+                    "17850",
+                    "--expected-server-identity",
+                    server_identity,
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("did not become healthy; rolling back", result.stderr)
+            self.assertIn("The previous release was restored", result.stderr)
+            self.assertTrue((install_root / "current" / "runtime-marker").is_file())
+
+    def test_managed_disabled_install_rejects_missing_secure_peer_pairing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_exact_health_uv(fake_bin)
+            self.write_json_health_curl(fake_bin)
+            self.write_event_systemctl(fake_bin)
+            old_version = "0.0.9"
+            self.prepare_managed_runtime_fixture(
+                install_root,
+                old_version=old_version,
+            )
+            server_identity = "server_client_missing_12345678"
+            token = "preserved_token_abcdefghijklmnopqrstuvwxyz0123456789"
+            event_log = root / "events.log"
+            config_root = root / "config"
+            config_root.mkdir()
+            (config_root / "env").write_text(
+                f"AGENTSDOCK_AGENT_TOKEN={token}\n"
+                "AGENTSDOCK_AGENT_PORT=17850\n"
+                "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
+            )
+            environment.update(
+                {
+                    "FAKE_EVENT_LOG": str(event_log),
+                    "FAKE_HEALTH_VERSION": self.release_version(),
+                    "FAKE_HEALTH_VERSION_AFTER_RESTORE": old_version,
+                    "FAKE_SERVER_IDENTITY": server_identity,
+                    "FAKE_TEAM_HUB_MODE": "disabled",
+                    "FAKE_TEAM_HUB_ID": "hub_client_missing_12345678",
+                    "FAKE_TEAM_HUB_CONNECTION_ID": "11111111-2222-4333-8444-555555555555",
+                    "FAKE_TEAM_HUB_HOST_SERVER_IDENTITY": "server_host_missing_12345678",
+                    "FAKE_SECURE_PEER_ACTIVE": "true",
+                    "FAKE_SECURE_PEER_ACTIVE_AFTER_RESTART": "false",
+                    "REAL_PYTHON": sys.executable,
+                    "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(INSTALLER),
+                    "--non-interactive",
+                    "--port",
+                    "17850",
+                    "--expected-server-identity",
+                    server_identity,
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("did not become healthy; rolling back", result.stderr)
+            self.assertIn("The previous release was restored", result.stderr)
+            self.assertTrue((install_root / "current" / "runtime-marker").is_file())
+
+    def test_managed_disabled_install_rejects_missing_inactive_approved_pairing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_exact_health_uv(fake_bin)
+            self.write_json_health_curl(fake_bin)
+            self.write_event_systemctl(fake_bin)
+            old_version = "0.0.9"
+            self.prepare_managed_runtime_fixture(
+                install_root,
+                old_version=old_version,
+            )
+            server_identity = "server_client_inactive_12345678"
+            token = "preserved_token_abcdefghijklmnopqrstuvwxyz0123456789"
+            event_log = root / "events.log"
+            config_root = root / "config"
+            config_root.mkdir()
+            (config_root / "env").write_text(
+                f"AGENTSDOCK_AGENT_TOKEN={token}\n"
+                "AGENTSDOCK_AGENT_PORT=17850\n"
+                "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
+            )
+            environment.update(
+                {
+                    "FAKE_EVENT_LOG": str(event_log),
+                    "FAKE_HEALTH_VERSION": self.release_version(),
+                    "FAKE_HEALTH_VERSION_AFTER_RESTORE": old_version,
+                    "FAKE_SERVER_IDENTITY": server_identity,
+                    "FAKE_TEAM_HUB_MODE": "disabled",
+                    "FAKE_TEAM_HUB_ID": "hub_client_inactive_12345678",
+                    "FAKE_TEAM_HUB_CONNECTION_ID": "11111111-2222-4333-8444-555555555555",
+                    "FAKE_TEAM_HUB_HOST_SERVER_IDENTITY": "server_host_inactive_12345678",
+                    "FAKE_SECURE_PEER_ACTIVE": "true",
+                    "FAKE_SECURE_PEER_EXTRA_APPROVED": "true",
+                    "FAKE_SECURE_PEER_EXTRA_APPROVED_AFTER_RESTART": "false",
+                    "REAL_PYTHON": sys.executable,
+                    "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(INSTALLER),
+                    "--non-interactive",
+                    "--port",
+                    "17850",
+                    "--expected-server-identity",
+                    server_identity,
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("did not become healthy; rolling back", result.stderr)
+            self.assertIn("The previous release was restored", result.stderr)
+            self.assertTrue((install_root / "current" / "runtime-marker").is_file())
+
+    def test_managed_disabled_install_accepts_secure_peer_certificate_renewal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_exact_health_uv(fake_bin)
+            self.write_json_health_curl(fake_bin)
+            self.write_event_systemctl(fake_bin)
+            old_version = "0.0.9"
+            self.prepare_managed_runtime_fixture(
+                install_root,
+                old_version=old_version,
+            )
+            server_identity = "server_client_cert_change_12345678"
+            token = "preserved_token_abcdefghijklmnopqrstuvwxyz0123456789"
+            event_log = root / "events.log"
+            config_root = root / "config"
+            config_root.mkdir()
+            (config_root / "env").write_text(
+                f"AGENTSDOCK_AGENT_TOKEN={token}\n"
+                "AGENTSDOCK_AGENT_PORT=17850\n"
+                "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
+            )
+            environment.update(
+                {
+                    "FAKE_EVENT_LOG": str(event_log),
+                    "FAKE_HEALTH_VERSION": self.release_version(),
+                    "FAKE_HEALTH_VERSION_AFTER_RESTORE": old_version,
+                    "FAKE_SERVER_IDENTITY": server_identity,
+                    "FAKE_TEAM_HUB_MODE": "disabled",
+                    "FAKE_TEAM_HUB_ID": "hub_client_cert_change_12345678",
+                    "FAKE_TEAM_HUB_CONNECTION_ID": "11111111-2222-4333-8444-555555555555",
+                    "FAKE_TEAM_HUB_HOST_SERVER_IDENTITY": "server_host_cert_change_12345678",
+                    "FAKE_SECURE_PEER_ACTIVE": "true",
+                    "FAKE_SECURE_PEER_CERTIFICATE_FINGERPRINT_AFTER_RESTART": (
+                        "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                    ),
+                    "REAL_PYTHON": sys.executable,
+                    "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(INSTALLER),
+                    "--non-interactive",
+                    "--port",
+                    "17850",
+                    "--expected-server-identity",
+                    server_identity,
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                (install_root / "current" / "VERSION").read_text().strip(),
+                self.release_version(),
+            )
+            self.assertNotIn("rolling back", result.stderr)
+
+    def test_managed_disabled_install_accepts_legacy_disabled_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_exact_health_uv(fake_bin)
+            self.write_json_health_curl(fake_bin)
+            self.write_event_systemctl(fake_bin)
+            server_identity = "server_legacy_disabled_12345678"
+            token = "preserved_token_abcdefghijklmnopqrstuvwxyz0123456789"
+            event_log = root / "events.log"
+            config_root = root / "config"
+            config_root.mkdir()
+            (config_root / "env").write_text(
+                f"AGENTSDOCK_AGENT_TOKEN={token}\n"
+                "AGENTSDOCK_AGENT_PORT=17850\n"
+                "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
+            )
+            environment.update(
+                {
+                    "FAKE_EVENT_LOG": str(event_log),
+                    "FAKE_HEALTH_VERSION": self.release_version(),
+                    "FAKE_SERVER_IDENTITY": server_identity,
+                    "FAKE_TEAM_HUB_MODE": "disabled",
+                    "FAKE_OMIT_SECURE_PEER_CAPABILITY_BEFORE_RESTART": "true",
+                    "FAKE_SECURE_PEER_ACTIVE": "false",
+                    "REAL_PYTHON": sys.executable,
+                    "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(INSTALLER),
+                    "--non-interactive",
+                    "--port",
+                    "17850",
+                    "--expected-server-identity",
+                    server_identity,
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                (install_root / "current" / "VERSION").read_text().strip(),
+                self.release_version(),
+            )
+            self.assertIn("Binding current Teamspace client state", result.stdout)
+
+    def test_managed_secure_peer_client_rejects_quarantined_candidate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_exact_health_uv(fake_bin)
+            self.write_json_health_curl(fake_bin)
+            self.write_event_systemctl(fake_bin)
+            old_version = "0.0.9"
+            self.prepare_managed_runtime_fixture(
+                install_root,
+                old_version=old_version,
+            )
+            server_identity = "server_client_quarantine_12345678"
+            token = "preserved_token_abcdefghijklmnopqrstuvwxyz0123456789"
+            event_log = root / "events.log"
+            config_root = root / "config"
+            config_root.mkdir()
+            (config_root / "env").write_text(
+                f"AGENTSDOCK_AGENT_TOKEN={token}\n"
+                "AGENTSDOCK_AGENT_PORT=17850\n"
+                "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
+            )
+            environment.update(
+                {
+                    "FAKE_EVENT_LOG": str(event_log),
+                    "FAKE_HEALTH_VERSION": self.release_version(),
+                    "FAKE_HEALTH_VERSION_AFTER_RESTORE": old_version,
+                    "FAKE_SERVER_IDENTITY": server_identity,
+                    "FAKE_TEAM_HUB_MODE": "disabled",
+                    "FAKE_TEAM_HUB_ID": "hub_client_quarantine_12345678",
+                    "FAKE_TEAM_HUB_CONNECTION_ID": "11111111-2222-4333-8444-555555555555",
+                    "FAKE_TEAM_HUB_HOST_SERVER_IDENTITY": "server_host_quarantine_12345678",
+                    "FAKE_SECURE_PEER_ACTIVE": "true",
+                    "FAKE_SECURE_PEER_STATE_AVAILABLE_AFTER_RESTART": "false",
+                    "REAL_PYTHON": sys.executable,
+                    "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(INSTALLER),
+                    "--non-interactive",
+                    "--port",
+                    "17850",
+                    "--expected-server-identity",
+                    server_identity,
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("did not become healthy; rolling back", result.stderr)
+            self.assertIn("The previous release was restored", result.stderr)
+            self.assertTrue((install_root / "current" / "runtime-marker").is_file())
+
     def test_rendering_systemd_service_does_not_run_restart_from_comment(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2104,7 +3035,7 @@ exit 0
             self.assertNotIn("restart", calls)
             self.assertIn("synchronous systemctl restart", service)
 
-    def test_candidate_with_quarantined_secure_peer_state_is_not_accepted(self):
+    def test_quarantined_secure_peer_state_is_rejected_before_takeover(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
@@ -2147,7 +3078,10 @@ exit 0
             )
 
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("did not become healthy; rolling back", result.stderr)
+            self.assertIn(
+                "Could not bind the current authenticated Teamspace client",
+                result.stderr,
+            )
             self.assertTrue((install_root / "current" / "runtime-marker").is_file())
 
     def test_team_hub_tailscale_serve_transport_is_persisted_and_verified(self):
@@ -4524,39 +5458,204 @@ chmod 755 "$project/.venv/bin/python"
             """#!/bin/sh
 output=""
 want_output="false"
+want_header="false"
+peer_authorized="false"
+request_path=""
 for argument in "$@"; do
   if [ "$want_output" = "true" ]; then
     output="$argument"
     want_output="false"
     continue
   fi
+  if [ "$want_header" = "true" ]; then
+    case "$argument" in
+      "X-AgentsDock-Token: "*) peer_authorized="true" ;;
+    esac
+    want_header="false"
+    continue
+  fi
   case "$argument" in
     --version) exit 0 ;;
     --output) want_output="true" ;;
+    -H|--header) want_header="true" ;;
+    http://127.0.0.1:*) request_path="$argument" ;;
   esac
 done
 if [ -n "$output" ]; then
   health_version="$FAKE_HEALTH_VERSION"
   health_server_identity="$FAKE_SERVER_IDENTITY"
   health_hub_id="$FAKE_TEAM_HUB_ID"
+  health_team_hub_mode="${FAKE_TEAM_HUB_MODE:-disabled}"
+  health_connection_id="${FAKE_TEAM_HUB_CONNECTION_ID:-11111111-2222-4333-8444-555555555555}"
+  health_host_server_identity="${FAKE_TEAM_HUB_HOST_SERVER_IDENTITY:-host_server_test_12345678}"
   health_secure_state_available="${FAKE_SECURE_PEER_STATE_AVAILABLE:-true}"
+  omit_secure_peer_capability="${FAKE_OMIT_SECURE_PEER_CAPABILITY:-false}"
+  peer_active="${FAKE_SECURE_PEER_ACTIVE:-}"
+  peer_pairing_id="${FAKE_SECURE_PEER_PAIRING_ID:-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee}"
+  peer_team_id="${FAKE_SECURE_PEER_TEAM_ID:-team_client_12345678}"
+  peer_host_ca_fingerprint="${FAKE_SECURE_PEER_HOST_CA_FINGERPRINT:-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
+  peer_public_key_fingerprint="${FAKE_SECURE_PEER_PUBLIC_KEY_FINGERPRINT:-sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}"
+  peer_certificate_fingerprint="${FAKE_SECURE_PEER_CERTIFICATE_FINGERPRINT:-sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc}"
+  peer_transcript_hash="${FAKE_SECURE_PEER_TRANSCRIPT_HASH:-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd}"
+  peer_requested_scopes="${FAKE_SECURE_PEER_REQUESTED_SCOPES:-[\\\"teamspace.read\\\",\\\"teamspace.write\\\"]}"
+  peer_granted_scopes="${FAKE_SECURE_PEER_GRANTED_SCOPES:-[\\\"teamspace.read\\\",\\\"teamspace.write\\\"]}"
+  peer_transport_state="${FAKE_SECURE_PEER_TRANSPORT_STATE:-online}"
+  peer_status_version="${FAKE_SECURE_PEER_STATUS_VERSION:-2}"
+  peer_extra_approved="${FAKE_SECURE_PEER_EXTRA_APPROVED:-false}"
+  peer_active_connection="${FAKE_SECURE_PEER_ACTIVE_CONNECTION:-true}"
+  peer_pending="${FAKE_SECURE_PEER_PENDING:-false}"
   after_restore="false"
   if [ -n "${FAKE_EVENT_LOG:-}" ]; then
-    printf 'health\n' >> "$FAKE_EVENT_LOG"
-    if grep -q '^restore:' "$FAKE_EVENT_LOG"; then
+    case "$request_path" in
+      */api/admin/secure-peers/v1/status) printf 'peer-status\n' >> "$FAKE_EVENT_LOG" ;;
+      *) printf 'health\n' >> "$FAKE_EVENT_LOG" ;;
+    esac
+    restart_count="$(grep -c '^systemctl:--user restart agents-server.service$' "$FAKE_EVENT_LOG" || true)"
+    if grep -q '^restore:' "$FAKE_EVENT_LOG" || [ "$restart_count" -ge 2 ]; then
       after_restore="true"
       health_version="${FAKE_HEALTH_VERSION_AFTER_RESTORE:-$health_version}"
       health_server_identity="${FAKE_SERVER_IDENTITY_AFTER_RESTORE:-$health_server_identity}"
       health_hub_id="${FAKE_TEAM_HUB_ID_AFTER_RESTORE:-$health_hub_id}"
       health_secure_state_available="${FAKE_SECURE_PEER_STATE_AVAILABLE_AFTER_RESTORE:-$health_secure_state_available}"
+      health_team_hub_mode="${FAKE_TEAM_HUB_MODE_AFTER_RESTORE:-$health_team_hub_mode}"
+      health_connection_id="${FAKE_TEAM_HUB_CONNECTION_ID_AFTER_RESTORE:-$health_connection_id}"
+      health_host_server_identity="${FAKE_TEAM_HUB_HOST_SERVER_IDENTITY_AFTER_RESTORE:-$health_host_server_identity}"
+      omit_secure_peer_capability="${FAKE_OMIT_SECURE_PEER_CAPABILITY_AFTER_RESTORE:-$omit_secure_peer_capability}"
+      peer_active="${FAKE_SECURE_PEER_ACTIVE_AFTER_RESTORE:-$peer_active}"
+      peer_pairing_id="${FAKE_SECURE_PEER_PAIRING_ID_AFTER_RESTORE:-$peer_pairing_id}"
+      peer_team_id="${FAKE_SECURE_PEER_TEAM_ID_AFTER_RESTORE:-$peer_team_id}"
+      peer_host_ca_fingerprint="${FAKE_SECURE_PEER_HOST_CA_FINGERPRINT_AFTER_RESTORE:-$peer_host_ca_fingerprint}"
+      peer_public_key_fingerprint="${FAKE_SECURE_PEER_PUBLIC_KEY_FINGERPRINT_AFTER_RESTORE:-$peer_public_key_fingerprint}"
+      peer_certificate_fingerprint="${FAKE_SECURE_PEER_CERTIFICATE_FINGERPRINT_AFTER_RESTORE:-$peer_certificate_fingerprint}"
+      peer_transcript_hash="${FAKE_SECURE_PEER_TRANSCRIPT_HASH_AFTER_RESTORE:-$peer_transcript_hash}"
+      peer_requested_scopes="${FAKE_SECURE_PEER_REQUESTED_SCOPES_AFTER_RESTORE:-$peer_requested_scopes}"
+      peer_granted_scopes="${FAKE_SECURE_PEER_GRANTED_SCOPES_AFTER_RESTORE:-$peer_granted_scopes}"
+      peer_transport_state="${FAKE_SECURE_PEER_TRANSPORT_STATE_AFTER_RESTORE:-$peer_transport_state}"
+      peer_status_version="${FAKE_SECURE_PEER_STATUS_VERSION_AFTER_RESTORE:-$peer_status_version}"
+      peer_extra_approved="${FAKE_SECURE_PEER_EXTRA_APPROVED_AFTER_RESTORE:-$peer_extra_approved}"
+      peer_active_connection="${FAKE_SECURE_PEER_ACTIVE_CONNECTION_AFTER_RESTORE:-$peer_active_connection}"
+    elif grep -q '^systemctl:--user restart agents-server.service$' "$FAKE_EVENT_LOG"; then
+      health_team_hub_mode="${FAKE_TEAM_HUB_MODE_AFTER_RESTART:-$health_team_hub_mode}"
+      health_connection_id="${FAKE_TEAM_HUB_CONNECTION_ID_AFTER_RESTART:-$health_connection_id}"
+      health_hub_id="${FAKE_TEAM_HUB_ID_AFTER_RESTART:-$health_hub_id}"
+      health_host_server_identity="${FAKE_TEAM_HUB_HOST_SERVER_IDENTITY_AFTER_RESTART:-$health_host_server_identity}"
+      health_secure_state_available="${FAKE_SECURE_PEER_STATE_AVAILABLE_AFTER_RESTART:-$health_secure_state_available}"
+      omit_secure_peer_capability="${FAKE_OMIT_SECURE_PEER_CAPABILITY_AFTER_RESTART:-$omit_secure_peer_capability}"
+      peer_active="${FAKE_SECURE_PEER_ACTIVE_AFTER_RESTART:-$peer_active}"
+      peer_pairing_id="${FAKE_SECURE_PEER_PAIRING_ID_AFTER_RESTART:-$peer_pairing_id}"
+      peer_team_id="${FAKE_SECURE_PEER_TEAM_ID_AFTER_RESTART:-$peer_team_id}"
+      peer_host_ca_fingerprint="${FAKE_SECURE_PEER_HOST_CA_FINGERPRINT_AFTER_RESTART:-$peer_host_ca_fingerprint}"
+      peer_public_key_fingerprint="${FAKE_SECURE_PEER_PUBLIC_KEY_FINGERPRINT_AFTER_RESTART:-$peer_public_key_fingerprint}"
+      peer_certificate_fingerprint="${FAKE_SECURE_PEER_CERTIFICATE_FINGERPRINT_AFTER_RESTART:-$peer_certificate_fingerprint}"
+      peer_transcript_hash="${FAKE_SECURE_PEER_TRANSCRIPT_HASH_AFTER_RESTART:-$peer_transcript_hash}"
+      peer_requested_scopes="${FAKE_SECURE_PEER_REQUESTED_SCOPES_AFTER_RESTART:-$peer_requested_scopes}"
+      peer_granted_scopes="${FAKE_SECURE_PEER_GRANTED_SCOPES_AFTER_RESTART:-$peer_granted_scopes}"
+      peer_transport_state="${FAKE_SECURE_PEER_TRANSPORT_STATE_AFTER_RESTART:-$peer_transport_state}"
+      peer_status_version="${FAKE_SECURE_PEER_STATUS_VERSION_AFTER_RESTART:-$peer_status_version}"
+      peer_extra_approved="${FAKE_SECURE_PEER_EXTRA_APPROVED_AFTER_RESTART:-$peer_extra_approved}"
+      peer_active_connection="${FAKE_SECURE_PEER_ACTIVE_CONNECTION_AFTER_RESTART:-$peer_active_connection}"
+    else
+      health_team_hub_mode="${FAKE_TEAM_HUB_MODE_BEFORE_RESTART:-$health_team_hub_mode}"
+      health_connection_id="${FAKE_TEAM_HUB_CONNECTION_ID_BEFORE_RESTART:-$health_connection_id}"
+      health_hub_id="${FAKE_TEAM_HUB_ID_BEFORE_RESTART:-$health_hub_id}"
+      health_host_server_identity="${FAKE_TEAM_HUB_HOST_SERVER_IDENTITY_BEFORE_RESTART:-$health_host_server_identity}"
+      health_secure_state_available="${FAKE_SECURE_PEER_STATE_AVAILABLE_BEFORE_RESTART:-$health_secure_state_available}"
+      omit_secure_peer_capability="${FAKE_OMIT_SECURE_PEER_CAPABILITY_BEFORE_RESTART:-$omit_secure_peer_capability}"
+      peer_active="${FAKE_SECURE_PEER_ACTIVE_BEFORE_RESTART:-$peer_active}"
+      peer_pairing_id="${FAKE_SECURE_PEER_PAIRING_ID_BEFORE_RESTART:-$peer_pairing_id}"
+      peer_team_id="${FAKE_SECURE_PEER_TEAM_ID_BEFORE_RESTART:-$peer_team_id}"
+      peer_host_ca_fingerprint="${FAKE_SECURE_PEER_HOST_CA_FINGERPRINT_BEFORE_RESTART:-$peer_host_ca_fingerprint}"
+      peer_public_key_fingerprint="${FAKE_SECURE_PEER_PUBLIC_KEY_FINGERPRINT_BEFORE_RESTART:-$peer_public_key_fingerprint}"
+      peer_certificate_fingerprint="${FAKE_SECURE_PEER_CERTIFICATE_FINGERPRINT_BEFORE_RESTART:-$peer_certificate_fingerprint}"
+      peer_transcript_hash="${FAKE_SECURE_PEER_TRANSCRIPT_HASH_BEFORE_RESTART:-$peer_transcript_hash}"
+      peer_requested_scopes="${FAKE_SECURE_PEER_REQUESTED_SCOPES_BEFORE_RESTART:-$peer_requested_scopes}"
+      peer_granted_scopes="${FAKE_SECURE_PEER_GRANTED_SCOPES_BEFORE_RESTART:-$peer_granted_scopes}"
+      peer_transport_state="${FAKE_SECURE_PEER_TRANSPORT_STATE_BEFORE_RESTART:-$peer_transport_state}"
+      peer_status_version="${FAKE_SECURE_PEER_STATUS_VERSION_BEFORE_RESTART:-$peer_status_version}"
+      peer_extra_approved="${FAKE_SECURE_PEER_EXTRA_APPROVED_BEFORE_RESTART:-$peer_extra_approved}"
+      peer_active_connection="${FAKE_SECURE_PEER_ACTIVE_CONNECTION_BEFORE_RESTART:-$peer_active_connection}"
     fi
   fi
+  if [ -z "$peer_active" ]; then
+    if [ "$health_team_hub_mode" = "client" ]; then
+      peer_active="true"
+    else
+      peer_active="false"
+    fi
+  fi
+  case "$request_path" in
+    */api/admin/secure-peers/v1/status)
+      [ "$peer_authorized" = "true" ] || exit 96
+      if [ "$peer_active" = "true" ]; then
+        if [ "$peer_active_connection" = "true" ]; then
+          peer_active_connection_json="\\\"$health_connection_id\\\""
+          peer_pairing_status="connected"
+          peer_effective_transport_state="$peer_transport_state"
+          peer_base_path_json="\\\"/api/team-hub-secure/$health_connection_id\\\""
+        elif [ "$peer_active_connection" = "false" ]; then
+          peer_active_connection_json="null"
+          peer_pairing_status="approved"
+          peer_effective_transport_state="disconnected"
+          peer_base_path_json="null"
+        else
+          exit 91
+        fi
+        peer_extra_json=""
+        case "$peer_extra_approved:$peer_status_version" in
+          true:1)
+            peer_extra_json=',{"id":"bbbbbbbb-cccc-4ddd-8eee-ffffffffffff","direction":"outgoing","status":"approved","peer_server_identity":"server_secondary_host_12345678","host_server_identity":"server_secondary_host_12345678","hub_id":"hub_secondary_12345678","team_id":"team_secondary_12345678","connection_id":"66666666-7777-4888-8999-aaaaaaaaaaaa","host_ca_fingerprint":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","peer_public_key_fingerprint":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","certificate_fingerprint":"sha256:1111111111111111111111111111111111111111111111111111111111111111","transcript_hash":"2222222222222222222222222222222222222222222222222222222222222222","requested_scopes":["teamspace.read"],"granted_scopes":["teamspace.read"],"local_proxy_base_path":null}'
+            ;;
+          true:2)
+            peer_extra_json=',{"id":"bbbbbbbb-cccc-4ddd-8eee-ffffffffffff","direction":"outgoing","status":"approved","trust_state":"approved","transport_state":"disconnected","peer_server_identity":"server_secondary_host_12345678","host_server_identity":"server_secondary_host_12345678","hub_id":"hub_secondary_12345678","team_id":"team_secondary_12345678","connection_id":"66666666-7777-4888-8999-aaaaaaaaaaaa","host_ca_fingerprint":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","peer_public_key_fingerprint":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","certificate_fingerprint":"sha256:1111111111111111111111111111111111111111111111111111111111111111","transcript_hash":"2222222222222222222222222222222222222222222222222222222222222222","requested_scopes":["teamspace.read"],"granted_scopes":["teamspace.read"],"local_proxy_base_path":null}'
+            ;;
+          false:1|false:2) ;;
+          *) exit 92 ;;
+        esac
+        peer_pending_json=""
+        case "$peer_pending:$peer_status_version" in
+          true:1)
+            peer_pending_json=',{"id":"cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa","direction":"outgoing","status":"pending_approval","connection_id":"77777777-8888-4999-8aaa-bbbbbbbbbbbb"}'
+            ;;
+          true:2)
+            peer_pending_json=',{"id":"cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa","direction":"outgoing","status":"pending_approval","trust_state":"pending","transport_state":"disconnected","connection_id":"77777777-8888-4999-8aaa-bbbbbbbbbbbb"}'
+            ;;
+          false:1|false:2) ;;
+          *) exit 90 ;;
+        esac
+        if [ "$peer_status_version" = "1" ]; then
+          cat > "$output" <<EOF
+{"version":1,"server_identity":"$health_server_identity","server_instance_id":"instance_test_12345678","active_connection_id":$peer_active_connection_json,"host":{"available":false,"enabled":false},"pairings":[{"id":"$peer_pairing_id","direction":"outgoing","status":"$peer_pairing_status","peer_server_identity":"$health_host_server_identity","host_server_identity":"$health_host_server_identity","hub_id":"$health_hub_id","team_id":"$peer_team_id","connection_id":"$health_connection_id","host_ca_fingerprint":"$peer_host_ca_fingerprint","peer_public_key_fingerprint":"$peer_public_key_fingerprint","certificate_fingerprint":"$peer_certificate_fingerprint","transcript_hash":"$peer_transcript_hash","requested_scopes":$peer_requested_scopes,"granted_scopes":$peer_granted_scopes,"local_proxy_base_path":$peer_base_path_json}$peer_extra_json$peer_pending_json],"remote_routes":[],"published_routes":[],"remote_route_delivery_available":false,"connection_error":null}
+EOF
+        elif [ "$peer_status_version" = "2" ]; then
+          cat > "$output" <<EOF
+{"version":2,"heartbeat_interval_seconds":30,"lease_seconds":90,"server_identity":"$health_server_identity","server_instance_id":"instance_test_12345678","active_connection_id":$peer_active_connection_json,"host":{"available":false,"enabled":false,"listen_port":7851,"advertised_host":null,"advertised_hosts":[],"ca_fingerprint":null,"pairing_link":null,"certificate_expires_at":null,"error":null,"error_code":null,"action":null},"pairings":[{"id":"$peer_pairing_id","direction":"outgoing","status":"$peer_pairing_status","trust_state":"approved","transport_state":"$peer_effective_transport_state","peer_server_identity":"$health_host_server_identity","host_server_identity":"$health_host_server_identity","hub_id":"$health_hub_id","team_id":"$peer_team_id","connection_id":"$health_connection_id","host_ca_fingerprint":"$peer_host_ca_fingerprint","peer_public_key_fingerprint":"$peer_public_key_fingerprint","certificate_fingerprint":"$peer_certificate_fingerprint","transcript_hash":"$peer_transcript_hash","requested_scopes":$peer_requested_scopes,"granted_scopes":$peer_granted_scopes,"local_proxy_base_path":$peer_base_path_json}$peer_extra_json$peer_pending_json],"remote_routes":[],"published_routes":[],"remote_route_delivery_available":false,"connection_error":null,"delivery_error":null}
+EOF
+        else
+          exit 93
+        fi
+      elif [ "$peer_active" = "false" ]; then
+        cat > "$output" <<EOF
+{"version":$peer_status_version,"heartbeat_interval_seconds":30,"lease_seconds":90,"server_identity":"$health_server_identity","server_instance_id":"instance_test_12345678","active_connection_id":null,"host":{"available":false,"enabled":false,"listen_port":7851,"advertised_host":null,"advertised_hosts":[],"ca_fingerprint":null,"pairing_link":null,"certificate_expires_at":null,"error":null,"error_code":null,"action":null},"pairings":[],"remote_routes":[],"published_routes":[],"remote_route_delivery_available":false,"connection_error":null,"delivery_error":null}
+EOF
+      else
+        exit 95
+      fi
+      exit 0
+      ;;
+  esac
   case "$health_secure_state_available" in
     true) health_secure_state_error_code="null" ;;
     false) health_secure_state_error_code='"secure_peer_state_unavailable"' ;;
     *) exit 97 ;;
   esac
-  if [ "${FAKE_TEAM_HUB_MODE:-disabled}" = "host" ]; then
+  if [ "$omit_secure_peer_capability" = "true" ]; then
+    health_secure_capability=""
+  elif [ "$omit_secure_peer_capability" = "false" ]; then
+    health_secure_capability=',"secure_peer_v1":{"available":true,"state_available":'"$health_secure_state_available"',"state_error_code":'"$health_secure_state_error_code"',"required":false,"version":1,"control_path":"/api/admin/secure-peers/v1/status","proxy_prefix":"/api/team-hub-secure"}'
+  else
+    exit 94
+  fi
+  if [ "$health_team_hub_mode" = "host" ]; then
     health_transport="${FAKE_TEAM_HUB_TRANSPORT:-loopback}"
     health_url="${FAKE_TEAM_HUB_URL:-}"
     health_direct_ip_url="${FAKE_TEAM_HUB_DIRECT_IP_URL:-}"
@@ -4575,11 +5674,16 @@ if [ -n "$output" ]; then
       health_routes="[{\\\"transport\\\":\\\"$health_transport\\\",\\\"hub_url\\\":$health_hub_url},{\\\"transport\\\":\\\"direct_ip\\\",\\\"hub_url\\\":\\\"$health_direct_ip_url\\\"}]"
     fi
     cat > "$output" <<EOF
-{"ok":true,"server_version":"$health_version","server_identity":"$health_server_identity","capabilities":{"team_hub_v1":{"available":true,"designated_host":true,"version":1,"base_path":"/api/team-hub","hub_id":"$health_hub_id","host_server_identity":"$health_server_identity","transport":"$health_transport","hub_url":$health_hub_url,"routes":$health_routes},"secure_peer_v1":{"available":true,"state_available":$health_secure_state_available,"state_error_code":$health_secure_state_error_code,"required":false,"version":1,"control_path":"/api/admin/secure-peers/v1/status","proxy_prefix":"/api/team-hub-secure"}}}
+{"ok":true,"server_version":"$health_version","server_identity":"$health_server_identity","capabilities":{"team_hub_v1":{"available":true,"designated_host":true,"version":1,"base_path":"/api/team-hub","hub_id":"$health_hub_id","host_server_identity":"$health_server_identity","transport":"$health_transport","hub_url":$health_hub_url,"routes":$health_routes}$health_secure_capability}}
+EOF
+  elif [ "$health_team_hub_mode" = "client" ]; then
+    health_base_path="/api/team-hub-secure/$health_connection_id"
+    cat > "$output" <<EOF
+{"ok":true,"server_version":"$health_version","server_identity":"$health_server_identity","capabilities":{"team_hub_v1":{"available":true,"designated_host":false,"version":1,"base_path":"$health_base_path","hub_id":"$health_hub_id","host_server_identity":"$health_host_server_identity","connection_id":"$health_connection_id","transport":"secure_peer","hub_url":null,"routes":[{"transport":"secure_peer","hub_url":null,"base_path":"$health_base_path","connection_id":"$health_connection_id","host_server_identity":"$health_host_server_identity","hub_id":"$health_hub_id"}]}$health_secure_capability}}
 EOF
   else
     cat > "$output" <<EOF
-{"ok":true,"server_version":"$health_version","server_identity":"$health_server_identity","capabilities":{"team_hub_v1":{"available":false,"designated_host":false,"version":1,"base_path":null,"hub_id":null,"host_server_identity":null,"transport":null,"hub_url":null,"routes":[]},"secure_peer_v1":{"available":true,"state_available":$health_secure_state_available,"state_error_code":$health_secure_state_error_code,"required":false,"version":1,"control_path":"/api/admin/secure-peers/v1/status","proxy_prefix":"/api/team-hub-secure"}}}
+{"ok":true,"server_version":"$health_version","server_identity":"$health_server_identity","capabilities":{"team_hub_v1":{"available":false,"designated_host":false,"version":1,"base_path":null,"hub_id":null,"host_server_identity":null,"transport":null,"hub_url":null,"routes":[]}$health_secure_capability}}
 EOF
   fi
 fi

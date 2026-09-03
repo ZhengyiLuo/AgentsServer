@@ -259,7 +259,7 @@ class InstallerContractTests(unittest.TestCase):
             )
             events = root / "systemctl.log"
             stopped = root / "stopped"
-            self.write_fake_uv(fake_bin)
+            self.write_exact_health_uv(fake_bin)
             self.write_json_health_curl(fake_bin)
             self.write_executable(fake_bin / "sleep", "#!/bin/sh\nexit 0\n")
             self.write_executable(
@@ -326,7 +326,7 @@ exit 0
             )
             events = root / "systemctl.log"
             count = root / "show-count"
-            self.write_fake_uv(fake_bin)
+            self.write_exact_health_uv(fake_bin)
             self.write_json_health_curl(fake_bin)
             self.write_executable(fake_bin / "sleep", "#!/bin/sh\nexit 0\n")
             self.write_executable(

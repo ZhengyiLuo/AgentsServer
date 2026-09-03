@@ -541,7 +541,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                     "provider contexts."
                 ),
                 "action": None,
-                "version": 5,
+                "version": 6,
                 "context_modes": ["chat", "standalone"],
                 "default_context_mode": "chat",
                 "features": {
@@ -549,6 +549,8 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                     "direct_message_mentions": False,
                     "route_mentions": True,
                     "route_hint_mentions": True,
+                    "next_run_reset": True,
+                    "interval_next_run_reanchors": True,
                 },
             },
         )

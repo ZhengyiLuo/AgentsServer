@@ -24,6 +24,7 @@ from agentsdock_team_hub.store import HubError, HubStore
 
 
 TEAM_HUB_MOUNT_PATH = "/api/team-hub"
+TEAM_HUB_SERVER_SESSION_MOUNT_PATH = "/api/team-hub-server"
 TEAM_HUB_CAPABILITY_VERSION = 1
 TEAM_HUB_MODE_DISABLED = "disabled"
 TEAM_HUB_MODE_HOST = "host"
@@ -392,6 +393,21 @@ class ManagedTeamHubHost:
                 else "Wait for the designated Team Hub to finish starting."
             ),
         }
+
+    def server_session_available(self) -> bool:
+        """Return whether this exact managed host can expose its shared session."""
+
+        with self._guard:
+            store = self._store if self._accepting else None
+        if store is None or not self.server_identity:
+            return False
+        try:
+            if not bool(store.health().get("bootstrapped")):
+                return False
+            store.managed_server_claims()
+            return True
+        except Exception:
+            return False
 
     def tailscale_serve_identity(
         self,

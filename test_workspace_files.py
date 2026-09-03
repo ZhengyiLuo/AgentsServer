@@ -1475,6 +1475,34 @@ class WorkspaceFilesTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertIn(":(icase,glob)**/*policy_runner*", command)
 
+    def test_search_falls_back_when_git_index_omits_visible_ignored_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(
+                ["git", "init", "--quiet", str(root)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            (root / ".gitignore").write_text("outputs/\n")
+            target = root / "outputs" / "g1_thor_result.json"
+            target.parent.mkdir()
+            target.write_text("{}\n")
+            with patch.object(
+                agent_server.STORE,
+                "sessions",
+                {"session-1": self.session(root)},
+            ):
+                result = agent_server.search_workspace_files_sync(
+                    "session-1", "g1_thor", 20
+                )
+
+        self.assertEqual(
+            [item["path"] for item in result["entries"]],
+            ["outputs/g1_thor_result.json"],
+        )
+        self.assertFalse(result["truncated"])
+
     def test_empty_search_reports_truncation_and_posix_backslashes_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

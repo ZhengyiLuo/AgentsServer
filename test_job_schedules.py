@@ -1346,6 +1346,77 @@ class JobStoreTests(unittest.IsolatedAsyncioTestCase):
 
         run_job.assert_not_awaited()
 
+    async def test_scheduler_does_not_defer_over_a_schedule_edit_during_blocker_check(
+        self,
+    ) -> None:
+        store = agent_server.JobStore()
+        session_id = "sess_schedule_edit_race"
+        original_revision = agent_server.new_job_revision()
+        store.jobs["job_due"] = {
+            "id": "job_due",
+            "session_id": session_id,
+            "title": "Due before edit",
+            "prompt": "Do not overwrite the edit",
+            "schedule_kind": "interval",
+            "interval_seconds": 60,
+            "timezone": "UTC",
+            "schedule_start_at": 1.0,
+            "enabled": True,
+            "loop": True,
+            "max_runs": None,
+            "run_count": 0,
+            "next_run_at": 1.0,
+            "scheduled_run_at": 1.0,
+            "_revision": original_revision,
+        }
+        sleep_count = 0
+
+        async def one_scheduler_iteration(_delay: float) -> None:
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count > 1:
+                raise asyncio.CancelledError
+
+        async def edit_while_checking(_session_id: str) -> str:
+            await store.update("job_due", {"next_run_at": "100"})
+            return "chat already has a running turn"
+
+        events = AsyncMock()
+        with (
+            patch.object(agent_server.STORE, "sessions", {
+                session_id: {"id": session_id, "archived": False},
+            }),
+            patch.object(agent_server.time, "time", return_value=2.0),
+            patch.object(
+                agent_server.asyncio,
+                "sleep",
+                side_effect=one_scheduler_iteration,
+            ),
+            patch.object(
+                agent_server,
+                "scheduled_job_blocker",
+                side_effect=edit_while_checking,
+            ),
+            patch.object(store, "save", new_callable=AsyncMock),
+            patch.object(store, "run_job", new_callable=AsyncMock) as run_job,
+            patch.object(agent_server, "append_event", events),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await store.scheduler_loop()
+
+        current = store.jobs["job_due"]
+        self.assertEqual(current["schedule_start_at"], 100.0)
+        self.assertEqual(current["next_run_at"], 100.0)
+        self.assertEqual(current["scheduled_run_at"], 100.0)
+        self.assertNotEqual(current["_revision"], original_revision)
+        self.assertNotIn("last_deferred_at", current)
+        self.assertNotIn("last_defer_reason", current)
+        self.assertNotIn(
+            "job_deferred",
+            [call.args[1] for call in events.await_args_list],
+        )
+        run_job.assert_not_awaited()
+
     async def test_scheduler_treats_a_late_archive_rejection_as_a_pause(
         self,
     ) -> None:
@@ -2138,6 +2209,219 @@ class JobStoreTests(unittest.IsolatedAsyncioTestCase):
             updated = await store.update("job_interval", {"title": "Renamed", "timezone": None})
         self.assertEqual(updated["schedule_start_at"], 1000.0)
         self.assertEqual(updated["next_run_at"], 4600.0)
+
+    async def test_explicit_interval_next_run_reanchors_recurring_cadence(self) -> None:
+        store = agent_server.JobStore()
+        selected_run = 10_000.0
+        store.jobs["job_interval"] = {
+            "id": "job_interval",
+            "session_id": "sess_owner",
+            "title": "Daily",
+            "prompt": "Check",
+            "schedule_kind": "interval",
+            "interval_seconds": 86_400,
+            "cron_expression": None,
+            "rrule": None,
+            "timezone": "UTC",
+            "schedule_start_at": 1_000.0,
+            "scheduled_run_at": 2_000.0,
+            "next_run_at": 2_000.0,
+            "enabled": True,
+            "loop": True,
+            "max_runs": None,
+            "run_count": 0,
+        }
+        with patch.object(store, "save", new_callable=AsyncMock), \
+                patch.object(agent_server, "append_event", new_callable=AsyncMock), \
+                patch.object(agent_server.time, "time", return_value=5_000.0):
+            updated = await store.update(
+                "job_interval",
+                {"next_run_at": str(selected_run)},
+            )
+
+        self.assertEqual(updated["schedule_start_at"], selected_run)
+        self.assertEqual(updated["scheduled_run_at"], selected_run)
+        self.assertEqual(updated["next_run_at"], selected_run)
+
+        with patch.object(store, "save", new_callable=AsyncMock), \
+                patch.object(agent_server.time, "time", return_value=selected_run + 1):
+            await store.mark_ran("job_interval")
+
+        self.assertEqual(
+            store.jobs["job_interval"]["next_run_at"],
+            selected_run + 86_400,
+        )
+
+    async def test_explicit_interval_next_run_wins_over_duration_change(self) -> None:
+        store = agent_server.JobStore()
+        selected_run = 10_000.0
+        store.jobs["job_interval"] = {
+            "id": "job_interval",
+            "session_id": "sess_owner",
+            "title": "Hourly",
+            "prompt": "Check",
+            "schedule_kind": "interval",
+            "interval_seconds": 3_600,
+            "cron_expression": None,
+            "rrule": None,
+            "timezone": "UTC",
+            "schedule_start_at": 1_000.0,
+            "scheduled_run_at": 4_600.0,
+            "next_run_at": 4_600.0,
+            "enabled": True,
+            "loop": True,
+            "max_runs": None,
+            "run_count": 0,
+        }
+        with patch.object(store, "save", new_callable=AsyncMock), \
+                patch.object(agent_server, "append_event", new_callable=AsyncMock), \
+                patch.object(agent_server.time, "time", return_value=5_000.0):
+            updated = await store.update("job_interval", {
+                "interval_seconds": 7_200,
+                "next_run_at": str(selected_run),
+            })
+
+        self.assertEqual(updated["interval_seconds"], 7_200)
+        self.assertEqual(updated["schedule_start_at"], selected_run)
+        self.assertEqual(updated["next_run_at"], selected_run)
+
+    async def test_explicit_null_recomputes_calendar_next_match(self) -> None:
+        store = agent_server.JobStore()
+        now = timestamp("2026-07-21T08:15:00")
+        stale_override = timestamp("2026-07-21T12:34:00")
+        expected = timestamp("2026-07-21T09:00:00")
+        store.jobs["job_cron"] = {
+            "id": "job_cron",
+            "session_id": "sess_owner",
+            "title": "Daily",
+            "prompt": "Check",
+            "schedule_kind": "cron",
+            "interval_seconds": None,
+            "cron_expression": "0 9 * * *",
+            "rrule": None,
+            "timezone": "UTC",
+            "schedule_start_at": timestamp("2026-07-01T00:00:00"),
+            "scheduled_run_at": stale_override,
+            "next_run_at": stale_override,
+            "enabled": True,
+            "loop": True,
+            "max_runs": None,
+            "run_count": 0,
+        }
+        with patch.object(store, "save", new_callable=AsyncMock), \
+                patch.object(agent_server, "append_event", new_callable=AsyncMock), \
+                patch.object(agent_server.time, "time", return_value=now):
+            updated = await store.update("job_cron", {"next_run_at": None})
+
+        self.assertEqual(updated["next_run_at"], expected)
+        self.assertEqual(updated["scheduled_run_at"], expected)
+
+    async def test_cron_expression_update_recomputes_next_run(self) -> None:
+        store = agent_server.JobStore()
+        now = timestamp("2026-07-21T08:15:00")
+        expected = timestamp("2026-07-21T10:30:00")
+        store.jobs["job_cron"] = {
+            "id": "job_cron",
+            "session_id": "sess_owner",
+            "title": "Daily",
+            "prompt": "Check",
+            "schedule_kind": "cron",
+            "interval_seconds": None,
+            "cron_expression": "0 9 * * *",
+            "rrule": None,
+            "timezone": "UTC",
+            "schedule_start_at": timestamp("2026-07-01T00:00:00"),
+            "scheduled_run_at": timestamp("2026-07-21T09:00:00"),
+            "next_run_at": timestamp("2026-07-21T09:00:00"),
+            "enabled": True,
+            "loop": True,
+            "max_runs": None,
+            "run_count": 0,
+        }
+        with patch.object(store, "save", new_callable=AsyncMock), \
+                patch.object(agent_server, "append_event", new_callable=AsyncMock), \
+                patch.object(agent_server.time, "time", return_value=now):
+            updated = await store.update(
+                "job_cron",
+                {"cron_expression": "30 10 * * *"},
+            )
+
+        self.assertEqual(updated["cron_expression"], "30 10 * * *")
+        self.assertEqual(updated["next_run_at"], expected)
+        self.assertEqual(updated["scheduled_run_at"], expected)
+
+    async def test_explicit_cron_next_run_remains_a_one_off_override(self) -> None:
+        store = agent_server.JobStore()
+        now = timestamp("2026-07-21T08:15:00")
+        override = timestamp("2026-07-21T12:34:00")
+        expected_after_override = timestamp("2026-07-22T09:00:00")
+        original_anchor = timestamp("2026-07-01T00:00:00")
+        store.jobs["job_cron"] = {
+            "id": "job_cron",
+            "session_id": "sess_owner",
+            "title": "Daily",
+            "prompt": "Check",
+            "schedule_kind": "cron",
+            "interval_seconds": None,
+            "cron_expression": "0 9 * * *",
+            "rrule": None,
+            "timezone": "UTC",
+            "schedule_start_at": original_anchor,
+            "scheduled_run_at": timestamp("2026-07-21T09:00:00"),
+            "next_run_at": timestamp("2026-07-21T09:00:00"),
+            "enabled": True,
+            "loop": True,
+            "max_runs": None,
+            "run_count": 0,
+        }
+        with patch.object(store, "save", new_callable=AsyncMock), \
+                patch.object(agent_server, "append_event", new_callable=AsyncMock), \
+                patch.object(agent_server.time, "time", return_value=now):
+            updated = await store.update(
+                "job_cron",
+                {"next_run_at": str(override)},
+            )
+
+        self.assertEqual(updated["schedule_start_at"], original_anchor)
+        self.assertEqual(updated["next_run_at"], override)
+
+        with patch.object(store, "save", new_callable=AsyncMock), \
+                patch.object(agent_server.time, "time", return_value=override + 1):
+            await store.mark_ran("job_cron")
+
+        self.assertEqual(
+            store.jobs["job_cron"]["next_run_at"],
+            expected_after_override,
+        )
+
+    async def test_omitted_next_run_preserves_calendar_override(self) -> None:
+        store = agent_server.JobStore()
+        override = timestamp("2026-07-21T12:34:00")
+        store.jobs["job_cron"] = {
+            "id": "job_cron",
+            "session_id": "sess_owner",
+            "title": "Daily",
+            "prompt": "Check",
+            "schedule_kind": "cron",
+            "interval_seconds": None,
+            "cron_expression": "0 9 * * *",
+            "rrule": None,
+            "timezone": "UTC",
+            "schedule_start_at": timestamp("2026-07-01T00:00:00"),
+            "scheduled_run_at": override,
+            "next_run_at": override,
+            "enabled": True,
+            "loop": True,
+            "max_runs": None,
+            "run_count": 0,
+        }
+        with patch.object(store, "save", new_callable=AsyncMock), \
+                patch.object(agent_server, "append_event", new_callable=AsyncMock), \
+                patch.object(agent_server.time, "time", return_value=timestamp("2026-07-21T08:15:00")):
+            updated = await store.update("job_cron", {"title": "Renamed"})
+
+        self.assertEqual(updated["next_run_at"], override)
+        self.assertEqual(updated["scheduled_run_at"], override)
 
     async def test_schedule_kind_switch_preserves_finite_run_limit(self) -> None:
         store = agent_server.JobStore()

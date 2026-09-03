@@ -622,6 +622,152 @@ class TeamHubParentIntegrationTests(unittest.TestCase):
                 mount.app = original_mount
                 asyncio.run(runtime.shutdown())
 
+    def test_server_scoped_session_is_shared_through_the_authenticated_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = ManagedTeamHubHost(
+                mode=TEAM_HUB_MODE_HOST,
+                data_dir=Path(temporary) / "hub",
+                server_identity=HOST_ID,
+                allowed_hosts={"localhost", "127.0.0.1"},
+            )
+            runtime.initialize()
+            hub_mount = next(
+                route
+                for route in agent_server.app.routes
+                if getattr(route, "name", None) == "team-hub"
+            )
+            server_mount = next(
+                route
+                for route in agent_server.app.routes
+                if getattr(route, "name", None) == "team-hub-server-session"
+            )
+            original_hub_mount = hub_mount.app
+            original_server_mount = server_mount.app
+            hub_mount.app = runtime
+            server_mount.app = runtime
+            try:
+                with patch.object(agent_server, "TEAM_HUB_RUNTIME", runtime), \
+                     patch.object(agent_server, "AGENT_TOKEN", "agents-server-token"):
+                    client = TestClient(
+                        agent_server.app,
+                        base_url="http://localhost",
+                        client=("127.0.0.1", 41000),
+                    )
+                    proof = (
+                        runtime.data_dir / "bootstrap-owner.proof"
+                    ).read_text().strip()
+                    bootstrap = client.post(
+                        "/api/team-hub/v1/bootstrap/redeem",
+                        headers={"X-Team-Hub-Bootstrap-Proof": proof},
+                        json={
+                            "email": "owner@example.com",
+                            "display_name": "Owner",
+                            "device_label": "Studio",
+                        },
+                    )
+                    self.assertEqual(bootstrap.status_code, 200, bootstrap.text)
+
+                    headers = {"X-AgentsDock-Token": "agents-server-token"}
+                    health = client.get(
+                        "/api/team-hub-server/v1/health",
+                        headers=headers,
+                    )
+                    self.assertEqual(health.status_code, 200, health.text)
+                    self.assertTrue(health.json()["server_session_available"])
+                    first = client.get(
+                        "/api/team-hub-server/v1/server-session",
+                        headers=headers,
+                    )
+                    second = client.get(
+                        "/api/team-hub-server/v1/server-session",
+                        headers=headers,
+                    )
+                    self.assertEqual(first.status_code, 200, first.text)
+                    self.assertEqual(second.status_code, 200, second.text)
+                    self.assertEqual(
+                        first.json()["principal"]["id"],
+                        second.json()["principal"]["id"],
+                    )
+                    self.assertEqual(
+                        first.json()["teams"][0]["id"],
+                        second.json()["teams"][0]["id"],
+                    )
+
+                    for request_headers, expected in (
+                        ({}, 401),
+                        ({"X-AgentsDock-Token": "wrong"}, 401),
+                        ({**headers, "Origin": "https://evil.test"}, 403),
+                        ({**headers, "Cookie": "ambient=yes"}, 403),
+                    ):
+                        denied = client.get(
+                            "/api/team-hub-server/v1/server-session",
+                            headers=request_headers,
+                        )
+                        self.assertEqual(denied.status_code, expected, denied.text)
+
+                    bare = client.get(
+                        "/api/team-hub-server",
+                        headers=headers,
+                        follow_redirects=False,
+                    )
+                    self.assertEqual(bare.status_code, 404, bare.text)
+                    forbidden = client.post(
+                        "/api/team-hub-server/v1/sessions/refresh",
+                        headers=headers,
+                        json={"refresh_token": "not-a-device-credential"},
+                    )
+                    self.assertEqual(forbidden.status_code, 404, forbidden.text)
+                    direct = client.get("/api/team-hub/v1/server-session")
+                    self.assertEqual(direct.status_code, 404, direct.text)
+
+                    # A fresh client reaches this parent through the selected
+                    # AgentsServer address, which need not also be configured
+                    # as a direct Team Hub transport host. The authenticated
+                    # process-local mount accepts that authority while the
+                    # ordinary Hub mount keeps its strict Host allowlist.
+                    remote = TestClient(
+                        agent_server.app,
+                        base_url="http://100.73.184.23:7850",
+                        client=("100.73.184.24", 41001),
+                    )
+                    try:
+                        remote_session = remote.get(
+                            "/api/team-hub-server/v1/server-session",
+                            headers=headers,
+                        )
+                        self.assertEqual(
+                            remote_session.status_code,
+                            200,
+                            remote_session.text,
+                        )
+                        self.assertEqual(
+                            remote_session.json()["principal"]["id"],
+                            first.json()["principal"]["id"],
+                        )
+                        direct_remote = remote.get("/api/team-hub/v1/health")
+                        self.assertEqual(
+                            direct_remote.status_code,
+                            400,
+                            direct_remote.text,
+                        )
+                        self.assertEqual(
+                            direct_remote.json()["error"]["message"],
+                            "Invalid Host header",
+                        )
+                    finally:
+                        remote.close()
+
+                    capability = agent_server.current_team_hub_capability()
+                    self.assertEqual(
+                        capability["server_session_base_path"],
+                        "/api/team-hub-server",
+                    )
+                    client.close()
+            finally:
+                hub_mount.app = original_hub_mount
+                server_mount.app = original_server_mount
+                asyncio.run(runtime.shutdown())
+
 
 if __name__ == "__main__":
     unittest.main()

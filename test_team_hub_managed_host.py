@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -10,9 +11,14 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
+from fastapi.testclient import TestClient
+
 from agentsdock_team_hub.cli import main as cli_main
-from agentsdock_team_hub.service import create_app
-from agentsdock_team_hub.store import HubStore
+from agentsdock_team_hub.service import (
+    MANAGED_SERVER_SESSION_SCOPE_KEY,
+    create_app,
+)
+from agentsdock_team_hub.store import HubError, HubStore
 
 
 HOST_A = "server-host-a-12345678"
@@ -20,6 +26,288 @@ HOST_B = "server-host-b-12345678"
 
 
 class ManagedHostTests(unittest.TestCase):
+    def test_managed_server_mount_health_requires_issuable_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            application = create_app(
+                Path(temporary) / "hub",
+                managed_host_identity=HOST_A,
+                managed_server_instance_id="managed-instance-a",
+            )
+
+            async def managed_server_mount(scope, receive, send):
+                scoped = dict(scope)
+                scoped[MANAGED_SERVER_SESSION_SCOPE_KEY] = True
+                await application(scoped, receive, send)
+
+            store = application.state.store
+            with TestClient(managed_server_mount, base_url="http://localhost") as client:
+                health = client.get("/v1/health")
+                self.assertEqual(health.status_code, 200, health.text)
+                self.assertFalse(health.json()["server_session_available"])
+
+                proof = store.bootstrap_proof_path.read_text().strip()
+                store.bootstrap(
+                    proof,
+                    "owner@example.com",
+                    "Owner",
+                    "Owner Mac",
+                )
+                health = client.get("/v1/health")
+                self.assertEqual(health.status_code, 200, health.text)
+                self.assertTrue(health.json()["server_session_available"])
+
+                connection = store.connect()
+                try:
+                    connection.execute(
+                        """
+                        UPDATE memberships SET status='suspended'
+                        WHERE principal_id='service_managed_server'
+                        """
+                    )
+                finally:
+                    connection.close()
+                self.assertTrue(store.health()["bootstrapped"])
+                with self.assertRaises(HubError):
+                    store.managed_server_claims()
+
+                health = client.get("/v1/health")
+                self.assertEqual(health.status_code, 200, health.text)
+                self.assertFalse(health.json()["server_session_available"])
+
+    def test_managed_server_session_is_distinct_host_bound_and_write_capable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "hub"
+            store = HubStore(
+                data_dir,
+                managed_host_identity=HOST_A,
+                managed_server_instance_id="managed-instance-a",
+            )
+            with self.assertRaises(HubError) as unavailable:
+                store.managed_server_claims()
+            self.assertEqual(unavailable.exception.code, "server_session_unavailable")
+
+            proof = store.bootstrap_proof_path.read_text().strip()
+            owner_bundle = store.bootstrap(
+                proof,
+                "owner@example.com",
+                "Owner",
+                "Owner Mac",
+            )
+            team_id = owner_bundle["teams"][0]["id"]
+            claims = store.managed_server_claims()
+            local_mail_claims = store.local_agent_mail_claims(team_id)
+
+            self.assertEqual(claims.principal_id, "service_managed_server")
+            self.assertEqual(claims.auth_kind, "managed_server")
+            self.assertEqual(claims.team_id, team_id)
+            self.assertEqual(
+                claims.scopes,
+                frozenset({"teamspace.read", "teamspace.write"}),
+            )
+            self.assertNotEqual(claims.principal_id, local_mail_claims.principal_id)
+            self.assertNotEqual(claims.auth_kind, local_mail_claims.auth_kind)
+
+            session = store.session_snapshot(claims)
+            self.assertEqual(session["principal"]["id"], "service_managed_server")
+            self.assertEqual(session["principal"]["kind"], "service")
+            self.assertIsNone(session["principal"]["email"])
+            self.assertEqual(session["teams"][0]["role"], "automation")
+
+            network = store.get_network(claims, team_id)
+            host = next(server for server in network["servers"] if server["is_host"])
+            self.assertTrue(host["owned_by_caller"])
+            agent = store.register_network_agent(
+                claims,
+                team_id,
+                {
+                    "external_agent_id": "managed-server-agent",
+                    "backend": "codex",
+                    "display_name": "Managed server agent",
+                    "idempotency_key": "managed-server-agent-register-0001",
+                },
+            )["agent"]
+            sent = store.create_network_mailbox_item(
+                claims,
+                team_id,
+                {
+                    "to": {"kind": "server", "id": host["id"]},
+                    "from_agent_id": agent["id"],
+                    "body": "Managed server mailbox write",
+                    "body_format": "plain",
+                    "idempotency_key": "managed-server-mailbox-0001",
+                },
+            )
+            self.assertEqual(sent["item"]["from"]["kind"], "agent")
+            self.assertEqual(sent["item"]["from"]["id"], agent["id"])
+
+            bulletin = store.create_network_bulletin_post(
+                claims,
+                team_id,
+                {
+                    "body": "Managed server bulletin",
+                    "body_format": "plain",
+                    "reply_to_post_id": None,
+                    "idempotency_key": "managed-server-bulletin-0001",
+                },
+            )["post"]
+            self.assertEqual(bulletin["author"]["kind"], "server")
+            self.assertEqual(bulletin["author"]["id"], host["id"])
+
+            connection = store.connect()
+            try:
+                board_id = connection.execute(
+                    "SELECT channel_id FROM network_boards WHERE team_id=?",
+                    (team_id,),
+                ).fetchone()["channel_id"]
+                actor_rows = connection.execute(
+                    """
+                    SELECT p.kind,s.service_identifier,m.role,m.status
+                    FROM principals AS p
+                    JOIN service_accounts AS s ON s.principal_id=p.id
+                    JOIN memberships AS m ON m.principal_id=p.id
+                    WHERE p.id=? AND m.team_id=?
+                    """,
+                    (claims.principal_id, team_id),
+                ).fetchall()
+                self.assertEqual(
+                    [tuple(row) for row in actor_rows],
+                    [
+                        (
+                            "service",
+                            "agentsdock.team-hub.managed-server",
+                            "automation",
+                            "active",
+                        )
+                    ],
+                )
+                rate_subjects = {
+                    row["subject_key"]
+                    for row in connection.execute(
+                        "SELECT subject_key FROM rate_limit_buckets WHERE team_id=?",
+                        (team_id,),
+                    )
+                }
+                self.assertEqual(
+                    rate_subjects,
+                    {"managed-server:service_managed_server"},
+                )
+                host_principal_id = connection.execute(
+                    "SELECT principal_id FROM nodes WHERE id=?",
+                    (host["id"],),
+                ).fetchone()["principal_id"]
+                connection.execute(
+                    """
+                    INSERT INTO principals(
+                        id,kind,scope_team_id,display_name,status,
+                        created_at,updated_at
+                    ) VALUES (?,'service',NULL,?,'active',?,?)
+                    """,
+                    ("service_spoof_actor", "Spoof actor", 1_800_000_000, 1_800_000_000),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO service_accounts(
+                        principal_id,service_identifier,created_at
+                    ) VALUES (?,?,?)
+                    """,
+                    ("service_spoof_actor", "agentsdock.test.spoof", 1_800_000_000),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO memberships(
+                        id,team_id,principal_id,role,status,
+                        invited_by_principal_id,created_at,updated_at
+                    ) VALUES (?,?,?,'automation','active',NULL,?,?)
+                    """,
+                    (
+                        "membership_spoof_actor",
+                        team_id,
+                        "service_spoof_actor",
+                        1_800_000_000,
+                        1_800_000_000,
+                    ),
+                )
+                with self.assertRaisesRegex(
+                    sqlite3.IntegrityError,
+                    "network mailbox sender is not authorized",
+                ):
+                    connection.execute(
+                        """
+                        INSERT INTO network_mailbox_items(
+                            id,team_id,kind,sender_kind,sender_principal_id,
+                            sender_node_id,sender_agent_id,
+                            recipient_kind,recipient_principal_id,
+                            recipient_node_id,recipient_agent_id,
+                            root_request_item_id,body_format,body,
+                            idempotency_key,created_at,expires_at
+                        ) VALUES (?,?,'message','server',?,?,NULL,
+                                  'server',?,?,NULL,NULL,'plain',?,?,?,NULL)
+                        """,
+                        (
+                            "network_item_spoof_actor",
+                            team_id,
+                            "service_spoof_actor",
+                            host["id"],
+                            host_principal_id,
+                            host["id"],
+                            "spoof",
+                            hashlib.sha256(b"spoof").digest(),
+                            1_800_000_000,
+                        ),
+                    )
+            finally:
+                connection.close()
+
+            store.create_message(
+                claims,
+                str(board_id),
+                {
+                    "kind": "post",
+                    "body": "Managed server generic channel write",
+                    "body_format": "plain",
+                    "thread_root_message_id": None,
+                    "parent_message_id": None,
+                    "idempotency_key": "managed-server-channel-0001",
+                },
+            )
+
+            invalid_claims = (
+                replace(claims, principal_id="service_local_control"),
+                replace(claims, session_id="managed_server_session_wrong"),
+                replace(claims, jti="managed_server_wrong"),
+                replace(claims, scopes=frozenset({"teamspace.read"})),
+                replace(claims, peer_id="00000000-0000-4000-8000-000000000000"),
+                replace(claims, expires_at=0),
+                replace(claims, team_id="team_wrong"),
+            )
+            for invalid in invalid_claims:
+                with self.subTest(invalid=invalid):
+                    with self.assertRaises(HubError) as denied:
+                        store.session_snapshot(invalid)
+                    self.assertEqual(denied.exception.code, "authentication_required")
+
+            connection = store.connect()
+            try:
+                connection.execute(
+                    "UPDATE nodes SET status='offline' WHERE id=?",
+                    (host["id"],),
+                )
+            finally:
+                connection.close()
+            with self.assertRaises(HubError) as offline:
+                store.session_snapshot(claims)
+            self.assertEqual(offline.exception.code, "authentication_required")
+
+            reopened = HubStore(
+                data_dir,
+                managed_host_identity=HOST_A,
+                managed_server_instance_id="managed-instance-b",
+            )
+            self.assertEqual(
+                reopened.managed_server_claims().principal_id,
+                "service_managed_server",
+            )
+
     @staticmethod
     def downgrade_database_to_schema5(database_path: Path) -> None:
         connection = sqlite3.connect(database_path, isolation_level=None)
@@ -389,7 +677,7 @@ class ManagedHostTests(unittest.TestCase):
             self.assertEqual(migrated.bootstrap_proof_path.read_bytes(), expected_proof)
             connection = migrated.connect()
             try:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 7)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
                 self.assertEqual(
                     connection.execute(
                         "SELECT count(*) FROM bootstrap_delegations"
@@ -483,7 +771,7 @@ class ManagedHostTests(unittest.TestCase):
                 try:
                     self.assertEqual(
                         connection.execute("PRAGMA user_version").fetchone()[0],
-                        7,
+                        8,
                     )
                     preserved = connection.execute(
                         "SELECT * FROM channels WHERE id=?", (old_board_id,)

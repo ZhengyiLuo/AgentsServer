@@ -80,6 +80,12 @@ SECURE_PEER_HEARTBEAT_WRITE_INTERVAL_SECONDS = 15
 # below that transport ceiling, including JSON escaping and envelope fields.
 MAX_NETWORK_PAGE_RESPONSE_BYTES = 1_900_000
 LOCAL_CONTROL_PRINCIPAL_ID = "service_local_control"
+MANAGED_SERVER_PRINCIPAL_ID = "service_managed_server"
+MANAGED_SERVER_SERVICE_IDENTIFIER = "agentsdock.team-hub.managed-server"
+NETWORK_AUTOMATION_AUTH_KINDS = frozenset(
+    {"secure_peer", "local_agent_mail", "managed_server"}
+)
+MANAGED_HOST_AUTH_KINDS = frozenset({"local_agent_mail", "managed_server"})
 
 
 class HubError(RuntimeError):
@@ -565,6 +571,9 @@ class HubStore:
                     if len(team_owners) == 1:
                         team_owner = team_owners[0]
                         self._ensure_managed_host_node(
+                            connection, team_owner["team_id"], timestamp
+                        )
+                        self._managed_server_principal(
                             connection, team_owner["team_id"], timestamp
                         )
                         self._ensure_network_board(
@@ -1870,6 +1879,55 @@ class HubStore:
             scopes=frozenset({"teamspace.read", "teamspace.write"}),
         )
 
+    def managed_server_claims(self) -> AccessClaims:
+        """Return the one server-scoped Teamspace actor for this Hub host.
+
+        The parent AgentsServer authenticates the client before requesting
+        these process-local claims. No bearer or refresh credential is minted,
+        serialized, persisted by a client, or accepted on the public Hub mount.
+        A managed host identity belongs to exactly one active Team Network.
+        """
+
+        timestamp = _now()
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT m.team_id
+                FROM memberships AS m
+                JOIN principals AS p ON p.id=m.principal_id
+                JOIN service_accounts AS s ON s.principal_id=p.id
+                JOIN nodes AS n ON n.team_id=m.team_id
+                JOIN managed_host_bindings AS managed
+                  ON managed.singleton=1
+                 AND managed.server_identity=n.server_identity
+                WHERE m.principal_id=? AND m.role='automation'
+                  AND m.status='active' AND p.kind='service'
+                  AND p.scope_team_id IS NULL AND p.status='active'
+                  AND s.service_identifier=? AND n.status='active'
+                ORDER BY m.team_id
+                """,
+                (MANAGED_SERVER_PRINCIPAL_ID, MANAGED_SERVER_SERVICE_IDENTIFIER),
+            ).fetchall()
+        finally:
+            connection.close()
+        if len(rows) != 1:
+            raise HubError(
+                "server_session_unavailable",
+                "Server-scoped Teamspace access is unavailable",
+                409,
+            )
+        team_id = str(rows[0]["team_id"])
+        return AccessClaims(
+            principal_id=MANAGED_SERVER_PRINCIPAL_ID,
+            session_id=f"managed_server_session_{team_id}",
+            jti=f"managed_server_{team_id}",
+            expires_at=timestamp + 60,
+            auth_kind="managed_server",
+            team_id=team_id,
+            scopes=frozenset({"teamspace.read", "teamspace.write"}),
+        )
+
     @staticmethod
     def _require_session(
         connection: sqlite3.Connection, claims: AccessClaims, timestamp: int
@@ -1906,6 +1964,50 @@ class HubStore:
                     "AgentsDock agent mail",
                     claims.expires_at,
                     LOCAL_CONTROL_PRINCIPAL_ID,
+                    claims.team_id,
+                ),
+            ).fetchone()
+            if row is None:
+                raise HubError("authentication_required", "Authentication required", 401)
+            return row
+        if claims.auth_kind == "managed_server":
+            if (
+                claims.principal_id != MANAGED_SERVER_PRINCIPAL_ID
+                or claims.team_id is None
+                or claims.expires_at <= timestamp
+                or claims.session_id
+                != f"managed_server_session_{claims.team_id}"
+                or claims.jti != f"managed_server_{claims.team_id}"
+                or claims.scopes
+                != frozenset({"teamspace.read", "teamspace.write"})
+                or claims.peer_id is not None
+            ):
+                raise HubError("authentication_required", "Authentication required", 401)
+            row = connection.execute(
+                """
+                SELECT ? AS id, p.id AS human_principal_id,
+                       ? AS device_label, ? AS expires_at,
+                       NULL AS email_normalized, p.display_name,
+                       p.kind AS principal_kind
+                FROM principals AS p
+                JOIN service_accounts AS s ON s.principal_id=p.id
+                JOIN memberships AS m ON m.principal_id=p.id
+                JOIN nodes AS n ON n.team_id=m.team_id
+                JOIN managed_host_bindings AS managed
+                  ON managed.singleton=1
+                 AND managed.server_identity=n.server_identity
+                WHERE p.id=? AND p.kind='service'
+                  AND p.scope_team_id IS NULL AND p.status='active'
+                  AND s.service_identifier=?
+                  AND m.team_id=? AND m.role='automation'
+                  AND m.status='active' AND n.status='active'
+                """,
+                (
+                    claims.session_id,
+                    "AgentsDock managed server",
+                    claims.expires_at,
+                    MANAGED_SERVER_PRINCIPAL_ID,
+                    MANAGED_SERVER_SERVICE_IDENTIFIER,
                     claims.team_id,
                 ),
             ).fetchone()
@@ -2077,6 +2179,84 @@ class HubStore:
         elif membership["role"] != "automation" or membership["status"] != "active":
             raise RuntimeError("invalid Team Hub local-control team membership")
         return LOCAL_CONTROL_PRINCIPAL_ID
+
+    @staticmethod
+    def _managed_server_principal(
+        connection: sqlite3.Connection, team_id: str, timestamp: int
+    ) -> str:
+        """Provision the managed AgentsServer as its own automation actor."""
+
+        principal = connection.execute(
+            """
+            SELECT p.kind, p.scope_team_id, p.display_name, p.status,
+                   s.service_identifier
+            FROM principals AS p
+            LEFT JOIN service_accounts AS s ON s.principal_id = p.id
+            WHERE p.id = ?
+            """,
+            (MANAGED_SERVER_PRINCIPAL_ID,),
+        ).fetchone()
+        if principal is None:
+            connection.execute(
+                """
+                INSERT INTO principals(
+                    id, kind, scope_team_id, display_name, status,
+                    created_at, updated_at
+                ) VALUES (?, 'service', NULL, ?, 'active', ?, ?)
+                """,
+                (
+                    MANAGED_SERVER_PRINCIPAL_ID,
+                    "AgentsDock managed server",
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO service_accounts(
+                    principal_id, service_identifier, created_at
+                ) VALUES (?, ?, ?)
+                """,
+                (
+                    MANAGED_SERVER_PRINCIPAL_ID,
+                    MANAGED_SERVER_SERVICE_IDENTIFIER,
+                    timestamp,
+                ),
+            )
+        elif (
+            principal["kind"] != "service"
+            or principal["scope_team_id"] is not None
+            or principal["status"] != "active"
+            or principal["service_identifier"] != MANAGED_SERVER_SERVICE_IDENTIFIER
+        ):
+            raise RuntimeError("invalid Team Hub managed-server service principal")
+
+        membership = connection.execute(
+            """
+            SELECT role, status FROM memberships
+            WHERE team_id = ? AND principal_id = ?
+            """,
+            (team_id, MANAGED_SERVER_PRINCIPAL_ID),
+        ).fetchone()
+        if membership is None:
+            connection.execute(
+                """
+                INSERT INTO memberships(
+                    id, team_id, principal_id, role, status,
+                    invited_by_principal_id, created_at, updated_at
+                ) VALUES (?, ?, ?, 'automation', 'active', NULL, ?, ?)
+                """,
+                (
+                    _id("membership"),
+                    team_id,
+                    MANAGED_SERVER_PRINCIPAL_ID,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        elif membership["role"] != "automation" or membership["status"] != "active":
+            raise RuntimeError("invalid Team Hub managed-server team membership")
+        return MANAGED_SERVER_PRINCIPAL_ID
 
     @staticmethod
     def _secure_peer_principal_id(peer_id: str) -> str:
@@ -2921,6 +3101,9 @@ class HubStore:
                     connection, result.team_id, timestamp
                 )
                 self._local_control_principal(
+                    connection, result.team_id, timestamp
+                )
+                self._managed_server_principal(
                     connection, result.team_id, timestamp
                 )
                 self._ensure_network_board(
@@ -4368,7 +4551,7 @@ class HubStore:
         write: bool,
     ) -> sqlite3.Row:
         HubStore._require_session(connection, claims, _now())
-        if claims.auth_kind in {"secure_peer", "local_agent_mail"}:
+        if claims.auth_kind in NETWORK_AUTOMATION_AUTH_KINDS:
             expected_scope = "teamspace.write" if write else "teamspace.read"
             if claims.team_id != team_id or expected_scope not in claims.scopes:
                 raise HubError("forbidden", "Operation is not permitted", 403)
@@ -4439,7 +4622,7 @@ class HubStore:
                 claims.principal_id,
                 (
                     ("automation",)
-                    if claims.auth_kind == "local_agent_mail"
+                    if claims.auth_kind in MANAGED_HOST_AUTH_KINDS
                     else ("owner", "admin", "member")
                 ),
             )
@@ -4517,7 +4700,7 @@ class HubStore:
             if team is None:
                 raise HubError("not_found", "Resource not found", 404)
             owned_node_id: str | None = None
-            if claims.auth_kind in {"secure_peer", "local_agent_mail"}:
+            if claims.auth_kind in NETWORK_AUTOMATION_AUTH_KINDS:
                 owned_node_id = str(
                     self._caller_network_node(connection, claims, team_id)["node_id"]
                 )
@@ -4963,14 +5146,36 @@ class HubStore:
     def _bulletin_post_select() -> str:
         return """
             SELECT m.*,p.display_name AS author_principal_display_name,
-                   b.node_id AS author_node_id,
-                   n.display_name AS author_node_display_name
+                   COALESCE(b.node_id, managed_node.id) AS author_node_id,
+                   COALESCE(peer_node.display_name, managed_node.display_name)
+                       AS author_node_display_name
             FROM messages AS m
             JOIN principals AS p ON p.id=m.author_principal_id
             LEFT JOIN network_peer_bindings AS b
               ON b.service_principal_id=m.author_principal_id
              AND b.team_id=m.team_id
-            LEFT JOIN nodes AS n ON n.team_id=b.team_id AND n.id=b.node_id
+            LEFT JOIN nodes AS peer_node
+              ON peer_node.team_id=b.team_id AND peer_node.id=b.node_id
+            LEFT JOIN service_accounts AS managed_author
+              ON managed_author.principal_id=m.author_principal_id
+             AND (
+                (
+                    m.author_principal_id='service_local_control'
+                    AND managed_author.service_identifier=
+                        'agentsdock.team-hub.local-control'
+                )
+                OR (
+                    m.author_principal_id='service_managed_server'
+                    AND managed_author.service_identifier=
+                        'agentsdock.team-hub.managed-server'
+                )
+             )
+            LEFT JOIN managed_host_bindings AS managed
+              ON managed.singleton=1 AND managed_author.principal_id IS NOT NULL
+            LEFT JOIN nodes AS managed_node
+              ON managed_node.team_id=m.team_id
+             AND managed_node.server_identity=managed.server_identity
+             AND managed_node.status='active'
         """
 
     @staticmethod
@@ -5479,6 +5684,16 @@ class HubStore:
         }
         return response, row
 
+    @staticmethod
+    def _network_automation_rate_subject(claims: AccessClaims) -> str | None:
+        if claims.auth_kind == "secure_peer":
+            return f"secure-peer:{claims.peer_id or claims.principal_id}"
+        if claims.auth_kind == "local_agent_mail":
+            return f"local-agent-mail:{claims.principal_id}"
+        if claims.auth_kind == "managed_server":
+            return f"managed-server:{claims.principal_id}"
+        return None
+
     def _charge_network_peer_write(
         self,
         connection: sqlite3.Connection,
@@ -5487,11 +5702,8 @@ class HubStore:
         body_bytes: int,
         timestamp: int,
     ) -> None:
-        if claims.auth_kind == "secure_peer":
-            subject = f"secure-peer:{claims.peer_id or claims.principal_id}"
-        elif claims.auth_kind == "local_agent_mail":
-            subject = f"local-agent-mail:{claims.principal_id}"
-        else:
+        subject = self._network_automation_rate_subject(claims)
+        if subject is None:
             return
         self._charge_rate_bucket(
             connection,
@@ -6680,11 +6892,12 @@ class HubStore:
                 )
                 if cached is not None:
                     return cached
-                if claims.auth_kind == "secure_peer":
-                    subject = f"secure-peer:{claims.peer_id or claims.principal_id}"
+                subject = self._network_automation_rate_subject(claims)
+                if subject is not None:
                     # These durable buckets bound remote write amplification
-                    # even across gateway/server restarts. Replays with the
-                    # same idempotency key return above without being charged.
+                    # by automation actors even across gateway/server restarts.
+                    # Replays with the same idempotency key return above without
+                    # being charged.
                     self._charge_rate_bucket(
                         connection,
                         team_id=team_id,

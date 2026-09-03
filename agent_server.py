@@ -100,13 +100,15 @@ from update_runner import (
 from team_hub_host import (
     TEAM_HUB_MODE_HOST,
     TEAM_HUB_MOUNT_PATH,
+    TEAM_HUB_SERVER_SESSION_MOUNT_PATH,
     TEAM_HUB_TRANSPORT_DIRECT_IP,
     ManagedTeamHubHost,
     configured_team_hub_endpoint,
     configured_team_hub_hosts,
     configured_team_hub_mode,
 )
-from agentsdock_team_hub.store import HubError
+from agentsdock_team_hub.service import MANAGED_SERVER_SESSION_SCOPE_KEY
+from agentsdock_team_hub.store import HubError, MANAGED_SERVER_PRINCIPAL_ID
 from agentsdock_team_hub.secure_peer import SecurePeerError
 from secure_peer_runtime import SECURE_PEER_HEARTBEAT_SECONDS, SecurePeerRuntime
 
@@ -876,7 +878,7 @@ PROVIDER_SECRET_ENV_NAMES = (
 SERVER_BIND_ADDRESS = agentsdock_setting("AGENT_BIND", "0.0.0.0")
 SERVER_PORT = int(agentsdock_setting("AGENT_PORT", "7850"))
 SERVER_INSTANCE_ID = uuid.uuid4().hex
-API_CONTRACT_VERSION = 25
+API_CONTRACT_VERSION = 26
 SESSION_ORDER_STEP = 1000.0
 LOCAL_CROSS_CHAT_DELIVERY_PURPOSE = "cross_chat_handoff_delivery"
 SECURE_PEER_DELIVERY_PURPOSE = "secure_peer_handoff_delivery"
@@ -5567,6 +5569,13 @@ class SecurePeerForgetRequest(SecurePeerDeactivateRequest):
     )
 
 
+class SecurePeerHostPeerRevokeRequest(SecurePeerConfirmedRequest):
+    team_id: str = Field(min_length=1, max_length=128)
+    expected_certificate_fingerprint: str = Field(
+        pattern=r"^sha256:[0-9a-f]{64}$"
+    )
+
+
 class SecurePeerRouteCreateRequest(SecurePeerConfirmedRequest):
     connection_id: uuid.UUID
     chat_id: str = Field(min_length=1, max_length=128)
@@ -7668,7 +7677,9 @@ class JobStore:
                 raise HTTPException(status_code=400, detail="schedule fields conflict with schedule_kind")
             next_kind = requested_kind or (supplied_kinds[0] if supplied_kinds else current_kind)
 
-            has_next_run_patch = "next_run_at" in patch and patch["next_run_at"] is not None
+            has_next_run_field = "next_run_at" in patch
+            has_exact_next_run_patch = has_next_run_field and patch["next_run_at"] is not None
+            reset_next_run_to_schedule = has_next_run_field and patch["next_run_at"] is None
             timezone_name = normalize_job_timezone(
                 patch.get("timezone") if patch.get("timezone") is not None else job.get("timezone")
             )
@@ -7682,7 +7693,11 @@ class JobStore:
                 schedule_changed = schedule_changed or normalize_rrule_expression(
                     patch["rrule"], timezone_name, comparison_anchor
                 ) != job.get("rrule")
-            next_run_at = parse_job_timestamp(patch.get("next_run_at"), timezone_name) if has_next_run_patch else None
+            next_run_at = (
+                parse_job_timestamp(patch.get("next_run_at"), timezone_name)
+                if has_exact_next_run_patch
+                else None
+            )
             for key in ("title", "prompt", "enabled", "backend", "context_mode"):
                 if key in patch and patch[key] is not None:
                     job[key] = patch[key]
@@ -7744,14 +7759,26 @@ class JobStore:
             elif job.get("schedule_start_at") is None:
                 job["schedule_start_at"] = job.get("scheduled_run_at") or job.get("next_run_at") or time.time()
 
+            if next_kind == "interval" and has_exact_next_run_patch:
+                # For interval schedules, the selected next run is the new
+                # cadence anchor, just like an explicit first run at creation.
+                # Treating it as a one-off makes every later run snap back to
+                # the old wall-clock time.
+                job["schedule_start_at"] = next_run_at
+
             max_runs = job.get("max_runs")
             exhausted = max_runs is not None and int(job.get("run_count") or 0) >= int(max_runs)
             if exhausted:
                 job["enabled"] = False
-            if job.get("enabled") and has_next_run_patch:
+            if job.get("enabled") and has_exact_next_run_patch:
                 job["next_run_at"] = next_run_at
                 job["scheduled_run_at"] = next_run_at
-            elif job.get("enabled") and (schedule_changed or patch.get("enabled") is True or not job.get("next_run_at")):
+            elif job.get("enabled") and (
+                reset_next_run_to_schedule
+                or schedule_changed
+                or patch.get("enabled") is True
+                or not job.get("next_run_at")
+            ):
                 reference = time.time()
                 if (
                     next_kind == "interval"
@@ -8050,14 +8077,37 @@ class JobStore:
             await self.save()
             return dict(job)
 
-    async def defer(self, jid: str, reason: str, delay_seconds: int | None = None) -> None:
+    async def defer(
+        self,
+        jid: str,
+        reason: str,
+        delay_seconds: int | None = None,
+        *,
+        expected_revision: str | None = None,
+        expected_next_run_at: float | None = None,
+    ) -> bool:
         delay = int(delay_seconds or JOB_BUSY_RETRY_SECONDS)
         emit_event = False
         event_job: dict[str, Any] | None = None
         async with self._lock:
             job = self.jobs.get(jid)
             if not job or not job.get("enabled"):
-                return
+                return False
+            if (
+                expected_revision is not None
+                and job.get("_revision") != expected_revision
+            ):
+                return False
+            if expected_next_run_at is not None:
+                try:
+                    same_occurrence = (
+                        float(job.get("next_run_at"))
+                        == float(expected_next_run_at)
+                    )
+                except (TypeError, ValueError):
+                    same_occurrence = False
+                if not same_occurrence:
+                    return False
             now = time.time()
             job["next_run_at"] = now + max(delay, 5)
             job["last_deferred_at"] = now_iso()
@@ -8076,6 +8126,7 @@ class JobStore:
                 "job_id": jid,
                 "message": f"Scheduled job deferred: {event_job.get('title') or jid} — {reason}",
             })
+        return True
 
     def _manual_run_deferred_result(
         self,
@@ -8427,7 +8478,20 @@ class JobStore:
             await asyncio.sleep(max(JOB_SCHEDULER_INTERVAL_SECONDS, 1.0))
             now = time.time()
             due = [
-                job["id"] for job in list(self.jobs.values())
+                (
+                    job["id"],
+                    job.get("_revision"),
+                    (
+                        float(job["next_run_at"])
+                        if (
+                            not job.get("manual_run_pending")
+                            and job.get("enabled")
+                            and job.get("next_run_at")
+                        )
+                        else None
+                    ),
+                )
+                for job in list(self.jobs.values())
                 if job.get("manual_run_pending")
                 or (
                     job.get("enabled")
@@ -8435,7 +8499,7 @@ class JobStore:
                     and float(job["next_run_at"]) <= now
                 )
             ]
-            for jid in due:
+            for jid, due_revision, due_next_run_at in due:
                 job = self.jobs.get(jid)
                 if not job:
                     continue
@@ -8471,7 +8535,13 @@ class JobStore:
                     if manual_run_pending:
                         await self._record_manual_run_deferred(jid, blocker)
                     else:
-                        await self.defer(jid, blocker, JOB_BUSY_RETRY_SECONDS)
+                        await self.defer(
+                            jid,
+                            blocker,
+                            JOB_BUSY_RETRY_SECONDS,
+                            expected_revision=due_revision,
+                            expected_next_run_at=due_next_run_at,
+                        )
                     continue
                 # The blocker check yields. Archive/pause or a user edit may
                 # have changed this due item while it was in flight; never
@@ -50316,6 +50386,8 @@ class AgentsServerCORSMiddleware(CORSMiddleware):
         if (
             path == TEAM_HUB_MOUNT_PATH
             or path.startswith(TEAM_HUB_MOUNT_PATH + "/")
+            or path == TEAM_HUB_SERVER_SESSION_MOUNT_PATH
+            or path.startswith(TEAM_HUB_SERVER_SESSION_MOUNT_PATH + "/")
             or path == "/api/admin/secure-peers/v1"
             or path.startswith("/api/admin/secure-peers/v1/")
             or path.startswith("/api/team-hub-secure/")
@@ -50333,6 +50405,51 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.mount(TEAM_HUB_MOUNT_PATH, TEAM_HUB_RUNTIME, name="team-hub")
+app.mount(
+    TEAM_HUB_SERVER_SESSION_MOUNT_PATH,
+    TEAM_HUB_RUNTIME,
+    name="team-hub-server-session",
+)
+
+TEAM_HUB_SERVER_SESSION_ROUTE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("GET", re.compile(r"^/v1/health$")),
+    ("GET", re.compile(r"^/v1/server-session$")),
+    ("GET", re.compile(r"^/v1/teams$")),
+    ("GET", re.compile(r"^/v1/teams/[^/]+$")),
+    ("GET", re.compile(r"^/v1/teams/[^/]+/(?:members|nodes|channels)$")),
+    ("GET", re.compile(r"^/v1/channels/[^/]+/messages$")),
+    ("POST", re.compile(r"^/v1/channels/[^/]+/messages$")),
+    ("GET", re.compile(r"^/v1/teams/[^/]+/network$")),
+    ("POST", re.compile(r"^/v1/teams/[^/]+/network/agents$")),
+    ("GET", re.compile(r"^/v1/teams/[^/]+/network/bulletin$")),
+    ("POST", re.compile(r"^/v1/teams/[^/]+/network/bulletin$")),
+    ("GET", re.compile(r"^/v1/teams/[^/]+/network/mailbox$")),
+    ("POST", re.compile(r"^/v1/teams/[^/]+/network/mailbox$")),
+    ("GET", re.compile(r"^/v1/teams/[^/]+/network/items/[^/]+$")),
+    (
+        "POST",
+        re.compile(r"^/v1/teams/[^/]+/network/deliveries/[^/]+/receipts$"),
+    ),
+    ("POST", re.compile(r"^/v1/teams/[^/]+/network/requests$")),
+    ("GET", re.compile(r"^/v1/teams/[^/]+/network/requests/[^/]+$")),
+    (
+        "POST",
+        re.compile(r"^/v1/teams/[^/]+/network/requests/[^/]+/replies$"),
+    ),
+)
+
+
+def is_team_hub_server_session_route_allowed(method: str, path: str) -> bool:
+    """Allow only shared server/team operations through the core-auth proxy."""
+
+    if not path.startswith(TEAM_HUB_SERVER_SESSION_MOUNT_PATH + "/"):
+        return False
+    relative_path = path[len(TEAM_HUB_SERVER_SESSION_MOUNT_PATH) :]
+    normalized_method = str(method or "").upper()
+    return any(
+        normalized_method == allowed_method and pattern.fullmatch(relative_path)
+        for allowed_method, pattern in TEAM_HUB_SERVER_SESSION_ROUTE_RULES
+    )
 
 AGENT_HELPER_ROUTE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("POST", re.compile(r"^/api/agent/cross-chat/handoffs$")),
@@ -50547,7 +50664,10 @@ async def require_agent_token(request: Request, call_next):
     # Starlette otherwise redirects a bare mount path and builds Location from
     # the untrusted Host header. The Hub contract is versioned below the mount;
     # the bare prefix is deliberately inert for every method.
-    if request.url.path == TEAM_HUB_MOUNT_PATH:
+    if request.url.path in {
+        TEAM_HUB_MOUNT_PATH,
+        TEAM_HUB_SERVER_SESSION_MOUNT_PATH,
+    }:
         return JSONResponse(
             {
                 "error": {
@@ -50567,10 +50687,15 @@ async def require_agent_token(request: Request, call_next):
     secure_peer_proxy_route = request.url.path.startswith(
         "/api/team-hub-secure/"
     )
+    team_hub_server_session_route = request.url.path.startswith(
+        TEAM_HUB_SERVER_SESSION_MOUNT_PATH + "/"
+    )
     if request.method == "OPTIONS" and team_hub_bootstrap_route:
         return JSONResponse({"detail": "forbidden"}, status_code=403)
     if request.method == "OPTIONS" and (
-        secure_peer_admin_route or secure_peer_proxy_route
+        secure_peer_admin_route
+        or secure_peer_proxy_route
+        or team_hub_server_session_route
     ):
         return JSONResponse({"detail": "forbidden"}, status_code=403)
     if request.method == "OPTIONS" or not request.url.path.startswith("/api/"):
@@ -50619,6 +50744,7 @@ async def require_agent_token(request: Request, call_next):
                 return JSONResponse({"detail": detail}, status_code=status_code)
     if (
         not team_hub_route
+        and not team_hub_server_session_route
         and not agent_helper_route
         and not team_hub_bootstrap_route
         and not secure_peer_admin_route
@@ -50627,6 +50753,44 @@ async def require_agent_token(request: Request, call_next):
     ):
         logger.warning("unauthorized request method=%s path=%s host=%s", request.method, request.url.path, request.client.host if request.client else "-")
         return JSONResponse({"detail": "unauthorized"}, status_code=401)
+
+    if team_hub_server_session_route:
+        if secure_peer_browser_request_forbidden(request):
+            return JSONResponse({"detail": "forbidden"}, status_code=403)
+        if not AGENT_TOKEN:
+            return JSONResponse(
+                {
+                    "detail": (
+                        "Server-scoped Teamspace access requires authenticated "
+                        "AgentsServer mode"
+                    )
+                },
+                status_code=503,
+            )
+        if not request_exact_secure_peer_control_authorized(request):
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+        if not is_team_hub_server_session_route_allowed(
+            request.method,
+            request.url.path,
+        ):
+            return JSONResponse(
+                {
+                    "error": {
+                        "code": "not_found",
+                        "message": "Resource not found",
+                    }
+                },
+                status_code=404,
+            )
+        if request.method.upper() in {"POST", "PUT", "PATCH"}:
+            transport_error = secure_peer_post_transport_error(request)
+            if transport_error is not None:
+                status_code, detail = transport_error
+                return JSONResponse({"detail": detail}, status_code=status_code)
+        # This marker is process-local ASGI state, not an HTTP credential. The
+        # child Hub accepts it only after this parent route has authenticated
+        # the exact AgentsServer token and rejected browser ambient authority.
+        request.scope[MANAGED_SERVER_SESSION_SCOPE_KEY] = True
 
     if secure_peer_admin_route or secure_peer_proxy_route:
         if secure_peer_browser_request_forbidden(request):
@@ -50701,7 +50865,11 @@ async def require_agent_token(request: Request, call_next):
 
     async with UNSAFE_HTTP_MUTATION_ADMISSION_LOCK:
         if managed_server_restart_blocks_work():
-            if team_hub_route or team_hub_bootstrap_route:
+            if (
+                team_hub_route
+                or team_hub_server_session_route
+                or team_hub_bootstrap_route
+            ):
                 return JSONResponse(
                     {
                         "error": {
@@ -50723,7 +50891,11 @@ async def require_agent_token(request: Request, call_next):
                 status_code=409,
             )
         if managed_server_update_blocks_work():
-            if team_hub_route or team_hub_bootstrap_route:
+            if (
+                team_hub_route
+                or team_hub_server_session_route
+                or team_hub_bootstrap_route
+            ):
                 return JSONResponse(
                     {
                         "error": {
@@ -50751,7 +50923,14 @@ async def require_agent_token(request: Request, call_next):
 def current_team_hub_capability() -> dict[str, Any]:
     hosted = TEAM_HUB_RUNTIME.capability()
     if TEAM_HUB_RUNTIME.designated_host:
-        return hosted
+        return {
+            **hosted,
+            "server_session_base_path": (
+                TEAM_HUB_SERVER_SESSION_MOUNT_PATH
+                if AGENT_TOKEN and TEAM_HUB_RUNTIME.server_session_available()
+                else None
+            ),
+        }
     return SECURE_PEER_RUNTIME.team_hub_capability() or hosted
 
 
@@ -50800,6 +50979,37 @@ def canonical_secure_peer_path_uuid(value: str, label: str) -> str:
 async def secure_peer_status_endpoint(request: Request) -> Response:
     require_secure_peer_control(request)
     result = await asyncio.to_thread(SECURE_PEER_RUNTIME.status)
+    return JSONResponse(
+        result,
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
+
+
+@app.get("/api/admin/secure-peers/v1/peers")
+async def secure_peer_host_peers_endpoint(
+    request: Request,
+    expected_server_identity: str = Query(min_length=8, max_length=240),
+    expected_server_instance_id: str = Query(min_length=8, max_length=240),
+    team_id: str = Query(min_length=1, max_length=128),
+) -> Response:
+    """List one team's host-side peer records under local server authority."""
+
+    require_secure_peer_control(request)
+    if (
+        expected_server_identity != server_identity()
+        or expected_server_instance_id != SERVER_INSTANCE_ID
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="The connected AgentsServer instance changed before confirmation",
+        )
+    try:
+        result = await asyncio.to_thread(
+            SECURE_PEER_RUNTIME.list_peers,
+            team_id=team_id,
+        )
+    except (SecurePeerError, HubError) as exc:
+        return secure_peer_error_response(exc)
     return JSONResponse(
         result,
         headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
@@ -51015,6 +51225,36 @@ async def secure_peer_connection_forget_endpoint(
             ),
         )
     except SecurePeerError as exc:
+        return secure_peer_error_response(exc)
+    return JSONResponse(
+        result,
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
+
+
+@app.post("/api/admin/secure-peers/v1/peers/{peer_id}/revoke")
+async def secure_peer_host_peer_revoke_endpoint(
+    peer_id: str,
+    body: SecurePeerHostPeerRevokeRequest,
+    request: Request,
+) -> Response:
+    """Revoke one exact host-side peer without granting Hub owner authority."""
+
+    require_secure_peer_control(request)
+    require_secure_peer_target(body)
+    clean_id = canonical_secure_peer_path_uuid(peer_id, "Peer")
+    try:
+        result = await asyncio.to_thread(
+            SECURE_PEER_RUNTIME.revoke_peer,
+            peer_id=clean_id,
+            team_id=body.team_id,
+            expected_certificate_fingerprint=(
+                body.expected_certificate_fingerprint
+            ),
+            idempotency_key=str(body.request_id),
+            revoked_by=MANAGED_SERVER_PRINCIPAL_ID,
+        )
+    except (SecurePeerError, HubError) as exc:
         return secure_peer_error_response(exc)
     return JSONResponse(
         result,
@@ -51385,7 +51625,7 @@ async def health() -> dict[str, Any]:
                     "provider contexts."
                 ),
                 "action": None,
-                "version": 5,
+                "version": 6,
                 "context_modes": ["chat", "standalone"],
                 "default_context_mode": "chat",
                 "features": {
@@ -51393,6 +51633,8 @@ async def health() -> dict[str, Any]:
                     "direct_message_mentions": False,
                     "route_mentions": True,
                     "route_hint_mentions": True,
+                    "next_run_reset": True,
+                    "interval_next_run_reanchors": True,
                 },
             },
             "provider_jobs_access_control_v1": {

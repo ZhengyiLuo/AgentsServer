@@ -813,6 +813,7 @@ TEAM_HUB_RELEASE_FILES=(
   migrations/0005_tailnet_bootstrap_delegations.sql
   migrations/0006_team_network_mailbox.sql
   migrations/0007_local_agent_mail.sql
+  migrations/0008_managed_server_session.sql
 )
 
 for name in "${RELEASE_FILES[@]}"; do

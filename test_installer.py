@@ -1022,6 +1022,10 @@ exit 0
                 f"agents-server-{version}/agentsdock_team_hub/migrations/0007_local_agent_mail.sql",
                 members,
             )
+            self.assertIn(
+                f"agents-server-{version}/agentsdock_team_hub/migrations/0008_managed_server_session.sql",
+                members,
+            )
             self.assertFalse(
                 any("__pycache__" in name or name.endswith((".pyc", ".pyo")) for name in members)
             )
@@ -1034,7 +1038,7 @@ exit 0
                 "beta" if "-" in version.split("+", 1)[0] else "stable",
             )
             self.assertEqual(manifest["prerelease"], manifest["track"] == "beta")
-            self.assertEqual(manifest["api_contract_version"], 25)
+            self.assertEqual(manifest["api_contract_version"], 26)
 
     def test_installer_preserves_state_and_emits_private_result(self):
         source = INSTALLER.read_text()
@@ -2471,7 +2475,7 @@ exit 0
             self.assertFalse(store.maintenance_fence_path.exists())
             connection = sqlite3.connect(store.database_path)
             try:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 7)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
                 self.assertEqual(
                     connection.execute(
                         "SELECT hub_id, server_identity FROM managed_host_bindings"

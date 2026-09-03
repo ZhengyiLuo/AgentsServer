@@ -907,7 +907,7 @@ class ProviderTeamMailTests(unittest.IsolatedAsyncioTestCase):
     async def test_health_advertises_explicit_bounded_mail_contract(self) -> None:
         with patch.object(agent_server, "AGENT_TOKEN", "configured"):
             health = await agent_server.health()
-        self.assertEqual(health["api_contract_version"], 25)
+        self.assertEqual(health["api_contract_version"], 26)
         self.assertEqual(health["capabilities"]["cursor_backend"]["version"], 2)
         capability = health["capabilities"]["agent_team_mail_v1"]
         self.assertTrue(capability["available"])

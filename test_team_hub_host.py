@@ -19,7 +19,7 @@ from team_hub_host import (
     ManagedTeamHubHost,
     configured_team_hub_endpoint,
 )
-from agentsdock_team_hub.store import HubStore
+from agentsdock_team_hub.store import HubError, HubStore
 
 
 HOST_ID = "server-managed-host-12345678"
@@ -164,6 +164,70 @@ class ManagedTeamHubHostTests(unittest.IsolatedAsyncioTestCase):
                     },
                 ],
             )
+
+    async def test_server_session_availability_requires_issuable_managed_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = host(Path(temporary) / "hub")
+            self.assertFalse(runtime.server_session_available())
+
+            runtime.initialize()
+            self.assertFalse(runtime.server_session_available())
+            proof = runtime.store.bootstrap_proof_path.read_text().strip()  # type: ignore[union-attr]
+            runtime.store.bootstrap(  # type: ignore[union-attr]
+                proof,
+                "owner@example.com",
+                "Owner",
+                "Owner Mac",
+            )
+            self.assertTrue(runtime.server_session_available())
+            await runtime.shutdown()
+
+    async def test_server_session_availability_rejects_legacy_multi_team_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "hub"
+            legacy = HubStore(root)
+            proof = legacy.bootstrap_proof_path.read_text().strip()
+            legacy.bootstrap(
+                proof,
+                "owner@example.com",
+                "Owner",
+                "Owner Mac",
+            )
+            connection = legacy.connect()
+            try:
+                owner = connection.execute(
+                    "SELECT principal_id FROM memberships WHERE role='owner'"
+                ).fetchone()["principal_id"]
+                with connection:
+                    connection.execute(
+                        """
+                        INSERT INTO teams(
+                            id, kind, slug, display_name,
+                            personal_owner_principal_id, retention_days,
+                            created_by_principal_id, created_at, updated_at
+                        ) VALUES (?, 'shared', ?, ?, NULL, 365, ?, 1, 1)
+                        """,
+                        ("team_legacy_shared", "legacy-shared", "Legacy shared", owner),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO memberships(
+                            id, team_id, principal_id, role, status,
+                            invited_by_principal_id, created_at, updated_at
+                        ) VALUES (?, ?, ?, 'owner', 'active', NULL, 1, 1)
+                        """,
+                        ("membership_legacy_owner", "team_legacy_shared", owner),
+                    )
+            finally:
+                connection.close()
+
+            runtime = host(root)
+            runtime.initialize()
+            self.assertTrue(runtime.capability()["available"])
+            with self.assertRaisesRegex(HubError, "Server-scoped Teamspace access is unavailable"):
+                runtime.store.managed_server_claims()  # type: ignore[union-attr]
+            self.assertFalse(runtime.server_session_available())
+            await runtime.shutdown()
 
     async def test_disabled_host_creates_no_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -784,12 +848,13 @@ class VendoredTeamHubParityTests(unittest.TestCase):
             "migrations/0005_tailnet_bootstrap_delegations.sql": "e47d25ea16353d023355cf875d008808cd3742cd038569abfb9607556cdbd09b",
             "migrations/0006_team_network_mailbox.sql": "c215068c903b4b65cd7a0e52506f859b5301d7e7d5ac9a66ad1636e6efd84d63",
             "migrations/0007_local_agent_mail.sql": "a01c33ef0d66de486e45bc3470a438ac0dd41edb5007eb6c12c26c240b4ca883",
+            "migrations/0008_managed_server_session.sql": "487b29e425b7c53ef019e9ff476f4b18615c5142975c6d0bac8c134dc84e849c",
             "migrations/__init__.py": "aaf340c45c8d39c2939814977ba4cef8eb6b3bd0671b0f7542ebe06f5431d6ec",
             "security.py": "0c1895c7443e7be07a2f53c7e4c4228e3ee04c65d6cd36f039b7bbba1813e4fa",
             "secure_peer.py": "f6a8d4f8a9ead94ef1fd6478eecdb31dc6da7c2ca9468d2beaac95590f4a2da0",
             "secure_peer_hub.py": "f74ab0eb6bf7705147b6e4ec10596751c40efeaabb3d0df71409bee9731e9fb8",
-            "service.py": "659a741aa598763eaa4a4541e6676020e6fd5cf529c906ae1da35cf1f9a8f303",
-            "store.py": "379e17c586de433cfaefc85ec5c760e3d5e769a80bb89596635321944bdaee6a",
+            "service.py": "6b3255387c36c52a334f0a0a5f71b7b4b2b05cad986b212237254be3f038a5f0",
+            "store.py": "2df05edafe2e6f1187e2dc4dc8286fae3ea506252ba9e481214250357af3e673",
         }
         entries = list(vendored.rglob("*"))
         for path in entries:

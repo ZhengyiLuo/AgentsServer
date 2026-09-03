@@ -31,6 +31,11 @@ MAX_JSON_BODY_BYTES = 65_536
 BODY_READ_TIMEOUT_SECONDS = 10.0
 HOSTNAME_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 TAILSCALE_SERVE_HEADERS_INFO = "https://tailscale.com/s/serve-headers"
+# Set only by the authenticated parent AgentsServer mount. HTTP clients cannot
+# manufacture ASGI scope extensions, so this keeps the core server credential
+# out of the Team Hub credential realm while allowing every client authorized
+# to the same AgentsServer to share its server-scoped Teamspace identity.
+MANAGED_SERVER_SESSION_SCOPE_KEY = "agentsdock.team_hub.managed_server_session"
 
 
 @dataclass(frozen=True)
@@ -429,6 +434,9 @@ def create_app(
     @app.middleware("http")
     async def strict_transport(request: Request, call_next):
         raw_headers = request.scope.get("headers", [])
+        managed_server_session = (
+            request.scope.get(MANAGED_SERVER_SESSION_SCOPE_KEY) is True
+        )
         values: dict[bytes, list[bytes]] = {}
         for key, value in raw_headers:
             values.setdefault(key.lower(), []).append(value)
@@ -440,7 +448,10 @@ def create_app(
         except UnicodeDecodeError:
             return _error("invalid_request", "Invalid Host header", 400)
         host_name = _host_name(host_header)
-        if host_name is None or host_name not in {item.lower() for item in hosts}:
+        if host_name is None or (
+            not managed_server_session
+            and host_name not in {item.lower() for item in hosts}
+        ):
             return _error("invalid_request", "Invalid Host header", 400)
         managed_identity: ManagedTransportIdentity | None = None
         managed_identity_url: str | None = None
@@ -449,7 +460,9 @@ def create_app(
             if managed_transport is not None and managed_hub_url is not None
             else {}
         )
-        if managed_transport is not None or managed_routes is not None:
+        if not managed_server_session and (
+            managed_transport is not None or managed_routes is not None
+        ):
             if not configured_routes:
                 return _error("transport_configuration_invalid", "Transport is unavailable", 503)
             for route_kind, route_url in configured_routes.items():
@@ -644,6 +657,8 @@ def create_app(
         return _error("internal_error", "Internal server error", 500)
 
     def claims_from_request(request: Request) -> AccessClaims:
+        if request.scope.get(MANAGED_SERVER_SESSION_SCOPE_KEY) is True:
+            return store.managed_server_claims()
         raw = request.scope.get("headers", [])
         authorization = [value for key, value in raw if key.lower() == b"authorization"]
         if len(authorization) != 1:
@@ -659,8 +674,25 @@ def create_app(
     Auth = Annotated[AccessClaims, Depends(claims_from_request)]
 
     @app.get("/v1/health")
-    def health() -> dict[str, Any]:
-        return store.health()
+    def health(request: Request) -> dict[str, Any]:
+        result = store.health()
+        if request.scope.get(MANAGED_SERVER_SESSION_SCOPE_KEY) is True:
+            server_session_available = False
+            if result["bootstrapped"]:
+                try:
+                    store.managed_server_claims()
+                except Exception:
+                    server_session_available = False
+                else:
+                    server_session_available = True
+            result["server_session_available"] = server_session_available
+        return result
+
+    @app.get("/v1/server-session")
+    def server_session(request: Request) -> dict[str, Any]:
+        if request.scope.get(MANAGED_SERVER_SESSION_SCOPE_KEY) is not True:
+            raise HubError("not_found", "Resource not found", 404)
+        return store.session_snapshot(store.managed_server_claims())
 
     @app.post("/v1/bootstrap/redeem")
     def bootstrap(request: Request, body: BootstrapRequest) -> dict[str, Any]:

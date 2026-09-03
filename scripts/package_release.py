@@ -55,6 +55,7 @@ DIRECTORY_FILES = {
         "migrations/0005_tailnet_bootstrap_delegations.sql",
         "migrations/0006_team_network_mailbox.sql",
         "migrations/0007_local_agent_mail.sql",
+        "migrations/0008_managed_server_session.sql",
     ),
 }
 DIRECTORIES = tuple(DIRECTORY_FILES)
@@ -175,7 +176,7 @@ def main() -> int:
         "version": version,
         "track": "beta" if "-" in version.split("+", 1)[0] else "stable",
         "prerelease": "-" in version.split("+", 1)[0],
-        "api_contract_version": 25,
+        "api_contract_version": 26,
         "commit": commit,
         "archive": {
             "name": archive_name,

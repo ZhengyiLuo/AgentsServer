@@ -50525,6 +50525,22 @@ def secure_peer_browser_request_forbidden(request: Request) -> bool:
     )
 
 
+def team_hub_server_session_browser_request_forbidden(request: Request) -> bool:
+    """Keep server-scoped Teamspace outside browsers without rejecting proxies.
+
+    Unlike the secure-peer control plane, this route is expected to follow the
+    selected AgentsServer through an ordinary reverse proxy. Forwarded/Via
+    headers carry no authority here: the exact core token and process-local
+    ASGI marker remain the only bridge into the managed Teamspace session.
+    """
+
+    return any(
+        bytes(name).lower() in {b"origin", b"cookie"}
+        or bytes(name).lower().startswith(b"sec-fetch-")
+        for name, _value in request.scope.get("headers", [])
+    )
+
+
 def request_exact_secure_peer_control_authorized(request: Request) -> bool:
     """Require one header-only core token while reserving Authorization for Hub."""
 
@@ -50755,7 +50771,7 @@ async def require_agent_token(request: Request, call_next):
         return JSONResponse({"detail": "unauthorized"}, status_code=401)
 
     if team_hub_server_session_route:
-        if secure_peer_browser_request_forbidden(request):
+        if team_hub_server_session_browser_request_forbidden(request):
             return JSONResponse({"detail": "forbidden"}, status_code=403)
         if not AGENT_TOKEN:
             return JSONResponse(

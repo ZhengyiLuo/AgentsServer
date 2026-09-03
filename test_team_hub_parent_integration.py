@@ -698,12 +698,31 @@ class TeamHubParentIntegrationTests(unittest.TestCase):
                         ({"X-AgentsDock-Token": "wrong"}, 401),
                         ({**headers, "Origin": "https://evil.test"}, 403),
                         ({**headers, "Cookie": "ambient=yes"}, 403),
+                        ({**headers, "Sec-Fetch-Site": "cross-site"}, 403),
                     ):
                         denied = client.get(
                             "/api/team-hub-server/v1/server-session",
                             headers=request_headers,
                         )
                         self.assertEqual(denied.status_code, expected, denied.text)
+
+                    proxied = client.get(
+                        "/api/team-hub-server/v1/server-session",
+                        headers={
+                            **headers,
+                            "Forwarded": "for=192.0.2.50;proto=https",
+                            "Via": "1.1 edge.example.test",
+                            "X-Forwarded-For": "192.0.2.50",
+                            "X-Forwarded-Host": "dock.example.test",
+                            "X-Forwarded-Proto": "https",
+                            "X-Real-IP": "192.0.2.50",
+                        },
+                    )
+                    self.assertEqual(proxied.status_code, 200, proxied.text)
+                    self.assertEqual(
+                        proxied.json()["principal"]["id"],
+                        first.json()["principal"]["id"],
+                    )
 
                     bare = client.get(
                         "/api/team-hub-server",

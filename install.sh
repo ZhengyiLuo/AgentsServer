@@ -332,6 +332,11 @@ ENV_CONFIG_CAPTURED="false"
 SERVICE_CONFIG_BACKUP=""
 SERVICE_CONFIG_EXISTED="false"
 SERVICE_CONFIG_CAPTURED="false"
+# Canonical, non-secret continuity proof captured from the authenticated old
+# server immediately before takeover.  A disabled static host mode may still
+# be an active secure-peer Teamspace client, so candidate health must preserve
+# that exact pairing rather than misclassifying the client as a disabled Hub.
+EXPECTED_TEAM_HUB_CLIENT_BINDING=""
 
 scrub_staged_process_environment() {
   unset \
@@ -1765,7 +1770,7 @@ restore_previous_release_transaction() {
     echo "The previous release link and configuration were restored, but its service could not be restarted." >&2
     return 1
   fi
-  if [[ "$TEAM_HUB_OPERATION_PENDING" == "true" ]]; then
+  if [[ "$TEAM_HUB_OPERATION_PENDING" == "true" || -n "$EXPECTED_TEAM_HUB_CLIENT_BINDING" ]]; then
     if ! wait_for_previous_release_health; then
       echo "The previous service restarted, but its exact server and Team Hub identities were not healthy; rollback is incomplete." >&2
       return 1
@@ -1949,6 +1954,368 @@ health_check_once() {
   return 1
 }
 
+fetch_managed_json() {
+  local port="$1"
+  local path="$2"
+  local authorization_kind="$3"
+  local output_file="$4"
+  local authorization_header=""
+  case "$authorization_kind" in
+    core) authorization_header="Authorization: Bearer $TOKEN" ;;
+    secure-peer) authorization_header="X-AgentsDock-Token: $TOKEN" ;;
+    *) return 1 ;;
+  esac
+  if command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1; then
+    curl --fail --silent --show-error --connect-timeout 1 --max-time 2 --max-filesize 1048576 \
+      -H "$authorization_header" \
+      --output "$output_file" \
+      "http://127.0.0.1:$port$path" >/dev/null 2>&1
+  else
+    wget \
+      --quiet \
+      --timeout=2 \
+      --tries=1 \
+      --header="$authorization_header" \
+      --output-document="$output_file" \
+      "http://127.0.0.1:$port$path" >/dev/null 2>&1
+  fi
+}
+
+managed_secure_peer_binding_from_responses() {
+  local runtime_root="$1"
+  local health_file="$2"
+  local status_file="$3"
+  local expected_server="$4"
+  local allow_legacy="${5:-false}"
+  local health_size=""
+  local status_size=""
+  health_size="$(wc -c < "$health_file" 2>/dev/null || true)"
+  health_size="${health_size//[[:space:]]/}"
+  status_size="$(wc -c < "$status_file" 2>/dev/null || true)"
+  status_size="${status_size//[[:space:]]/}"
+  if [[ ! "$health_size" =~ ^[0-9]+$ ]] || ((health_size < 2 || health_size > 1048576)); then
+    return 1
+  fi
+  if [[ ! "$status_size" =~ ^[0-9]+$ ]] || ((status_size > 1048576)); then
+    return 1
+  fi
+  run_without_server_secrets "$runtime_root/.venv/bin/python" - \
+    "$health_file" \
+    "$status_file" \
+    "$expected_server" \
+    "$allow_legacy" <<'PY'
+import json
+import re
+import sys
+import uuid
+
+health_path, status_path, expected_server, allow_legacy = sys.argv[1:]
+
+
+def load_json(path):
+    try:
+        with open(path, "rb") as stream:
+            return json.load(stream)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise SystemExit(1)
+
+
+def exact_values(value, expected):
+    return isinstance(value, dict) and all(
+        value.get(key) == item for key, item in expected.items()
+    )
+
+
+def valid_identifier(value):
+    return (
+        isinstance(value, str)
+        and re.fullmatch(r"[A-Za-z0-9_.:-]{8,240}", value) is not None
+    )
+
+
+def valid_uuid4(value):
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError):
+        return False
+    return parsed.version == 4 and str(parsed) == value
+
+
+disabled_capability = {
+    "available": False,
+    "designated_host": False,
+    "version": 1,
+    "base_path": None,
+    "hub_id": None,
+    "host_server_identity": None,
+    "transport": None,
+    "hub_url": None,
+}
+health = load_json(health_path)
+if not isinstance(health, dict) or health.get("ok") is not True:
+    raise SystemExit(1)
+if health.get("server_identity") != expected_server:
+    raise SystemExit(1)
+capabilities = health.get("capabilities")
+team_hub = capabilities.get("team_hub_v1") if isinstance(capabilities, dict) else None
+if not isinstance(team_hub, dict) or team_hub.get("designated_host") is not False:
+    raise SystemExit(1)
+secure_peer = capabilities.get("secure_peer_v1")
+if secure_peer is None:
+    if allow_legacy != "true" or not exact_values(team_hub, disabled_capability):
+        raise SystemExit(1)
+    print('{"kind":"disabled"}')
+    raise SystemExit(0)
+secure_required = {
+    "available": True,
+    "state_available": True,
+    "state_error_code": None,
+    "required": False,
+    "version": 1,
+    "control_path": "/api/admin/secure-peers/v1/status",
+    "proxy_prefix": "/api/team-hub-secure",
+}
+if not exact_values(secure_peer, secure_required):
+    raise SystemExit(1)
+
+status = load_json(status_path)
+status_version = status.get("version") if isinstance(status, dict) else None
+if (
+    not isinstance(status, dict)
+    or status_version not in {1, 2}
+    or status.get("server_identity") != expected_server
+    or "active_connection_id" not in status
+    or not isinstance(status.get("pairings"), list)
+):
+    raise SystemExit(1)
+active_connection_id = status.get("active_connection_id")
+if active_connection_id is not None and not valid_uuid4(active_connection_id):
+    raise SystemExit(1)
+fingerprint = re.compile(r"sha256:[0-9a-f]{64}")
+known_statuses = {
+    "requesting",
+    "pending_approval",
+    "approved",
+    "connected",
+    "rejected",
+    "revoked",
+    "expired",
+    "error",
+}
+trust_statuses = {
+    "pending": {"requesting", "pending_approval"},
+    "approved": {"approved", "connected"},
+    "rejected": {"rejected"},
+    "cancelled": {"rejected"},
+    "revoked": {"revoked"},
+    "expired": {"expired"},
+    "error": {"error"},
+}
+known_transport_states = {"online", "reconnecting", "offline", "disconnected", "revoked"}
+durable_pairings = []
+seen_pairing_ids = set()
+seen_connection_ids = set()
+for pairing in status["pairings"]:
+    if not isinstance(pairing, dict) or pairing.get("direction") not in {"incoming", "outgoing"}:
+        raise SystemExit(1)
+    if pairing["direction"] != "outgoing":
+        continue
+    pairing_id = pairing.get("id")
+    connection_id = pairing.get("connection_id")
+    pairing_status = pairing.get("status")
+    if (
+        not valid_uuid4(pairing_id)
+        or not valid_uuid4(connection_id)
+        or pairing_id in seen_pairing_ids
+        or connection_id in seen_connection_ids
+        or pairing_status not in known_statuses
+    ):
+        raise SystemExit(1)
+    seen_pairing_ids.add(pairing_id)
+    seen_connection_ids.add(connection_id)
+    if status_version == 1:
+        if pairing_status in {"requesting", "pending_approval"}:
+            raise SystemExit(1)
+        durable = pairing_status in {"approved", "connected"}
+    else:
+        trust_state = pairing.get("trust_state")
+        transport_state = pairing.get("transport_state")
+        if (
+            trust_state not in trust_statuses
+            or pairing_status not in trust_statuses[trust_state]
+            or transport_state not in known_transport_states
+        ):
+            raise SystemExit(1)
+        if trust_state == "pending":
+            raise SystemExit(1)
+        durable = trust_state == "approved"
+    if not durable:
+        continue
+
+    host_server_identity = pairing.get("host_server_identity")
+    hub_id = pairing.get("hub_id")
+    team_id = pairing.get("team_id")
+    host_ca_fingerprint = pairing.get("host_ca_fingerprint")
+    peer_public_key_fingerprint = pairing.get("peer_public_key_fingerprint")
+    certificate_fingerprint = pairing.get("certificate_fingerprint")
+    transcript_hash = pairing.get("transcript_hash")
+    requested_scopes = pairing.get("requested_scopes")
+    granted_scopes = pairing.get("granted_scopes")
+    is_active = connection_id == active_connection_id
+    expected_base_path = (
+        f"/api/team-hub-secure/{connection_id}" if is_active else None
+    )
+    if (
+        pairing_status != ("connected" if is_active else "approved")
+        or (
+            status_version == 2
+            and pairing.get("transport_state")
+            not in ({"online", "reconnecting", "offline"} if is_active else {"disconnected"})
+        )
+        or pairing.get("peer_server_identity") != host_server_identity
+        or not valid_identifier(host_server_identity)
+        or not valid_identifier(hub_id)
+        or not valid_identifier(team_id)
+        or not all(
+            isinstance(value, str) and fingerprint.fullmatch(value) is not None
+            for value in (
+                host_ca_fingerprint,
+                peer_public_key_fingerprint,
+                certificate_fingerprint,
+            )
+        )
+        or not isinstance(transcript_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", transcript_hash) is None
+        or not isinstance(requested_scopes, list)
+        or not 1 <= len(requested_scopes) <= 4
+        or len(set(requested_scopes)) != len(requested_scopes)
+        or not all(isinstance(scope, str) and scope for scope in requested_scopes)
+        or not isinstance(granted_scopes, list)
+        or not 1 <= len(granted_scopes) <= 4
+        or len(set(granted_scopes)) != len(granted_scopes)
+        or not all(isinstance(scope, str) and scope for scope in granted_scopes)
+        or not set(granted_scopes).issubset(requested_scopes)
+        or pairing.get("local_proxy_base_path") != expected_base_path
+    ):
+        raise SystemExit(1)
+    durable_pairings.append(
+        {
+            "id": pairing_id,
+            "connection_id": connection_id,
+            "host_server_identity": host_server_identity,
+            "hub_id": hub_id,
+            "team_id": team_id,
+            "host_ca_fingerprint": host_ca_fingerprint,
+            "peer_public_key_fingerprint": peer_public_key_fingerprint,
+            "transcript_hash": transcript_hash,
+            # The leaf certificate is intentionally not a continuity key:
+            # startup may renew it while retaining the durable trust anchors.
+            "requested_scopes": sorted(requested_scopes),
+            "granted_scopes": sorted(granted_scopes),
+        }
+    )
+
+if active_connection_id is not None and active_connection_id not in {
+    item["connection_id"] for item in durable_pairings
+}:
+    raise SystemExit(1)
+if not durable_pairings:
+    if active_connection_id is not None or not exact_values(team_hub, disabled_capability):
+        raise SystemExit(1)
+    print('{"kind":"disabled"}')
+    raise SystemExit(0)
+
+binding = {
+    "kind": "secure_peer_client",
+    "active_connection_id": active_connection_id,
+    "pairings": sorted(durable_pairings, key=lambda item: item["connection_id"]),
+}
+if active_connection_id is None:
+    if not exact_values(team_hub, disabled_capability):
+        raise SystemExit(1)
+else:
+    active_pairing = next(
+        item for item in durable_pairings
+        if item["connection_id"] == active_connection_id
+    )
+    base_path = f"/api/team-hub-secure/{active_connection_id}"
+    route = {
+        "transport": "secure_peer",
+        "hub_url": None,
+        "base_path": base_path,
+        "connection_id": active_connection_id,
+        "host_server_identity": active_pairing["host_server_identity"],
+        "hub_id": active_pairing["hub_id"],
+    }
+    active_capability = {
+        "available": True,
+        "designated_host": False,
+        "version": 1,
+        "base_path": base_path,
+        "transport": "secure_peer",
+        "hub_url": None,
+        "connection_id": active_connection_id,
+        "hub_id": active_pairing["hub_id"],
+        "host_server_identity": active_pairing["host_server_identity"],
+        "routes": [route],
+    }
+    # The health projection intentionally disappears while the active client
+    # is offline or stale. Durable status remains authoritative in that case.
+    if not (
+        exact_values(team_hub, disabled_capability)
+        or exact_values(team_hub, active_capability)
+    ):
+        raise SystemExit(1)
+print(json.dumps(binding, sort_keys=True, separators=(",", ":")))
+PY
+}
+
+capture_managed_team_hub_client_binding() {
+  local port="$1"
+  local runtime_root="$2"
+  local expected_server="$3"
+  local health_file=""
+  local status_file=""
+  local binding_file=""
+  health_file="$(mktemp "$STATE_ROOT/admin/.install-pre-health.XXXXXX")" || return 1
+  status_file="$(mktemp "$STATE_ROOT/admin/.install-pre-peer-status.XXXXXX")" || {
+    rm -f "$health_file"
+    return 1
+  }
+  binding_file="$(mktemp "$STATE_ROOT/admin/.install-client-binding.XXXXXX")" || {
+    rm -f "$health_file" "$status_file"
+    return 1
+  }
+  chmod 600 "$health_file" "$status_file" "$binding_file"
+  if ! fetch_managed_json "$port" "/api/health" core "$health_file"; then
+    rm -f "$health_file" "$status_file" "$binding_file"
+    return 1
+  fi
+  # Legacy sources predate the control endpoint. The projection below accepts
+  # a missing status response only when the health capability is also absent.
+  if ! fetch_managed_json \
+      "$port" \
+      "/api/admin/secure-peers/v1/status" \
+      secure-peer \
+      "$status_file"; then
+    : > "$status_file"
+  fi
+  if ! managed_secure_peer_binding_from_responses \
+      "$runtime_root" \
+      "$health_file" \
+      "$status_file" \
+      "$expected_server" \
+      "true" > "$binding_file"; then
+    rm -f "$health_file" "$status_file" "$binding_file"
+    return 1
+  fi
+  EXPECTED_TEAM_HUB_CLIENT_BINDING="$(tr -d '\r\n' < "$binding_file")"
+  rm -f "$health_file" "$status_file" "$binding_file"
+  [[ -n "$EXPECTED_TEAM_HUB_CLIENT_BINDING" ]]
+}
+
 release_health_check_once() {
   local port="$1"
   local runtime_root="$2"
@@ -1960,14 +2327,24 @@ release_health_check_once() {
   local expected_hub_url="$8"
   local allow_legacy_transport="${9:-false}"
   local response_file=""
+  local status_file=""
+  local observed_binding_file=""
   response_file="$(mktemp "$STATE_ROOT/admin/.install-health.XXXXXX")" || return 1
-  chmod 600 "$response_file"
+  status_file="$(mktemp "$STATE_ROOT/admin/.install-peer-status.XXXXXX")" || {
+    rm -f "$response_file"
+    return 1
+  }
+  observed_binding_file="$(mktemp "$STATE_ROOT/admin/.install-observed-binding.XXXXXX")" || {
+    rm -f "$response_file" "$status_file"
+    return 1
+  }
+  chmod 600 "$response_file" "$status_file" "$observed_binding_file"
   if command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1; then
     if ! curl --fail --silent --show-error --connect-timeout 1 --max-time 2 --max-filesize 1048576 \
       -H "Authorization: Bearer $TOKEN" \
       --output "$response_file" \
       "http://127.0.0.1:$port/api/health" >/dev/null 2>&1; then
-      rm -f "$response_file"
+      rm -f "$response_file" "$status_file" "$observed_binding_file"
       return 1
     fi
   elif ! wget \
@@ -1977,14 +2354,14 @@ release_health_check_once() {
     --header="Authorization: Bearer $TOKEN" \
     --output-document="$response_file" \
     "http://127.0.0.1:$port/api/health" >/dev/null 2>&1; then
-    rm -f "$response_file"
+    rm -f "$response_file" "$status_file" "$observed_binding_file"
     return 1
   fi
   local response_size=""
   response_size="$(wc -c < "$response_file" 2>/dev/null || true)"
   response_size="${response_size//[[:space:]]/}"
   if [[ ! "$response_size" =~ ^[0-9]+$ ]] || ((response_size > 1048576)); then
-    rm -f "$response_file"
+    rm -f "$response_file" "$status_file" "$observed_binding_file"
     return 1
   fi
   local result=1
@@ -1997,7 +2374,8 @@ release_health_check_once() {
     "$expected_hub_transport" \
     "$expected_hub_url" \
     "$TEAM_HUB_DIRECT_IP_URL" \
-    "$allow_legacy_transport" <<'PY'
+    "$allow_legacy_transport" \
+    "$EXPECTED_TEAM_HUB_CLIENT_BINDING" <<'PY'
 import json
 import re
 import sys
@@ -2012,6 +2390,7 @@ import sys
     expected_hub_url,
     expected_direct_ip_url,
     allow_legacy_transport,
+    expected_client_binding_json,
 ) = sys.argv[1:]
 try:
     with open(path, "rb") as stream:
@@ -2030,6 +2409,16 @@ if expected_server and server_identity != expected_server:
 capabilities = health.get("capabilities")
 capability = capabilities.get("team_hub_v1") if isinstance(capabilities, dict) else None
 if not isinstance(capability, dict):
+    raise SystemExit(1)
+try:
+    expected_client_binding = (
+        json.loads(expected_client_binding_json)
+        if expected_client_binding_json
+        else None
+    )
+except json.JSONDecodeError:
+    raise SystemExit(1)
+if expected_client_binding is not None and not isinstance(expected_client_binding, dict):
     raise SystemExit(1)
 if hub_mode == "host":
     required = {
@@ -2071,7 +2460,12 @@ if hub_mode == "host":
         if not (allow_legacy_transport == "true" and routes is None):
             raise SystemExit(1)
 elif hub_mode == "disabled":
-    required = {
+    binding_kind = (
+        expected_client_binding.get("kind")
+        if expected_client_binding is not None
+        else "disabled"
+    )
+    disabled_required = {
         "available": False,
         "designated_host": False,
         "version": 1,
@@ -2081,6 +2475,63 @@ elif hub_mode == "disabled":
         "transport": None,
         "hub_url": None,
     }
+    if binding_kind == "disabled":
+        required = disabled_required
+    elif binding_kind == "secure_peer_client":
+        connection_id = expected_client_binding.get("active_connection_id")
+        pairings = expected_client_binding.get("pairings")
+        if not isinstance(pairings, list) or not pairings:
+            raise SystemExit(1)
+        if connection_id is None:
+            required = disabled_required
+        else:
+            active = [
+                item
+                for item in pairings
+                if isinstance(item, dict)
+                and item.get("connection_id") == connection_id
+            ]
+            if len(active) != 1:
+                raise SystemExit(1)
+            hub_id = active[0].get("hub_id")
+            host_server_identity = active[0].get("host_server_identity")
+            identifier = re.compile(r"[A-Za-z0-9_.:-]{8,240}")
+            if not all(
+                isinstance(value, str) and identifier.fullmatch(value) is not None
+                for value in (connection_id, hub_id, host_server_identity)
+            ):
+                raise SystemExit(1)
+            expected_base_path = f"/api/team-hub-secure/{connection_id}"
+            expected_route = {
+                "transport": "secure_peer",
+                "hub_url": None,
+                "base_path": expected_base_path,
+                "connection_id": connection_id,
+                "host_server_identity": host_server_identity,
+                "hub_id": hub_id,
+            }
+            active_required = {
+                "available": True,
+                "designated_host": False,
+                "version": 1,
+                "base_path": expected_base_path,
+                "hub_id": hub_id,
+                "host_server_identity": host_server_identity,
+                "transport": "secure_peer",
+                "hub_url": None,
+                "connection_id": connection_id,
+                "routes": [expected_route],
+            }
+            # A paired client is intentionally omitted from health while its
+            # heartbeat is stale/offline. The authenticated status endpoint
+            # below remains the durable continuity proof.
+            required = (
+                disabled_required
+                if capability.get("available") is False
+                else active_required
+            )
+    else:
+        raise SystemExit(1)
     if any(capability.get(key) != value for key, value in required.items()):
         raise SystemExit(1)
 else:
@@ -2106,8 +2557,27 @@ else:
 PY
   then
     result=0
+    if [[ -n "$EXPECTED_TEAM_HUB_CLIENT_BINDING" ]]; then
+      if ! fetch_managed_json \
+          "$port" \
+          "/api/admin/secure-peers/v1/status" \
+          secure-peer \
+          "$status_file"; then
+        : > "$status_file"
+      fi
+      if ! managed_secure_peer_binding_from_responses \
+          "$runtime_root" \
+          "$response_file" \
+          "$status_file" \
+          "$expected_server" \
+          "$allow_legacy_transport" > "$observed_binding_file"; then
+        result=1
+      elif [[ "$(tr -d '\r\n' < "$observed_binding_file")" != "$EXPECTED_TEAM_HUB_CLIENT_BINDING" ]]; then
+        result=1
+      fi
+    fi
   fi
-  rm -f "$response_file"
+  rm -f "$response_file" "$status_file" "$observed_binding_file"
   return "$result"
 }
 
@@ -2173,6 +2643,10 @@ wait_for_release_health() {
 wait_for_previous_release_health() {
   local previous_version=""
   local rollback_attempts="$HEALTH_CHECK_ATTEMPTS"
+  local previous_hub_mode="host"
+  local previous_hub_id="$EXPECTED_TEAM_HUB_ID"
+  local previous_hub_transport="$PREVIOUS_TEAM_HUB_TRANSPORT"
+  local previous_hub_url="$PREVIOUS_TEAM_HUB_URL"
   [[ -n "$OLD_TARGET" && -f "$OLD_TARGET/VERSION" ]] || {
     echo "The previous release version cannot be verified." >&2
     return 1
@@ -2185,14 +2659,20 @@ wait_for_previous_release_health() {
   if ((rollback_attempts > ROLLBACK_HEALTH_CHECK_MAX_ATTEMPTS)); then
     rollback_attempts="$ROLLBACK_HEALTH_CHECK_MAX_ATTEMPTS"
   fi
+  if [[ "$TEAM_HUB_OPERATION_PENDING" != "true" ]]; then
+    previous_hub_mode="disabled"
+    previous_hub_id=""
+    previous_hub_transport="loopback"
+    previous_hub_url=""
+  fi
   wait_for_exact_release_health \
     "$OLD_TARGET" \
     "$previous_version" \
     "$EXPECTED_SERVER_IDENTITY" \
-    "host" \
-    "$EXPECTED_TEAM_HUB_ID" \
-    "$PREVIOUS_TEAM_HUB_TRANSPORT" \
-    "$PREVIOUS_TEAM_HUB_URL" \
+    "$previous_hub_mode" \
+    "$previous_hub_id" \
+    "$previous_hub_transport" \
+    "$previous_hub_url" \
     "restored release" \
     "$rollback_attempts" \
     "true"
@@ -2228,6 +2708,16 @@ fi
 if ! validate_managed_team_hub_inputs "$CURRENT_LINK"; then
   echo "Managed Team Hub inputs changed before candidate activation." >&2
   exit 1
+fi
+if [[ -n "$EXPECTED_SERVER_IDENTITY" && "$TEAM_HUB_MODE" == "disabled" && -n "$OLD_TARGET" && -e "$OLD_TARGET" ]]; then
+  echo "      Binding current Teamspace client state before takeover"
+  if ! capture_managed_team_hub_client_binding \
+      "$PORT" \
+      "$STAGE_DIR" \
+      "$EXPECTED_SERVER_IDENTITY"; then
+    echo "Could not bind the current authenticated Teamspace client before candidate activation." >&2
+    exit 1
+  fi
 fi
 
 backup_runtime_configuration

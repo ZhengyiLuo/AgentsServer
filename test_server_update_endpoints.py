@@ -520,7 +520,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response["managed_updates"])
         self.assertEqual(
             response["capabilities"]["server_updates"]["version"],
-            7,
+            8,
         )
         self.assertEqual(response["update_service_cgroup"], {
             "safe": True,
@@ -1357,7 +1357,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
         run_tmux.assert_called_once()
 
-    async def test_pending_waiter_defers_for_admitted_mutation_then_transitions(self):
+    async def test_pending_waiter_defers_for_cancelled_mutation_then_transitions(self):
         def request(path: str):
             return agent_server.Request({
                 "type": "http",
@@ -1397,7 +1397,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(agent_server, "SERVER_MAINTENANCE_SESSIONS", set()), \
                  patch.object(agent_server, "QUEUED_TURNS", {}), \
                  patch.object(agent_server, "RUN_NOW_TURNS", {}), \
-                 patch.object(agent_server, "UNSAFE_HTTP_MUTATIONS_IN_FLIGHT", 0), \
+                 patch.object(agent_server, "UNSAFE_HTTP_MUTATION_TASKS", {}), \
                  patch.object(agent_server, "active_provider_background_work_labels", return_value=[]), \
                  patch.object(agent_server, "server_update_is_active", return_value=False), \
                  patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
@@ -1421,10 +1421,17 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
                 await asyncio.wait_for(mutation_entered.wait(), timeout=1)
+                mutation_task.cancel()
+                await asyncio.sleep(0)
+                mutation_task.cancel()
+                await asyncio.sleep(0)
                 still_pending = await agent_server.advance_pending_server_update_once()
-                self.assertEqual(agent_server.UNSAFE_HTTP_MUTATIONS_IN_FLIGHT, 1)
+                self.assertEqual(agent_server.unsafe_http_mutation_count_locked(), 1)
+                self.assertFalse(mutation_task.done())
+                run_tmux.assert_not_called()
                 release_mutation.set()
-                mutation_response = await mutation_task
+                with self.assertRaises(asyncio.CancelledError):
+                    await mutation_task
                 started = await agent_server.advance_pending_server_update_once()
                 blocked_next = AsyncMock()
                 blocked_mutation = await agent_server.require_agent_token(
@@ -1438,14 +1445,89 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
             still_pending["blocker_counts"]["in_flight_server_changes"],
             1,
         )
-        self.assertEqual(mutation_response.status_code, 200)
-        self.assertEqual(agent_server.UNSAFE_HTTP_MUTATIONS_IN_FLIGHT, 0)
+        self.assertEqual(agent_server.unsafe_http_mutation_count_locked(), 0)
         self.assertEqual(started["phase"], "starting")
         self.assertEqual(started["schedule_id"], pending["schedule_id"])
         self.assertEqual(blocked_mutation.status_code, 409)
         self.assertIn(b"preparing a managed update", blocked_mutation.body)
         blocked_next.assert_not_awaited()
         run_tmux.assert_called_once()
+
+    async def test_cancelled_http_mutation_holds_lease_until_thread_finishes(self):
+        path = "/api/sessions/chat/unread"
+        request = agent_server.Request({
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "method": "POST",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "root_path": "",
+            "headers": [],
+            "client": ("127.0.0.1", 50000),
+            "server": ("127.0.0.1", 7850),
+        })
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_write():
+            entered.set()
+            release.wait()
+
+        async def slow_mutation(_request):
+            await asyncio.to_thread(blocked_write)
+            return agent_server.JSONResponse({"saved": True})
+
+        with patch.object(agent_server, "AGENT_TOKEN", ""), \
+             patch.object(agent_server, "UNSAFE_HTTP_MUTATION_TASKS", {}):
+            mutation = asyncio.create_task(
+                agent_server.require_agent_token(request, slow_mutation)
+            )
+            entered_ready = await asyncio.wait_for(
+                asyncio.to_thread(entered.wait, 1),
+                timeout=2,
+            )
+            self.assertTrue(entered_ready)
+            mutation.cancel()
+            await asyncio.sleep(0)
+            mutation.cancel()
+            await asyncio.sleep(0)
+
+            # Cancelling the asyncio wrapper does not stop its worker thread.
+            # The exact lease must remain until that real mutation settles.
+            self.assertFalse(mutation.done())
+            self.assertEqual(agent_server.unsafe_http_mutation_count_locked(), 1)
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await mutation
+            await asyncio.sleep(0)
+
+            self.assertEqual(agent_server.unsafe_http_mutation_count_locked(), 0)
+
+    async def test_mutation_registry_prunes_only_finished_tasks(self):
+        release = asyncio.Event()
+        live = asyncio.create_task(release.wait())
+        completed = asyncio.create_task(asyncio.sleep(0))
+        cancelled = asyncio.create_task(asyncio.sleep(60))
+        await completed
+        cancelled.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await cancelled
+
+        registry = {
+            "completed": completed,
+            "cancelled": cancelled,
+            "live": live,
+        }
+        with patch.object(agent_server, "UNSAFE_HTTP_MUTATION_TASKS", registry):
+            self.assertEqual(
+                agent_server.live_unsafe_http_mutation_ids_locked(),
+                ["live"],
+            )
+            release.set()
+            await live
+            self.assertEqual(agent_server.unsafe_http_mutation_count_locked(), 0)
 
     async def test_pending_cancel_is_exact_and_stale_waiter_cannot_restart_it(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1565,7 +1647,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.detail["code"], "server_update_not_cancelable")
         self.assertEqual(raised.exception.detail["schedule_id"], pending["schedule_id"])
 
-    async def test_pending_is_passive_for_new_and_existing_agent_work(self):
+    async def test_pending_fences_new_work_but_preserves_drain_controls(self):
         with tempfile.TemporaryDirectory() as temporary:
             status_path = Path(temporary) / "status.json"
             stop_turn = AsyncMock(return_value={"stopped": True})
@@ -1593,9 +1675,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                     blocker_counts={"active_runs": 1},
                 )
                 self.assertIsNone(agent_server.managed_server_update_blocker())
-                self.assertIsNone(
-                    agent_server.managed_server_update_admission_blocker()
-                )
+                admission = agent_server.managed_server_update_admission_blocker()
                 interactive = await agent_server.turn_start_blocker()
                 scheduled = await agent_server.scheduled_job_blocker("other-chat")
                 stopped = await agent_server.stop_turn_endpoint("active-chat")
@@ -1614,8 +1694,9 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
 
-        self.assertIsNone(interactive)
-        self.assertIsNone(scheduled)
+        self.assertIn("waiting for existing work", admission)
+        self.assertEqual(interactive, admission)
+        self.assertEqual(scheduled, admission)
         self.assertEqual(stopped, {"stopped": True})
         self.assertEqual(codex["interaction"]["status"], "resolved")
         self.assertEqual(claude["interaction"]["status"], "resolved")
@@ -1623,7 +1704,214 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         resolve_codex.assert_awaited_once()
         resolve_claude.assert_awaited_once()
 
-    async def test_pending_allows_messages_and_normal_http_mutations(self):
+    async def test_user_message_is_parked_durably_while_update_is_pending(self):
+        queued = {"status": "queued", "queued_id": "queued-after-update"}
+        store = MagicMock()
+        store.sessions = {"chat": {"id": "chat", "backend": "codex"}}
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(
+                 agent_server,
+                 "SERVER_UPDATE_STATUS_FILE",
+                 Path(temporary) / "status.json",
+             ), \
+             patch.object(agent_server, "STORE", store), \
+             patch.object(
+                 agent_server,
+                 "start_turn",
+                 new=AsyncMock(
+                     side_effect=agent_server.ManagedServerUpdatePendingError()
+                 ),
+             ), \
+             patch.object(
+                 agent_server,
+                 "enqueue_turn",
+                 new=AsyncMock(return_value=queued),
+             ) as enqueue:
+            agent_server.write_fresh_server_update_status(
+                phase="pending",
+                schedule_id="e" * 32,
+                target_version="1.1.0",
+                track="stable",
+                when_idle=True,
+                cancelable=True,
+                blocker_counts={"active_runs": 1},
+            )
+            request = agent_server.TurnRequest(prompt="keep this message")
+            result = await agent_server.post_turn("chat", request)
+
+        self.assertEqual(result, queued)
+        enqueue.assert_awaited_once_with("chat", request, store.sessions["chat"])
+
+    async def test_generic_503_does_not_bypass_turn_admission(self):
+        store = MagicMock()
+        store.sessions = {"chat": {"id": "chat", "backend": "codex"}}
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(
+                 agent_server,
+                 "SERVER_UPDATE_STATUS_FILE",
+                 Path(temporary) / "status.json",
+             ), \
+             patch.object(agent_server, "STORE", store), \
+             patch.object(
+                 agent_server,
+                 "start_turn",
+                 new=AsyncMock(
+                     side_effect=HTTPException(
+                         status_code=503,
+                         detail="some unrelated dependency is unavailable",
+                     )
+                 ),
+             ), \
+             patch.object(
+                 agent_server,
+                 "enqueue_turn",
+                 new_callable=AsyncMock,
+             ) as enqueue:
+            agent_server.write_fresh_server_update_status(
+                phase="pending",
+                schedule_id="e" * 32,
+                target_version="1.1.0",
+                track="stable",
+                when_idle=True,
+                cancelable=True,
+                blocker_counts={"active_runs": 1},
+            )
+            with self.assertRaises(HTTPException) as raised:
+                await agent_server.post_turn(
+                    "chat",
+                    agent_server.TurnRequest(prompt="do not misclassify this"),
+                )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        enqueue.assert_not_awaited()
+
+    async def test_pending_fallback_revalidates_archived_chat(self):
+        store = MagicMock()
+        store.sessions = {"chat": {"id": "chat", "backend": "codex"}}
+
+        async def archive_then_report_pending(*_args, **_kwargs):
+            store.sessions["chat"]["archived"] = True
+            raise agent_server.ManagedServerUpdatePendingError()
+
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(
+                 agent_server,
+                 "SERVER_UPDATE_STATUS_FILE",
+                 Path(temporary) / "status.json",
+             ), \
+             patch.object(agent_server, "STORE", store), \
+             patch.object(agent_server, "start_turn", new=archive_then_report_pending), \
+             patch.object(
+                 agent_server,
+                 "enqueue_turn",
+                 new_callable=AsyncMock,
+             ) as enqueue:
+            agent_server.write_fresh_server_update_status(
+                phase="pending",
+                schedule_id="e" * 32,
+                target_version="1.1.0",
+                track="stable",
+                when_idle=True,
+                cancelable=True,
+                blocker_counts={"active_runs": 1},
+            )
+            with self.assertRaises(HTTPException) as raised:
+                await agent_server.post_turn(
+                    "chat",
+                    agent_server.TurnRequest(prompt="do not queue after archive"),
+                )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        enqueue.assert_not_awaited()
+
+    async def test_pending_fallback_retries_when_update_was_cancelled(self):
+        store = MagicMock()
+        store.sessions = {"chat": {"id": "chat", "backend": "codex"}}
+        accepted = {"run_id": "run-after-cancel"}
+        with tempfile.TemporaryDirectory() as temporary:
+            status_path = Path(temporary) / "status.json"
+
+            async def cancel_then_report_pending(*_args, **_kwargs):
+                agent_server.write_fresh_server_update_status(
+                    phase="available",
+                    latest_version="1.1.0",
+                    update_available=True,
+                )
+                raise agent_server.ManagedServerUpdatePendingError()
+
+            calls = 0
+
+            async def start_side_effect(*_args, **_kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    return await cancel_then_report_pending()
+                return accepted
+
+            with patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", status_path), \
+                 patch.object(agent_server, "STORE", store), \
+                 patch.object(agent_server, "start_turn", new=AsyncMock(side_effect=start_side_effect)) as start, \
+                 patch.object(
+                     agent_server,
+                     "enqueue_turn",
+                     new_callable=AsyncMock,
+                 ) as enqueue:
+                agent_server.write_fresh_server_update_status(
+                    phase="pending",
+                    schedule_id="e" * 32,
+                    target_version="1.1.0",
+                    track="stable",
+                    when_idle=True,
+                    cancelable=True,
+                    blocker_counts={"active_runs": 1},
+                )
+                result = await agent_server.post_turn(
+                    "chat",
+                    agent_server.TurnRequest(prompt="start after cancellation"),
+                )
+
+        self.assertEqual(result, accepted)
+        self.assertEqual(start.await_count, 2)
+        enqueue.assert_not_awaited()
+
+    async def test_cancel_pending_update_wakes_durable_queues_immediately(self):
+        wake_queues = MagicMock(return_value=1)
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(
+                 agent_server,
+                 "SERVER_UPDATE_STATUS_FILE",
+                 Path(temporary) / "status.json",
+             ), \
+             patch.object(
+                 agent_server.TERMINAL_ATTACHMENTS,
+                 "reopen_if_update_inactive",
+                 new=AsyncMock(),
+             ), \
+             patch.object(
+                 agent_server,
+                 "schedule_rebuilt_queued_turns",
+                 wake_queues,
+             ):
+            pending = agent_server.write_fresh_server_update_status(
+                phase="pending",
+                schedule_id="c" * 32,
+                target_version="1.1.0",
+                latest_version="1.1.0",
+                track="stable",
+                when_idle=True,
+                cancelable=True,
+                blocker_counts={"active_runs": 1},
+            )
+            cancelled = await agent_server.cancel_server_update(
+                agent_server.ServerUpdateCancelRequest(
+                    schedule_id=pending["schedule_id"],
+                )
+            )
+
+        self.assertEqual(cancelled["phase"], "available")
+        wake_queues.assert_called_once_with()
+
+    async def test_pending_allows_drain_safe_http_mutations(self):
         def request(method: str, path: str):
             return agent_server.Request({
                 "type": "http",
@@ -1641,7 +1929,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as temporary, \
              patch.object(agent_server, "AGENT_TOKEN", ""), \
-             patch.object(agent_server, "UNSAFE_HTTP_MUTATIONS_IN_FLIGHT", 0), \
+             patch.object(agent_server, "UNSAFE_HTTP_MUTATION_TASKS", {}), \
              patch.object(
                  agent_server,
                  "SERVER_UPDATE_STATUS_FILE",
@@ -1662,12 +1950,11 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                 observed.append((
                     incoming.method,
                     incoming.url.path,
-                    agent_server.UNSAFE_HTTP_MUTATIONS_IN_FLIGHT,
+                    agent_server.unsafe_http_mutation_count_locked(),
                 ))
                 return agent_server.JSONResponse({"accepted": True})
 
             for method, path in (
-                ("POST", "/api/sessions/chat/turn"),
                 ("POST", "/api/sessions/chat/unread"),
                 ("PATCH", "/api/sessions/chat"),
             ):
@@ -1681,12 +1968,11 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             observed,
             [
-                ("POST", "/api/sessions/chat/turn", 1),
                 ("POST", "/api/sessions/chat/unread", 1),
                 ("PATCH", "/api/sessions/chat", 1),
             ],
         )
-        self.assertEqual(agent_server.UNSAFE_HTTP_MUTATIONS_IN_FLIGHT, 0)
+        self.assertEqual(agent_server.unsafe_http_mutation_count_locked(), 0)
         self.assertEqual(pending["phase"], "pending")
         self.assertEqual(pending["schedule_id"], "f" * 32)
 
@@ -2270,10 +2556,20 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(agent_server, "AGENT_TOKEN", "test-secret"), \
                  patch.object(agent_server, "BUSY_SESSIONS", set()), \
                  patch.object(agent_server, "SERVER_MAINTENANCE_SESSIONS", set()), \
-                 patch.object(agent_server, "QUEUED_TURNS", {}), \
+                 patch.object(agent_server, "QUEUED_TURNS", {
+                     "chat": deque([{
+                         "queued_id": "resume-after-launch-failure",
+                         "_durable": True,
+                     }]),
+                 }), \
                  patch.object(agent_server, "RUN_NOW_TURNS", {}), \
                  patch.object(agent_server, "server_update_is_active", return_value=False), \
                  patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
+                 patch.object(
+                     agent_server,
+                     "schedule_rebuilt_queued_turns",
+                     return_value=1,
+                 ) as wake_queues, \
                  patch.object(
                      agent_server,
                      "run_tmux",
@@ -2291,6 +2587,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["phase"], "failed")
         self.assertIsNone(blocker)
         self.assertEqual(credentials, [])
+        wake_queues.assert_called_once_with()
 
     async def test_starting_update_blocks_new_interactive_and_scheduled_work(self):
         with tempfile.TemporaryDirectory() as temporary, \

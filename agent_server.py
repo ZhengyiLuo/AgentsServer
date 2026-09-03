@@ -8613,6 +8613,28 @@ class JobStore:
                                 concise_error_message(exc),
                             )
                         continue
+                    lifecycle_defer_reason = (
+                        scheduled_job_lifecycle_admission_defer_reason(e)
+                    )
+                    if lifecycle_defer_reason:
+                        if manual_run_pending:
+                            await self._record_manual_run_deferred(
+                                jid,
+                                lifecycle_defer_reason,
+                            )
+                        else:
+                            # Preserve the canonical occurrence and use the due
+                            # snapshot as a CAS guard. If a user edited/replaced
+                            # the schedule while dispatch was in flight, that
+                            # revision owns timing and defer cannot overwrite it.
+                            await self.defer(
+                                jid,
+                                lifecycle_defer_reason,
+                                JOB_BUSY_RETRY_SECONDS,
+                                expected_revision=due_revision,
+                                expected_next_run_at=due_next_run_at,
+                            )
+                        continue
                     if manual_run_pending:
                         logger.warning(
                             "pending manual job %s failed permanently: %s",
@@ -11572,6 +11594,7 @@ async def enqueue_turn(
         "grant_admission_" + uuid.uuid4().hex
     )
     queue_event_committed = False
+    queue_event_revoked = False
     item: dict[str, Any]
     display_prompt = req.display_prompt if req.display_prompt is not None else req.prompt
     secure_snapshots = (
@@ -11583,7 +11606,10 @@ async def enqueue_turn(
         )
     )
     async with QUEUE_LOCK:
-        update_blocker = managed_server_update_admission_blocker()
+        # A pending update fences execution, not durable intake. Messages that
+        # arrive while existing work drains are persisted for the replacement
+        # process; active update/restart phases still reject new mutations.
+        update_blocker = managed_server_update_blocker()
         if update_blocker:
             raise HTTPException(status_code=503, detail=update_blocker)
         try:
@@ -11729,6 +11755,11 @@ async def enqueue_turn(
                 ],
             })
             queue_event_committed = True
+            # The fsynced turn_queued event is the authoritative ownership
+            # boundary. Publish that fact without another await so repeated
+            # cancellation can never turn a recoverable row into a disk-only
+            # "orphan" that disappears until process restart.
+            item["_durable"] = True
             await commit_durable_provider_cross_chat_reference_grants(
                 session_id,
                 route_grant_mutation,
@@ -11757,7 +11788,7 @@ async def enqueue_turn(
                             bind_task
                         )
                     if bound is not None:
-                        with suppress(BaseException):
+                        try:
                             await append_durable_event(
                                 session_id,
                                 "turn_unqueued",
@@ -11773,6 +11804,9 @@ async def enqueue_turn(
                                     "message": "Cross-chat queue admission was cancelled before completion.",
                                 },
                             )
+                            queue_event_revoked = True
+                        except BaseException:
+                            pass
                         with suppress(BaseException):
                             failed = await update_cross_chat_delivery_record(
                                 req.cross_chat_envelope_id,
@@ -11803,6 +11837,7 @@ async def enqueue_turn(
                         "target_session_id": req.target_session_id,
                         "message": "Cross-chat authorization ended before queue admission.",
                     })
+                    queue_event_revoked = True
                     raise HTTPException(
                         status_code=410,
                         detail="cross-chat authorization ended before queue admission",
@@ -11825,7 +11860,7 @@ async def enqueue_turn(
                             bind_task
                         )
                     if bound is not None:
-                        with suppress(BaseException):
+                        try:
                             await append_durable_event(session_id, "turn_unqueued", {
                                 "queued_id": queued_id,
                                 "purpose": SECURE_PEER_DELIVERY_PURPOSE,
@@ -11836,6 +11871,9 @@ async def enqueue_turn(
                                     "before completion."
                                 ),
                             })
+                            queue_event_revoked = True
+                        except BaseException:
+                            pass
                         with suppress(BaseException):
                             await asyncio.to_thread(
                                 SECURE_PEER_RUNTIME.finish_delivery,
@@ -11854,6 +11892,7 @@ async def enqueue_turn(
                             "Secure peer authorization ended before queue admission."
                         ),
                     })
+                    queue_event_revoked = True
                     raise HTTPException(
                         status_code=410,
                         detail=(
@@ -11861,36 +11900,44 @@ async def enqueue_turn(
                         ),
                     )
         except BaseException:
-            # A non-durable queue entry cannot survive restart. Roll back only
-            # this exact provisional object; concurrent additions keep their
-            # original order.
-            queue = QUEUED_TURNS.get(session_id)
-            if queue is not None:
-                kept = deque(candidate for candidate in queue if candidate is not item)
-                if kept:
-                    QUEUED_TURNS[session_id] = kept
-                else:
-                    QUEUED_TURNS.pop(session_id, None)
-            for envelope_id in obligation_ids:
-                await CROSS_CHAT.update(
-                    envelope_id,
-                    expected={"waiting_source"},
-                    status="failed",
-                    error="source turn could not be durably queued",
-                )
-            for exchange_id in exchange_ids:
-                await CROSS_CHAT.update_exchange(
-                    exchange_id,
-                    expected={"waiting_request"},
-                    status="failed",
-                    error_code="source_failed",
-                    error="source turn could not be durably queued",
-                )
-            if not queue_event_committed:
-                await rollback_durable_provider_cross_chat_reference_grants(
-                    session_id,
-                    route_grant_mutation,
-                )
+            if queue_event_committed and not queue_event_revoked:
+                # The user message already exists in the durable timeline.
+                # Keep the same in-memory row and let normal promotion/recovery
+                # settle it; deleting it here makes the live process disagree
+                # with its journal and is the source of disk-only queue rows.
+                item["_durable"] = True
+                schedule_next_queued_turn(session_id)
+            else:
+                # A provisional row, or one with a matching durable unqueue,
+                # is safe to remove. Roll back only this exact object so
+                # concurrent additions keep their original order.
+                queue = QUEUED_TURNS.get(session_id)
+                if queue is not None:
+                    kept = deque(candidate for candidate in queue if candidate is not item)
+                    if kept:
+                        QUEUED_TURNS[session_id] = kept
+                    else:
+                        QUEUED_TURNS.pop(session_id, None)
+                for envelope_id in obligation_ids:
+                    await CROSS_CHAT.update(
+                        envelope_id,
+                        expected={"waiting_source"},
+                        status="failed",
+                        error="source turn could not be durably queued",
+                    )
+                for exchange_id in exchange_ids:
+                    await CROSS_CHAT.update_exchange(
+                        exchange_id,
+                        expected={"waiting_request"},
+                        status="failed",
+                        error_code="source_failed",
+                        error="source turn could not be durably queued",
+                    )
+                if not queue_event_committed:
+                    await rollback_durable_provider_cross_chat_reference_grants(
+                        session_id,
+                        route_grant_mutation,
+                    )
             raise
         item["_durable"] = True
     if queue_event_committed:
@@ -16637,9 +16684,11 @@ async def _run_queued_turn_now_once(
                 STEERING_SESSIONS.discard(session_id)
             schedule_next_queued_turn(session_id)
 
-        # A second cancellation may arrive while rollback waits for QUEUE_LOCK.
-        # Settle the exact child before exposing cancellation so neither the
-        # transition marker nor its steering fence can become ownerless.
+        # Force Send temporarily turns a durable queue row into a restart-
+        # blocking transition. A second cancellation can arrive while rollback
+        # waits for QUEUE_LOCK; settle the exact rollback child before exposing
+        # cancellation so `_update_transitioning` cannot become a stale managed-
+        # update blocker and its steering fence cannot become ownerless.
         restoration = asyncio.create_task(restore_uncommitted_promotion())
         try:
             await asyncio.shield(restoration)
@@ -26467,17 +26516,23 @@ async def digest_job_is_active(session_id: str, digest_job_id: str, purpose: str
 
 
 async def start_turn_durably(session_id: str, req: TurnRequest) -> dict[str, Any]:
-    try:
-        return await start_turn(session_id, req, queue_if_busy=True)
-    except HTTPException as exc:
-        if exc.status_code != 503:
-            raise
-        sess = STORE.sessions.get(session_id)
-        if not sess:
-            raise
-        queued = await enqueue_turn(session_id, req, sess)
-        schedule_next_queued_turn(session_id)
-        return queued
+    while True:
+        try:
+            return await start_turn(session_id, req, queue_if_busy=True)
+        except ManagedServerUpdatePendingError:
+            async with session_lifecycle_lock(session_id):
+                ensure_session_not_deleting(session_id)
+                sess = STORE.sessions.get(session_id)
+                if not sess:
+                    raise HTTPException(status_code=404, detail="session not found")
+                if sess.get("archived"):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="archived chats cannot start turns",
+                    )
+                if not managed_server_update_is_pending():
+                    continue
+                return await enqueue_turn(session_id, req, sess)
 
 
 async def submit_handoff_digest_source_turn(job: dict[str, Any], *, recovered: bool = False) -> dict[str, Any]:
@@ -37654,8 +37709,8 @@ async def acquire_codex_control_thread(
     maintenance_reserved = False
     active_thread_id = ""
     async with ACTIVE_LOCK:
-        # Active updates/restarts fence provider maintenance and new controls.
-        # A passive update-when-idle reservation does not change admission.
+        # Existing active-turn controls remain available while a pending update
+        # drains, but new provider maintenance is fenced with other new work.
         update_blocker = (
             managed_server_update_blocker()
             if (
@@ -48679,6 +48734,8 @@ async def _start_turn_locked(
     async with ACTIVE_LOCK:
         update_blocker = managed_server_update_admission_blocker()
         if update_blocker:
+            if update_blocker == MANAGED_SERVER_UPDATE_PENDING_DETAIL:
+                raise ManagedServerUpdatePendingError()
             raise HTTPException(status_code=503, detail=update_blocker)
         requested_backend = str(
             req.backend or sess.get("backend") or DEFAULT_BACKEND
@@ -49434,9 +49491,55 @@ TEAM_HUB_BOOTSTRAP_MAX_BODY_BYTES = 4_096
 SECURE_PEER_MAX_BODY_BYTES = 65_536
 UNSAFE_HTTP_MUTATION_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 UNSAFE_HTTP_MUTATION_ADMISSION_LOCK = asyncio.Lock()
-UNSAFE_HTTP_MUTATIONS_IN_FLIGHT = 0
+# Exact leases replace the old scalar counter. A request task can be cancelled
+# again while unwinding its middleware ``finally`` block, so any cleanup that
+# awaits this admission lock can be cancelled before decrementing and strand a
+# permanent update/restart blocker. Lease cleanup is synchronous and exact;
+# completed tasks are also pruned defensively by every authoritative reader.
+UNSAFE_HTTP_MUTATION_TASKS: dict[str, asyncio.Task[Any] | None] = {}
+MANAGED_SERVER_UPDATE_PENDING_DETAIL = (
+    "AgentsServer is waiting for existing work to finish before updating"
+)
+MANAGED_SERVER_UPDATE_ACTIVE_DETAIL = "AgentsServer is preparing a managed update"
+MANAGED_SERVER_RESTART_ACTIVE_DETAIL = "AgentsServer is restarting"
 MANAGED_SERVER_SERVICE_KIND_CACHE: str | None = None
 SERVER_RESTART_SIGNAL_LOCK = threading.Lock()
+
+
+class ManagedServerUpdatePendingError(HTTPException):
+    """Dedicated admission result used to durably park an interactive turn."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            status_code=503,
+            detail=MANAGED_SERVER_UPDATE_PENDING_DETAIL,
+        )
+
+
+def scheduled_job_lifecycle_admission_defer_reason(
+    error: Exception,
+) -> str | None:
+    """Return a retry reason only for the server lifecycle admission fence.
+
+    The scheduler checks its blockers before dispatch, but the managed updater
+    or restart path can establish its fence after that check and before
+    ``start_turn`` reserves the chat. That rejection did not execute the due
+    occurrence, so it must be parked rather than recorded as a failed run.
+    Other HTTP 503 responses can be durable provider/configuration failures and
+    keep the ordinary failure/recurrence behavior.
+    """
+
+    if not isinstance(error, HTTPException) or error.status_code != 503:
+        return None
+    reason = str(error.detail or "").strip()
+    if isinstance(error, ManagedServerUpdatePendingError):
+        return reason
+    if reason in {
+        MANAGED_SERVER_UPDATE_ACTIVE_DETAIL,
+        MANAGED_SERVER_RESTART_ACTIVE_DETAIL,
+    }:
+        return reason
+    return None
 
 
 def managed_server_update_blocks_work(
@@ -49451,7 +49554,7 @@ def managed_server_update_blocks_work(
 def managed_server_update_is_pending(
     status: dict[str, Any] | None = None,
 ) -> bool:
-    """Return whether a passive update-when-idle reservation exists."""
+    """Return whether a durable update-when-idle reservation exists."""
 
     current = status if status is not None else read_server_update_status()
     return str(current.get("phase") or "") == SERVER_UPDATE_PENDING_PHASE
@@ -49459,21 +49562,75 @@ def managed_server_update_is_pending(
 
 def managed_server_update_blocker() -> str | None:
     if managed_server_update_blocks_work():
-        return "AgentsServer is preparing a managed update"
+        return MANAGED_SERVER_UPDATE_ACTIVE_DETAIL
     if managed_server_restart_blocks_work():
-        return "AgentsServer is restarting"
+        return MANAGED_SERVER_RESTART_ACTIVE_DETAIL
     return None
 
 
 def managed_server_update_admission_blocker() -> str | None:
-    """Fence work only after update or restart transition has begun.
+    """Fence new agent work while an update drains or replaces this process."""
 
-    A pending install-when-idle reservation is passive. Normal work remains
-    admissible until the updater atomically observes an idle server and writes
-    an active update phase while holding the same admission locks.
+    blocker = managed_server_update_blocker()
+    if blocker:
+        return blocker
+    if managed_server_update_is_pending():
+        return MANAGED_SERVER_UPDATE_PENDING_DETAIL
+    return None
+
+
+def live_unsafe_http_mutation_ids_locked() -> list[str]:
+    """Return exact live mutation leases, pruning only tasks already finished.
+
+    Callers hold ``UNSAFE_HTTP_MUTATION_ADMISSION_LOCK`` in production. A task
+    with cancellation requested remains live until it is actually done because
+    request code may suppress cancellation and continue committing a change.
     """
 
-    return managed_server_update_blocker()
+    for mutation_id, task in tuple(UNSAFE_HTTP_MUTATION_TASKS.items()):
+        if task is None:
+            continue
+        try:
+            done = task.done()
+        except Exception:
+            done = False
+        if done and UNSAFE_HTTP_MUTATION_TASKS.get(mutation_id) is task:
+            UNSAFE_HTTP_MUTATION_TASKS.pop(mutation_id, None)
+    return sorted(UNSAFE_HTTP_MUTATION_TASKS)
+
+
+def unsafe_http_mutation_count_locked() -> int:
+    return len(live_unsafe_http_mutation_ids_locked())
+
+
+def register_unsafe_http_mutation_locked(
+    task: asyncio.Task[Any],
+) -> tuple[str, asyncio.Task[Any] | None, dict[str, asyncio.Task[Any] | None]]:
+    """Register one downstream mutation and its exact completion fallback."""
+
+    mutation_id = uuid.uuid4().hex
+    registry = UNSAFE_HTTP_MUTATION_TASKS
+    registry[mutation_id] = task
+    def release_finished_mutation(completed: asyncio.Task[Any]) -> None:
+        if registry.get(mutation_id) is completed:
+            registry.pop(mutation_id, None)
+
+    task.add_done_callback(release_finished_mutation)
+    return mutation_id, task, registry
+
+
+def release_unsafe_http_mutation(
+    mutation_id: str,
+    task: asyncio.Task[Any] | None,
+    registry: dict[str, asyncio.Task[Any] | None],
+) -> None:
+    """Release only the exact completed downstream lease, without awaiting."""
+
+    if (
+        registry.get(mutation_id) is task
+        and (task is None or task.done())
+    ):
+        registry.pop(mutation_id, None)
 
 
 def managed_server_restart_is_planned() -> bool:
@@ -49854,7 +50011,8 @@ def server_restart_blocker_snapshot_locked(
         for label in active_provider_background_work_labels()
         if str(label) not in duplicate_provider_labels
     ][:SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT]
-    mutation_count = max(0, int(UNSAFE_HTTP_MUTATIONS_IN_FLIGHT))
+    live_mutation_ids = live_unsafe_http_mutation_ids_locked()
+    mutation_count = len(live_mutation_ids)
     codex_goals_reconfiguring = bool(CODEX_GOALS_RECONFIGURING)
     tmux_state = (
         tmux_cgroup_state
@@ -49893,6 +50051,9 @@ def server_restart_blocker_snapshot_locked(
         "queued_tokens": queued_tokens,
         "provider_work_labels": provider_work_labels,
         "mutation_count": mutation_count,
+        # IDs distinguish replacement requests in the private revision without
+        # exposing request identity through the public restart snapshot.
+        "mutation_ids": live_mutation_ids,
         "deleting_session_ids": deleting_session_ids,
         "codex_goals_reconfiguring": codex_goals_reconfiguring,
         "tmux_server": {
@@ -51477,7 +51638,6 @@ def secure_peer_post_transport_error(request: Request) -> tuple[int, str] | None
 
 @app.middleware("http")
 async def require_agent_token(request: Request, call_next):
-    global UNSAFE_HTTP_MUTATIONS_IN_FLIGHT
     # Starlette otherwise redirects a bare mount path and builds Location from
     # the untrusted Host header. The Hub contract is versioned below the mount;
     # the bare prefix is deliberately inert for every method.
@@ -51680,60 +51840,80 @@ async def require_agent_token(request: Request, call_next):
     if not unsafe_mutation:
         return await call_next(request)
 
-    async with UNSAFE_HTTP_MUTATION_ADMISSION_LOCK:
-        if managed_server_restart_blocks_work():
-            if (
-                team_hub_route
-                or team_hub_server_session_route
-                or team_hub_bootstrap_route
-            ):
-                return JSONResponse(
-                    {
-                        "error": {
-                            "code": "hub_maintenance",
-                            "message": "Team Hub is unavailable during server maintenance",
-                        }
-                    },
-                    status_code=503,
-                )
-            return JSONResponse(
-                {
-                    "detail": server_restart_error_detail(
-                        "server_restarting",
-                        "AgentsServer is restarting and is not accepting server changes.",
-                        action="Wait for the server to reconnect, then retry.",
-                        retryable=True,
-                    )
-                },
-                status_code=409,
-            )
-        if managed_server_update_blocks_work():
-            if (
-                team_hub_route
-                or team_hub_server_session_route
-                or team_hub_bootstrap_route
-            ):
-                return JSONResponse(
-                    {
-                        "error": {
-                            "code": "hub_maintenance",
-                            "message": "Team Hub is unavailable during server maintenance",
-                        }
-                    },
-                    status_code=503,
-                )
-            return JSONResponse(
-                {"detail": "AgentsServer is preparing a managed update"},
-                status_code=409,
-            )
-        UNSAFE_HTTP_MUTATIONS_IN_FLIGHT += 1
+    mutation_id = ""
+    mutation_task: asyncio.Task[Any] | None = None
+    mutation_registry = UNSAFE_HTTP_MUTATION_TASKS
     try:
-        return await call_next(request)
-    finally:
         async with UNSAFE_HTTP_MUTATION_ADMISSION_LOCK:
-            UNSAFE_HTTP_MUTATIONS_IN_FLIGHT = max(
-                0,
-                UNSAFE_HTTP_MUTATIONS_IN_FLIGHT - 1,
+            if managed_server_restart_blocks_work():
+                if (
+                    team_hub_route
+                    or team_hub_server_session_route
+                    or team_hub_bootstrap_route
+                ):
+                    return JSONResponse(
+                        {
+                            "error": {
+                                "code": "hub_maintenance",
+                                "message": "Team Hub is unavailable during server maintenance",
+                            }
+                        },
+                        status_code=503,
+                    )
+                return JSONResponse(
+                    {
+                        "detail": server_restart_error_detail(
+                            "server_restarting",
+                            "AgentsServer is restarting and is not accepting server changes.",
+                            action="Wait for the server to reconnect, then retry.",
+                            retryable=True,
+                        )
+                    },
+                    status_code=409,
+                )
+            if managed_server_update_blocks_work():
+                if (
+                    team_hub_route
+                    or team_hub_server_session_route
+                    or team_hub_bootstrap_route
+                ):
+                    return JSONResponse(
+                        {
+                            "error": {
+                                "code": "hub_maintenance",
+                                "message": "Team Hub is unavailable during server maintenance",
+                            }
+                        },
+                        status_code=503,
+                    )
+                return JSONResponse(
+                    {"detail": "AgentsServer is preparing a managed update"},
+                    status_code=409,
+                )
+            # Own the downstream operation independently from the HTTP caller.
+            # Cancelling an await on asyncio.to_thread only cancels its Future;
+            # the worker keeps mutating state. Shielding this child means the
+            # lease remains authoritative until the actual handler settles.
+            downstream_task = asyncio.create_task(call_next(request))
+            (
+                mutation_id,
+                mutation_task,
+                mutation_registry,
+            ) = register_unsafe_http_mutation_locked(downstream_task)
+        try:
+            return await asyncio.shield(downstream_task)
+        except asyncio.CancelledError:
+            # A disconnected/re-cancelled request cannot release admission
+            # while its downstream thread or coroutine still owns a mutation.
+            with suppress(BaseException):
+                await join_task_despite_caller_cancellation(downstream_task)
+            raise
+    finally:
+        if mutation_id:
+            release_unsafe_http_mutation(
+                mutation_id,
+                mutation_task,
+                mutation_registry,
             )
 
 
@@ -52389,10 +52569,9 @@ async def health() -> dict[str, Any]:
                 "required": False,
                 "message": "Signed Stable and Beta AgentsServer channels are available.",
                 "action": None,
-                # v7 makes durable update-when-idle reservations passive and
-                # begins the active fence only at an atomic idle transition.
-                # v6 already persisted and resumed the reservation.
-                "version": 7,
+                # v8 fences new turn/job materialization while existing work
+                # drains. v7 reservations were durable but passive.
+                "version": 8,
                 "tracks": ["stable", "beta"],
             },
             "tmux": tmux,
@@ -53006,7 +53185,6 @@ async def restart_server_endpoint(
     request: Request,
     background_tasks: BackgroundTasks,
 ) -> dict[str, Any]:
-    global UNSAFE_HTTP_MUTATIONS_IN_FLIGHT
     require_server_restart_control(request)
     request_id = str(body.request_id)
     forced = body.force is True and body.force_confirmed is True
@@ -53527,7 +53705,7 @@ async def _start_server_update(
                         BUSY_SESSIONS | SERVER_MAINTENANCE_SESSIONS
                     )
                     queued_turn_count = update_blocking_queued_turn_count_locked()
-                    mutation_count = UNSAFE_HTTP_MUTATIONS_IN_FLIGHT
+                    mutation_count = unsafe_http_mutation_count_locked()
                     duplicate_provider_labels = {
                         *(f"active chat {session_id}" for session_id in BUSY_SESSIONS),
                         *(
@@ -53825,6 +54003,10 @@ async def _start_server_update(
                 await TEAM_HUB_RUNTIME.reopen_admission()
             if not fence_clear_failed:
                 await TERMINAL_ATTACHMENTS.reopen_admission()
+                # A failed detached launch reopened normal work admission.
+                # Resume durable queues now instead of leaving them parked
+                # until an unrelated retry timer or server restart.
+                schedule_rebuilt_queued_turns()
 
         # The durable drain is now authoritative. Retire only the known idle
         # provider supervisors, then fail closed if any other process remains
@@ -53949,6 +54131,10 @@ async def cancel_server_update(
             checked_at=status.get("checked_at"),
         )
         await TERMINAL_ATTACHMENTS.reopen_if_update_inactive(cancelled)
+        # Messages accepted while the drain was pending are already durable.
+        # Wake their queues immediately when the user cancels instead of
+        # waiting for the periodic deferred-turn retry.
+        schedule_rebuilt_queued_turns()
         return cancelled
 
 
@@ -57444,7 +57630,34 @@ async def _fork_session_locked(
 
 @app.post("/api/sessions/{session_id}/turns")
 async def post_turn(session_id: str, req: TurnRequest) -> dict[str, Any]:
-    return await start_turn(session_id, req)
+    while True:
+        try:
+            return await start_turn(session_id, req)
+        except ManagedServerUpdatePendingError as exc:
+            # The pending fence may be cancelled between admission and this
+            # fallback. Revalidate chat lifecycle and the exact fence under the
+            # same lock used by archive/delete/start; a generic 503 must never
+            # be reinterpreted as permission to bypass normal admission.
+            async with session_lifecycle_lock(session_id):
+                ensure_session_not_deleting(session_id)
+                sess = STORE.sessions.get(session_id)
+                if not sess:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="session not found",
+                    ) from exc
+                if sess.get("archived"):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="archived chats cannot start turns",
+                    ) from exc
+                if not managed_server_update_is_pending():
+                    # Cancellation reopened admission. Retry through the full
+                    # start path after releasing this lifecycle lock.
+                    continue
+                # Accept the user's message durably without materializing a
+                # new run. enqueue_turn owns scheduling once persistence wins.
+                return await enqueue_turn(session_id, req, sess)
 
 
 @app.get("/api/chats/search")
@@ -58544,19 +58757,10 @@ async def submit_provider_route_handoff(
     try:
         return await asyncio.shield(completion)
     except asyncio.CancelledError:
-        def log_completion(task: asyncio.Task[dict[str, Any]]) -> None:
-            if task.cancelled():
-                return
-            with suppress(Exception):
-                error = task.exception()
-                if error is not None:
-                    logger.warning(
-                        "accepted agent route handoff completion failed route=%s error=%s",
-                        route_id,
-                        concise_error_message(error),
-                    )
-
-        completion.add_done_callback(log_completion)
+        # Acceptance may be inside a worker-thread SQLite commit. Do not let
+        # the HTTP mutation lease finish while this child still owns it.
+        with suppress(BaseException):
+            await join_task_despite_caller_cancellation(completion)
         raise
 
 
@@ -58637,19 +58841,8 @@ async def submit_authorized_cross_chat_handoff(
     try:
         return await asyncio.shield(completion)
     except asyncio.CancelledError:
-        def log_completion(task: asyncio.Task[dict[str, Any]]) -> None:
-            if task.cancelled():
-                return
-            with suppress(Exception):
-                error = task.exception()
-                if error is not None:
-                    logger.warning(
-                        "accepted cross-chat handoff completion failed target=%s error=%s",
-                        req.target_session_id,
-                        concise_error_message(error),
-                    )
-
-        completion.add_done_callback(log_completion)
+        with suppress(BaseException):
+            await join_task_despite_caller_cancellation(completion)
         raise
 
 
@@ -58729,9 +58922,8 @@ async def submit_authorized_cross_chat_exchange_response(
     try:
         return await asyncio.shield(completion)
     except asyncio.CancelledError:
-        completion.add_done_callback(
-            lambda task: task.exception() if not task.cancelled() else None
-        )
+        with suppress(BaseException):
+            await join_task_despite_caller_cancellation(completion)
         raise
 
 

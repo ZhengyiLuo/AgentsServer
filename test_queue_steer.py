@@ -221,6 +221,36 @@ class StopTurnProviderReadinessTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(list(queued["chat-1"]), [existing])
 
+    async def test_queue_append_cancellation_cannot_leave_provisional_blocker(self) -> None:
+        queued: dict[str, deque[dict[str, object]]] = {}
+        request = agent_server.TurnRequest(prompt="Do not strand this admission")
+        session = {"id": "chat-1", "backend": "codex"}
+        append_entered = asyncio.Event()
+
+        async def blocked_append(*_args, **_kwargs):
+            append_entered.set()
+            await asyncio.Event().wait()
+
+        with patch.object(agent_server.STORE, "sessions", {"chat-1": session}), \
+             patch.object(agent_server, "QUEUED_TURNS", queued), \
+             patch.object(agent_server, "BUSY_SESSIONS", {"chat-1"}), \
+             patch.object(agent_server, "append_durable_event", side_effect=blocked_append), \
+             patch.object(agent_server, "schedule_next_queued_turn") as schedule:
+            admission = asyncio.create_task(
+                agent_server.enqueue_turn("chat-1", request, session)
+            )
+            await asyncio.wait_for(append_entered.wait(), timeout=1)
+            self.assertEqual(agent_server.update_blocking_queued_turn_count_locked(), 1)
+
+            admission.cancel()
+            admission.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await admission
+
+            self.assertNotIn("chat-1", queued)
+            self.assertEqual(agent_server.update_blocking_queued_turn_count_locked(), 0)
+            schedule.assert_not_called()
+
     async def test_successful_queue_append_becomes_restart_durable(self) -> None:
         queued: dict[str, deque[dict[str, object]]] = {}
         request = agent_server.TurnRequest(prompt="New message")
@@ -234,6 +264,35 @@ class StopTurnProviderReadinessTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(queued["chat-1"][0]["_durable"])
         schedule.assert_not_called()
+
+    async def test_cancellation_after_queue_fsync_keeps_live_durable_row(self) -> None:
+        queued: dict[str, deque[dict[str, object]]] = {}
+        request = agent_server.TurnRequest(prompt="Keep this even if I disconnect")
+        session = {"id": "chat-1", "backend": "codex"}
+        with patch.object(agent_server.STORE, "sessions", {"chat-1": session}), \
+             patch.object(agent_server, "QUEUED_TURNS", queued), \
+             patch.object(agent_server, "BUSY_SESSIONS", {"chat-1"}), \
+             patch.object(agent_server, "managed_server_update_blocker", return_value=None), \
+             patch.object(
+                 agent_server,
+                 "append_durable_event",
+                 new_callable=AsyncMock,
+                 return_value={"type": "turn_queued"},
+             ), \
+             patch.object(
+                 agent_server,
+                 "commit_durable_provider_cross_chat_reference_grants",
+                 new_callable=AsyncMock,
+                 side_effect=asyncio.CancelledError,
+             ), \
+             patch.object(agent_server, "schedule_next_queued_turn") as schedule:
+            with self.assertRaises(asyncio.CancelledError):
+                await agent_server.enqueue_turn("chat-1", request, session)
+
+            self.assertEqual(len(queued["chat-1"]), 1)
+            self.assertTrue(queued["chat-1"][0]["_durable"])
+            self.assertEqual(agent_server.update_blocking_queued_turn_count_locked(), 0)
+            schedule.assert_called_once_with("chat-1")
 
     async def test_pre_spawn_force_send_defers_without_cancelling_the_original_turn(self) -> None:
         stop_requests: set[str] = set()
@@ -2543,6 +2602,7 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         item = agent_server.QUEUED_TURNS["chat-1"][0]
         self.assertTrue(item["_durable"])
         self.assertTrue(item["_paused_after_stop"])
+        self.assertEqual(agent_server.update_blocking_queued_turn_count_locked(), 0)
 
     def test_recovery_holds_native_delivery_fence_without_replaying(self) -> None:
         agent_server.QUEUED_TURNS.pop("chat-1", None)
@@ -2946,7 +3006,7 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("chat-1", agent_server.STEERING_SESSIONS)
         schedule_next.assert_called_once_with("chat-1")
 
-    async def test_repeated_cancellation_cannot_cancel_force_send_rollback(
+    async def test_repeated_precommit_cancellation_cannot_cancel_force_send_rollback(
         self,
     ) -> None:
         selected = agent_server.QUEUED_TURNS["chat-1"][0]
@@ -3003,6 +3063,7 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("_update_transitioning", restored)
         self.assertNotIn("chat-1", agent_server.RUN_NOW_TURNS)
         self.assertNotIn("chat-1", agent_server.STEERING_SESSIONS)
+        self.assertEqual(agent_server.update_blocking_queued_turn_count_locked(), 0)
         schedule_next.assert_called_once_with("chat-1")
 
 

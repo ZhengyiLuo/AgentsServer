@@ -1683,6 +1683,7 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(legs), 1)
         leg = legs[0]
         self.assertEqual(exchange["authorization_kind"], "configured_route")
+
         self.assertEqual(exchange["authorization_route_id"], route["route_id"])
         self.assertEqual(exchange["initial_action"], "instruction")
         self.assertEqual(exchange["max_legs"], 2)
@@ -1713,6 +1714,43 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         persisted = await reopened.get_exchange(exchange["id"])
         self.assertEqual(persisted["authorization_route_id"], route["route_id"])
         self.assertEqual(persisted["initial_action"], "instruction")
+
+    async def test_route_request_cancel_waits_for_acceptance_child(self) -> None:
+        route = self.route("a")
+        agent_server.STORE.sessions["source"]["provider_cross_chat_routes"] = [route]
+        _token, request = await self.issue("run_route_cancel", [route])
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed_reservation(*_args, **_kwargs):
+            entered.set()
+            await release.wait()
+            raise RuntimeError("acceptance settled after request cancellation")
+
+        with patch.object(
+            agent_server,
+            "reserve_provider_route_handoff",
+            side_effect=delayed_reservation,
+        ):
+            task = asyncio.create_task(
+                agent_server.submit_provider_route_handoff(
+                    route["route_id"],
+                    agent_server.AgentRouteHandoffRequest(
+                        body="Deliver exactly once",
+                        idempotency_key="route-cancel-key",
+                    ),
+                    request,
+                )
+            )
+            await entered.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
 
     async def test_route_send_binds_exact_user_instruction_without_provider_authority(self) -> None:
         route = self.route("a")

@@ -665,19 +665,24 @@ class DarwinMetricsTests(unittest.TestCase):
 
     def test_darwin_ps_rows_parse_bsd_output(self):
         stdout = (
-            "52965 52964 52924 S    03:58 14.6  4.4 1641904 codex codex app-server --listen stdio://\n"
-            "  791     1   791 Ss 10-18:28:56 40.6  0.1 23056 backupd /System/Library/CoreServices/TimeMachine/backupd\n"
+            "52965 52964 52924 S    03:58 14.6  4.4 1641904 /Users/zen/.nvm/bin/codex app-server --listen stdio://\n"
+            "  791     1   791 Ss 10-18:28:56 40.6  0.1 23056 /System/Library/CoreServices/TimeMachine/backupd\n"
+            "  900     1   900 S  01:02:03  1.0  0.2 4096 /Applications/Activity Monitor.app/Contents/MacOS/Activity Monitor\n"
             "garbage line\n"
         )
         rows = agent_server.parse_darwin_ps_rows(stdout)
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 3)
         self.assertEqual(rows[0]["pid"], 52965)
         self.assertEqual(rows[0]["sid"], 52924)
         self.assertEqual(rows[0]["elapsed_seconds"], 238)
         self.assertEqual(rows[0]["rss_kb"], 1641904)
         self.assertEqual(rows[0]["command"], "codex")
-        self.assertEqual(rows[0]["args"], "codex app-server --listen stdio://")
+        self.assertEqual(rows[0]["args"], "/Users/zen/.nvm/bin/codex app-server --listen stdio://")
         self.assertEqual(rows[1]["elapsed_seconds"], 10 * 86400 + 18 * 3600 + 28 * 60 + 56)
+        self.assertEqual(rows[1]["command"], "backupd")
+        # Command names with spaces must not shift the numeric columns.
+        self.assertEqual(rows[2]["rss_kb"], 4096)
+        self.assertIn("Activity Monitor", rows[2]["args"])
 
     def test_vm_stat_available_memory(self):
         stdout = (

@@ -1028,6 +1028,18 @@ class CodexAppServerClient:
                     )
                     self._fail_all(error)
                     self._cancel_server_request_tasks()
+                    # An unplanned exit must release the child's registry entry
+                    # now; ``_discard_process`` only runs on the next start or
+                    # on close, and a stale {pid, pgid} could be reused.
+                    raw_pid = getattr(proc, "pid", None)
+                    if (
+                        self._on_process_exited is not None
+                        and isinstance(raw_pid, int)
+                        and not isinstance(raw_pid, bool)
+                        and raw_pid > 0
+                    ):
+                        with suppress(Exception):
+                            self._on_process_exited(raw_pid, self._process_group_id)
 
     async def _stderr_loop(self, proc: asyncio.subprocess.Process) -> None:
         if not proc.stderr:

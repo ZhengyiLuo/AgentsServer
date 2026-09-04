@@ -20273,10 +20273,13 @@ def parse_elapsed_seconds(value: str) -> int:
     return days * 86400 + hours * 3600 + minutes * 60 + seconds
 
 
+# No ``ucomm`` column: BSD ``ucomm`` is the 16-char process name and routinely
+# contains spaces on macOS ("Activity Monitor", "Codex (Service)"), which would
+# shift every later field. ``args`` is last and parsed as the remainder.
 DARWIN_PS_COMMAND = [
     "ps",
     "-eo",
-    "pid=,ppid=,pgid=,stat=,etime=,pcpu=,pmem=,rss=,ucomm=,args=",
+    "pid=,ppid=,pgid=,stat=,etime=,pcpu=,pmem=,rss=,args=",
     "-r",
 ]
 
@@ -20291,7 +20294,7 @@ def parse_darwin_ps_rows(stdout: str) -> list[dict[str, Any]]:
 
     rows: list[dict[str, Any]] = []
     for line in stdout.splitlines():
-        parts = line.strip().split(None, 9)
+        parts = line.strip().split(None, 8)
         if len(parts) < 9:
             continue
         try:
@@ -20304,6 +20307,10 @@ def parse_darwin_ps_rows(stdout: str) -> list[dict[str, Any]]:
             rss = int(float(parts[7]))
         except ValueError:
             continue
+        args = parts[8]
+        # The executable path is the first argv token; its basename is the
+        # closest analogue of the Linux ``comm`` column.
+        command = os.path.basename(args.split(None, 1)[0]) or args
         rows.append({
             "pid": pid,
             "ppid": ppid,
@@ -20316,8 +20323,8 @@ def parse_darwin_ps_rows(stdout: str) -> list[dict[str, Any]]:
             "cpu_percent": cpu,
             "mem_percent": mem,
             "rss_kb": rss,
-            "command": parts[8],
-            "args": parts[9] if len(parts) > 9 else parts[8],
+            "command": command,
+            "args": args,
         })
     return rows
 
@@ -55286,6 +55293,11 @@ def sweep_orphaned_provider_children() -> int:
                     surviving.append(entry)
                     continue
                 if parent_pid != 1:
+                    # Unknown parent (probe failed) or a child still owned by
+                    # another live server during an overlapping restart: keep
+                    # the entry so the group can be reaped later, never drop
+                    # a live child from the registry.
+                    surviving.append(entry)
                     continue
                 if "codex" not in provider_child_command_line(pid).lower():
                     continue
@@ -61540,6 +61552,20 @@ async def rotate_codex_thread(
         hygiene = await codex_thread_hygiene(session)
         rotated_at = now_iso()
         reason_text = compact_memory_text(str(req.reason or "").strip(), 500) or None
+
+        # The old thread's native children would otherwise stay loaded and
+        # "running" forever once the parent is unbound. Interrupt them first
+        # (bounded), then let the detached finalizer unload the finished ones.
+        if CODEX_APP_SERVER_MANAGER is not None:
+            with suppress(Exception):
+                await asyncio.wait_for(
+                    stop_codex_descendant_subagents(
+                        session_id,
+                        provider_id,
+                        manager=CODEX_APP_SERVER_MANAGER,
+                    ),
+                    timeout=max(1.0, CODEX_SUBAGENT_FINALIZE_TIMEOUT_SECONDS),
+                )
 
         quarantined_goal_thread = False
         usage_signal: dict[str, Any] | None = None

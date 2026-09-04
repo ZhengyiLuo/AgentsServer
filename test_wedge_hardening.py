@@ -361,5 +361,201 @@ class RestartDenialLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(snapshot["force_restart_available"])
 
 
+class HistoryImportAnchorTests(unittest.TestCase):
+    def select(self, events, items):
+        with patch.object(agent_server, "read_events", return_value=events) as read:
+            fresh = agent_server.unsynced_history_items("chat-x", items)
+        return fresh, read
+
+    def test_dedup_scans_the_timeline_tail(self):
+        events = [{"type": "turn_started", "prompt": "hello"}]
+        _fresh, read = self.select(events, [{"kind": "user", "text": "hello"}])
+        self.assertTrue(read.call_args.kwargs.get("tail"))
+
+    def test_no_anchor_on_a_populated_timeline_imports_nothing(self):
+        # Every transcript item failed to match an existing conversation:
+        # importing them would duplicate the whole chat (12k duplicate events
+        # on 2026-09-04). Nothing is the only safe answer.
+        events = [
+            {"type": "turn_started", "prompt": "timeline only"},
+            {"type": "assistant_text", "text": "timeline reply"},
+        ]
+        with self.assertLogs(agent_server.logger, level="WARNING"):
+            fresh, _read = self.select(
+                events,
+                [
+                    {"kind": "user", "text": "transcript A"},
+                    {"kind": "assistant", "text": "transcript B"},
+                ],
+            )
+        self.assertEqual(fresh, [])
+
+    def test_empty_timeline_still_imports_everything(self):
+        items = [{"kind": "user", "text": "hello"}, {"kind": "assistant", "text": "hi"}]
+        fresh, _read = self.select([], items)
+        self.assertEqual(fresh, items)
+
+
+class SubagentReconcileBurstTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.previous_sessions = agent_server.STORE.sessions
+        self.previous_index = agent_server.CODEX_SUBAGENT_SESSION_INDEX
+        self.previous_states = agent_server.CODEX_SUBAGENT_STATE
+        self.session = {
+            "id": "chat",
+            "backend": agent_server.BACKEND_CODEX,
+            "codex_thread_id": "parent-thread",
+            "session_id": "parent-thread",
+        }
+        agent_server.STORE.sessions = {"chat": self.session}
+        agent_server.CODEX_SUBAGENT_SESSION_INDEX = {}
+        agent_server.CODEX_SUBAGENT_STATE = {}
+        self.events: list[tuple[str, dict]] = []
+
+    async def asyncTearDown(self) -> None:
+        agent_server.STORE.sessions = self.previous_sessions
+        agent_server.CODEX_SUBAGENT_SESSION_INDEX = self.previous_index
+        agent_server.CODEX_SUBAGENT_STATE = self.previous_states
+
+    async def append(self, session_id, event_type, payload):
+        self.events.append((event_type, payload))
+        return {"seq": len(self.events), **payload}
+
+    class Manager:
+        def __init__(self, descendants):
+            self.descendants = descendants
+
+        async def list_descendant_threads(self, thread_id):
+            return list(self.descendants)
+
+    async def test_terminal_children_unknown_to_this_process_are_learned_silently(self):
+        manager = self.Manager([
+            {"id": f"child-{index}", "parentThreadId": "parent-thread",
+             "preview": f"Audit {index}", "status": {"type": "notLoaded"},
+             "updatedAt": f"2026-09-04T10:00:{index:02d}Z"}
+            for index in range(5)
+        ])
+        with patch.object(agent_server, "append_event", AsyncMock(side_effect=self.append)), \
+             patch.object(agent_server.STORE, "save", AsyncMock()):
+            result = await agent_server.reconcile_codex_subagents("chat", manager)
+        self.assertEqual(result["reconciled"], 5)
+        self.assertEqual(result["silent"], 5)
+        self.assertEqual(self.events, [])
+        self.assertEqual(
+            agent_server.CODEX_SUBAGENT_STATE["child-3"]["subagent_status"],
+            "completed",
+        )
+        self.assertEqual(agent_server.CODEX_SUBAGENT_SESSION_INDEX["child-3"], "chat")
+
+    async def test_running_children_and_known_transitions_still_emit(self):
+        manager = self.Manager([
+            {"id": "child-run", "parentThreadId": "parent-thread",
+             "preview": "Live", "status": {"type": "active", "activeFlags": []}},
+        ])
+        with patch.object(agent_server, "append_event", AsyncMock(side_effect=self.append)), \
+             patch.object(agent_server.STORE, "save", AsyncMock()):
+            await agent_server.reconcile_codex_subagents("chat", manager)
+            self.assertEqual([kind for kind, _ in self.events], ["subagent_state"])
+            self.assertEqual(self.events[0][1]["subagent_status"], "running")
+            manager.descendants[0]["status"] = {"type": "notLoaded"}
+            await agent_server.reconcile_codex_subagents("chat", manager)
+        self.assertEqual(len(self.events), 2)
+        self.assertEqual(self.events[1][1]["subagent_status"], "completed")
+
+    async def test_durable_snapshot_rehydrates_known_children_after_restart(self):
+        self.session["codex_subagents"] = {
+            "child-a": {
+                "session_id": "chat",
+                "subagent_id": "child-a",
+                "subagent_status": "completed",
+                "subagent_name": "Leibniz",
+            },
+        }
+        manager = self.Manager([
+            {"id": "child-a", "parentThreadId": "parent-thread",
+             "preview": "Audit A", "status": {"type": "notLoaded"}},
+        ])
+        with patch.object(agent_server, "append_event", AsyncMock(side_effect=self.append)), \
+             patch.object(agent_server.STORE, "save", AsyncMock()):
+            await agent_server.reconcile_codex_subagents("chat", manager)
+        self.assertEqual(self.events, [])
+        self.assertEqual(
+            agent_server.CODEX_SUBAGENT_STATE["child-a"]["subagent_name"],
+            "Leibniz",
+        )
+
+    async def test_descendant_reconciliation_is_capped_to_most_recent(self):
+        manager = self.Manager([
+            {"id": f"child-{index}", "parentThreadId": "parent-thread",
+             "preview": f"Audit {index}", "status": {"type": "notLoaded"},
+             "updatedAt": f"2026-09-04T10:{index // 60:02d}:{index % 60:02d}Z"}
+            for index in range(10)
+        ])
+        with patch.object(agent_server, "CODEX_SUBAGENT_RECONCILE_LIMIT", 3), \
+             patch.object(agent_server, "append_event", AsyncMock(side_effect=self.append)), \
+             patch.object(agent_server.STORE, "save", AsyncMock()):
+            result = await agent_server.reconcile_codex_subagents("chat", manager)
+        self.assertEqual(result["reconciled"], 3)
+        self.assertEqual(result["skipped"], 7)
+        self.assertEqual(result["descendants"], 10)
+        self.assertIn("child-9", agent_server.CODEX_SUBAGENT_STATE)
+        self.assertNotIn("child-0", agent_server.CODEX_SUBAGENT_STATE)
+
+
+class DarwinMetricsTests(unittest.TestCase):
+    def test_elapsed_time_parsing(self):
+        self.assertEqual(agent_server.parse_elapsed_seconds("05:33"), 333)
+        self.assertEqual(agent_server.parse_elapsed_seconds("01:02:03"), 3723)
+        self.assertEqual(agent_server.parse_elapsed_seconds("10-17:57:40"), 928660)
+        with self.assertRaises(ValueError):
+            agent_server.parse_elapsed_seconds("")
+
+    def test_darwin_ps_rows_parse_bsd_output(self):
+        stdout = (
+            "52965 52964 52924 S    03:58 14.6  4.4 1641904 codex codex app-server --listen stdio://\n"
+            "  791     1   791 Ss 10-18:28:56 40.6  0.1 23056 backupd /System/Library/CoreServices/TimeMachine/backupd\n"
+            "garbage line\n"
+        )
+        rows = agent_server.parse_darwin_ps_rows(stdout)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["pid"], 52965)
+        self.assertEqual(rows[0]["sid"], 52924)
+        self.assertEqual(rows[0]["elapsed_seconds"], 238)
+        self.assertEqual(rows[0]["rss_kb"], 1641904)
+        self.assertEqual(rows[0]["command"], "codex")
+        self.assertEqual(rows[0]["args"], "codex app-server --listen stdio://")
+        self.assertEqual(rows[1]["elapsed_seconds"], 10 * 86400 + 18 * 3600 + 28 * 60 + 56)
+
+    def test_vm_stat_available_memory(self):
+        stdout = (
+            "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
+            "Pages free:                               100000.\n"
+            "Pages active:                            2000000.\n"
+            "Pages inactive:                           200000.\n"
+            "Pages speculative:                         50000.\n"
+            "Pages purgeable:                           10000.\n"
+            "Pages wired down:                         900000.\n"
+        )
+        expected = int((100000 + 200000 + 50000 + 10000) * 16384 / (1024 * 1024))
+        self.assertEqual(agent_server.parse_vm_stat_available_mb(stdout), expected)
+        self.assertIsNone(agent_server.parse_vm_stat_available_mb("no pages here"))
+
+    def test_darwin_memory_probe_is_cached(self):
+        completed = MagicMock(returncode=0, stdout=(
+            "Mach Virtual Memory Statistics: (page size of 4096 bytes)\n"
+            "Pages free: 1024.\n"
+        ))
+        with patch.object(
+            agent_server,
+            "DARWIN_MEMORY_CACHE",
+            {"at": float("-inf"), "mb": None},
+        ), patch.object(agent_server.subprocess, "run", return_value=completed) as run:
+            first = agent_server.darwin_available_memory_mb()
+            second = agent_server.darwin_available_memory_mb()
+        self.assertEqual(first, 4)
+        self.assertEqual(second, 4)
+        self.assertEqual(run.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

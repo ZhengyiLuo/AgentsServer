@@ -978,6 +978,10 @@ FORK_INTERNAL_PURPOSES = {
 }
 CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS = int(agentsdock_setting("CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS", "120"))
 SUBAGENT_SNAPSHOT_STATE_LIMIT = 256
+# Most recently updated persisted descendants reconciled per chat open.
+CODEX_SUBAGENT_RECONCILE_LIMIT = int(
+    agentsdock_setting("CODEX_SUBAGENT_RECONCILE_LIMIT", "200")
+)
 SUBAGENT_SNAPSHOT_LOG_LIMIT = 80
 SUBAGENT_SNAPSHOT_TEXT_LIMIT = 600
 
@@ -19291,7 +19295,87 @@ def parse_ps_rows(stdout: str) -> list[dict[str, Any]]:
     return rows
 
 
+def parse_elapsed_seconds(value: str) -> int:
+    """Parse BSD ``etime`` (``[[dd-]hh:]mm:ss``) into seconds."""
+
+    text = str(value or "").strip()
+    days = 0
+    if "-" in text:
+        day_text, text = text.split("-", 1)
+        days = int(day_text)
+    fields = [int(float(part)) for part in text.split(":") if part != ""]
+    if not fields:
+        raise ValueError(f"invalid elapsed time: {value!r}")
+    while len(fields) < 3:
+        fields.insert(0, 0)
+    hours, minutes, seconds = fields[-3:]
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+DARWIN_PS_COMMAND = [
+    "ps",
+    "-eo",
+    "pid=,ppid=,pgid=,stat=,etime=,pcpu=,pmem=,rss=,ucomm=,args=",
+    "-r",
+]
+
+
+def parse_darwin_ps_rows(stdout: str) -> list[dict[str, Any]]:
+    """Parse BSD ``ps`` output (no ``sid``/``etimes``/``--sort`` on macOS).
+
+    The GNU keyword set used on Linux makes macOS ``ps`` exit non-zero, so the
+    host health monitor recorded an empty process list on every macOS sample
+    (2026-09-04: 1,621 samples, none with processes).
+    """
+
+    rows: list[dict[str, Any]] = []
+    for line in stdout.splitlines():
+        parts = line.strip().split(None, 9)
+        if len(parts) < 9:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+            pgid = int(parts[2])
+            etimes = parse_elapsed_seconds(parts[4])
+            cpu = float(parts[5])
+            mem = float(parts[6])
+            rss = int(float(parts[7]))
+        except ValueError:
+            continue
+        rows.append({
+            "pid": pid,
+            "ppid": ppid,
+            "pgid": pgid,
+            # BSD ps has no session id column; the process group is the
+            # closest stable grouping for the diagnostics that consume it.
+            "sid": pgid,
+            "stat": parts[3],
+            "elapsed_seconds": etimes,
+            "cpu_percent": cpu,
+            "mem_percent": mem,
+            "rss_kb": rss,
+            "command": parts[8],
+            "args": parts[9] if len(parts) > 9 else parts[8],
+        })
+    return rows
+
+
 def top_process_rows(limit: int = 20) -> list[dict[str, Any]]:
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                DARWIN_PS_COMMAND,
+                text=True,
+                capture_output=True,
+                timeout=3,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("top process ps scan timed out")
+            return []
+        rows = parse_darwin_ps_rows(result.stdout)
+        return rows[: max(1, min(limit, 50))]
     command = ["ps", "-eo", "pid=,ppid=,pgid=,sid=,stat=,etimes=,pcpu=,pmem=,rss=,comm=,args=", "--sort=-pcpu"]
     try:
         result = subprocess.run(command, text=True, capture_output=True, timeout=3, check=False)
@@ -19304,6 +19388,69 @@ def top_process_rows(limit: int = 20) -> list[dict[str, Any]]:
     if not rows:
         rows = sorted(procfs_process_rows(), key=lambda row: int(row.get("rss_kb") or 0), reverse=True)
     return rows[: max(1, min(limit, 50))]
+
+
+DARWIN_MEMORY_CACHE: dict[str, Any] = {"at": float("-inf"), "mb": None}
+DARWIN_MEMORY_CACHE_SECONDS = 5.0
+
+
+def parse_vm_stat_available_mb(stdout: str) -> int | None:
+    """Derive available memory from ``vm_stat`` output.
+
+    Free, inactive, speculative, and purgeable pages are all reclaimable
+    without swapping, which is the closest macOS analogue of Linux
+    ``MemAvailable``.
+    """
+
+    page_size = 4096
+    pages: dict[str, int] = {}
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Mach Virtual Memory Statistics"):
+            match = re.search(r"page size of (\d+) bytes", stripped)
+            if match:
+                page_size = int(match.group(1))
+            continue
+        if ":" not in stripped:
+            continue
+        name, _, raw = stripped.partition(":")
+        digits = raw.strip().rstrip(".")
+        if digits.isdigit():
+            pages[name.strip().lower()] = int(digits)
+    if not pages:
+        return None
+    reclaimable = sum(
+        pages.get(name, 0)
+        for name in (
+            "pages free",
+            "pages inactive",
+            "pages speculative",
+            "pages purgeable",
+        )
+    )
+    return int(reclaimable * page_size / (1024 * 1024))
+
+
+def darwin_available_memory_mb() -> int | None:
+    now = time.monotonic()
+    if now - float(DARWIN_MEMORY_CACHE["at"]) < DARWIN_MEMORY_CACHE_SECONDS:
+        return DARWIN_MEMORY_CACHE["mb"]
+    value: int | None = None
+    try:
+        result = subprocess.run(
+            ["vm_stat"],
+            text=True,
+            capture_output=True,
+            timeout=2,
+            check=False,
+        )
+        if result.returncode == 0:
+            value = parse_vm_stat_available_mb(result.stdout)
+    except (OSError, subprocess.SubprocessError):
+        value = None
+    DARWIN_MEMORY_CACHE["at"] = now
+    DARWIN_MEMORY_CACHE["mb"] = value
+    return value
 
 
 def proc_cwd(pid: int) -> str | None:
@@ -22553,8 +22700,15 @@ async def emit_codex_subagent_state(
     agent_path: Any = None,
     activity: Any = None,
     summary: Any = None,
+    persist_event: bool = True,
 ) -> dict[str, Any] | None:
-    """Persist one authoritative Codex child lifecycle transition."""
+    """Persist one authoritative Codex child lifecycle transition.
+
+    With ``persist_event=False`` the child's state is recorded in memory only.
+    Reconciliation uses that for children that are already terminal and whose
+    terminal event was already written earlier, so re-learning the spawn tree
+    after a restart does not append a duplicate event per child.
+    """
 
     child_thread_id = str(child_thread_id or "").strip()
     if not child_thread_id or session_id not in STORE.sessions:
@@ -22652,6 +22806,18 @@ async def emit_codex_subagent_state(
         with CODEX_SUBAGENT_INDEX_LOCK:
             CODEX_SUBAGENT_SESSION_INDEX[child_thread_id] = session_id
         return previous
+
+    if not persist_event:
+        stored = {
+            "session_id": session_id,
+            "type": "subagent_state",
+            "ts": now_iso(),
+            **payload,
+        }
+        with CODEX_SUBAGENT_INDEX_LOCK:
+            CODEX_SUBAGENT_SESSION_INDEX[child_thread_id] = session_id
+            CODEX_SUBAGENT_STATE[child_thread_id] = stored
+        return stored
 
     event = await append_event(session_id, "subagent_state", payload)
     stored = {
@@ -22762,16 +22928,50 @@ async def reconcile_codex_subagents(
     if not isinstance(descendants, list):
         return {"reconciled": 0, "descendants": 0}
 
+    # A long-lived chat can have well over a thousand persisted descendants
+    # (1,415 on 2026-09-04). Reconciling all of them on every chat open, and
+    # emitting a fresh subagent_state event for each after a restart, appended
+    # ~1,150 events in seconds and forced full timeline-index rebuilds. Only
+    # the most recently updated children can still be active; older ones are
+    # terminal and already have their terminal event.
+    ordered = sorted(
+        (thread for thread in descendants if isinstance(thread, dict)),
+        key=lambda thread: str(
+            thread.get("updatedAt") or thread.get("updated_at") or ""
+        ),
+        reverse=True,
+    )
+    skipped = max(0, len(ordered) - CODEX_SUBAGENT_RECONCILE_LIMIT)
+    if skipped:
+        logger.info(
+            "Codex subagent reconciliation capped session=%s descendants=%d "
+            "reconciled_limit=%d",
+            session_id,
+            len(ordered),
+            CODEX_SUBAGENT_RECONCILE_LIMIT,
+        )
+    durable_children = session.get("codex_subagents")
+    if not isinstance(durable_children, dict):
+        durable_children = {}
+
     reconciled = 0
-    for thread in descendants:
-        if not isinstance(thread, dict):
-            continue
+    silent = 0
+    for thread in ordered[:CODEX_SUBAGENT_RECONCILE_LIMIT]:
         child_thread_id = str(thread.get("id") or "").strip()
         if not child_thread_id:
             continue
         with CODEX_SUBAGENT_INDEX_LOCK:
             CODEX_SUBAGENT_SESSION_INDEX[child_thread_id] = session_id
             previous = dict(CODEX_SUBAGENT_STATE.get(child_thread_id) or {})
+            if not previous:
+                # Rehydrate from the chat's durable snapshot so a restart does
+                # not make every known child look like a new transition.
+                durable = durable_children.get(child_thread_id)
+                if isinstance(durable, dict) and str(
+                    durable.get("session_id") or session_id
+                ) == session_id:
+                    previous = dict(durable)
+                    CODEX_SUBAGENT_STATE[child_thread_id] = dict(durable)
         status = codex_child_status_from_thread(thread.get("status"))
         turns = thread.get("turns") if isinstance(thread.get("turns"), list) else []
         latest_turn = turns[0] if turns else None
@@ -22788,6 +22988,20 @@ async def reconcile_codex_subagents(
             # Unknown states must not manufacture an immortal active card.
             status = "completed"
         nickname, agent_path, source_parent_thread_id = codex_subagent_thread_identity(thread)
+        # Only a real transition deserves a timeline event: a child that is
+        # still active, or one whose status differs from what this chat last
+        # recorded. A terminal child that is already terminal (or that this
+        # process has never seen) is learned in memory only; its terminal
+        # transition was recorded when it happened.
+        normalized_status = normalize_subagent_status(status)
+        previous_status = (
+            normalize_subagent_status(previous.get("subagent_status"))
+            if previous
+            else None
+        )
+        persist_event = normalized_status in {"starting", "running"} or (
+            previous_status is not None and previous_status != normalized_status
+        )
         await emit_codex_subagent_state(
             session_id,
             child_thread_id,
@@ -22797,9 +23011,17 @@ async def reconcile_codex_subagents(
             nickname=nickname,
             agent_path=agent_path,
             activity=f"Subagent {status}",
+            persist_event=persist_event,
         )
         reconciled += 1
-    return {"reconciled": reconciled, "descendants": len(descendants)}
+        if not persist_event:
+            silent += 1
+    return {
+        "reconciled": reconciled,
+        "descendants": len(descendants),
+        "silent": silent,
+        "skipped": skipped,
+    }
 
 
 async def stop_codex_descendant_subagents(
@@ -35342,12 +35564,24 @@ def unsynced_history_items(
     """
 
     seen: Counter[tuple[str, str]] = Counter()
-    for event in read_events(session_id, limit=HISTORY_SYNC_EVENT_SCAN_LIMIT):
+    timeline_has_messages = False
+    # Scan the newest events. The anchor is the last transcript item the
+    # timeline already shows, and that item is by construction near the tail.
+    # Scanning the *first* N events of a long chat never reached the current
+    # tail, so every open re-imported the same ~400 messages (12k duplicate
+    # events in one day on 2026-09-04 and a 44 s renderer stall).
+    for event in read_events(
+        session_id,
+        limit=HISTORY_SYNC_EVENT_SCAN_LIMIT,
+        tail=True,
+    ):
         event_type = event.get("type")
         if event_type == "turn_started":
             seen[history_dedup_key("user", event.get("prompt"))] += 1
+            timeline_has_messages = True
         elif event_type == "assistant_text":
             seen[history_dedup_key("assistant", event.get("text"))] += 1
+            timeline_has_messages = True
 
     last_matched = -1
     for index, item in enumerate(items):
@@ -35355,6 +35589,17 @@ def unsynced_history_items(
         if seen.get(key):
             seen[key] -= 1
             last_matched = index
+    if last_matched == -1 and timeline_has_messages and items:
+        # The timeline already has a conversation but none of the transcript
+        # matched it. Importing the whole transcript here would duplicate the
+        # chat wholesale; the safe outcome is to import nothing.
+        logger.warning(
+            "provider history sync found no anchor session=%s transcript_items=%d; "
+            "skipping import to avoid duplicating the timeline",
+            session_id,
+            len(items),
+        )
+        return []
     return items[last_matched + 1:]
 
 
@@ -36966,6 +37211,9 @@ def host_pressure_snapshot() -> dict[str, Any]:
                     if len(parts) >= 2:
                         available_mem_mb = int(int(parts[1]) / 1024)
                     break
+    elif sys.platform == "darwin":
+        with suppress(Exception):
+            available_mem_mb = darwin_available_memory_mb()
 
     return {
         "load_1m": load_1m,

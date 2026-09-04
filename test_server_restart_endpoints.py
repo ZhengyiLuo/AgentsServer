@@ -746,7 +746,7 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
         snapshot = capability_builder.call_args.args[0]
         self.assertEqual(snapshot["version"], 2)
         self.assertRegex(snapshot["revision"], r"^[0-9a-f]{64}$")
-        self.assertFalse(snapshot["has_blockers"])
+        self.assertFalse(snapshot["has_blockers"], snapshot)
 
     async def test_authenticated_get_exposes_bounded_private_blocker_digest(self):
         with tempfile.TemporaryDirectory() as temporary:

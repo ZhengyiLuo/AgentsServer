@@ -5820,6 +5820,8 @@ exit 0
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_insert")
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_update")
             for table in (
+                # Migration 0010 (attachment orphan reclamation).
+                "team_attachment_cleanup_queue",
                 # Migration 0009 (Team Messages V2), children first.
                 "team_skill_versions",
                 "team_attachments",

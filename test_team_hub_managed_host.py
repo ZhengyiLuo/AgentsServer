@@ -447,6 +447,7 @@ sys.exit(10)
             ):
                 connection.execute(f"DROP TRIGGER {trigger}")
             for table in (
+                "team_attachment_cleanup_queue",
                 "team_skill_versions",
                 "team_attachments",
                 "team_message_recipients",
@@ -481,6 +482,7 @@ sys.exit(10)
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_insert")
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_update")
             for table in (
+                "team_attachment_cleanup_queue",
                 "team_skill_versions",
                 "team_attachments",
                 "team_message_recipients",

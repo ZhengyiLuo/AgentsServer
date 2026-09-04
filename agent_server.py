@@ -852,6 +852,15 @@ SERVER_UPDATE_PENDING_INTERACTIVE_FENCE_SECONDS = float(
     agentsdock_setting("SERVER_UPDATE_PENDING_INTERACTIVE_FENCE_SECONDS", "120")
 )
 QUEUE_FENCE_LOG_INTERVAL_SECONDS = 60.0
+# Hidden cross-chat/secure-peer delivery rows retry admission when the target
+# chat is busy or the server is updating. A row whose admission keeps failing
+# for another reason used to retry forever (2026-09-04). After this many
+# consecutive deferrals the delivery is failed visibly instead. The user's own
+# queued messages are never discarded by this bound.
+QUEUE_DELIVERY_ADMISSION_FAILURE_LIMIT = max(
+    1,
+    int(agentsdock_setting("QUEUE_DELIVERY_ADMISSION_FAILURE_LIMIT", "30")),
+)
 CLAUDE_CONTEXT_USAGE_TIMEOUT_SECONDS = max(
     0.1,
     float(agentsdock_setting("CLAUDE_CONTEXT_USAGE_TIMEOUT_SECONDS", "2")),
@@ -18103,6 +18112,46 @@ async def start_next_queued_turn(session_id: str) -> None:
                     SESSION_TURN_TASKS.pop(session_id, None)
 
 
+async def discard_delivery_after_repeated_deferrals(
+    session_id: str,
+    item: dict[str, Any],
+    detail: str,
+) -> bool:
+    """Count a deferred admission; fail a hidden delivery once retries run out.
+
+    Every deferred requeue increments ``_admission_failures`` on the in-memory
+    row. Only cross-chat/secure-peer delivery rows are bounded: once the count
+    exceeds QUEUE_DELIVERY_ADMISSION_FAILURE_LIMIT the row is terminally
+    discarded, which fails its envelope/leg and emits a visible error. The
+    user's own queued messages are never discarded here. Returns whether the
+    item was discarded (the caller must then not requeue it).
+
+    A deferral while the target chat is simply waiting (running turn, explicit
+    Stop, or a server update fence) is not an admission failure: a delivery
+    behind a 40-minute turn must still run when that turn ends, so those
+    retries are not counted.
+    """
+    if (
+        session_id in BUSY_SESSIONS
+        or explicit_stop_in_progress(session_id)
+        or managed_server_update_admission_blocker() is not None
+    ):
+        return False
+    failures = int(item.get("_admission_failures") or 0) + 1
+    item["_admission_failures"] = failures
+    if item.get("purpose") not in CROSS_CHAT_DELIVERY_PURPOSES:
+        return False
+    if failures <= QUEUE_DELIVERY_ADMISSION_FAILURE_LIMIT:
+        return False
+    await terminally_discard_queued_turn(
+        session_id,
+        item,
+        f"cross-chat delivery could not be admitted after {failures} attempts: "
+        f"{detail or 'unknown error'}",
+    )
+    return True
+
+
 async def _start_next_queued_turn_locked(
     session_id: str,
     *,
@@ -18313,6 +18362,12 @@ async def _start_next_queued_turn_locked(
         if e.status_code in (409, 503):
             already_notified = bool(item.get("_turn_deferred_notified"))
             item["_turn_deferred_notified"] = True
+            deferred_detail = str(e.detail or "")
+            item["_last_deferred_detail"] = deferred_detail
+            if await discard_delivery_after_repeated_deferrals(
+                session_id, item, deferred_detail
+            ):
+                return
             await requeue_turn_front(session_id, item)
             if not already_notified:
                 await append_event(session_id, "turn_deferred", {
@@ -18354,17 +18409,30 @@ async def _start_next_queued_turn_locked(
                     "target provider failed before launch",
                 )
                 return
+            # Mirror the HTTP deferral path: announce the deferral once, and
+            # again only when the concise error changes. Every retry used to
+            # append a fresh turn_deferred event, flooding the timeline while
+            # the row was requeued forever.
+            deferred_detail = concise_error_message(e)
+            already_notified = bool(item.get("_turn_deferred_notified"))
+            previous_detail = item.get("_last_deferred_detail")
             item["_turn_deferred_notified"] = True
+            item["_last_deferred_detail"] = deferred_detail
+            if await discard_delivery_after_repeated_deferrals(
+                session_id, item, deferred_detail
+            ):
+                return
             await requeue_turn_front(session_id, item)
-            with suppress(Exception):
-                await append_event(session_id, "turn_deferred", {
-                    "queued_id": item.get("queued_id"),
-                    "cross_chat_envelope_id": item.get("cross_chat_envelope_id"),
-                    "cross_chat_exchange_id": item.get("cross_chat_exchange_id"),
-                    "cross_chat_exchange_leg_id": item.get("cross_chat_exchange_leg_id"),
-                    "secure_peer_envelope_id": item.get("secure_peer_envelope_id"),
-                    "message": f"Cross-chat delivery retry deferred: {concise_error_message(e)}",
-                })
+            if not already_notified or previous_detail != deferred_detail:
+                with suppress(Exception):
+                    await append_event(session_id, "turn_deferred", {
+                        "queued_id": item.get("queued_id"),
+                        "cross_chat_envelope_id": item.get("cross_chat_envelope_id"),
+                        "cross_chat_exchange_id": item.get("cross_chat_exchange_id"),
+                        "cross_chat_exchange_leg_id": item.get("cross_chat_exchange_leg_id"),
+                        "secure_peer_envelope_id": item.get("secure_peer_envelope_id"),
+                        "message": f"Cross-chat delivery retry deferred: {deferred_detail}",
+                    })
             schedule_queued_turn_retry(session_id)
             return
         logger.warning("queued turn failed session=%s queued_id=%s: %s", session_id, item.get("queued_id"), e)
@@ -18417,6 +18485,13 @@ def queued_turn_from_event(event: dict[str, Any], sess: dict[str, Any], position
             if steering_lineage
             else event.get("prompt")
         )
+    # Hidden deliveries never carry a user-selected runtime: enqueue_turn
+    # persists the target chat's backend for display, and the admission check
+    # in _start_turn_locked treats any concrete backend/model/effort on a
+    # delivery as an immutability violation. Rebuilding those fields from the
+    # event or the session made every restart-recovered delivery row
+    # unrunnable (2026-09-04: a legitimate reply was discarded with 400).
+    delivery_row = event.get("purpose") in CROSS_CHAT_DELIVERY_PURPOSES
     return {
         "queued_id": str(event.get("queued_id") or ""),
         "prompt": request_prompt if request_prompt is not None else event.get("prompt") or "",
@@ -18426,9 +18501,17 @@ def queued_turn_from_event(event: dict[str, Any], sess: dict[str, Any], position
             if event.get("display_file_ids") is not None
             else None
         ),
-        "backend": event.get("backend") or sess.get("backend"),
-        "model": event.get("model") if event.get("model") is not None else sess.get("model"),
-        "effort": event.get("effort") if event.get("effort") is not None else sess.get("effort"),
+        "backend": None if delivery_row else (event.get("backend") or sess.get("backend")),
+        "model": (
+            None
+            if delivery_row
+            else event.get("model") if event.get("model") is not None else sess.get("model")
+        ),
+        "effort": (
+            None
+            if delivery_row
+            else event.get("effort") if event.get("effort") is not None else sess.get("effort")
+        ),
         "display_prompt": event.get("display_prompt"),
         "purpose": event.get("purpose"),
         "digest_job_id": event.get("digest_job_id"),
@@ -29175,6 +29258,57 @@ def cross_chat_delivery_client_capabilities(target: dict[str, Any]) -> list[str]
     raise HTTPException(
         status_code=409,
         detail=f"target backend {backend!r} does not support cross-chat delivery",
+    )
+
+
+CROSS_CHAT_DELIVERY_CAPABILITIES_BY_BACKEND: dict[str, frozenset[str]] = {
+    BACKEND_CODEX: frozenset({CODEX_INTERACTIVE_CLIENT_CAPABILITY}),
+    BACKEND_CLAUDE: frozenset({CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY}),
+    BACKEND_CURSOR: frozenset(),
+}
+
+
+def cross_chat_delivery_runtime_matches_target(
+    req: TurnRequest,
+    target: dict[str, Any],
+) -> bool:
+    """Whether a delivery request carries no runtime other than the target's own.
+
+    Deliveries never carry a user-selected runtime. Rows persisted by older
+    builds, or rebuilt from the session after a restart, may echo the target
+    chat's effective backend/model/effort; that is not a mutation. Only a value
+    that differs from the chat's effective runtime is an immutability violation.
+    """
+    target_backend = str(target.get("backend") or DEFAULT_BACKEND).strip().lower()
+    if (
+        req.backend is not None
+        and str(req.backend).strip().lower() != target_backend
+    ):
+        return False
+    if req.model is not None and req.model != target.get("model"):
+        return False
+    if req.effort is not None and req.effort != target.get("effort"):
+        return False
+    return True
+
+
+def cross_chat_delivery_target_runtime_changed(
+    client_capabilities: list[str],
+    target: dict[str, Any],
+) -> bool:
+    """Whether a delivery's immutable capability set names a different backend.
+
+    The delivery capability set is derived from the target chat's backend when
+    the delivery is admitted to the queue. If it now equals the set for some
+    other supported backend, the target chat's runtime changed underneath the
+    queued row; that is a target change (410), not a malformed request (400).
+    """
+    target_backend = str(target.get("backend") or DEFAULT_BACKEND).strip().lower()
+    persisted = frozenset(client_capabilities)
+    return any(
+        persisted == capabilities
+        for backend, capabilities in CROSS_CHAT_DELIVERY_CAPABILITIES_BY_BACKEND.items()
+        if backend != target_backend
     )
 
 
@@ -51444,9 +51578,7 @@ async def _start_turn_locked(
             or req.chat_references
             or req.team_references
             or req.file_ids
-            or req.backend is not None
-            or req.model is not None
-            or req.effort is not None
+            or not cross_chat_delivery_runtime_matches_target(req, sess)
         ):
             raise HTTPException(
                 status_code=400,
@@ -51475,6 +51607,13 @@ async def _start_turn_locked(
             cross_chat_delivery_client_capabilities(sess)
         )
         if set(req.client_capabilities) != expected_delivery_capabilities:
+            if cross_chat_delivery_target_runtime_changed(
+                req.client_capabilities, sess
+            ):
+                raise HTTPException(
+                    status_code=410,
+                    detail="secure peer delivery target runtime changed",
+                )
             raise HTTPException(
                 status_code=400,
                 detail="secure peer delivery runtime is immutable",
@@ -51550,11 +51689,21 @@ async def _start_turn_locked(
             req.chat_references
             or req.team_references
             or req.file_ids
-            or req.backend is not None
-            or req.model is not None
-            or req.effort is not None
-            or set(req.client_capabilities) != expected_delivery_capabilities
+            or not cross_chat_delivery_runtime_matches_target(req, sess)
         ):
+            raise HTTPException(status_code=400, detail="cross-chat delivery runtime is immutable")
+        if set(req.client_capabilities) != expected_delivery_capabilities:
+            # The capability set was fixed from the target's backend when the
+            # row was queued. A set that names another supported backend means
+            # the target chat's runtime changed while the delivery waited: the
+            # row can never run and must be reported as a target change.
+            if cross_chat_delivery_target_runtime_changed(
+                req.client_capabilities, sess
+            ):
+                raise HTTPException(
+                    status_code=410,
+                    detail="cross-chat delivery target runtime changed",
+                )
             raise HTTPException(status_code=400, detail="cross-chat delivery runtime is immutable")
     else:
         if (

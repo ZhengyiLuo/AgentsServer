@@ -1190,6 +1190,147 @@ class TeamMessagesServiceTests(unittest.TestCase):
             message["id"],
         )
 
+    def test_attachment_cleanup_failures_remain_durably_retryable(self) -> None:
+        store = self.app.state.store
+        ready_payload = b"ready orphan pending durable cleanup"
+        ready = self.upload(self.owner, ready_payload, name="cleanup-ready.bin")
+        partial_payload = b"partial orphan pending durable cleanup"
+        partial = self.declare(
+            self.owner, partial_payload, name="cleanup-partial.bin"
+        )["attachment"]
+        response = self.put_chunk(
+            self.owner,
+            partial["id"],
+            partial_payload,
+            0,
+            len(partial_payload) // 2,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        ready_path = (
+            self.data_dir
+            / "attachments"
+            / ready["sha256"][:2]
+            / ready["sha256"]
+        )
+        partial_path = (
+            self.data_dir / "attachments" / "uploads" / f"{partial['id']}.part"
+        )
+        self.assertTrue(ready_path.is_file())
+        self.assertTrue(partial_path.is_file())
+
+        with mock.patch.object(
+            store,
+            "_unlink_team_attachment_cleanup_path",
+            side_effect=OSError("filesystem temporarily busy"),
+        ):
+            self.assertEqual(store.purge_expired_team_attachments(10**10), 2)
+
+        connection = store.connect()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT count(*) FROM team_attachments WHERE id IN (?,?)",
+                    (ready["id"], partial["id"]),
+                ).fetchone()[0],
+                0,
+            )
+            queued = {
+                (str(row["path_kind"]), str(row["path_key"]))
+                for row in connection.execute(
+                    """
+                    SELECT path_kind,path_key FROM team_attachment_cleanup_queue
+                    ORDER BY path_kind,path_key
+                    """
+                )
+            }
+        finally:
+            connection.close()
+        self.assertEqual(
+            queued,
+            {
+                ("content", ready["sha256"]),
+                ("staging", ready["id"]),
+                ("staging", partial["id"]),
+            },
+        )
+        self.assertTrue(ready_path.is_file())
+        self.assertTrue(partial_path.is_file())
+
+        # There are no new stale rows, but a later pass still drains the
+        # committed tombstones and treats already-missing paths as success.
+        self.assertEqual(store.purge_expired_team_attachments(10**10), 0)
+        self.assertFalse(ready_path.exists())
+        self.assertFalse(partial_path.exists())
+        connection = store.connect()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT count(*) FROM team_attachment_cleanup_queue"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+
+    def test_cleanup_tombstone_rechecks_a_reused_ready_blob(self) -> None:
+        store = self.app.state.store
+        payload = b"reused bytes must survive cleanup retry"
+        orphan = self.upload(self.owner, payload, name="cleanup-orphan.bin")
+        blob = (
+            self.data_dir
+            / "attachments"
+            / orphan["sha256"][:2]
+            / orphan["sha256"]
+        )
+        original_unlink = store._unlink_team_attachment_cleanup_path
+
+        def fail_content(path_kind: str, path_key: str) -> None:
+            if path_kind == "content":
+                raise OSError("filesystem temporarily busy")
+            original_unlink(path_kind, path_key)
+
+        with mock.patch.object(
+            store,
+            "_unlink_team_attachment_cleanup_path",
+            side_effect=fail_content,
+        ):
+            self.assertEqual(store.purge_expired_team_attachments(10**10), 1)
+            replacement = self.declare(
+                self.owner, payload, name="cleanup-replacement.bin"
+            )["attachment"]
+        self.assertEqual(replacement["state"], "uploading")
+        response = self.put_chunk(
+            self.owner, replacement["id"], payload, 0, len(payload) - 1
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["attachment"]["state"], "ready")
+
+        # The pending content tombstone now observes the new ready metadata
+        # reference and retires itself without unlinking the shared blob.
+        self.assertEqual(store.purge_expired_team_attachments(), 0)
+        self.assertTrue(blob.is_file())
+        download = self.client.get(
+            f"{self.base}/attachments/{replacement['id']}/content",
+            headers=self.auth(self.owner),
+        )
+        self.assertEqual(download.status_code, 200, download.text)
+        self.assertEqual(download.content, payload)
+        connection = store.connect()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT count(*) FROM team_attachment_cleanup_queue
+                    WHERE path_kind='content' AND path_key=?
+                    """,
+                    (orphan["sha256"],),
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+
     def test_declaration_waits_for_reclaimer_before_deciding_blob_is_ready(self) -> None:
         store = self.app.state.store
         payload = b"serialize ready deduplication with physical reclamation"
@@ -1210,18 +1351,21 @@ class TeamMessagesServiceTests(unittest.TestCase):
 
         claims = store.verify_access(self.owner["access_token"])
         original_purge = store.purge_expired_team_attachments
-        original_storage_path = store._team_attachment_storage_path
+        original_cleanup_unlink = store._unlink_team_attachment_cleanup_path
         collector_at_unlink = threading.Event()
         allow_unlink = threading.Event()
         declaration_done = threading.Event()
         outcomes: dict[str, object] = {}
 
-        def controlled_storage_path(storage_key: str) -> Path:
-            if threading.current_thread().name == "attachment-reclaimer":
+        def controlled_cleanup_unlink(path_kind: str, path_key: str) -> None:
+            if (
+                threading.current_thread().name == "attachment-reclaimer"
+                and path_kind == "content"
+            ):
                 collector_at_unlink.set()
                 if not allow_unlink.wait(2):
                     raise RuntimeError("test did not release attachment reclaimer")
-            return original_storage_path(storage_key)
+            original_cleanup_unlink(path_kind, path_key)
 
         def controlled_purge(*args, **kwargs) -> int:
             if threading.current_thread().name == "attachment-declarer":
@@ -1254,7 +1398,9 @@ class TeamMessagesServiceTests(unittest.TestCase):
 
         with (
             mock.patch.object(
-                store, "_team_attachment_storage_path", side_effect=controlled_storage_path
+                store,
+                "_unlink_team_attachment_cleanup_path",
+                side_effect=controlled_cleanup_unlink,
             ),
             mock.patch.object(
                 store, "purge_expired_team_attachments", side_effect=controlled_purge

@@ -99,6 +99,7 @@ TEAM_ATTACHMENT_UPLOAD_TTL_SECONDS = 24 * 60 * 60
 # Opportunistic cleanup is intentionally bounded so an ordinary declaration
 # cannot turn into an unbounded maintenance request after a long offline period.
 TEAM_ATTACHMENT_RECLAIM_BATCH = 128
+TEAM_ATTACHMENT_CLEANUP_BATCH = 2 * TEAM_ATTACHMENT_RECLAIM_BATCH
 MAX_TEAM_SKILLS_PER_TEAM = 500
 MAX_TEAM_SKILL_VERSIONS = 200
 MAX_TEAM_SKILL_TAGS = 8
@@ -110,6 +111,8 @@ TEAM_ATTACHMENT_FILE_NAME_RE = re.compile(r"^[^\x00-\x1f\x7f/\\]{1,255}$")
 TEAM_ATTACHMENT_MEDIA_TYPE_RE = re.compile(
     r"^[A-Za-z0-9!#$&^_.+-]{1,64}/[A-Za-z0-9!#$&^_.+-]{1,64}(?:;[ -~]{1,90})?$"
 )
+TEAM_ATTACHMENT_ID_RE = re.compile(r"^tatt_[0-9a-f]{32}$")
+TEAM_ATTACHMENT_STORAGE_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
 LOCAL_CONTROL_PRINCIPAL_ID = "service_local_control"
 MANAGED_SERVER_PRINCIPAL_ID = "service_managed_server"
 MANAGED_SERVER_SERVICE_IDENTIFIER = "agentsdock.team-hub.managed-server"
@@ -8769,6 +8772,148 @@ class HubStore:
         ensure_private_directory(uploads)
         return uploads / f"{attachment_id}.part"
 
+    @staticmethod
+    def _validate_team_attachment_cleanup_key(path_kind: str, path_key: str) -> None:
+        if path_kind == "staging" and TEAM_ATTACHMENT_ID_RE.fullmatch(path_key):
+            return
+        if path_kind == "content" and TEAM_ATTACHMENT_STORAGE_KEY_RE.fullmatch(path_key):
+            return
+        raise RuntimeError("Team attachment cleanup key is invalid")
+
+    def _unlink_team_attachment_cleanup_path(
+        self,
+        path_kind: str,
+        path_key: str,
+    ) -> None:
+        """Unlink one exact owner-only attachment file without following links."""
+
+        self._validate_team_attachment_cleanup_key(path_kind, path_key)
+        root = self.team_attachment_root
+        if path_kind == "staging":
+            parent = root / "uploads"
+            filename = f"{path_key}.part"
+        else:
+            parent = root / path_key[:2]
+            filename = path_key
+        directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(
+            os, "O_DIRECTORY", 0
+        )
+        try:
+            directory = os.open(parent, directory_flags)
+        except FileNotFoundError:
+            return
+        descriptor = -1
+        try:
+            directory_info = os.fstat(directory)
+            if (
+                not stat.S_ISDIR(directory_info.st_mode)
+                or directory_info.st_uid != os.getuid()
+                or stat.S_IMODE(directory_info.st_mode) != 0o700
+            ):
+                raise PermissionError("Team attachment cleanup directory is unsafe")
+            file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            file_flags |= getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(filename, file_flags, dir_fd=directory)
+            except FileNotFoundError:
+                # A prior attempt may have unlinked the file and crashed before
+                # retiring its tombstone. Anchor the observed absence before
+                # committing the cleanup record deletion.
+                os.fsync(directory)
+                return
+            opened = os.fstat(descriptor)
+            linked = os.stat(filename, dir_fd=directory, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or opened.st_uid != os.getuid()
+                or stat.S_IMODE(opened.st_mode) != 0o600
+                or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+            ):
+                raise PermissionError("Team attachment cleanup file is unsafe")
+            os.unlink(filename, dir_fd=directory)
+            os.fsync(directory)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            os.close(directory)
+
+    def _drain_team_attachment_cleanup_queue_locked(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        limit: int,
+    ) -> int:
+        """Retry a bounded set of committed attachment cleanup tombstones.
+
+        The caller holds the cross-process attachment lease. Content tombstones
+        are rechecked against ready metadata so a blob reused after an earlier
+        unlink failure is never removed. Unsafe or transiently undeletable
+        paths stay queued for a later pass.
+        """
+
+        pending = connection.execute(
+            """
+            SELECT path_kind,path_key FROM team_attachment_cleanup_queue
+            ORDER BY attempt_count,created_at,path_kind,path_key LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        completed: list[tuple[str, str]] = []
+        failed: list[tuple[str, str]] = []
+        for row in pending:
+            path_kind = str(row["path_kind"])
+            path_key = str(row["path_key"])
+            try:
+                self._validate_team_attachment_cleanup_key(path_kind, path_key)
+            except RuntimeError:
+                # The migration constrains these values. If an externally
+                # corrupted database bypasses that invariant, fail closed on
+                # filesystem mutation and retain the evidence for repair.
+                failed.append((path_kind, path_key))
+                continue
+            if path_kind == "staging":
+                protected = connection.execute(
+                    "SELECT 1 FROM team_attachments WHERE id=? LIMIT 1",
+                    (path_key,),
+                ).fetchone()
+            else:
+                protected = connection.execute(
+                    """
+                    SELECT 1 FROM team_attachments
+                    WHERE storage_key=? AND state='ready' LIMIT 1
+                    """,
+                    (path_key,),
+                ).fetchone()
+            if protected is not None:
+                completed.append((path_kind, path_key))
+                continue
+            try:
+                self._unlink_team_attachment_cleanup_path(path_kind, path_key)
+            except (OSError, RuntimeError):
+                failed.append((path_kind, path_key))
+                continue
+            completed.append((path_kind, path_key))
+        if completed or failed:
+            with _write_transaction(connection):
+                connection.executemany(
+                    """
+                    DELETE FROM team_attachment_cleanup_queue
+                    WHERE path_kind=? AND path_key=?
+                    """,
+                    completed,
+                )
+                connection.executemany(
+                    """
+                    UPDATE team_attachment_cleanup_queue
+                    SET attempt_count=attempt_count+1
+                    WHERE path_kind=? AND path_key=?
+                    """,
+                    failed,
+                )
+        return len(completed)
+
     def declare_team_attachment(
         self,
         claims: AccessClaims,
@@ -9266,7 +9411,6 @@ class HubStore:
         attachment_lease = self.acquire_attachment_control_lease(self.data_dir)
         connection: sqlite3.Connection | None = None
         stale: list[sqlite3.Row] = []
-        removable_storage_keys: set[str] = set()
         try:
             connection = self.connect()
             with _write_transaction(connection):
@@ -9282,12 +9426,25 @@ class HubStore:
                 parameters.append(limit)
                 stale = connection.execute(query, parameters).fetchall()
                 for row in stale:
+                    attachment_id = str(row["id"])
+                    self._validate_team_attachment_cleanup_key(
+                        "staging", attachment_id
+                    )
                     connection.execute(
-                        "DELETE FROM team_attachments WHERE id=?", (row["id"],)
+                        """
+                        INSERT OR IGNORE INTO team_attachment_cleanup_queue(
+                            path_kind,path_key,created_at
+                        ) VALUES ('staging',?,?)
+                        """,
+                        (attachment_id, timestamp),
+                    )
+                    connection.execute(
+                        "DELETE FROM team_attachments WHERE id=?", (attachment_id,)
                     )
                 for storage_key in {
                     str(row["storage_key"]) for row in stale if row["state"] == "ready"
                 }:
+                    self._validate_team_attachment_cleanup_key("content", storage_key)
                     still_referenced = connection.execute(
                         """
                         SELECT 1 FROM team_attachments
@@ -9297,16 +9454,27 @@ class HubStore:
                         (storage_key,),
                     ).fetchone()
                     if still_referenced is None:
-                        removable_storage_keys.add(storage_key)
+                        connection.execute(
+                            """
+                            INSERT OR IGNORE INTO team_attachment_cleanup_queue(
+                                path_kind,path_key,created_at
+                            ) VALUES ('content',?,?)
+                            """,
+                            (storage_key, timestamp),
+                        )
 
-            # Do not unlink before the metadata deletion commits: a rollback
-            # must never leave a still-bindable row without its bytes.
-            for row in stale:
-                with suppress(OSError):
-                    self._team_attachment_staging_path(str(row["id"])).unlink()
-            for storage_key in removable_storage_keys:
-                with suppress(OSError):
-                    self._team_attachment_storage_path(storage_key).unlink()
+            # Tombstones and metadata deletion commit together. Physical
+            # cleanup is replay-safe: failed paths remain queued, while a
+            # successful unlink followed by a crash becomes a missing-file
+            # success on the next pass.
+            cleanup_limit = min(
+                8192,
+                max(TEAM_ATTACHMENT_CLEANUP_BATCH, limit * 2),
+            )
+            self._drain_team_attachment_cleanup_queue_locked(
+                connection,
+                limit=cleanup_limit,
+            )
             return len(stale)
         finally:
             if connection is not None:

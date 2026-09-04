@@ -617,7 +617,7 @@ class StopTurnProviderReadinessTests(unittest.IsolatedAsyncioTestCase):
                 RUN_NOW_TURNS={},
                 DELETING_SESSIONS=set(),
                 CODEX_GOALS_RECONFIGURING=False,
-                UNSAFE_HTTP_MUTATIONS_IN_FLIGHT=0,
+                UNSAFE_HTTP_MUTATION_TASKS={},
                 CODEX_APP_SERVER_MANAGER=None,
                 CLAUDE_SDK_MANAGER=None,
                 CODEX_NATIVE_ACTION_TASKS={},

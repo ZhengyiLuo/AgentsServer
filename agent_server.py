@@ -4115,13 +4115,15 @@ class TeamReference(BaseModel):
     path, and a team mention never resolves to a same-server chat.
     """
 
+    model_config = {"extra": "forbid"}
+
     kind: Literal["recipient", "skill"]
     recipient_kind: Literal["server", "human", "all"] | None = None
     team_id: str = Field(min_length=1, max_length=240)
     target_id: str = Field(min_length=1, max_length=240)
-    display_name_snapshot: str = Field(default="", max_length=160)
-    source_text_start: int | None = Field(default=None, ge=0)
-    source_text_end: int | None = Field(default=None, ge=0)
+    display_name_snapshot: str = Field(min_length=1, max_length=160)
+    source_text_start: int = Field(ge=0)
+    source_text_end: int = Field(ge=1)
     grant_intent: Literal[True] = True
 
     @model_validator(mode="after")
@@ -4133,13 +4135,7 @@ class TeamReference(BaseModel):
                 raise ValueError("team-wide recipients use target_id 'all'")
         elif self.recipient_kind is not None:
             raise ValueError("skill references cannot carry recipient_kind")
-        if (self.source_text_start is None) != (self.source_text_end is None):
-            raise ValueError("team reference spans need both offsets")
-        if (
-            self.source_text_start is not None
-            and self.source_text_end is not None
-            and self.source_text_end < self.source_text_start
-        ):
+        if self.source_text_end <= self.source_text_start:
             raise ValueError("team reference span is inverted")
         return self
 
@@ -7614,6 +7610,12 @@ class JobStore:
             req.chat_references,
             redact_target_detail=redact_chat_reference_errors,
         )
+        team_references = validate_scheduled_job_team_references(
+            req.prompt,
+            req.team_references,
+            chat_references=chat_references,
+            redact_target_detail=redact_chat_reference_errors,
+        )
         jid = f"job_{uuid.uuid4().hex[:16]}"
         now = now_iso()
         now_timestamp = time.time()
@@ -7652,7 +7654,7 @@ class JobStore:
             "title": req.title,
             "prompt": req.prompt,
             "chat_references": chat_reference_dicts(chat_references),
-            "team_references": team_reference_dicts(req.team_references),
+            "team_references": team_reference_dicts(team_references),
             "schedule_kind": schedule_kind,
             "interval_seconds": interval_seconds,
             "cron_expression": cron_expression,
@@ -7816,12 +7818,12 @@ class JobStore:
                 and patch["team_references"] is not None
                 else job.get("team_references") or []
             )
-            next_team_references = [
-                reference
-                if isinstance(reference, TeamReference)
-                else TeamReference(**reference)
-                for reference in raw_team_references
-            ]
+            next_team_references = validate_scheduled_job_team_references(
+                next_prompt,
+                raw_team_references,
+                chat_references=next_chat_references,
+                redact_target_detail=redact_chat_reference_errors,
+            )
             job["team_references"] = team_reference_dicts(
                 next_team_references
             )
@@ -8505,12 +8507,12 @@ class JobStore:
                 job.get("chat_references") or [],
                 redact_target_detail=True,
             )
-            team_references = [
-                reference
-                if isinstance(reference, TeamReference)
-                else TeamReference(**reference)
-                for reference in list(job.get("team_references") or [])
-            ]
+            team_references = validate_scheduled_job_team_references(
+                str(job.get("prompt") or ""),
+                job.get("team_references") or [],
+                chat_references=chat_references,
+                redact_target_detail=True,
+            )
             req = TurnRequest(
                 prompt=job["prompt"],
                 file_ids=[],
@@ -12819,7 +12821,7 @@ def utf16_slice(text: str, start: int, end: int) -> str:
     except UnicodeDecodeError as exc:
         raise HTTPException(
             status_code=400,
-            detail="chat reference range splits a Unicode character",
+            detail="reference range splits a Unicode character",
         ) from exc
 
 
@@ -13133,6 +13135,125 @@ def validate_chat_references(
     return normalized_references
 
 
+def team_reference_marker(reference: TeamReference) -> str:
+    """Return the one visible prompt token authorized by a team reference."""
+
+    return f"@@{reference.display_name_snapshot}"
+
+
+def validate_team_references(
+    prompt: str,
+    references: Any,
+    *,
+    chat_references: Any = (),
+) -> list[TeamReference]:
+    """Bind Team Network authority to exact visible ``@@`` prompt tokens.
+
+    Client-supplied IDs and spans are never authority by themselves.  Every
+    structured team reference must cover the exact display snapshot in the
+    immutable prompt, and the combined chat/team ranges must be disjoint.  The
+    latter makes ``@@`` the unambiguous first parser: a legacy chat reference
+    cannot claim either ``@`` inside an accepted team token.
+    """
+
+    if references is None or references == []:
+        return []
+    if not isinstance(references, list):
+        raise HTTPException(status_code=400, detail="team_references must be a list")
+    normalized: list[TeamReference] = []
+    try:
+        normalized = [
+            reference
+            if isinstance(reference, TeamReference)
+            else TeamReference.model_validate(reference)
+            for reference in references
+        ]
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="team reference is invalid") from exc
+
+    normalized_chat: list[ChatReference] = []
+    try:
+        normalized_chat = [
+            reference
+            if isinstance(reference, ChatReference)
+            else ChatReference.model_validate(reference)
+            for reference in (chat_references or [])
+        ]
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="chat reference is invalid") from exc
+
+    prompt_units = utf16_length(prompt)
+    ranges: list[tuple[int, int, str]] = [
+        (reference.source_text_start, reference.source_text_end, "chat")
+        for reference in normalized_chat
+    ]
+    seen: set[tuple[str, ...]] = set()
+    for reference in normalized:
+        display_name = reference.display_name_snapshot
+        if (
+            display_name.startswith("@")
+            or display_name != display_name.strip()
+            or any(character in display_name for character in "\r\n\x00")
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="team reference display name is not a visible token",
+            )
+        if reference.source_text_end > prompt_units:
+            raise HTTPException(
+                status_code=400,
+                detail="team reference range is outside the prompt",
+            )
+        if (
+            utf16_slice(
+                prompt,
+                reference.source_text_start,
+                reference.source_text_end,
+            )
+            != team_reference_marker(reference)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "team reference range does not match its visible @@ "
+                    "display-name snapshot"
+                ),
+            )
+        if not chat_reference_has_token_boundaries(
+            prompt,
+            reference,
+            prompt_units,
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="team reference marker is not delimited from surrounding text",
+            )
+        key = (
+            reference.kind,
+            reference.team_id,
+            str(reference.recipient_kind or ""),
+            reference.target_id,
+        )
+        if key in seen:
+            raise HTTPException(
+                status_code=400,
+                detail="duplicate team reference grant",
+            )
+        seen.add(key)
+        ranges.append(
+            (reference.source_text_start, reference.source_text_end, "team")
+        )
+
+    ordered_ranges = sorted(ranges)
+    for previous, current in zip(ordered_ranges, ordered_ranges[1:]):
+        if current[0] < previous[1]:
+            raise HTTPException(
+                status_code=400,
+                detail="chat and team reference ranges overlap",
+            )
+    return normalized
+
+
 class ScheduledJobChatReferenceRepairRequired(HTTPException):
     """A persisted job reference is unsafe to run until the user repairs it."""
 
@@ -13214,6 +13335,33 @@ def validate_scheduled_job_chat_references(
             status_code=exc.status_code,
             detail=(
                 provider_safe_scheduled_chat_reference_detail(exc)
+                if redact_target_detail
+                else exc.detail
+            ),
+            headers=None if redact_target_detail else exc.headers,
+        ) from exc
+
+
+def validate_scheduled_job_team_references(
+    prompt: str,
+    references: Any,
+    *,
+    chat_references: Any = (),
+    redact_target_detail: bool = False,
+) -> list[TeamReference]:
+    """Fail closed when a saved ``@@`` grant no longer matches its job prompt."""
+
+    try:
+        return validate_team_references(
+            prompt,
+            references,
+            chat_references=chat_references,
+        )
+    except HTTPException as exc:
+        raise ScheduledJobChatReferenceRepairRequired(
+            status_code=exc.status_code,
+            detail=(
+                "saved Team target configuration is invalid"
                 if redact_target_detail
                 else exc.detail
             ),
@@ -13924,6 +14072,11 @@ async def issue_cross_chat_capability(
     team_references: list[TeamReference] | None = None,
     team_read_enabled: bool = False,
 ) -> Path | None:
+    validated_team_references = validate_team_references(
+        source_user_instruction,
+        list(team_references or []),
+        chat_references=references,
+    )
     grants = {
         (reference.session_id, reference.action)
         for reference in references
@@ -13982,7 +14135,7 @@ async def issue_cross_chat_capability(
     # Recipient identities never appear in the authority file or the prompt.
     team_routes: dict[str, dict[str, Any]] = {}
     if AGENT_TOKEN:
-        for reference in team_references or []:
+        for reference in validated_team_references:
             team_routes["team_" + secrets.token_hex(16)] = reference.model_dump()
     if not team_routes:
         effective_actions.discard("team_send")
@@ -15631,6 +15784,16 @@ async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedT
                                 candidate.get("secure_peer_route_snapshots")
                             ),
                         )
+                    candidate_team_references = validate_team_references(
+                        str(candidate.get("prompt") or ""),
+                        list(candidate.get("team_references") or []),
+                        chat_references=list(
+                            candidate.get("chat_references") or []
+                        ),
+                    )
+                    candidate["team_references"] = team_reference_dicts(
+                        candidate_team_references
+                    )
                     item.clear()
                     item.update(candidate)
                     updated = dict(item)
@@ -50920,12 +51083,23 @@ async def _start_turn_locked(
                 req.chat_references,
                 redact_target_detail=True,
             )
+            req.team_references = validate_scheduled_job_team_references(
+                req.prompt,
+                req.team_references,
+                chat_references=req.chat_references,
+                redact_target_detail=True,
+            )
         else:
             req.chat_references = validate_chat_references(
                 session_id,
                 req.prompt,
                 req.chat_references,
                 req.client_capabilities,
+            )
+            req.team_references = validate_team_references(
+                req.prompt,
+                req.team_references,
+                chat_references=req.chat_references,
             )
             if (
                 provider_context_mode == "chat"

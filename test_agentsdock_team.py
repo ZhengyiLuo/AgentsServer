@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import io
 import json
 import tempfile
@@ -40,6 +41,8 @@ def _all_reference() -> agent_server.TeamReference:
         team_id="team_alpha_0001",
         target_id="all",
         display_name_snapshot="all",
+        source_text_start=17,
+        source_text_end=22,
     )
 
 
@@ -99,10 +102,130 @@ class TeamPurposeGatingTests(unittest.TestCase):
         self.assertTrue(
             agent_server.team_reference_requests_skill_publish([
                 agent_server.TeamReference(
-                    kind="skill", team_id="team_alpha_0001", target_id="tskill_1"
+                    kind="skill",
+                    team_id="team_alpha_0001",
+                    target_id="tskill_1",
+                    display_name_snapshot="deploy-runbook",
+                    source_text_start=4,
+                    source_text_end=21,
                 )
             ])
         )
+
+    def test_exact_visible_utf16_team_mentions_are_required(self) -> None:
+        prompt = "😀 Tell @@SONIC now"
+        start = len("😀 Tell ".encode("utf-16-le")) // 2
+        reference = _server_reference(
+            source_text_start=start,
+            source_text_end=start + len("@@SONIC"),
+        )
+        self.assertEqual(
+            agent_server.validate_team_references(prompt, [reference]),
+            [reference],
+        )
+
+        unicode_prompt = "Send @@李😀 now"
+        unicode_marker = "@@李😀"
+        unicode_reference = _server_reference(
+            display_name_snapshot="李😀",
+            source_text_start=5,
+            source_text_end=5 + agent_server.utf16_length(unicode_marker),
+        )
+        self.assertEqual(
+            agent_server.validate_team_references(
+                unicode_prompt,
+                [unicode_reference],
+            ),
+            [unicode_reference],
+        )
+
+        for rejected in (
+            _server_reference(source_text_start=0, source_text_end=7),
+            _server_reference(source_text_start=start + 1, source_text_end=start + 8),
+            _server_reference(source_text_start=start, source_text_end=10_000),
+            _server_reference(display_name_snapshot="DPark"),
+            _server_reference(source_text_start=1, source_text_end=8),
+        ):
+            with self.subTest(reference=rejected.model_dump()):
+                with self.assertRaises(HTTPException):
+                    agent_server.validate_team_references(prompt, [rejected])
+
+    def test_team_mentions_reject_duplicates_bad_boundaries_and_chat_overlap(self) -> None:
+        with self.assertRaisesRegex(HTTPException, "delimited"):
+            agent_server.validate_team_references(
+                "x@@SONIC now",
+                [_server_reference(source_text_start=1, source_text_end=8)],
+            )
+        with self.assertRaisesRegex(HTTPException, "duplicate"):
+            agent_server.validate_team_references(
+                "@@SONIC then @@SONIC",
+                [
+                    _server_reference(source_text_start=0, source_text_end=7),
+                    _server_reference(source_text_start=13, source_text_end=20),
+                ],
+            )
+
+        legacy_chat_reference = agent_server.ChatReference(
+            session_id="target-private-id",
+            display_title_snapshot="SONIC",
+            source_text_start=0,
+            source_text_end=7,
+            action="route",
+        )
+        with self.assertRaisesRegex(HTTPException, "overlap"):
+            agent_server.validate_team_references(
+                "@@SONIC now",
+                [_server_reference(source_text_start=0, source_text_end=7)],
+                chat_references=[legacy_chat_reference],
+            )
+
+    def test_hidden_team_reference_cannot_mint_provider_authority(self) -> None:
+        async def exercise() -> None:
+            with (
+                tempfile.TemporaryDirectory() as temporary,
+                patch.object(agent_server, "AGENT_TOKEN", "test-agent-token"),
+                patch.object(
+                    agent_server,
+                    "CROSS_CHAT_AUTHORITY_ROOT",
+                    Path(temporary) / "authority",
+                ),
+            ):
+                with self.assertRaisesRegex(HTTPException, "visible @@"):
+                    await agent_server.issue_cross_chat_capability(
+                        "source",
+                        "run_hidden_team_reference",
+                        [],
+                        source_user_instruction="Do the work today",
+                        actions={"team_send"},
+                        team_references=[_server_reference()],
+                    )
+                self.assertFalse((Path(temporary) / "authority").exists())
+
+        asyncio.run(exercise())
+
+
+class TeamReferenceAdmissionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ordinary_turn_rejects_a_stale_team_reference_before_launch(self) -> None:
+        sessions = {
+            "source": {
+                "id": "source",
+                "title": "Source",
+                "backend": agent_server.BACKEND_CODEX,
+            }
+        }
+        request = agent_server.TurnRequest(
+            prompt="Mention was removed",
+            team_references=[_server_reference()],
+        )
+        with patch.object(agent_server.STORE, "sessions", sessions):
+            with self.assertRaisesRegex(HTTPException, "visible @@"):
+                await agent_server._start_turn_locked(
+                    "source",
+                    request,
+                    queue_if_busy=False,
+                    provider_context_mode="chat",
+                    admission_backend=agent_server.BACKEND_CODEX,
+                )
 
 
 class FakeResponse:
@@ -284,6 +407,7 @@ class ProviderTeamEndpointTests(unittest.IsolatedAsyncioTestCase):
             "source",
             "run_team",
             [],
+            source_user_instruction="Tell @@SONIC and @@all",
             actions=set(actions),
             team_references=list(references) if references else None,
             team_read_enabled="team_read" in actions,

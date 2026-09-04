@@ -7,6 +7,8 @@ from collections import OrderedDict, deque
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from fastapi import HTTPException
+
 import agent_server
 from agent_server import (
     build_turn_provider_prompt,
@@ -1095,6 +1097,72 @@ class QueuedTurnEditTests(unittest.IsolatedAsyncioTestCase):
                 update_payload["team_references"],
                 updated["team_references"],
             )
+        finally:
+            agent_server.STORE.sessions = original_sessions
+            agent_server.QUEUED_TURNS = original_queue
+
+    async def test_edit_rejects_hidden_team_reference_without_mutating_queue(self) -> None:
+        original_sessions = agent_server.STORE.sessions
+        original_queue = agent_server.QUEUED_TURNS
+        item = {
+            "queued_id": "queued-hidden-team-reference",
+            "prompt": "No team mention here",
+            "file_ids": [],
+            "chat_references": [],
+            "team_references": [],
+            "client_capabilities": [],
+            "provider_cross_chat_route_snapshot": [],
+            "secure_peer_route_snapshots": [],
+            "cross_chat_obligation_ids": [],
+            "cross_chat_exchange_ids": [],
+            "backend": "codex",
+        }
+        original_item = dict(item)
+        append = AsyncMock()
+        try:
+            agent_server.STORE.sessions = {
+                "chat-edit": {
+                    "id": "chat-edit",
+                    "title": "Edit",
+                    "backend": "codex",
+                }
+            }
+            agent_server.QUEUED_TURNS = {
+                "chat-edit": deque([item])
+            }
+            with (
+                patch.object(
+                    agent_server,
+                    "managed_server_update_blocker",
+                    return_value=None,
+                ),
+                patch.object(
+                    agent_server,
+                    "append_durable_event",
+                    append,
+                ),
+            ):
+                with self.assertRaisesRegex(HTTPException, "visible @@"):
+                    await agent_server.update_queued_turn(
+                        "chat-edit",
+                        "queued-hidden-team-reference",
+                        agent_server.UpdateQueuedTurnRequest(
+                            team_references=[
+                                agent_server.TeamReference(
+                                    kind="recipient",
+                                    recipient_kind="server",
+                                    team_id="team_alpha",
+                                    target_id="node_sonic",
+                                    display_name_snapshot="SONIC",
+                                    source_text_start=0,
+                                    source_text_end=7,
+                                )
+                            ],
+                        ),
+                    )
+
+            self.assertEqual(item, original_item)
+            append.assert_not_awaited()
         finally:
             agent_server.STORE.sessions = original_sessions
             agent_server.QUEUED_TURNS = original_queue

@@ -645,6 +645,7 @@ exit 0
         self.assertIn('"$SCRIPT_DIR/agentsdock_chats.py"', source)
         self.assertIn('"$SCRIPT_DIR/agentsdock_emergency.py"', source)
         self.assertIn('"$SCRIPT_DIR/agentsdock_publish.py"', source)
+        self.assertIn('"$SCRIPT_DIR/agentsdock_team.py"', source)
         self.assertIn('"$SCRIPT_DIR/claude_sdk_client.py"', source)
         self.assertIn('"$SCRIPT_DIR/codex_app_server.py"', source)
         self.assertIn('"$SCRIPT_DIR/cursor_agent_client.py"', source)
@@ -662,9 +663,10 @@ exit 0
         self.assertIn("'$REMOTE_SERVER_DIR/team_hub_host.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/secure_peer_runtime.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/secure_peer_delivery.py'", source)
+        self.assertIn("'$REMOTE_SERVER_DIR/agentsdock_team.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/agentsdock_team_hub'", source)
         self.assertIn(
-            "import agentsdock_team_hub, claude_agent_sdk, cursor_agent_client, cursor_process_guard, secure_peer_delivery, secure_peer_runtime, team_hub_host",
+            "import agentsdock_team_hub, claude_agent_sdk, cursor_agent_client, cursor_process_guard, secure_peer_delivery, secure_peer_runtime, team_hub_host, agentsdock_mail, agentsdock_team",
             source,
         )
         self.assertIn("from agentsdock_team_hub import secure_peer, secure_peer_hub", source)

@@ -1475,6 +1475,52 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
 
         await turn.close()
 
+    async def test_goal_continuation_can_follow_completed_turn(self) -> None:
+        factory = FakeProcessFactory()
+        process = factory.process
+        process.responders["turn/start"] = lambda _: {
+            "turn": {
+                "id": "turn_initial",
+                "status": "inProgress",
+                "items": [],
+            }
+        }
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+
+        turn = await client.start_turn(
+            "thread_goal",
+            [{"type": "text", "text": "Start goal"}],
+            follow_goal_continuations=True,
+        )
+        completed = {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread_goal",
+                "turn": {"id": "turn_initial", "status": "completed"},
+            },
+        }
+        process.feed(completed)
+        self.assertEqual(await turn.next_notification(timeout=1), completed)
+        self.assertIs(client.active_turn("thread_goal"), turn)
+
+        continued = {
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread_goal",
+                "turn": {
+                    "id": "turn_continued",
+                    "status": "inProgress",
+                    "items": [],
+                },
+            },
+        }
+        process.feed(continued)
+        self.assertEqual(await turn.next_notification(timeout=1), continued)
+        self.assertEqual(turn.turn_id, "turn_continued")
+
+        await turn.close()
+
     async def test_resume_accepts_a_jsonl_response_larger_than_16_mib(self) -> None:
         factory = FakeProcessFactory()
         process = factory.process

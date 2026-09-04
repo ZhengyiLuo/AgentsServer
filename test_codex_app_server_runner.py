@@ -161,6 +161,7 @@ class FakeManager:
         self.start_calls = 0
         self.read_thread_calls: list[tuple[str, bool]] = []
         self.list_turns_calls: list[tuple[str, int, str, str]] = []
+        self.follow_goal_continuation_calls: list[bool] = []
         self.turn_calls: list[
             tuple[str, list[dict[str, object]], dict[str, object]]
         ] = []
@@ -182,7 +183,9 @@ class FakeManager:
         input_items: list[dict[str, object]],
         *,
         overrides: dict[str, object] | None = None,
+        follow_goal_continuations: bool = False,
     ) -> FakeTurn:
+        self.follow_goal_continuation_calls.append(follow_goal_continuations)
         self.turn_calls.append((thread_id, input_items, dict(overrides or {})))
         if self.start_turn_error is not None:
             raise self.start_turn_error
@@ -768,6 +771,109 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             manager.notification_barriers,
             [(agent_server.project_codex_notification, "thread-native")],
+        )
+
+    async def test_active_goal_keeps_run_owner_across_native_continuation(self) -> None:
+        turn = FakeTurn()
+        manager = FakeManager(turn)
+        self.session["codex_goal"] = {
+            "threadId": "thread-native",
+            "objective": "Finish the task",
+            "status": "active",
+        }
+        stack, events, finished, _exec_fallback = self.runner_patches(manager)
+        with stack:
+            runner = asyncio.create_task(
+                agent_server.run_codex_app_server(
+                    "chat-native",
+                    "run-original",
+                    "Start the goal",
+                    dict(self.session),
+                    Path(self.cwd) / ".runner-test-manifest.json",
+                    allow_exec_fallback=True,
+                    allow_resume_rollover=False,
+                )
+            )
+            for _ in range(100):
+                if (
+                    agent_server.ACTIVE.get("chat-native") or {}
+                ).get("provider_turn_ready"):
+                    break
+                await asyncio.sleep(0)
+            else:
+                self.fail("Codex app-server turn never became ready")
+
+            turn.feed(completed_notification())
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(runner), timeout=0.01)
+            finished.assert_not_awaited()
+            self.assertTrue(
+                await agent_server.codex_thread_has_local_run_owner(
+                    "chat-native",
+                    "thread-native",
+                )
+            )
+
+            turn.turn_id = "turn-continued"
+            turn.feed({
+                "method": "turn/started",
+                "params": {
+                    "threadId": "thread-native",
+                    "turn": {
+                        "id": "turn-continued",
+                        "status": "inProgress",
+                        "items": [],
+                    },
+                },
+            })
+            turn.feed({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-native",
+                    "turnId": "turn-continued",
+                    "item": {
+                        "id": "continued-final",
+                        "type": "agentMessage",
+                        "text": "Continued goal output.",
+                        "phase": "final_answer",
+                    },
+                },
+            })
+            turn.feed({
+                "method": "thread/goal/updated",
+                "params": {
+                    "threadId": "thread-native",
+                    "goal": {
+                        "threadId": "thread-native",
+                        "objective": "Finish the task",
+                        "status": "complete",
+                    },
+                },
+            })
+            turn.feed({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-native",
+                    "turnId": "turn-continued",
+                    "turn": {
+                        "id": "turn-continued",
+                        "status": "completed",
+                    },
+                },
+            })
+            await asyncio.wait_for(runner, timeout=1)
+
+        self.assertEqual(manager.turn_calls[0][0], "thread-native")
+        self.assertEqual(manager.follow_goal_continuation_calls, [True])
+        continued_output = [
+            call.args[2]["text"]
+            for call in events.await_args_list
+            if call.args[1] == "assistant_text"
+        ]
+        self.assertEqual(continued_output, ["Continued goal output."])
+        self.assertEqual(
+            finished.await_args.args[1]["provider_turn_id"],
+            "turn-continued",
         )
 
     async def test_scheduled_run_metadata_is_attached_to_live_reasoning_and_tools(
@@ -3332,6 +3438,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                 input_items: list[dict[str, object]],
                 *,
                 overrides: dict[str, object] | None = None,
+                follow_goal_continuations: bool = False,
             ) -> FakeTurn:
                 self.turn_calls.append(
                     (thread_id, input_items, dict(overrides or {}))

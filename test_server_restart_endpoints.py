@@ -731,7 +731,11 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
             "action": None,
         }
         capability_builder = MagicMock(return_value=capability)
-        with patch.object(agent_server, "SERVER_INSTANCE_ID", SERVER_INSTANCE_ID), \
+        # Other modules can leave queued rows in module-global state; the
+        # capability contract must be asserted against an isolated snapshot.
+        with tempfile.TemporaryDirectory() as temporary, \
+             restart_environment(Path(temporary)), \
+             patch.object(agent_server, "SERVER_INSTANCE_ID", SERVER_INSTANCE_ID), \
              patch.object(agent_server, "server_restart_capability", capability_builder), \
              patch.object(
                  agent_server,

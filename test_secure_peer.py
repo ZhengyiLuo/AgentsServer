@@ -669,6 +669,18 @@ class SecurePeerStoreTests(unittest.TestCase):
             b'{"external_agent_id":"agent-runtime","backend":"codex","display_name":"Agent","idempotency_key":"agent-register-001"}',
         )
         self.assertEqual(registration.method, "POST")
+        skills = sanitize_proxy_request(
+            peer,
+            "GET",
+            "/v1/teams/team-alpha/network/skills",
+            "include_archived=false&slug=deploy-sonic",
+            (),
+            b"",
+        )
+        self.assertEqual(
+            skills.query,
+            "include_archived=false&slug=deploy-sonic",
+        )
         for path in (
             "/v1/sessions/refresh",
             "/v1/invitations/redeem",
@@ -677,7 +689,6 @@ class SecurePeerStoreTests(unittest.TestCase):
             "/v1/teams/team-other/members",
             "/v1/teams/team-other/network",
             "/v1/teams/team-alpha/network/invites",
-            "/v1/teams/team-alpha/network/skills",
         ):
             with self.subTest(path=path), self.assertRaises(SecurePeerError):
                 sanitize_proxy_request(peer, "GET", path, "", (), b"")

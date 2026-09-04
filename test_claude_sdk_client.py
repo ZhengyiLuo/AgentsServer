@@ -7,6 +7,7 @@ from typing import Any
 
 from claude_sdk_client import (
     CLAUDE_NON_DURABLE_SCHEDULER_TOOLS,
+    CLAUDE_SDK_LITERAL_MESSAGE_PREFIX,
     CLAUDE_SDK_MCP_STATUS_SCAN_LIMIT,
     CLAUDE_SDK_MCP_STATUS_TRUNCATED_KEY,
     ClaudeSDKConfigurationConflict,
@@ -502,6 +503,37 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
             result,
         ])
         self.assertEqual(await handle.wait_result(), result)
+
+    async def test_leading_slash_prompts_are_literalized_only_on_sdk_transport(self) -> None:
+        cases = (
+            ("/team use research", True),
+            (" \ufeff  /compact this explanation", True),
+            ("What does /team mean?", False),
+            ("https://example.test/team", False),
+        )
+        for index, (prompt, literalized) in enumerate(cases):
+            with self.subTest(prompt=prompt):
+                handle = await self.manager.start_run(
+                    "chat-1",
+                    prompt,
+                    run_id=f"run-{index}",
+                    options={"cwd": "/tmp"},
+                    configuration_key="config-a",
+                )
+                client = self.factory.clients[0]
+                transmitted = client.calls[-1][1]
+                self.assertEqual(
+                    transmitted,
+                    f"{CLAUDE_SDK_LITERAL_MESSAGE_PREFIX}{prompt}"
+                    if literalized else prompt,
+                )
+                self.assertEqual(
+                    client.query_envelopes[-1][0]["uuid"],
+                    handle.correlation_id,
+                )
+                result = {"type": "result", "result": "done"}
+                await client.emit(result)
+                await handle.wait_result()
 
     async def test_delegated_task_keeps_run_open_until_followup_result(self) -> None:
         handle = await self.manager.start_run(

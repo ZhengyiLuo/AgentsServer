@@ -6,17 +6,23 @@ from contextlib import suppress
 from datetime import datetime, timezone
 import hashlib
 import json
+import mimetypes
 import os
 from pathlib import Path
+import re
 import socket
 import stat
 import threading
 import time
 from typing import Any, Mapping
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 import uuid
 
 from agentsdock_team_hub.secure_peer import (
+    AttachmentFileLease,
+    AttachmentProxyRequest,
+    AttachmentProxyResponse,
+    MAX_ATTACHMENT_PROTOCOL_BYTES,
     PAIRING_STATUS_LIMIT,
     PEER_HEARTBEAT_LEASE_SECONDS,
     PeerAuthorization,
@@ -29,7 +35,12 @@ from agentsdock_team_hub.secure_peer import (
 )
 from agentsdock_team_hub.secure_peer_hub import SecurePeerHubAdapter
 from agentsdock_team_hub.security import canonical_json, ensure_private_directory
-from agentsdock_team_hub.store import HubError, HubStore
+from agentsdock_team_hub.store import (
+    TEAM_ATTACHMENT_CHUNK_BYTES,
+    TEAM_ATTACHMENT_FILE_NAME_RE,
+    HubError,
+    HubStore,
+)
 from secure_peer_delivery import SecurePeerDeliveryLedger
 
 
@@ -38,6 +49,11 @@ SECURE_PEER_PROXY_PREFIX = "/api/team-hub-secure"
 SECURE_PEER_HEARTBEAT_SECONDS = 30
 SECURE_PEER_LEASE_SECONDS = PEER_HEARTBEAT_LEASE_SECONDS
 SECURE_PEER_OFFLINE_FAILURES = 3
+DEFAULT_TEAM_CACHE_MAX_BYTES = 10 * 1024 * 1024 * 1024
+_TEAM_CACHE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,239}$")
+_TEAM_CACHE_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_TEAM_CACHE_META_NAME = ".metadata.json"
+_TEAM_CACHE_META_MAX_BYTES = 4096
 _PAIRING_ACTIONABLE_STATUSES = frozenset(
     {"requesting", "pending_approval", "approved", "connected"}
 )
@@ -129,12 +145,30 @@ class SecurePeerRuntime:
         server_instance_id: str,
         display_name: str | None = None,
         logger: Any = None,
+        team_cache_max_bytes: int | None = None,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.server_identity = str(server_identity)
         self.server_instance_id = str(server_instance_id)
         self.display_name = str(display_name or socket.gethostname() or "AgentsServer")[:160]
         self.logger = logger
+        configured_cache_max = (
+            os.environ.get("AGENTSDOCK_TEAM_CACHE_MAX_BYTES")
+            if team_cache_max_bytes is None
+            else str(team_cache_max_bytes)
+        )
+        try:
+            parsed_cache_max = int(configured_cache_max or DEFAULT_TEAM_CACHE_MAX_BYTES)
+        except (TypeError, ValueError):
+            parsed_cache_max = DEFAULT_TEAM_CACHE_MAX_BYTES
+        self.team_cache_max_bytes = (
+            parsed_cache_max
+            if 1 <= parsed_cache_max <= MAX_ATTACHMENT_PROTOCOL_BYTES
+            else DEFAULT_TEAM_CACHE_MAX_BYTES
+        )
+        self.team_cache_dir = self.data_dir.parent / "team-cache"
+        self._team_cache_guard = threading.RLock()
+        self._team_cache_pins: dict[Path, int] = {}
         self.config_path = self.data_dir / "host-config.json"
         self._guard = threading.RLock()
         # Linearizes durable outbound intent creation with every local
@@ -477,6 +511,7 @@ class SecurePeerRuntime:
                     int(self._config["listen_port"]),
                     forwarder=self._forward_peer_request,
                     resource_team_resolver=adapter.resource_team,
+                    attachment_max_bytes=lambda: hub_store.team_attachment_max_bytes,
                     relay_enabled=lambda: self._relay_enabled,
                     peer_heartbeat=self._record_authenticated_peer_heartbeat,
                     peer_revoker=self._revoke_authenticated_peer,
@@ -579,6 +614,11 @@ class SecurePeerRuntime:
                         port,
                         forwarder=self._forward_peer_request,
                         resource_team_resolver=self._adapter.resource_team,
+                        attachment_max_bytes=(
+                            lambda: self._hub_store.team_attachment_max_bytes
+                            if self._hub_store is not None
+                            else 0
+                        ),
                         relay_enabled=lambda: self._relay_enabled,
                         peer_heartbeat=self._record_authenticated_peer_heartbeat,
                         peer_revoker=self._revoke_authenticated_peer,
@@ -608,6 +648,11 @@ class SecurePeerRuntime:
                         int(old_config["listen_port"]),
                         forwarder=self._forward_peer_request,
                         resource_team_resolver=self._adapter.resource_team,
+                        attachment_max_bytes=(
+                            lambda: self._hub_store.team_attachment_max_bytes
+                            if self._hub_store is not None
+                            else 0
+                        ),
                         relay_enabled=lambda: self._relay_enabled,
                         peer_heartbeat=self._record_authenticated_peer_heartbeat,
                         peer_revoker=self._revoke_authenticated_peer,
@@ -2966,6 +3011,7 @@ class SecurePeerRuntime:
     def _forward_peer_request(self, request):
         """Enter the same crash-consistency boundary as mounted Hub traffic."""
 
+        deferred_release = False
         with self._peer_admission:
             if not self._peer_accepting:
                 raise SecurePeerError(
@@ -2979,7 +3025,7 @@ class SecurePeerRuntime:
                 adapter, hub_store = self._adapter, self._hub_store
             if adapter is None or hub_store is None:
                 raise SecurePeerError("hub_unavailable", "Team Hub is unavailable", 503)
-            if request.method == "POST":
+            if request.method in {"POST", "PUT"}:
                 # Snapshot/fence creation takes this exact lock.  A write
                 # therefore either commits before the snapshot begins or sees
                 # the durable fence and fails before mutation.
@@ -2990,19 +3036,64 @@ class SecurePeerRuntime:
                             "Team Hub is unavailable during server maintenance",
                             503,
                         )
-                    return adapter.forward(request)
-            if hub_store.maintenance_fence() is not None:
-                raise SecurePeerError(
-                    "hub_maintenance",
-                    "Team Hub is unavailable during server maintenance",
-                    503,
+                    result = (
+                        adapter.forward_attachment(request)
+                        if isinstance(request, AttachmentProxyRequest)
+                        else adapter.forward(request)
+                    )
+            else:
+                if hub_store.maintenance_fence() is not None:
+                    raise SecurePeerError(
+                        "hub_maintenance",
+                        "Team Hub is unavailable during server maintenance",
+                        503,
+                    )
+                result = (
+                    adapter.forward_attachment(request)
+                    if isinstance(request, AttachmentProxyRequest)
+                    else adapter.forward(request)
                 )
-            return adapter.forward(request)
+            if (
+                isinstance(result, AttachmentProxyResponse)
+                and result.descriptor is not None
+                and callable(result.finalizer)
+            ):
+                inner_finalizer = result.finalizer
+                finalizer_lock = threading.Lock()
+                finalized = False
+
+                def finalize() -> None:
+                    nonlocal finalized
+                    with finalizer_lock:
+                        if finalized:
+                            return
+                        finalized = True
+                    try:
+                        inner_finalizer()
+                    finally:
+                        with self._peer_admission:
+                            self._peer_in_flight = max(0, self._peer_in_flight - 1)
+                            if self._peer_in_flight == 0:
+                                self._peer_admission.notify_all()
+
+                result = AttachmentProxyResponse(
+                    status=result.status,
+                    headers=result.headers,
+                    body=result.body,
+                    descriptor=result.descriptor,
+                    offset=result.offset,
+                    length=result.length,
+                    finalizer=finalize,
+                    cancelled=result.cancelled,
+                )
+                deferred_release = True
+            return result
         finally:
-            with self._peer_admission:
-                self._peer_in_flight = max(0, self._peer_in_flight - 1)
-                if self._peer_in_flight == 0:
-                    self._peer_admission.notify_all()
+            if not deferred_release:
+                with self._peer_admission:
+                    self._peer_in_flight = max(0, self._peer_in_flight - 1)
+                    if self._peer_in_flight == 0:
+                        self._peer_admission.notify_all()
 
     def _record_authenticated_peer_heartbeat(
         self,
@@ -3486,6 +3577,1130 @@ class SecurePeerRuntime:
             target_id=target_id,
             message=message,
         )
+
+    # ------------------------------------------------------------------
+    # Team Messages V2: the local server acts as its own node on the Hub.
+    # Host realm talks to the in-process HubStore with process-local claims;
+    # peer realm goes through the pinned mTLS connection and attachment-only
+    # binary lane.
+
+    @staticmethod
+    def _team_attachment_path(team_id: str, attachment_id: str) -> str:
+        return (
+            f"/v1/teams/{quote(team_id, safe='')}/network/attachments/"
+            f"{quote(attachment_id, safe='')}/content"
+        )
+
+    @staticmethod
+    def _validate_team_attachment_metadata(
+        value: Any, *, team_id: str, attachment_id: str
+    ) -> dict[str, Any]:
+        attachment = value.get("attachment") if isinstance(value, Mapping) else None
+        if not isinstance(attachment, Mapping):
+            raise SecurePeerError(
+                "remote_invalid", "Team Hub returned invalid attachment metadata", 502
+            )
+        file_name = attachment.get("file_name")
+        media_type = attachment.get("media_type")
+        sha256 = attachment.get("sha256")
+        size = attachment.get("byte_size")
+        if (
+            str(attachment.get("id") or "") != attachment_id
+            or str(attachment.get("team_id") or team_id) != team_id
+            or attachment.get("state") != "ready"
+            or not isinstance(file_name, str)
+            or TEAM_ATTACHMENT_FILE_NAME_RE.fullmatch(file_name) is None
+            or file_name.strip() != file_name
+            or file_name in {".", ".."}
+            or not isinstance(media_type, str)
+            or not 3 <= len(media_type) <= 160
+            or not isinstance(sha256, str)
+            or _TEAM_CACHE_SHA256_RE.fullmatch(sha256) is None
+            or type(size) is not int
+            or not 1 <= size <= MAX_ATTACHMENT_PROTOCOL_BYTES
+        ):
+            raise SecurePeerError(
+                "remote_invalid", "Team Hub returned invalid attachment metadata", 502
+            )
+        return dict(attachment)
+
+    def _active_team_connection(
+        self, connection_id: str, team_id: str
+    ) -> dict[str, Any]:
+        active = next(
+            (
+                dict(item)
+                for item in self.client.list_connections()
+                if item.get("active")
+                and item.get("status") == "connected"
+                and item.get("connection_id") == connection_id
+            ),
+            None,
+        )
+        if active is None or active.get("team_id") != team_id:
+            raise SecurePeerError(
+                "connection_unavailable", "Secure peer connection is unavailable", 404
+            )
+        return active
+
+    def _team_attachment_metadata(
+        self, connection_id: str, team_id: str, attachment_id: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        active = self._active_team_connection(connection_id, team_id)
+        response = self.proxy(
+            connection_id,
+            "GET",
+            f"/v1/teams/{quote(team_id, safe='')}/network/attachments/"
+            f"{quote(attachment_id, safe='')}",
+            query="",
+            headers={"accept": "application/json"},
+            body=None,
+        )
+        if int(response.status) >= 400:
+            raise SecurePeerError(
+                "attachment_unavailable", "Team attachment is unavailable", response.status
+            )
+        try:
+            value = json.loads(response.body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SecurePeerError(
+                "remote_invalid", "Team Hub returned invalid attachment metadata", 502
+            ) from exc
+        return active, self._validate_team_attachment_metadata(
+            value, team_id=team_id, attachment_id=attachment_id
+        )
+
+    def proxy_team_attachment_chunk(
+        self,
+        connection_id: str,
+        team_id: str,
+        attachment_id: str,
+        *,
+        content_range: str,
+        body: bytes,
+    ):
+        """Forward one content chunk, preserving active-connection retirement."""
+
+        with self._outbound_guard:
+            active = self._active_team_connection(connection_id, team_id)
+            try:
+                return self.client.upload_attachment_chunk(
+                    connection_id,
+                    self._team_attachment_path(team_id, attachment_id),
+                    content_range=content_range,
+                    body=body,
+                )
+            except SecurePeerError as exc:
+                if (
+                    self._is_unconfirmed_peer_revocation(exc)
+                    and self._remote_revocation_confirmed(connection_id) is True
+                ):
+                    with suppress(Exception):
+                        self._retire_remote_revoked_active_connection(active, {})
+                raise
+
+    def proxy_team_attachment_head(
+        self, connection_id: str, team_id: str, attachment_id: str
+    ):
+        """Forward an attachment HEAD while enforcing the exact active route."""
+
+        with self._outbound_guard:
+            active = self._active_team_connection(connection_id, team_id)
+            try:
+                return self.client.head_attachment(
+                    connection_id,
+                    self._team_attachment_path(team_id, attachment_id),
+                )
+            except SecurePeerError as exc:
+                if (
+                    self._is_unconfirmed_peer_revocation(exc)
+                    and self._remote_revocation_confirmed(connection_id) is True
+                ):
+                    with suppress(Exception):
+                        self._retire_remote_revoked_active_connection(active, {})
+                raise
+
+    @staticmethod
+    def _team_file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while True:
+                block = handle.read(1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _team_cache_payload_name(file_name: str) -> str:
+        """Keep ordinary names readable and bound oversized UTF-8 basenames."""
+
+        if len(os.fsencode(file_name)) <= 240:
+            return file_name
+        digest = hashlib.sha256(file_name.encode("utf-8")).hexdigest()[:32]
+        suffix = Path(file_name).suffix
+        if (
+            len(suffix.encode("utf-8")) > 32
+            or re.fullmatch(r"\.[A-Za-z0-9._+-]{1,31}", suffix) is None
+        ):
+            suffix = ""
+        return f"attachment-{digest}{suffix}"
+
+    def _team_cache_paths(
+        self,
+        active: Mapping[str, Any],
+        team_id: str,
+        attachment_id: str,
+        file_name: str,
+    ) -> tuple[Path, Path]:
+        hub_id = str(active.get("hub_id") or "")
+        for value in (hub_id, team_id, attachment_id):
+            if _TEAM_CACHE_SEGMENT_RE.fullmatch(value) is None:
+                raise SecurePeerError(
+                    "remote_invalid", "Team attachment identity is invalid", 502
+                )
+        if TEAM_ATTACHMENT_FILE_NAME_RE.fullmatch(file_name) is None:
+            raise SecurePeerError(
+                "remote_invalid", "Team attachment file name is invalid", 502
+            )
+        directory = self.team_cache_dir
+        # Validate each owner-only component instead of allowing mkdir's
+        # parents walk to silently traverse a stale/symlinked cache segment.
+        ensure_private_directory(directory)
+        for component in (hub_id, team_id, attachment_id):
+            directory = directory / component
+            ensure_private_directory(directory)
+        payload_directory = directory / "payload"
+        ensure_private_directory(payload_directory)
+        target = payload_directory / self._team_cache_payload_name(file_name)
+        return target, directory / _TEAM_CACHE_META_NAME
+
+    @staticmethod
+    def _team_cache_read_sidecar(path: Path) -> dict[str, Any] | None:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except (FileNotFoundError, OSError):
+            return None
+        try:
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_size < 2
+                or info.st_size > _TEAM_CACHE_META_MAX_BYTES
+            ):
+                return None
+            raw = os.read(descriptor, _TEAM_CACHE_META_MAX_BYTES + 1)
+            if len(raw) != info.st_size:
+                return None
+        finally:
+            os.close(descriptor)
+        try:
+            value = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    @staticmethod
+    def _team_cache_write_sidecar(path: Path, value: Mapping[str, Any]) -> None:
+        encoded = canonical_json(dict(value))
+        if not 2 <= len(encoded) <= _TEAM_CACHE_META_MAX_BYTES:
+            raise SecurePeerError(
+                "cache_unavailable", "Team attachment cache metadata is invalid", 503
+            )
+        temporary = path.parent / f".metadata.{uuid.uuid4().hex}.tmp"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(temporary, flags, 0o600)
+        try:
+            try:
+                view = memoryview(encoded)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError("Team attachment cache sidecar write stalled")
+                    view = view[written:]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.replace(temporary, path)
+            os.chmod(path, 0o600)
+        except BaseException:
+            with suppress(OSError):
+                temporary.unlink()
+            raise
+
+    def _team_cache_file_valid(
+        self, target: Path, sidecar: Path, attachment: Mapping[str, Any]
+    ) -> bool:
+        metadata = self._team_cache_read_sidecar(sidecar)
+        try:
+            info = target.lstat()
+        except (FileNotFoundError, OSError):
+            return False
+        if (
+            metadata is None
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_size != int(attachment["byte_size"])
+            or metadata.get("sha256") != attachment["sha256"]
+            or metadata.get("byte_size") != attachment["byte_size"]
+            or metadata.get("file_name") != attachment["file_name"]
+        ):
+            return False
+        unchanged = (
+            metadata.get("inode") == info.st_ino
+            and metadata.get("mtime_ns") == info.st_mtime_ns
+        )
+        if not unchanged and self._team_file_sha256(target) != attachment["sha256"]:
+            return False
+        if not unchanged:
+            self._team_cache_write_sidecar(
+                sidecar,
+                {
+                    **metadata,
+                    "inode": info.st_ino,
+                    "mtime_ns": info.st_mtime_ns,
+                },
+            )
+        with suppress(OSError):
+            os.utime(sidecar, None, follow_symlinks=False)
+        return True
+
+    def _evict_team_cache(
+        self, *, protected: Path | None = None, reserve_bytes: int = 0
+    ) -> None:
+        if (
+            type(reserve_bytes) is not int
+            or reserve_bytes < 0
+            or reserve_bytes > self.team_cache_max_bytes
+        ):
+            raise SecurePeerError(
+                "attachment_limit", "Attachment exceeds the local cache limit", 413
+            )
+        entries: list[tuple[int, int, tuple[Path, ...]]] = []
+        total = 0
+        if not self.team_cache_dir.is_dir():
+            return
+        regular: dict[Path, os.stat_result] = {}
+        for candidate in self.team_cache_dir.rglob("*"):
+            try:
+                info = candidate.lstat()
+            except OSError:
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                continue
+            # No cache operation remains live while this global lock is held;
+            # these names can only be crash leftovers. Remove them eagerly so
+            # repeated failed downloads cannot accumulate outside the LRU.
+            if (
+                (candidate.parent / "payload").is_dir()
+                and (
+                    candidate.name.startswith(".download.")
+                    or (
+                        candidate.name.startswith(".metadata.")
+                        and candidate.name.endswith(".tmp")
+                    )
+                )
+            ):
+                with suppress(OSError):
+                    candidate.unlink()
+                if not candidate.exists():
+                    continue
+            regular[candidate] = info
+
+        grouped: set[Path] = set()
+        for sidecar, side_info in tuple(regular.items()):
+            target: Path | None = None
+            if sidecar.name == _TEAM_CACHE_META_NAME:
+                metadata = self._team_cache_read_sidecar(sidecar)
+                file_name = metadata.get("file_name") if metadata else None
+                if (
+                    isinstance(file_name, str)
+                    and TEAM_ATTACHMENT_FILE_NAME_RE.fullmatch(file_name) is not None
+                    and file_name not in {".", ".."}
+                ):
+                    target = (
+                        sidecar.parent
+                        / "payload"
+                        / self._team_cache_payload_name(file_name)
+                    )
+            elif sidecar.name.endswith(".agentsdock-meta"):
+                target = sidecar.with_name(
+                    sidecar.name[: -len(".agentsdock-meta")]
+                )
+            if target is None or target not in regular:
+                if sidecar.name == _TEAM_CACHE_META_NAME or sidecar.name.endswith(
+                    ".agentsdock-meta"
+                ):
+                    with suppress(OSError):
+                        sidecar.unlink()
+                    if not sidecar.exists():
+                        grouped.add(sidecar)
+                continue
+            target_info = regular[target]
+            entry_size = target_info.st_size + side_info.st_size
+            total += entry_size
+            entries.append(
+                (
+                    side_info.st_mtime_ns,
+                    entry_size,
+                    (target, sidecar),
+                )
+            )
+            grouped.update((target, sidecar))
+
+        # Corrupt/missing-sidecar payloads and undeletable staging files still
+        # consume the bound and are eligible for oldest-first cleanup.
+        for candidate, info in regular.items():
+            if candidate in grouped:
+                continue
+            total += info.st_size
+            entries.append((info.st_mtime_ns, info.st_size, (candidate,)))
+
+        for _used, size, paths in sorted(entries, key=lambda item: item[0]):
+            if total + reserve_bytes <= self.team_cache_max_bytes:
+                break
+            if (
+                protected is not None
+                and protected in paths
+                or any(self._team_cache_pins.get(path, 0) > 0 for path in paths)
+            ):
+                continue
+            freed = 0
+            for candidate in paths:
+                info = regular.get(candidate)
+                before = candidate.exists()
+                with suppress(OSError):
+                    candidate.unlink()
+                if before and not candidate.exists() and info is not None:
+                    freed += info.st_size
+            total -= freed
+        if total + reserve_bytes > self.team_cache_max_bytes:
+            raise SecurePeerError(
+                "cache_unavailable", "Team attachment cache cannot free enough space", 507
+            )
+
+    def cache_team_attachment(
+        self, connection_id: str, team_id: str, attachment_id: str
+    ) -> tuple[dict[str, Any], Path]:
+        """Return a verified local peer-cache path, downloading atomically once."""
+
+        active, attachment = self._team_attachment_metadata(
+            connection_id, team_id, attachment_id
+        )
+        required_cache_bytes = (
+            int(attachment["byte_size"]) + _TEAM_CACHE_META_MAX_BYTES
+        )
+        if required_cache_bytes > self.team_cache_max_bytes:
+            raise SecurePeerError(
+                "attachment_limit", "Attachment exceeds the local cache limit", 413
+            )
+        target, sidecar = self._team_cache_paths(
+            active,
+            team_id,
+            attachment_id,
+            str(attachment["file_name"]),
+        )
+        with self._team_cache_guard:
+            if self._team_cache_file_valid(target, sidecar, attachment):
+                self._evict_team_cache(protected=target)
+                return attachment, target
+            if self._team_cache_pins.get(target, 0) > 0:
+                raise SecurePeerError(
+                    "cache_unavailable",
+                    "Team attachment cache entry is currently in use",
+                    503,
+                )
+            with suppress(OSError):
+                target.unlink()
+            with suppress(OSError):
+                sidecar.unlink()
+            # Reserve the entire incoming payload before creating its staging
+            # file so the configured bound remains true during download, not
+            # only after the atomic replace.
+            self._evict_team_cache(reserve_bytes=required_cache_bytes)
+            temporary = sidecar.parent / f".download.{uuid.uuid4().hex}"
+            try:
+                with self._outbound_guard:
+                    current = self._active_team_connection(connection_id, team_id)
+                    if current.get("hub_id") != active.get("hub_id"):
+                        raise SecurePeerError(
+                            "connection_changed", "Secure peer connection changed", 409
+                        )
+                    try:
+                        response_headers = self.client.download_attachment_to(
+                            connection_id,
+                            self._team_attachment_path(team_id, attachment_id),
+                            temporary,
+                            expected_size=int(attachment["byte_size"]),
+                        )
+                    except SecurePeerError as exc:
+                        if (
+                            self._is_unconfirmed_peer_revocation(exc)
+                            and self._remote_revocation_confirmed(connection_id) is True
+                        ):
+                            with suppress(Exception):
+                                self._retire_remote_revoked_active_connection(current, {})
+                        raise
+                header_map = dict(response_headers)
+                if (
+                    header_map.get("etag") != f'"{attachment["sha256"]}"'
+                    or header_map.get("content-type") != attachment["media_type"]
+                    or header_map.get("accept-ranges") != "bytes"
+                    or temporary.stat().st_size != int(attachment["byte_size"])
+                    or self._team_file_sha256(temporary) != attachment["sha256"]
+                ):
+                    raise SecurePeerError(
+                        "attachment_hash_mismatch",
+                        "Downloaded attachment failed integrity verification",
+                        502,
+                    )
+                os.chmod(temporary, 0o600)
+                os.replace(temporary, target)
+            except BaseException:
+                with suppress(OSError):
+                    temporary.unlink()
+                raise
+            info = target.lstat()
+            self._team_cache_write_sidecar(
+                sidecar,
+                {
+                    "version": 1,
+                    "hub_id": active["hub_id"],
+                    "team_id": team_id,
+                    "attachment_id": attachment_id,
+                    "file_name": attachment["file_name"],
+                    "media_type": attachment["media_type"],
+                    "byte_size": attachment["byte_size"],
+                    "sha256": attachment["sha256"],
+                    "inode": info.st_ino,
+                    "mtime_ns": info.st_mtime_ns,
+                },
+            )
+            self._evict_team_cache(protected=target)
+            return attachment, target
+
+    def open_cached_team_attachment(
+        self, connection_id: str, team_id: str, attachment_id: str
+    ) -> tuple[dict[str, Any], AttachmentFileLease]:
+        """Pin a verified cache inode for a complete local HTTP response."""
+
+        with self._team_cache_guard:
+            attachment, target = self.cache_team_attachment(
+                connection_id, team_id, attachment_id
+            )
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = -1
+            try:
+                descriptor = os.open(target, flags)
+                info = os.fstat(descriptor)
+                _target, sidecar = self._team_cache_paths(
+                    self._active_team_connection(connection_id, team_id),
+                    team_id,
+                    attachment_id,
+                    str(attachment["file_name"]),
+                )
+                metadata = self._team_cache_read_sidecar(sidecar)
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.getuid()
+                    or info.st_size != int(attachment["byte_size"])
+                    or metadata is None
+                    or metadata.get("inode") != info.st_ino
+                    or metadata.get("mtime_ns") != info.st_mtime_ns
+                    or metadata.get("sha256") != attachment["sha256"]
+                ):
+                    raise OSError("Team attachment cache inode changed")
+            except (OSError, ValueError) as exc:
+                if descriptor >= 0:
+                    with suppress(OSError):
+                        os.close(descriptor)
+                raise SecurePeerError(
+                    "cache_unavailable", "Team attachment cache is unavailable", 503
+                ) from exc
+            self._team_cache_pins[target] = self._team_cache_pins.get(target, 0) + 1
+            finalizer_lock = threading.Lock()
+            finalized = False
+
+            def finalize() -> None:
+                nonlocal finalized
+                with finalizer_lock:
+                    if finalized:
+                        return
+                    finalized = True
+                with suppress(OSError):
+                    os.close(descriptor)
+                with self._team_cache_guard:
+                    remaining = self._team_cache_pins.get(target, 0) - 1
+                    if remaining > 0:
+                        self._team_cache_pins[target] = remaining
+                    else:
+                        self._team_cache_pins.pop(target, None)
+
+            return attachment, AttachmentFileLease(descriptor, finalize)
+
+    def team_realms(self) -> list[dict[str, Any]]:
+        """Every team this server can act in, in deterministic order."""
+
+        realms: list[dict[str, Any]] = []
+        with self._guard:
+            host_store = self._hub_store
+            active = next(
+                (
+                    dict(item)
+                    for item in self.client.list_connections()
+                    if item.get("active")
+                    and item.get("status") == "connected"
+                    and "teamspace.read" in set(item.get("scopes") or [])
+                ),
+                None,
+            )
+        if host_store is not None:
+            for team_id in host_store.local_agent_mail_team_ids():
+                realms.append({
+                    "realm": "host",
+                    "team_id": team_id,
+                    "hub_id": host_store.hub_id,
+                    "server_identity": self.server_identity,
+                    "can_write": True,
+                })
+        if active is not None:
+            realms.append({
+                "realm": "secure_peer",
+                "connection_id": str(active.get("connection_id") or ""),
+                "team_id": str(active.get("team_id") or ""),
+                "hub_id": str(active.get("hub_id") or ""),
+                "host_server_identity": str(active.get("host_server_identity") or ""),
+                "certificate_fingerprint": str(active.get("certificate_fingerprint") or ""),
+                "can_write": "teamspace.write" in set(active.get("scopes") or []),
+            })
+        return realms
+
+    def team_realm(self, team_id: str | None = None) -> dict[str, Any]:
+        realms = self.team_realms()
+        if not realms:
+            raise SecurePeerError(
+                "team_unavailable", "This server is not connected to a Team Network", 409
+            )
+        if team_id:
+            for realm in realms:
+                if realm["team_id"] == team_id:
+                    return realm
+            raise SecurePeerError("team_unavailable", "Unknown team for this server", 404)
+        if len(realms) > 1:
+            raise SecurePeerError(
+                "team_ambiguous",
+                "This server belongs to several teams; pass --team "
+                + ", ".join(realm["team_id"] for realm in realms),
+                409,
+            )
+        return realms[0]
+
+    def _team_hub_get(self, realm: dict[str, Any], path: str, query: dict[str, Any]) -> dict[str, Any]:
+        clean = {
+            key: ("1" if value is True else str(value))
+            for key, value in query.items()
+            if value not in (None, "", False)
+        }
+        if realm["realm"] == "host":
+            return self._team_host_call(realm, "GET", path, clean, None)
+        response = self.proxy(
+            str(realm["connection_id"]),
+            "GET",
+            path,
+            query=urlencode(clean),
+            headers={"accept": "application/json"},
+            body=None,
+        )
+        return self._decoded_proxy_json(response)
+
+    def _team_hub_post(self, realm: dict[str, Any], path: str, body: dict[str, Any]) -> dict[str, Any]:
+        if realm["realm"] == "host":
+            return self._team_host_call(realm, "POST", path, {}, body)
+        if not realm.get("can_write"):
+            raise SecurePeerError(
+                "forbidden", "This server's Team Network connection is read-only", 403
+            )
+        response = self.proxy(
+            str(realm["connection_id"]),
+            "POST",
+            path,
+            query="",
+            headers={"accept": "application/json", "content-type": "application/json"},
+            body=json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        )
+        return self._decoded_proxy_json(response)
+
+    def _team_host_call(
+        self,
+        realm: dict[str, Any],
+        method: str,
+        path: str,
+        query: dict[str, str],
+        body: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Serve a host-realm Team Messages call directly from the HubStore."""
+
+        with self._guard:
+            store = self._hub_store
+        if store is None or store.hub_id != realm.get("hub_id"):
+            raise SecurePeerError("team_unavailable", "Team Hub is unavailable", 409)
+        team_id = str(realm["team_id"])
+        claims = store.local_agent_mail_claims(team_id)
+        prefix = f"/v1/teams/{quote(team_id, safe='')}/network/"
+        if not path.startswith(prefix):
+            raise SecurePeerError("route_forbidden", "Hub route is not permitted", 403)
+        pieces = [piece for piece in path[len(prefix):].split("/") if piece]
+        flag = lambda key: query.get(key, "0") in {"1", "true"}  # noqa: E731
+        if method == "GET" and pieces == ["messages"]:
+            return store.list_team_messages(
+                claims,
+                team_id,
+                box=query.get("box", "inbox"),
+                address_kind=query.get("address_kind"),
+                address_id=query.get("address_id"),
+                unread=flag("unread"),
+                from_kind=query.get("from_kind"),
+                from_id=query.get("from_id"),
+                since=query.get("since"),
+                after_sequence=int(query.get("after_sequence", "0")),
+                limit=int(query.get("limit", "50")),
+            )
+        if method == "GET" and len(pieces) == 2 and pieces[0] == "messages":
+            return store.get_team_message(claims, team_id, pieces[1])
+        if method == "POST" and pieces == ["messages"]:
+            return store.create_team_message(claims, team_id, dict(body or {}))
+        if method == "POST" and len(pieces) == 3 and pieces[0] == "messages" and pieces[2] == "receipts":
+            return store.record_team_message_receipt(claims, team_id, pieces[1], dict(body or {}))
+        if method == "GET" and pieces == ["skills"]:
+            return store.list_team_skills(
+                claims, team_id, include_archived=flag("include_archived"), slug=query.get("slug")
+            )
+        if method == "GET" and len(pieces) == 2 and pieces[0] == "skills":
+            return store.get_team_skill(claims, team_id, pieces[1])
+        if method == "GET" and len(pieces) == 4 and pieces[0] == "skills" and pieces[2] == "versions":
+            return store.get_team_skill_version(claims, team_id, pieces[1], int(pieces[3]))
+        if method == "GET" and len(pieces) == 2 and pieces[0] == "attachments":
+            return store.get_team_attachment(claims, team_id, pieces[1])
+        if method == "POST" and pieces == ["attachments"]:
+            return store.declare_team_attachment(claims, team_id, dict(body or {}))
+        raise SecurePeerError("route_forbidden", "Hub route is not permitted", 403)
+
+    def team_list_messages(
+        self,
+        *,
+        box: str,
+        team_id: str | None = None,
+        unread: bool = False,
+        since: str | None = None,
+        after_sequence: int = 0,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        realm = self.team_realm(team_id)
+        result = self._team_hub_get(
+            realm,
+            f"/v1/teams/{quote(realm['team_id'], safe='')}/network/messages",
+            {
+                "box": box,
+                "unread": unread,
+                "since": since,
+                "after_sequence": after_sequence,
+                "limit": limit,
+            },
+        )
+        result["team_id"] = realm["team_id"]
+        return result
+
+    def team_get_message(self, message_id: str, *, team_id: str | None = None) -> dict[str, Any]:
+        realm = self.team_realm(team_id)
+        result = self._team_hub_get(
+            realm,
+            f"/v1/teams/{quote(realm['team_id'], safe='')}/network/messages/{quote(message_id, safe='')}",
+            {},
+        )
+        result["team_id"] = realm["team_id"]
+        return result
+
+    def team_list_skills(self, *, include_archived: bool = False, team_id: str | None = None) -> dict[str, Any]:
+        realm = self.team_realm(team_id)
+        result = self._team_hub_get(
+            realm,
+            f"/v1/teams/{quote(realm['team_id'], safe='')}/network/skills",
+            {"include_archived": include_archived},
+        )
+        result["team_id"] = realm["team_id"]
+        return result
+
+    def team_get_skill(
+        self,
+        slug: str,
+        *,
+        version: int | None = None,
+        team_id: str | None = None,
+    ) -> dict[str, Any]:
+        realm = self.team_realm(team_id)
+        team_path = f"/v1/teams/{quote(realm['team_id'], safe='')}/network/skills"
+        listed = self._team_hub_get(realm, team_path, {"slug": slug, "include_archived": True})
+        skills = listed.get("skills") if isinstance(listed, dict) else None
+        if not isinstance(skills, list) or len(skills) != 1 or not isinstance(skills[0], dict):
+            raise SecurePeerError("not_found", f"No team skill named {slug!r}", 404)
+        skill_id = str(skills[0].get("id") or "")
+        if version is None:
+            result = self._team_hub_get(realm, f"{team_path}/{quote(skill_id, safe='')}", {})
+        else:
+            result = self._team_hub_get(
+                realm, f"{team_path}/{quote(skill_id, safe='')}/versions/{int(version)}", {}
+            )
+        result["team_id"] = realm["team_id"]
+        return result
+
+    def team_send_message(
+        self,
+        reference: Mapping[str, Any],
+        *,
+        payload: Mapping[str, Any],
+        attachment_paths: list[str],
+        idempotency_key: str,
+        provenance: Mapping[str, str],
+    ) -> dict[str, Any]:
+        """Create one team message for a frozen @@ reference, with attachments."""
+
+        realm = self.team_realm(str(reference.get("team_id") or "") or None)
+        if not realm.get("can_write"):
+            raise SecurePeerError(
+                "forbidden", "This server's Team Network connection is read-only", 403
+            )
+        team_path = f"/v1/teams/{quote(realm['team_id'], safe='')}/network"
+        kind = str(payload.get("kind") or "message")
+        if reference.get("kind") == "skill":
+            recipients = [{"kind": "all"}]
+        elif reference.get("recipient_kind") == "all":
+            recipients = [{"kind": "all"}]
+        else:
+            recipients = [
+                {"kind": str(reference.get("recipient_kind")), "id": str(reference.get("target_id"))}
+            ]
+        attachment_ids: list[str] = []
+        for index, path in enumerate(attachment_paths):
+            attachment_ids.append(
+                self._team_upload_attachment(
+                    realm,
+                    Path(path),
+                    idempotency_key=f"{idempotency_key}:attachment:{index}",
+                )
+            )
+        body: dict[str, Any] = {
+            "kind": kind,
+            "body": str(payload.get("body") or ""),
+            "body_format": str(payload.get("body_format") or "markdown"),
+            "recipients": recipients,
+            "attachment_ids": attachment_ids,
+            "provenance": dict(provenance),
+            "idempotency_key": idempotency_key,
+        }
+        if payload.get("title"):
+            body["title"] = str(payload["title"])
+        skill = payload.get("skill")
+        if kind == "skill":
+            details = dict(skill or {})
+            if reference.get("kind") == "skill" and not details.get("slug"):
+                raise SecurePeerError(
+                    "invalid_request", "Publishing to a mentioned skill requires --skill-slug", 422
+                )
+            body["skill"] = details
+        return self._team_hub_post(realm, f"{team_path}/messages", body)
+
+    def _team_upload_attachment(
+        self,
+        realm: dict[str, Any],
+        path: Path,
+        *,
+        idempotency_key: str,
+    ) -> str:
+        """Stream one local file into the Hub and return its attachment id."""
+
+        descriptor, initial = self._open_team_attachment_source(path)
+        try:
+            digest = hashlib.sha256()
+            hashed_bytes = 0
+            while True:
+                block = os.read(descriptor, 1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+                hashed_bytes += len(block)
+            after_hash = os.fstat(descriptor)
+            identity = lambda info: (
+                info.st_dev,
+                info.st_ino,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+            )
+            if hashed_bytes != initial.st_size or identity(after_hash) != identity(initial):
+                raise SecurePeerError(
+                    "invalid_request", "Attachment changed while it was being read", 422
+                )
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            return self._team_upload_attachment_descriptor(
+                realm,
+                path,
+                descriptor,
+                initial,
+                digest.hexdigest(),
+                idempotency_key=idempotency_key,
+            )
+        finally:
+            with suppress(OSError):
+                os.close(descriptor)
+
+    @staticmethod
+    def _open_team_attachment_source(path: Path) -> tuple[int, os.stat_result]:
+        """Open one absolute regular file without following any path symlink."""
+
+        path = Path(path)
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        directory_flag = getattr(os, "O_DIRECTORY", 0)
+        try:
+            canonical = path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            canonical = None
+        if (
+            not path.is_absolute()
+            or canonical != path
+            or not nofollow
+            or not directory_flag
+        ):
+            raise SecurePeerError(
+                "invalid_request", "Attachment path cannot be opened safely", 422
+            )
+        directory = os.open(
+            os.sep,
+            os.O_RDONLY | directory_flag | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            for component in path.parts[1:-1]:
+                if component in {"", ".", ".."}:
+                    raise OSError("unsafe attachment path component")
+                next_directory = os.open(
+                    component,
+                    os.O_RDONLY | directory_flag | nofollow | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=directory,
+                )
+                os.close(directory)
+                directory = next_directory
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY
+                | nofollow
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=directory,
+            )
+        except (OSError, ValueError) as exc:
+            raise SecurePeerError(
+                "invalid_request", f"Attachment is not a readable regular file: {path}", 422
+            ) from exc
+        finally:
+            with suppress(OSError):
+                os.close(directory)
+        try:
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_nlink != 1
+                or not 1 <= info.st_size <= MAX_ATTACHMENT_PROTOCOL_BYTES
+            ):
+                raise OSError("unsafe attachment inode")
+            return descriptor, info
+        except (OSError, ValueError) as exc:
+            with suppress(OSError):
+                os.close(descriptor)
+            raise SecurePeerError(
+                "invalid_request", f"Attachment is not a readable regular file: {path}", 422
+            ) from exc
+
+    def _team_upload_attachment_descriptor(
+        self,
+        realm: dict[str, Any],
+        path: Path,
+        descriptor: int,
+        source_info: os.stat_result,
+        expected_sha256: str,
+        *,
+        idempotency_key: str,
+    ) -> str:
+        """Declare and stream the exact inode already validated and hashed."""
+
+        size = source_info.st_size
+        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        declared = self._team_hub_post(
+            realm,
+            f"/v1/teams/{quote(realm['team_id'], safe='')}/network/attachments",
+            {
+                "file_name": path.name,
+                "media_type": media_type,
+                "byte_size": size,
+                "sha256": expected_sha256,
+                "idempotency_key": idempotency_key,
+            },
+        )
+        declared_attachment = (
+            declared.get("attachment") if isinstance(declared, dict) else None
+        )
+        if not isinstance(declared_attachment, dict) or not declared_attachment.get("id"):
+            raise SecurePeerError(
+                "remote_invalid", "Team Hub returned an invalid attachment", 502
+            )
+        attachment_id = str(declared_attachment["id"])
+        live = self._team_hub_get(
+            realm,
+            f"/v1/teams/{quote(realm['team_id'], safe='')}/network/attachments/"
+            f"{quote(attachment_id, safe='')}",
+            {},
+        )
+        attachment = live.get("attachment") if isinstance(live, dict) else None
+        if (
+            not isinstance(attachment, dict)
+            or attachment.get("id") != attachment_id
+            or attachment.get("file_name") != path.name
+            or attachment.get("byte_size") != size
+            or attachment.get("sha256") != expected_sha256
+            or attachment.get("state") not in {"uploading", "ready"}
+            or type(attachment.get("received_bytes")) is not int
+            or not 0 <= attachment["received_bytes"] <= size
+        ):
+            raise SecurePeerError(
+                "remote_invalid", "Team Hub returned an invalid attachment", 502
+            )
+        if attachment.get("state") == "ready":
+            if attachment["received_bytes"] != size:
+                raise SecurePeerError(
+                    "remote_invalid", "Team Hub returned an invalid attachment", 502
+                )
+            return attachment_id
+        chunk_bytes = declared.get("chunk_bytes")
+        if (
+            type(chunk_bytes) is not int
+            or not 1 <= chunk_bytes <= TEAM_ATTACHMENT_CHUNK_BYTES
+        ):
+            raise SecurePeerError(
+                "remote_invalid", "Team Hub returned an invalid attachment chunk size", 502
+            )
+        store = None
+        claims = None
+        if realm["realm"] == "host":
+            with self._guard:
+                store = self._hub_store
+            if store is None:
+                raise SecurePeerError("team_unavailable", "Team Hub is unavailable", 409)
+            claims = store.local_agent_mail_claims(str(realm["team_id"]))
+        offset = int(attachment["received_bytes"])
+        os.lseek(descriptor, offset, os.SEEK_SET)
+        while offset < size:
+            chunk = os.read(descriptor, min(chunk_bytes, size - offset))
+            if not chunk:
+                break
+            if realm["realm"] == "host":
+                assert store is not None and claims is not None
+                store.write_team_attachment_chunk(
+                    claims,
+                    str(realm["team_id"]),
+                    attachment_id,
+                    offset=offset,
+                    total=size,
+                    data=chunk,
+                )
+            else:
+                response = self.proxy_team_attachment_chunk(
+                    str(realm["connection_id"]),
+                    str(realm["team_id"]),
+                    attachment_id,
+                    content_range=(
+                        f"bytes {offset}-{offset + len(chunk) - 1}/{size}"
+                    ),
+                    body=chunk,
+                )
+                if int(response.status) != 200:
+                    raise SecurePeerError(
+                        "attachment_unavailable",
+                        "Team attachment upload failed",
+                        int(response.status),
+                    )
+            offset += len(chunk)
+        after_upload = os.fstat(descriptor)
+        if (
+            after_upload.st_dev,
+            after_upload.st_ino,
+            after_upload.st_size,
+            after_upload.st_mtime_ns,
+            after_upload.st_ctime_ns,
+        ) != (
+            source_info.st_dev,
+            source_info.st_ino,
+            source_info.st_size,
+            source_info.st_mtime_ns,
+            source_info.st_ctime_ns,
+        ):
+            raise SecurePeerError(
+                "invalid_request", "Attachment changed while it was being uploaded", 422
+            )
+        completed = self._team_hub_get(
+            realm,
+            f"/v1/teams/{quote(realm['team_id'], safe='')}/network/attachments/"
+            f"{quote(attachment_id, safe='')}",
+            {},
+        )
+        completed_attachment = (
+            completed.get("attachment") if isinstance(completed, dict) else None
+        )
+        if (
+            not isinstance(completed_attachment, dict)
+            or completed_attachment.get("id") != attachment_id
+            or completed_attachment.get("state") != "ready"
+            or completed_attachment.get("received_bytes") != size
+            or completed_attachment.get("byte_size") != size
+            or completed_attachment.get("sha256") != expected_sha256
+        ):
+            raise SecurePeerError(
+                "attachment_unavailable", "Team attachment upload did not complete", 502
+            )
+        return attachment_id
+
+    def team_attachment_local_paths(
+        self,
+        attachments: list[Mapping[str, Any]],
+        *,
+        team_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Resolve ready attachments to local files; host realm serves storage paths."""
+
+        realm = self.team_realm(team_id)
+        resolved: list[dict[str, Any]] = []
+        if realm["realm"] != "host":
+            for attachment in attachments:
+                public, path = self.cache_team_attachment(
+                    str(realm["connection_id"]),
+                    str(realm["team_id"]),
+                    str(attachment.get("id") or ""),
+                )
+                resolved.append({**public, "local_path": str(path)})
+            return resolved
+        with self._guard:
+            store = self._hub_store
+        if store is None:
+            raise SecurePeerError("team_unavailable", "Team Hub is unavailable", 409)
+        claims = store.local_agent_mail_claims(str(realm["team_id"]))
+        for attachment in attachments:
+            public, path = store.open_team_attachment(
+                claims, str(realm["team_id"]), str(attachment.get("id") or "")
+            )
+            resolved.append({**public, "local_path": str(path)})
+        return resolved
 
     def shutdown(self) -> None:
         self.close_host_admission()

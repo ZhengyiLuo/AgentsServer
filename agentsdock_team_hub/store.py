@@ -79,6 +79,32 @@ SECURE_PEER_HEARTBEAT_WRITE_INTERVAL_SECONDS = 15
 # Secure-peer responses are hard-capped at 2 MiB. Keep paged network payloads
 # below that transport ceiling, including JSON escaping and envelope fields.
 MAX_NETWORK_PAGE_RESPONSE_BYTES = 1_900_000
+# Team Messages V2 (docs/TEAM_MESSAGES_V2.md). Bodies stay inside the 64 KiB
+# JSON request limit; attachment bytes never travel through JSON or SQLite.
+MAX_TEAM_MESSAGE_BODY_BYTES = 49_152
+MAX_TEAM_MESSAGE_RECIPIENTS = 16
+MAX_TEAM_MESSAGE_ATTACHMENTS = 16
+MAX_TEAM_MESSAGE_ATTACHMENT_BYTES = 2 * 1024 * 1024 * 1024
+MAX_TEAM_MESSAGE_TITLE_CHARS = 160
+MAX_TEAM_MESSAGE_PREVIEW_CHARS = 280
+DEFAULT_TEAM_ATTACHMENT_MAX_BYTES = 512 * 1024 * 1024
+DEFAULT_TEAM_ATTACHMENT_QUOTA_BYTES = 50 * 1024 * 1024 * 1024
+TEAM_ATTACHMENT_CHUNK_BYTES = 8 * 1024 * 1024
+# The secure-peer Content-Length and Content-Range grammar permits at most
+# fifteen decimal digits. Keep persisted Hub settings inside that protocol
+# ceiling so health never advertises a file size the binary lane will reject.
+MAX_TEAM_ATTACHMENT_PROTOCOL_BYTES = 999_999_999_999_999
+MAX_SQLITE_SIGNED_INTEGER = 9_223_372_036_854_775_807
+TEAM_ATTACHMENT_UPLOAD_TTL_SECONDS = 24 * 60 * 60
+MAX_TEAM_SKILLS_PER_TEAM = 500
+MAX_TEAM_SKILL_VERSIONS = 200
+MAX_TEAM_SKILL_TAGS = 8
+TEAM_SKILL_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+TEAM_SKILL_TAG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+TEAM_ATTACHMENT_FILE_NAME_RE = re.compile(r"^[^\x00-\x1f\x7f/\\]{1,255}$")
+TEAM_ATTACHMENT_MEDIA_TYPE_RE = re.compile(
+    r"^[A-Za-z0-9!#$&^_.+-]{1,64}/[A-Za-z0-9!#$&^_.+-]{1,64}(?:;[ -~]{1,90})?$"
+)
 LOCAL_CONTROL_PRINCIPAL_ID = "service_local_control"
 MANAGED_SERVER_PRINCIPAL_ID = "service_managed_server"
 MANAGED_SERVER_SERVICE_IDENTIFIER = "agentsdock.team-hub.managed-server"
@@ -96,6 +122,14 @@ class HubError(RuntimeError):
         self.status_code = status_code
 
 
+class _TeamAttachmentFailure(Exception):
+    """Carry a terminal upload error out of a rolled-back chunk transaction."""
+
+    def __init__(self, error: HubError) -> None:
+        super().__init__(error.message)
+        self.error = error
+
+
 @dataclass(frozen=True)
 class AccessClaims:
     principal_id: str
@@ -110,6 +144,19 @@ class AccessClaims:
 
 def _now(value: int | None = None) -> int:
     return now_seconds() if value is None else int(value)
+
+
+def _positive_int_env(name: str, default: int, *, maximum: int) -> int:
+    """Read a host-level size limit; malformed or non-positive values fall back."""
+
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if 0 < value <= maximum else default
 
 
 def _row_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -234,6 +281,16 @@ class HubStore:
             else None
         )
         ensure_private_directory(self.data_dir)
+        self.team_attachment_max_bytes = _positive_int_env(
+            "AGENTSDOCK_TEAM_ATTACHMENT_MAX_BYTES",
+            DEFAULT_TEAM_ATTACHMENT_MAX_BYTES,
+            maximum=MAX_TEAM_ATTACHMENT_PROTOCOL_BYTES,
+        )
+        self.team_attachment_quota_bytes = _positive_int_env(
+            "AGENTSDOCK_TEAM_ATTACHMENT_QUOTA_BYTES",
+            DEFAULT_TEAM_ATTACHMENT_QUOTA_BYTES,
+            maximum=MAX_SQLITE_SIGNED_INTEGER,
+        )
         self.instance_id = _id("hub_instance")
         self.hub_id = ""
         expected_host = (
@@ -715,7 +772,10 @@ class HubStore:
                         "max_agents_per_server": MAX_NETWORK_AGENTS_PER_SERVER,
                         "max_page_items": MAX_NETWORK_PAGE_ITEMS,
                         "max_body_bytes": MAX_NETWORK_BODY_BYTES,
-                    }
+                    },
+                    # Sibling object: clients that parse team_network_v1 with
+                    # an exact key list keep working unchanged.
+                    "team_messages_v1": self.team_messages_capability(),
                 },
             }
         finally:
@@ -6797,6 +6857,1887 @@ class HubStore:
             raise HubError("conflict", "Channel already exists", 409) from exc
         finally:
             connection.close()
+
+    # ------------------------------------------------------------------
+    # Team Messages V2: messages with recipients and attachments, plus the
+    # versioned Skills library.  See docs/TEAM_MESSAGES_V2.md in AgentsDock.
+
+    def team_messages_capability(self) -> dict[str, Any]:
+        return {
+            "available": True,
+            "version": 1,
+            "kinds": ["message", "skill"],
+            "recipient_kinds": ["server", "human", "all"],
+            "max_body_bytes": MAX_TEAM_MESSAGE_BODY_BYTES,
+            "max_recipients_per_message": MAX_TEAM_MESSAGE_RECIPIENTS,
+            "max_page_items": MAX_NETWORK_PAGE_ITEMS,
+            "attachments": {
+                "max_bytes_per_file": self.team_attachment_max_bytes,
+                "max_files_per_message": MAX_TEAM_MESSAGE_ATTACHMENTS,
+                "max_bytes_per_message": MAX_TEAM_MESSAGE_ATTACHMENT_BYTES,
+                "chunk_bytes": TEAM_ATTACHMENT_CHUNK_BYTES,
+                "range_downloads": True,
+                "team_quota_bytes": self.team_attachment_quota_bytes,
+            },
+            "skills": {
+                "slug_pattern": TEAM_SKILL_SLUG_RE.pattern,
+                "max_per_team": MAX_TEAM_SKILLS_PER_TEAM,
+                "max_versions_per_skill": MAX_TEAM_SKILL_VERSIONS,
+                "max_tags": MAX_TEAM_SKILL_TAGS,
+            },
+        }
+
+    # -- validation helpers -------------------------------------------------
+
+    @staticmethod
+    def _team_text(
+        value: Any,
+        field: str,
+        minimum: int,
+        maximum: int,
+        *,
+        allow_none: bool = False,
+    ) -> str | None:
+        if value is None:
+            if allow_none:
+                return None
+            if minimum == 0:
+                return ""
+            raise HubError("invalid_request", f"{field} is required", 422)
+        if not isinstance(value, str):
+            raise HubError("invalid_request", f"{field} is invalid", 422)
+        normalized = " ".join(value.split())
+        if not minimum <= len(normalized) <= maximum:
+            raise HubError(
+                "invalid_request",
+                f"{field} must be between {minimum} and {maximum} characters",
+                422,
+            )
+        return normalized
+
+    @staticmethod
+    def _team_body(request: dict[str, Any]) -> tuple[str, str, bytes, int]:
+        body = request.get("body")
+        if not isinstance(body, str):
+            raise HubError("invalid_request", "Message body is invalid", 422)
+        try:
+            encoded = body.encode("utf-8", "strict")
+        except UnicodeEncodeError as exc:
+            raise HubError("invalid_request", "Message body is invalid", 422) from exc
+        if not 1 <= len(encoded) <= MAX_TEAM_MESSAGE_BODY_BYTES:
+            raise HubError("invalid_request", "Message body is invalid", 422)
+        body_format = request.get("body_format", "markdown")
+        if body_format not in {"plain", "markdown"}:
+            raise HubError("invalid_request", "Message body format is invalid", 422)
+        return body, body_format, hashlib.sha256(encoded).digest(), len(encoded)
+
+    @staticmethod
+    def _team_slug(value: Any) -> str:
+        slug = str(value or "").strip().lower()
+        if TEAM_SKILL_SLUG_RE.fullmatch(slug) is None:
+            raise HubError("invalid_request", "Skill slug is invalid", 422)
+        return slug
+
+    @staticmethod
+    def _team_tags(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list) or len(value) > MAX_TEAM_SKILL_TAGS:
+            raise HubError("invalid_request", "Skill tags are invalid", 422)
+        tags: list[str] = []
+        for item in value:
+            tag = item.strip().lower() if isinstance(item, str) else ""
+            if TEAM_SKILL_TAG_RE.fullmatch(tag) is None:
+                raise HubError("invalid_request", "Skill tags are invalid", 422)
+            if tag not in tags:
+                tags.append(tag)
+        return tags
+
+    @staticmethod
+    def _team_provenance(value: Any) -> str:
+        if value is None:
+            return "{}"
+        if (
+            not isinstance(value, dict)
+            or len(value) > 8
+            or any(
+                not isinstance(key, str)
+                or not isinstance(item, str)
+                or not 1 <= len(key) <= 40
+                or len(item) > 200
+                for key, item in value.items()
+            )
+        ):
+            raise HubError("invalid_request", "Provenance is invalid", 422)
+        encoded = canonical_json(value)
+        if len(encoded) > 2_048:
+            raise HubError("invalid_request", "Provenance is invalid", 422)
+        return encoded.decode("utf-8")
+
+    @staticmethod
+    def _team_idempotency_key(request: dict[str, Any]) -> str:
+        key = request.get("idempotency_key")
+        if not isinstance(key, str) or not 8 <= len(key) <= 240:
+            raise HubError("invalid_request", "idempotency_key must be 8-240 characters", 422)
+        return key
+
+    @staticmethod
+    def _team_sha256_hex(value: Any) -> str:
+        digest = str(value or "").strip().lower()
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise HubError("invalid_request", "sha256 must be 64 hex characters", 422)
+        return digest
+
+    @staticmethod
+    def _team_since(value: Any) -> int | None:
+        if value is None or value == "":
+            return None
+        if isinstance(value, bool):
+            raise HubError("invalid_request", "since is invalid", 422)
+        if isinstance(value, int):
+            if value < 0:
+                raise HubError("invalid_request", "since is invalid", 422)
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            if text.isdigit():
+                return int(text)
+            try:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise HubError("invalid_request", "since is invalid", 422) from exc
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return int(parsed.timestamp())
+        raise HubError("invalid_request", "since is invalid", 422)
+
+    @staticmethod
+    def _team_party(kind: str, identity: str, display_name: str | None) -> dict[str, Any]:
+        return {
+            "kind": kind,
+            "id": identity,
+            "display_name": display_name or ("Team" if kind == "all" else identity),
+        }
+
+    # -- identity helpers ---------------------------------------------------
+
+    def _team_sender(
+        self,
+        connection: sqlite3.Connection,
+        claims: AccessClaims,
+        team_id: str,
+    ) -> tuple[str, str | None]:
+        if claims.auth_kind in NETWORK_AUTOMATION_AUTH_KINDS:
+            node = self._caller_network_node(connection, claims, team_id)
+            return "server", str(node["node_id"])
+        return "human", None
+
+    def _team_owned_addresses(
+        self,
+        connection: sqlite3.Connection,
+        claims: AccessClaims,
+        team_id: str,
+        membership_role: str | None,
+    ) -> list[tuple[str, str]]:
+        """Addresses whose inbox this caller may read and receipt."""
+
+        if claims.auth_kind in NETWORK_AUTOMATION_AUTH_KINDS:
+            node = self._caller_network_node(connection, claims, team_id)
+            return [("server", str(node["node_id"]))]
+        owned: list[tuple[str, str]] = [("human", claims.principal_id)]
+        if membership_role in {"owner", "admin", "member"}:
+            try:
+                node = self._caller_network_node(connection, claims, team_id)
+            except HubError as exc:
+                if exc.code != "network_host_unavailable":
+                    raise
+            else:
+                owned.append(("server", str(node["node_id"])))
+        return owned
+
+    @staticmethod
+    def _team_can_write(claims: AccessClaims, membership_role: str | None) -> bool:
+        if claims.auth_kind in NETWORK_AUTOMATION_AUTH_KINDS:
+            return "teamspace.write" in claims.scopes
+        return membership_role in {"owner", "admin", "member"}
+
+    # -- projections --------------------------------------------------------
+
+    @staticmethod
+    def _team_message_select() -> str:
+        return """
+            SELECT m.*, length(CAST(m.body AS BLOB)) AS body_bytes,
+                   sp.display_name AS sender_principal_display_name,
+                   sn.display_name AS sender_node_display_name,
+                   s.slug AS skill_slug
+            FROM team_messages AS m
+            JOIN principals AS sp ON sp.id=m.sender_principal_id
+            LEFT JOIN nodes AS sn ON sn.team_id=m.team_id AND sn.id=m.sender_node_id
+            LEFT JOIN team_skills AS s ON s.team_id=m.team_id AND s.id=m.skill_id
+        """
+
+    @staticmethod
+    def _team_sender_party(row: sqlite3.Row, prefix: str = "sender") -> dict[str, Any]:
+        if row[f"{prefix}_kind"] == "server":
+            return HubStore._team_party(
+                "server",
+                str(row[f"{prefix}_node_id"]),
+                row[f"{prefix}_node_display_name"],
+            )
+        return HubStore._team_party(
+            "human",
+            str(row[f"{prefix}_principal_id"]),
+            row[f"{prefix}_principal_display_name"],
+        )
+
+    @staticmethod
+    def _team_recipient_public(row: sqlite3.Row) -> dict[str, Any]:
+        kind = str(row["recipient_kind"])
+        if kind == "server":
+            party = HubStore._team_party(
+                "server", str(row["recipient_node_id"]), row["node_display_name"]
+            )
+        elif kind == "human":
+            party = HubStore._team_party(
+                "human", str(row["recipient_principal_id"]), row["principal_display_name"]
+            )
+        else:
+            party = HubStore._team_party("all", "all", "Team")
+        return {
+            **party,
+            "state": row["state"],
+            "delivered_at": _iso8601(row["delivered_at"]),
+            "read_at": _iso8601(row["read_at"]),
+        }
+
+    @staticmethod
+    def _team_attachment_public(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "message_id": row["message_id"],
+            "file_name": row["file_name"],
+            "media_type": row["media_type"],
+            "byte_size": int(row["byte_size"]),
+            "sha256": row["storage_key"],
+            "state": row["state"],
+            "received_bytes": int(row["received_bytes"]),
+            "created_at": _iso8601(row["created_at"]),
+            "ready_at": _iso8601(row["ready_at"]),
+        }
+
+    def _team_message_recipients(
+        self, connection: sqlite3.Connection, team_id: str, message_id: str
+    ) -> list[sqlite3.Row]:
+        return connection.execute(
+            """
+            SELECT r.*, rp.display_name AS principal_display_name,
+                   rn.display_name AS node_display_name
+            FROM team_message_recipients AS r
+            LEFT JOIN principals AS rp ON rp.id=r.recipient_principal_id
+            LEFT JOIN nodes AS rn ON rn.team_id=r.team_id AND rn.id=r.recipient_node_id
+            WHERE r.team_id=? AND r.message_id=?
+            ORDER BY r.recipient_kind, r.id
+            """,
+            (team_id, message_id),
+        ).fetchall()
+
+    def _team_message_attachments(
+        self, connection: sqlite3.Connection, team_id: str, message_id: str
+    ) -> list[dict[str, Any]]:
+        return [
+            self._team_attachment_public(row)
+            for row in connection.execute(
+                """
+                SELECT * FROM team_attachments
+                WHERE team_id=? AND message_id=?
+                ORDER BY created_at, id
+                """,
+                (team_id, message_id),
+            )
+        ]
+
+    def _team_message_public(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        include_body: bool,
+        owned: list[tuple[str, str]] | None = None,
+        delivery_address: tuple[str, str] | None = None,
+    ) -> dict[str, Any]:
+        team_id = str(row["team_id"])
+        message_id = str(row["id"])
+        recipient_rows = self._team_message_recipients(connection, team_id, message_id)
+        body = str(row["body"])
+        item: dict[str, Any] = {
+            "id": message_id,
+            "sequence": int(row["queue_ordinal"]),
+            "kind": row["kind"],
+            "title": row["title"],
+            "body_format": row["body_format"],
+            "body_bytes": int(row["body_bytes"]),
+            "body_sha256": bytes(row["body_sha256"]).hex(),
+            "sender": self._team_sender_party(row),
+            "recipients": [self._team_recipient_public(item) for item in recipient_rows],
+            "attachments": self._team_message_attachments(connection, team_id, message_id),
+            "in_reply_to_message_id": row["in_reply_to_message_id"],
+            "skill": (
+                {
+                    "id": row["skill_id"],
+                    "slug": row["skill_slug"],
+                    "version": int(row["skill_version"]),
+                }
+                if row["skill_id"] is not None
+                else None
+            ),
+            "provenance": json.loads(str(row["provenance_json"] or "{}")),
+            "created_at": _iso8601(row["created_at"]),
+        }
+        if include_body:
+            item["body"] = body
+        else:
+            preview = " ".join(body.split())
+            if len(preview) > MAX_TEAM_MESSAGE_PREVIEW_CHARS:
+                preview = preview[: MAX_TEAM_MESSAGE_PREVIEW_CHARS - 1] + "…"
+            item["preview"] = preview
+        if owned is not None:
+            mine = [
+                self._team_recipient_public(recipient)
+                for recipient in recipient_rows
+                if recipient["recipient_kind"] != "all"
+                and (
+                    str(recipient["recipient_kind"]),
+                    str(recipient["recipient_node_id"] or recipient["recipient_principal_id"]),
+                )
+                in owned
+            ]
+            if delivery_address is not None:
+                delivery_kind, delivery_id = delivery_address
+                mine = [
+                    recipient
+                    for recipient in mine
+                    if recipient["kind"] == delivery_kind
+                    and recipient["id"] == delivery_id
+                ]
+            item["delivery"] = mine[0] if mine else None
+        return item
+
+    def _team_message_visible(
+        self,
+        connection: sqlite3.Connection,
+        claims: AccessClaims,
+        row: sqlite3.Row,
+        owned: list[tuple[str, str]],
+    ) -> bool:
+        if row["sender_kind"] == "human" and row["sender_principal_id"] == claims.principal_id:
+            return True
+        if row["sender_kind"] == "server" and ("server", str(row["sender_node_id"])) in owned:
+            return True
+        for recipient in connection.execute(
+            """
+            SELECT recipient_kind, recipient_node_id, recipient_principal_id
+            FROM team_message_recipients WHERE team_id=? AND message_id=?
+            """,
+            (row["team_id"], row["id"]),
+        ):
+            kind = str(recipient["recipient_kind"])
+            if kind == "all":
+                return True
+            identity = recipient["recipient_node_id"] or recipient["recipient_principal_id"]
+            if (kind, str(identity)) in owned:
+                return True
+        return False
+
+    # -- messages -----------------------------------------------------------
+
+    def create_team_message(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        timestamp = _now()
+        kind = request.get("kind")
+        if kind not in {"message", "skill"}:
+            raise HubError("invalid_request", "Message kind is invalid", 422)
+        title = self._team_text(
+            request.get("title"), "title", 1, MAX_TEAM_MESSAGE_TITLE_CHARS, allow_none=True
+        )
+        body, body_format, body_digest, body_bytes = self._team_body(request)
+        provenance_json = self._team_provenance(request.get("provenance"))
+        idempotency_key = self._team_idempotency_key(request)
+        reply_to = request.get("in_reply_to_message_id")
+        if reply_to is not None and (not isinstance(reply_to, str) or not 8 <= len(reply_to) <= 240):
+            raise HubError("invalid_request", "in_reply_to_message_id is invalid", 422)
+        raw_recipients = request.get("recipients")
+        if (
+            not isinstance(raw_recipients, list)
+            or not 1 <= len(raw_recipients) <= MAX_TEAM_MESSAGE_RECIPIENTS
+        ):
+            raise HubError("invalid_request", "Message recipients are invalid", 422)
+        requested: list[tuple[str, str | None]] = []
+        for entry in raw_recipients:
+            if not isinstance(entry, dict) or entry.get("kind") not in {"server", "human", "all"}:
+                raise HubError("invalid_request", "Message recipients are invalid", 422)
+            recipient_kind = str(entry["kind"])
+            recipient_id = entry.get("id")
+            if recipient_kind == "all":
+                if recipient_id not in (None, "all"):
+                    raise HubError("invalid_request", "Message recipients are invalid", 422)
+                recipient_id = None
+            elif not isinstance(recipient_id, str) or not 1 <= len(recipient_id) <= 240:
+                raise HubError("invalid_request", "Message recipients are invalid", 422)
+            if (recipient_kind, recipient_id) not in requested:
+                requested.append((recipient_kind, recipient_id))
+        raw_attachments = request.get("attachment_ids") or []
+        if (
+            not isinstance(raw_attachments, list)
+            or len(raw_attachments) > MAX_TEAM_MESSAGE_ATTACHMENTS
+            or any(not isinstance(item, str) or not 8 <= len(item) <= 240 for item in raw_attachments)
+            or len(set(raw_attachments)) != len(raw_attachments)
+        ):
+            raise HubError("invalid_request", "Message attachments are invalid", 422)
+        skill_request = request.get("skill")
+        slug: str | None = None
+        skill_summary = ""
+        skill_tags: list[str] = []
+        change_note = ""
+        expected_version: int | None = None
+        if kind == "skill":
+            if title is None:
+                raise HubError("invalid_request", "A skill post requires a title", 422)
+            if not isinstance(skill_request, dict):
+                raise HubError("invalid_request", "A skill post requires skill details", 422)
+            if requested != [("all", None)]:
+                raise HubError(
+                    "invalid_request", "A skill post must be addressed to the whole team", 422
+                )
+            slug = self._team_slug(skill_request.get("slug"))
+            skill_summary = str(self._team_text(skill_request.get("summary"), "summary", 0, 280))
+            skill_tags = self._team_tags(skill_request.get("tags"))
+            change_note = str(
+                self._team_text(skill_request.get("change_note"), "change note", 0, 280)
+            )
+            expected_version = skill_request.get("expected_version")
+            if expected_version is not None and (
+                type(expected_version) is not int or expected_version < 1
+            ):
+                raise HubError("invalid_request", "expected_version is invalid", 422)
+        elif skill_request is not None:
+            raise HubError("invalid_request", "Only skill posts carry skill details", 422)
+        fingerprint = canonical_fingerprint(
+            {
+                "team_id": team_id,
+                "kind": kind,
+                "title": title,
+                "body": body,
+                "body_format": body_format,
+                "recipients": requested,
+                "attachment_ids": list(raw_attachments),
+                "in_reply_to_message_id": reply_to,
+                "skill": (
+                    {
+                        "slug": slug,
+                        "summary": skill_summary,
+                        "tags": skill_tags,
+                        "change_note": change_note,
+                        "expected_version": expected_version,
+                    }
+                    if kind == "skill"
+                    else None
+                ),
+                "provenance": provenance_json,
+            }
+        )
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                membership = self._require_network_scope(connection, claims, team_id, write=True)
+                cached = self._idempotency_lookup(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "team.message.create",
+                    idempotency_key,
+                    fingerprint,
+                )
+                if cached is not None:
+                    return cached
+                sender_kind, sender_node_id = self._team_sender(connection, claims, team_id)
+                resolved: list[tuple[str, str | None, str | None]] = []
+                for recipient_kind, recipient_id in requested:
+                    if recipient_kind == "all":
+                        resolved.append(("all", None, None))
+                        continue
+                    if recipient_kind == "server":
+                        found = connection.execute(
+                            """
+                            SELECT id FROM nodes
+                            WHERE team_id=? AND id=? AND status<>'revoked'
+                            """,
+                            (team_id, recipient_id),
+                        ).fetchone()
+                        if found is None:
+                            raise HubError(
+                                "recipient_unavailable",
+                                "Team Network server recipient is unavailable",
+                                404,
+                            )
+                        resolved.append(("server", str(found["id"]), None))
+                        continue
+                    found = connection.execute(
+                        """
+                        SELECT p.id FROM principals AS p
+                        JOIN memberships AS m ON m.team_id=? AND m.principal_id=p.id
+                        WHERE p.id=? AND p.kind='human' AND p.status='active'
+                          AND m.status='active'
+                        """,
+                        (team_id, recipient_id),
+                    ).fetchone()
+                    if found is None:
+                        raise HubError(
+                            "recipient_unavailable",
+                            "Team Network member recipient is unavailable",
+                            404,
+                        )
+                    resolved.append(("human", None, str(found["id"])))
+                if reply_to is not None:
+                    parent = connection.execute(
+                        "SELECT id FROM team_messages WHERE team_id=? AND id=?",
+                        (team_id, reply_to),
+                    ).fetchone()
+                    if parent is None:
+                        raise HubError("invalid_request", "Reply target is unavailable", 422)
+                attachment_rows: list[sqlite3.Row] = []
+                attachment_bytes = 0
+                for attachment_id in raw_attachments:
+                    attachment = connection.execute(
+                        "SELECT * FROM team_attachments WHERE team_id=? AND id=?",
+                        (team_id, attachment_id),
+                    ).fetchone()
+                    if (
+                        attachment is None
+                        or attachment["state"] != "ready"
+                        or attachment["message_id"] is not None
+                        or attachment["uploaded_by_principal_id"] != claims.principal_id
+                    ):
+                        raise HubError(
+                            "attachment_unavailable",
+                            "An attachment is missing, unfinished, or already used",
+                            409,
+                        )
+                    attachment_rows.append(attachment)
+                    attachment_bytes += int(attachment["byte_size"])
+                if attachment_bytes > MAX_TEAM_MESSAGE_ATTACHMENT_BYTES:
+                    raise HubError(
+                        "attachment_limit", "Attachments exceed the per-message limit", 413
+                    )
+                self._charge_network_peer_write(
+                    connection, claims, team_id, body_bytes, timestamp
+                )
+                message_id = _id("tmsg")
+                skill_id: str | None = None
+                skill_version: int | None = None
+                if kind == "skill":
+                    assert slug is not None and title is not None
+                    skill = connection.execute(
+                        "SELECT * FROM team_skills WHERE team_id=? AND slug=?",
+                        (team_id, slug),
+                    ).fetchone()
+                    if skill is None:
+                        if expected_version is not None:
+                            raise HubError(
+                                "skill_version_conflict",
+                                "The skill does not exist yet; omit expected_version",
+                                409,
+                            )
+                        count = connection.execute(
+                            "SELECT COUNT(*) FROM team_skills WHERE team_id=?", (team_id,)
+                        ).fetchone()[0]
+                        if int(count) >= MAX_TEAM_SKILLS_PER_TEAM:
+                            raise HubError(
+                                "skill_limit", "This team has reached its skill limit", 409
+                            )
+                        skill_id = _id("tskill")
+                        skill_version = 1
+                        connection.execute(
+                            """
+                            INSERT INTO team_skills(
+                                id,team_id,slug,title,summary,tags_json,current_version,
+                                created_by_principal_id,created_at,updated_at
+                            ) VALUES (?,?,?,?,?,?,1,?,?,?)
+                            """,
+                            (
+                                skill_id,
+                                team_id,
+                                slug,
+                                title,
+                                skill_summary,
+                                json.dumps(skill_tags, separators=(",", ":")),
+                                claims.principal_id,
+                                timestamp,
+                                timestamp,
+                            ),
+                        )
+                    else:
+                        if skill["archived_at"] is not None:
+                            raise HubError(
+                                "skill_archived", "Restore the skill before updating it", 409
+                            )
+                        if expected_version is None or expected_version != int(
+                            skill["current_version"]
+                        ):
+                            raise HubError(
+                                "skill_version_conflict",
+                                "The skill changed since it was loaded",
+                                409,
+                            )
+                        versions = connection.execute(
+                            "SELECT COUNT(*) FROM team_skill_versions WHERE skill_id=?",
+                            (skill["id"],),
+                        ).fetchone()[0]
+                        if int(versions) >= MAX_TEAM_SKILL_VERSIONS:
+                            raise HubError(
+                                "skill_limit", "This skill has reached its version limit", 409
+                            )
+                        skill_id = str(skill["id"])
+                        skill_version = expected_version + 1
+                        connection.execute(
+                            """
+                            UPDATE team_skills
+                            SET title=?,summary=?,tags_json=?,current_version=?,updated_at=?
+                            WHERE team_id=? AND id=?
+                            """,
+                            (
+                                title,
+                                skill_summary,
+                                json.dumps(skill_tags, separators=(",", ":")),
+                                skill_version,
+                                timestamp,
+                                team_id,
+                                skill_id,
+                            ),
+                        )
+                connection.execute(
+                    """
+                    INSERT INTO team_messages(
+                        id,team_id,kind,title,body_format,body,body_sha256,
+                        sender_kind,sender_principal_id,sender_node_id,provenance_json,
+                        in_reply_to_message_id,skill_id,skill_version,
+                        attachment_count,attachment_bytes,idempotency_key,created_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        message_id,
+                        team_id,
+                        kind,
+                        title,
+                        body_format,
+                        body,
+                        body_digest,
+                        sender_kind,
+                        claims.principal_id,
+                        sender_node_id,
+                        provenance_json,
+                        reply_to,
+                        skill_id,
+                        skill_version,
+                        len(attachment_rows),
+                        attachment_bytes,
+                        hashlib.sha256(
+                            f"{team_id}\0{claims.principal_id}\0team.message.create\0{idempotency_key}".encode(
+                                "utf-8"
+                            )
+                        ).digest(),
+                        timestamp,
+                    ),
+                )
+                for recipient_kind, node_id, principal_id in resolved:
+                    connection.execute(
+                        """
+                        INSERT INTO team_message_recipients(
+                            id,team_id,message_id,recipient_kind,recipient_node_id,
+                            recipient_principal_id,state
+                        ) VALUES (?,?,?,?,?,?,'available')
+                        """,
+                        (_id("trcpt"), team_id, message_id, recipient_kind, node_id, principal_id),
+                    )
+                for attachment in attachment_rows:
+                    bound = connection.execute(
+                        """
+                        UPDATE team_attachments SET message_id=?
+                        WHERE team_id=? AND id=? AND message_id IS NULL AND state='ready'
+                        """,
+                        (message_id, team_id, attachment["id"]),
+                    )
+                    if bound.rowcount != 1:
+                        raise HubError(
+                            "attachment_unavailable",
+                            "An attachment is missing, unfinished, or already used",
+                            409,
+                        )
+                skill_version_id: str | None = None
+                if kind == "skill":
+                    assert skill_id is not None and skill_version is not None
+                    skill_version_id = _id("tskillv")
+                    connection.execute(
+                        """
+                        INSERT INTO team_skill_versions(
+                            id,team_id,skill_id,version,message_id,title,summary,
+                            tags_json,change_note,created_at
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            skill_version_id,
+                            team_id,
+                            skill_id,
+                            skill_version,
+                            message_id,
+                            title,
+                            skill_summary,
+                            json.dumps(skill_tags, separators=(",", ":")),
+                            change_note,
+                            timestamp,
+                        ),
+                    )
+                row = connection.execute(
+                    self._team_message_select() + " WHERE m.team_id=? AND m.id=?",
+                    (team_id, message_id),
+                ).fetchone()
+                assert row is not None
+                response = {
+                    "message": self._team_message_public(connection, row, include_body=True)
+                }
+                self._idempotency_store(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "team.message.create",
+                    idempotency_key,
+                    fingerprint,
+                    "team_message",
+                    message_id,
+                    response,
+                    timestamp,
+                )
+                self._audit(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "team.message.create",
+                    "team_message",
+                    message_id,
+                    "succeeded",
+                    {
+                        "kind": kind,
+                        "recipient_kinds": sorted({item[0] for item in resolved}),
+                        "attachments": len(attachment_rows),
+                        "skill_slug": slug,
+                        "skill_version": skill_version,
+                    },
+                    timestamp,
+                )
+                self._outbox(
+                    connection, team_id, "team_message", message_id, "team.message.created", timestamp
+                )
+                if skill_version_id is not None:
+                    # Outbox effects are deduplicated per aggregate and event
+                    # type, so each version is its own aggregate.
+                    self._outbox(
+                        connection,
+                        team_id,
+                        "team_skill_version",
+                        skill_version_id,
+                        "team.skill.versioned",
+                        timestamp,
+                    )
+                return response
+        except sqlite3.IntegrityError as exc:
+            raise HubError("conflict", "Team message conflicts with existing data", 409) from exc
+        finally:
+            connection.close()
+
+    def list_team_messages(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        *,
+        box: str,
+        address_kind: str | None = None,
+        address_id: str | None = None,
+        unread: bool = False,
+        from_kind: str | None = None,
+        from_id: str | None = None,
+        since: Any = None,
+        after_sequence: int = 0,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        if box not in {"inbox", "feed", "sent"}:
+            raise HubError("invalid_request", "Message box is invalid", 422)
+        if type(limit) is not int or not 1 <= limit <= MAX_NETWORK_PAGE_ITEMS:
+            raise HubError("invalid_request", "Message page limit is invalid", 422)
+        if type(after_sequence) is not int or after_sequence < 0:
+            raise HubError("invalid_request", "Message page cursor is invalid", 422)
+        if from_kind is not None and from_kind not in {"server", "human"}:
+            raise HubError("invalid_request", "Sender filter is invalid", 422)
+        if (from_kind is None) != (from_id is None):
+            raise HubError("invalid_request", "Sender filter is invalid", 422)
+        since_epoch = self._team_since(since)
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            membership = self._require_network_scope(connection, claims, team_id, write=False)
+            owned = self._team_owned_addresses(
+                connection, claims, team_id, str(membership["role"])
+            )
+            where = ["m.team_id=?", "m.queue_ordinal>?"]
+            params: list[Any] = [team_id, after_sequence]
+            joins = ""
+            if box == "feed":
+                joins = (
+                    " JOIN team_message_recipients AS r"
+                    " ON r.team_id=m.team_id AND r.message_id=m.id"
+                    " AND r.recipient_kind='all'"
+                )
+            elif box == "inbox":
+                if address_kind is None and address_id is None:
+                    address_kind, address_id = owned[0]
+                if (address_kind, address_id) not in owned:
+                    raise HubError(
+                        "forbidden", "This mailbox is not owned by the caller", 403
+                    )
+                column = (
+                    "recipient_node_id" if address_kind == "server" else "recipient_principal_id"
+                )
+                joins = (
+                    " JOIN team_message_recipients AS r"
+                    " ON r.team_id=m.team_id AND r.message_id=m.id"
+                    f" AND r.recipient_kind=? AND r.{column}=?"
+                )
+                params = [address_kind, address_id, *params]
+                if unread:
+                    where.append("r.state<>'read'")
+            else:
+                if claims.auth_kind in NETWORK_AUTOMATION_AUTH_KINDS:
+                    server_ids = [identity for kind, identity in owned if kind == "server"]
+                    where.append("m.sender_kind='server' AND m.sender_node_id=?")
+                    params.append(server_ids[0])
+                else:
+                    where.append("m.sender_kind='human' AND m.sender_principal_id=?")
+                    params.append(claims.principal_id)
+            if from_kind == "server":
+                where.append("m.sender_kind='server' AND m.sender_node_id=?")
+                params.append(from_id)
+            elif from_kind == "human":
+                where.append("m.sender_kind='human' AND m.sender_principal_id=?")
+                params.append(from_id)
+            if since_epoch is not None:
+                where.append("m.created_at>=?")
+                params.append(since_epoch)
+            rows = connection.execute(
+                self._team_message_select()
+                + joins
+                + " WHERE "
+                + " AND ".join(where)
+                + " ORDER BY m.queue_ordinal ASC LIMIT ?",
+                (*params, limit + 1),
+            ).fetchall()
+            visible = rows[:limit]
+            messages = [
+                self._team_message_public(
+                    connection,
+                    row,
+                    include_body=False,
+                    owned=owned if box == "inbox" else None,
+                    delivery_address=(str(address_kind), str(address_id))
+                    if box == "inbox"
+                    else None,
+                )
+                for row in visible
+            ]
+            response = {
+                "box": box,
+                "address": (
+                    {"kind": address_kind, "id": address_id} if box == "inbox" else None
+                ),
+                "messages": messages,
+                "next_after_sequence": (
+                    int(visible[-1]["queue_ordinal"]) if visible else after_sequence
+                ),
+                "has_more": len(rows) > limit,
+            }
+            if len(canonical_json(response)) > MAX_NETWORK_PAGE_RESPONSE_BYTES:
+                raise HubError(
+                    "invalid_request", "Message page exceeds the response limit; lower limit", 422
+                )
+            connection.execute("COMMIT")
+            return response
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def get_team_message(
+        self, claims: AccessClaims, team_id: str, message_id: str
+    ) -> dict[str, Any]:
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            membership = self._require_network_scope(connection, claims, team_id, write=False)
+            row = connection.execute(
+                self._team_message_select() + " WHERE m.team_id=? AND m.id=?",
+                (team_id, message_id),
+            ).fetchone()
+            if row is None:
+                raise HubError("not_found", "Resource not found", 404)
+            owned = self._team_owned_addresses(
+                connection, claims, team_id, str(membership["role"])
+            )
+            if not self._team_message_visible(connection, claims, row, owned):
+                raise HubError("not_found", "Resource not found", 404)
+            response = {
+                "message": self._team_message_public(
+                    connection, row, include_body=True, owned=owned
+                )
+            }
+            connection.execute("COMMIT")
+            return response
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def record_team_message_receipt(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        message_id: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        timestamp = _now()
+        state = request.get("state")
+        if state not in {"delivered", "read"}:
+            raise HubError("invalid_request", "Receipt state is invalid", 422)
+        idempotency_key = self._team_idempotency_key(request)
+        fingerprint = canonical_fingerprint(
+            {"team_id": team_id, "message_id": message_id, "state": state}
+        )
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                membership = self._require_network_scope(connection, claims, team_id, write=False)
+                cached = self._idempotency_lookup(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "team.message.receipt",
+                    idempotency_key,
+                    fingerprint,
+                )
+                if cached is not None:
+                    return cached
+                owned = self._team_owned_addresses(
+                    connection, claims, team_id, str(membership["role"])
+                )
+                rows = [
+                    recipient
+                    for recipient in self._team_message_recipients(connection, team_id, message_id)
+                    if recipient["recipient_kind"] != "all"
+                    and (
+                        str(recipient["recipient_kind"]),
+                        str(recipient["recipient_node_id"] or recipient["recipient_principal_id"]),
+                    )
+                    in owned
+                ]
+                if not rows:
+                    raise HubError("forbidden", "This message is not addressed to the caller", 403)
+                for recipient in rows:
+                    current = str(recipient["state"])
+                    if current == "read" or (current == "delivered" and state == "delivered"):
+                        continue
+                    if state == "delivered":
+                        connection.execute(
+                            """
+                            UPDATE team_message_recipients
+                            SET state='delivered',delivered_at=? WHERE id=?
+                            """,
+                            (timestamp, recipient["id"]),
+                        )
+                    else:
+                        connection.execute(
+                            """
+                            UPDATE team_message_recipients
+                            SET state='read',delivered_at=COALESCE(delivered_at,?),read_at=?
+                            WHERE id=?
+                            """,
+                            (timestamp, timestamp, recipient["id"]),
+                        )
+                updated = [
+                    self._team_recipient_public(recipient)
+                    for recipient in self._team_message_recipients(connection, team_id, message_id)
+                    if recipient["id"] in {item["id"] for item in rows}
+                ]
+                response = {"message_id": message_id, "recipients": updated}
+                self._idempotency_store(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "team.message.receipt",
+                    idempotency_key,
+                    fingerprint,
+                    "team_message",
+                    message_id,
+                    response,
+                    timestamp,
+                )
+                self._audit(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "team.message.receipt",
+                    "team_message",
+                    message_id,
+                    "succeeded",
+                    {"state": state},
+                    timestamp,
+                )
+                return response
+        finally:
+            connection.close()
+
+    # -- attachments --------------------------------------------------------
+
+    @property
+    def team_attachment_root(self) -> Path:
+        root = self.data_dir / "attachments"
+        ensure_private_directory(root)
+        return root
+
+    def _team_attachment_storage_path(self, storage_key: str) -> Path:
+        return self.team_attachment_root / storage_key[:2] / storage_key
+
+    def _team_attachment_staging_path(self, attachment_id: str) -> Path:
+        uploads = self.team_attachment_root / "uploads"
+        ensure_private_directory(uploads)
+        return uploads / f"{attachment_id}.part"
+
+    def declare_team_attachment(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        timestamp = _now()
+        file_name = request.get("file_name")
+        if (
+            not isinstance(file_name, str)
+            or TEAM_ATTACHMENT_FILE_NAME_RE.fullmatch(file_name) is None
+            or file_name.strip() != file_name
+            or file_name in {".", ".."}
+        ):
+            raise HubError("invalid_request", "Attachment file name is invalid", 422)
+        media_type = request.get("media_type")
+        if not isinstance(media_type, str) or TEAM_ATTACHMENT_MEDIA_TYPE_RE.fullmatch(
+            media_type.strip()
+        ) is None:
+            raise HubError("invalid_request", "Attachment media type is invalid", 422)
+        media_type = media_type.strip()
+        byte_size = request.get("byte_size")
+        if type(byte_size) is not int or byte_size < 1:
+            raise HubError("invalid_request", "Attachment size is invalid", 422)
+        if byte_size > self.team_attachment_max_bytes:
+            raise HubError(
+                "attachment_limit", "Attachment exceeds the per-file size limit", 413
+            )
+        storage_key = self._team_sha256_hex(request.get("sha256"))
+        idempotency_key = self._team_idempotency_key(request)
+        fingerprint = canonical_fingerprint(
+            {
+                "team_id": team_id,
+                "file_name": file_name,
+                "media_type": media_type,
+                "byte_size": byte_size,
+                "sha256": storage_key,
+            }
+        )
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                self._require_network_scope(connection, claims, team_id, write=True)
+                cached = self._idempotency_lookup(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "team.attachment.declare",
+                    idempotency_key,
+                    fingerprint,
+                )
+                if cached is not None:
+                    return cached
+                used = connection.execute(
+                    """
+                    SELECT COALESCE(SUM(byte_size),0) FROM team_attachments
+                    WHERE team_id=? AND state IN ('uploading','ready')
+                    """,
+                    (team_id,),
+                ).fetchone()[0]
+                if int(used) + byte_size > self.team_attachment_quota_bytes:
+                    raise HubError(
+                        "attachment_limit", "Team attachment storage quota exceeded", 413
+                    )
+                _sender_kind, uploader_node_id = self._team_sender(connection, claims, team_id)
+                attachment_id = _id("tatt")
+                storage_path = self._team_attachment_storage_path(storage_key)
+                duplicate_ready = connection.execute(
+                    """
+                    SELECT 1 FROM team_attachments
+                    WHERE team_id=? AND storage_key=? AND state='ready' AND byte_size=?
+                    LIMIT 1
+                    """,
+                    (team_id, storage_key, byte_size),
+                ).fetchone()
+                already_stored = (
+                    duplicate_ready is not None
+                    and storage_path.is_file()
+                    and storage_path.stat().st_size == byte_size
+                )
+                connection.execute(
+                    """
+                    INSERT INTO team_attachments(
+                        id,team_id,message_id,file_name,media_type,byte_size,sha256,
+                        storage_key,state,received_bytes,uploaded_by_principal_id,
+                        uploader_node_id,idempotency_key,created_at,ready_at,expires_at
+                    ) VALUES (?,?,NULL,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        attachment_id,
+                        team_id,
+                        file_name,
+                        media_type,
+                        byte_size,
+                        bytes.fromhex(storage_key),
+                        storage_key,
+                        "ready" if already_stored else "uploading",
+                        byte_size if already_stored else 0,
+                        claims.principal_id,
+                        uploader_node_id,
+                        hashlib.sha256(
+                            f"{team_id}\0{claims.principal_id}\0team.attachment.declare\0{idempotency_key}".encode(
+                                "utf-8"
+                            )
+                        ).digest(),
+                        timestamp,
+                        timestamp if already_stored else None,
+                        timestamp + TEAM_ATTACHMENT_UPLOAD_TTL_SECONDS,
+                    ),
+                )
+                row = connection.execute(
+                    "SELECT * FROM team_attachments WHERE team_id=? AND id=?",
+                    (team_id, attachment_id),
+                ).fetchone()
+                assert row is not None
+                response = {
+                    "attachment": self._team_attachment_public(row),
+                    "chunk_bytes": TEAM_ATTACHMENT_CHUNK_BYTES,
+                }
+                self._idempotency_store(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "team.attachment.declare",
+                    idempotency_key,
+                    fingerprint,
+                    "team_attachment",
+                    attachment_id,
+                    response,
+                    timestamp,
+                )
+                self._audit(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "team.attachment.declare",
+                    "team_attachment",
+                    attachment_id,
+                    "succeeded",
+                    {"byte_size": byte_size, "deduplicated": already_stored},
+                    timestamp,
+                )
+                return response
+        finally:
+            connection.close()
+
+    def write_team_attachment_chunk(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        attachment_id: str,
+        *,
+        offset: int,
+        total: int,
+        data: bytes,
+    ) -> dict[str, Any]:
+        """Append one contiguous chunk; finish, verify, and publish on the last one."""
+
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            raise HubError("invalid_request", "Attachment chunk is empty", 422)
+        if len(data) > TEAM_ATTACHMENT_CHUNK_BYTES:
+            raise HubError("request_too_large", "Attachment chunk is too large", 413)
+        if type(offset) is not int or offset < 0 or type(total) is not int or total < 1:
+            raise HubError("invalid_request", "Attachment range is invalid", 422)
+        timestamp = _now()
+        connection = self.connect()
+        try:
+            try:
+                return self._write_team_attachment_chunk_locked(
+                    connection,
+                    claims,
+                    team_id,
+                    attachment_id,
+                    offset=offset,
+                    total=total,
+                    data=bytes(data),
+                    timestamp=timestamp,
+                )
+            except _TeamAttachmentFailure as failure:
+                # The chunk transaction rolled back; record the terminal state
+                # in its own transaction so a retry cannot resume a bad upload.
+                with _write_transaction(connection):
+                    connection.execute(
+                        """
+                        UPDATE team_attachments SET state='failed'
+                        WHERE team_id=? AND id=? AND state='uploading'
+                        """,
+                        (team_id, attachment_id),
+                    )
+                raise failure.error from None
+        finally:
+            connection.close()
+
+    def _write_team_attachment_chunk_locked(
+        self,
+        connection: sqlite3.Connection,
+        claims: AccessClaims,
+        team_id: str,
+        attachment_id: str,
+        *,
+        offset: int,
+        total: int,
+        data: bytes,
+        timestamp: int,
+    ) -> dict[str, Any]:
+        with _write_transaction(connection):
+                self._require_network_scope(connection, claims, team_id, write=True)
+                row = connection.execute(
+                    "SELECT * FROM team_attachments WHERE team_id=? AND id=?",
+                    (team_id, attachment_id),
+                ).fetchone()
+                if row is None or row["uploaded_by_principal_id"] != claims.principal_id:
+                    raise HubError("not_found", "Resource not found", 404)
+                byte_size = int(row["byte_size"])
+                if total != byte_size:
+                    raise HubError("invalid_request", "Attachment range total is wrong", 422)
+                received = int(row["received_bytes"])
+                if row["state"] == "ready":
+                    if offset + len(data) <= byte_size:
+                        return {"attachment": self._team_attachment_public(row)}
+                    raise HubError("conflict", "Attachment is already complete", 409)
+                if row["state"] == "failed":
+                    raise HubError(
+                        "attachment_unavailable", "Attachment upload failed; declare it again", 409
+                    )
+                if offset + len(data) <= received:
+                    return {"attachment": self._team_attachment_public(row)}
+                if offset != received:
+                    raise HubError("conflict", "Attachment chunk offset is not contiguous", 409)
+                if received + len(data) > byte_size:
+                    raise HubError(
+                        "invalid_request", "Attachment chunk exceeds the declared size", 422
+                    )
+                staging = self._team_attachment_staging_path(attachment_id)
+                flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(staging, flags, 0o600)
+                try:
+                    current_size = os.fstat(descriptor).st_size
+                    if current_size > received:
+                        os.ftruncate(descriptor, received)
+                    elif current_size < received:
+                        raise _TeamAttachmentFailure(
+                            HubError(
+                                "attachment_unavailable",
+                                "Attachment upload state was lost; declare it again",
+                                409,
+                            )
+                        )
+                    os.lseek(descriptor, received, os.SEEK_SET)
+                    view = memoryview(data)
+                    while view:
+                        written = os.write(descriptor, view)
+                        view = view[written:]
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                new_received = received + len(data)
+                if new_received < byte_size:
+                    connection.execute(
+                        "UPDATE team_attachments SET received_bytes=? WHERE id=?",
+                        (new_received, attachment_id),
+                    )
+                else:
+                    digest = hashlib.sha256()
+                    with open(staging, "rb") as handle:
+                        while True:
+                            block = handle.read(1024 * 1024)
+                            if not block:
+                                break
+                            digest.update(block)
+                    if digest.hexdigest() != str(row["storage_key"]):
+                        with suppress(OSError):
+                            staging.unlink()
+                        raise _TeamAttachmentFailure(
+                            HubError(
+                                "attachment_hash_mismatch",
+                                "Uploaded bytes do not match the declared SHA-256",
+                                422,
+                            )
+                        )
+                    final = self._team_attachment_storage_path(str(row["storage_key"]))
+                    final.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    if final.is_file() and final.stat().st_size == byte_size:
+                        with suppress(OSError):
+                            staging.unlink()
+                    else:
+                        os.replace(staging, final)
+                        os.chmod(final, 0o600)
+                        directory = os.open(final.parent, os.O_RDONLY)
+                        try:
+                            os.fsync(directory)
+                        finally:
+                            os.close(directory)
+                    connection.execute(
+                        """
+                        UPDATE team_attachments
+                        SET received_bytes=?,state='ready',ready_at=? WHERE id=?
+                        """,
+                        (byte_size, timestamp, attachment_id),
+                    )
+                    self._audit(
+                        connection,
+                        team_id,
+                        claims.principal_id,
+                        "team.attachment.ready",
+                        "team_attachment",
+                        attachment_id,
+                        "succeeded",
+                        {"byte_size": byte_size},
+                        timestamp,
+                    )
+                    self._outbox(
+                        connection,
+                        team_id,
+                        "team_attachment",
+                        attachment_id,
+                        "team.attachment.ready",
+                        timestamp,
+                    )
+                updated = connection.execute(
+                    "SELECT * FROM team_attachments WHERE team_id=? AND id=?",
+                    (team_id, attachment_id),
+                ).fetchone()
+                assert updated is not None
+                return {"attachment": self._team_attachment_public(updated)}
+
+    def _team_attachment_row_visible(
+        self,
+        connection: sqlite3.Connection,
+        claims: AccessClaims,
+        team_id: str,
+        row: sqlite3.Row,
+        membership_role: str,
+    ) -> bool:
+        if row["message_id"] is None:
+            return row["uploaded_by_principal_id"] == claims.principal_id
+        message = connection.execute(
+            self._team_message_select() + " WHERE m.team_id=? AND m.id=?",
+            (team_id, row["message_id"]),
+        ).fetchone()
+        if message is None:
+            return False
+        owned = self._team_owned_addresses(connection, claims, team_id, membership_role)
+        return self._team_message_visible(connection, claims, message, owned)
+
+    def get_team_attachment(
+        self, claims: AccessClaims, team_id: str, attachment_id: str
+    ) -> dict[str, Any]:
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            membership = self._require_network_scope(connection, claims, team_id, write=False)
+            row = connection.execute(
+                "SELECT * FROM team_attachments WHERE team_id=? AND id=?",
+                (team_id, attachment_id),
+            ).fetchone()
+            if row is None or not self._team_attachment_row_visible(
+                connection, claims, team_id, row, str(membership["role"])
+            ):
+                raise HubError("not_found", "Resource not found", 404)
+            response = {"attachment": self._team_attachment_public(row)}
+            connection.execute("COMMIT")
+            return response
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def open_team_attachment(
+        self, claims: AccessClaims, team_id: str, attachment_id: str
+    ) -> tuple[dict[str, Any], Path]:
+        """Authorize a download and return the content-addressed file path."""
+
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            membership = self._require_network_scope(connection, claims, team_id, write=False)
+            row = connection.execute(
+                "SELECT * FROM team_attachments WHERE team_id=? AND id=?",
+                (team_id, attachment_id),
+            ).fetchone()
+            if row is None or not self._team_attachment_row_visible(
+                connection, claims, team_id, row, str(membership["role"])
+            ):
+                raise HubError("not_found", "Resource not found", 404)
+            if row["state"] != "ready":
+                raise HubError(
+                    "attachment_unavailable", "Attachment upload is not complete", 409
+                )
+            path = self._team_attachment_storage_path(str(row["storage_key"]))
+            if not path.is_file() or path.stat().st_size != int(row["byte_size"]):
+                raise HubError("attachment_unavailable", "Attachment bytes are unavailable", 404)
+            public = self._team_attachment_public(row)
+            connection.execute("COMMIT")
+            return public, path
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def purge_expired_team_attachments(self, now: int | None = None) -> int:
+        """Remove declared uploads that never finished; never touch ready files."""
+
+        timestamp = _now(now)
+        connection = self.connect()
+        removed = 0
+        try:
+            with _write_transaction(connection):
+                stale = connection.execute(
+                    """
+                    SELECT id FROM team_attachments
+                    WHERE state IN ('uploading','failed') AND message_id IS NULL
+                      AND expires_at<=?
+                    """,
+                    (timestamp,),
+                ).fetchall()
+                for row in stale:
+                    connection.execute(
+                        "DELETE FROM team_attachments WHERE id=?", (row["id"],)
+                    )
+                    with suppress(OSError):
+                        self._team_attachment_staging_path(str(row["id"])).unlink()
+                    removed += 1
+            return removed
+        finally:
+            connection.close()
+
+    # -- skills -------------------------------------------------------------
+
+    @staticmethod
+    def _team_skill_select() -> str:
+        return """
+            SELECT s.*, v.id AS version_id, v.message_id AS version_message_id,
+                   v.change_note AS version_change_note,
+                   v.created_at AS version_created_at,
+                   m.sender_kind AS author_kind, m.sender_principal_id AS author_principal_id,
+                   m.sender_node_id AS author_node_id,
+                   ap.display_name AS author_principal_display_name,
+                   an.display_name AS author_node_display_name,
+                   m.body AS version_body, m.body_format AS version_body_format,
+                   length(CAST(m.body AS BLOB)) AS version_body_bytes,
+                   (SELECT COUNT(*) FROM team_skill_versions AS c WHERE c.skill_id=s.id)
+                       AS versions_count
+            FROM team_skills AS s
+            JOIN team_skill_versions AS v
+              ON v.team_id=s.team_id AND v.skill_id=s.id AND v.version=s.current_version
+            JOIN team_messages AS m ON m.team_id=v.team_id AND m.id=v.message_id
+            JOIN principals AS ap ON ap.id=m.sender_principal_id
+            LEFT JOIN nodes AS an ON an.team_id=m.team_id AND an.id=m.sender_node_id
+        """
+
+    def _team_skill_public(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        include_body: bool,
+        can_write: bool,
+    ) -> dict[str, Any]:
+        item: dict[str, Any] = {
+            "id": row["id"],
+            "slug": row["slug"],
+            "title": row["title"],
+            "summary": row["summary"],
+            "tags": json.loads(str(row["tags_json"] or "[]")),
+            "version": int(row["current_version"]),
+            "versions_count": int(row["versions_count"]),
+            "pinned": row["pinned_at"] is not None,
+            "pinned_at": _iso8601(row["pinned_at"]),
+            "archived": row["archived_at"] is not None,
+            "archived_at": _iso8601(row["archived_at"]),
+            "author": self._team_sender_party(row, "author"),
+            "body_bytes": int(row["version_body_bytes"]),
+            "current": {
+                "version": int(row["current_version"]),
+                "message_id": row["version_message_id"],
+                "change_note": row["version_change_note"],
+                "created_at": _iso8601(row["version_created_at"]),
+            },
+            "created_at": _iso8601(row["created_at"]),
+            "updated_at": _iso8601(row["updated_at"]),
+            "permissions": {
+                "edit": can_write and row["archived_at"] is None,
+                "manage": can_write,
+            },
+        }
+        if include_body:
+            item["body"] = row["version_body"]
+            item["body_format"] = row["version_body_format"]
+            item["attachments"] = self._team_message_attachments(
+                connection, str(row["team_id"]), str(row["version_message_id"])
+            )
+        return item
+
+    def _team_skill_version_public(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        include_body: bool,
+    ) -> dict[str, Any]:
+        item: dict[str, Any] = {
+            "version": int(row["version"]),
+            "message_id": row["message_id"],
+            "title": row["title"],
+            "summary": row["summary"],
+            "tags": json.loads(str(row["tags_json"] or "[]")),
+            "change_note": row["change_note"],
+            "author": self._team_sender_party(row, "author"),
+            "body_bytes": int(row["version_body_bytes"]),
+            "attachments": self._team_message_attachments(
+                connection, str(row["team_id"]), str(row["message_id"])
+            ),
+            "created_at": _iso8601(row["created_at"]),
+        }
+        if include_body:
+            item["body"] = row["version_body"]
+            item["body_format"] = row["version_body_format"]
+        return item
+
+    @staticmethod
+    def _team_skill_version_select() -> str:
+        return """
+            SELECT v.*, m.sender_kind AS author_kind,
+                   m.sender_principal_id AS author_principal_id,
+                   m.sender_node_id AS author_node_id,
+                   ap.display_name AS author_principal_display_name,
+                   an.display_name AS author_node_display_name,
+                   m.body AS version_body, m.body_format AS version_body_format,
+                   length(CAST(m.body AS BLOB)) AS version_body_bytes
+            FROM team_skill_versions AS v
+            JOIN team_messages AS m ON m.team_id=v.team_id AND m.id=v.message_id
+            JOIN principals AS ap ON ap.id=m.sender_principal_id
+            LEFT JOIN nodes AS an ON an.team_id=m.team_id AND an.id=m.sender_node_id
+        """
+
+    def list_team_skills(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        *,
+        include_archived: bool = False,
+        slug: str | None = None,
+    ) -> dict[str, Any]:
+        clean_slug = self._team_slug(slug) if slug is not None else None
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            membership = self._require_network_scope(connection, claims, team_id, write=False)
+            can_write = self._team_can_write(claims, str(membership["role"]))
+            where = ["s.team_id=?"]
+            params: list[Any] = [team_id]
+            if not include_archived:
+                where.append("s.archived_at IS NULL")
+            if clean_slug is not None:
+                where.append("s.slug=?")
+                params.append(clean_slug)
+            rows = connection.execute(
+                self._team_skill_select()
+                + " WHERE "
+                + " AND ".join(where)
+                + " ORDER BY s.pinned_at IS NULL, s.pinned_at DESC, s.updated_at DESC, s.id"
+                + f" LIMIT {MAX_TEAM_SKILLS_PER_TEAM}",
+                params,
+            ).fetchall()
+            response = {
+                "skills": [
+                    self._team_skill_public(
+                        connection, row, include_body=False, can_write=can_write
+                    )
+                    for row in rows
+                ]
+            }
+            connection.execute("COMMIT")
+            return response
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def get_team_skill(
+        self, claims: AccessClaims, team_id: str, skill_id: str
+    ) -> dict[str, Any]:
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            membership = self._require_network_scope(connection, claims, team_id, write=False)
+            row = connection.execute(
+                self._team_skill_select() + " WHERE s.team_id=? AND s.id=?",
+                (team_id, skill_id),
+            ).fetchone()
+            if row is None:
+                raise HubError("not_found", "Resource not found", 404)
+            response = {
+                "skill": self._team_skill_public(
+                    connection,
+                    row,
+                    include_body=True,
+                    can_write=self._team_can_write(claims, str(membership["role"])),
+                )
+            }
+            connection.execute("COMMIT")
+            return response
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def list_team_skill_versions(
+        self, claims: AccessClaims, team_id: str, skill_id: str
+    ) -> dict[str, Any]:
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            self._require_network_scope(connection, claims, team_id, write=False)
+            exists = connection.execute(
+                "SELECT 1 FROM team_skills WHERE team_id=? AND id=?", (team_id, skill_id)
+            ).fetchone()
+            if exists is None:
+                raise HubError("not_found", "Resource not found", 404)
+            rows = connection.execute(
+                self._team_skill_version_select()
+                + " WHERE v.team_id=? AND v.skill_id=? ORDER BY v.version DESC",
+                (team_id, skill_id),
+            ).fetchall()
+            response = {
+                "skill_id": skill_id,
+                "versions": [
+                    self._team_skill_version_public(connection, row, include_body=False)
+                    for row in rows
+                ],
+            }
+            connection.execute("COMMIT")
+            return response
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def get_team_skill_version(
+        self, claims: AccessClaims, team_id: str, skill_id: str, version: int
+    ) -> dict[str, Any]:
+        if type(version) is not int or version < 1:
+            raise HubError("invalid_request", "Skill version is invalid", 422)
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            self._require_network_scope(connection, claims, team_id, write=False)
+            row = connection.execute(
+                self._team_skill_version_select()
+                + " WHERE v.team_id=? AND v.skill_id=? AND v.version=?",
+                (team_id, skill_id, version),
+            ).fetchone()
+            if row is None:
+                raise HubError("not_found", "Resource not found", 404)
+            response = {
+                "skill_id": skill_id,
+                "version": self._team_skill_version_public(connection, row, include_body=True),
+            }
+            connection.execute("COMMIT")
+            return response
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def _set_team_skill_flag(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        skill_id: str,
+        request: dict[str, Any],
+        *,
+        flag: str,
+    ) -> dict[str, Any]:
+        timestamp = _now()
+        value = request.get(flag)
+        if type(value) is not bool:
+            raise HubError("invalid_request", f"{flag} must be a boolean", 422)
+        idempotency_key = self._team_idempotency_key(request)
+        operation = f"team.skill.{flag}"
+        fingerprint = canonical_fingerprint(
+            {"team_id": team_id, "skill_id": skill_id, flag: value}
+        )
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                membership = self._require_network_scope(connection, claims, team_id, write=True)
+                cached = self._idempotency_lookup(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    operation,
+                    idempotency_key,
+                    fingerprint,
+                )
+                if cached is not None:
+                    return cached
+                skill = connection.execute(
+                    "SELECT * FROM team_skills WHERE team_id=? AND id=?", (team_id, skill_id)
+                ).fetchone()
+                if skill is None:
+                    raise HubError("not_found", "Resource not found", 404)
+                if flag == "pinned":
+                    if value and skill["archived_at"] is not None:
+                        raise HubError("skill_archived", "Restore the skill before pinning it", 409)
+                    if value != (skill["pinned_at"] is not None):
+                        connection.execute(
+                            """
+                            UPDATE team_skills SET pinned_at=?,pinned_by_principal_id=?
+                            WHERE team_id=? AND id=?
+                            """,
+                            (
+                                timestamp if value else None,
+                                claims.principal_id if value else None,
+                                team_id,
+                                skill_id,
+                            ),
+                        )
+                else:
+                    if value != (skill["archived_at"] is not None):
+                        connection.execute(
+                            """
+                            UPDATE team_skills
+                            SET archived_at=?,archived_by_principal_id=?,
+                                pinned_at=CASE WHEN ? THEN NULL ELSE pinned_at END,
+                                pinned_by_principal_id=
+                                    CASE WHEN ? THEN NULL ELSE pinned_by_principal_id END,
+                                updated_at=?
+                            WHERE team_id=? AND id=?
+                            """,
+                            (
+                                timestamp if value else None,
+                                claims.principal_id if value else None,
+                                1 if value else 0,
+                                1 if value else 0,
+                                timestamp,
+                                team_id,
+                                skill_id,
+                            ),
+                        )
+                row = connection.execute(
+                    self._team_skill_select() + " WHERE s.team_id=? AND s.id=?",
+                    (team_id, skill_id),
+                ).fetchone()
+                assert row is not None
+                response = {
+                    "skill": self._team_skill_public(
+                        connection,
+                        row,
+                        include_body=False,
+                        can_write=self._team_can_write(claims, str(membership["role"])),
+                    )
+                }
+                self._idempotency_store(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    operation,
+                    idempotency_key,
+                    fingerprint,
+                    "team_skill",
+                    skill_id,
+                    response,
+                    timestamp,
+                )
+                self._audit(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    operation,
+                    "team_skill",
+                    skill_id,
+                    "succeeded",
+                    {flag: value},
+                    timestamp,
+                )
+                # Pin and archive toggle back and forth, so each change is its
+                # own outbox aggregate rather than a deduplicated per-skill row.
+                self._outbox(
+                    connection,
+                    team_id,
+                    "team_skill_change",
+                    _id("tskillchange"),
+                    f"team.skill.{flag}.{'on' if value else 'off'}",
+                    timestamp,
+                )
+                return response
+        finally:
+            connection.close()
+
+    def set_team_skill_pinned(
+        self, claims: AccessClaims, team_id: str, skill_id: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._set_team_skill_flag(claims, team_id, skill_id, request, flag="pinned")
+
+    def set_team_skill_archived(
+        self, claims: AccessClaims, team_id: str, skill_id: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._set_team_skill_flag(claims, team_id, skill_id, request, flag="archived")
 
     @staticmethod
     def _message_dict(row: sqlite3.Row) -> dict[str, Any]:

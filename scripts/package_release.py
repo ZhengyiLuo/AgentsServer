@@ -23,6 +23,7 @@ FILES = (
     "agentsdock_emergency.py",
     "agentsdock_publish.py",
     "agentsdock_mail.py",
+    "agentsdock_team.py",
     "claude_sdk_client.py",
     "codex_app_server.py",
     "cursor_agent_client.py",
@@ -56,6 +57,7 @@ DIRECTORY_FILES = {
         "migrations/0006_team_network_mailbox.sql",
         "migrations/0007_local_agent_mail.sql",
         "migrations/0008_managed_server_session.sql",
+        "migrations/0009_team_messages.sql",
     ),
 }
 DIRECTORIES = tuple(DIRECTORY_FILES)
@@ -164,6 +166,7 @@ def main() -> int:
         (package_root / "agentsdock_emergency.py").chmod(0o755)
         (package_root / "agentsdock_publish.py").chmod(0o755)
         (package_root / "agentsdock_mail.py").chmod(0o755)
+        (package_root / "agentsdock_team.py").chmod(0o755)
         (package_root / "update_runner.py").chmod(0o755)
         with tarfile.open(archive_path, "w:gz", format=tarfile.PAX_FORMAT) as archive:
             archive.add(package_root, arcname=package_root.name)
@@ -176,7 +179,7 @@ def main() -> int:
         "version": version,
         "track": "beta" if "-" in version.split("+", 1)[0] else "stable",
         "prerelease": "-" in version.split("+", 1)[0],
-        "api_contract_version": 26,
+        "api_contract_version": 27,
         "commit": commit,
         "archive": {
             "name": archive_name,

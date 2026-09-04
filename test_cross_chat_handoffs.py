@@ -1720,6 +1720,319 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_exact_delivery_skip_preserves_fifo_during_update_drain(self) -> None:
+        record, _created = await agent_server.CROSS_CHAT.create_instruction(
+            envelope_id="handoff_exact_skip",
+            source_session_id="source",
+            source_run_id="run_source",
+            target_session_id="target",
+            body="skip me",
+            idempotency_key="exact-skip-key",
+        )
+        await agent_server.CROSS_CHAT.update(
+            record["id"],
+            expected={"ready"},
+            status="queued",
+            queued_id="queued_exact_skip",
+        )
+        agent_server.QUEUED_TURNS["target"] = deque([
+            {"queued_id": "queued_before"},
+            {
+                "queued_id": "queued_exact_skip",
+                "purpose": agent_server.LOCAL_CROSS_CHAT_DELIVERY_PURPOSE,
+                "cross_chat_envelope_id": record["id"],
+                "source_session_id": "source",
+                "target_session_id": "target",
+            },
+            {"queued_id": "queued_after"},
+        ])
+        append = AsyncMock(return_value={})
+        lifecycle = AsyncMock()
+        with (
+            patch.object(
+                agent_server,
+                "managed_server_update_blocker",
+                side_effect=AssertionError(
+                    "skip must remain available while draining"
+                ),
+            ),
+            patch.object(agent_server, "append_durable_event", append),
+            patch.object(
+                agent_server,
+                "append_cross_chat_terminal_lifecycle",
+                lifecycle,
+            ),
+        ):
+            result = await agent_server.post_skip_queued_cross_chat_delivery(
+                "target",
+                "queued_exact_skip",
+                agent_server.SkipQueuedCrossChatDeliveryRequest(
+                    cross_chat_envelope_id=record["id"],
+                ),
+            )
+
+        self.assertTrue(result["skipped"])
+        self.assertEqual(result["remaining"], 2)
+        self.assertEqual(
+            [item["queued_id"] for item in agent_server.QUEUED_TURNS["target"]],
+            ["queued_before", "queued_after"],
+        )
+        self.assertEqual(
+            (await agent_server.CROSS_CHAT.get(record["id"]))["status"],
+            "cancelled",
+        )
+        self.assertEqual(append.await_args.args[:2], ("target", "turn_unqueued"))
+        lifecycle.assert_awaited_once()
+
+    async def test_exact_delivery_skip_keeps_terminal_cas_after_tombstone_failure(self) -> None:
+        record, _created = await agent_server.CROSS_CHAT.create_instruction(
+            envelope_id="handoff_skip_tombstone_failure",
+            source_session_id="source",
+            source_run_id="run_source",
+            target_session_id="target",
+            body="skip despite disk failure",
+            idempotency_key="skip-tombstone-failure-key",
+        )
+        await agent_server.CROSS_CHAT.update(
+            record["id"],
+            expected={"ready"},
+            status="queued",
+            queued_id="queued_skip_tombstone_failure",
+        )
+        agent_server.QUEUED_TURNS["target"] = deque([{
+            "queued_id": "queued_skip_tombstone_failure",
+            "purpose": agent_server.LOCAL_CROSS_CHAT_DELIVERY_PURPOSE,
+            "cross_chat_envelope_id": record["id"],
+        }])
+
+        with patch.object(
+            agent_server,
+            "append_durable_event",
+            AsyncMock(side_effect=OSError("disk unavailable")),
+        ):
+            with self.assertRaises(OSError):
+                await agent_server.skip_queued_cross_chat_delivery(
+                    "target",
+                    "queued_skip_tombstone_failure",
+                    agent_server.SkipQueuedCrossChatDeliveryRequest(
+                        cross_chat_envelope_id=record["id"],
+                    ),
+                )
+
+        self.assertNotIn("target", agent_server.QUEUED_TURNS)
+        self.assertEqual(
+            (await agent_server.CROSS_CHAT.get(record["id"]))["status"],
+            "cancelled",
+        )
+
+    async def test_exact_delivery_skip_rejects_stale_identity_or_owner(self) -> None:
+        record, _created = await agent_server.CROSS_CHAT.create_instruction(
+            envelope_id="handoff_exact_conflict",
+            source_session_id="source",
+            source_run_id="run_source",
+            target_session_id="target",
+            body="keep me",
+            idempotency_key="exact-conflict-key",
+        )
+        await agent_server.CROSS_CHAT.update(
+            record["id"],
+            expected={"ready"},
+            status="queued",
+            queued_id="queued_exact_conflict",
+        )
+        delivery = {
+            "queued_id": "queued_exact_conflict",
+            "purpose": agent_server.LOCAL_CROSS_CHAT_DELIVERY_PURPOSE,
+            "cross_chat_envelope_id": record["id"],
+        }
+        request = agent_server.SkipQueuedCrossChatDeliveryRequest(
+            cross_chat_envelope_id=record["id"],
+        )
+        agent_server.QUEUED_TURNS["target"] = deque([delivery])
+
+        with self.assertRaises(HTTPException) as mismatch:
+            await agent_server.skip_queued_cross_chat_delivery(
+                "target",
+                "queued_exact_conflict",
+                agent_server.SkipQueuedCrossChatDeliveryRequest(
+                    cross_chat_envelope_id="handoff_stale_card",
+                ),
+            )
+        self.assertEqual(mismatch.exception.status_code, 409)
+
+        await agent_server.CROSS_CHAT.update(
+            record["id"], expected={"queued"}, status="running"
+        )
+        with self.assertRaises(HTTPException) as ledger_race:
+            await agent_server.skip_queued_cross_chat_delivery(
+                "target", "queued_exact_conflict", request
+            )
+        self.assertEqual(ledger_race.exception.status_code, 409)
+        self.assertEqual(list(agent_server.QUEUED_TURNS["target"]), [delivery])
+
+        agent_server.QUEUED_TURNS.pop("target")
+        with self.assertRaises(HTTPException) as promoted:
+            await agent_server.skip_queued_cross_chat_delivery(
+                "target", "queued_exact_conflict", request
+            )
+        self.assertEqual(promoted.exception.status_code, 409)
+
+    async def test_exact_delivery_skip_wakes_live_exchange_waiter(self) -> None:
+        source_token = await self.issue_live_waiter_owner(
+            "source",
+            "run_live_skip",
+        )
+        await agent_server.CROSS_CHAT.create_exchange_obligation(
+            exchange_id="exchange_live_skip",
+            requester_session_id="source",
+            authorization_source_run_id="run_live_skip",
+            responder_session_id="target",
+            max_legs=6,
+            expires_at="2099-01-01T00:00:00Z",
+        )
+        exchange, leg, _created = (
+            await agent_server.CROSS_CHAT.create_initial_exchange_leg(
+                exchange_id="exchange_live_skip",
+                source_session_id="source",
+                source_run_id="run_live_skip",
+                target_session_id="target",
+                body="Please answer",
+                idempotency_key="live-skip-request",
+                live_response_lease=True,
+            )
+        )
+        async with agent_server.cross_chat_live_lease_lock(exchange["id"]):
+            waiter = await agent_server.register_cross_chat_live_waiter_locked(
+                exchange,
+                leg,
+                owner_session_id="source",
+                owner_run_id="run_live_skip",
+                capability_token=source_token,
+            )
+        await agent_server.CROSS_CHAT.update_exchange_leg(
+            leg["id"],
+            expected={"registered"},
+            status="queued",
+            queued_id="queued_live_skip",
+        )
+        agent_server.QUEUED_TURNS["target"] = deque([{
+            "queued_id": "queued_live_skip",
+            "purpose": agent_server.LOCAL_CROSS_CHAT_DELIVERY_PURPOSE,
+            "cross_chat_exchange_id": exchange["id"],
+            "cross_chat_exchange_leg_id": leg["id"],
+            "source_session_id": "source",
+            "target_session_id": "target",
+        }])
+
+        with (
+            patch.object(
+                agent_server,
+                "append_durable_event",
+                AsyncMock(return_value={}),
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_leg_terminal_lifecycle",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_terminal_lifecycle",
+                AsyncMock(),
+            ),
+        ):
+            await agent_server.skip_queued_cross_chat_delivery(
+                "target",
+                "queued_live_skip",
+                agent_server.SkipQueuedCrossChatDeliveryRequest(
+                    cross_chat_exchange_id=exchange["id"],
+                    cross_chat_exchange_leg_id=leg["id"],
+                ),
+            )
+
+        waiter_result = await asyncio.wait_for(waiter["future"], timeout=1)
+        self.assertFalse(waiter_result["ok"])
+        self.assertEqual(waiter_result["error_code"], "cancelled_by_user")
+        durable = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
+        self.assertEqual(durable["status"], "cancelled")
+        self.assertEqual(
+            (await agent_server.CROSS_CHAT.get_exchange_leg(leg["id"]))["status"],
+            "cancelled",
+        )
+
+    async def test_exact_delivery_skip_status_leg_preserves_terminal_exchange(self) -> None:
+        exchange, parent = await self.create_exchange("exchange_status_skip")
+        await agent_server.CROSS_CHAT.finish_exchange_leg(
+            parent["id"],
+            status="failed",
+            error_code="target_failed",
+            error="original target failure",
+        )
+        status_leg, _created = await agent_server.CROSS_CHAT.create_exchange_status_leg(
+            exchange_id=exchange["id"],
+            source_session_id="target",
+            target_session_id="source",
+            body="Target failed",
+            error_code="target_failed",
+        )
+        await agent_server.CROSS_CHAT.update_exchange_leg(
+            status_leg["id"],
+            expected={"registered"},
+            status="queued",
+            queued_id="queued_status_skip",
+        )
+        agent_server.QUEUED_TURNS["source"] = deque([{
+            "queued_id": "queued_status_skip",
+            "purpose": agent_server.LOCAL_CROSS_CHAT_DELIVERY_PURPOSE,
+            "cross_chat_exchange_id": exchange["id"],
+            "cross_chat_exchange_leg_id": status_leg["id"],
+            "cross_chat_exchange_status": True,
+            "source_session_id": "target",
+            "target_session_id": "source",
+        }])
+        status_lifecycle = AsyncMock()
+        with (
+            patch.object(
+                agent_server,
+                "append_durable_event",
+                AsyncMock(return_value={}),
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_leg_terminal_lifecycle",
+                status_lifecycle,
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_terminal_lifecycle",
+                AsyncMock(
+                    side_effect=AssertionError(
+                        "status skip must not rewrite exchange lifecycle"
+                    )
+                ),
+            ),
+        ):
+            await agent_server.skip_queued_cross_chat_delivery(
+                "source",
+                "queued_status_skip",
+                agent_server.SkipQueuedCrossChatDeliveryRequest(
+                    cross_chat_exchange_id=exchange["id"],
+                    cross_chat_exchange_leg_id=status_leg["id"],
+                ),
+            )
+
+        refreshed_exchange = await agent_server.CROSS_CHAT.get_exchange(
+            exchange["id"]
+        )
+        refreshed_status = await agent_server.CROSS_CHAT.get_exchange_leg(
+            status_leg["id"]
+        )
+        self.assertEqual(refreshed_exchange["status"], "failed")
+        self.assertEqual(refreshed_exchange["error"], "original target failure")
+        self.assertEqual(refreshed_status["status"], "cancelled")
+        self.assertEqual(refreshed_status["response_state"], "closed")
+        status_lifecycle.assert_awaited_once()
+
     async def test_source_deletion_does_not_reclassify_admitted_target_run(self) -> None:
         record, _created = await agent_server.CROSS_CHAT.create_instruction(
             envelope_id="handoff_running_delete_source",
@@ -2165,7 +2478,11 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
                         (
                             "mail_0123456789abcdef0123456789abcdef"
                             if path.startswith("/api/agent/team-mail/")
-                            else "route_0123456789abcdef0123456789abcdef"
+                            else (
+                                "team_0123456789abcdef0123456789abcdef"
+                                if path.startswith("/api/agent/team/")
+                                else "route_0123456789abcdef0123456789abcdef"
+                            )
                         ),
                     )
                 )
@@ -2201,6 +2518,25 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "queued_id": "queued_secure_peer",
                     "prompt": "opaque remote envelope",
+                    "display_prompt": "Encrypted message from Secret Studio",
+                    "file_ids": ["remote-file-secret"],
+                    "source_session_id": "sha256:secret-peer-identity",
+                    "target_session_id": "target",
+                    "secure_peer_envelope_id": "secure-envelope-secret",
+                    "chat_references": [{
+                        "session_id": "secret",
+                        "display_title_snapshot": "Secret",
+                        "source_text_start": 0,
+                        "source_text_end": 1,
+                        "action": "route",
+                    }],
+                    "team_references": [{
+                        "kind": "recipient",
+                        "recipient_kind": "human",
+                        "team_id": "team-secret",
+                        "target_id": "secret",
+                        "display_name_snapshot": "Secret",
+                    }],
                     "purpose": "secure_peer_handoff_delivery",
                 },
                 {
@@ -2226,14 +2562,35 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         snapshot = await agent_server.queued_turns_snapshot("target")
         self.assertEqual(
             [item["queued_id"] for item in snapshot],
-            ["queued_internal", "queued_user", "queued_exchange_internal"],
+            [
+                "queued_secure_peer",
+                "queued_internal",
+                "queued_user",
+                "queued_exchange_internal",
+            ],
         )
-        self.assertEqual([item["position"] for item in snapshot], [2, 3, 4])
+        self.assertEqual([item["position"] for item in snapshot], [1, 2, 3, 4])
+        self.assertEqual(snapshot[0]["prompt"], "Incoming secure-peer delivery")
         self.assertEqual(
-            snapshot[0]["prompt"],
+            snapshot[0]["display_prompt"],
+            "Incoming secure-peer delivery",
+        )
+        self.assertEqual(snapshot[0]["file_ids"], [])
+        self.assertEqual(snapshot[0]["chat_references"], [])
+        self.assertEqual(snapshot[0]["team_references"], [])
+        self.assertIsNone(snapshot[0]["source_session_id"])
+        self.assertIsNone(snapshot[0]["target_session_id"])
+        self.assertNotIn("secure_peer_envelope_id", snapshot[0])
+        self.assertEqual(
+            snapshot[1]["prompt"],
             "Agent-authored same-server handoff",
         )
-        self.assertEqual(snapshot[2]["prompt"], "Incoming cross-chat message")
+        self.assertEqual(snapshot[3]["prompt"], "Incoming cross-chat message")
+        self.assertNotIn("opaque remote envelope", repr(snapshot))
+        self.assertNotIn("Secret Studio", repr(snapshot))
+        self.assertNotIn("remote-file-secret", repr(snapshot))
+        self.assertNotIn("secret-peer-identity", repr(snapshot))
+        self.assertNotIn("secure-envelope-secret", repr(snapshot))
         self.assertNotIn("private provider wrapper", repr(snapshot))
         self.assertNotIn("internal exchange", repr(snapshot))
 
@@ -2543,6 +2900,72 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(orphan_page["semantic_item_count"], 0)
         self.assertEqual(orphan_page["events"], [])
+
+    def test_semantic_pagination_hides_internal_exchange_status_run(self) -> None:
+        event_file = self.root / "status-leg-timeline.jsonl"
+        status_turn = {
+            "run_id": "status-run",
+            "purpose": agent_server.LOCAL_CROSS_CHAT_DELIVERY_PURPOSE,
+            "cross_chat_exchange_id": "exchange_status",
+            "cross_chat_exchange_leg_id": "status-leg",
+        }
+        marked_status_turn = {
+            **status_turn,
+            "cross_chat_exchange_status": True,
+        }
+        with patch.dict(
+            agent_server.RUN_METADATA,
+            {"status-run": marked_status_turn},
+            clear=True,
+        ):
+            inherited = agent_server.inherit_internal_status_run_metadata({
+                "run_id": "status-run",
+                "backend": "claude",
+            })
+        self.assertTrue(inherited["cross_chat_exchange_status"])
+        self.assertEqual(inherited["cross_chat_exchange_leg_id"], "status-leg")
+        events = [
+            {"id": "summary", "seq": 1, "type": "cross_chat_exchange_failed", "exchange_id": "exchange_status", "exchange_status": "failed", "message": "Exchange failed"},
+            {"id": "status-registered", "seq": 2, "type": "cross_chat_exchange_leg_registered", "exchange_id": "exchange_status", "exchange_leg_id": "status-leg", "exchange_leg_kind": "status", "exchange_leg_status": "registered"},
+            {"id": "status-started", "seq": 3, "type": "turn_started", "prompt": "Internal status prompt", **marked_status_turn},
+            {"id": "status-process", "seq": 4, "type": "process_started", "run_id": "status-run", "backend": "claude"},
+            {"id": "status-provider", "seq": 5, "type": "provider_session", "run_id": "status-run", "backend": "claude"},
+            {"id": "status-reasoning", "seq": 6, "type": "reasoning_summary", "run_id": "status-run", "text": "Processing status"},
+            {"id": "status-tool", "seq": 7, "type": "tool_started", "run_id": "status-run", "tool": {"name": "Internal"}},
+            {"id": "status-output", "seq": 8, "type": "assistant_text", "text": "Acknowledged", **marked_status_turn},
+            {"id": "status-finished", "seq": 9, "type": "turn_finished", "result_text": "Acknowledged", "exit_code": 0, **marked_status_turn},
+            {"id": "status-delivered", "seq": 10, "type": "cross_chat_exchange_leg_delivered", "exchange_id": "exchange_status", "exchange_leg_id": "status-leg", "cross_chat_exchange_status": True, "exchange_leg_status": "delivered"},
+            {"id": "turn-started", "seq": 11, "type": "turn_started", "run_id": "ordinary", "prompt": "Still visible"},
+            {"id": "turn-finished", "seq": 12, "type": "turn_finished", "run_id": "ordinary", "result_text": "Done", "exit_code": 0},
+        ]
+        event_file.write_text(
+            "".join(json.dumps(event) + "\n" for event in events)
+        )
+        with (
+            patch.object(agent_server, "events_path", return_value=event_file),
+            patch.object(
+                agent_server,
+                "TIMELINE_INDEX_CACHE",
+                agent_server.OrderedDict(),
+            ),
+        ):
+            page = agent_server.read_semantic_timeline_page(
+                "target", limit=2, tail=True
+            )
+
+        self.assertEqual(page["semantic_total"], 2)
+        self.assertEqual(page["semantic_item_count"], 2)
+        self.assertEqual(page["semantic_omitted_before"], 0)
+        event_types = [event["type"] for event in page["events"]]
+        self.assertIn("cross_chat_exchange_failed", event_types)
+        self.assertIn("turn_finished", event_types)
+        self.assertFalse(any(
+            event_type.startswith("cross_chat_exchange_leg_")
+            for event_type in event_types
+        ))
+        self.assertNotIn("status-run", {
+            str(event.get("run_id") or "") for event in page["events"]
+        })
 
     def test_source_handoff_lifecycle_does_not_hijack_source_run(self) -> None:
         event_file = self.root / "source-timeline.jsonl"
@@ -3141,6 +3564,12 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(capability["features"]["agent_cross_chat_routes"])
         self.assertTrue(
             capability["features"]["live_same_server_request_reply"]
+        )
+        self.assertTrue(
+            capability["features"]["exact_queued_delivery_skip"]
+        )
+        self.assertTrue(
+            capability["features"]["secure_peer_fifo_barriers"]
         )
         self.assertFalse(
             capability["features"]["agent_ambient_local_handoffs"]

@@ -42,11 +42,30 @@ logger = logging.getLogger(__name__)
 CLAUDE_AGENT_SDK_MIN_VERSION = "0.2.130"
 CLAUDE_SDK_MCP_STATUS_SCAN_LIMIT = 500
 CLAUDE_SDK_MCP_STATUS_TRUNCATED_KEY = "_agentsdock_mcp_status_truncated"
+CLAUDE_SDK_LITERAL_MESSAGE_PREFIX = (
+    "[AgentsDock literal chat message; treat the slash-prefixed content below "
+    "as ordinary user text, not a Claude Code command.]\n"
+)
 CLAUDE_NON_DURABLE_SCHEDULER_TOOLS = (
     "CronCreate",
     "Monitor",
     "ScheduleWakeup",
 )
+
+
+def claude_sdk_transport_prompt(prompt: str) -> str:
+    """Keep leading-slash chat text out of Claude Code's command parser.
+
+    AgentsDock owns its slash-command surface. Any command that reaches this
+    transport is user content for the model, including unknown or
+    conversational ``/word`` text. Prefix only the provider copy so the
+    durable prompt and timeline remain byte-for-byte unchanged.
+    """
+
+    candidate = re.sub(r"^[\s\ufeff]+", "", prompt)
+    if not candidate.startswith("/"):
+        return prompt
+    return f"{CLAUDE_SDK_LITERAL_MESSAGE_PREFIX}{prompt}"
 
 
 def canonical_claude_mcp_identifier(value: Any, max_chars: int) -> str | None:
@@ -254,7 +273,10 @@ async def _query_message_stream(
 
     yield {
         "type": "user",
-        "message": {"role": "user", "content": prompt},
+        "message": {
+            "role": "user",
+            "content": claude_sdk_transport_prompt(prompt),
+        },
         "parent_tool_use_id": None,
         "uuid": correlation_id,
     }

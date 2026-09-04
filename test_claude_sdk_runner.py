@@ -67,6 +67,20 @@ class FailingClaudeRun(FakeClaudeRun):
         raise self.error
 
 
+class PrematurelyEndedClaudeRun(FakeClaudeRun):
+    def __init__(self) -> None:
+        super().__init__()
+        self.wait_result_calls = 0
+
+    async def __anext__(self) -> object:
+        raise StopAsyncIteration
+
+    async def wait_result(self) -> object:
+        self.wait_result_calls += 1
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
 class FakeClaudePrintStdin:
     def __init__(self) -> None:
         self.writes: list[bytes] = []
@@ -640,9 +654,11 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
 
     async def _run_sdk_terminal_case(
         self,
-        messages: list[object],
+        messages: list[object] | None = None,
+        *,
+        handle: FakeClaudeRun | None = None,
     ) -> tuple[AsyncMock, AsyncMock, Mock, Mock]:
-        manager = FakeClaudeManager(FakeClaudeRun(messages))
+        manager = FakeClaudeManager(handle or FakeClaudeRun(messages))
         append_event = AsyncMock(return_value={})
         append_finished = AsyncMock(return_value={})
         runtime_success = Mock()
@@ -795,6 +811,27 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         ))
         runtime_success.assert_called_once_with(agent_server.BACKEND_CLAUDE)
         runtime_failure.assert_not_called()
+
+    async def test_sdk_iterator_end_before_terminal_never_waits_forever(self) -> None:
+        handle = PrematurelyEndedClaudeRun()
+
+        append_event, append_finished, runtime_success, runtime_failure = (
+            await asyncio.wait_for(
+                self._run_sdk_terminal_case(handle=handle),
+                0.5,
+            )
+        )
+
+        self.assertEqual(handle.wait_result_calls, 0)
+        terminal = append_finished.await_args.args[1]
+        self.assertEqual(terminal["exit_code"], 1)
+        self.assertTrue(any(
+            call.args[1] == "error"
+            and "ended before a terminal result" in call.args[2]["message"]
+            for call in append_event.await_args_list
+        ))
+        runtime_success.assert_not_called()
+        runtime_failure.assert_called_once()
 
     async def test_empty_print_result_without_tools_is_visible_failure(self) -> None:
         process = FakeClaudePrintProcess([
@@ -1951,6 +1988,53 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         append_event.assert_not_awaited()
         update_metadata.assert_not_awaited()
 
+    async def test_bypass_permission_mode_never_creates_approval_interaction(self) -> None:
+        self.session["claude_permission_mode"] = "bypassPermissions"
+        manager = FakeClaudeManager()
+        manager.active_run_id = "run-claude"
+        agent_server.CLAUDE_SDK_MANAGER = manager
+        agent_server.ACTIVE = {
+            "chat-claude": {
+                "run_id": "run-claude",
+                "backend": agent_server.BACKEND_CLAUDE,
+                "transport": agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+                "interactive_agent_sdk": True,
+                "stop_requested": False,
+                "claude_sdk_owner_token": manager.owner_token,
+                "claude_permission_run_id": "run-claude",
+                "claude_permissions_open": True,
+            }
+        }
+        append_event = AsyncMock(return_value={})
+        update_metadata = AsyncMock()
+        with patch.dict(sys.modules, fake_claude_sdk_modules()), patch.object(
+            agent_server,
+            "append_event",
+            append_event,
+        ), patch.object(
+            agent_server,
+            "update_claude_pending_session_metadata",
+            update_metadata,
+        ):
+            for tool_name, input_data in (
+                ("Read", {"file_path": "/tmp/read-only.txt"}),
+                ("Bash", {"command": "pwd"}),
+            ):
+                with self.subTest(tool_name=tool_name):
+                    result = await agent_server.handle_claude_tool_permission(
+                        "chat-claude",
+                        tool_name,
+                        input_data,
+                        {"tool_use_id": f"tool-{tool_name}"},
+                        owner_token=manager.owner_token,
+                    )
+                    self.assertIsInstance(result, FakePermissionResultAllow)
+                    self.assertEqual(result.updated_input, input_data)
+
+        self.assertFalse(agent_server.CLAUDE_PENDING_INTERACTIONS)
+        append_event.assert_not_awaited()
+        update_metadata.assert_not_awaited()
+
     async def test_permission_mode_runtime_contract_and_public_session(self) -> None:
         self.session["claude_permission_mode"] = "acceptEdits"
         with patch.object(
@@ -2008,29 +2092,45 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             agent_server.CLAUDE_DEFAULT_PERMISSION_MODE,
         )
 
-    async def test_permission_mode_change_is_fenced_but_noop_is_allowed(self) -> None:
+    async def test_permission_mode_change_is_saved_for_next_turn_while_active(self) -> None:
         self.session["claude_permission_mode"] = "default"
-        update = AsyncMock(return_value=self.session)
-        with patch.object(agent_server.STORE, "update", update):
-            with self.assertRaises(agent_server.HTTPException) as raised:
-                await agent_server.update_session(
-                    "chat-claude",
-                    agent_server.UpdateSessionRequest(
-                        claude_permission_mode="plan",
-                    ),
-                )
-            self.assertEqual(raised.exception.status_code, 409)
-            update.assert_not_awaited()
+        agent_server.ACTIVE = {
+            "chat-claude": {
+                "run_id": "run-claude",
+                "backend": agent_server.BACKEND_CLAUDE,
+                "transport": agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+                "claude_permission_mode": "default",
+            }
+        }
 
+        async def update_session_value(
+            _session_id: str,
+            values: dict[str, object],
+        ) -> dict[str, object]:
+            self.session.update(values)
+            return self.session
+
+        update = AsyncMock(side_effect=update_session_value)
+        with patch.object(agent_server.STORE, "update", update):
             result = await agent_server.update_session(
                 "chat-claude",
                 agent_server.UpdateSessionRequest(
-                    claude_permission_mode="default",
+                    claude_permission_mode="bypassPermissions",
                 ),
             )
 
-        self.assertEqual(result["session"]["claude_permission_mode"], "default")
+        self.assertEqual(
+            result["session"]["claude_permission_mode"],
+            "bypassPermissions",
+        )
         update.assert_awaited_once()
+        self.assertEqual(
+            agent_server.active_claude_permission_mode(
+                "chat-claude",
+                agent_server.ACTIVE["chat-claude"],
+            ),
+            "default",
+        )
 
     async def test_permission_mode_store_persists_and_null_resets(self) -> None:
         self.session["claude_permission_mode"] = "default"
@@ -3766,6 +3866,127 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"subtype":"task_progress"', serialized)
         self.assertIn('"status":"completed"', serialized)
         self.assertIn('"agentId":"task-1"', serialized)
+
+    async def test_post_ack_first_activity_timeout_retires_visible_failure(self) -> None:
+        handle = FakeClaudeRun(acknowledged=False)
+        manager = FakeClaudeManager(handle)
+        append_event = AsyncMock(return_value={})
+        append_finished = AsyncMock(return_value={})
+        release = AsyncMock(return_value=True)
+        runtime_failure = Mock()
+        schedule_next = Mock()
+
+        with patch.object(
+            agent_server,
+            "CLAUDE_SDK_POST_ACK_FIRST_ACTIVITY_TIMEOUT_SECONDS",
+            0.02,
+        ), patch.object(
+            agent_server,
+            "resolve_claude_resume_provider",
+            return_value=(None, None),
+        ), patch.object(
+            agent_server,
+            "capture_git_baseline",
+            AsyncMock(return_value={"head": "base"}),
+        ), patch.object(
+            agent_server,
+            "build_claude_sdk_options",
+            return_value=(object(), "config", "/usr/bin/claude"),
+        ), patch.object(
+            agent_server,
+            "claude_sdk_manager",
+            AsyncMock(return_value=manager),
+        ), patch.object(
+            agent_server,
+            "watch_manifest_artifacts",
+            wait_forever,
+        ), patch.object(
+            agent_server,
+            "append_event",
+            append_event,
+        ), patch.object(
+            agent_server,
+            "project_claude_sdk_message",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "cancel_claude_interactions",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "collect_manifest",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "collect_recent_leftover_manifests",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "publish_turn_code_diff",
+            AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "append_turn_finished_event",
+            append_finished,
+        ), patch.object(
+            agent_server,
+            "release_turn_slot",
+            release,
+        ), patch.object(
+            agent_server,
+            "record_runtime_success",
+            Mock(),
+        ), patch.object(
+            agent_server,
+            "record_runtime_failure",
+            runtime_failure,
+        ), patch.object(
+            agent_server,
+            "should_schedule_queue_after_finish",
+            return_value=True,
+        ), patch.object(
+            agent_server,
+            "schedule_next_queued_turn",
+            schedule_next,
+        ):
+            runner = asyncio.create_task(agent_server.run_claude_sdk(
+                "chat-claude",
+                "run-claude",
+                "Prompt",
+                dict(self.session),
+                Path(self.cwd) / ".manifest.json",
+            ))
+            for _ in range(100):
+                active = agent_server.ACTIVE.get("chat-claude") or {}
+                if active.get("claude_sdk_run") is handle:
+                    break
+                await asyncio.sleep(0)
+
+            # The timeout begins at the provider replay ACK, not when the
+            # local query is merely written.
+            await asyncio.sleep(0.05)
+            self.assertFalse(runner.done())
+            self.assertFalse(handle.acknowledged)
+
+            handle.acknowledge()
+            await asyncio.wait_for(runner, 0.5)
+
+        self.assertGreaterEqual(handle.interrupt_calls, 1)
+        self.assertEqual(manager.evict_calls, [("chat-claude", True)])
+        release.assert_awaited_once_with(
+            "chat-claude",
+            expected_run_id="run-claude",
+        )
+        terminal = append_finished.await_args.args[1]
+        self.assertEqual(terminal["exit_code"], 1)
+        self.assertFalse(terminal["stopped"])
+        self.assertTrue(any(
+            call.args[1] == "error"
+            and "produced no provider activity" in call.args[2]["message"]
+            for call in append_event.await_args_list
+        ))
+        runtime_failure.assert_called_once()
+        schedule_next.assert_called_once_with("chat-claude")
 
     async def test_delivery_uncertain_stream_retires_without_empty_success(self) -> None:
         handle = FailingClaudeRun(ClaudeSDKQueryError("replay ACK missing"))

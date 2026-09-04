@@ -8,15 +8,25 @@ synthetic, live-checked automation principal.
 
 from __future__ import annotations
 
+from contextlib import suppress
 import json
 from collections import deque
+import os
+import re
+import stat
 import threading
 import time
-from typing import Any
-from urllib.parse import parse_qsl
+from typing import Any, Callable
+from urllib.parse import parse_qsl, quote
 
 from .auth import _identity
-from .secure_peer import PeerAuthorization, ProxyRequest, ProxyResponse
+from .secure_peer import (
+    AttachmentProxyRequest,
+    AttachmentProxyResponse,
+    PeerAuthorization,
+    ProxyRequest,
+    ProxyResponse,
+)
 from .security import canonical_json
 from .store import MAX_NETWORK_BODY_BYTES, HubError, HubStore
 
@@ -25,6 +35,11 @@ _TEAM_PREFIX = "/v1/teams/"
 _CHANNEL_PREFIX = "/v1/channels/"
 _MESSAGE_SUFFIX = "/messages"
 _NETWORK_CHILD = "network"
+_CONTENT_RANGE_RE = re.compile(
+    r"^bytes (?P<start>[0-9]{1,15})-(?P<end>[0-9]{1,15})/"
+    r"(?P<total>[0-9]{1,15})$"
+)
+_RANGE_RE = re.compile(r"^bytes=(?P<start>[0-9]{0,15})-(?P<end>[0-9]{0,15})$")
 
 
 class SecurePeerHubAdapter:
@@ -33,14 +48,23 @@ class SecurePeerHubAdapter:
     def __init__(self, store: HubStore) -> None:
         self.store = store
         self._rate_lock = threading.Lock()
+        self._rate_condition = threading.Condition(self._rate_lock)
         self._rate_events: dict[tuple[str, str], deque[float]] = {}
         self._in_flight: dict[str, int] = {}
+        self._revoking: set[str] = set()
+        self._stream_aborters: dict[str, set[Callable[[], None]]] = {}
 
-    def _admit(self, peer_id: str, *, write: bool) -> None:
+    def _admit(
+        self, peer_id: str, *, write: bool, attachment: bool = False
+    ) -> None:
         """Bound authenticated-peer CPU/concurrency before touching SQLite."""
 
         now = time.monotonic()
-        with self._rate_lock:
+        with self._rate_condition:
+            if peer_id in self._revoking:
+                raise HubError(
+                    "forbidden", "Secure peer authorization is being revoked", 403
+                )
             in_flight = self._in_flight.get(peer_id, 0)
             if in_flight >= 4:
                 raise HubError(
@@ -48,7 +72,12 @@ class SecurePeerHubAdapter:
                     "Secure peer has too many concurrent requests",
                     429,
                 )
-            for kind, limit in (("all", 240), ("write", 60)):
+            limits = (
+                (("attachment", 1_200),)
+                if attachment
+                else (("all", 240), ("write", 60))
+            )
+            for kind, limit in limits:
                 if kind == "write" and not write:
                     continue
                 key = (peer_id, kind)
@@ -65,12 +94,13 @@ class SecurePeerHubAdapter:
             self._in_flight[peer_id] = in_flight + 1
 
     def _release(self, peer_id: str) -> None:
-        with self._rate_lock:
+        with self._rate_condition:
             remaining = self._in_flight.get(peer_id, 0) - 1
             if remaining > 0:
                 self._in_flight[peer_id] = remaining
             else:
                 self._in_flight.pop(peer_id, None)
+            self._rate_condition.notify_all()
 
     def provision_peer(self, peer: dict[str, Any], *, display_name: str) -> str:
         """Bind an approved peer once, before request-time read-only claims."""
@@ -102,7 +132,28 @@ class SecurePeerHubAdapter:
         return self.store.expire_secure_peer_leases(stale_before)
 
     def revoke_peer(self, *, peer_id: str, team_id: str) -> None:
-        self.store.revoke_secure_peer_service(peer_id=peer_id, team_id=team_id)
+        # The core peer credential is revoked before this projection call.
+        # Fence new adapter work and wait for already-authorized response
+        # streams so successful revocation proves no old peer still has bytes.
+        with self._rate_condition:
+            self._revoking.add(peer_id)
+        while True:
+            with self._rate_condition:
+                if self._in_flight.get(peer_id, 0) <= 0:
+                    break
+                aborters = tuple(self._stream_aborters.get(peer_id, ()))
+            for abort in aborters:
+                with suppress(Exception):
+                    abort()
+            with self._rate_condition:
+                if self._in_flight.get(peer_id, 0) > 0:
+                    self._rate_condition.wait(timeout=0.25)
+        try:
+            self.store.revoke_secure_peer_service(peer_id=peer_id, team_id=team_id)
+        finally:
+            with self._rate_condition:
+                self._revoking.discard(peer_id)
+                self._rate_condition.notify_all()
 
     def resource_team(self, resource_kind: str, resource_id: str) -> str | None:
         return self.store.secure_peer_resource_team(resource_kind, resource_id)
@@ -358,6 +409,114 @@ class SecurePeerHubAdapter:
             ),
         }
 
+    @classmethod
+    def _team_message_body(cls, request: ProxyRequest) -> dict[str, Any]:
+        """Shape-check a Team Messages V2 create request; the store validates values."""
+
+        value = cls._object_body(
+            request,
+            allowed={
+                "kind",
+                "title",
+                "body",
+                "body_format",
+                "recipients",
+                "attachment_ids",
+                "in_reply_to_message_id",
+                "skill",
+                "provenance",
+                "idempotency_key",
+            },
+            required={"kind", "body", "recipients", "idempotency_key"},
+        )
+        recipients = value.get("recipients")
+        if (
+            not isinstance(recipients, list)
+            or not 1 <= len(recipients) <= 16
+            or any(
+                not isinstance(item, dict) or not set(item).issubset({"kind", "id"})
+                for item in recipients
+            )
+        ):
+            raise HubError("invalid_request", "Request body is invalid", 422)
+        skill = value.get("skill")
+        if skill is not None and (
+            not isinstance(skill, dict)
+            or not set(skill).issubset(
+                {"slug", "summary", "tags", "change_note", "expected_version"}
+            )
+        ):
+            raise HubError("invalid_request", "Request body is invalid", 422)
+        value["idempotency_key"] = cls._identifier(value["idempotency_key"], minimum=8)
+        return value
+
+    @classmethod
+    def _team_receipt_body(cls, request: ProxyRequest) -> dict[str, Any]:
+        value = cls._object_body(
+            request,
+            allowed={"state", "idempotency_key"},
+            required={"state", "idempotency_key"},
+        )
+        if value.get("state") not in {"delivered", "read"}:
+            raise HubError("invalid_request", "Request body is invalid", 422)
+        return {
+            "state": value["state"],
+            "idempotency_key": cls._identifier(value["idempotency_key"], minimum=8),
+        }
+
+    @classmethod
+    def _team_attachment_body(cls, request: ProxyRequest) -> dict[str, Any]:
+        value = cls._object_body(
+            request,
+            allowed={"file_name", "media_type", "byte_size", "sha256", "idempotency_key"},
+            required={"file_name", "media_type", "byte_size", "sha256", "idempotency_key"},
+        )
+        value["idempotency_key"] = cls._identifier(value["idempotency_key"], minimum=8)
+        return value
+
+    @classmethod
+    def _team_skill_flag_body(cls, request: ProxyRequest, flag: str) -> dict[str, Any]:
+        value = cls._object_body(
+            request,
+            allowed={flag, "idempotency_key"},
+            required={flag, "idempotency_key"},
+        )
+        if type(value.get(flag)) is not bool:
+            raise HubError("invalid_request", "Request body is invalid", 422)
+        return {
+            flag: value[flag],
+            "idempotency_key": cls._identifier(value["idempotency_key"], minimum=8),
+        }
+
+    @staticmethod
+    def _team_query(request: ProxyRequest, *, allowed: set[str]) -> dict[str, str]:
+        """Bound Team Messages V2 query strings without mailbox-specific rules."""
+
+        try:
+            pairs = parse_qsl(request.query, keep_blank_values=True, strict_parsing=True)
+        except ValueError as exc:
+            raise HubError("invalid_request", "Query is invalid", 422) from exc
+        if len(pairs) != len({key for key, _value in pairs}) or any(
+            key not in allowed for key, _value in pairs
+        ):
+            raise HubError("invalid_request", "Query is invalid", 422)
+        values = dict(pairs)
+        for key in ("after_sequence", "limit"):
+            if key in values and (
+                not values[key].isdigit() or str(int(values[key])) != values[key]
+            ):
+                raise HubError("invalid_request", "Query is invalid", 422)
+        if "limit" in values and not 1 <= int(values["limit"]) <= 100:
+            raise HubError("invalid_request", "Query is invalid", 422)
+        for key in ("address_id", "from_id"):
+            if key in values:
+                values[key] = SecurePeerHubAdapter._resource_id(values[key])
+        return values
+
+    @staticmethod
+    def _query_flag(values: dict[str, str], key: str) -> bool:
+        return values.get(key, "0") in {"1", "true"}
+
     @staticmethod
     def _query(
         request: ProxyRequest,
@@ -399,6 +558,197 @@ class SecurePeerHubAdapter:
                 values["after_server_id"]
             )
         return values
+
+    @staticmethod
+    def _attachment_error(exc: HubError) -> AttachmentProxyResponse:
+        body = canonical_json({"error": {"code": exc.code, "message": exc.message}})
+        return AttachmentProxyResponse(
+            status=exc.status_code,
+            headers=(
+                ("content-type", "application/json"),
+                ("cache-control", "no-store"),
+            ),
+            body=body,
+            length=len(body),
+        )
+
+    def forward_attachment(
+        self, request: AttachmentProxyRequest
+    ) -> AttachmentProxyResponse:
+        """Serve the attachment-only binary lane after gateway authorization."""
+
+        admitted = False
+        deferred_release = False
+        try:
+            self._admit(
+                request.peer.peer_id,
+                write=request.method == "PUT",
+                attachment=True,
+            )
+            admitted = True
+            claims = self._claims(self.store, request.peer)
+            pieces = request.path[len(_TEAM_PREFIX) :].split("/")
+            if (
+                len(pieces) != 5
+                or pieces[1:3] != [_NETWORK_CHILD, "attachments"]
+                or pieces[4] != "content"
+            ):
+                raise HubError("not_found", "Resource not found", 404)
+            team_id = pieces[0]
+            attachment_id = self._resource_id(pieces[3])
+            headers = dict(request.headers)
+            if request.method == "PUT":
+                match = _CONTENT_RANGE_RE.fullmatch(headers.get("content-range", ""))
+                if match is None:
+                    raise HubError("invalid_request", "Content-Range is invalid", 422)
+                start = int(match.group("start"))
+                end = int(match.group("end"))
+                total = int(match.group("total"))
+                if end < start or end - start + 1 != len(request.body) or end >= total:
+                    raise HubError("invalid_request", "Content-Range is invalid", 422)
+                result = self.store.write_team_attachment_chunk(
+                    claims,
+                    team_id,
+                    attachment_id,
+                    offset=start,
+                    total=total,
+                    data=request.body,
+                )
+                body = canonical_json(result)
+                return AttachmentProxyResponse(
+                    status=200,
+                    headers=(
+                        ("content-type", "application/json"),
+                        ("cache-control", "no-store"),
+                    ),
+                    body=body,
+                    length=len(body),
+                )
+
+            attachment, path = self.store.open_team_attachment(
+                claims, team_id, attachment_id
+            )
+            size = int(attachment["byte_size"])
+            response_headers: list[tuple[str, str]] = [
+                ("accept-ranges", "bytes"),
+                (
+                    "content-disposition",
+                    "inline; filename*=UTF-8''"
+                    + quote(str(attachment["file_name"]), safe=""),
+                ),
+                ("cache-control", "private, max-age=0"),
+                ("x-content-type-options", "nosniff"),
+                ("etag", f'"{attachment["sha256"]}"'),
+                ("content-type", str(attachment["media_type"])),
+            ]
+            start, end, status = 0, size - 1, 200
+            range_value = headers.get("range")
+            if range_value:
+                match = _RANGE_RE.fullmatch(range_value)
+                invalid = match is None
+                if not invalid and match is not None:
+                    raw_start, raw_end = match.group("start"), match.group("end")
+                    if raw_start == "" and raw_end == "":
+                        invalid = True
+                    elif raw_start == "":
+                        suffix = int(raw_end)
+                        if suffix == 0:
+                            invalid = True
+                        else:
+                            start, end = max(0, size - suffix), size - 1
+                    else:
+                        start = int(raw_start)
+                        end = int(raw_end) if raw_end else size - 1
+                        if start >= size or end < start:
+                            invalid = True
+                        end = min(end, size - 1)
+                if invalid:
+                    response_headers.append(("content-range", f"bytes */{size}"))
+                    return AttachmentProxyResponse(
+                        status=416,
+                        headers=tuple(response_headers),
+                    )
+                status = 206
+                response_headers.append(
+                    ("content-range", f"bytes {start}-{end}/{size}")
+                )
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = -1
+            try:
+                descriptor = os.open(path, flags)
+                info = os.fstat(descriptor)
+            except OSError as exc:
+                if descriptor >= 0:
+                    with suppress(OSError):
+                        os.close(descriptor)
+                raise HubError(
+                    "attachment_unavailable", "Attachment content is unavailable", 409
+                ) from exc
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_size != size
+            ):
+                os.close(descriptor)
+                raise HubError(
+                    "attachment_unavailable", "Attachment content is unavailable", 409
+                )
+
+            stream_lock = threading.RLock()
+            finalized = False
+            cancelled = threading.Event()
+
+            def abort() -> None:
+                # Never close a descriptor from the revocation thread while
+                # the gateway may be between pread calls. Descriptor numbers
+                # can be reused process-wide. The gateway observes this flag,
+                # owns descriptor closure, and releases the stream lease.
+                cancelled.set()
+
+            def finalize() -> None:
+                nonlocal finalized
+                with stream_lock:
+                    if finalized:
+                        return
+                    finalized = True
+                with suppress(OSError):
+                    os.close(descriptor)
+                with self._rate_condition:
+                    aborters = self._stream_aborters.get(request.peer.peer_id)
+                    if aborters is not None:
+                        aborters.discard(abort)
+                        if not aborters:
+                            self._stream_aborters.pop(request.peer.peer_id, None)
+                self._release(request.peer.peer_id)
+
+            with self._rate_condition:
+                if request.peer.peer_id in self._revoking:
+                    # The descriptor has not escaped to the gateway yet, so
+                    # this thread still owns it and can close it synchronously.
+                    with suppress(OSError):
+                        os.close(descriptor)
+                    raise HubError(
+                        "forbidden", "Secure peer authorization is being revoked", 403
+                    )
+                self._stream_aborters.setdefault(request.peer.peer_id, set()).add(
+                    abort
+                )
+            deferred_release = True
+            return AttachmentProxyResponse(
+                status=status,
+                headers=tuple(response_headers),
+                descriptor=descriptor,
+                offset=start,
+                length=end - start + 1,
+                finalizer=finalize,
+                cancelled=cancelled.is_set,
+            )
+        except HubError as exc:
+            return self._attachment_error(exc)
+        finally:
+            if admitted and not deferred_release:
+                self._release(request.peer.peer_id)
 
     def forward(self, request: ProxyRequest) -> ProxyResponse:
         """Serve one already-sanitized request without network recursion."""
@@ -484,6 +834,71 @@ class SecurePeerHubAdapter:
                     result = self.store.get_network_request(
                         claims, team_id, self._resource_id(pieces[3])
                     )
+                elif len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "messages"]:
+                    values = self._team_query(
+                        request,
+                        allowed={
+                            "box",
+                            "address_kind",
+                            "address_id",
+                            "unread",
+                            "from_kind",
+                            "from_id",
+                            "since",
+                            "after_sequence",
+                            "limit",
+                        },
+                    )
+                    result = self.store.list_team_messages(
+                        claims,
+                        team_id,
+                        box=values.get("box", "inbox"),
+                        address_kind=values.get("address_kind"),
+                        address_id=values.get("address_id"),
+                        unread=self._query_flag(values, "unread"),
+                        from_kind=values.get("from_kind"),
+                        from_id=values.get("from_id"),
+                        since=values.get("since"),
+                        after_sequence=int(values.get("after_sequence", "0")),
+                        limit=int(values.get("limit", "50")),
+                    )
+                elif len(pieces) == 4 and pieces[1:3] == [_NETWORK_CHILD, "messages"]:
+                    result = self.store.get_team_message(
+                        claims, team_id, self._resource_id(pieces[3])
+                    )
+                elif len(pieces) == 4 and pieces[1:3] == [_NETWORK_CHILD, "attachments"]:
+                    result = self.store.get_team_attachment(
+                        claims, team_id, self._resource_id(pieces[3])
+                    )
+                elif len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "skills"]:
+                    values = self._team_query(request, allowed={"include_archived", "slug"})
+                    result = self.store.list_team_skills(
+                        claims,
+                        team_id,
+                        include_archived=self._query_flag(values, "include_archived"),
+                        slug=values.get("slug"),
+                    )
+                elif len(pieces) == 4 and pieces[1:3] == [_NETWORK_CHILD, "skills"]:
+                    result = self.store.get_team_skill(
+                        claims, team_id, self._resource_id(pieces[3])
+                    )
+                elif (
+                    len(pieces) == 5
+                    and pieces[1:3] == [_NETWORK_CHILD, "skills"]
+                    and pieces[4] == "versions"
+                ):
+                    result = self.store.list_team_skill_versions(
+                        claims, team_id, self._resource_id(pieces[3])
+                    )
+                elif (
+                    len(pieces) == 6
+                    and pieces[1:3] == [_NETWORK_CHILD, "skills"]
+                    and pieces[4] == "versions"
+                    and pieces[5].isdigit()
+                ):
+                    result = self.store.get_team_skill_version(
+                        claims, team_id, self._resource_id(pieces[3]), int(pieces[5])
+                    )
                 else:  # The gateway sanitizer should make this unreachable.
                     raise HubError("not_found", "Resource not found", 404)
             elif request.method == "POST" and path.startswith(_TEAM_PREFIX):
@@ -533,6 +948,42 @@ class SecurePeerHubAdapter:
                         team_id,
                         self._resource_id(pieces[3]),
                         self._network_text_body(request, mode="reply"),
+                    )
+                elif len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "messages"]:
+                    result = self.store.create_team_message(
+                        claims, team_id, self._team_message_body(request)
+                    )
+                elif (
+                    len(pieces) == 5
+                    and pieces[1:3] == [_NETWORK_CHILD, "messages"]
+                    and pieces[4] == "receipts"
+                ):
+                    result = self.store.record_team_message_receipt(
+                        claims,
+                        team_id,
+                        self._resource_id(pieces[3]),
+                        self._team_receipt_body(request),
+                    )
+                elif len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "attachments"]:
+                    result = self.store.declare_team_attachment(
+                        claims, team_id, self._team_attachment_body(request)
+                    )
+                elif (
+                    len(pieces) == 5
+                    and pieces[1:3] == [_NETWORK_CHILD, "skills"]
+                    and pieces[4] in {"pin", "archive"}
+                ):
+                    flag = "pinned" if pieces[4] == "pin" else "archived"
+                    setter = (
+                        self.store.set_team_skill_pinned
+                        if flag == "pinned"
+                        else self.store.set_team_skill_archived
+                    )
+                    result = setter(
+                        claims,
+                        team_id,
+                        self._resource_id(pieces[3]),
+                        self._team_skill_flag_body(request, flag),
                     )
                 else:
                     raise HubError("not_found", "Resource not found", 404)

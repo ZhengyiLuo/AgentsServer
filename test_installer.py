@@ -1294,9 +1294,10 @@ exit 0
         installer_source = INSTALLER.read_text()
         packager_source = PACKAGER.read_text()
         self.assertIn(
-            "RELEASE_FILES=(agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py claude_sdk_client.py codex_app_server.py cursor_agent_client.py cursor_process_guard.py",
+            "RELEASE_FILES=(agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py claude_sdk_client.py codex_app_server.py cursor_agent_client.py cursor_process_guard.py",
             installer_source,
         )
+        self.assertIn('"$STAGE_DIR/agentsdock_team.py"', installer_source)
         self.assertIn("RELEASE_DIRECTORIES=(agentsdock_team_hub)", installer_source)
         self.assertIn('"$STAGE_DIR/agentsdock_chats.py"', installer_source)
         self.assertIn('"$STAGE_DIR/agentsdock_emergency.py"', installer_source)
@@ -1315,6 +1316,7 @@ exit 0
         self.assertIn('"agentsdock_chats.py"', packager_source)
         self.assertIn('"agentsdock_emergency.py"', packager_source)
         self.assertIn('"agentsdock_mail.py"', packager_source)
+        self.assertIn('"agentsdock_team.py"', packager_source)
         self.assertIn('"claude_sdk_client.py"', packager_source)
         self.assertIn('"codex_app_server.py"', packager_source)
         self.assertIn('"cursor_agent_client.py"', packager_source)
@@ -1365,6 +1367,10 @@ exit 0
             )
             self.assertIn(
                 f"agents-server-{version}/agentsdock_mail.py",
+                members,
+            )
+            self.assertIn(
+                f"agents-server-{version}/agentsdock_team.py",
                 members,
             )
             self.assertIn(
@@ -1419,6 +1425,10 @@ exit 0
                 f"agents-server-{version}/agentsdock_team_hub/migrations/0008_managed_server_session.sql",
                 members,
             )
+            self.assertIn(
+                f"agents-server-{version}/agentsdock_team_hub/migrations/0009_team_messages.sql",
+                members,
+            )
             self.assertFalse(
                 any("__pycache__" in name or name.endswith((".pyc", ".pyo")) for name in members)
             )
@@ -1431,7 +1441,7 @@ exit 0
                 "beta" if "-" in version.split("+", 1)[0] else "stable",
             )
             self.assertEqual(manifest["prerelease"], manifest["track"] == "beta")
-            self.assertEqual(manifest["api_contract_version"], 26)
+            self.assertEqual(manifest["api_contract_version"], 27)
 
     def test_installer_preserves_state_and_emits_private_result(self):
         source = INSTALLER.read_text()
@@ -3409,7 +3419,7 @@ exit 0
             self.assertFalse(store.maintenance_fence_path.exists())
             connection = sqlite3.connect(store.database_path)
             try:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 9)
                 self.assertEqual(
                     connection.execute(
                         "SELECT hub_id, server_identity FROM managed_host_bindings"
@@ -5804,6 +5814,12 @@ exit 0
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_insert")
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_update")
             for table in (
+                # Migration 0009 (Team Messages V2), children first.
+                "team_skill_versions",
+                "team_attachments",
+                "team_message_recipients",
+                "team_messages",
+                "team_skills",
                 "network_passive_requests",
                 "network_deliveries",
                 "network_mailbox_items",

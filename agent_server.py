@@ -19238,8 +19238,12 @@ async def _start_next_queued_turn_locked(
             item["_turn_deferred_notified"] = True
             deferred_detail = str(e.detail or "")
             item["_last_deferred_detail"] = deferred_detail
-            if await discard_delivery_after_repeated_deferrals(
-                session_id, item, deferred_detail
+            # Pure wait states (capacity, memory, goals or maintenance in
+            # progress) are not admission failures of this row.
+            if not isinstance(e, TransientAdmissionWait) and (
+                await discard_delivery_after_repeated_deferrals(
+                    session_id, item, deferred_detail
+                )
             ):
                 return
             await requeue_turn_front(session_id, item)
@@ -31366,11 +31370,51 @@ def cross_chat_exchange_delivery_prompt(
             exchange.get("source_user_instruction"),
             leg.get("body"),
             delivery_kind=str(delivery_kind or "message"),
-            replay_source=cross_chat_exchange_leg_is_first_for_target(exchange, leg),
+            replay_source=(
+                cross_chat_exchange_leg_is_first_for_target(exchange, leg)
+                or cross_chat_target_thread_replaced_since(exchange, leg)
+            ),
         )
         + reply_line
         + "[End delivery]"
     )
+
+
+def cross_chat_target_thread_replaced_since(
+    exchange: dict[str, Any],
+    leg: dict[str, Any],
+) -> bool:
+    """Whether the target chat's provider thread no longer saw earlier legs.
+
+    The first leg delivered to a chat carries the full source instruction and
+    later legs only an excerpt. If the chat's Codex thread was rotated or
+    rolled over in between (no bound thread yet, or a thread started after the
+    exchange began), the fresh thread never saw that instruction, so it must
+    be replayed in full again.
+    """
+
+    target = STORE.sessions.get(str(leg.get("target_session_id") or "")) or {}
+    if not target:
+        return False
+    started_raw = str(target.get("codex_thread_started_at") or "").strip()
+    if not session_provider_id(target):
+        # Unbound after a rotation/rollover (evidence: a rotation record or an
+        # earlier thread start). A chat that simply has no thread yet keeps
+        # the ordinary first-leg rule.
+        return bool(target.get("codex_rotated_threads")) or bool(started_raw)
+    created_raw = str(exchange.get("created_at") or "").strip()
+    if not started_raw or not created_raw:
+        return False
+    try:
+        started = datetime.fromisoformat(started_raw.replace("Z", "+00:00"))
+        created = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return started > created
 
 
 def cross_chat_exchange_leg_is_first_for_target(
@@ -53306,12 +53350,12 @@ async def _start_turn_locked(
             req.backend or sess.get("backend") or DEFAULT_BACKEND
         ).strip().lower()
         if CODEX_GOALS_RECONFIGURING and requested_backend == BACKEND_CODEX:
-            raise HTTPException(
+            raise TransientAdmissionWait(
                 status_code=409,
                 detail="wait for Codex goals configuration to finish",
             )
         if session_id in SERVER_MAINTENANCE_SESSIONS:
-            raise HTTPException(
+            raise TransientAdmissionWait(
                 status_code=409,
                 detail="wait for Codex session maintenance to finish",
             )
@@ -53374,7 +53418,7 @@ async def _start_turn_locked(
         if reserved:
             await release_turn_slot(session_id)
             reserved = False
-        raise HTTPException(status_code=503, detail=f"agent launch deferred: {blocker}")
+        raise TransientAdmissionWait(status_code=503, detail=f"agent launch deferred: {blocker}")
 
     started_event: dict[str, Any] | None = None
     started_payload: dict[str, Any] | None = None
@@ -54126,6 +54170,15 @@ MANAGED_SERVER_UPDATE_ACTIVE_DETAIL = "AgentsServer is preparing a managed updat
 MANAGED_SERVER_RESTART_ACTIVE_DETAIL = "AgentsServer is restarting"
 MANAGED_SERVER_SERVICE_KIND_CACHE: str | None = None
 SERVER_RESTART_SIGNAL_LOCK = threading.Lock()
+
+
+class TransientAdmissionWait(HTTPException):
+    """A 409/503 that only means "try again shortly", never a rejection.
+
+    Raised for Codex goals reconfiguration, per-chat maintenance, and host
+    capacity/memory deferrals. Queue promotion requeues such rows without
+    counting them toward the cross-chat delivery discard bound.
+    """
 
 
 class ManagedServerUpdatePendingError(HTTPException):
@@ -66273,6 +66326,7 @@ async def stop_turn(
     stopping_purpose = ""
     stopping_control_reservation_id = ""
     stopping_control_thread_id = ""
+    stopping_admission_id = ""
     async with ACTIVE_LOCK:
         active = ACTIVE.get(session_id)
         busy = session_id in BUSY_SESSIONS
@@ -66329,6 +66383,12 @@ async def stop_turn(
                     (CURRENT_TURNS.get(session_id) or {}).get("run_id") or ""
                 ) or None
         current_turn = CURRENT_TURNS.get(session_id) or {}
+        # Identity of the reservation this Stop observed. A Stop that outlives
+        # its deadline runs detached; it must never act on a successor turn
+        # admitted after the fence was released.
+        stopping_admission_id = str(
+            current_turn.get("_server_restart_admission_id") or ""
+        )
         stopping_control_reservation_id = str(
             (active or {}).get("codex_control_reservation_id")
             or current_turn.get("codex_control_reservation_id")
@@ -66496,6 +66556,12 @@ async def stop_turn(
                     bound_active = ACTIVE.get(session_id)
                     still_busy = session_id in BUSY_SESSIONS
                     current_turn = dict(CURRENT_TURNS.get(session_id) or {})
+                    reservation_replaced = bool(
+                        still_busy
+                        and stopping_admission_id
+                        and str(current_turn.get("_server_restart_admission_id") or "")
+                        != stopping_admission_id
+                    )
                     pending = {
                         task
                         for task in SESSION_TURN_TASKS.get(session_id) or ()
@@ -66509,6 +66575,20 @@ async def stop_turn(
                             and task is not current_task
                             and not task.done()
                         )
+                    }
+                if reservation_replaced:
+                    # A successor turn owns the chat: the reservation this Stop
+                    # observed is gone. Leave the new turn untouched.
+                    logger.info(
+                        "explicit Stop superseded by a new turn session=%s",
+                        session_id,
+                    )
+                    return {
+                        "ok": True,
+                        "stopped": True,
+                        "pending": False,
+                        "superseded": True,
+                        "subagents": subagent_stop,
                     }
                 if bound_active:
                     # The runner bound while Stop was waiting. Re-enter through

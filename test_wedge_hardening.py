@@ -589,6 +589,72 @@ class ManagedServiceProofTests(unittest.TestCase):
         )
 
 
+class ExchangeReplayAfterThreadRotationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.previous_sessions = agent_server.STORE.sessions
+        self.marker = "ZZ-END-OF-INSTRUCTION-MARKER"
+        self.exchange = {
+            "id": "exchange-1",
+            "requester_session_id": "requester",
+            "responder_session_id": "target",
+            "authorization_source_run_id": "run-1",
+            "initial_action": "request_reply",
+            "max_legs": 6,
+            "used_legs": 2,
+            "created_at": "2026-09-04T10:00:00Z",
+            "source_user_instruction": ("please audit the release " * 30) + self.marker,
+        }
+        self.leg = {
+            "id": "leg-3",
+            "ordinal": 3,
+            "kind": "message",
+            "target_session_id": "target",
+            "source_session_id": "requester",
+            "body": "third leg body",
+        }
+
+    def tearDown(self) -> None:
+        agent_server.STORE.sessions = self.previous_sessions
+
+    def prompt_for(self, target: dict) -> str:
+        agent_server.STORE.sessions = {
+            "target": target,
+            "requester": {"id": "requester", "title": "Requester chat"},
+        }
+        return agent_server.cross_chat_exchange_delivery_prompt(self.exchange, self.leg)
+
+    def test_later_leg_to_an_unchanged_thread_carries_only_an_excerpt(self):
+        prompt = self.prompt_for({
+            "id": "target",
+            "backend": agent_server.BACKEND_CODEX,
+            "codex_thread_id": "thread-1",
+            "codex_thread_started_at": "2026-09-04T09:00:00Z",
+        })
+        self.assertNotIn(self.marker, prompt)
+
+    def test_later_leg_replays_in_full_when_the_thread_was_rotated(self):
+        rotated = self.prompt_for({
+            "id": "target",
+            "backend": agent_server.BACKEND_CODEX,
+            "codex_thread_id": "thread-2",
+            "codex_thread_started_at": "2026-09-04T11:00:00Z",
+        })
+        self.assertIn(self.marker, rotated)
+        # Unbound after a rotation: the rotation record is the evidence.
+        unbound = self.prompt_for({
+            "id": "target",
+            "backend": agent_server.BACKEND_CODEX,
+            "codex_rotated_threads": [{"thread_id": "thread-1"}],
+        })
+        self.assertIn(self.marker, unbound)
+        # A chat that never had a thread keeps the ordinary first-leg rule.
+        fresh = self.prompt_for({
+            "id": "target",
+            "backend": agent_server.BACKEND_CODEX,
+        })
+        self.assertNotIn(self.marker, fresh)
+
+
 class DarwinMetricsTests(unittest.TestCase):
     def test_elapsed_time_parsing(self):
         self.assertEqual(agent_server.parse_elapsed_seconds("05:33"), 333)

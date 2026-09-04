@@ -16,6 +16,11 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+# Keep the default below provider shell-tool deadlines (Claude's default is
+# commonly 120 seconds). The server still enforces its own configurable cap.
+LIVE_RESPONSE_TIMEOUT_SECONDS = 75
+LIVE_RESPONSE_SOCKET_GRACE_SECONDS = 15
+
 
 class ChatsCLIError(RuntimeError):
     pass
@@ -87,7 +92,13 @@ def post_json(
     promotion_deadline = time.monotonic() + 10.0
     while True:
         try:
-            with opener.open(request, timeout=30) as response:
+            socket_timeout = (
+                float(payload.get("response_timeout_seconds") or 0)
+                + LIVE_RESPONSE_SOCKET_GRACE_SECONDS
+                if payload.get("wait_for_response") is True
+                else 30
+            )
+            with opener.open(request, timeout=socket_timeout) as response:
                 result = json.loads(response.read().decode("utf-8"))
             break
         except urllib.error.HTTPError as exc:
@@ -117,7 +128,12 @@ def post_json(
     return result
 
 
-def get_json(path: str, capability: str) -> dict[str, Any]:
+def get_json(
+    path: str,
+    capability: str,
+    *,
+    timeout: float = 30,
+) -> dict[str, Any]:
     server_url = environment()
     request = urllib.request.Request(
         f"{server_url}{path}",
@@ -133,7 +149,7 @@ def get_json(path: str, capability: str) -> dict[str, Any]:
         NoRedirectHandler(),
     )
     try:
-        with opener.open(request, timeout=30) as response:
+        with opener.open(request, timeout=timeout) as response:
             result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
@@ -142,7 +158,7 @@ def get_json(path: str, capability: str) -> dict[str, Any]:
         except json.JSONDecodeError:
             detail = raw
         raise ChatsCLIError(
-            f"server rejected route listing ({exc.code}): {detail or exc.reason}"
+            f"server rejected request ({exc.code}): {detail or exc.reason}"
         ) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise ChatsCLIError(
@@ -150,6 +166,38 @@ def get_json(path: str, capability: str) -> dict[str, Any]:
         ) from exc
     if not isinstance(result, dict):
         raise ChatsCLIError("AgentsServer returned an invalid response")
+    return result
+
+
+def await_live_response(
+    receipt: dict[str, Any],
+    capability: str,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    exchange_id = str(receipt.get("exchange_id") or "")
+    inbound_leg_id = str(receipt.get("inbound_leg_id") or "")
+    lease_id = str(receipt.get("live_response_lease_id") or "")
+    query = urllib.parse.urlencode({
+        "lease_id": lease_id,
+        "timeout_seconds": timeout_seconds,
+    })
+    result = get_json(
+        "/api/agent/cross-chat/exchanges/"
+        f"{urllib.parse.quote(exchange_id, safe='')}/legs/"
+        f"{urllib.parse.quote(inbound_leg_id, safe='')}/live-response?{query}",
+        capability,
+        timeout=timeout_seconds + LIVE_RESPONSE_SOCKET_GRACE_SECONDS,
+    )
+    if (
+        set(result)
+        != {"ok", "exchange_id", "inbound_leg_id", "body", "request_response"}
+        or result.get("ok") is not True
+        or result.get("exchange_id") != exchange_id
+        or not isinstance(result.get("inbound_leg_id"), str)
+        or not isinstance(result.get("body"), str)
+        or not isinstance(result.get("request_response"), bool)
+    ):
+        raise ChatsCLIError("AgentsServer returned an invalid live response")
     return result
 
 
@@ -174,10 +222,15 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
     if bool(route) == bool(target):
         raise ChatsCLIError("provide exactly one of --route or --target")
     destination = route if route else target
+    live_wait = (
+        action == "request_reply"
+        and not bool(getattr(args, "async_response", False))
+    )
     stable_key = "cli_" + hashlib.sha256(
         (
             f"{capability}\0{action}\0"
-            f"{'route' if route else 'target'}\0{destination}\0{message}"
+            f"{'route' if route else 'target'}\0{destination}\0"
+            f"{int(live_wait)}\0{message}"
         ).encode("utf-8")
     ).hexdigest()
     payload: dict[str, Any] = {
@@ -186,6 +239,11 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
         "idempotency_key": args.idempotency_key or stable_key,
         "artifact_grants": [],
     }
+    if live_wait:
+        payload["wait_for_response"] = True
+        payload["response_timeout_seconds"] = int(
+            getattr(args, "timeout_seconds", LIVE_RESPONSE_TIMEOUT_SECONDS)
+        )
     if route:
         path = (
             "/api/agent/cross-chat/routes/"
@@ -195,20 +253,55 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
         path = "/api/agent/cross-chat/handoffs"
         payload["target_session_id"] = target
     result = post_json(path, payload, capability)
+    minimal_expected = {"ok", "action", "accepted"}
+    if route:
+        minimal_expected.add("route_id")
+    expected = set(minimal_expected)
+    wait_expected = set(minimal_expected)
+    if live_wait:
+        expected.update({
+            "exchange_id",
+            "inbound_leg_id",
+            "body",
+            "request_response",
+        })
+        wait_expected.update({
+            "exchange_id",
+            "inbound_leg_id",
+            "live_response_lease_id",
+        })
+        if frozenset(result) == frozenset(wait_expected):
+            live_result = await_live_response(
+                result,
+                capability,
+                int(payload["response_timeout_seconds"]),
+            )
+            result = {
+                **{key: result[key] for key in minimal_expected},
+                **live_result,
+            }
+        elif frozenset(result) == frozenset(minimal_expected):
+            raise ChatsCLIError(
+                "AgentsServer does not support a live response for this route"
+            )
+    has_live_response = live_wait and frozenset(result) == frozenset(expected)
     if route:
         if (
-            result.get("ok") is not True
+            frozenset(result) not in {frozenset(minimal_expected), frozenset(expected)}
+            or result.get("ok") is not True
             or result.get("route_id") != route
             or result.get("action") != action
             or result.get("accepted") is not True
+            or (has_live_response and not isinstance(result.get("body"), str))
         ):
             raise ChatsCLIError("AgentsServer returned an invalid route handoff response")
     else:
         if (
-            set(result) != {"ok", "action", "accepted"}
+            frozenset(result) not in {frozenset(minimal_expected), frozenset(expected)}
             or result.get("ok") is not True
             or result.get("action") != action
             or result.get("accepted") is not True
+            or (has_live_response and not isinstance(result.get("body"), str))
         ):
             raise ChatsCLIError("AgentsServer returned an invalid direct handoff response")
     return result
@@ -227,28 +320,68 @@ def respond(args: argparse.Namespace) -> dict[str, Any]:
     message = str(args.message or "").strip()
     if not message:
         raise ChatsCLIError("--message must not be empty")
+    request_response = bool(args.request_response)
+    async_response = bool(getattr(args, "async_response", False))
+    if async_response and not request_response:
+        raise ChatsCLIError("--async-response requires --request-response")
+    live_wait = request_response and not async_response
     stable_key = "cli_" + hashlib.sha256(
         (
             f"{capability}\0respond\0{args.exchange}\0{args.inbound_leg}\0"
-            f"{int(bool(args.request_response))}\0{message}"
+            f"{int(request_response)}\0{int(live_wait)}\0{message}"
         ).encode("utf-8")
     ).hexdigest()
+    payload = {
+        "inbound_leg_id": args.inbound_leg,
+        "body": message,
+        "request_response": request_response,
+        "idempotency_key": args.idempotency_key or stable_key,
+        "artifact_grants": [],
+    }
+    if live_wait:
+        payload["wait_for_response"] = True
+        payload["response_timeout_seconds"] = int(
+            getattr(args, "timeout_seconds", LIVE_RESPONSE_TIMEOUT_SECONDS)
+        )
     result = post_json(
         f"/api/agent/cross-chat/exchanges/{urllib.parse.quote(args.exchange, safe='')}/responses",
-        {
-            "inbound_leg_id": args.inbound_leg,
-            "body": message,
-            "request_response": bool(args.request_response),
-            "idempotency_key": args.idempotency_key or stable_key,
-            "artifact_grants": [],
-        },
+        payload,
         capability,
     )
+    minimal_expected = {"ok", "action", "accepted"}
+    expected = set(minimal_expected)
+    wait_expected = set(minimal_expected)
+    if live_wait:
+        expected.update({
+            "exchange_id",
+            "inbound_leg_id",
+            "body",
+            "request_response",
+        })
+        wait_expected.update({
+            "exchange_id",
+            "inbound_leg_id",
+            "live_response_lease_id",
+        })
+        if frozenset(result) == frozenset(wait_expected):
+            live_result = await_live_response(
+                result,
+                capability,
+                int(payload["response_timeout_seconds"]),
+            )
+            result = {**result, **live_result}
+            result.pop("live_response_lease_id", None)
+        elif frozenset(result) == frozenset(minimal_expected):
+            raise ChatsCLIError(
+                "AgentsServer does not support a live follow-up response"
+            )
+    has_live_response = live_wait and frozenset(result) == frozenset(expected)
     if (
-        set(result) != {"ok", "action", "accepted"}
+        frozenset(result) not in {frozenset(minimal_expected), frozenset(expected)}
         or result.get("ok") is not True
         or result.get("action") != "response"
         or result.get("accepted") is not True
+        or (has_live_response and not isinstance(result.get("body"), str))
     ):
         raise ChatsCLIError(
             "AgentsServer returned an invalid cross-chat response"
@@ -280,13 +413,41 @@ def parser() -> argparse.ArgumentParser:
     ask_destination.add_argument("--target")
     ask_command.add_argument("--message", required=True)
     ask_command.add_argument("--idempotency-key")
+    ask_command.add_argument(
+        "--async-response",
+        action="store_true",
+        help=(
+            "return after durable send and receive the peer reply in a later "
+            "turn (required for secure-peer routes)"
+        ),
+    )
+    ask_command.add_argument(
+        "--timeout-seconds",
+        type=int,
+        choices=range(1, 3601),
+        default=LIVE_RESPONSE_TIMEOUT_SECONDS,
+    )
     ask_command.set_defaults(handler=ask)
     response_command = commands.add_parser("respond", help="respond to the exact inbound exchange leg")
     response_command.add_argument("--exchange", required=True)
     response_command.add_argument("--inbound-leg", required=True)
     response_command.add_argument("--message", required=True)
     response_command.add_argument("--request-response", action="store_true")
+    response_command.add_argument(
+        "--async-response",
+        action="store_true",
+        help=(
+            "with --request-response, receive the peer reply in a later turn "
+            "instead of waiting on this provider call"
+        ),
+    )
     response_command.add_argument("--idempotency-key")
+    response_command.add_argument(
+        "--timeout-seconds",
+        type=int,
+        choices=range(1, 3601),
+        default=LIVE_RESPONSE_TIMEOUT_SECONDS,
+    )
     response_command.set_defaults(handler=respond)
     return root
 

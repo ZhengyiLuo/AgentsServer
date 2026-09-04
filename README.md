@@ -474,10 +474,40 @@ JSON body containing a UUID `request_id`, the exact
 Replaying the same request ID is idempotent; another pending or recently
 completed request is rejected.
 
-Restart admission is fail-closed while an active update, active turn, provisional
-queue write, provider background task, lifecycle operation, or HTTP mutation
-is in flight. Durable queued turns remain queued for recovery after relaunch.
-There is no force mode and unmanaged processes cannot use this control.
+A cooperative restart is fail-closed while an active update, active turn,
+provisional queue write, provider background task, lifecycle operation, or
+HTTP mutation is in flight. Durable queued turns remain queued for recovery
+after relaunch. Unmanaged processes cannot use this control.
+
+### Forced (emergency) restart
+
+Adding `force: true` and `force_confirmed: true` to the POST body requests an
+emergency restart. It exists for the case where the server is wedged, so it
+never refuses or waits on server state beyond authentication, the managed
+service proof, and the exact `expected_server_identity` /
+`expected_server_instance_id` pair:
+
+- Cooldowns, a pending or stale restart record, an active managed update,
+  safety-critical work (Codex maintenance, session deletions, in-flight HTTP
+  mutations, goal reconfiguration), and Team Hub snapshot failures are
+  overridden and recorded in `forced_audit` instead of rejected.
+- `expected_blocker_revision` is optional. A stale or omitted revision is
+  audited (`blockers_changed_after_confirmation`, `blocker_revision_omitted`)
+  rather than refused, because a wedged server may be unable to serve a fresh
+  blocker snapshot at all.
+- Every admission lock and probe on the forced path is bounded by a short
+  timeout. If one cannot be obtained the audit snapshot is marked
+  `snapshot_degraded` and the restart still proceeds. `GET /api/admin/restart`
+  and `/api/health` use the same bounded snapshot so they cannot hang.
+- The restart journal is best effort: if it cannot be written the restart
+  still proceeds.
+- SIGTERM is sent from a dedicated thread after the `202` response, and a
+  hard-kill watchdog sends SIGKILL a few seconds later if graceful shutdown
+  has not finished, so the user service always relaunches the server.
+
+Forced restarts interrupt active agent turns and can leave provider children
+to be reaped by the relaunched server; use the cooperative restart when the
+server is healthy.
 
 ## Remote Access With Tailscale
 
@@ -557,6 +587,10 @@ and manual restart remain available while the reservation is pending. The
 server begins maintenance only when one shared-lock snapshot proves it is
 actually idle; that same atomic transition closes new-work admission. A
 pending reservation survives a manual restart and is re-armed after startup.
+While it is pending it fences nothing: new turns, Force Send, scheduled jobs,
+and provider controls are all admitted, and the update simply waits for the
+next moment nothing is running. (Releases before 0.1.26-beta.31 parked new
+turns behind the reservation; that behavior is gone.)
 
 ## Uninstalling AgentsServer
 
@@ -1068,6 +1102,28 @@ Workspace-files capability v4 adds no-overwrite creation. Post
 `{path, kind: "directory"}` to create one directory. Creation is
 descriptor-relative, rejects symlinked parents and existing destinations, and
 is unavailable for archived chats.
+
+## Imported provider history
+
+Opening a chat catches its timeline up with messages added to the provider
+transcript outside AgentsDock. The sync anchors on the newest timeline
+messages, skips the parse when the transcript file is unchanged, refuses to
+import a transcript that matches nothing on a populated timeline, and closes
+every import batch with a `turn_finished` marked `imported: true`. Imported
+turns never set a chat's active run, so replayed history can never make a
+stopped chat look busy.
+
+Servers before 0.1.26-beta.30 could append the same transcript tail on every
+open. To remove those duplicates from a chat's event log:
+
+```text
+POST /api/sessions/{session_id}/history/prune-duplicates
+{"dry_run": true}
+```
+
+The default dry run reports how many events and import runs would be
+removed; `{"dry_run": false}` rewrites the log atomically while the chat is
+idle, keeping the first occurrence of every message.
 
 ## Whole-History Search
 

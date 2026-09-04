@@ -982,8 +982,14 @@ class ProviderTeamMailTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("MBA", allowed_path.read_text())
         self.assertNotIn("exact body", allowed_path.read_text())
-        self.assertIn("explicitly opened this turn", provider_prompt)
-        self.assertIn("pre-bound by AgentsServer", provider_prompt)
+        # The per-turn block is compact: it names the pre-bound mail grant,
+        # while the usage rules live once in the thread-level instructions.
+        self.assertIn("team_mail=prebound", provider_prompt)
+        self.assertIn("/mail server MBA exact body", provider_prompt)
+        self.assertIn(
+            "pre-bound",
+            agent_server.PROVIDER_AUTHORITY_USAGE_INSTRUCTIONS,
+        )
 
 
 class LocalAgentMailClaimsTests(unittest.TestCase):

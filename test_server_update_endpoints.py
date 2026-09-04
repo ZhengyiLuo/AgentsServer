@@ -1857,9 +1857,11 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
 
-        self.assertIn("waiting for existing work", admission)
-        self.assertEqual(interactive, admission)
-        self.assertEqual(scheduled, admission)
+        # A pending when-idle reservation is passive: it must never fence new
+        # turns, scheduled jobs, or any other operation.
+        self.assertIsNone(admission)
+        self.assertIsNone(interactive)
+        self.assertIsNone(scheduled)
         self.assertEqual(stopped, {"stopped": True})
         self.assertEqual(codex["interaction"]["status"], "resolved")
         self.assertEqual(claude["interaction"]["status"], "resolved")

@@ -104,6 +104,9 @@ ServerRequestHandler = Callable[
     [Any, str, dict[str, Any]],
     Awaitable[dict[str, Any]] | dict[str, Any],
 ]
+# ``(pid, process_group_id)``; the group id is None when it is not provably
+# owned by the client (injected factories, non-POSIX hosts).
+ProcessLifecycleHook = Callable[[int, int | None], None]
 
 _THREAD_GOAL_STATUSES = frozenset(
     {
@@ -449,10 +452,17 @@ class CodexAppServerClient:
         process_factory: ProcessFactory | None = None,
         server_request_handler: ServerRequestHandler | None = None,
         initialize_params: dict[str, Any] | None = None,
+        on_process_started: ProcessLifecycleHook | None = None,
+        on_process_exited: ProcessLifecycleHook | None = None,
     ) -> None:
         self.codex_bin = codex_bin
         self.cwd = cwd
         self.env_factory = env_factory
+        # Lifecycle hooks receive ``(pid, process_group_id)``. The group id is
+        # None whenever start() could not prove it owns the child's session,
+        # so a hook must never derive a signal target from the pid alone.
+        self._on_process_started = on_process_started
+        self._on_process_exited = on_process_exited
         self.app_server_args = tuple(str(value) for value in app_server_args)
         self.request_timeout = request_timeout
         self.lifecycle_timeout = lifecycle_timeout
@@ -615,6 +625,16 @@ class CodexAppServerClient:
                 else None
             )
             self._proc = proc
+            if (
+                self._on_process_started is not None
+                and isinstance(raw_pid, int)
+                and not isinstance(raw_pid, bool)
+                and raw_pid > 0
+            ):
+                # Registry/bookkeeping hooks must never break a provider
+                # start; they exist so an orphaned child can be reaped later.
+                with suppress(Exception):
+                    self._on_process_started(raw_pid, self._process_group_id)
             self._reader_task = asyncio.create_task(
                 self._reader_loop(proc),
                 name="codex-app-server-reader",
@@ -769,6 +789,15 @@ class CodexAppServerClient:
                         proc.kill()
                     with suppress(Exception):
                         await asyncio.wait_for(proc.wait(), timeout=1.0)
+            raw_pid = getattr(proc, "pid", None)
+            if (
+                self._on_process_exited is not None
+                and isinstance(raw_pid, int)
+                and not isinstance(raw_pid, bool)
+                and raw_pid > 0
+            ):
+                with suppress(Exception):
+                    self._on_process_exited(raw_pid, process_group_id)
 
         for task in (reader_task, stderr_task):
             if task and task is not current:
@@ -999,6 +1028,18 @@ class CodexAppServerClient:
                     )
                     self._fail_all(error)
                     self._cancel_server_request_tasks()
+                    # An unplanned exit must release the child's registry entry
+                    # now; ``_discard_process`` only runs on the next start or
+                    # on close, and a stale {pid, pgid} could be reused.
+                    raw_pid = getattr(proc, "pid", None)
+                    if (
+                        self._on_process_exited is not None
+                        and isinstance(raw_pid, int)
+                        and not isinstance(raw_pid, bool)
+                        and raw_pid > 0
+                    ):
+                        with suppress(Exception):
+                            self._on_process_exited(raw_pid, self._process_group_id)
 
     async def _stderr_loop(self, proc: asyncio.subprocess.Process) -> None:
         if not proc.stderr:
@@ -2158,6 +2199,8 @@ class CodexAppServerManager:
         process_factory: ProcessFactory | None = None,
         server_request_handler: ServerRequestHandler | None = None,
         initialize_params: dict[str, Any] | None = None,
+        on_process_started: ProcessLifecycleHook | None = None,
+        on_process_exited: ProcessLifecycleHook | None = None,
     ) -> None:
         self.client = CodexAppServerClient(
             codex_bin,
@@ -2172,6 +2215,8 @@ class CodexAppServerManager:
             process_factory=process_factory,
             server_request_handler=server_request_handler,
             initialize_params=initialize_params,
+            on_process_started=on_process_started,
+            on_process_exited=on_process_exited,
         )
 
     @property

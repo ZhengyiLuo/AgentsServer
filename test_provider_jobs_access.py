@@ -323,11 +323,17 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
             },
             "Source",
         )
+        # Context diet: the jobs guidance is static and now lives once in the
+        # thread-level delivery instructions instead of every relay prompt.
+        self.assertIn("kind=instruction leg=1/1 origin=route", relay)
         self.assertIn(
             "Handoff or reply authorization governs cross-chat contact only",
-            relay,
+            agent_server.CROSS_CHAT_DELIVERY_INSTRUCTIONS,
         )
-        self.assertIn("route-free scheduled job", relay)
+        self.assertIn(
+            "route-free scheduled job",
+            agent_server.CROSS_CHAT_DELIVERY_INSTRUCTIONS,
+        )
         self.assertIn(
             "user or an authorized same-server handoff explicitly asks",
             agent_server.SCHEDULED_JOBS_PROMPT,

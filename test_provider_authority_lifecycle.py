@@ -620,7 +620,12 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("jobs", capability["actions"])
         self.assertNotIn("$AGENTSDOCK_JOBS_CLI", prompt)
         self.assertNotIn("Jobs (full access)", prompt)
-        self.assertIn("$AGENTSDOCK_PUBLISH_CLI", prompt)
+        # The source chat is a Codex chat, so the steer carries the compact
+        # block: grants are listed by name and the helper syntax lives in the
+        # thread instructions (context diet).
+        self.assertIn("actions=emergency,publish", prompt)
+        self.assertNotIn("jobs=", prompt)
+        self.assertIn(str(authority_path), prompt)
         self.assertNotIn(token, prompt)
 
     async def test_revoke_never_unlinks_an_unregistered_or_outside_path(self) -> None:

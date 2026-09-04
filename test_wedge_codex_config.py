@@ -186,7 +186,11 @@ class CodexThreadParamsConfigTests(unittest.IsolatedAsyncioTestCase):
     def test_thread_params_carry_bounded_defaults_without_settings(self) -> None:
         params = agent_server.codex_thread_params({"id": "chat"}, "/repo")
 
-        self.assertEqual(params["config"], DEFAULT_CONFIG)
+        # Sent as dotted -c style keys so only the leaf is overridden.
+        self.assertEqual(
+            params["config"],
+            {"agents.max_concurrent_threads_per_session": 4},
+        )
         # Existing keys are untouched by the additive config object.
         self.assertEqual(params["cwd"], "/repo")
         self.assertEqual(
@@ -217,7 +221,8 @@ class CodexThreadParamsConfigTests(unittest.IsolatedAsyncioTestCase):
             params = agent_server.codex_thread_params(session, "/repo")
 
         self.assertEqual(params["config"], {
-            "agents": {"max_concurrent_threads_per_session": 2, "enabled": False},
+            "agents.max_concurrent_threads_per_session": 2,
+            "agents.enabled": False,
             "model_auto_compact_token_limit": 200_000,
             "model_auto_compact_token_limit_scope": "thread",
         })
@@ -233,12 +238,12 @@ class CodexThreadParamsConfigTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             params["config"],
-            {"agents": {"max_concurrent_threads_per_session": 1}},
+            {"agents.max_concurrent_threads_per_session": 1},
         )
 
     async def test_thread_start_and_resume_send_config(self) -> None:
         self.write_settings({"agents": {"max_concurrent_threads_per_session": 3}})
-        expected = {"agents": {"max_concurrent_threads_per_session": 3}}
+        expected = {"agents.max_concurrent_threads_per_session": 3}
         session = {
             "id": "chat-1",
             "backend": agent_server.BACKEND_CODEX,
@@ -310,7 +315,7 @@ class CodexThreadParamsConfigTests(unittest.IsolatedAsyncioTestCase):
         params = manager.fork_thread.await_args.args[1]
         self.assertEqual(
             params["config"],
-            {"agents": {"max_concurrent_threads_per_session": 2}},
+            {"agents.max_concurrent_threads_per_session": 2},
         )
         self.assertTrue(params["deferGoalContinuation"])
 
@@ -607,8 +612,18 @@ class CodexRunnerFinalizationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.fixture = runner_fixtures.CodexAppServerRunnerTests()
         await self.fixture.asyncSetUp()
+        # The shared runner fixture installs fake sessions on the real STORE;
+        # never let the run persist them to the operator's sessions.json.
+        self._save_patches = [
+            patch.object(agent_server.STORE, "save", AsyncMock()),
+            patch.object(agent_server.STORE, "save_provider_session", AsyncMock()),
+        ]
+        for patcher in self._save_patches:
+            patcher.start()
 
     async def asyncTearDown(self) -> None:
+        for patcher in self._save_patches:
+            patcher.stop()
         await self.fixture.asyncTearDown()
 
     async def test_run_finalizes_subagents_after_the_turn_finished_event(self) -> None:

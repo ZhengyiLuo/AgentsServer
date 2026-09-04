@@ -274,7 +274,13 @@ PROVIDER_CHILD_PROC_ROOT = Path("/proc")
 SERVER_UPDATE_PUBLIC_KEY = SERVER_ROOT / "release-public-key.pem"
 SERVER_UPDATE_RUNNER = SERVER_ROOT / "update_runner.py"
 CLAUDE_PROJECTS_ROOT = Path(os.environ.get("CLAUDE_PROJECTS_ROOT", Path.home() / ".claude" / "projects"))
-CODEX_SESSIONS_ROOT = Path(os.environ.get("CODEX_SESSIONS_ROOT", Path.home() / ".codex" / "sessions"))
+CODEX_SESSIONS_ROOT = Path(
+    os.environ.get("CODEX_SESSIONS_ROOT")
+    or (
+        Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+        / "sessions"
+    )
+)
 CODEX_SESSION_INDEX_PATH = (
     Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser() / "session_index.jsonl"
 )
@@ -1321,7 +1327,7 @@ You are operating through AgentsDock, backed by AgentsServer.
 - Check installed skills and project playbooks before claiming a specialized environment or remote path is unavailable.
 - If an incidental cleanup or optional clause makes a compound command fail, immediately retry the still-safe requested operation without that clause.
 - Keep the main chat focused; delegate bounded noisy exploration and return summaries instead of dumping large logs or tool output into the thread.
-- When you call `spawn_agent`, pass `fork_turns` as a small integer (2-4) or `"none"`, never `"all"`: a full-history fork copies the entire compacted parent transcript (hundreds of MB per child) and exhausts the server.
+- When you call `spawn_agent`, pass `fork_turns` as a small number written as a string (for example `"3"`) or `"none"`, never `"all"`: a full-history fork copies the entire compacted parent transcript (hundreds of MB per child) and exhausts the server.
 - Preserve user work; avoid destructive actions without authorization; continue until complete or blocked.
 """ + PROVIDER_THREAD_INSTRUCTION_ADDENDUM
 
@@ -44490,8 +44496,27 @@ def codex_thread_params(
     # call site inherits the same ceiling without a process-wide config change.
     config = codex_effective_thread_config(sess)
     if config:
-        params["config"] = config
+        # Dotted keys: Codex applies the per-thread config map like ``-c``
+        # overrides, and a nested ``{"agents": {...}}`` would replace the
+        # user's whole [agents] table instead of only the leaf we set.
+        params["config"] = flatten_codex_config_overrides(config)
     return params
+
+
+def flatten_codex_config_overrides(
+    config: dict[str, Any],
+    prefix: str = "",
+) -> dict[str, Any]:
+    """Flatten a nested override map into dotted Codex config keys."""
+
+    flat: dict[str, Any] = {}
+    for key, value in config.items():
+        dotted = f"{prefix}{key}"
+        if isinstance(value, dict):
+            flat.update(flatten_codex_config_overrides(value, f"{dotted}."))
+        else:
+            flat[dotted] = value
+    return flat
 
 
 def codex_raw_developer_message(text: str) -> dict[str, Any]:
@@ -57956,6 +57981,34 @@ async def secure_peer_hub_proxy_endpoint(
 
 
 HEALTH_QUEUE_RECONCILE_STATE: dict[str, float] = {"last_at": float("-inf")}
+SESSION_SNAPSHOT_RECONCILE_AT: dict[str, float] = {}
+
+
+async def reconcile_idle_queue_session_from_snapshot(session_id: str) -> bool:
+    """Run the per-chat queue repair from a session GET at most once per interval.
+
+    Desktop clients fetch the session snapshot on every open and scroll; the
+    repair pass is not a per-request duty.
+    """
+
+    now = time.monotonic()
+    last = SESSION_SNAPSHOT_RECONCILE_AT.get(session_id, float("-inf"))
+    if now - last < HEALTH_QUEUE_RECONCILE_INTERVAL_SECONDS:
+        return False
+    SESSION_SNAPSHOT_RECONCILE_AT[session_id] = now
+    if len(SESSION_SNAPSHOT_RECONCILE_AT) > 4096:
+        stale = [
+            key
+            for key, at in SESSION_SNAPSHOT_RECONCILE_AT.items()
+            if now - at >= HEALTH_QUEUE_RECONCILE_INTERVAL_SECONDS
+        ]
+        for key in stale:
+            SESSION_SNAPSHOT_RECONCILE_AT.pop(key, None)
+    return await reconcile_idle_queue_session(
+        session_id,
+        schedule=True,
+        reason="session_snapshot",
+    )
 
 
 async def reconcile_idle_queued_turns_from_health_poll() -> bool:
@@ -60676,11 +60729,7 @@ async def get_session(
             limit=limit,
             tail=page_tail,
         )
-    await reconcile_idle_queue_session(
-        session_id,
-        schedule=True,
-        reason="session_snapshot",
-    )
+    await reconcile_idle_queue_session_from_snapshot(session_id)
     response = {
         "session": public_session(sess),
         "events": events,

@@ -546,6 +546,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                 "default_context_mode": "chat",
                 "features": {
                     "chat_references": True,
+                    "team_references": True,
                     "direct_message_mentions": False,
                     "route_mentions": True,
                     "route_hint_mentions": True,

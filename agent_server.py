@@ -529,6 +529,15 @@ CLAUDE_SDK_IDLE_TTL_SECONDS = max(
     30,
     int(agentsdock_setting("CLAUDE_SDK_IDLE_TTL_SECONDS", "300")),
 )
+CLAUDE_SDK_POST_ACK_FIRST_ACTIVITY_TIMEOUT_SECONDS = max(
+    1.0,
+    float(
+        agentsdock_setting(
+            "CLAUDE_SDK_POST_ACK_FIRST_ACTIVITY_TIMEOUT_SECONDS",
+            "180",
+        )
+    ),
+)
 CLAUDE_MCP_CONTROL_TIMEOUT_SECONDS = max(
     1.0,
     float(agentsdock_setting("CLAUDE_MCP_CONTROL_TIMEOUT_SECONDS", "15")),
@@ -4230,6 +4239,40 @@ class MoveQueuedTurnRequest(BaseModel):
 
 class RunQueuedTurnNowRequest(BaseModel):
     accept_deferred_queue_response: bool = False
+
+
+class SkipQueuedCrossChatDeliveryRequest(BaseModel):
+    """Exact identity required to remove one still-queued local delivery."""
+
+    model_config = {"extra": "forbid"}
+
+    cross_chat_envelope_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+    )
+    cross_chat_exchange_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+    )
+    cross_chat_exchange_leg_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+    )
+
+    @model_validator(mode="after")
+    def validate_delivery_identity(self) -> "SkipQueuedCrossChatDeliveryRequest":
+        has_envelope = self.cross_chat_envelope_id is not None
+        has_exchange = self.cross_chat_exchange_id is not None
+        has_leg = self.cross_chat_exchange_leg_id is not None
+        if has_envelope == (has_exchange or has_leg) or has_exchange != has_leg:
+            raise ValueError(
+                "provide exactly cross_chat_envelope_id or both "
+                "cross_chat_exchange_id and cross_chat_exchange_leg_id"
+            )
+        return self
 
 
 class ForkSessionRequest(BaseModel):
@@ -10548,6 +10591,88 @@ class CrossChatStore:
 
         return await self._call(operation)
 
+    async def cancel_exact_queued_exchange_leg(
+        self,
+        *,
+        exchange_id: str,
+        leg_id: str,
+        target_session_id: str,
+        queued_id: str,
+        error_code: str,
+        error: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Cancel only the exchange leg that still owns an exact queue row."""
+
+        timestamp = now_iso()
+
+        def operation() -> tuple[dict[str, Any], dict[str, Any]] | None:
+            with self._transaction() as connection:
+                leg_row = connection.execute(
+                    """
+                    SELECT * FROM cross_chat_exchange_legs
+                    WHERE id=? AND exchange_id=? AND target_session_id=?
+                      AND queued_id=? AND status='queued'
+                    """,
+                    (leg_id, exchange_id, target_session_id, queued_id),
+                ).fetchone()
+                if leg_row is None:
+                    return None
+                leg = dict(leg_row)
+                exchange_row = connection.execute(
+                    "SELECT * FROM cross_chat_exchanges WHERE id=?",
+                    (exchange_id,),
+                ).fetchone()
+                if exchange_row is None:
+                    return None
+                exchange = dict(exchange_row)
+                if (
+                    leg.get("kind") != "status"
+                    and exchange.get("status") == "active"
+                    and str(exchange.get("active_leg_id") or "") != leg_id
+                ):
+                    return None
+                cursor = connection.execute(
+                    """
+                    UPDATE cross_chat_exchange_legs
+                    SET status='cancelled', response_state='closed',
+                        error_code=?, error=?, lifecycle_status='', updated_at=?
+                    WHERE id=? AND exchange_id=? AND target_session_id=?
+                      AND queued_id=? AND status='queued'
+                    """,
+                    (
+                        error_code,
+                        error,
+                        timestamp,
+                        leg_id,
+                        exchange_id,
+                        target_session_id,
+                        queued_id,
+                    ),
+                )
+                if int(cursor.rowcount or 0) != 1:
+                    return None
+                if leg.get("kind") != "status" and exchange.get("status") == "active":
+                    connection.execute(
+                        """
+                        UPDATE cross_chat_exchanges
+                        SET status='cancelled', error_code=?, error=?,
+                            lifecycle_status='', updated_at=?
+                        WHERE id=? AND status='active' AND active_leg_id=?
+                        """,
+                        (error_code, error, timestamp, exchange_id, leg_id),
+                    )
+                exchange = dict(connection.execute(
+                    "SELECT * FROM cross_chat_exchanges WHERE id=?",
+                    (exchange_id,),
+                ).fetchone())
+                leg = dict(connection.execute(
+                    "SELECT * FROM cross_chat_exchange_legs WHERE id=?",
+                    (leg_id,),
+                ).fetchone())
+                return exchange, leg
+
+        return await self._call(operation)
+
     async def cancel_exchange(
         self,
         exchange_id: str,
@@ -11035,6 +11160,45 @@ class CrossChatStore:
             return self._row(row)
         return await self._call(operation)
 
+    async def cancel_exact_queued_envelope(
+        self,
+        *,
+        envelope_id: str,
+        target_session_id: str,
+        queued_id: str,
+        error: str,
+    ) -> dict[str, Any] | None:
+        """Cancel only the envelope that still owns an exact queue row."""
+
+        timestamp = now_iso()
+
+        def operation() -> dict[str, Any] | None:
+            with self._transaction() as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE cross_chat_envelopes
+                    SET status='cancelled', error=?, lifecycle_status='',
+                        updated_at=?
+                    WHERE id=? AND target_session_id=? AND queued_id=?
+                      AND status='queued'
+                    """,
+                    (
+                        error,
+                        timestamp,
+                        envelope_id,
+                        target_session_id,
+                        queued_id,
+                    ),
+                )
+                if int(cursor.rowcount or 0) != 1:
+                    return None
+                return self._row(connection.execute(
+                    "SELECT * FROM cross_chat_envelopes WHERE id=?",
+                    (envelope_id,),
+                ).fetchone())
+
+        return await self._call(operation)
+
 
 CROSS_CHAT = CrossChatStore(CROSS_CHAT_DB_FILE)
 CROSS_CHAT_CAPABILITY_LOCK = asyncio.Lock()
@@ -11326,6 +11490,36 @@ def run_event_metadata(run_id: str) -> dict[str, Any]:
     return {key: value for key, value in metadata.items() if value is not None}
 
 
+def inherit_internal_status_run_metadata(
+    payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Mark every event emitted by an internal exchange-status provider run.
+
+    A renderer can reconnect between the hidden ``turn_started`` boundary and
+    a later trace event. Copying this narrow identity onto every run-scoped
+    event keeps that isolated event hidden without broadly duplicating normal
+    run metadata throughout the log.
+    """
+
+    stored = dict(payload or {})
+    run_id = str(stored.get("run_id") or "").strip()
+    metadata = run_event_metadata(run_id) if run_id else {}
+    if metadata.get("cross_chat_exchange_status") is not True:
+        return stored
+    for key in (
+        "purpose",
+        "cross_chat_exchange_id",
+        "cross_chat_exchange_leg_id",
+        "exchange_id",
+        "exchange_leg_id",
+        "cross_chat_exchange_status",
+    ):
+        value = metadata.get(key)
+        if value is not None:
+            stored.setdefault(key, value)
+    return stored
+
+
 async def append_event(
     session_id: str,
     event_type: str,
@@ -11357,7 +11551,7 @@ async def append_event(
         path = events_path(session_id)
         seq = await next_event_seq(session_id, path)
         ts = now_iso()
-        stored_payload = dict(payload or {})
+        stored_payload = inherit_internal_status_run_metadata(payload)
         output = stored_payload.get("output")
         if event_type == "tool_finished" and output is not None:
             output_text = event_output_text(output)
@@ -15009,6 +15203,7 @@ def public_queued_turn(session_id: str, item: dict[str, Any], position: int) -> 
     display_file_ids = item.get("display_file_ids")
     display_prompt = item.get("display_prompt")
     purpose = item.get("purpose")
+    secure_peer_barrier = purpose == SECURE_PEER_DELIVERY_PURPOSE
     # The provider prompt for an internal handoff contains authority metadata
     # and an untrusted relay wrapper. The queue may expose that a delivery is
     # waiting, but it must never expose the wrapper itself. Modern producers
@@ -15016,6 +15211,18 @@ def public_queued_turn(session_id: str, item: dict[str, Any], position: int) -> 
     if purpose == LOCAL_CROSS_CHAT_DELIVERY_PURPOSE:
         public_prompt = str(display_prompt or "Incoming cross-chat message")
         public_display_prompt: str | None = public_prompt
+        public_file_ids = list(
+            display_file_ids
+            if display_file_ids is not None
+            else item.get("file_ids") or []
+        )
+    elif secure_peer_barrier:
+        # Project only the immutable FIFO barrier. The remote envelope,
+        # provider wrapper, peer identity, body, and attachment identifiers
+        # remain private to the secure-peer lifecycle surface.
+        public_prompt = "Incoming secure-peer delivery"
+        public_display_prompt = public_prompt
+        public_file_ids = []
     else:
         public_prompt = str(
             display_prompt
@@ -15023,30 +15230,35 @@ def public_queued_turn(session_id: str, item: dict[str, Any], position: int) -> 
             else item.get("steering_prompt") or item.get("prompt") or ""
         )
         public_display_prompt = item.get("display_prompt")
+        public_file_ids = list(
+            display_file_ids
+            if display_file_ids is not None
+            else item.get("file_ids") or []
+        )
     delivery_uncertain = item.get("_native_delivery_fenced") is True
     paused = item.get("_paused_after_stop") is True or delivery_uncertain
     return {
         "queued_id": str(item.get("queued_id") or ""),
         "session_id": session_id,
         "prompt": public_prompt,
-        "file_ids": list(display_file_ids if display_file_ids is not None else item.get("file_ids") or []),
-        "backend": item.get("backend"),
-        "model": item.get("model"),
-        "effort": item.get("effort"),
+        "file_ids": public_file_ids,
+        "backend": None if secure_peer_barrier else item.get("backend"),
+        "model": None if secure_peer_barrier else item.get("model"),
+        "effort": None if secure_peer_barrier else item.get("effort"),
         "display_prompt": public_display_prompt,
         "purpose": purpose,
-        "digest_job_id": item.get("digest_job_id"),
-        "digest_detail": item.get("digest_detail"),
-        "source_session_id": item.get("source_session_id"),
-        "target_session_id": item.get("target_session_id"),
-        "chat_references": list(item.get("chat_references") or []),
-        "team_references": list(item.get("team_references") or []),
-        "cross_chat_envelope_id": item.get("cross_chat_envelope_id"),
-        "cross_chat_exchange_id": item.get("cross_chat_exchange_id"),
-        "cross_chat_exchange_leg_id": item.get("cross_chat_exchange_leg_id"),
-        "cross_chat_exchange_status": bool(item.get("cross_chat_exchange_status")),
-        "cross_chat_obligation_ids": list(item.get("cross_chat_obligation_ids") or []),
-        "cross_chat_exchange_ids": list(item.get("cross_chat_exchange_ids") or []),
+        "digest_job_id": None if secure_peer_barrier else item.get("digest_job_id"),
+        "digest_detail": None if secure_peer_barrier else item.get("digest_detail"),
+        "source_session_id": None if secure_peer_barrier else item.get("source_session_id"),
+        "target_session_id": None if secure_peer_barrier else item.get("target_session_id"),
+        "chat_references": [] if secure_peer_barrier else list(item.get("chat_references") or []),
+        "team_references": [] if secure_peer_barrier else list(item.get("team_references") or []),
+        "cross_chat_envelope_id": None if secure_peer_barrier else item.get("cross_chat_envelope_id"),
+        "cross_chat_exchange_id": None if secure_peer_barrier else item.get("cross_chat_exchange_id"),
+        "cross_chat_exchange_leg_id": None if secure_peer_barrier else item.get("cross_chat_exchange_leg_id"),
+        "cross_chat_exchange_status": False if secure_peer_barrier else bool(item.get("cross_chat_exchange_status")),
+        "cross_chat_obligation_ids": [] if secure_peer_barrier else list(item.get("cross_chat_obligation_ids") or []),
+        "cross_chat_exchange_ids": [] if secure_peer_barrier else list(item.get("cross_chat_exchange_ids") or []),
         "created_at": item.get("created_at"),
         "position": position,
         "paused": paused,
@@ -15070,10 +15282,6 @@ async def queued_turns_snapshot(session_id: str) -> list[dict[str, Any]]:
         public_queued_turn(session_id, item, idx + 1)
         for idx, item in enumerate(items)
         if str(item.get("queued_id") or "").strip()
-        # Same-server deliveries are visible as immutable FIFO rows. Secure
-        # peer deliveries remain hidden because their remote envelope is not a
-        # local-chat message and has a separate lifecycle surface.
-        and item.get("purpose") != SECURE_PEER_DELIVERY_PURPOSE
     ]
 
 
@@ -22909,7 +23117,16 @@ def timeline_index_event_is_hidden(event: dict[str, Any]) -> bool:
     # ordinary chat transitions are hidden, while a scheduled-job transition
     # is the terminal status for that job run. Both index builders handle that
     # distinction using their run-to-job maps before calling this predicate.
-    return str(event.get("type") or "") in TIMELINE_INDEX_HIDDEN_TYPES
+    event_type = str(event.get("type") or "")
+    if event_type in TIMELINE_INDEX_HIDDEN_TYPES:
+        return True
+    # A status delivery only carries an exchange's terminal state to the other
+    # agent. Its exchange summary is the user-facing row; neither the internal
+    # status leg nor its provider-turn stream may consume a pagination slot.
+    return event.get("cross_chat_exchange_status") is True or (
+        event_type.startswith("cross_chat_exchange_leg_")
+        and str(event.get("exchange_leg_kind") or "") == "status"
+    )
 
 
 def timeline_index_retire_native_steer_turn(
@@ -23317,6 +23534,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
     can_append = bool(
         cached and cached.get("inode") == stat.st_ino and
         cached.get("codex_scope_signature") == codex_scope_signature and
+        "internal_status_run_ids" in cached and
         0 <= int(cached.get("offset") or 0) < stat.st_size
     )
     records: list[dict[str, Any]] = cached["records"] if can_append else []
@@ -23379,6 +23597,11 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
     )
     fork_internal_run_ids: set[str] = (
         cached.get("fork_internal_run_ids") or set()
+        if can_append
+        else set()
+    )
+    internal_status_run_ids: set[str] = (
+        cached.get("internal_status_run_ids") or set()
         if can_append
         else set()
     )
@@ -23857,6 +24080,11 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                 continue
             if not event_files_belong_to_session(event, session_id):
                 continue
+            # The synthetic status turn_started row is intentionally not
+            # client-visible. Learn its run identity before that filter so
+            # legacy unmarked provider traces from the same run stay hidden.
+            if event.get("cross_chat_exchange_status") is True and run_id:
+                internal_status_run_ids.add(run_id)
             latest_seq = max(latest_seq, seq)
             if not is_client_visible_event(event):
                 continue
@@ -23905,6 +24133,14 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                 fork_internal_run_ids.add(run_id)
             if is_forked and (is_fork_internal or run_id in fork_internal_run_ids):
                 continue
+            # Older records tagged only some events in an internal status
+            # provider turn. Once its run identity is known, suppress the
+            # entire run before it can affect active-turn or pagination state.
+            if (
+                timeline_index_event_is_hidden(event)
+                or run_id in internal_status_run_ids
+            ):
+                continue
             indexed_job = (
                 event.get("job")
                 if isinstance(event.get("job"), dict)
@@ -23931,8 +24167,6 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                     current_turn_by_run,
                     active_turn_key,
                 )
-                continue
-            if timeline_index_event_is_hidden(event):
                 continue
             visible_count += 1
             indexed_job_title = str(
@@ -24442,6 +24676,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
         "run_history_key_by_occurrence": run_history_key_by_occurrence,
         "current_run_history_key": current_run_history_key,
         "fork_internal_run_ids": fork_internal_run_ids,
+        "internal_status_run_ids": internal_status_run_ids,
         "durable_child_codex_thread_ids": durable_child_codex_thread_ids,
         "visible_count": visible_count,
         "latest_seq": latest_seq,
@@ -25165,6 +25400,7 @@ def collect_semantic_timeline_events(
     job_timeline_group_by_run_start_seq: dict[int, str],
     job_timeline_group_by_runless_event_seq: dict[int, str],
     fork_internal_run_ids: set[str],
+    internal_status_run_ids: set[str],
     event_limit: int,
 ) -> list[dict[str, Any]]:
     if not selected:
@@ -25210,12 +25446,21 @@ def collect_semantic_timeline_events(
             except Exception:
                 continue
             seq = int(event.get("seq") or 0)
-            if seq <= 0 or is_fork_internal_event(event, fork_internal_run_ids):
+            if seq <= 0:
+                continue
+            run_id = str(event.get("run_id") or "").strip()
+            if event.get("cross_chat_exchange_status") is True and run_id:
+                internal_status_run_ids.add(run_id)
+            if is_fork_internal_event(event, fork_internal_run_ids):
                 continue
             if not is_client_visible_event(event):
                 continue
             event_type = str(event.get("type") or "")
-            run_id = str(event.get("run_id") or "").strip()
+            if (
+                timeline_index_event_is_hidden(event)
+                or run_id in internal_status_run_ids
+            ):
+                continue
             job_payload = (
                 event.get("job")
                 if isinstance(event.get("job"), dict)
@@ -25245,8 +25490,6 @@ def collect_semantic_timeline_events(
                     current_turn_by_run,
                     active_turn_key,
                 )
-                continue
-            if timeline_index_event_is_hidden(event):
                 continue
             key: str | None = None
             job_attempt_id: str | None = None
@@ -25720,6 +25963,9 @@ def read_semantic_timeline_page(
             cached.get("job_timeline_group_by_runless_event_seq") or {}
         )
         fork_internal_run_ids = set(cached.get("fork_internal_run_ids") or ())
+        internal_status_run_ids = set(
+            cached.get("internal_status_run_ids") or ()
+        )
         records_by_key = cached.get("by_key") or {}
         landmarks = index.get("landmarks") or []
         total = len(landmarks)
@@ -25780,6 +26026,7 @@ def read_semantic_timeline_page(
             job_timeline_group_by_runless_event_seq
         ),
         fork_internal_run_ids=fork_internal_run_ids,
+        internal_status_run_ids=internal_status_run_ids,
         event_limit=min(
             MAX_EVENT_RESPONSE_LIMIT,
             sum(
@@ -28103,6 +28350,8 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
             "agent_cross_chat_routes": True,
             "agent_ambient_local_handoffs": False,
             "live_same_server_request_reply": True,
+            "exact_queued_delivery_skip": True,
+            "secure_peer_fifo_barriers": True,
         },
         "live_request_reply": {
             "available": available,
@@ -32650,6 +32899,184 @@ def public_cross_chat_envelope(
             "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
         })
     return result
+
+
+def queued_cross_chat_delivery_skip_conflict(queued_id: str) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": "cross_chat_delivery_not_queued",
+            "message": (
+                "The queued cross-chat delivery no longer matches this exact "
+                "request or has already started. Refresh the queue before retrying."
+            ),
+            "queued_id": queued_id,
+        },
+    )
+
+
+async def skip_queued_cross_chat_delivery(
+    session_id: str,
+    queued_id: str,
+    req: SkipQueuedCrossChatDeliveryRequest,
+) -> dict[str, Any]:
+    """Skip one exact local delivery without admitting or reordering work."""
+
+    if session_id not in STORE.sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    envelope_id = str(req.cross_chat_envelope_id or "")
+    exchange_id = str(req.cross_chat_exchange_id or "")
+    exchange_leg_id = str(req.cross_chat_exchange_leg_id or "")
+
+    async def finish_exact_skip() -> dict[str, Any]:
+        terminal_envelope: dict[str, Any] | None = None
+        terminal_exchange: dict[str, Any] | None = None
+        terminal_leg: dict[str, Any] | None = None
+        remaining = 0
+
+        async with QUEUE_LOCK:
+            queue = QUEUED_TURNS.get(session_id)
+            original = list(queue or ())
+            index = next((
+                idx
+                for idx, item in enumerate(original)
+                if str(item.get("queued_id") or "") == queued_id
+            ), None)
+            if index is None:
+                # RUN_NOW_TURNS and CURRENT_TURNS are deliberately excluded:
+                # reaching either means promotion won this compare-and-skip.
+                raise queued_cross_chat_delivery_skip_conflict(queued_id)
+
+            item = original[index]
+            if item.get("purpose") != LOCAL_CROSS_CHAT_DELIVERY_PURPOSE:
+                raise queued_cross_chat_delivery_skip_conflict(queued_id)
+
+            item_envelope_id = str(item.get("cross_chat_envelope_id") or "")
+            item_exchange_id = str(item.get("cross_chat_exchange_id") or "")
+            item_exchange_leg_id = str(
+                item.get("cross_chat_exchange_leg_id") or ""
+            )
+            if envelope_id:
+                identity_matches = bool(
+                    item_envelope_id == envelope_id
+                    and not item_exchange_id
+                    and not item_exchange_leg_id
+                )
+                if not identity_matches:
+                    raise queued_cross_chat_delivery_skip_conflict(queued_id)
+                terminal_envelope = await CROSS_CHAT.cancel_exact_queued_envelope(
+                    envelope_id=envelope_id,
+                    target_session_id=session_id,
+                    queued_id=queued_id,
+                    error="queued target delivery was skipped by the user",
+                )
+                if terminal_envelope is None:
+                    raise queued_cross_chat_delivery_skip_conflict(queued_id)
+            else:
+                identity_matches = bool(
+                    not item_envelope_id
+                    and item_exchange_id == exchange_id
+                    and item_exchange_leg_id == exchange_leg_id
+                )
+                if not identity_matches:
+                    raise queued_cross_chat_delivery_skip_conflict(queued_id)
+                cancelled = await CROSS_CHAT.cancel_exact_queued_exchange_leg(
+                    exchange_id=exchange_id,
+                    leg_id=exchange_leg_id,
+                    target_session_id=session_id,
+                    queued_id=queued_id,
+                    error_code="cancelled_by_user",
+                    error="queued target delivery was skipped by the user",
+                )
+                if cancelled is None:
+                    raise queued_cross_chat_delivery_skip_conflict(queued_id)
+                terminal_exchange, terminal_leg = cancelled
+
+            remaining_items = original[:index] + original[index + 1:]
+            if remaining_items:
+                QUEUED_TURNS[session_id] = deque(remaining_items)
+            else:
+                QUEUED_TURNS.pop(session_id, None)
+            remaining = len(remaining_items)
+            try:
+                await append_durable_event(session_id, "turn_unqueued", {
+                    "queued_id": queued_id,
+                    "purpose": LOCAL_CROSS_CHAT_DELIVERY_PURPOSE,
+                    "cross_chat_envelope_id": envelope_id or None,
+                    "cross_chat_exchange_id": exchange_id or None,
+                    "cross_chat_exchange_leg_id": exchange_leg_id or None,
+                    "exchange_id": exchange_id or None,
+                    "exchange_leg_id": exchange_leg_id or None,
+                    "cross_chat_exchange_status": bool(
+                        item.get("cross_chat_exchange_status")
+                    ),
+                    "source_session_id": item.get("source_session_id"),
+                    "target_session_id": session_id,
+                    "remaining": remaining,
+                    "reason": "cross_chat_delivery_skipped",
+                    "message": "Skipped queued cross-chat delivery.",
+                })
+            except BaseException as exc:
+                # The exact ledger CAS is the irreversible ownership boundary.
+                # Restoring this row would leave a terminal delivery blocking
+                # FIFO forever, so recovery must consume the durable CAS instead.
+                logger.error(
+                    "could not persist skipped cross-chat queue tombstone "
+                    "session=%s queued_id=%s error=%s",
+                    session_id,
+                    queued_id,
+                    concise_error_message(exc),
+                )
+                raise
+
+        if terminal_envelope is not None:
+            await append_cross_chat_terminal_lifecycle(
+                terminal_envelope,
+                "Cross-chat delivery was skipped before the target agent started.",
+            )
+        elif terminal_exchange is not None and terminal_leg is not None:
+            await append_cross_chat_exchange_leg_terminal_lifecycle(
+                terminal_exchange,
+                terminal_leg,
+                "Cross-chat exchange delivery was skipped before target execution.",
+            )
+            if str(terminal_leg.get("kind") or "") != "status":
+                await append_cross_chat_exchange_terminal_lifecycle(
+                    terminal_exchange,
+                    "Cross-chat exchange delivery was skipped by the user.",
+                )
+                if (
+                    str(terminal_exchange.get("status") or "") == "cancelled"
+                    and str(terminal_exchange.get("error_code") or "")
+                    == "cancelled_by_user"
+                ):
+                    await maybe_deliver_cross_chat_exchange_failure_status(
+                        terminal_exchange,
+                        failed_session_id=session_id,
+                        failed_leg=terminal_leg,
+                    )
+
+        return {
+            "ok": True,
+            "skipped": True,
+            "queued_id": queued_id,
+            "remaining": remaining,
+            "cross_chat_envelope_id": envelope_id or None,
+            "cross_chat_exchange_id": exchange_id or None,
+            "cross_chat_exchange_leg_id": exchange_leg_id or None,
+        }
+
+    # Once the exact ledger CAS succeeds, cancellation must not strand its
+    # durable queue tombstone or lifecycle merely because the HTTP caller went
+    # away. This intentionally bypasses new-work blockers during update drain.
+    completion = asyncio.create_task(finish_exact_skip())
+    try:
+        return await asyncio.shield(completion)
+    except asyncio.CancelledError:
+        with suppress(BaseException):
+            await join_task_despite_caller_cancellation(completion)
+        raise
 
 
 async def cancel_queued_cross_chat_handoff(envelope_id: str) -> dict[str, Any]:
@@ -45062,6 +45489,7 @@ async def run_claude_sdk(
     pending_steer: dict[str, Any] | None = None
     message_task: asyncio.Task[Any] | None = None
     steer_task: asyncio.Task[Any] | None = None
+    first_activity_task: asyncio.Task[bool] | None = None
     provider_ready_tasks: set[asyncio.Task[bool]] = set()
     outputs_finished_run_ids: set[str] = set()
     manifest_watch_task: asyncio.Task[Any] | None = asyncio.create_task(
@@ -45091,11 +45519,48 @@ async def run_claude_sdk(
         provider_ready_tasks.add(task)
         task.add_done_callback(provider_ready_tasks.discard)
 
+    async def first_activity_timeout_after_ack(
+        logical_handle: Any,
+    ) -> bool:
+        """Return true only when an acknowledged turn stays fully silent."""
+
+        wait_acknowledged = getattr(logical_handle, "wait_acknowledged", None)
+        if not callable(wait_acknowledged):
+            return False
+        await wait_acknowledged()
+        await asyncio.sleep(
+            CLAUDE_SDK_POST_ACK_FIRST_ACTIVITY_TIMEOUT_SECONDS
+        )
+        # A terminal result can complete immediately before this timeout wins
+        # its scheduling race. That completion is provider activity even if
+        # the iterator consumer has not projected the frame yet.
+        return not bool(getattr(logical_handle, "done", False))
+
+    async def cancel_first_activity_watchdog() -> None:
+        nonlocal first_activity_task
+
+        task = first_activity_task
+        first_activity_task = None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def reset_first_activity_watchdog(logical_handle: Any) -> None:
+        nonlocal first_activity_task
+
+        await cancel_first_activity_watchdog()
+        first_activity_task = asyncio.create_task(
+            first_activity_timeout_after_ack(logical_handle)
+        )
+
     watch_provider_readiness(
         current_run_id,
         current_handle,
         already_published_ready=initial_provider_ready,
     )
+    await reset_first_activity_watchdog(current_handle)
 
     async def finish_outputs(
         logical_run_id: str,
@@ -45144,10 +45609,34 @@ async def run_claude_sdk(
             waiters = {message_task}
             if steer_task is not None:
                 waiters.add(steer_task)
+            if first_activity_task is not None:
+                waiters.add(first_activity_task)
             done, _pending = await asyncio.wait(
                 waiters,
                 return_when=asyncio.FIRST_COMPLETED,
             )
+
+            if (
+                first_activity_task is not None
+                and first_activity_task in done
+                and message_task not in done
+            ):
+                timed_out = first_activity_task.result()
+                first_activity_task = None
+                if timed_out:
+                    stream_error = (
+                        "Claude SDK acknowledged the turn but produced no provider "
+                        "activity within "
+                        f"{CLAUDE_SDK_POST_ACK_FIRST_ACTIVITY_TIMEOUT_SECONDS:g}s."
+                    )
+                    retire_supervisor = True
+                    logger.warning(
+                        "Claude SDK post-ACK first-activity timeout "
+                        "session=%s run=%s",
+                        session_id,
+                        current_run_id,
+                    )
+                    break
 
             if steer_task is not None and steer_task in done:
                 request = steer_task.result()
@@ -45253,9 +45742,17 @@ async def run_claude_sdk(
                 message = message_task.result()
             except StopAsyncIteration:
                 message_task = None
-                result_details = claude_sdk_result_details(
-                    await current_handle.wait_result()
-                )
+                if not bool(getattr(current_handle, "done", False)):
+                    stream_error = (
+                        "Claude SDK message stream ended before a terminal result "
+                        "became available."
+                    )
+                    retire_supervisor = True
+                    result_details = None
+                else:
+                    result_details = claude_sdk_result_details(
+                        await current_handle.wait_result()
+                    )
             except Exception as exc:
                 message_task = None
                 if bool(getattr(exc, "delivery_uncertain", False)):
@@ -45264,6 +45761,7 @@ async def run_claude_sdk(
                 result_details = None
             else:
                 message_task = None
+                await cancel_first_activity_watchdog()
                 message_provider_id = str(
                     claude_sdk_field(message, "session_id") or ""
                 )
@@ -45593,6 +46091,7 @@ async def run_claude_sdk(
                 # exact point onward the steering message is never safe to
                 # replay, even if local projection or bookkeeping fails.
                 steer_state["candidate_accepted"] = True
+                await reset_first_activity_watchdog(candidate_handle)
             except Exception as exc:
                 steer_state["candidate_failure_handled"] = True
                 if steer_state.get("candidate_authority_path") is not None:
@@ -45857,12 +46356,24 @@ async def run_claude_sdk(
                 candidate = steer_task.result()
                 if isinstance(candidate, dict):
                     unhandled_steer = candidate
-        for task in (message_task, steer_task):
+        for task in (message_task, steer_task, first_activity_task):
             if task is not None and not task.done():
                 task.cancel()
-        if message_task is not None or steer_task is not None:
+        if (
+            message_task is not None
+            or steer_task is not None
+            or first_activity_task is not None
+        ):
             await asyncio.gather(
-                *(task for task in (message_task, steer_task) if task is not None),
+                *(
+                    task
+                    for task in (
+                        message_task,
+                        steer_task,
+                        first_activity_task,
+                    )
+                    if task is not None
+                ),
                 return_exceptions=True,
             )
         if pending_steer is not None:
@@ -53005,7 +53516,9 @@ AGENT_HELPER_ROUTE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("GET", re.compile(r"^/api/agent/team/skills$")),
     ("GET", re.compile(r"^/api/agent/team/skills/[^/]+$")),
     ("GET", re.compile(r"^/api/agent/team/routes$")),
-    ("POST", re.compile(r"^/api/agent/team/routes/team_[0-9a-f]{32}$")),
+    # The handler validates the opaque team_<32 hex> route id so malformed
+    # values reach its stable 404 response instead of being hidden as 403.
+    ("POST", re.compile(r"^/api/agent/team/routes/[^/]+$")),
 )
 
 
@@ -61404,6 +61917,15 @@ async def cancel_cross_chat_handoff(envelope_id: str) -> dict[str, Any]:
 @app.delete("/api/sessions/{session_id}/queue/{queued_id}")
 async def delete_queued_turn(session_id: str, queued_id: str) -> dict[str, Any]:
     return await unqueue_turn(session_id, queued_id)
+
+
+@app.post("/api/sessions/{session_id}/queue/{queued_id}/skip-cross-chat-delivery")
+async def post_skip_queued_cross_chat_delivery(
+    session_id: str,
+    queued_id: str,
+    req: SkipQueuedCrossChatDeliveryRequest,
+) -> dict[str, Any]:
+    return await skip_queued_cross_chat_delivery(session_id, queued_id, req)
 
 
 @app.patch("/api/sessions/{session_id}/queue/{queued_id}")

@@ -782,6 +782,48 @@ class SecurePeerConnectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(closed["state"], "completed")
         self.assertEqual(len(self.runtime.submissions), before)
 
+    async def test_explicit_async_followup_preserves_secure_peer_multi_leg_exchange(self) -> None:
+        record = self.prepare_running(used_legs=1)
+        self.assertIn(
+            "--request-response --async-response",
+            agent_server.secure_peer_delivery_prompt(record),
+        )
+        token = await self.issue_secure_response(record, self.response_snapshot())
+        authority_copy = agent_server.cross_chat_provider_authority_block(
+            [],
+            self.root / "secure-response-authority.json",
+            "target",
+            {"secure_peer_response"},
+            exchange_response_grant=(
+                str(record["exchange_id"]),
+                str(record["envelope_id"]),
+            ),
+            exchange_response_followup_allowed=True,
+        )
+        self.assertIn(
+            "`--request-response --async-response`",
+            authority_copy,
+        )
+        request = Mock(headers={
+            "x-agentsdock-provider-capability": token,
+        })
+        receipt = await agent_server.submit_authorized_cross_chat_exchange_response(
+            str(record["exchange_id"]),
+            agent_server.CrossChatExchangeResponseRequest(
+                inbound_leg_id=str(record["envelope_id"]),
+                body="Question back to the peer",
+                request_response=True,
+                idempotency_key="secure-async-followup",
+            ),
+            request,
+        )
+        self.assertEqual(
+            receipt,
+            {"ok": True, "action": "response", "accepted": True},
+        )
+        self.assertTrue(self.runtime.submissions[-1]["request_response"])
+        self.assertEqual(self.runtime.submissions[-1]["expected_used_legs"], 2)
+
     async def test_automatic_terminal_reply_is_early_and_closes_ledger(self) -> None:
         record = self.prepare_running(used_legs=1)
         exact = self.response_snapshot()

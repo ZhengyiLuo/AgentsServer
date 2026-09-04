@@ -3,7 +3,7 @@ import io
 import json
 import unittest
 import urllib.error
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import agentsdock_chats
 
@@ -74,6 +74,129 @@ class AgentsDockChatsCLITests(unittest.TestCase):
         )
         sleep.assert_called_once_with(0.05)
 
+    def test_live_post_socket_timeout_outlives_server_lease(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self):
+                return json.dumps({"ok": True}).encode("utf-8")
+
+        class FakeOpener:
+            timeout = None
+
+            def open(self, _request, timeout):
+                self.timeout = timeout
+                return FakeResponse()
+
+        opener = FakeOpener()
+        with (
+            patch.object(agentsdock_chats, "environment", return_value="http://127.0.0.1:7850"),
+            patch.object(agentsdock_chats.urllib.request, "build_opener", return_value=opener),
+        ):
+            agentsdock_chats.post_json(
+                "/api/agent/cross-chat/handoffs",
+                {
+                    "wait_for_response": True,
+                    "response_timeout_seconds": 120,
+                },
+                "capability",
+            )
+        self.assertEqual(opener.timeout, 135.0)
+
+    def test_ask_posts_then_long_polls_exact_live_lease(self) -> None:
+        post = Mock(return_value={
+            "ok": True,
+            "action": "request_reply",
+            "accepted": True,
+            "exchange_id": "exchange_live",
+            "inbound_leg_id": "leg_question",
+            "live_response_lease_id": "lease_" + "a" * 32,
+        })
+        get = Mock(return_value={
+            "ok": True,
+            "exchange_id": "exchange_live",
+            "inbound_leg_id": "leg_answer",
+            "body": "Peer answer",
+            "request_response": False,
+        })
+        args = argparse.Namespace(
+            authority_file="authority.json",
+            route=None,
+            target="grant_" + "b" * 64,
+            message="Question",
+            idempotency_key=None,
+            timeout_seconds=75,
+        )
+        with (
+            patch.object(agentsdock_chats, "authority", return_value="capability"),
+            patch.object(agentsdock_chats, "post_json", post),
+            patch.object(agentsdock_chats, "get_json", get),
+        ):
+            result = agentsdock_chats.ask(args)
+        self.assertEqual(result["body"], "Peer answer")
+        self.assertEqual(result["inbound_leg_id"], "leg_answer")
+        wait_path = get.call_args.args[0]
+        self.assertIn("exchange_live/legs/leg_question/live-response?", wait_path)
+        self.assertIn("lease_id=lease_", wait_path)
+        self.assertEqual(get.call_args.kwargs["timeout"], 90)
+
+    def test_ask_rejects_server_without_live_wait_support(self) -> None:
+        args = argparse.Namespace(
+            authority_file="authority.json",
+            route="route_" + "a" * 32,
+            target=None,
+            message="Question",
+            idempotency_key=None,
+            timeout_seconds=75,
+        )
+        with (
+            patch.object(agentsdock_chats, "authority", return_value="capability"),
+            patch.object(
+                agentsdock_chats,
+                "post_json",
+                return_value={
+                    "ok": True,
+                    "route_id": args.route,
+                    "action": "request_reply",
+                    "accepted": True,
+                },
+            ),
+        ):
+            with self.assertRaisesRegex(
+                agentsdock_chats.ChatsCLIError,
+                "does not support a live response",
+            ):
+                agentsdock_chats.ask(args)
+
+    def test_secure_peer_ask_can_explicitly_use_async_response_delivery(self) -> None:
+        args = argparse.Namespace(
+            authority_file="authority.json",
+            route=None,
+            target="route_" + "a" * 32,
+            message="Question for peer server",
+            idempotency_key=None,
+            timeout_seconds=75,
+            async_response=True,
+        )
+        receipt = {
+            "ok": True,
+            "action": "request_reply",
+            "accepted": True,
+        }
+        post = Mock(return_value=receipt)
+        with (
+            patch.object(agentsdock_chats, "authority", return_value="capability"),
+            patch.object(agentsdock_chats, "post_json", post),
+        ):
+            self.assertEqual(agentsdock_chats.ask(args), receipt)
+        payload = post.call_args.args[1]
+        self.assertNotIn("wait_for_response", payload)
+        self.assertNotIn("response_timeout_seconds", payload)
+
     def test_list_uses_capability_scoped_route_endpoint(self) -> None:
         args = argparse.Namespace(authority_file="authority.json")
         with (
@@ -107,6 +230,10 @@ class AgentsDockChatsCLITests(unittest.TestCase):
                 "ok": True,
                 "action": "request_reply",
                 "accepted": True,
+                "exchange_id": "exchange_live",
+                "inbound_leg_id": "leg_live_answer",
+                "body": "Investigation complete",
+                "request_response": False,
             }
 
         with (
@@ -120,6 +247,8 @@ class AgentsDockChatsCLITests(unittest.TestCase):
         self.assertEqual(calls[0][1]["action"], "request_reply")
         self.assertEqual(calls[0][1]["body"], "investigate this")
         self.assertEqual(calls[0][1]["target_session_id"], handle)
+        self.assertTrue(calls[0][1]["wait_for_response"])
+        self.assertEqual(calls[0][1]["response_timeout_seconds"], 75)
         self.assertEqual(calls[0][1]["idempotency_key"], calls[1][1]["idempotency_key"])
 
     def test_direct_send_rejects_receipt_with_internal_identifiers(self) -> None:
@@ -157,7 +286,15 @@ class AgentsDockChatsCLITests(unittest.TestCase):
 
         def post(_path, payload, _capability):
             payloads.append(payload)
-            return {"ok": True, "action": "response", "accepted": True}
+            receipt = {"ok": True, "action": "response", "accepted": True}
+            if payload["request_response"]:
+                receipt.update({
+                    "exchange_id": "exchange_one",
+                    "inbound_leg_id": "leg_two",
+                    "body": "follow-up answer",
+                    "request_response": False,
+                })
+            return receipt
 
         with (
             patch.object(agentsdock_chats, "authority", return_value="capability"),
@@ -169,6 +306,8 @@ class AgentsDockChatsCLITests(unittest.TestCase):
         self.assertEqual(payloads[0]["inbound_leg_id"], "leg_one")
         self.assertFalse(payloads[0]["request_response"])
         self.assertTrue(payloads[1]["request_response"])
+        self.assertTrue(payloads[1]["wait_for_response"])
+        self.assertEqual(payloads[1]["response_timeout_seconds"], 75)
         self.assertNotEqual(payloads[0]["idempotency_key"], payloads[1]["idempotency_key"])
 
     def test_respond_accepts_only_strict_configured_route_receipt(self) -> None:
@@ -197,6 +336,70 @@ class AgentsDockChatsCLITests(unittest.TestCase):
         ):
             with self.assertRaises(agentsdock_chats.ChatsCLIError):
                 agentsdock_chats.respond(args)
+
+    def test_secure_peer_followup_can_explicitly_remain_async(self) -> None:
+        args = argparse.Namespace(
+            authority_file="authority.json",
+            exchange="exchange_peer",
+            inbound_leg="envelope_peer",
+            message="Question back to peer",
+            request_response=True,
+            async_response=True,
+            idempotency_key=None,
+            timeout_seconds=75,
+        )
+        receipt = {"ok": True, "action": "response", "accepted": True}
+        post = Mock(return_value=receipt)
+        with (
+            patch.object(agentsdock_chats, "authority", return_value="capability"),
+            patch.object(agentsdock_chats, "post_json", post),
+        ):
+            self.assertEqual(agentsdock_chats.respond(args), receipt)
+        payload = post.call_args.args[1]
+        self.assertTrue(payload["request_response"])
+        self.assertNotIn("wait_for_response", payload)
+        self.assertNotIn("response_timeout_seconds", payload)
+
+    def test_live_and_async_followups_use_distinct_retry_keys(self) -> None:
+        base = dict(
+            authority_file="authority.json",
+            exchange="exchange_peer",
+            inbound_leg="envelope_peer",
+            message="Question back to peer",
+            request_response=True,
+            idempotency_key=None,
+            timeout_seconds=75,
+        )
+        payloads = []
+
+        def post(_path, payload, _capability):
+            payloads.append(payload)
+            if payload.get("wait_for_response"):
+                return {
+                    "ok": True,
+                    "action": "response",
+                    "accepted": True,
+                    "exchange_id": "exchange_peer",
+                    "inbound_leg_id": "envelope_reply",
+                    "body": "Peer reply",
+                    "request_response": False,
+                }
+            return {"ok": True, "action": "response", "accepted": True}
+
+        with (
+            patch.object(agentsdock_chats, "authority", return_value="capability"),
+            patch.object(agentsdock_chats, "post_json", side_effect=post),
+        ):
+            agentsdock_chats.respond(
+                argparse.Namespace(**base, async_response=False)
+            )
+            agentsdock_chats.respond(
+                argparse.Namespace(**base, async_response=True)
+            )
+        self.assertNotEqual(
+            payloads[0]["idempotency_key"],
+            payloads[1]["idempotency_key"],
+        )
 
     def test_route_send_uses_opaque_route_path_and_no_target(self) -> None:
         args = argparse.Namespace(

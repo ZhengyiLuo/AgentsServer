@@ -1029,14 +1029,11 @@ EXPLICIT_STOP_FENCE_RELEASE_TIMEOUT_SECONDS = 5.0
 HEALTH_QUEUE_RECONCILE_INTERVAL_SECONDS = float(
     agentsdock_setting("HEALTH_QUEUE_RECONCILE_INTERVAL_SECONDS", "15")
 )
-# A pending update-when-idle reservation parks new user messages so the server
-# can reach idleness. If a long-running turn keeps it pending, that parking
-# locked every other chat out for 27 minutes (2026-09-04). After this grace
-# period the user's own messages are admitted again and the update waits for
-# the next natural idle moment instead.
-SERVER_UPDATE_PENDING_INTERACTIVE_FENCE_SECONDS = float(
-    agentsdock_setting("SERVER_UPDATE_PENDING_INTERACTIVE_FENCE_SECONDS", "120")
-)
+# A pending update-when-idle reservation is passive: it waits for a moment
+# when no work is running and never fences admission. Earlier releases parked
+# every new turn (including Force Send) behind the reservation so the server
+# could reach idleness, which locked every chat out for 27 minutes on
+# 2026-09-04 while one long turn ran.
 QUEUE_FENCE_LOG_INTERVAL_SECONDS = 60.0
 # Hidden cross-chat/secure-peer delivery rows retry admission when the target
 # chat is busy or the server is updating. A row whose admission keeps failing
@@ -53538,11 +53535,10 @@ async def _start_turn_locked(
     async with ACTIVE_LOCK:
         update_blocker = managed_server_update_admission_blocker()
         if update_blocker:
-            if update_blocker == MANAGED_SERVER_UPDATE_PENDING_DETAIL:
-                if not interactive_turn_may_bypass_pending_update(req):
-                    raise ManagedServerUpdatePendingError()
-            else:
-                raise HTTPException(status_code=503, detail=update_blocker)
+            # Only an update or restart that is actually replacing this
+            # process fences admission; a pending when-idle reservation never
+            # does.
+            raise HTTPException(status_code=503, detail=update_blocker)
         requested_backend = str(
             req.backend or sess.get("backend") or DEFAULT_BACKEND
         ).strip().lower()
@@ -54441,73 +54437,16 @@ def managed_server_update_blocker() -> str | None:
 
 
 def managed_server_update_admission_blocker() -> str | None:
-    """Fence new agent work while an update drains or replaces this process."""
+    """Fence new agent work only while an update or restart replaces this process.
 
-    blocker = managed_server_update_blocker()
-    if blocker:
-        return blocker
-    if managed_server_update_is_pending():
-        return MANAGED_SERVER_UPDATE_PENDING_DETAIL
-    return None
-
-
-PENDING_UPDATE_BYPASS_LOGGED_AT: dict[str, float] = {"at": float("-inf")}
-
-
-def pending_server_update_age_seconds(
-    status: dict[str, Any] | None = None,
-) -> float | None:
-    """Return how long the update-when-idle reservation has been pending."""
-
-    current = status if status is not None else read_server_update_status()
-    if not managed_server_update_is_pending(current):
-        return None
-    for name in ("pending_at", "updated_at"):
-        raw = str(current.get(name) or "").strip()
-        if not raw:
-            continue
-        try:
-            candidate = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        except ValueError:
-            continue
-        if candidate.tzinfo is None:
-            candidate = candidate.replace(tzinfo=timezone.utc)
-        return max(0.0, (datetime.now(timezone.utc) - candidate).total_seconds())
-    return None
-
-
-def interactive_turn_may_bypass_pending_update(req: "TurnRequest") -> bool:
-    """Admit a user's own message once a pending update has parked chats too long.
-
-    Parking every new message lets the server reach idleness quickly when the
-    active work is short. When a long turn keeps the reservation pending, the
-    parking locks the user out of every chat (27 minutes on 2026-09-04). After
-    ``SERVER_UPDATE_PENDING_INTERACTIVE_FENCE_SECONDS`` the user's interactive
-    turns run again and the update waits for the next natural idle moment.
-    Internal, scheduled, and cross-chat turns stay parked.
+    A pending update-when-idle reservation is deliberately NOT a blocker: it
+    waits for a moment when nothing is running and must never refuse a turn,
+    a Force Send, a scheduled job, or a provider control. Earlier releases
+    parked every new turn behind the reservation, which locked the operator
+    out of every chat while one long turn ran.
     """
 
-    if (
-        req.purpose
-        or req.cross_chat_envelope_id is not None
-        or req.cross_chat_exchange_id is not None
-        or req.cross_chat_exchange_leg_id is not None
-        or req.cross_chat_exchange_status
-        or req.secure_peer_envelope_id is not None
-    ):
-        return False
-    age = pending_server_update_age_seconds()
-    if age is None or age < SERVER_UPDATE_PENDING_INTERACTIVE_FENCE_SECONDS:
-        return False
-    now = time.monotonic()
-    if now - PENDING_UPDATE_BYPASS_LOGGED_AT["at"] >= QUEUE_FENCE_LOG_INTERVAL_SECONDS:
-        PENDING_UPDATE_BYPASS_LOGGED_AT["at"] = now
-        logger.warning(
-            "pending server update has parked chats for %.0fs; admitting "
-            "interactive turns until the server is naturally idle",
-            age,
-        )
-    return True
+    return managed_server_update_blocker()
 
 
 def live_unsafe_http_mutation_ids_locked() -> list[str]:

@@ -243,80 +243,36 @@ class ExplicitStopDeadlineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fences, {})
 
 
-class PendingUpdateGraceTests(unittest.TestCase):
-    def pending_status(self, root: Path, *, age_seconds: float) -> None:
-        agent_server.write_fresh_server_update_status(
-            phase="pending",
-            schedule_id="e" * 32,
-            target_version="1.1.0",
-            track="stable",
-            when_idle=True,
-            pending_at=utc(age_seconds),
-        )
-
-    def test_recent_reservation_still_parks_interactive_turns(self):
+class PendingUpdateNeverFencesTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pending_reservation_blocks_nothing(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             with patch.object(
                 agent_server,
                 "SERVER_UPDATE_STATUS_FILE",
                 root / "status.json",
-            ), patch.object(
-                agent_server,
-                "PENDING_UPDATE_BYPASS_LOGGED_AT",
-                {"at": float("-inf")},
-            ):
-                self.pending_status(root, age_seconds=5)
-                self.assertFalse(
-                    agent_server.interactive_turn_may_bypass_pending_update(
-                        agent_server.TurnRequest(prompt="hi"),
-                    )
+            ), patch.object(agent_server, "BUSY_SESSIONS", {"busy-chat"}), \
+                 patch.object(agent_server, "MAX_ACTIVE_AGENT_RUNS", 0), \
+                 patch.object(agent_server, "JOB_MAX_ACTIVE_RUNS", 0), \
+                 patch.object(
+                     agent_server,
+                     "host_pressure_snapshot",
+                     return_value={"available_mem_mb": 1_000_000},
+                 ):
+                agent_server.write_fresh_server_update_status(
+                    phase="pending",
+                    schedule_id="e" * 32,
+                    target_version="1.1.0",
+                    track="stable",
+                    when_idle=True,
+                    pending_at=utc(3600),
                 )
+                self.assertTrue(agent_server.managed_server_update_is_pending())
+                self.assertIsNone(agent_server.managed_server_update_admission_blocker())
+                self.assertIsNone(await agent_server.turn_start_blocker())
+                self.assertIsNone(await agent_server.scheduled_job_blocker("other-chat"))
 
-    def test_stale_reservation_admits_interactive_turns_only(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            with patch.object(
-                agent_server,
-                "SERVER_UPDATE_STATUS_FILE",
-                root / "status.json",
-            ), patch.object(
-                agent_server,
-                "PENDING_UPDATE_BYPASS_LOGGED_AT",
-                {"at": float("-inf")},
-            ), patch.object(
-                agent_server,
-                "SERVER_UPDATE_PENDING_INTERACTIVE_FENCE_SECONDS",
-                120.0,
-            ):
-                self.pending_status(root, age_seconds=600)
-                with self.assertLogs(agent_server.logger, level="WARNING") as logs:
-                    self.assertTrue(
-                        agent_server.interactive_turn_may_bypass_pending_update(
-                            agent_server.TurnRequest(prompt="hi"),
-                        )
-                    )
-                self.assertTrue(
-                    any("parked chats" in line for line in logs.output)
-                )
-                self.assertFalse(
-                    agent_server.interactive_turn_may_bypass_pending_update(
-                        agent_server.TurnRequest(
-                            prompt="job",
-                            purpose="scheduled_job",
-                        ),
-                    )
-                )
-                self.assertFalse(
-                    agent_server.interactive_turn_may_bypass_pending_update(
-                        agent_server.TurnRequest(
-                            prompt="delivery",
-                            cross_chat_envelope_id="env-1",
-                        ),
-                    )
-                )
-
-    def test_no_reservation_means_no_bypass(self):
+    async def test_active_update_still_fences(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             with patch.object(
@@ -324,11 +280,14 @@ class PendingUpdateGraceTests(unittest.TestCase):
                 "SERVER_UPDATE_STATUS_FILE",
                 root / "status.json",
             ):
-                self.assertIsNone(agent_server.pending_server_update_age_seconds())
-                self.assertFalse(
-                    agent_server.interactive_turn_may_bypass_pending_update(
-                        agent_server.TurnRequest(prompt="hi"),
-                    )
+                agent_server.write_fresh_server_update_status(
+                    phase="installing",
+                    update_id="update-1",
+                    track="stable",
+                )
+                self.assertEqual(
+                    agent_server.managed_server_update_admission_blocker(),
+                    agent_server.MANAGED_SERVER_UPDATE_ACTIVE_DETAIL,
                 )
 
 

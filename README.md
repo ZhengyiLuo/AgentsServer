@@ -587,6 +587,10 @@ and manual restart remain available while the reservation is pending. The
 server begins maintenance only when one shared-lock snapshot proves it is
 actually idle; that same atomic transition closes new-work admission. A
 pending reservation survives a manual restart and is re-armed after startup.
+While it is pending it fences nothing: new turns, Force Send, scheduled jobs,
+and provider controls are all admitted, and the update simply waits for the
+next moment nothing is running. (Releases before 0.1.26-beta.31 parked new
+turns behind the reservation; that behavior is gone.)
 
 ## Uninstalling AgentsServer
 

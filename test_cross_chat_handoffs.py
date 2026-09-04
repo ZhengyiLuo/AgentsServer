@@ -3716,7 +3716,17 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             receipt.update(response)
             return receipt
 
+        initial_submission_started = asyncio.Event()
+
         async def start_initial(exchange, leg):
+            # Submission is downstream of exact waiter registration. This is
+            # the durable synchronization point for the test; a fixed number
+            # of event-loop yields cannot bound a SQLite worker on loaded CI.
+            self.assertIn(
+                (str(exchange["id"]), str(leg["id"])),
+                agent_server.CROSS_CHAT_LIVE_RESPONSE_WAITERS,
+            )
+            initial_submission_started.set()
             running = await agent_server.CROSS_CHAT.update_exchange_leg(
                 leg["id"],
                 expected={"registered"},
@@ -3727,7 +3737,20 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
 
         submit = AsyncMock(side_effect=start_initial)
         lifecycle = AsyncMock()
+        create_authorized = agent_server.create_authorized_cross_chat_instruction
+
+        async def delayed_create_authorized(*args, **kwargs):
+            # Reproduce a slow SQLite/worker handoff deterministically. The old
+            # 100 x sleep(0) poll completed before this delay on Linux CI.
+            await asyncio.sleep(0.02)
+            return await create_authorized(*args, **kwargs)
+
         with (
+            patch.object(
+                agent_server,
+                "create_authorized_cross_chat_instruction",
+                side_effect=delayed_create_authorized,
+            ),
             patch.object(agent_server, "append_cross_chat_exchange_registered", lifecycle),
             patch.object(agent_server, "append_cross_chat_exchange_leg_lifecycle", lifecycle),
             patch.object(agent_server, "append_cross_chat_exchange_leg_terminal_lifecycle", lifecycle),
@@ -3750,10 +3773,10 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
                     source_token,
                 )
             )
-            for _ in range(100):
-                if agent_server.CROSS_CHAT_LIVE_RESPONSE_WAITERS:
-                    break
-                await asyncio.sleep(0)
+            await asyncio.wait_for(
+                initial_submission_started.wait(),
+                timeout=5,
+            )
             self.assertEqual(len(agent_server.CROSS_CHAT_LIVE_RESPONSE_WAITERS), 1)
             exchange = await agent_server.CROSS_CHAT.get_exchange(exchange_ids[0])
             inbound = (await agent_server.CROSS_CHAT.exchange_legs(exchange_ids[0]))[0]

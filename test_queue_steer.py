@@ -2194,7 +2194,10 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
             agent_server,
             "stop_turn",
             stop_turn,
-        ):
+        ), patch.object(
+            agent_server,
+            "schedule_next_queued_turn",
+        ) as schedule_next:
             force_send = asyncio.create_task(
                 run_queued_turn_now("chat-1", "queued-steer")
             )
@@ -2214,6 +2217,7 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             stop_turn.await_args.kwargs["_admission_ready"].is_set()
         )
+        schedule_next.assert_called_once_with("chat-1")
 
     async def test_stop_after_promotion_holds_run_now_and_clears_cached_success(
         self,

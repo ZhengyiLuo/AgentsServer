@@ -824,7 +824,9 @@ class RuntimeDiagnosticTests(unittest.TestCase):
         )
         args = captured["args"]
         kwargs = captured["kwargs"]
+        self.assertEqual(args[1], "--disable")
         self.assertEqual(args[-1], "https://api.anthropic.com/v1/models?limit=1000")
+        self.assertNotIn("--noproxy", args)
         self.assertIn("--max-time", args)
         self.assertIn("--max-filesize", args)
         self.assertEqual(args[args.index("--header") + 1], "@-")
@@ -875,6 +877,8 @@ class RuntimeDiagnosticTests(unittest.TestCase):
             {
                 "ANTHROPIC_API_KEY": "test-secret-never-log",
                 "ANTHROPIC_BASE_URL": "http://127.0.0.1:8099/v1",
+                "ALL_PROXY": "http://proxy.example.test:8080",
+                "HTTP_PROXY": "http://proxy.example.test:8080",
             },
         ), patch.object(
             agent_server.shutil,
@@ -893,6 +897,9 @@ class RuntimeDiagnosticTests(unittest.TestCase):
             run.call_args.args[0][-1],
             "http://127.0.0.1:8099/v1/models?limit=1000",
         )
+        args = run.call_args.args[0]
+        self.assertEqual(args[1], "--disable")
+        self.assertEqual(args[args.index("--noproxy") + 1], "*")
 
     def test_claude_models_api_trickle_has_hard_process_deadline(self) -> None:
         with patch.dict(

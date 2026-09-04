@@ -41791,9 +41791,13 @@ def discover_claude_provider_models(
         child_env = runner_env()
         for secret_name in CLAUDE_PROVIDER_SECRET_ENV_NAMES:
             child_env.pop(secret_name, None)
-        result = subprocess.run(
+        curl_args = [curl_bin, "--disable"]
+        if parsed_base.scheme == "http":
+            # Plain HTTP is allowed only for loopback. Never let inherited
+            # proxy settings send that credential-bearing request elsewhere.
+            curl_args.extend(["--noproxy", "*"])
+        curl_args.extend(
             [
-                curl_bin,
                 "--fail",
                 "--silent",
                 "--show-error",
@@ -41808,7 +41812,10 @@ def discover_claude_provider_models(
                 "--user-agent",
                 f"AgentsServer/{SERVER_VERSION}",
                 endpoint,
-            ],
+            ]
+        )
+        result = subprocess.run(
+            curl_args,
             cwd=DEFAULT_CWD if Path(DEFAULT_CWD).exists() else str(Path.home()),
             env=child_env,
             input=header_bytes,

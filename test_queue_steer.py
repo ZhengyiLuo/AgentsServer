@@ -1183,9 +1183,13 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         self.previous_queued = agent_server.QUEUED_TURNS
         self.previous_run_now = agent_server.RUN_NOW_TURNS
         self.previous_steering = agent_server.STEERING_SESSIONS
+        self.previous_steering_wait_tasks = agent_server.STEERING_WAIT_TASKS
         self.previous_run_now_requests = agent_server.RUN_NOW_REQUESTS
         self.previous_run_now_completed = agent_server.RUN_NOW_COMPLETED_RESULTS
         self.previous_current = agent_server.CURRENT_TURNS
+        self.previous_active = agent_server.ACTIVE
+        self.previous_busy = agent_server.BUSY_SESSIONS
+        self.previous_queue_start_tasks = agent_server.QUEUE_START_TASKS
         agent_server.STORE.sessions = {
             "chat-1": {"id": "chat-1", "title": "Chat", "backend": "codex"},
         }
@@ -1199,8 +1203,12 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         }
         agent_server.RUN_NOW_TURNS = {}
         agent_server.STEERING_SESSIONS = set()
+        agent_server.STEERING_WAIT_TASKS = {}
         agent_server.RUN_NOW_REQUESTS = {}
         agent_server.RUN_NOW_COMPLETED_RESULTS = OrderedDict()
+        agent_server.ACTIVE = {}
+        agent_server.BUSY_SESSIONS = set()
+        agent_server.QUEUE_START_TASKS = {}
         agent_server.CURRENT_TURNS = {
             "chat-1": {
                 "run_id": "run-original",
@@ -1211,13 +1219,349 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         }
 
     async def asyncTearDown(self) -> None:
+        live_waiters = [
+            owner[2]
+            for owner in agent_server.STEERING_WAIT_TASKS.values()
+            if not owner[2].done()
+        ]
+        for task in live_waiters:
+            task.cancel()
+        if live_waiters:
+            await asyncio.gather(*live_waiters, return_exceptions=True)
         agent_server.STORE.sessions = self.previous_sessions
         agent_server.QUEUED_TURNS = self.previous_queued
         agent_server.RUN_NOW_TURNS = self.previous_run_now
         agent_server.STEERING_SESSIONS = self.previous_steering
+        agent_server.STEERING_WAIT_TASKS = self.previous_steering_wait_tasks
         agent_server.RUN_NOW_REQUESTS = self.previous_run_now_requests
         agent_server.RUN_NOW_COMPLETED_RESULTS = self.previous_run_now_completed
         agent_server.CURRENT_TURNS = self.previous_current
+        agent_server.ACTIVE = self.previous_active
+        agent_server.BUSY_SESSIONS = self.previous_busy
+        agent_server.QUEUE_START_TASKS = self.previous_queue_start_tasks
+
+    async def test_idle_orphaned_steering_fence_self_heals_before_force_send(
+        self,
+    ) -> None:
+        agent_server.CURRENT_TURNS.clear()
+        agent_server.STEERING_SESSIONS.add("chat-1")
+
+        with patch.object(
+            agent_server,
+            "_run_queued_turn_now_once",
+            new_callable=AsyncMock,
+            return_value={"ok": True, "queued_id": "queued-steer"},
+        ) as handoff:
+            result = await agent_server.run_queued_turn_now(
+                "chat-1",
+                "queued-steer",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertNotIn("chat-1", agent_server.STEERING_SESSIONS)
+        handoff.assert_awaited_once()
+
+    async def test_idle_reconciliation_keeps_live_owner_but_prunes_done_owner(
+        self,
+    ) -> None:
+        agent_server.CURRENT_TURNS.clear()
+        agent_server.STEERING_SESSIONS.add("chat-1")
+        release = asyncio.Event()
+
+        async def live_operation() -> dict[str, object]:
+            await release.wait()
+            return {"ok": True}
+
+        live_task = asyncio.create_task(live_operation())
+        setattr(live_task, "_agentsdock_force_send_queued_id", "queued-old")
+        setattr(live_task, "_agentsdock_force_send_started_at", time.monotonic())
+        agent_server.RUN_NOW_REQUESTS["chat-1"] = ("queued-old", live_task)
+        try:
+            repaired = await agent_server.reconcile_idle_queue_session(
+                "chat-1",
+                schedule=False,
+                reason="test_live_owner",
+            )
+            self.assertFalse(repaired)
+            self.assertIn("chat-1", agent_server.STEERING_SESSIONS)
+
+            release.set()
+            await live_task
+            repaired = await agent_server.reconcile_idle_queue_session(
+                "chat-1",
+                schedule=False,
+                reason="test_done_owner",
+            )
+        finally:
+            if not live_task.done():
+                live_task.cancel()
+                await asyncio.gather(live_task, return_exceptions=True)
+
+        self.assertTrue(repaired)
+        self.assertNotIn("chat-1", agent_server.RUN_NOW_REQUESTS)
+        self.assertNotIn("chat-1", agent_server.STEERING_SESSIONS)
+
+    async def test_idle_reconciliation_expires_stale_owner_and_restores_fenced_row(
+        self,
+    ) -> None:
+        agent_server.CURRENT_TURNS.clear()
+        agent_server.QUEUED_TURNS.clear()
+        agent_server.STEERING_SESSIONS.add("chat-1")
+
+        async def stuck_operation() -> dict[str, object]:
+            await asyncio.Event().wait()
+            return {"ok": True}
+
+        stale_task = asyncio.create_task(stuck_operation())
+        setattr(
+            stale_task,
+            "_agentsdock_force_send_started_at",
+            time.monotonic() - 60,
+        )
+        setattr(
+            stale_task,
+            "_agentsdock_force_send_queued_id",
+            "queued-steer",
+        )
+        agent_server.RUN_NOW_REQUESTS["chat-1"] = (
+            "queued-steer",
+            stale_task,
+        )
+        fenced = {
+            "queued_id": "queued-steer",
+            "prompt": "Change course now.",
+            "file_ids": [],
+            "_durable": True,
+            "_paused_after_stop": True,
+            "_native_delivery_fenced": True,
+        }
+
+        with patch.object(
+            agent_server,
+            "RUN_NOW_IDLE_OWNER_TIMEOUT_SECONDS",
+            0.01,
+        ), patch.object(
+            agent_server,
+            "scan_queued_turns_from_events",
+            return_value={"chat-1": [fenced]},
+        ), patch.object(
+            agent_server,
+            "schedule_next_queued_turn",
+        ) as schedule_next:
+            repaired = await agent_server.reconcile_idle_queue_session(
+                "chat-1",
+                schedule=True,
+                reason="test_stale_owner",
+            )
+
+        self.assertTrue(repaired)
+        self.assertTrue(stale_task.cancelled())
+        self.assertNotIn("chat-1", agent_server.RUN_NOW_REQUESTS)
+        self.assertNotIn("chat-1", agent_server.STEERING_SESSIONS)
+        restored = agent_server.QUEUED_TURNS["chat-1"][0]
+        self.assertIs(restored, fenced)
+        self.assertTrue(restored["_paused_after_stop"])
+        self.assertTrue(restored["_native_delivery_fenced"])
+        schedule_next.assert_not_called()
+
+    async def test_ownerless_transitioning_promotion_is_released_when_idle(
+        self,
+    ) -> None:
+        agent_server.CURRENT_TURNS.clear()
+        agent_server.QUEUED_TURNS.clear()
+        agent_server.RUN_NOW_TURNS["chat-1"] = {
+            "queued_id": "queued-steer",
+            "prompt": "Change course now.",
+            "file_ids": [],
+            "_durable": True,
+            "_paused_after_stop": False,
+            "_update_transitioning": True,
+        }
+        agent_server.STEERING_SESSIONS.add("chat-1")
+
+        with patch.object(
+            agent_server,
+            "schedule_next_queued_turn",
+        ) as schedule_next:
+            repaired = await agent_server.reconcile_idle_queue_session(
+                "chat-1",
+                schedule=True,
+                reason="test_transitioning_owner",
+            )
+
+        self.assertTrue(repaired)
+        self.assertNotIn("chat-1", agent_server.STEERING_SESSIONS)
+        self.assertNotIn(
+            "_update_transitioning",
+            agent_server.RUN_NOW_TURNS["chat-1"],
+        )
+        schedule_next.assert_called_once_with("chat-1")
+
+    async def test_stale_owner_restores_unfenced_row_for_normal_delivery(
+        self,
+    ) -> None:
+        agent_server.CURRENT_TURNS.clear()
+        agent_server.QUEUED_TURNS.clear()
+        agent_server.STEERING_SESSIONS.add("chat-1")
+
+        async def stuck_operation() -> dict[str, object]:
+            await asyncio.Event().wait()
+            return {"ok": True}
+
+        stale_task = asyncio.create_task(stuck_operation())
+        setattr(
+            stale_task,
+            "_agentsdock_force_send_started_at",
+            time.monotonic() - 60,
+        )
+        agent_server.RUN_NOW_REQUESTS["chat-1"] = (
+            "queued-steer",
+            stale_task,
+        )
+        recovered = {
+            "queued_id": "queued-steer",
+            "prompt": "Change course now.",
+            "file_ids": [],
+            "_durable": True,
+            "_paused_after_stop": False,
+        }
+
+        with patch.object(
+            agent_server,
+            "RUN_NOW_IDLE_OWNER_TIMEOUT_SECONDS",
+            0.01,
+        ), patch.object(
+            agent_server,
+            "scan_queued_turns_from_events",
+            return_value={"chat-1": [recovered]},
+        ), patch.object(
+            agent_server,
+            "schedule_next_queued_turn",
+        ) as schedule_next:
+            repaired = await agent_server.reconcile_idle_queue_session(
+                "chat-1",
+                schedule=True,
+                reason="test_stale_unfenced_owner",
+            )
+
+        self.assertTrue(repaired)
+        self.assertTrue(stale_task.cancelled())
+        self.assertIs(agent_server.QUEUED_TURNS["chat-1"][0], recovered)
+        schedule_next.assert_called_once_with("chat-1")
+
+    async def test_delivery_fenced_row_cannot_be_force_sent_again(self) -> None:
+        fenced = agent_server.QUEUED_TURNS["chat-1"][0]
+        fenced["_paused_after_stop"] = True
+        fenced["_native_delivery_fenced"] = True
+
+        with self.assertRaises(agent_server.HTTPException) as raised:
+            await agent_server.run_queued_turn_now(
+                "chat-1",
+                "queued-steer",
+            )
+
+        detail = raised.exception.detail
+        self.assertEqual(detail["guard"], "delivery_uncertain")
+        self.assertFalse(detail["retryable"])
+        self.assertIs(agent_server.QUEUED_TURNS["chat-1"][0], fenced)
+        self.assertNotIn("chat-1", agent_server.STEERING_SESSIONS)
+        self.assertNotIn("chat-1", agent_server.RUN_NOW_REQUESTS)
+
+    async def test_native_provider_handoff_deadline_only_expires_before_accept(
+        self,
+    ) -> None:
+        selected = agent_server.QUEUED_TURNS["chat-1"][0]
+
+        async def exercise_pre_accept() -> agent_server.NativeSteerHandoffError:
+            provider_queue: asyncio.Queue[dict[str, object]] = asyncio.Queue(
+                maxsize=1
+            )
+            future: asyncio.Future[dict[str, object]] = (
+                asyncio.get_running_loop().create_future()
+            )
+            request: dict[str, object] = {
+                "selected": selected,
+                "future": future,
+                "phase": "queued",
+                "accepted_event": asyncio.Event(),
+            }
+            provider_queue.put_nowait(request)
+            try:
+                with patch.object(
+                    agent_server,
+                    "RUN_NOW_PROVIDER_HANDOFF_TIMEOUT_SECONDS",
+                    0.01,
+                ):
+                    await agent_server.await_native_steer_result(
+                        "chat-1",
+                        selected,
+                        backend="codex",
+                        native_steer_queue=provider_queue,
+                        request=request,
+                        future=future,
+                    )
+            except agent_server.NativeSteerHandoffError as exc:
+                return exc
+            finally:
+                if not future.done():
+                    future.cancel()
+            self.fail("handoff deadline did not raise")
+
+        pre_accept = await exercise_pre_accept()
+        self.assertTrue(pre_accept.safe_to_requeue)
+        self.assertFalse(pre_accept.delivery_uncertain)
+        self.assertNotIn("_native_delivery_fenced", selected)
+
+        provider_queue = asyncio.Queue(maxsize=1)
+        future = asyncio.get_running_loop().create_future()
+        accepted_event = asyncio.Event()
+        request = {
+            "selected": selected,
+            "future": future,
+            "phase": "accepted",
+            "accepted_event": accepted_event,
+        }
+        accepted_event.set()
+        with patch.object(
+            agent_server,
+            "RUN_NOW_PROVIDER_HANDOFF_TIMEOUT_SECONDS",
+            0.01,
+        ):
+            owner = asyncio.create_task(agent_server.await_native_steer_result(
+                "chat-1",
+                selected,
+                backend="codex",
+                native_steer_queue=provider_queue,
+                request=request,
+                future=future,
+            ))
+            await asyncio.sleep(0.02)
+            self.assertFalse(owner.done())
+            future.set_result({"ok": True, "queued_id": "queued-steer"})
+            result = await owner
+        self.assertTrue(result["ok"])
+        self.assertNotIn("_native_delivery_fenced", selected)
+
+    async def test_cancelled_steering_waiter_always_releases_its_exact_fence(
+        self,
+    ) -> None:
+        agent_server.CURRENT_TURNS.clear()
+        agent_server.QUEUED_TURNS.clear()
+        agent_server.BUSY_SESSIONS.add("chat-1")
+        agent_server.STEERING_SESSIONS.add("chat-1")
+        waiter = agent_server.schedule_steered_turn_slot_waiter(
+            "chat-1",
+            "queued-steer",
+        )
+        await asyncio.sleep(0)
+
+        waiter.cancel()
+        agent_server.BUSY_SESSIONS.discard("chat-1")
+        await asyncio.gather(waiter, return_exceptions=True)
+        await asyncio.sleep(0)
+
+        self.assertNotIn("chat-1", agent_server.STEERING_SESSIONS)
+        self.assertNotIn("chat-1", agent_server.STEERING_WAIT_TASKS)
 
     async def test_duplicate_force_send_requests_join_one_handoff(self) -> None:
         started = asyncio.Event()
@@ -1540,11 +1884,18 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
                 run_queued_turn_now("chat-1", "queued-steer")
             )
             await started.wait()
-            with self.assertRaisesRegex(
-                agent_server.HTTPException,
-                "Another Force Send is already being applied",
-            ):
+            with self.assertRaises(agent_server.HTTPException) as raised:
                 await run_queued_turn_now("chat-1", "queued-other")
+            detail = raised.exception.detail
+            self.assertIn(
+                "Another Force Send is already being applied",
+                detail["message"],
+            )
+            self.assertEqual(detail["guard"], "run_now_request")
+            self.assertEqual(detail["owner"]["queued_id"], "queued-steer")
+            self.assertTrue(detail["owner"]["operation_id"].startswith("force_send_"))
+            self.assertIsNotNone(detail["owner"]["age_seconds"])
+            self.assertEqual(detail["owner"]["phase"], "admission")
             release.set()
             await first
 
@@ -2040,8 +2391,14 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
             "queued_id": "already-steering",
             "prompt": "First steer",
         }
-        with self.assertRaisesRegex(agent_server.HTTPException, "already being applied"):
+        with self.assertRaises(agent_server.HTTPException) as raised:
             await run_queued_turn_now("chat-1", "queued-steer")
+        detail = raised.exception.detail
+        self.assertEqual(detail["guard"], "run_now_promotion")
+        self.assertEqual(detail["owner"]["queued_id"], "already-steering")
+        # The newly admitted request is the observer, not the stale owner.
+        self.assertIsNone(detail["owner"]["operation_id"])
+        self.assertIsNone(detail["owner"]["age_seconds"])
         self.assertEqual(agent_server.RUN_NOW_TURNS["chat-1"]["queued_id"], "already-steering")
         self.assertEqual(len(agent_server.QUEUED_TURNS["chat-1"]), 1)
 
@@ -2485,17 +2842,17 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rebuilt, 0)
         self.assertNotIn("chat-1", agent_server.QUEUED_TURNS)
 
-    def test_stopped_runner_does_not_schedule_a_second_steering_drain(self) -> None:
+    def test_finished_runner_schedules_owner_fenced_queue_reconciliation(self) -> None:
         agent_server.RUN_NOW_TURNS["chat-1"] = {
             "queued_id": "queued-steer",
             "prompt": "Run this next.",
         }
 
-        self.assertFalse(should_schedule_queue_after_finish("chat-1", stopped=True))
-        self.assertFalse(should_schedule_queue_after_finish("chat-1", stopped=False))
+        self.assertTrue(should_schedule_queue_after_finish("chat-1", stopped=True))
+        self.assertTrue(should_schedule_queue_after_finish("chat-1", stopped=False))
         agent_server.RUN_NOW_TURNS.clear()
         agent_server.STEERING_SESSIONS.add("chat-1")
-        self.assertFalse(should_schedule_queue_after_finish("chat-1", stopped=False))
+        self.assertTrue(should_schedule_queue_after_finish("chat-1", stopped=False))
         agent_server.STEERING_SESSIONS.clear()
         self.assertTrue(should_schedule_queue_after_finish("chat-1", stopped=False))
         self.assertTrue(should_schedule_queue_after_finish("chat-1", stopped=True))
@@ -2583,6 +2940,65 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
 
         restored = agent_server.QUEUED_TURNS["chat-1"][0]
         self.assertEqual(restored["queued_id"], "queued-steer")
+        self.assertTrue(restored["_paused_after_stop"])
+        self.assertNotIn("_update_transitioning", restored)
+        self.assertNotIn("chat-1", agent_server.RUN_NOW_TURNS)
+        self.assertNotIn("chat-1", agent_server.STEERING_SESSIONS)
+        schedule_next.assert_called_once_with("chat-1")
+
+    async def test_repeated_cancellation_cannot_cancel_force_send_rollback(
+        self,
+    ) -> None:
+        selected = agent_server.QUEUED_TURNS["chat-1"][0]
+        selected["_durable"] = True
+        selected["_paused_after_stop"] = True
+        write_started = asyncio.Event()
+
+        async def cancelled_before_commit(*_args: object) -> dict[str, object]:
+            write_started.set()
+            await asyncio.Event().wait()
+            return {}
+
+        with patch.object(
+            agent_server,
+            "stop_turn",
+            new_callable=AsyncMock,
+            return_value={"stopped": True},
+        ), patch.object(
+            agent_server,
+            "append_durable_event",
+            side_effect=cancelled_before_commit,
+        ), patch.object(
+            agent_server,
+            "schedule_next_queued_turn",
+        ) as schedule_next:
+            task = asyncio.create_task(
+                agent_server._run_queued_turn_now_once(
+                    "chat-1",
+                    "queued-steer",
+                )
+            )
+            await asyncio.wait_for(write_started.wait(), 0.5)
+            await agent_server.QUEUE_LOCK.acquire()
+            try:
+                task.cancel()
+                await asyncio.sleep(0)
+                task.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(task.done())
+                self.assertTrue(
+                    agent_server.RUN_NOW_TURNS["chat-1"][
+                        "_update_transitioning"
+                    ]
+                )
+            finally:
+                agent_server.QUEUE_LOCK.release()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        restored = agent_server.QUEUED_TURNS["chat-1"][0]
+        self.assertIs(restored, selected)
+        self.assertTrue(restored["_durable"])
         self.assertTrue(restored["_paused_after_stop"])
         self.assertNotIn("_update_transitioning", restored)
         self.assertNotIn("chat-1", agent_server.RUN_NOW_TURNS)

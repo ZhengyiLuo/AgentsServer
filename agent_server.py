@@ -8972,6 +8972,13 @@ ACTIVE_LOCK = asyncio.Lock()
 QUEUED_TURNS: dict[str, deque[dict[str, Any]]] = {}
 RUN_NOW_TURNS: dict[str, dict[str, Any]] = {}
 STEERING_SESSIONS: set[str] = set()
+# A non-native Force Send keeps the steering fence while the interrupted
+# provider releases BUSY. Track that short-lived owner explicitly so a
+# cancelled waiter cannot leave an immortal, ownerless queue barrier.
+STEERING_WAIT_TASKS: dict[
+    str,
+    tuple[str, float, asyncio.Task[Any]],
+] = {}
 # One queue promotion owner per chat. Without this fence, two scheduled
 # drain tasks can pop A then B before either reserves the provider slot, and
 # whichever reaches the lifecycle lock first can run B ahead of A.
@@ -8979,6 +8986,33 @@ QUEUE_START_TASKS: dict[str, asyncio.Task[Any]] = {}
 QUEUE_LOCK = asyncio.Lock()
 RUN_NOW_REQUESTS: dict[str, tuple[str, asyncio.Task[dict[str, Any]]]] = {}
 RUN_NOW_REQUEST_LOCK = asyncio.Lock()
+RUN_NOW_PROVIDER_HANDOFF_TIMEOUT_SECONDS = max(
+    5.0,
+    float(
+        agentsdock_setting(
+            "RUN_NOW_PROVIDER_HANDOFF_TIMEOUT_SECONDS",
+            "120",
+        )
+    ),
+)
+RUN_NOW_IDLE_OWNER_TIMEOUT_SECONDS = max(
+    RUN_NOW_PROVIDER_HANDOFF_TIMEOUT_SECONDS,
+    float(
+        agentsdock_setting(
+            "RUN_NOW_IDLE_OWNER_TIMEOUT_SECONDS",
+            "300",
+        )
+    ),
+)
+RUN_NOW_IDLE_OWNER_CLEANUP_TIMEOUT_SECONDS = max(
+    1.0,
+    float(
+        agentsdock_setting(
+            "RUN_NOW_IDLE_OWNER_CLEANUP_TIMEOUT_SECONDS",
+            "15",
+        )
+    ),
+)
 RUN_NOW_COMPLETED_TTL_SECONDS = max(
     1.0,
     float(agentsdock_setting("RUN_NOW_COMPLETED_TTL_SECONDS", "120")),
@@ -15122,9 +15156,396 @@ class NonNativeForceSendRequiresLifecycleLock(Exception):
     """Internal retry signal emitted before a queued turn is mutated."""
 
 
+def force_send_task_owner(task: asyncio.Task[Any] | None) -> dict[str, Any]:
+    """Return bounded diagnostics for one in-memory Force Send owner."""
+
+    if task is None:
+        return {}
+    started_at = getattr(task, "_agentsdock_force_send_started_at", None)
+    age_seconds = (
+        max(0.0, time.monotonic() - float(started_at))
+        if isinstance(started_at, (int, float))
+        and not isinstance(started_at, bool)
+        else None
+    )
+    return {
+        "operation_id": str(
+            getattr(task, "_agentsdock_force_send_operation_id", "") or ""
+        )
+        or None,
+        "queued_id": str(
+            getattr(task, "_agentsdock_force_send_queued_id", "") or ""
+        )
+        or None,
+        "age_seconds": round(age_seconds, 3) if age_seconds is not None else None,
+        "phase": str(
+            getattr(task, "_agentsdock_force_send_phase", "") or ""
+        )
+        or None,
+        "done": task.done(),
+        "cancelled": task.cancelled() if task.done() else False,
+    }
+
+
+def force_send_conflict_detail(
+    session_id: str,
+    queued_id: str,
+    *,
+    guard: str,
+    message: str,
+    action: str,
+    retryable: bool,
+    owner_queued_id: str | None = None,
+    owner_task: asyncio.Task[Any] | None = None,
+) -> dict[str, Any]:
+    """Log and expose the exact in-memory guard that rejected Force Send."""
+
+    owner = force_send_task_owner(owner_task)
+    effective_owner_queued_id = (
+        owner_queued_id
+        or str(owner.get("queued_id") or "").strip()
+        or None
+    )
+    logger.warning(
+        "Force Send rejected session=%s queued_id=%s guard=%s "
+        "owner_queued_id=%s owner_operation_id=%s owner_age_seconds=%s "
+        "owner_phase=%s owner_done=%s steering=%s promoted=%s active=%s "
+        "current=%s busy=%s",
+        session_id,
+        queued_id,
+        guard,
+        effective_owner_queued_id,
+        owner.get("operation_id"),
+        owner.get("age_seconds"),
+        owner.get("phase"),
+        owner.get("done"),
+        session_id in STEERING_SESSIONS,
+        str((RUN_NOW_TURNS.get(session_id) or {}).get("queued_id") or "")
+        or None,
+        session_id in ACTIVE,
+        session_id in CURRENT_TURNS,
+        session_id in BUSY_SESSIONS,
+    )
+    return {
+        "code": "force_send_blocked",
+        "message": message,
+        "action": action,
+        "retryable": retryable,
+        "guard": guard,
+        "queued_id": queued_id,
+        "owner": {
+            "queued_id": effective_owner_queued_id,
+            "operation_id": owner.get("operation_id"),
+            "age_seconds": owner.get("age_seconds"),
+            "phase": owner.get("phase"),
+        },
+        "state": {
+            "active": session_id in ACTIVE,
+            "current": session_id in CURRENT_TURNS,
+            "busy": session_id in BUSY_SESSIONS,
+        },
+    }
+
+
+async def restore_missing_durable_force_send_row(
+    session_id: str,
+    queued_id: str,
+) -> bool:
+    """Restore one detached durable queue row after its volatile owner dies.
+
+    The event reducer is the authority at this boundary. In particular, a
+    native delivery fence reconstructs a paused row, while a committed
+    ``turn_started`` removes it entirely. That distinction prevents a
+    liveness repair from replaying a prompt the provider may have accepted.
+    """
+
+    session = STORE.sessions.get(session_id)
+    if session is None:
+        return False
+    try:
+        recovered = await asyncio.to_thread(
+            scan_queued_turns_from_events,
+            [(session_id, dict(session))],
+        )
+    except Exception as exc:
+        logger.error(
+            "could not restore stale Force Send row session=%s queued_id=%s "
+            "error=%s",
+            session_id,
+            queued_id,
+            concise_error_message(exc),
+        )
+        return False
+    durable_items = list(recovered.get(session_id) or ())
+    durable_index = next(
+        (
+            index
+            for index, item in enumerate(durable_items)
+            if str(item.get("queued_id") or "") == queued_id
+        ),
+        None,
+    )
+    if durable_index is None:
+        return False
+    selected = durable_items[durable_index]
+    durable_ids = [
+        str(item.get("queued_id") or "")
+        for item in durable_items
+    ]
+    async with QUEUE_LOCK:
+        promoted = RUN_NOW_TURNS.get(session_id)
+        if (
+            promoted is not None
+            and str(promoted.get("queued_id") or "") == queued_id
+        ):
+            return False
+        items = list(QUEUED_TURNS.get(session_id) or ())
+        if any(
+            str(item.get("queued_id") or "") == queued_id
+            for item in items
+        ):
+            return False
+
+        current_positions = {
+            str(item.get("queued_id") or ""): index
+            for index, item in enumerate(items)
+        }
+        successor_index = next(
+            (
+                current_positions[candidate_id]
+                for candidate_id in durable_ids[durable_index + 1:]
+                if candidate_id in current_positions
+            ),
+            None,
+        )
+        predecessor_index = next(
+            (
+                current_positions[candidate_id]
+                for candidate_id in reversed(durable_ids[:durable_index])
+                if candidate_id in current_positions
+            ),
+            None,
+        )
+        if successor_index is not None:
+            insert_at = successor_index
+        elif predecessor_index is not None:
+            insert_at = predecessor_index + 1
+        else:
+            insert_at = min(durable_index, len(items))
+        items.insert(insert_at, selected)
+        QUEUED_TURNS[session_id] = deque(items)
+    return True
+
+
+async def reconcile_idle_queue_session(
+    session_id: str,
+    *,
+    schedule: bool,
+    reason: str,
+) -> bool:
+    """Repair an idle queue whose volatile promotion owner disappeared.
+
+    Durable queue rows are authoritative.  Volatile steering/request markers
+    may only suppress them while a matching live owner exists.  Older builds
+    could lose the waiter task but retain ``STEERING_SESSIONS`` forever; every
+    later prompt then queued and every Run Now returned 409 despite an idle
+    provider.  Reconcile that invariant without touching active work or a
+    Stop-held queue head.
+    """
+
+    recovered_guards: list[str] = []
+    should_schedule = False
+    cancelled_waiter: asyncio.Task[Any] | None = None
+    expired_request: tuple[str, asyncio.Task[dict[str, Any]]] | None = None
+    async with RUN_NOW_REQUEST_LOCK:
+        request_entry = RUN_NOW_REQUESTS.get(session_id)
+        if request_entry is not None and request_entry[1].done():
+            RUN_NOW_REQUESTS.pop(session_id, None)
+            recovered_guards.append("completed_run_now_request")
+            request_entry = None
+        if request_entry is not None:
+            request_queued_id, request_task = request_entry
+            owner = force_send_task_owner(request_task)
+            age_seconds = owner.get("age_seconds")
+            async with ACTIVE_LOCK:
+                request_session_idle = (
+                    session_id not in ACTIVE
+                    and session_id not in BUSY_SESSIONS
+                    and session_id not in CURRENT_TURNS
+                )
+            if (
+                request_task is asyncio.current_task()
+                or not request_session_idle
+                or not isinstance(age_seconds, (int, float))
+                or age_seconds < RUN_NOW_IDLE_OWNER_TIMEOUT_SECONDS
+            ):
+                return False
+            setattr(
+                request_task,
+                "_agentsdock_force_send_phase",
+                "expiring_idle_owner",
+            )
+            expired_request = (request_queued_id, request_task)
+
+    if expired_request is not None:
+        expired_queued_id, expired_task = expired_request
+        logger.error(
+            "expiring stale idle Force Send owner session=%s queued_id=%s "
+            "owner=%s",
+            session_id,
+            expired_queued_id,
+            force_send_task_owner(expired_task),
+        )
+        expired_task.cancel()
+        _done, pending = await asyncio.wait(
+            {expired_task},
+            timeout=RUN_NOW_IDLE_OWNER_CLEANUP_TIMEOUT_SECONDS,
+        )
+        if pending:
+            logger.error(
+                "stale idle Force Send cleanup did not settle session=%s "
+                "queued_id=%s",
+                session_id,
+                expired_queued_id,
+            )
+            return False
+        await asyncio.gather(expired_task, return_exceptions=True)
+        async with RUN_NOW_REQUEST_LOCK:
+            current = RUN_NOW_REQUESTS.get(session_id)
+            if current is not None and current[1] is expired_task:
+                RUN_NOW_REQUESTS.pop(session_id, None)
+        recovered_guards.append("expired_idle_run_now_request")
+        if await restore_missing_durable_force_send_row(
+            session_id,
+            expired_queued_id,
+        ):
+            recovered_guards.append("restored_durable_queue_row")
+
+    async with RUN_NOW_REQUEST_LOCK:
+        request_entry = RUN_NOW_REQUESTS.get(session_id)
+        if request_entry is not None:
+            return bool(recovered_guards)
+
+        async with ACTIVE_LOCK:
+            idle = (
+                session_id not in ACTIVE
+                and session_id not in BUSY_SESSIONS
+                and session_id not in CURRENT_TURNS
+            )
+        if not idle:
+            return False
+
+        async with QUEUE_LOCK:
+            promotion_owner = QUEUE_START_TASKS.get(session_id)
+            if promotion_owner is not None and promotion_owner.done():
+                QUEUE_START_TASKS.pop(session_id, None)
+                recovered_guards.append("completed_queue_start_owner")
+                promotion_owner = None
+            if (
+                promotion_owner is not None
+                and promotion_owner is not asyncio.current_task()
+            ):
+                return False
+
+            waiter_entry = STEERING_WAIT_TASKS.get(session_id)
+            if waiter_entry is not None:
+                _waiter_queued_id, waiter_started_at, waiter_task = waiter_entry
+                if waiter_task.done():
+                    STEERING_WAIT_TASKS.pop(session_id, None)
+                    recovered_guards.append("completed_steering_waiter")
+                elif (
+                    time.monotonic() - waiter_started_at
+                    >= RUN_NOW_PROVIDER_HANDOFF_TIMEOUT_SECONDS
+                ):
+                    # An idle provider has no slot left for this waiter to
+                    # observe. Cancel only the exact aged owner; its fenced
+                    # cleanup cannot target a replacement generation.
+                    STEERING_WAIT_TASKS.pop(session_id, None)
+                    cancelled_waiter = waiter_task
+                    recovered_guards.append("expired_steering_waiter")
+                else:
+                    return False
+
+            if session_id in STEERING_SESSIONS:
+                STEERING_SESSIONS.discard(session_id)
+                recovered_guards.append("ownerless_steering_fence")
+
+            promoted = RUN_NOW_TURNS.get(session_id)
+            if promoted is not None:
+                if promoted.get("_update_transitioning") is True:
+                    # No request owner remains, so no coroutine can commit or
+                    # roll back this provisional non-native promotion. Its
+                    # original queue event is still durable and provider
+                    # delivery has not started; release the provisional flag
+                    # so the ordinary scheduler can finish the exact row.
+                    promoted.pop("_update_transitioning", None)
+                    recovered_guards.append(
+                        "ownerless_transitioning_promotion"
+                    )
+                # A committed or safely released promotion keeps its exact
+                # queued_id and resumes through the ordinary scheduler.
+                should_schedule = bool(
+                    promoted.get("_durable") is not False
+                    and promoted.get("_update_transitioning") is not True
+                    and promoted.get("_paused_after_stop") is not True
+                )
+            else:
+                head = next(iter(QUEUED_TURNS.get(session_id) or ()), None)
+                should_schedule = bool(
+                    head
+                    and head.get("_durable") is not False
+                    and head.get("_paused_after_stop") is not True
+                )
+
+    if cancelled_waiter is not None:
+        cancelled_waiter.cancel()
+    if recovered_guards or should_schedule:
+        logger.warning(
+            "idle queue reconciled session=%s reason=%s recovered_guards=%s "
+            "scheduled=%s promoted_queued_id=%s visible_queue_count=%s",
+            session_id,
+            reason,
+            ",".join(recovered_guards) or "none",
+            bool(schedule and should_schedule),
+            str((RUN_NOW_TURNS.get(session_id) or {}).get("queued_id") or "")
+            or None,
+            len(QUEUED_TURNS.get(session_id) or ()),
+        )
+    if schedule and should_schedule:
+        schedule_next_queued_turn(session_id)
+    return bool(recovered_guards or should_schedule)
+
+
+async def reconcile_idle_queued_turns(*, reason: str) -> int:
+    """Reconcile every chat with volatile or durable queued state."""
+
+    session_ids = {
+        *QUEUED_TURNS.keys(),
+        *RUN_NOW_TURNS.keys(),
+        *STEERING_SESSIONS,
+        *STEERING_WAIT_TASKS.keys(),
+        *RUN_NOW_REQUESTS.keys(),
+    }
+    repaired = 0
+    for session_id in sorted(str(value) for value in session_ids):
+        repaired += int(
+            await reconcile_idle_queue_session(
+                session_id,
+                schedule=True,
+                reason=reason,
+            )
+        )
+    return repaired
+
+
 async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]:
     """Coalesce duplicate Force Send requests without replaying a steer."""
     ensure_session_not_deleting(session_id)
+    await reconcile_idle_queue_session(
+        session_id,
+        schedule=False,
+        reason="force_send_admission",
+    )
     cached: dict[str, Any] | None = None
     async with RUN_NOW_REQUEST_LOCK:
         # Delete reserves the tombstone before acquiring this same lock. A
@@ -15147,16 +15568,34 @@ async def run_queued_turn_now(session_id: str, queued_id: str) -> dict[str, Any]
             if existing_queued_id != queued_id:
                 raise HTTPException(
                     status_code=409,
-                    detail=(
-                        "Another Force Send is already being applied. "
-                        "Wait for it to finish before steering a different message."
+                    detail=force_send_conflict_detail(
+                        session_id,
+                        queued_id,
+                        guard="run_now_request",
+                        message=(
+                            "Another Force Send is already being applied. "
+                            "Wait for it to finish before steering a different message."
+                        ),
+                        action="Refresh the queue before trying a different message.",
+                        retryable=True,
+                        owner_queued_id=existing_queued_id,
+                        owner_task=existing_task,
                     ),
                 )
             task = existing_task
         else:
+            operation_id = f"force_send_{uuid.uuid4().hex[:16]}"
             task = asyncio.create_task(
                 _run_queued_turn_now_and_release(session_id, queued_id)
             )
+            setattr(task, "_agentsdock_force_send_operation_id", operation_id)
+            setattr(task, "_agentsdock_force_send_queued_id", queued_id)
+            setattr(
+                task,
+                "_agentsdock_force_send_started_at",
+                time.monotonic(),
+            )
+            setattr(task, "_agentsdock_force_send_phase", "admission")
             RUN_NOW_REQUESTS[session_id] = (queued_id, task)
 
     if cached is not None:
@@ -15220,65 +15659,159 @@ async def fence_native_steer_delivery(
     may already have been accepted.
     """
 
-    queued_id = selected.get("queued_id")
-    display_prompt = str(
-        selected.get("display_prompt")
-        if selected.get("display_prompt") is not None
-        else selected.get("prompt") or ""
-    )
-    # The standard tombstone makes rollback to an older server fail closed:
-    # beta.7 recovery understands turn_unqueued even though it does not know
-    # the additive delivery-fence marker. Beta.8 reconstructs the full queued
-    # item from the second event and keeps it paused.
-    await append_durable_event_batch(session_id, [
-        ("turn_unqueued", {
-            "queued_id": queued_id,
-            "reason": "native_delivery_fence",
-        }),
-        ("turn_queue_delivery_fenced", {
-            "queued_id": queued_id,
-            "backend": backend,
-            "prompt": display_prompt,
-            "request_prompt": str(selected.get("prompt") or ""),
-            "display_prompt": display_prompt,
-            "file_ids": list(selected.get("file_ids") or []),
-            "display_file_ids": list(
-                selected.get("display_file_ids")
-                if selected.get("display_file_ids") is not None
-                else selected.get("file_ids") or []
-            ),
-            "model": selected.get("model"),
-            "effort": selected.get("effort"),
-            "purpose": selected.get("purpose"),
-            "digest_job_id": selected.get("digest_job_id"),
-            "digest_detail": selected.get("digest_detail"),
-            "source_session_id": selected.get("source_session_id"),
-            "target_session_id": selected.get("target_session_id"),
-            "chat_references": list(selected.get("chat_references") or []),
-            "cross_chat_envelope_id": selected.get("cross_chat_envelope_id"),
-            "cross_chat_exchange_id": selected.get("cross_chat_exchange_id"),
-            "cross_chat_exchange_leg_id": selected.get("cross_chat_exchange_leg_id"),
-            "cross_chat_exchange_status": bool(selected.get("cross_chat_exchange_status")),
-            "cross_chat_obligation_ids": list(selected.get("cross_chat_obligation_ids") or []),
-            "cross_chat_exchange_ids": list(selected.get("cross_chat_exchange_ids") or []),
-            "client_capabilities": list(
-                selected.get("client_capabilities") or []
-            ),
-            "position": selected.get("_native_delivery_queue_position"),
-            "provider_cross_chat_route_snapshot": [
-                dict(route)
-                for route in normalized_provider_cross_chat_route_snapshot(
-                    selected.get("provider_cross_chat_route_snapshot")
-                )
-            ],
-            "message": (
-                "Force Send delivery started; keep this message paused until "
-                "its provider lifecycle is durably committed."
-            ),
-        }),
-    ])
-    selected["_paused_after_stop"] = True
-    selected["_native_delivery_fenced"] = True
+    fence_lock = selected.get("_native_delivery_fence_lock")
+    if not isinstance(fence_lock, asyncio.Lock):
+        fence_lock = asyncio.Lock()
+        selected["_native_delivery_fence_lock"] = fence_lock
+    async with fence_lock:
+        # The coordinator watchdog and provider consumer can reach this fence
+        # concurrently. Exactly one durable marker must win; both share the
+        # same selected object and lock.
+        if selected.get("_native_delivery_fenced") is True:
+            return
+        queued_id = selected.get("queued_id")
+        display_prompt = str(
+            selected.get("display_prompt")
+            if selected.get("display_prompt") is not None
+            else selected.get("prompt") or ""
+        )
+        # The standard tombstone makes rollback to an older server fail closed:
+        # beta.7 recovery understands turn_unqueued even though it does not know
+        # the additive delivery-fence marker. Beta.8 reconstructs the full queued
+        # item from the second event and keeps it paused.
+        await append_durable_event_batch(session_id, [
+            ("turn_unqueued", {
+                "queued_id": queued_id,
+                "reason": "native_delivery_fence",
+            }),
+            ("turn_queue_delivery_fenced", {
+                "queued_id": queued_id,
+                "backend": backend,
+                "prompt": display_prompt,
+                "request_prompt": str(selected.get("prompt") or ""),
+                "display_prompt": display_prompt,
+                "file_ids": list(selected.get("file_ids") or []),
+                "display_file_ids": list(
+                    selected.get("display_file_ids")
+                    if selected.get("display_file_ids") is not None
+                    else selected.get("file_ids") or []
+                ),
+                "model": selected.get("model"),
+                "effort": selected.get("effort"),
+                "purpose": selected.get("purpose"),
+                "digest_job_id": selected.get("digest_job_id"),
+                "digest_detail": selected.get("digest_detail"),
+                "source_session_id": selected.get("source_session_id"),
+                "target_session_id": selected.get("target_session_id"),
+                "chat_references": list(selected.get("chat_references") or []),
+                "cross_chat_envelope_id": selected.get("cross_chat_envelope_id"),
+                "cross_chat_exchange_id": selected.get("cross_chat_exchange_id"),
+                "cross_chat_exchange_leg_id": selected.get("cross_chat_exchange_leg_id"),
+                "cross_chat_exchange_status": bool(selected.get("cross_chat_exchange_status")),
+                "cross_chat_obligation_ids": list(selected.get("cross_chat_obligation_ids") or []),
+                "cross_chat_exchange_ids": list(selected.get("cross_chat_exchange_ids") or []),
+                "client_capabilities": list(
+                    selected.get("client_capabilities") or []
+                ),
+                "position": selected.get("_native_delivery_queue_position"),
+                "provider_cross_chat_route_snapshot": [
+                    dict(route)
+                    for route in normalized_provider_cross_chat_route_snapshot(
+                        selected.get("provider_cross_chat_route_snapshot")
+                    )
+                ],
+                "message": (
+                    "Force Send delivery started; keep this message paused until "
+                    "its provider lifecycle is durably committed."
+                ),
+            }),
+        ])
+        selected["_paused_after_stop"] = True
+        selected["_native_delivery_fenced"] = True
+
+
+def withdraw_unaccepted_native_steer(
+    native_steer_queue: asyncio.Queue[dict[str, Any]],
+    request: dict[str, Any],
+) -> bool:
+    """Atomically withdraw a provider command that no consumer accepted."""
+
+    if request.get("phase") != "queued":
+        return False
+    try:
+        candidate = native_steer_queue.get_nowait()
+    except asyncio.QueueEmpty:
+        return False
+    if candidate is request:
+        request["phase"] = "withdrawn"
+        return True
+    # This should be impossible for a maxsize-one queue, but never discard a
+    # replacement command merely because an older watchdog raced it.
+    with suppress(asyncio.QueueFull):
+        native_steer_queue.put_nowait(candidate)
+    return False
+
+
+def mark_native_steer_accepted(request: dict[str, Any]) -> None:
+    """Transfer a queued native command to its exact provider consumer."""
+
+    request["phase"] = "accepted"
+    owner_task = request.get("owner_task")
+    if isinstance(owner_task, asyncio.Task):
+        setattr(
+            owner_task,
+            "_agentsdock_force_send_phase",
+            "provider_accepted",
+        )
+    accepted_event = request.get("accepted_event")
+    if isinstance(accepted_event, asyncio.Event):
+        accepted_event.set()
+
+
+async def await_native_steer_result(
+    session_id: str,
+    selected: dict[str, Any],
+    *,
+    backend: str,
+    native_steer_queue: asyncio.Queue[dict[str, Any]],
+    request: dict[str, Any],
+    future: asyncio.Future[dict[str, Any]],
+) -> dict[str, Any]:
+    """Bound only pre-accept handoff without guessing post-accept safety."""
+
+    accepted_event = request.get("accepted_event")
+    if not isinstance(accepted_event, asyncio.Event):
+        accepted_event = asyncio.Event()
+        request["accepted_event"] = accepted_event
+        if request.get("phase") != "queued":
+            accepted_event.set()
+    accepted_task = asyncio.create_task(accepted_event.wait())
+    try:
+        done, _pending = await asyncio.wait(
+            {future, accepted_task},
+            timeout=RUN_NOW_PROVIDER_HANDOFF_TIMEOUT_SECONDS,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if future in done or future.done():
+            return future.result()
+        if accepted_task in done or request.get("phase") != "queued":
+            # Provider ownership is an irreversible replay boundary. Keep the
+            # request owner (and its detached row) until the provider's own
+            # bounded lifecycle returns an authoritative result.
+            return await asyncio.shield(future)
+        if withdraw_unaccepted_native_steer(native_steer_queue, request):
+            raise NativeSteerHandoffError(
+                "The provider did not accept Force Send before its handoff deadline",
+                safe_to_requeue=True,
+            )
+        # The consumer removed the maxsize-one command in the same event-loop
+        # tick in which it marks acceptance. If that transfer won this timeout
+        # race, wait for its authoritative result instead of inferring replay.
+        return await asyncio.shield(future)
+    finally:
+        if not accepted_task.done():
+            accepted_task.cancel()
+        await asyncio.gather(accepted_task, return_exceptions=True)
 
 
 def native_steer_requeue_event_payload(
@@ -15443,6 +15976,7 @@ async def requeue_native_steer_after_safe_rejection(
             # runnable in-memory item before both standard events are fsynced.
             selected["_paused_after_stop"] = False
             selected.pop("_native_delivery_fenced", None)
+            selected.pop("_native_delivery_fence_lock", None)
         selected.pop("_native_delivery_queue_position", None)
         QUEUED_TURNS[session_id] = deque(items)
 
@@ -15519,56 +16053,63 @@ async def _run_queued_turn_now_and_release(
             }
         raise
     finally:
-        async with RUN_NOW_REQUEST_LOCK:
-            paused_after_stop = False
-            if (
-                result is not None
-                and result.get("ok") is True
-                and not result.get("deferred")
-            ):
-                # Stop may durably pause a non-native promotion after its
-                # handoff returned but before this completion cache is written.
-                # Validate under the same lock order used by Stop so a later
-                # Run Now can never receive stale success for a held message.
-                async with QUEUE_LOCK:
-                    candidates = list(QUEUED_TURNS.get(session_id) or ())
-                    promoted = RUN_NOW_TURNS.get(session_id)
-                    if promoted is not None:
-                        candidates.append(promoted)
-                    paused_after_stop = any(
-                        str(item.get("queued_id") or "") == queued_id
-                        and item.get("_paused_after_stop") is True
-                        for item in candidates
-                    )
-            cacheable_result = (
-                result
-                if result is not None
-                and result.get("ok") is True
-                and not result.get("deferred")
-                and not paused_after_stop
-                else None
-            )
-            if cacheable_result is not None or uncertain_error is not None:
-                cache_key = (session_id, queued_id)
-                RUN_NOW_COMPLETED_RESULTS[cache_key] = {
-                    "expires_at": (
-                        time.monotonic() + RUN_NOW_COMPLETED_TTL_SECONDS
-                    ),
-                    **(
-                        {"result": dict(cacheable_result)}
-                        if cacheable_result is not None
-                        else {"error": uncertain_error}
-                    ),
-                }
-                RUN_NOW_COMPLETED_RESULTS.move_to_end(cache_key)
-                while len(RUN_NOW_COMPLETED_RESULTS) > RUN_NOW_COMPLETED_MAX:
-                    RUN_NOW_COMPLETED_RESULTS.popitem(last=False)
-            current = RUN_NOW_REQUESTS.get(session_id)
-            if (
-                current is not None
-                and current[1] is asyncio.current_task()
-            ):
-                RUN_NOW_REQUESTS.pop(session_id, None)
+        owner_task = asyncio.current_task()
+
+        async def settle_force_send_request() -> None:
+            async with RUN_NOW_REQUEST_LOCK:
+                paused_after_stop = False
+                if (
+                    result is not None
+                    and result.get("ok") is True
+                    and not result.get("deferred")
+                ):
+                    # Stop may durably pause a non-native promotion after its
+                    # handoff returned but before this completion cache is written.
+                    # Validate under the same lock order used by Stop so a later
+                    # Run Now can never receive stale success for a held message.
+                    async with QUEUE_LOCK:
+                        candidates = list(QUEUED_TURNS.get(session_id) or ())
+                        promoted = RUN_NOW_TURNS.get(session_id)
+                        if promoted is not None:
+                            candidates.append(promoted)
+                        paused_after_stop = any(
+                            str(item.get("queued_id") or "") == queued_id
+                            and item.get("_paused_after_stop") is True
+                            for item in candidates
+                        )
+                cacheable_result = (
+                    result
+                    if result is not None
+                    and result.get("ok") is True
+                    and not result.get("deferred")
+                    and not paused_after_stop
+                    else None
+                )
+                if cacheable_result is not None or uncertain_error is not None:
+                    cache_key = (session_id, queued_id)
+                    RUN_NOW_COMPLETED_RESULTS[cache_key] = {
+                        "expires_at": (
+                            time.monotonic() + RUN_NOW_COMPLETED_TTL_SECONDS
+                        ),
+                        **(
+                            {"result": dict(cacheable_result)}
+                            if cacheable_result is not None
+                            else {"error": uncertain_error}
+                        ),
+                    }
+                    RUN_NOW_COMPLETED_RESULTS.move_to_end(cache_key)
+                    while len(RUN_NOW_COMPLETED_RESULTS) > RUN_NOW_COMPLETED_MAX:
+                        RUN_NOW_COMPLETED_RESULTS.popitem(last=False)
+                current = RUN_NOW_REQUESTS.get(session_id)
+                if current is not None and current[1] is owner_task:
+                    RUN_NOW_REQUESTS.pop(session_id, None)
+
+        settlement = asyncio.create_task(settle_force_send_request())
+        try:
+            await asyncio.shield(settlement)
+        except BaseException:
+            with suppress(BaseException):
+                await join_task_despite_caller_cancellation(settlement)
 
 
 async def _run_queued_turn_now_once(
@@ -15591,17 +16132,44 @@ async def _run_queued_turn_now_once(
     selected_was_paused = False
     native_steer = False
     native_steer_queue = active_turn.get("native_steer_queue")
+    selected_backend = str(
+        STORE.sessions[session_id].get("backend") or DEFAULT_BACKEND
+    )
     remaining: int
     async with QUEUE_LOCK:
         update_blocker = managed_server_update_admission_blocker()
         if update_blocker:
             raise HTTPException(status_code=503, detail=update_blocker)
-        if session_id in STEERING_SESSIONS or RUN_NOW_TURNS.get(session_id) is not None:
+        promoted_owner = RUN_NOW_TURNS.get(session_id)
+        if session_id in STEERING_SESSIONS or promoted_owner is not None:
+            waiter_entry = STEERING_WAIT_TASKS.get(session_id)
+            guard = (
+                "run_now_promotion"
+                if promoted_owner is not None
+                else "steering_reservation"
+            )
             raise HTTPException(
                 status_code=409,
-                detail=(
-                    "Force Send is already being applied. "
-                    "Wait for it to finish before steering another message."
+                detail=force_send_conflict_detail(
+                    session_id,
+                    queued_id,
+                    guard=guard,
+                    message=(
+                        "Force Send is already being applied. "
+                        "Wait for it to finish before steering another message."
+                    ),
+                    action="Refresh the queue and retry after the current promotion settles.",
+                    retryable=True,
+                    owner_queued_id=(
+                        str(promoted_owner.get("queued_id") or "")
+                        if promoted_owner is not None
+                        else None
+                    ),
+                    owner_task=(
+                        waiter_entry[2]
+                        if waiter_entry is not None
+                        else None
+                    ),
                 ),
             )
         queue = QUEUED_TURNS.get(session_id)
@@ -15613,10 +16181,43 @@ async def _run_queued_turn_now_once(
             )
             if selected_index is not None:
                 selected = items[selected_index]
+                if selected.get("_native_delivery_fenced") is True:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=force_send_conflict_detail(
+                            session_id,
+                            queued_id,
+                            guard="delivery_uncertain",
+                            message=(
+                                "This message may already have reached the "
+                                "provider and cannot be Force Sent again."
+                            ),
+                            action=(
+                                "Inspect the provider history, then remove "
+                                "this held queue item when it is safe."
+                            ),
+                            retryable=False,
+                            owner_queued_id=queued_id,
+                        ),
+                    )
                 if selected.get("purpose") in CROSS_CHAT_DELIVERY_PURPOSES:
                     raise HTTPException(
                         status_code=409,
-                        detail="cross-chat delivery cannot Force Send or steer another turn",
+                        detail=force_send_conflict_detail(
+                            session_id,
+                            queued_id,
+                            guard="selected_cross_chat_delivery",
+                            message=(
+                                "A cross-chat delivery cannot Force Send or "
+                                "steer another turn."
+                            ),
+                            action=(
+                                "Let the delivery run in queue order or use "
+                                "its exact Skip action."
+                            ),
+                            retryable=False,
+                            owner_queued_id=queued_id,
+                        ),
                     )
                 if any(
                     item.get("purpose") in CROSS_CHAT_DELIVERY_PURPOSES
@@ -15624,7 +16225,29 @@ async def _run_queued_turn_now_once(
                 ):
                     raise HTTPException(
                         status_code=409,
-                        detail="Force Send cannot overtake a queued cross-chat delivery",
+                        detail=force_send_conflict_detail(
+                            session_id,
+                            queued_id,
+                            guard="prior_cross_chat_delivery",
+                            message=(
+                                "Force Send cannot overtake a queued "
+                                "cross-chat delivery."
+                            ),
+                            action=(
+                                "Run or skip the earlier delivery before "
+                                "forcing this message."
+                            ),
+                            retryable=True,
+                            owner_queued_id=next(
+                                (
+                                    str(item.get("queued_id") or "")
+                                    for item in items[:selected_index]
+                                    if item.get("purpose")
+                                    in CROSS_CHAT_DELIVERY_PURPOSES
+                                ),
+                                None,
+                            ),
+                        ),
                     )
                 selected_was_paused = (
                     selected.get("_paused_after_stop") is True
@@ -15637,7 +16260,7 @@ async def _run_queued_turn_now_once(
                     selected_successor_id = str(
                         items[selected_index + 1].get("queued_id") or ""
                     ) or None
-                selected_backend = (
+                selected_backend = str(
                     selected.get("backend")
                     or STORE.sessions[session_id].get("backend")
                     or DEFAULT_BACKEND
@@ -15738,11 +16361,21 @@ async def _run_queued_turn_now_once(
     if native_steer:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[dict[str, Any]] = loop.create_future()
+        owner_task = asyncio.current_task()
+        if owner_task is not None:
+            setattr(
+                owner_task,
+                "_agentsdock_force_send_phase",
+                "provider_handoff_queued",
+            )
         try:
             request = {
                 "selected": selected,
                 "remaining": remaining,
                 "future": future,
+                "phase": "queued",
+                "accepted_event": asyncio.Event(),
+                "owner_task": owner_task,
             }
             # Commit delivery against the live ACTIVE record. The provider can
             # become terminal after the initial eligibility snapshot; putting
@@ -15767,32 +16400,78 @@ async def _run_queued_turn_now_once(
                         "The active provider is already applying another steering message",
                         safe_to_requeue=True,
                     ) from exc
-            result = await future
+            result = await await_native_steer_result(
+                session_id,
+                selected,
+                backend=selected_backend,
+                native_steer_queue=native_steer_queue,
+                request=request,
+                future=future,
+            )
             result["remaining"] = remaining
             return result
-        except Exception as exc:
-            if (
-                selected_index is not None
-                and bool(getattr(exc, "safe_to_requeue", False))
-            ):
-                await requeue_native_steer_after_safe_rejection(
-                    session_id,
-                    selected,
-                    selected_index=selected_index,
-                    selected_predecessor_id=selected_predecessor_id,
-                    selected_successor_id=selected_successor_id,
+        except BaseException as exc:
+            safe_to_requeue = bool(getattr(exc, "safe_to_requeue", False))
+            if isinstance(exc, asyncio.CancelledError):
+                safe_to_requeue = withdraw_unaccepted_native_steer(
+                    native_steer_queue,
+                    request,
                 )
+                if not safe_to_requeue:
+                    fence_task = asyncio.create_task(
+                        fence_native_steer_delivery(
+                            session_id,
+                            selected,
+                            backend=selected_backend,
+                        )
+                    )
+                    try:
+                        await asyncio.shield(fence_task)
+                    except BaseException:
+                        with suppress(BaseException):
+                            await join_task_despite_caller_cancellation(
+                                fence_task
+                            )
+            if selected_index is not None and safe_to_requeue:
+                requeue_task = asyncio.create_task(
+                    requeue_native_steer_after_safe_rejection(
+                        session_id,
+                        selected,
+                        selected_index=selected_index,
+                        selected_predecessor_id=selected_predecessor_id,
+                        selected_successor_id=selected_successor_id,
+                    )
+                )
+                try:
+                    await asyncio.shield(requeue_task)
+                except BaseException:
+                    await join_task_despite_caller_cancellation(requeue_task)
             raise
         finally:
-            async with QUEUE_LOCK:
-                STEERING_SESSIONS.discard(session_id)
-            async with ACTIVE_LOCK:
-                still_busy = session_id in BUSY_SESSIONS
-            if not still_busy:
-                schedule_next_queued_turn(session_id)
+            async def release_native_steering_fence() -> None:
+                async with QUEUE_LOCK:
+                    STEERING_SESSIONS.discard(session_id)
+                async with ACTIVE_LOCK:
+                    still_busy = session_id in BUSY_SESSIONS
+                if not still_busy:
+                    schedule_next_queued_turn(session_id)
+
+            cleanup = asyncio.create_task(release_native_steering_fence())
+            try:
+                await asyncio.shield(cleanup)
+            except BaseException:
+                with suppress(BaseException):
+                    await join_task_despite_caller_cancellation(cleanup)
 
     promotion_committed = False
     try:
+        owner_task = asyncio.current_task()
+        if owner_task is not None:
+            setattr(
+                owner_task,
+                "_agentsdock_force_send_phase",
+                "stopping_active_turn",
+            )
         stop_result = await stop_turn(
             session_id,
             emit_event=False,
@@ -15848,6 +16527,12 @@ async def _run_queued_turn_now_once(
                 RUN_NOW_TURNS[session_id] = prepared
 
         display_prompt = str(prepared.get("display_prompt") or prepared.get("steering_prompt") or selected.get("prompt") or "")
+        if owner_task is not None:
+            setattr(
+                owner_task,
+                "_agentsdock_force_send_phase",
+                "committing_promotion",
+            )
         await append_durable_event(session_id, "turn_queue_run_now", {
             "queued_id": queued_id,
             "backend": prepared.get("backend") or STORE.sessions[session_id].get("backend") or DEFAULT_BACKEND,
@@ -15888,7 +16573,13 @@ async def _run_queued_turn_now_once(
         })
         promotion_committed = True
         prepared.pop("_update_transitioning", None)
-        asyncio.create_task(wait_for_steered_turn_slot(session_id))
+        schedule_steered_turn_slot_waiter(session_id, queued_id)
+        if owner_task is not None:
+            setattr(
+                owner_task,
+                "_agentsdock_force_send_phase",
+                "promotion_committed",
+            )
         return {
             "ok": True,
             "queued_id": queued_id,
@@ -15898,52 +16589,63 @@ async def _run_queued_turn_now_once(
             "superseded_queued_ids": [],
         }
     except BaseException:
-        async with QUEUE_LOCK:
-            if not promotion_committed:
-                current = RUN_NOW_TURNS.get(session_id)
-                if current is not None and current.get("queued_id") == queued_id:
-                    RUN_NOW_TURNS.pop(session_id, None)
-                selected.pop("_update_transitioning", None)
-                selected["_paused_after_stop"] = selected_was_paused
-                items = list(QUEUED_TURNS.get(session_id) or ())
-                if not any(
-                    item.get("queued_id") == queued_id
-                    for item in items
-                ):
-                    successor_index = (
-                        next(
-                            (
-                                idx
-                                for idx, item in enumerate(items)
-                                if item.get("queued_id") == selected_successor_id
-                            ),
-                            None,
+        async def restore_uncommitted_promotion() -> None:
+            async with QUEUE_LOCK:
+                if not promotion_committed:
+                    current = RUN_NOW_TURNS.get(session_id)
+                    if current is not None and current.get("queued_id") == queued_id:
+                        RUN_NOW_TURNS.pop(session_id, None)
+                    selected.pop("_update_transitioning", None)
+                    selected["_paused_after_stop"] = selected_was_paused
+                    items = list(QUEUED_TURNS.get(session_id) or ())
+                    if not any(
+                        item.get("queued_id") == queued_id
+                        for item in items
+                    ):
+                        successor_index = (
+                            next(
+                                (
+                                    idx
+                                    for idx, item in enumerate(items)
+                                    if item.get("queued_id") == selected_successor_id
+                                ),
+                                None,
+                            )
+                            if selected_successor_id is not None
+                            else None
                         )
-                        if selected_successor_id is not None
-                        else None
-                    )
-                    predecessor_index = (
-                        next(
-                            (
-                                idx
-                                for idx, item in enumerate(items)
-                                if item.get("queued_id") == selected_predecessor_id
-                            ),
-                            None,
+                        predecessor_index = (
+                            next(
+                                (
+                                    idx
+                                    for idx, item in enumerate(items)
+                                    if item.get("queued_id") == selected_predecessor_id
+                                ),
+                                None,
+                            )
+                            if selected_predecessor_id is not None
+                            else None
                         )
-                        if selected_predecessor_id is not None
-                        else None
-                    )
-                    if successor_index is not None:
-                        insert_at = successor_index
-                    elif predecessor_index is not None:
-                        insert_at = predecessor_index + 1
-                    else:
-                        insert_at = min(int(selected_index or 0), len(items))
-                    items.insert(insert_at, selected)
-                    QUEUED_TURNS[session_id] = deque(items)
-            STEERING_SESSIONS.discard(session_id)
-        schedule_next_queued_turn(session_id)
+                        if successor_index is not None:
+                            insert_at = successor_index
+                        elif predecessor_index is not None:
+                            insert_at = predecessor_index + 1
+                        else:
+                            insert_at = min(int(selected_index or 0), len(items))
+                        items.insert(insert_at, selected)
+                        QUEUED_TURNS[session_id] = deque(items)
+                STEERING_SESSIONS.discard(session_id)
+            schedule_next_queued_turn(session_id)
+
+        # A second cancellation may arrive while rollback waits for QUEUE_LOCK.
+        # Settle the exact child before exposing cancellation so neither the
+        # transition marker nor its steering fence can become ownerless.
+        restoration = asyncio.create_task(restore_uncommitted_promotion())
+        try:
+            await asyncio.shield(restoration)
+        except BaseException:
+            with suppress(BaseException):
+                await join_task_despite_caller_cancellation(restoration)
         raise
 
 
@@ -16182,18 +16884,92 @@ async def retry_next_queued_turn_later(session_id: str, delay_seconds: int | Non
 
 
 async def wait_for_steered_turn_slot(session_id: str) -> None:
-    while True:
+    waiter_task = asyncio.current_task()
+
+    async def release_waiter_fence() -> None:
+        owns_fence = False
+        async with QUEUE_LOCK:
+            owner = STEERING_WAIT_TASKS.get(session_id)
+            owns_fence = bool(
+                waiter_task is not None
+                and owner is not None
+                and owner[2] is waiter_task
+            )
+            if owns_fence:
+                STEERING_SESSIONS.discard(session_id)
+        if not owns_fence:
+            return
         async with ACTIVE_LOCK:
-            busy = session_id in BUSY_SESSIONS
-        if not busy:
-            break
-        await asyncio.sleep(0.05)
-    async with QUEUE_LOCK:
-        STEERING_SESSIONS.discard(session_id)
-    await start_next_queued_turn(session_id)
+            idle = session_id not in BUSY_SESSIONS
+        if idle:
+            await start_next_queued_turn(session_id)
+
+    try:
+        while True:
+            async with ACTIVE_LOCK:
+                busy = session_id in BUSY_SESSIONS
+            if not busy:
+                break
+            await asyncio.sleep(0.05)
+    finally:
+        # Cancellation of the anonymous waiter was the direct source of the
+        # Sonic wedge. Cleanup must survive repeated cancellation and must
+        # compare the exact task before touching a replacement generation.
+        cleanup = asyncio.create_task(release_waiter_fence())
+        try:
+            await asyncio.shield(cleanup)
+        except BaseException:
+            with suppress(BaseException):
+                await join_task_despite_caller_cancellation(cleanup)
+
+
+def schedule_steered_turn_slot_waiter(
+    session_id: str,
+    queued_id: str,
+) -> asyncio.Task[Any]:
+    """Create and identify the one owner of a non-native steering fence."""
+
+    task = asyncio.create_task(wait_for_steered_turn_slot(session_id))
+    operation_id = str(
+        getattr(
+            asyncio.current_task(),
+            "_agentsdock_force_send_operation_id",
+            "",
+        )
+        or f"steering_wait_{uuid.uuid4().hex[:16]}"
+    )
+    started_at = time.monotonic()
+    setattr(task, "_agentsdock_force_send_operation_id", operation_id)
+    setattr(task, "_agentsdock_force_send_queued_id", queued_id)
+    setattr(task, "_agentsdock_force_send_started_at", started_at)
+    setattr(
+        task,
+        "_agentsdock_force_send_phase",
+        "waiting_for_provider_slot",
+    )
+    previous = STEERING_WAIT_TASKS.get(session_id)
+    if previous is not None and not previous[2].done():
+        # Admission should make this impossible. Preserve the newer exact
+        # owner and retire the older waiter rather than leaving two callbacks
+        # able to clear the same session-wide flag.
+        previous[2].cancel()
+    STEERING_WAIT_TASKS[session_id] = (queued_id, started_at, task)
+
+    def release_owner(completed: asyncio.Task[Any]) -> None:
+        current = STEERING_WAIT_TASKS.get(session_id)
+        if current is not None and current[2] is completed:
+            STEERING_WAIT_TASKS.pop(session_id, None)
+
+    task.add_done_callback(release_owner)
+    return task
 
 
 async def start_next_queued_turn(session_id: str) -> None:
+    await reconcile_idle_queue_session(
+        session_id,
+        schedule=False,
+        reason="queue_start",
+    )
     promotion_task = asyncio.current_task()
     async with QUEUE_LOCK:
         owner = QUEUE_START_TASKS.get(session_id)
@@ -16482,17 +17258,12 @@ def schedule_rebuilt_queued_turns() -> int:
 
 
 def should_schedule_queue_after_finish(session_id: str, stopped: bool) -> bool:
-    # A steering handoff has one owner: wait_for_steered_turn_slot. Scheduling
-    # here as well races that waiter and can pop a second queued item, including
-    # when the interrupted provider finishes naturally just before stop_turn.
-    # Explicit Stop holds ordinary successors on each queue item, so a stopped
-    # runner may still attempt a drain. This is required for unpaused messages
-    # queued behind scheduled jobs and for provider-side interruptions; a held
-    # head remains fail-closed in start_next_queued_turn.
-    return (
-        session_id not in STEERING_SESSIONS
-        and session_id not in RUN_NOW_TURNS
-    )
+    # Always schedule one post-release reconciliation. A live steering owner
+    # remains fenced in start_next_queued_turn, while an ownerless flag is
+    # repaired there immediately. QUEUE_START_TASKS serializes the normal
+    # waiter and this terminal path, so neither can pop a second row. Explicit
+    # Stop holds remain fail-closed on the queue item itself.
+    return True
 
 
 def queued_turn_from_event(event: dict[str, Any], sess: dict[str, Any], position: int) -> dict[str, Any]:
@@ -42846,6 +43617,7 @@ async def run_claude_sdk(
             if steer_task is not None and steer_task in done:
                 request = steer_task.result()
                 steer_task = None
+                mark_native_steer_accepted(request)
                 selected = request.get("selected") or {}
                 future = request.get("future")
                 candidate_run_id = f"run_{uuid.uuid4().hex[:16]}"
@@ -45664,6 +46436,19 @@ async def run_codex_app_server(
     handled_notification_sequence = 0
     last_activity = time.monotonic()
 
+    async def detach_native_steer_admission() -> None:
+        """Stop Force Send admission into this runner before queue cleanup."""
+
+        async with ACTIVE_LOCK:
+            active = ACTIVE.get(session_id)
+            if (
+                active
+                and str(active.get("run_id") or "") == current_run_id
+                and active.get("native_steer_queue") is steer_queue
+            ):
+                active["provider_turn_ready"] = False
+                active["native_steer_queue"] = None
+
     text_parts: list[str] = []
     seen_text: set[str] = set()
     seen_reasoning: set[str] = set()
@@ -47144,10 +47929,9 @@ async def run_codex_app_server(
 
                         if steer_task in done:
                             command = steer_task.result()
+                            mark_native_steer_accepted(command)
                             future = command.get("future")
-                            selected_for_steer = dict(
-                                command.get("selected") or {}
-                            )
+                            selected_for_steer = command.get("selected") or {}
                             try:
                                 async with logical_state_lock:
                                     result = await switch_logical_run(
@@ -47185,6 +47969,11 @@ async def run_codex_app_server(
                                 )
                             steer_task = asyncio.create_task(steer_queue.get())
                 finally:
+                    # Close native steering admission before inspecting or
+                    # draining the queue. The ACTIVE lock orders this against
+                    # Force Send's final queue-identity check: an earlier put is
+                    # drained below, while a later put is rejected and requeued.
+                    await detach_native_steer_admission()
                     if steer_task.done() and not steer_task.cancelled():
                         with suppress(Exception):
                             command = steer_task.result()
@@ -47224,6 +48013,9 @@ async def run_codex_app_server(
             or current_run_id in STOPPED_RUNS
         )
     except Exception as exc:
+        # Failures before the notification loop owns its cleanup must not leave
+        # this runner's queue advertised while fallback/error work awaits.
+        await detach_native_steer_admission()
         planned_transport_shutdown = (
             isinstance(exc, CodexAppServerDisconnected)
             and (
@@ -47305,6 +48097,9 @@ async def run_codex_app_server(
             })
             error_emitted = True
     finally:
+        # Cancellation can bypass the Exception handler. Keep this idempotent
+        # identity-fenced detach as the final exit guard.
+        await detach_native_steer_admission()
         if goal_time_budget_task is not None:
             goal_time_budget_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -47524,6 +48319,12 @@ async def start_turn(
     scheduled_job_revision: str | None = None,
     scheduled_job_manual_run: bool = False,
 ) -> dict[str, Any]:
+    if queue_if_busy and provider_context_mode == "chat":
+        await reconcile_idle_queue_session(
+            session_id,
+            schedule=True,
+            reason="turn_admission",
+        )
     # Capture the chat backend before this request can wait on lifecycle work.
     # If a concurrent backend PATCH wins the lock, the request must be retried
     # instead of applying a now-stale per-turn backend after the PATCH.
@@ -51438,6 +52239,7 @@ async def secure_peer_hub_proxy_endpoint(
 
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
+    await reconcile_idle_queued_turns(reason="health_poll")
     async with ACTIVE_LOCK:
         active = sorted(BUSY_SESSIONS)
     async with QUEUE_LOCK:
@@ -53802,6 +54604,11 @@ async def get_session(
             limit=limit,
             tail=page_tail,
         )
+    await reconcile_idle_queue_session(
+        session_id,
+        schedule=True,
+        reason="session_snapshot",
+    )
     response = {
         "session": public_session(sess),
         "events": events,
@@ -56220,6 +57027,9 @@ async def delete_session(session_id: str) -> dict[str, Any]:
             for deletion_run_id in deletion_run_ids:
                 await revoke_cross_chat_capability(deletion_run_id)
             await terminalize_cross_chat_session_deletion(session_id)
+            steering_waiter = STEERING_WAIT_TASKS.pop(session_id, None)
+            if steering_waiter is not None and not steering_waiter[2].done():
+                steering_waiter[2].cancel()
             async with QUEUE_LOCK:
                 QUEUED_TURNS.pop(session_id, None)
                 RUN_NOW_TURNS.pop(session_id, None)

@@ -51,7 +51,7 @@ class DatabaseTests(unittest.TestCase):
         connection = open_database()
         self.addCleanup(connection.close)
 
-        self.assertEqual(LATEST_SCHEMA_VERSION, 9)
+        self.assertEqual(LATEST_SCHEMA_VERSION, 10)
         self.assertEqual(
             connection.execute("PRAGMA user_version").fetchone()[0],
             LATEST_SCHEMA_VERSION,
@@ -91,8 +91,89 @@ class DatabaseTests(unittest.TestCase):
                 "network_mailbox_items",
                 "network_deliveries",
                 "network_passive_requests",
+                "team_attachment_cleanup_queue",
             }.issubset(table_names)
         )
+
+    def test_attachment_reclamation_schema_has_bounded_query_plans(self) -> None:
+        connection = open_database()
+        self.addCleanup(connection.close)
+        objects = {
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type IN ('table','index')
+                """
+            )
+        }
+        self.assertTrue(
+            {
+                "team_attachment_cleanup_queue",
+                "team_attachment_cleanup_queue_oldest",
+                "team_attachments_reclaim_expired_by_team",
+                "team_attachments_reclaim_expired_global",
+            }.issubset(objects)
+        )
+
+        team_plan = " ".join(
+            str(row[3])
+            for row in connection.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT id,storage_key,state FROM team_attachments
+                WHERE message_id IS NULL AND expires_at<=? AND team_id=?
+                ORDER BY expires_at,id LIMIT ?
+                """,
+                (NOW, "team_example", 128),
+            )
+        )
+        global_plan = " ".join(
+            str(row[3])
+            for row in connection.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT id,storage_key,state FROM team_attachments
+                WHERE message_id IS NULL AND expires_at<=?
+                ORDER BY expires_at,id LIMIT ?
+                """,
+                (NOW, 128),
+            )
+        )
+        cleanup_plan = " ".join(
+            str(row[3])
+            for row in connection.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT path_kind,path_key FROM team_attachment_cleanup_queue
+                ORDER BY attempt_count,created_at,path_kind,path_key LIMIT ?
+                """,
+                (256,),
+            )
+        )
+        self.assertIn("team_attachments_reclaim_expired_by_team", team_plan)
+        self.assertIn("team_attachments_reclaim_expired_global", global_plan)
+        self.assertIn("team_attachment_cleanup_queue_oldest", cleanup_plan)
+        self.assertNotIn("TEMP B-TREE", team_plan)
+        self.assertNotIn("TEMP B-TREE", global_plan)
+        self.assertNotIn("TEMP B-TREE", cleanup_plan)
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO team_attachment_cleanup_queue(path_kind,path_key,created_at)
+                VALUES ('content','../../outside',?)
+                """,
+                (NOW,),
+            )
+        with self.assertRaises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO team_attachment_cleanup_queue(path_kind,path_key,created_at)
+                VALUES ('staging','tatt_not-hex',?)
+                """,
+                (NOW,),
+            )
 
     def test_version_five_database_upgrades_to_network_schema(self) -> None:
         connection = sqlite3.connect(":memory:", isolation_level=None)

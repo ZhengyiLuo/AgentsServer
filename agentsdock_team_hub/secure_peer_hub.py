@@ -21,6 +21,7 @@ from urllib.parse import parse_qsl, quote
 
 from .auth import _identity
 from .secure_peer import (
+    AttachmentFileLease,
     AttachmentProxyRequest,
     AttachmentProxyResponse,
     PeerAuthorization,
@@ -579,6 +580,8 @@ class SecurePeerHubAdapter:
 
         admitted = False
         deferred_release = False
+        attachment_source: AttachmentFileLease | None = None
+        attachment_source_transferred = False
         try:
             self._admit(
                 request.peer.peer_id,
@@ -625,9 +628,10 @@ class SecurePeerHubAdapter:
                     length=len(body),
                 )
 
-            attachment, path = self.store.open_team_attachment(
+            attachment, source = self.store.open_team_attachment(
                 claims, team_id, attachment_id
             )
+            attachment_source = source
             size = int(attachment["byte_size"])
             response_headers: list[tuple[str, str]] = [
                 ("accept-ranges", "bytes"),
@@ -663,6 +667,7 @@ class SecurePeerHubAdapter:
                             invalid = True
                         end = min(end, size - 1)
                 if invalid:
+                    source.close()
                     response_headers.append(("content-range", f"bytes */{size}"))
                     return AttachmentProxyResponse(
                         status=416,
@@ -672,16 +677,11 @@ class SecurePeerHubAdapter:
                 response_headers.append(
                     ("content-range", f"bytes {start}-{end}/{size}")
                 )
-            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-            flags |= getattr(os, "O_NOFOLLOW", 0)
-            descriptor = -1
+            descriptor = source.descriptor
             try:
-                descriptor = os.open(path, flags)
                 info = os.fstat(descriptor)
             except OSError as exc:
-                if descriptor >= 0:
-                    with suppress(OSError):
-                        os.close(descriptor)
+                source.close()
                 raise HubError(
                     "attachment_unavailable", "Attachment content is unavailable", 409
                 ) from exc
@@ -690,7 +690,7 @@ class SecurePeerHubAdapter:
                 or info.st_uid != os.getuid()
                 or info.st_size != size
             ):
-                os.close(descriptor)
+                source.close()
                 raise HubError(
                     "attachment_unavailable", "Attachment content is unavailable", 409
                 )
@@ -712,8 +712,7 @@ class SecurePeerHubAdapter:
                     if finalized:
                         return
                     finalized = True
-                with suppress(OSError):
-                    os.close(descriptor)
+                source.close()
                 with self._rate_condition:
                     aborters = self._stream_aborters.get(request.peer.peer_id)
                     if aborters is not None:
@@ -726,16 +725,14 @@ class SecurePeerHubAdapter:
                 if request.peer.peer_id in self._revoking:
                     # The descriptor has not escaped to the gateway yet, so
                     # this thread still owns it and can close it synchronously.
-                    with suppress(OSError):
-                        os.close(descriptor)
+                    source.close()
                     raise HubError(
                         "forbidden", "Secure peer authorization is being revoked", 403
                     )
                 self._stream_aborters.setdefault(request.peer.peer_id, set()).add(
                     abort
                 )
-            deferred_release = True
-            return AttachmentProxyResponse(
+            response = AttachmentProxyResponse(
                 status=status,
                 headers=tuple(response_headers),
                 descriptor=descriptor,
@@ -744,9 +741,14 @@ class SecurePeerHubAdapter:
                 finalizer=finalize,
                 cancelled=cancelled.is_set,
             )
+            deferred_release = True
+            attachment_source_transferred = True
+            return response
         except HubError as exc:
             return self._attachment_error(exc)
         finally:
+            if attachment_source is not None and not attachment_source_transferred:
+                attachment_source.close()
             if admitted and not deferred_release:
                 self._release(request.peer.peer_id)
 

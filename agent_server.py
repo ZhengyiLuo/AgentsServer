@@ -4115,13 +4115,15 @@ class TeamReference(BaseModel):
     path, and a team mention never resolves to a same-server chat.
     """
 
+    model_config = {"extra": "forbid"}
+
     kind: Literal["recipient", "skill"]
     recipient_kind: Literal["server", "human", "all"] | None = None
     team_id: str = Field(min_length=1, max_length=240)
     target_id: str = Field(min_length=1, max_length=240)
-    display_name_snapshot: str = Field(default="", max_length=160)
-    source_text_start: int | None = Field(default=None, ge=0)
-    source_text_end: int | None = Field(default=None, ge=0)
+    display_name_snapshot: str = Field(min_length=1, max_length=160)
+    source_text_start: int = Field(ge=0)
+    source_text_end: int = Field(ge=1)
     grant_intent: Literal[True] = True
 
     @model_validator(mode="after")
@@ -4131,21 +4133,33 @@ class TeamReference(BaseModel):
                 raise ValueError("recipient references require recipient_kind")
             if self.recipient_kind == "all" and self.target_id != "all":
                 raise ValueError("team-wide recipients use target_id 'all'")
+            if (
+                self.recipient_kind == "all"
+                and self.display_name_snapshot != "all"
+            ):
+                raise ValueError("team-wide recipients use the visible token '@@all'")
         elif self.recipient_kind is not None:
             raise ValueError("skill references cannot carry recipient_kind")
-        if (self.source_text_start is None) != (self.source_text_end is None):
-            raise ValueError("team reference spans need both offsets")
-        if (
-            self.source_text_start is not None
-            and self.source_text_end is not None
-            and self.source_text_end < self.source_text_start
-        ):
+        if self.source_text_end <= self.source_text_start:
             raise ValueError("team reference span is inverted")
         return self
 
 
 def team_reference_dicts(references: list[TeamReference] | None) -> list[dict[str, Any]]:
     return [reference.model_dump() for reference in (references or [])]
+
+
+def routed_references_match_visible_prompt(
+    prompt: Any,
+    display_prompt: Any,
+    chat_references: Any,
+    team_references: Any,
+) -> bool:
+    """Whether routed text is exactly the text projected to the user."""
+
+    return not (chat_references or team_references) or (
+        display_prompt is None or display_prompt == prompt
+    )
 
 
 class TurnRequest(BaseModel):
@@ -4172,6 +4186,23 @@ class TurnRequest(BaseModel):
     cross_chat_exchange_leg_id: str | None = Field(default=None, max_length=128)
     cross_chat_exchange_status: bool = False
     secure_peer_envelope_id: str | None = Field(default=None, max_length=128)
+
+    @model_validator(mode="after")
+    def _routed_references_match_the_visible_prompt(self) -> "TurnRequest":
+        # display_prompt is what the user sees in the timeline. A caller must
+        # not bind a route to a hidden request prompt while showing different
+        # text to the user. Internal/digest turns may still use a display
+        # projection when they carry no routed authority.
+        if not routed_references_match_visible_prompt(
+            self.prompt,
+            self.display_prompt,
+            self.chat_references,
+            self.team_references,
+        ):
+            raise ValueError(
+                "routed references require display_prompt to exactly match prompt"
+            )
+        return self
 
 
 class CrossChatHandoffRequest(BaseModel):
@@ -5477,13 +5508,26 @@ class AgentUpdateJobRequest(UpdateJobRequest):
     )
 
 
-class ServerUpdateRequest(BaseModel):
+class ServerUpdateTargetExpectation(BaseModel):
+    expected_server_identity: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+    )
+    expected_server_instance_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+    )
+
+
+class ServerUpdateRequest(ServerUpdateTargetExpectation):
     version: str | None = None
     track: Literal["stable", "beta"] | None = None
     when_idle: bool = False
 
 
-class ServerUpdateCancelRequest(BaseModel):
+class ServerUpdateCancelRequest(ServerUpdateTargetExpectation):
     model_config = {"extra": "forbid"}
 
     schedule_id: str = Field(
@@ -5493,7 +5537,7 @@ class ServerUpdateCancelRequest(BaseModel):
     )
 
 
-class ServerUpdateCheckRequest(BaseModel):
+class ServerUpdateCheckRequest(ServerUpdateTargetExpectation):
     track: Literal["stable", "beta"] | None = None
 
 
@@ -7601,6 +7645,12 @@ class JobStore:
             req.chat_references,
             redact_target_detail=redact_chat_reference_errors,
         )
+        team_references = validate_scheduled_job_team_references(
+            req.prompt,
+            req.team_references,
+            chat_references=chat_references,
+            redact_target_detail=redact_chat_reference_errors,
+        )
         jid = f"job_{uuid.uuid4().hex[:16]}"
         now = now_iso()
         now_timestamp = time.time()
@@ -7639,7 +7689,7 @@ class JobStore:
             "title": req.title,
             "prompt": req.prompt,
             "chat_references": chat_reference_dicts(chat_references),
-            "team_references": team_reference_dicts(req.team_references),
+            "team_references": team_reference_dicts(team_references),
             "schedule_kind": schedule_kind,
             "interval_seconds": interval_seconds,
             "cron_expression": cron_expression,
@@ -7803,12 +7853,12 @@ class JobStore:
                 and patch["team_references"] is not None
                 else job.get("team_references") or []
             )
-            next_team_references = [
-                reference
-                if isinstance(reference, TeamReference)
-                else TeamReference(**reference)
-                for reference in raw_team_references
-            ]
+            next_team_references = validate_scheduled_job_team_references(
+                next_prompt,
+                raw_team_references,
+                chat_references=next_chat_references,
+                redact_target_detail=redact_chat_reference_errors,
+            )
             job["team_references"] = team_reference_dicts(
                 next_team_references
             )
@@ -8492,12 +8542,12 @@ class JobStore:
                 job.get("chat_references") or [],
                 redact_target_detail=True,
             )
-            team_references = [
-                reference
-                if isinstance(reference, TeamReference)
-                else TeamReference(**reference)
-                for reference in list(job.get("team_references") or [])
-            ]
+            team_references = validate_scheduled_job_team_references(
+                str(job.get("prompt") or ""),
+                job.get("team_references") or [],
+                chat_references=chat_references,
+                redact_target_detail=True,
+            )
             req = TurnRequest(
                 prompt=job["prompt"],
                 file_ids=[],
@@ -8524,6 +8574,17 @@ class JobStore:
                 scheduled_job_revision=job_revision,
                 scheduled_job_manual_run=manual,
             )
+        except TeamReferenceTargetRepairRequired as exc:
+            repair = ScheduledJobChatReferenceRepairRequired(
+                status_code=409,
+                detail="saved Team target configuration is invalid",
+            )
+            await self.pause_for_chat_reference_repair(
+                jid,
+                repair,
+                expected_revision=job_revision,
+            )
+            raise repair from exc
         except ScheduledJobChatReferenceRepairRequired as exc:
             await self.pause_for_chat_reference_repair(
                 jid,
@@ -12058,6 +12119,16 @@ async def enqueue_turn(
     provider_route_snapshot: list[dict[str, Any]] | None = None,
     secure_peer_route_snapshots: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    if not routed_references_match_visible_prompt(
+        req.prompt,
+        req.display_prompt,
+        req.chat_references,
+        req.team_references,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="routed references require display_prompt to exactly match prompt",
+        )
     req.file_ids = validate_session_file_ids(session_id, req.file_ids)
     queued_id = f"queued_{uuid.uuid4().hex[:16]}"
     obligation_ids: list[str] = []
@@ -12806,7 +12877,7 @@ def utf16_slice(text: str, start: int, end: int) -> str:
     except UnicodeDecodeError as exc:
         raise HTTPException(
             status_code=400,
-            detail="chat reference range splits a Unicode character",
+            detail="reference range splits a Unicode character",
         ) from exc
 
 
@@ -13120,8 +13191,131 @@ def validate_chat_references(
     return normalized_references
 
 
+def team_reference_marker(reference: TeamReference) -> str:
+    """Return the one visible prompt token authorized by a team reference."""
+
+    return f"@@{reference.display_name_snapshot}"
+
+
+def validate_team_references(
+    prompt: str,
+    references: Any,
+    *,
+    chat_references: Any = (),
+) -> list[TeamReference]:
+    """Bind Team Network authority to exact visible ``@@`` prompt tokens.
+
+    Client-supplied IDs and spans are never authority by themselves.  Every
+    structured team reference must cover the exact display snapshot in the
+    immutable prompt, and the combined chat/team ranges must be disjoint.  The
+    latter makes ``@@`` the unambiguous first parser: a legacy chat reference
+    cannot claim either ``@`` inside an accepted team token.
+    """
+
+    if references is None or references == []:
+        return []
+    if not isinstance(references, list):
+        raise HTTPException(status_code=400, detail="team_references must be a list")
+    normalized: list[TeamReference] = []
+    try:
+        normalized = [
+            reference
+            if isinstance(reference, TeamReference)
+            else TeamReference.model_validate(reference)
+            for reference in references
+        ]
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="team reference is invalid") from exc
+
+    normalized_chat: list[ChatReference] = []
+    try:
+        normalized_chat = [
+            reference
+            if isinstance(reference, ChatReference)
+            else ChatReference.model_validate(reference)
+            for reference in (chat_references or [])
+        ]
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="chat reference is invalid") from exc
+
+    prompt_units = utf16_length(prompt)
+    ranges: list[tuple[int, int, str]] = [
+        (reference.source_text_start, reference.source_text_end, "chat")
+        for reference in normalized_chat
+    ]
+    seen: set[tuple[str, ...]] = set()
+    for reference in normalized:
+        display_name = reference.display_name_snapshot
+        if (
+            display_name.startswith("@")
+            or display_name != display_name.strip()
+            or any(character in display_name for character in "\r\n\x00")
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="team reference display name is not a visible token",
+            )
+        if reference.source_text_end > prompt_units:
+            raise HTTPException(
+                status_code=400,
+                detail="team reference range is outside the prompt",
+            )
+        if (
+            utf16_slice(
+                prompt,
+                reference.source_text_start,
+                reference.source_text_end,
+            )
+            != team_reference_marker(reference)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "team reference range does not match its visible @@ "
+                    "display-name snapshot"
+                ),
+            )
+        if not chat_reference_has_token_boundaries(
+            prompt,
+            reference,
+            prompt_units,
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="team reference marker is not delimited from surrounding text",
+            )
+        key = (
+            reference.kind,
+            reference.team_id,
+            str(reference.recipient_kind or ""),
+            reference.target_id,
+        )
+        if key in seen:
+            raise HTTPException(
+                status_code=400,
+                detail="duplicate team reference grant",
+            )
+        seen.add(key)
+        ranges.append(
+            (reference.source_text_start, reference.source_text_end, "team")
+        )
+
+    ordered_ranges = sorted(ranges)
+    for previous, current in zip(ordered_ranges, ordered_ranges[1:]):
+        if current[0] < previous[1]:
+            raise HTTPException(
+                status_code=400,
+                detail="chat and team reference ranges overlap",
+            )
+    return normalized
+
+
 class ScheduledJobChatReferenceRepairRequired(HTTPException):
     """A persisted job reference is unsafe to run until the user repairs it."""
+
+
+class TeamReferenceTargetRepairRequired(HTTPException):
+    """A frozen Team target no longer matches its visible ``@@`` token."""
 
 
 def provider_safe_scheduled_chat_reference_detail(exc: HTTPException) -> str:
@@ -13201,6 +13395,33 @@ def validate_scheduled_job_chat_references(
             status_code=exc.status_code,
             detail=(
                 provider_safe_scheduled_chat_reference_detail(exc)
+                if redact_target_detail
+                else exc.detail
+            ),
+            headers=None if redact_target_detail else exc.headers,
+        ) from exc
+
+
+def validate_scheduled_job_team_references(
+    prompt: str,
+    references: Any,
+    *,
+    chat_references: Any = (),
+    redact_target_detail: bool = False,
+) -> list[TeamReference]:
+    """Fail closed when a saved ``@@`` grant no longer matches its job prompt."""
+
+    try:
+        return validate_team_references(
+            prompt,
+            references,
+            chat_references=chat_references,
+        )
+    except HTTPException as exc:
+        raise ScheduledJobChatReferenceRepairRequired(
+            status_code=exc.status_code,
+            detail=(
+                "saved Team target configuration is invalid"
                 if redact_target_detail
                 else exc.detail
             ),
@@ -13911,6 +14132,31 @@ async def issue_cross_chat_capability(
     team_references: list[TeamReference] | None = None,
     team_read_enabled: bool = False,
 ) -> Path | None:
+    validated_team_references = validate_team_references(
+        source_user_instruction,
+        list(team_references or []),
+        chat_references=references,
+    )
+    resolved_team_references: list[dict[str, Any]] = []
+    if validated_team_references and AGENT_TOKEN:
+        try:
+            resolved_team_references = await asyncio.to_thread(
+                SECURE_PEER_RUNTIME.resolve_team_references,
+                team_reference_dicts(validated_team_references),
+            )
+        except (HubError, SecurePeerError, OSError, ValueError) as exc:
+            if str(getattr(exc, "code", "") or "") == "team_reference_invalid":
+                raise TeamReferenceTargetRepairRequired(
+                    status_code=409,
+                    detail="Team Network reference is unavailable or changed",
+                ) from exc
+            raise HTTPException(
+                status_code=max(
+                    400,
+                    min(599, int(getattr(exc, "status_code", 409) or 409)),
+                ),
+                detail="Team Network reference is unavailable or changed",
+            ) from exc
     grants = {
         (reference.session_id, reference.action)
         for reference in references
@@ -13969,8 +14215,8 @@ async def issue_cross_chat_capability(
     # Recipient identities never appear in the authority file or the prompt.
     team_routes: dict[str, dict[str, Any]] = {}
     if AGENT_TOKEN:
-        for reference in team_references or []:
-            team_routes["team_" + secrets.token_hex(16)] = reference.model_dump()
+        for reference in resolved_team_references:
+            team_routes["team_" + secrets.token_hex(16)] = dict(reference)
     if not team_routes:
         effective_actions.discard("team_send")
         effective_actions.discard("team_skill_publish")
@@ -15618,6 +15864,29 @@ async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedT
                                 candidate.get("secure_peer_route_snapshots")
                             ),
                         )
+                    candidate_team_references = validate_team_references(
+                        str(candidate.get("prompt") or ""),
+                        list(candidate.get("team_references") or []),
+                        chat_references=list(
+                            candidate.get("chat_references") or []
+                        ),
+                    )
+                    if not routed_references_match_visible_prompt(
+                        candidate.get("prompt"),
+                        candidate.get("display_prompt"),
+                        candidate.get("chat_references"),
+                        candidate_team_references,
+                    ):
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                "routed references require display_prompt to "
+                                "exactly match prompt"
+                            ),
+                        )
+                    candidate["team_references"] = team_reference_dicts(
+                        candidate_team_references
+                    )
                     item.clear()
                     item.update(candidate)
                     updated = dict(item)
@@ -17776,6 +18045,36 @@ async def _start_next_queued_turn_locked(
         )
         return
 
+    # Queue records are durable and may have been written by an older build or
+    # restored after an interrupted update. Validate their structured Team
+    # references before rebuilding TurnRequest so a missing/stale/hidden span
+    # cannot escape as a Pydantic error after the item has already been popped.
+    # A permanently invalid grant is terminal for this exact queue item; record
+    # the pop so restart recovery cannot resurrect it and retry indefinitely.
+    try:
+        if not routed_references_match_visible_prompt(
+            item.get("prompt"),
+            item.get("display_prompt"),
+            item.get("chat_references"),
+            item.get("team_references"),
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="saved routed references do not match the visible prompt",
+            )
+        queued_team_references = validate_team_references(
+            str(item.get("prompt") or ""),
+            item.get("team_references") or [],
+            chat_references=item.get("chat_references") or [],
+        )
+    except HTTPException:
+        await terminally_discard_queued_turn(
+            session_id,
+            item,
+            "saved Team target configuration is invalid",
+        )
+        return
+
     req = TurnRequest(
         prompt=str(item.get("prompt") or ""),
         file_ids=list(item.get("file_ids") or []),
@@ -17789,12 +18088,7 @@ async def _start_next_queued_turn_locked(
         source_session_id=item.get("source_session_id"),
         target_session_id=item.get("target_session_id"),
         chat_references=list(item.get("chat_references") or []),
-        team_references=[
-            reference
-            if isinstance(reference, TeamReference)
-            else TeamReference(**reference)
-            for reference in list(item.get("team_references") or [])
-        ],
+        team_references=queued_team_references,
         cross_chat_envelope_id=item.get("cross_chat_envelope_id"),
         cross_chat_exchange_id=item.get("cross_chat_exchange_id"),
         cross_chat_exchange_leg_id=item.get("cross_chat_exchange_leg_id"),
@@ -17859,6 +18153,13 @@ async def _start_next_queued_turn_locked(
             # 409 while provider cleanup drains. Preserve this durable item so
             # an aborted delete can resume normally.
             await requeue_turn_front(session_id, item)
+            return
+        if isinstance(e, TeamReferenceTargetRepairRequired):
+            await terminally_discard_queued_turn(
+                session_id,
+                item,
+                "saved Team target configuration is invalid",
+            )
             return
         terminal_session_state = (
             session_id in DELETED_SESSION_TOMBSTONES
@@ -50716,6 +51017,16 @@ async def _start_turn_locked(
         raise HTTPException(status_code=404, detail="session not found")
     if sess.get("archived"):
         raise HTTPException(status_code=409, detail="archived chats cannot start turns")
+    if not routed_references_match_visible_prompt(
+        req.prompt,
+        req.display_prompt,
+        req.chat_references,
+        req.team_references,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="routed references require display_prompt to exactly match prompt",
+        )
     if scheduled_job_manual_run and (
         req.purpose != "scheduled_job" or not scheduled_job_revision
     ):
@@ -50907,12 +51218,23 @@ async def _start_turn_locked(
                 req.chat_references,
                 redact_target_detail=True,
             )
+            req.team_references = validate_scheduled_job_team_references(
+                req.prompt,
+                req.team_references,
+                chat_references=req.chat_references,
+                redact_target_detail=True,
+            )
         else:
             req.chat_references = validate_chat_references(
                 session_id,
                 req.prompt,
                 req.chat_references,
                 req.client_capabilities,
+            )
+            req.team_references = validate_team_references(
+                req.prompt,
+                req.team_references,
+                chat_references=req.chat_references,
             )
             if (
                 provider_context_mode == "chat"
@@ -52695,6 +53017,45 @@ def server_update_error_detail(
     return result
 
 
+def require_server_update_target(
+    expected_server_identity: str | None,
+    expected_server_instance_id: str | None,
+) -> None:
+    """Fail closed when a client-bound update target is absent or stale."""
+
+    if expected_server_identity is None and expected_server_instance_id is None:
+        # Compatibility for clients predating identity-bound update controls.
+        return
+    if (
+        not isinstance(expected_server_identity, str)
+        or not 1 <= len(expected_server_identity) <= 128
+        or not isinstance(expected_server_instance_id, str)
+        or not 1 <= len(expected_server_instance_id) <= 128
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=server_update_error_detail(
+                "server_update_target_incomplete",
+                "Server update target identity and instance must be supplied together.",
+                action="Refresh the server connection before trying again.",
+                retryable=True,
+            ),
+        )
+    if (
+        expected_server_identity != server_identity()
+        or expected_server_instance_id != SERVER_INSTANCE_ID
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=server_update_error_detail(
+                "server_update_target_changed",
+                "The connected AgentsServer instance changed before the update request.",
+                action="Refresh the server connection before trying again.",
+                retryable=True,
+            ),
+        )
+
+
 def update_blocking_queued_turn_count_locked() -> int:
     """Count only queue entries that are not yet restart-durable.
 
@@ -52769,6 +53130,16 @@ def read_server_update_status() -> dict[str, Any]:
     ):
         value["update_available"] = False
     return value
+
+
+def public_server_update_status(status: dict[str, Any]) -> dict[str, Any]:
+    """Attach the live responder identity without persisting process identity."""
+
+    return {
+        **status,
+        "server_identity": server_identity(),
+        "server_instance_id": SERVER_INSTANCE_ID,
+    }
 
 
 def _write_server_update_status_unlocked(**changes: Any) -> dict[str, Any]:
@@ -55152,9 +55523,9 @@ async def health() -> dict[str, Any]:
                 "required": False,
                 "message": "Signed Stable and Beta AgentsServer channels are available.",
                 "action": None,
-                # v8 fences new turn/job materialization while existing work
-                # drains. v7 reservations were durable but passive.
-                "version": 8,
+                # v9 binds status and controls to the exact live responder.
+                # v8 fenced new materialization while existing work drained.
+                "version": 9,
                 "tracks": ["stable", "beta"],
             },
             "tmux": tmux,
@@ -56062,8 +56433,15 @@ async def restart_server_endpoint(
 
 
 @app.get("/api/admin/update")
-async def server_update_status() -> dict[str, Any]:
+async def server_update_status(
+    expected_server_identity: str | None = None,
+    expected_server_instance_id: str | None = None,
+) -> dict[str, Any]:
     async with SERVER_UPDATE_OPERATION_LOCK:
+        require_server_update_target(
+            expected_server_identity,
+            expected_server_instance_id,
+        )
         status = read_server_update_status()
         phase = str(status.get("phase") or "")
         if phase in SERVER_UPDATE_ACTIVE_PHASES:
@@ -56088,8 +56466,9 @@ async def server_update_status() -> dict[str, Any]:
         # server process remains alive. Reconcile that durable phase with the
         # process-local terminal gate so clients need neither a restart nor a
         # second update attempt before reconnecting.
-        await TERMINAL_ATTACHMENTS.reopen_if_update_inactive(status)
-        return status
+        public_status = public_server_update_status(status)
+        await TERMINAL_ATTACHMENTS.reopen_if_update_inactive(public_status)
+        return public_status
 
 
 @app.post("/api/admin/update/check")
@@ -56097,6 +56476,10 @@ async def check_server_update(
     body: ServerUpdateCheckRequest | None = None,
 ) -> dict[str, Any]:
     async with SERVER_UPDATE_OPERATION_LOCK:
+        require_server_update_target(
+            body.expected_server_identity if body is not None else None,
+            body.expected_server_instance_id if body is not None else None,
+        )
         if managed_server_restart_blocks_work():
             raise HTTPException(
                 status_code=409,
@@ -56104,7 +56487,7 @@ async def check_server_update(
             )
         status = read_server_update_status()
         if managed_server_update_is_pending(status):
-            return status
+            return public_server_update_status(status)
         if str(status.get("phase") or "") in SERVER_UPDATE_ACTIVE_PHASES:
             updater_active = await asyncio.to_thread(server_update_is_active, status)
             if (
@@ -56136,12 +56519,14 @@ async def check_server_update(
         except HTTPException as exc:
             if exc.status_code != 404:
                 raise
-            return write_fresh_server_update_status(
-                phase="unavailable",
-                track=track,
-                update_available=False,
-                message=str(exc.detail),
-                checked_at=update_utc_now(),
+            return public_server_update_status(
+                write_fresh_server_update_status(
+                    phase="unavailable",
+                    track=track,
+                    update_available=False,
+                    message=str(exc.detail),
+                    checked_at=update_utc_now(),
+                )
             )
         latest = str(manifest["version"])
         current_track = server_release_track(SERVER_VERSION)
@@ -56159,15 +56544,17 @@ async def check_server_update(
             message = f"AgentsServer {latest} is available."
         else:
             message = f"AgentsServer {SERVER_VERSION} is current on {track}."
-        return write_fresh_server_update_status(
-            phase="available" if update_available else "current",
-            track=track,
-            current_track=current_track,
-            latest_version=latest,
-            update_available=update_available,
-            channel_switch=channel_switch,
-            message=message,
-            checked_at=update_utc_now(),
+        return public_server_update_status(
+            write_fresh_server_update_status(
+                phase="available" if update_available else "current",
+                track=track,
+                current_track=current_track,
+                latest_version=latest,
+                update_available=update_available,
+                channel_switch=channel_switch,
+                message=message,
+                checked_at=update_utc_now(),
+            )
         )
 
 
@@ -56177,6 +56564,10 @@ async def _start_server_update(
     expected_schedule_id: str | None = None,
 ) -> dict[str, Any]:
     async with SERVER_UPDATE_OPERATION_LOCK:
+        require_server_update_target(
+            body.expected_server_identity,
+            body.expected_server_instance_id,
+        )
         if managed_server_restart_blocks_work():
             raise HTTPException(
                 status_code=409,
@@ -56659,7 +57050,7 @@ async def _start_server_update(
 
 @app.post("/api/admin/update/start")
 async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
-    return await _start_server_update(body)
+    return public_server_update_status(await _start_server_update(body))
 
 
 @app.post("/api/admin/update/cancel")
@@ -56669,6 +57060,10 @@ async def cancel_server_update(
     """Cancel exactly one durable idle reservation before launch begins."""
 
     async with SERVER_UPDATE_OPERATION_LOCK:
+        require_server_update_target(
+            body.expected_server_identity,
+            body.expected_server_instance_id,
+        )
         status = read_server_update_status()
         actual_schedule_id = str(status.get("schedule_id") or "").strip()
         if actual_schedule_id != body.schedule_id:
@@ -56714,12 +57109,13 @@ async def cancel_server_update(
             ),
             checked_at=status.get("checked_at"),
         )
-        await TERMINAL_ATTACHMENTS.reopen_if_update_inactive(cancelled)
+        public_status = public_server_update_status(cancelled)
+        await TERMINAL_ATTACHMENTS.reopen_if_update_inactive(public_status)
         # Messages accepted while the drain was pending are already durable.
         # Wake their queues immediately when the user cancels instead of
         # waiting for the periodic deferred-turn retry.
         schedule_rebuilt_queued_turns()
-        return cancelled
+        return public_status
 
 
 async def advance_pending_server_update_once() -> dict[str, Any]:
@@ -61472,6 +61868,11 @@ async def send_provider_team_message(
     reference = (capability.get("team_routes") or {}).get(route_id)
     if not isinstance(reference, dict):
         raise HTTPException(status_code=404, detail="Team Network route was not found")
+    if reference.get("kind") == "skill" and req.kind != "skill":
+        raise HTTPException(
+            status_code=409,
+            detail="a mentioned Team skill route can only publish that skill",
+        )
     if req.kind == "skill":
         if "team_skill_publish" not in capability.get("actions", set()):
             raise HTTPException(
@@ -61486,6 +61887,13 @@ async def send_provider_team_message(
                 status_code=409,
                 detail="skills can only be published to @@all or to a mentioned skill",
             )
+        if reference.get("kind") == "skill":
+            requested_slug = str((req.skill or {}).get("slug") or "").strip().lower()
+            if requested_slug != str(reference.get("authorized_skill_slug") or ""):
+                raise HTTPException(
+                    status_code=409,
+                    detail="the skill slug does not match the mentioned Team skill",
+                )
     request_digest = hashlib.sha256(
         json.dumps(
             [route_id, req.model_dump(), attachment_paths],

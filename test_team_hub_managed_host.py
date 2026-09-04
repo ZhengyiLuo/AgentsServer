@@ -447,6 +447,7 @@ sys.exit(10)
             ):
                 connection.execute(f"DROP TRIGGER {trigger}")
             for table in (
+                "team_attachment_cleanup_queue",
                 "team_skill_versions",
                 "team_attachments",
                 "team_message_recipients",
@@ -481,6 +482,7 @@ sys.exit(10)
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_insert")
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_update")
             for table in (
+                "team_attachment_cleanup_queue",
                 "team_skill_versions",
                 "team_attachments",
                 "team_message_recipients",
@@ -1299,7 +1301,7 @@ sys.exit(10)
             self.assertEqual(migrated.bootstrap_proof_path.read_bytes(), expected_proof)
             connection = migrated.connect()
             try:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 9)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 10)
                 self.assertEqual(
                     connection.execute(
                         "SELECT count(*) FROM bootstrap_delegations"
@@ -1393,7 +1395,7 @@ sys.exit(10)
                 try:
                     self.assertEqual(
                         connection.execute("PRAGMA user_version").fetchone()[0],
-                        9,
+                        10,
                     )
                     preserved = connection.execute(
                         "SELECT * FROM channels WHERE id=?", (old_board_id,)

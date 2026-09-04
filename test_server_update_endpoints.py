@@ -520,7 +520,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response["managed_updates"])
         self.assertEqual(
             response["capabilities"]["server_updates"]["version"],
-            8,
+            9,
         )
         self.assertEqual(response["update_service_cgroup"], {
             "safe": True,
@@ -572,6 +572,141 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(response["update_blocking_queued_count"], 1)
 
+    async def test_status_returns_live_update_target_without_persisting_it(self):
+        terminal_attachments = MagicMock()
+        terminal_attachments.reopen_if_update_inactive = AsyncMock(
+            return_value=True
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            status_path = Path(temporary) / "status.json"
+            with patch.object(
+                agent_server,
+                "SERVER_UPDATE_STATUS_FILE",
+                status_path,
+            ), patch.object(
+                agent_server,
+                "server_identity",
+                return_value="server-current",
+            ), patch.object(
+                agent_server,
+                "SERVER_INSTANCE_ID",
+                "instance-current",
+            ), patch.object(
+                agent_server,
+                "TERMINAL_ATTACHMENTS",
+                terminal_attachments,
+            ):
+                agent_server.write_server_update_status(phase="current")
+                status = await agent_server.server_update_status(
+                    expected_server_identity="server-current",
+                    expected_server_instance_id="instance-current",
+                )
+                persisted = agent_server.read_server_update_status()
+
+        self.assertEqual(status["server_identity"], "server-current")
+        self.assertEqual(status["server_instance_id"], "instance-current")
+        self.assertNotIn("server_identity", persisted)
+        self.assertNotIn("server_instance_id", persisted)
+        terminal_attachments.reopen_if_update_inactive.assert_awaited_once_with(
+            status
+        )
+
+    async def test_update_endpoints_reject_stale_targets_before_state_access(self):
+        state_access = MagicMock(
+            side_effect=AssertionError("stale target reached update state")
+        )
+        restart_gate = MagicMock(
+            side_effect=AssertionError("stale target reached restart reconciliation")
+        )
+        status_write = MagicMock(
+            side_effect=AssertionError("stale target wrote update status")
+        )
+        abandoned_reconciliation = MagicMock(
+            side_effect=AssertionError("stale target reconciled update status")
+        )
+        prepare_hub = AsyncMock(
+            side_effect=AssertionError("stale target closed Hub admission")
+        )
+        calls = {
+            "status identity swap": lambda: agent_server.server_update_status(
+                expected_server_identity="server-stale",
+                expected_server_instance_id="instance-current",
+            ),
+            "check instance swap": lambda: agent_server.check_server_update(
+                agent_server.ServerUpdateCheckRequest(
+                    expected_server_identity="server-current",
+                    expected_server_instance_id="instance-stale",
+                )
+            ),
+            "start identity swap": lambda: agent_server.start_server_update(
+                agent_server.ServerUpdateRequest(
+                    version="1.1.0",
+                    expected_server_identity="server-stale",
+                    expected_server_instance_id="instance-current",
+                )
+            ),
+            "cancel instance swap": lambda: agent_server.cancel_server_update(
+                agent_server.ServerUpdateCancelRequest(
+                    schedule_id="a" * 32,
+                    expected_server_identity="server-current",
+                    expected_server_instance_id="instance-stale",
+                )
+            ),
+        }
+        with patch.object(
+            agent_server,
+            "server_identity",
+            return_value="server-current",
+        ), patch.object(
+            agent_server,
+            "SERVER_INSTANCE_ID",
+            "instance-current",
+        ), patch.object(
+            agent_server,
+            "read_server_update_status",
+            state_access,
+        ), patch.object(
+            agent_server,
+            "managed_server_restart_blocks_work",
+            restart_gate,
+        ), patch.object(
+            agent_server,
+            "write_fresh_server_update_status",
+            status_write,
+        ), patch.object(
+            agent_server,
+            "finalize_abandoned_server_update",
+            abandoned_reconciliation,
+        ), patch.object(
+            agent_server.TEAM_HUB_RUNTIME,
+            "prepare_maintenance",
+            new=prepare_hub,
+        ):
+            for label, call in calls.items():
+                with self.subTest(endpoint=label):
+                    with self.assertRaises(HTTPException) as raised:
+                        await call()
+                    self.assertEqual(raised.exception.status_code, 409)
+                    self.assertEqual(
+                        raised.exception.detail["code"],
+                        "server_update_target_changed",
+                    )
+            with self.assertRaises(HTTPException) as incomplete:
+                await agent_server.server_update_status(
+                    expected_server_identity="server-current",
+                )
+
+        state_access.assert_not_called()
+        restart_gate.assert_not_called()
+        status_write.assert_not_called()
+        abandoned_reconciliation.assert_not_called()
+        prepare_hub.assert_not_awaited()
+        self.assertEqual(incomplete.exception.status_code, 400)
+        self.assertEqual(
+            incomplete.exception.detail["code"],
+            "server_update_target_incomplete",
+        )
+
     async def test_check_reports_a_signed_newer_release(self):
         with tempfile.TemporaryDirectory() as temporary, \
              patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
@@ -584,6 +719,8 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["latest_version"], "1.1.0")
         self.assertTrue(status["update_available"])
         self.assertEqual(status["track"], "stable")
+        self.assertEqual(status["server_identity"], agent_server.server_identity())
+        self.assertEqual(status["server_instance_id"], agent_server.SERVER_INSTANCE_ID)
 
     async def test_check_beta_track_discovers_and_persists_beta_release(self):
         manifest = AsyncMock(return_value={"version": "1.1.0-beta.3"})
@@ -1126,6 +1263,8 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status["phase"], "current")
         self.assertFalse(status["update_available"])
+        self.assertEqual(status["server_identity"], agent_server.server_identity())
+        self.assertEqual(status["server_instance_id"], agent_server.SERVER_INSTANCE_ID)
         manifest.assert_not_awaited()
 
     async def test_start_newer_version_without_tmux_returns_actionable_503(self):
@@ -1936,6 +2075,8 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(cancelled["phase"], "available")
+        self.assertEqual(cancelled["server_identity"], agent_server.server_identity())
+        self.assertEqual(cancelled["server_instance_id"], agent_server.SERVER_INSTANCE_ID)
         wake_queues.assert_called_once_with()
 
     async def test_pending_allows_drain_safe_http_mutations(self):

@@ -1431,6 +1431,10 @@ exit 0
                 f"agents-server-{version}/agentsdock_team_hub/migrations/0009_team_messages.sql",
                 members,
             )
+            self.assertIn(
+                f"agents-server-{version}/agentsdock_team_hub/migrations/0010_team_attachment_orphan_reclamation.sql",
+                members,
+            )
             self.assertFalse(
                 any("__pycache__" in name or name.endswith((".pyc", ".pyo")) for name in members)
             )
@@ -3421,7 +3425,7 @@ exit 0
             self.assertFalse(store.maintenance_fence_path.exists())
             connection = sqlite3.connect(store.database_path)
             try:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 9)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 10)
                 self.assertEqual(
                     connection.execute(
                         "SELECT hub_id, server_identity FROM managed_host_bindings"
@@ -5816,6 +5820,8 @@ exit 0
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_insert")
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_update")
             for table in (
+                # Migration 0010 (attachment orphan reclamation).
+                "team_attachment_cleanup_queue",
                 # Migration 0009 (Team Messages V2), children first.
                 "team_skill_versions",
                 "team_attachments",

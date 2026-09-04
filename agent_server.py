@@ -6799,33 +6799,56 @@ def encode_sessions_json(sessions: dict[str, dict[str, Any]]) -> str:
 SESSIONS_WRITE_LOCK = threading.Lock()
 
 
-def write_sessions_json_text(path: Path, text: str, *, durable: bool) -> None:
-    """Atomically replace sessions.json; ``durable`` also fsyncs file and dir."""
+def write_sessions_json_text(
+    path: Path,
+    text: str,
+    *,
+    durable: bool,
+    lock_timeout: float | None = None,
+) -> None:
+    """Atomically replace sessions.json; ``durable`` also fsyncs file and dir.
 
-    with SESSIONS_WRITE_LOCK:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        with tmp.open("w", encoding="utf-8") as stream:
-            stream.write(text)
-            if durable:
-                stream.flush()
-                os.fsync(stream.fileno())
-        os.replace(tmp, path)
-        if not durable:
-            return
-        # Windows does not support opening/fsyncing a directory handle this
-        # way; FlushFileBuffers on the temporary file plus atomic replace is
-        # its portable boundary. POSIX additionally persists the rename itself.
-        if os.name == "nt":
-            return
-        directory_flags = os.O_RDONLY
-        directory_flags |= getattr(os, "O_DIRECTORY", 0)
-        directory_flags |= getattr(os, "O_CLOEXEC", 0)
-        directory_fd = os.open(path.parent, directory_flags)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+    ``lock_timeout`` bounds the wait for the writer lock. The shutdown fallback
+    runs on the event loop and must not block behind a worker thread that is
+    stalled inside a slow write.
+    """
+
+    if lock_timeout is None:
+        SESSIONS_WRITE_LOCK.acquire()
+    elif not SESSIONS_WRITE_LOCK.acquire(timeout=max(0.0, float(lock_timeout))):
+        raise RuntimeError("sessions.json writer is busy")
+    try:
+        _write_sessions_json_text_locked(path, text, durable=durable)
+    finally:
+        SESSIONS_WRITE_LOCK.release()
+
+
+def _write_sessions_json_text_locked(path: Path, text: str, *, durable: bool) -> None:
+    """Write sessions.json; the caller holds SESSIONS_WRITE_LOCK."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as stream:
+        stream.write(text)
+        if durable:
+            stream.flush()
+            os.fsync(stream.fileno())
+    os.replace(tmp, path)
+    if not durable:
+        return
+    # Windows does not support opening/fsyncing a directory handle this
+    # way; FlushFileBuffers on the temporary file plus atomic replace is
+    # its portable boundary. POSIX additionally persists the rename itself.
+    if os.name == "nt":
+        return
+    directory_flags = os.O_RDONLY
+    directory_flags |= getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    directory_fd = os.open(path.parent, directory_flags)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def write_sessions_json_durable(
@@ -7211,8 +7234,12 @@ class SessionStore:
                 await self._wait_for_save_window(pending)
                 # Marks arriving from here on belong to the next write.
                 self._pending_save = None
-                text = encode_sessions_json(self.sessions)
                 try:
+                    # Encoding can fail (a non-JSON value left in a session);
+                    # that failure must reach the awaiters like a write failure
+                    # instead of killing the writer and stranding every later
+                    # save() behind an event that is never set.
+                    text = encode_sessions_json(self.sessions)
                     await asyncio.to_thread(
                         write_sessions_json_text,
                         pending.path,
@@ -7247,10 +7274,13 @@ class SessionStore:
                 pending.done.set()
             if leftover is not None:
                 try:
+                    # Bounded: a worker thread stalled inside a slow write still
+                    # holds the lock, and this fallback runs on the event loop.
                     write_sessions_json_text(
                         leftover.path,
                         encode_sessions_json(self.sessions),
                         durable=leftover.durable,
+                        lock_timeout=1.0,
                     )
                     self.save_write_count += 1
                 except Exception as exc:
@@ -18801,7 +18831,14 @@ def schedule_queued_turn_retry(
     """
 
     existing = QUEUE_RETRY_TASKS.get(session_id)
-    if existing is not None and not existing.done():
+    if (
+        existing is not None
+        and not existing.done()
+        and existing is not asyncio.current_task()
+    ):
+        # Another timer is already pending. The running timer itself may
+        # re-arm (its promotion attempt deferred again), otherwise retries
+        # would be single-shot.
         return False
     task = asyncio.create_task(
         retry_next_queued_turn_later(session_id, delay_seconds)
@@ -23150,11 +23187,16 @@ def read_events(
     *,
     tail: bool = False,
     visible: bool = False,
+    cap_to_response_limit: bool = True,
 ) -> list[dict[str, Any]]:
     path = events_path(session_id)
     if not path.exists():
         return []
-    limit = max(1, min(int(limit or 500), MAX_EVENT_RESPONSE_LIMIT))
+    limit = max(1, int(limit or 500))
+    if cap_to_response_limit:
+        # API responses are bounded; internal scans (history dedup) may ask
+        # for a larger window and must not be silently clamped.
+        limit = min(limit, MAX_EVENT_RESPONSE_LIMIT)
     internal_run_ids = fork_internal_run_ids(session_id) if visible else set()
     out: list[dict[str, Any]] = []
     tail_out: deque[dict[str, Any]] | None = deque(maxlen=limit) if tail else None
@@ -23963,6 +24005,57 @@ async def codex_session_has_active_run(session_id: str) -> bool:
 
     async with ACTIVE_LOCK:
         return session_id in BUSY_SESSIONS or bool(ACTIVE.get(session_id))
+
+
+CODEX_SUBAGENT_FINALIZE_TIMEOUT_SECONDS = float(
+    agentsdock_setting("CODEX_SUBAGENT_FINALIZE_TIMEOUT_SECONDS", "20")
+)
+CODEX_SUBAGENT_FINALIZE_TASKS: dict[str, asyncio.Task[Any]] = {}
+
+
+def schedule_codex_subagent_finalization(
+    session_id: str,
+    manager: "CodexAppServerManager | None",
+    *,
+    run_id: str | None = None,
+) -> None:
+    """Run post-run child finalization detached, bounded, at most once per chat."""
+
+    existing = CODEX_SUBAGENT_FINALIZE_TASKS.get(session_id)
+    if existing is not None and not existing.done():
+        return
+
+    async def finalize() -> None:
+        try:
+            await asyncio.wait_for(
+                finalize_codex_subagents_after_run(session_id, manager),
+                timeout=max(1.0, CODEX_SUBAGENT_FINALIZE_TIMEOUT_SECONDS),
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Codex subagent finalization timed out session=%s run=%s after %.0fs",
+                session_id,
+                run_id,
+                CODEX_SUBAGENT_FINALIZE_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Codex subagent finalization failed session=%s run=%s: %s",
+                session_id,
+                run_id,
+                concise_error_message(exc),
+            )
+
+    task = asyncio.create_task(finalize())
+    CODEX_SUBAGENT_FINALIZE_TASKS[session_id] = task
+
+    def release(completed: asyncio.Task[Any]) -> None:
+        if CODEX_SUBAGENT_FINALIZE_TASKS.get(session_id) is completed:
+            CODEX_SUBAGENT_FINALIZE_TASKS.pop(session_id, None)
+
+    task.add_done_callback(release)
 
 
 async def finalize_codex_subagents_after_run(
@@ -36997,6 +37090,7 @@ def unsynced_history_items(
         session_id,
         limit=HISTORY_SYNC_EVENT_SCAN_LIMIT,
         tail=True,
+        cap_to_response_limit=False,
     ):
         event_type = event.get("type")
         if event_type == "turn_started":
@@ -52706,17 +52800,14 @@ async def run_codex_app_server(
         if provider_id and not standalone_provider_context:
             # Native children spawned during this turn stay loaded in the
             # app-server until something unsubscribes them. Finalize them
-            # here, after the parent's terminal event, so finished rollouts
-            # are released before the next turn can fork more.
-            try:
-                await finalize_codex_subagents_after_run(session_id, manager)
-            except Exception as exc:
-                logger.warning(
-                    "Codex subagent finalization failed session=%s run=%s: %s",
-                    session_id,
-                    current_run_id,
-                    concise_error_message(exc),
-                )
+            # after the parent's terminal event, detached and bounded, so a
+            # large spawn tree can neither hold the turn slot nor stall the
+            # chat if the app-server is slow to answer.
+            schedule_codex_subagent_finalization(
+                session_id,
+                manager,
+                run_id=current_run_id,
+            )
     finally:
         RUN_METADATA.pop(current_run_id, None)
         released = False
@@ -53977,11 +54068,34 @@ SERVER_RESTART_PHASES = {"idle", "accepted", "signaling", "complete", "failed"}
 SERVER_RESTART_ACTIVE_PHASES = {"accepted", "signaling"}
 SERVER_RESTART_SIGNAL_DELAY_SECONDS = 0.5
 SERVER_RESTART_FORCE_KILL_DELAY_SECONDS = 3.0
+# Every lifespan shutdown phase runs under this deadline (bounded_shutdown_phase)
+# so one wedged join cannot starve the provider teardown that follows it.
+SERVER_SHUTDOWN_PHASE_TIMEOUT_SECONDS = 5.0
+# Number of bounded_shutdown_phase calls in the lifespan teardown; keep in sync
+# so the cooperative watchdog budget below honours every phase.
+SERVER_SHUTDOWN_PHASE_COUNT = 15
+
+
+def configured_uvicorn_graceful_shutdown_seconds() -> float:
+    try:
+        return max(
+            1.0,
+            float(agentsdock_setting("UVICORN_GRACEFUL_SHUTDOWN_SECONDS", "20")),
+        )
+    except ValueError:
+        return 20.0
+
+
 # A cooperative restart still arms the hard-kill watchdog: uvicorn waits on
 # background tasks/websockets and a Codex child may ignore SIGTERM, so without
-# a deadline the port can stay closed forever. This budget must exceed the
-# uvicorn graceful window plus the bounded lifespan shutdown phases.
-SERVER_RESTART_GRACEFUL_KILL_DELAY_SECONDS = 30.0
+# a deadline the port can stay closed forever. The budget is derived from the
+# uvicorn graceful window plus every bounded lifespan shutdown phase, so the
+# watchdog can only fire after the phases it protects had their chance.
+SERVER_RESTART_GRACEFUL_KILL_DELAY_SECONDS = (
+    configured_uvicorn_graceful_shutdown_seconds()
+    + SERVER_SHUTDOWN_PHASE_COUNT * SERVER_SHUTDOWN_PHASE_TIMEOUT_SECONDS
+    + 5.0
+)
 SERVER_RESTART_ACCEPTED_STALE_SECONDS = 10.0
 SERVER_RESTART_COOLDOWN_SECONDS = 30.0
 # A forced (emergency) restart must never wait on server state that may itself
@@ -54221,8 +54335,11 @@ def official_server_release_tree() -> bool:
     return current == SERVER_ROOT
 
 
-def macos_launchd_owns_current_process() -> bool:
-    """Prove that the official launchd job owns this exact process."""
+def macos_launchd_owns_current_process() -> bool | None:
+    """Prove that the official launchd job owns this exact process.
+
+    Returns ``None`` when the probe could not decide (launchctl timed out).
+    """
 
     if sys.platform != "darwin" or not Path("/bin/launchctl").is_file():
         return False
@@ -54239,6 +54356,13 @@ def macos_launchd_owns_current_process() -> bool:
             check=False,
             timeout=3,
         )
+    except subprocess.TimeoutExpired:
+        # A slow launchctl under host load is not evidence that the job does
+        # not own this process. Report "unknown" so a prior positive proof
+        # for this immutable PID keeps standing instead of turning the
+        # emergency restart control into a 503.
+        logger.warning("launchctl ownership probe timed out; ownership unknown")
+        return None
     except (OSError, subprocess.SubprocessError):
         return False
     if result.returncode != 0:
@@ -54258,7 +54382,11 @@ def detect_managed_server_service_kind() -> str | None:
     if sys.platform.startswith("linux"):
         return "systemd-user" if agents_server_systemd_cgroup() else None
     if sys.platform == "darwin":
-        return "launch-agent" if macos_launchd_owns_current_process() else None
+        owned = macos_launchd_owns_current_process()
+        if owned is None:
+            # Unknown: fall back to the cached positive proof, if any.
+            return MANAGED_SERVER_SERVICE_KIND_CACHE
+        return "launch-agent" if owned else None
     return None
 
 
@@ -54909,7 +55037,7 @@ def server_restart_safety_work_message(
     detail = " and ".join(parts) or "safety-critical server work"
     return (
         f"AgentsServer cannot restart while {detail} remains active; "
-        "force restart cannot override this safety fence."
+        "a cooperative restart waits for it; force restart overrides it."
     )
 
 
@@ -55064,12 +55192,16 @@ def kill_registered_provider_children() -> int:
         pid = entry["pid"]
         pgid = entry["pgid"]
         with suppress(Exception):
-            if not provider_child_process_exists(pid):
+            if provider_child_process_exists(pid) and (
+                "codex" not in provider_child_command_line(pid).lower()
+            ):
+                # The leader pid was reused by an unrelated process.
                 continue
-            if "codex" not in provider_child_command_line(pid).lower():
-                continue
-            os.killpg(pgid, signal.SIGKILL)
-            killed += 1
+            # A group can outlive its leader (codex-code-mode-host and other
+            # helpers); kill the group whether or not the leader is alive.
+            with suppress(ProcessLookupError, PermissionError):
+                os.killpg(pgid, signal.SIGKILL)
+                killed += 1
     return killed
 
 
@@ -55091,6 +55223,10 @@ def sweep_orphaned_provider_children() -> int:
             pgid = entry["pgid"]
             try:
                 if not provider_child_process_exists(pid):
+                    # The leader is gone but helpers in its group may not be;
+                    # nobody owns them any more.
+                    with suppress(ProcessLookupError, PermissionError):
+                        os.killpg(pgid, signal.SIGKILL)
                     continue
                 parent_pid = provider_child_parent_pid(pid)
                 if parent_pid == own_pid:
@@ -55150,20 +55286,27 @@ def force_kill_managed_server_after_deadline(
     if pid != os.getpid():
         # Never signal a process other than the one that armed this watchdog.
         return
-    with SERVER_RESTART_SIGNAL_LOCK:
-        with suppress(Exception):
-            write_server_restart_status(
-                phase="signaling",
-                request_id=request_id,
-                message=(
-                    "AgentsServer did not stop after SIGTERM; forcing the "
-                    "managed process to exit so its user service relaunches."
-                ),
-            )
-        with suppress(Exception):
-            kill_registered_provider_children()
-        with suppress(ProcessLookupError):
-            os.kill(pid, signal.SIGKILL)
+    # The journal write is best effort and must not delay the kill: a signal
+    # worker stalled on filesystem I/O may hold this lock indefinitely.
+    journal_locked = SERVER_RESTART_SIGNAL_LOCK.acquire(timeout=2.0)
+    try:
+        if journal_locked:
+            with suppress(Exception):
+                write_server_restart_status(
+                    phase="signaling",
+                    request_id=request_id,
+                    message=(
+                        "AgentsServer did not stop after SIGTERM; forcing the "
+                        "managed process to exit so its user service relaunches."
+                    ),
+                )
+    finally:
+        if journal_locked:
+            SERVER_RESTART_SIGNAL_LOCK.release()
+    with suppress(Exception):
+        kill_registered_provider_children()
+    with suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
 
 
 def signal_managed_server_restart(request_id: str) -> None:
@@ -55179,7 +55322,7 @@ def signal_managed_server_restart(request_id: str) -> None:
             != SERVER_INSTANCE_ID
         ):
             return
-        if detect_managed_server_service_kind() is None:
+        if managed_server_service_kind() is None:
             write_server_restart_status(
                 phase="failed",
                 message="Managed service ownership changed before restart.",
@@ -56138,9 +56281,6 @@ TEAM_HUB_RUNTIME = ManagedTeamHubHost(
 )
 
 
-SERVER_SHUTDOWN_PHASE_TIMEOUT_SECONDS = 10.0
-
-
 async def join_cancelled_tasks(*tasks: Any) -> None:
     """Await already-cancelled tasks without letting any of them raise."""
 
@@ -56188,6 +56328,10 @@ async def bounded_shutdown_phase(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await STORE.load()
+    # Prime the managed-service ownership proof once, off the loop, so the
+    # restart controls never depend on a fresh launchctl/cgroup probe later.
+    with suppress(Exception):
+        await asyncio.to_thread(managed_server_service_kind)
     await JOBS.load()
     ensure_dirs()
     # A forced kill of the previous instance cannot reach provider children in
@@ -56350,6 +56494,13 @@ async def lifespan(app: FastAPI):
         # Stop startup reconciliation before taking the delivery-task
         # snapshot; otherwise it could enqueue a new retry owner after the
         # shutdown cancellation pass.
+        #
+        # Land the coalesced sessions.json write first: a restart watchdog can
+        # kill later phases, and the trailing flush covers marks they make.
+        await bounded_shutdown_phase(
+            "sessions-flush-early",
+            STORE.flush_pending_save(),
+        )
         cross_chat_recovery_task.cancel()
         cross_chat_expiry_task.cancel()
         digest_recovery_task.cancel()
@@ -57759,9 +57910,11 @@ async def reconcile_idle_queued_turns_from_health_poll() -> bool:
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     await reconcile_idle_queued_turns_from_health_poll()
-    async with ACTIVE_LOCK:
+    # Health must answer even when an admission lock is wedged; the reads
+    # below are consistent without the lock on a single-threaded loop.
+    async with bounded_lock(ACTIVE_LOCK, SERVER_RESTART_STATUS_LOCK_TIMEOUT_SECONDS):
         active = sorted(BUSY_SESSIONS)
-    async with QUEUE_LOCK:
+    async with bounded_lock(QUEUE_LOCK, SERVER_RESTART_STATUS_LOCK_TIMEOUT_SECONDS):
         queued = {sid: len(queue) for sid, queue in QUEUED_TURNS.items() if queue}
         update_blocking_queued_count = update_blocking_queued_turn_count_locked()
     restart_blocker_snapshot = await current_server_restart_blocker_snapshot()
@@ -58521,7 +58674,9 @@ def require_server_restart_control(request: Request) -> None:
                 "Server restart requires an access token in an authorization header.",
             ),
         )
-    if detect_managed_server_service_kind() is None:
+    # Cached positive proof: the managed-service probe runs a subprocess and
+    # must not be repeated (or time out into a refusal) on the emergency path.
+    if managed_server_service_kind() is None:
         raise HTTPException(
             status_code=503,
             detail=server_restart_error_detail(
@@ -58913,7 +59068,7 @@ async def _restart_server_endpoint_impl(
                     retryable=True,
                 ),
             )
-        if detect_managed_server_service_kind() is None:
+        if managed_server_service_kind() is None:
             raise HTTPException(
                 status_code=503,
                 detail=server_restart_error_detail(

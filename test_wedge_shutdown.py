@@ -123,14 +123,19 @@ class RestartWatchdogTests(unittest.TestCase):
                     {"pid": 4321, "pgid": 4321, "kind": "codex-app-server"},
                     # Recycled pid now running something else: never signal.
                     {"pid": 4444, "pgid": 4444, "kind": "codex-app-server"},
-                    # Already gone.
+                    # Leader already gone; its group may still hold helpers,
+                    # so the group is signalled anyway (harmless when empty).
                     {"pid": 4555, "pgid": 4555, "kind": "codex-app-server"},
                 ])
                 agent_server.force_kill_managed_server_after_deadline("req", 321)
 
         self.assertEqual(
             order,
-            [("killpg", 4321, signal.SIGKILL), ("kill", 321, signal.SIGKILL)],
+            [
+                ("killpg", 4321, signal.SIGKILL),
+                ("killpg", 4555, signal.SIGKILL),
+                ("kill", 321, signal.SIGKILL),
+            ],
         )
 
     def test_watchdog_probe_failure_still_kills_server(self):
@@ -267,7 +272,9 @@ class ProviderChildSweepTests(unittest.TestCase):
                 self.assertEqual(agent_server.sweep_orphaned_provider_children(), 0)
                 remaining = agent_server.read_provider_children_registry()
 
-        killpg.assert_not_called()
+        # A dead leader does not prove the group is gone (helpers such as
+        # codex-code-mode-host outlive it), so the group is still signalled.
+        killpg.assert_called_once_with(5000, signal.SIGKILL)
         self.assertEqual(remaining, [])
 
 

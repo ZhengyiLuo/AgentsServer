@@ -2,6 +2,7 @@
 storms, health-poll reconcile spam, and update-when-idle lockout."""
 
 import asyncio
+import json
 import tempfile
 import unittest
 import uuid
@@ -500,6 +501,92 @@ class SubagentReconcileBurstTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["descendants"], 10)
         self.assertIn("child-9", agent_server.CODEX_SUBAGENT_STATE)
         self.assertNotIn("child-0", agent_server.CODEX_SUBAGENT_STATE)
+
+
+class SessionsWriterFailureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_encode_failure_reaches_the_awaiter_and_does_not_strand_later_saves(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(agent_server, "SESSIONS_FILE", root / "sessions.json"):
+                store = agent_server.SessionStore()
+                store.sessions = {"chat": {"id": "chat", "bad": {1, 2}}}
+                with self.assertRaises(TypeError):
+                    await asyncio.wait_for(store.save(), timeout=5)
+                store.sessions = {"chat": {"id": "chat"}}
+                await asyncio.wait_for(store.save(), timeout=5)
+                await asyncio.wait_for(store.flush_pending_save(), timeout=5)
+            self.assertEqual(
+                json.loads((root / "sessions.json").read_text())["chat"]["id"],
+                "chat",
+            )
+
+    def test_bounded_writer_lock_refuses_instead_of_blocking(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "sessions.json"
+            agent_server.SESSIONS_WRITE_LOCK.acquire()
+            try:
+                with self.assertRaises(RuntimeError):
+                    agent_server.write_sessions_json_text(
+                        path,
+                        "{}",
+                        durable=False,
+                        lock_timeout=0.05,
+                    )
+            finally:
+                agent_server.SESSIONS_WRITE_LOCK.release()
+            agent_server.write_sessions_json_text(path, "{}", durable=False, lock_timeout=0.05)
+            self.assertEqual(path.read_text(), "{}")
+
+
+class ManagedServiceProofTests(unittest.TestCase):
+    def test_probe_timeout_keeps_prior_positive_proof(self):
+        with patch.object(agent_server.sys, "platform", "darwin"), \
+             patch.object(agent_server, "official_server_release_tree", return_value=True), \
+             patch.object(agent_server, "MANAGED_SERVER_SERVICE_KIND_CACHE", "launch-agent"), \
+             patch.object(
+                 agent_server,
+                 "macos_launchd_owns_current_process",
+                 return_value=None,
+             ):
+            self.assertEqual(
+                agent_server.detect_managed_server_service_kind(),
+                "launch-agent",
+            )
+            self.assertEqual(agent_server.managed_server_service_kind(), "launch-agent")
+
+    def test_probe_timeout_without_prior_proof_fails_closed(self):
+        with patch.object(agent_server.sys, "platform", "darwin"), \
+             patch.object(agent_server, "official_server_release_tree", return_value=True), \
+             patch.object(agent_server, "MANAGED_SERVER_SERVICE_KIND_CACHE", None), \
+             patch.object(
+                 agent_server,
+                 "macos_launchd_owns_current_process",
+                 return_value=None,
+             ):
+            self.assertIsNone(agent_server.detect_managed_server_service_kind())
+
+    def test_launchctl_timeout_reports_unknown(self):
+        with patch.object(agent_server.sys, "platform", "darwin"), \
+             patch.object(agent_server.Path, "is_file", return_value=True), \
+             patch.object(
+                 agent_server.subprocess,
+                 "run",
+                 side_effect=agent_server.subprocess.TimeoutExpired(cmd="launchctl", timeout=3),
+             ):
+            self.assertIsNone(agent_server.macos_launchd_owns_current_process())
+
+    def test_cooperative_kill_delay_covers_every_shutdown_phase(self):
+        self.assertGreaterEqual(
+            agent_server.SERVER_RESTART_GRACEFUL_KILL_DELAY_SECONDS,
+            agent_server.configured_uvicorn_graceful_shutdown_seconds()
+            + agent_server.SERVER_SHUTDOWN_PHASE_COUNT
+            * agent_server.SERVER_SHUTDOWN_PHASE_TIMEOUT_SECONDS,
+        )
+        source = Path(agent_server.__file__).read_text()
+        self.assertEqual(
+            source.count("await bounded_shutdown_phase("),
+            agent_server.SERVER_SHUTDOWN_PHASE_COUNT,
+        )
 
 
 class DarwinMetricsTests(unittest.TestCase):

@@ -139,6 +139,13 @@ def restart_environment(root: Path):
             "detect_managed_server_service_kind",
             return_value="systemd-user",
         ))
+        # The restart path consults the cached positive proof first; keep the
+        # cache empty so each test's patched probe decides.
+        stack.enter_context(patch.object(
+            agent_server,
+            "MANAGED_SERVER_SERVICE_KIND_CACHE",
+            None,
+        ))
         stack.enter_context(patch.object(agent_server, "BUSY_SESSIONS", set()))
         stack.enter_context(patch.object(
             agent_server,
@@ -811,6 +818,10 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
                     agent_server,
                     "detect_managed_server_service_kind",
                     return_value=None,
+                ), patch.object(
+                    agent_server,
+                    "MANAGED_SERVER_SERVICE_KIND_CACHE",
+                    None,
                 ), self.assertRaises(HTTPException) as unmanaged:
                     agent_server.require_server_restart_control(http_request())
                 self.assertEqual(unmanaged.exception.status_code, 503)

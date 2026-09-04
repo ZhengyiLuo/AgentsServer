@@ -6,6 +6,7 @@ thread/fork, the developer instructions never told the model to avoid
 ``fork_turns="all"``, and finished child rollouts were never unsubscribed.
 """
 
+import asyncio
 import json
 import tempfile
 import unittest
@@ -637,6 +638,12 @@ class CodexRunnerFinalizationTests(unittest.IsolatedAsyncioTestCase):
                 dict(self.fixture.session),
                 Path(self.fixture.cwd) / ".runner-test-manifest.json",
                 allow_exec_fallback=False,
+            )
+            # Finalization is detached and bounded so it can never hold the
+            # turn slot; join it here before asserting.
+            await asyncio.gather(
+                *list(agent_server.CODEX_SUBAGENT_FINALIZE_TASKS.values()),
+                return_exceptions=True,
             )
 
         finalizer.assert_awaited_once()

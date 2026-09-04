@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -14,6 +15,7 @@ from fastapi.testclient import TestClient
 
 from agentsdock_team_hub.service import create_app
 from agentsdock_team_hub.store import (
+    HubError,
     MAX_TEAM_MESSAGE_BODY_BYTES,
     TEAM_ATTACHMENT_CHUNK_BYTES,
 )
@@ -1330,6 +1332,43 @@ class TeamMessagesServiceTests(unittest.TestCase):
             )
         finally:
             connection.close()
+
+    def test_authorized_stream_survives_orphan_reclamation(self) -> None:
+        store = self.app.state.store
+        payload = b"pinned stream survives unlink"
+        orphan = self.upload(self.owner, payload, name="stream-orphan.bin")
+        claims = store.verify_access(self.owner["access_token"])
+        with self.assertRaises(HubError):
+            store.bound_team_attachment_local_path(
+                claims, self.team_id, orphan["id"]
+            )
+        public, source = store.open_team_attachment(
+            claims, self.team_id, orphan["id"]
+        )
+        self.assertEqual(public["byte_size"], len(payload))
+
+        connection = store.connect()
+        try:
+            created_at = int(
+                connection.execute(
+                    "SELECT created_at FROM team_attachments WHERE id=?",
+                    (orphan["id"],),
+                ).fetchone()[0]
+            )
+            connection.execute(
+                "UPDATE team_attachments SET expires_at=? WHERE id=?",
+                (created_at + 1, orphan["id"]),
+            )
+        finally:
+            connection.close()
+
+        try:
+            self.assertEqual(
+                store.purge_expired_team_attachments(created_at + 2), 1
+            )
+            self.assertEqual(os.pread(source.descriptor, len(payload), 0), payload)
+        finally:
+            source.close()
 
     def test_declaration_waits_for_reclaimer_before_deciding_blob_is_ready(self) -> None:
         store = self.app.state.store

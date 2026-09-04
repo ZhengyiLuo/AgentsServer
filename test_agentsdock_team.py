@@ -18,6 +18,7 @@ from starlette.requests import Request
 import agent_server
 import agentsdock_team
 from agentsdock_team_hub.secure_peer import SecurePeerError
+from secure_peer_runtime import SecurePeerRuntime
 
 
 def _server_reference(**overrides) -> agent_server.TeamReference:
@@ -46,6 +47,17 @@ def _all_reference() -> agent_server.TeamReference:
     )
 
 
+def _skill_reference() -> agent_server.TeamReference:
+    return agent_server.TeamReference(
+        kind="skill",
+        team_id="team_alpha_0001",
+        target_id="tskill_deploy_0001",
+        display_name_snapshot="deploy-sonic",
+        source_text_start=4,
+        source_text_end=18,
+    )
+
+
 class TeamReferenceModelTests(unittest.TestCase):
     def test_recipient_shapes_are_validated(self) -> None:
         self.assertEqual(_server_reference().recipient_kind, "server")
@@ -55,6 +67,12 @@ class TeamReferenceModelTests(unittest.TestCase):
             )
         with self.assertRaises(ValidationError):
             _server_reference(recipient_kind="all", target_id="node_sonic_0001")
+        with self.assertRaises(ValidationError):
+            _server_reference(
+                recipient_kind="all",
+                target_id="all",
+                display_name_snapshot="SONIC",
+            )
         with self.assertRaises(ValidationError):
             agent_server.TeamReference(
                 kind="skill",
@@ -78,6 +96,35 @@ class TeamReferenceModelTests(unittest.TestCase):
             agent_server.team_reference_dicts(request.team_references)[0]["kind"],
             "recipient",
         )
+
+    def test_routed_turn_cannot_hide_a_different_visible_prompt(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "display_prompt"):
+            agent_server.TurnRequest(
+                prompt="Tell @@SONIC the build is green",
+                display_prompt="Tell the team the build is green",
+                team_references=[_server_reference().model_dump()],
+            )
+        with self.assertRaisesRegex(ValidationError, "display_prompt"):
+            agent_server.TurnRequest(
+                prompt="Tell @Chat the build is green",
+                display_prompt="Tell the team the build is green",
+                chat_references=[
+                    agent_server.ChatReference(
+                        session_id="target",
+                        display_title_snapshot="Chat",
+                        source_text_start=5,
+                        source_text_end=10,
+                        action="route",
+                    )
+                ],
+            )
+        # Internal display projections remain valid when no authority-bearing
+        # reference is present.
+        request = agent_server.TurnRequest(
+            prompt="private wrapper",
+            display_prompt="Visible delivery",
+        )
+        self.assertEqual(request.display_prompt, "Visible delivery")
 
 
 class TeamPurposeGatingTests(unittest.TestCase):
@@ -203,6 +250,39 @@ class TeamPurposeGatingTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_changed_authoritative_target_cannot_mint_provider_authority(self) -> None:
+        async def exercise() -> None:
+            with (
+                tempfile.TemporaryDirectory() as temporary,
+                patch.object(agent_server, "AGENT_TOKEN", "test-agent-token"),
+                patch.object(
+                    agent_server,
+                    "CROSS_CHAT_AUTHORITY_ROOT",
+                    Path(temporary) / "authority",
+                ),
+                patch.object(
+                    agent_server.SECURE_PEER_RUNTIME,
+                    "resolve_team_references",
+                    side_effect=SecurePeerError(
+                        "team_reference_invalid", "renamed", 409
+                    ),
+                ),
+            ):
+                with self.assertRaises(
+                    agent_server.TeamReferenceTargetRepairRequired
+                ):
+                    await agent_server.issue_cross_chat_capability(
+                        "source",
+                        "run_changed_team_reference",
+                        [],
+                        source_user_instruction="Tell @@SONIC now",
+                        actions={"team_send"},
+                        team_references=[_server_reference()],
+                    )
+                self.assertFalse((Path(temporary) / "authority").exists())
+
+        asyncio.run(exercise())
+
 
 class TeamReferenceAdmissionTests(unittest.IsolatedAsyncioTestCase):
     async def test_ordinary_turn_rejects_a_stale_team_reference_before_launch(self) -> None:
@@ -226,6 +306,154 @@ class TeamReferenceAdmissionTests(unittest.IsolatedAsyncioTestCase):
                     provider_context_mode="chat",
                     admission_backend=agent_server.BACKEND_CODEX,
                 )
+
+
+class TeamReferenceResolutionTests(unittest.TestCase):
+    def runtime(
+        self,
+        *,
+        team_ids=("team_alpha_0001",),
+        servers=None,
+        members=None,
+        skills=None,
+    ) -> tuple[SecurePeerRuntime, list]:
+        runtime = object.__new__(SecurePeerRuntime)
+        realms = [
+            {
+                "realm": "secure_peer",
+                "team_id": team_id,
+                "connection_id": f"connection-{team_id}",
+                "can_write": True,
+            }
+            for team_id in team_ids
+        ]
+        server_map = servers or {}
+        member_map = members or {}
+        skill_map = skills or {}
+
+        def get(realm, path, _query):
+            team_id = realm["team_id"]
+            if path.endswith("/network"):
+                return {
+                    "servers": list(server_map.get(team_id, [])),
+                    "has_more": False,
+                }
+            if path.endswith("/members"):
+                return {"members": list(member_map.get(team_id, []))}
+            raise AssertionError(path)
+
+        runtime.team_realms = lambda: list(realms)
+        runtime._team_hub_get = get
+        runtime.team_list_skills = lambda *, include_archived, team_id: {
+            "skills": list(skill_map.get(team_id, [])),
+            "team_id": team_id,
+        }
+        return runtime, realms
+
+    def test_reference_resolves_only_to_one_authoritative_visible_target(self) -> None:
+        runtime, _realms = self.runtime(
+            servers={
+                "team_alpha_0001": [
+                    {
+                        "id": "node_sonic_0001",
+                        "display_name": "SONIC",
+                        "status": "active",
+                    }
+                ]
+            }
+        )
+        resolved = runtime.resolve_team_references(
+            [_server_reference().model_dump()]
+        )
+        self.assertEqual(resolved[0]["target_id"], "node_sonic_0001")
+
+    def test_renamed_or_replaced_server_reference_is_rejected(self) -> None:
+        runtime, _realms = self.runtime(
+            servers={
+                "team_alpha_0001": [
+                    {
+                        "id": "node_sonic_0001",
+                        "display_name": "SONIC Renamed",
+                        "status": "active",
+                    }
+                ]
+            }
+        )
+        with self.assertRaisesRegex(SecurePeerError, "changed"):
+            runtime.resolve_team_references([_server_reference().model_dump()])
+
+    def test_structured_team_id_disambiguates_all_across_multiple_teams(self) -> None:
+        runtime, _realms = self.runtime(
+            team_ids=("team_alpha_0001", "team_beta_0001")
+        )
+        resolved = runtime.resolve_team_references([_all_reference().model_dump()])
+        self.assertEqual(resolved[0]["team_id"], "team_alpha_0001")
+
+    def test_hidden_automation_member_is_not_a_human_recipient(self) -> None:
+        runtime, _realms = self.runtime(
+            members={
+                "team_alpha_0001": [
+                    {
+                        "principal_id": "service_1",
+                        "display_name": "Automation",
+                        "status": "active",
+                        "role": "automation",
+                    }
+                ]
+            }
+        )
+        reference = agent_server.TeamReference(
+            kind="recipient",
+            recipient_kind="human",
+            team_id="team_alpha_0001",
+            target_id="service_1",
+            display_name_snapshot="Automation",
+            source_text_start=0,
+            source_text_end=12,
+        )
+        with self.assertRaisesRegex(SecurePeerError, "unavailable"):
+            runtime.resolve_team_references([reference.model_dump()])
+
+    def test_active_human_member_resolves(self) -> None:
+        runtime, _realms = self.runtime(
+            members={
+                "team_alpha_0001": [
+                    {
+                        "principal_id": "human_dpark",
+                        "display_name": "DPark",
+                        "status": "active",
+                        "role": "member",
+                    }
+                ]
+            }
+        )
+        reference = agent_server.TeamReference(
+            kind="recipient",
+            recipient_kind="human",
+            team_id="team_alpha_0001",
+            target_id="human_dpark",
+            display_name_snapshot="DPark",
+            source_text_start=0,
+            source_text_end=7,
+        )
+        resolved = runtime.resolve_team_references([reference.model_dump()])
+        self.assertEqual(resolved[0]["target_id"], "human_dpark")
+
+    def test_skill_resolution_freezes_the_authorized_slug(self) -> None:
+        runtime, _realms = self.runtime(
+            skills={
+                "team_alpha_0001": [
+                    {
+                        "id": "tskill_deploy_0001",
+                        "slug": "deploy-sonic",
+                        "title": "Deploy SONIC",
+                        "archived": False,
+                    }
+                ]
+            }
+        )
+        resolved = runtime.resolve_team_references([_skill_reference().model_dump()])
+        self.assertEqual(resolved[0]["authorized_skill_slug"], "deploy-sonic")
 
 
 class FakeResponse:
@@ -402,16 +630,40 @@ class ProviderTeamEndpointTests(unittest.IsolatedAsyncioTestCase):
             setattr(agent_server, name, value)
         self.temporary.cleanup()
 
-    async def issue(self, actions: set[str], references) -> None:
-        path = await agent_server.issue_cross_chat_capability(
-            "source",
-            "run_team",
-            [],
-            source_user_instruction="Tell @@SONIC and @@all",
-            actions=set(actions),
-            team_references=list(references) if references else None,
-            team_read_enabled="team_read" in actions,
-        )
+    async def issue(
+        self,
+        actions: set[str],
+        references,
+        *,
+        source_prompt: str = "Tell @@SONIC and @@all",
+    ) -> None:
+        def resolved(items):
+            return [
+                {
+                    **item,
+                    **(
+                        {"authorized_skill_slug": item["display_name_snapshot"]}
+                        if item.get("kind") == "skill"
+                        else {}
+                    ),
+                }
+                for item in items
+            ]
+
+        with patch.object(
+            agent_server.SECURE_PEER_RUNTIME,
+            "resolve_team_references",
+            side_effect=resolved,
+        ):
+            path = await agent_server.issue_cross_chat_capability(
+                "source",
+                "run_team",
+                [],
+                source_user_instruction=source_prompt,
+                actions=set(actions),
+                team_references=list(references) if references else None,
+                team_read_enabled="team_read" in actions,
+            )
         self.authority_path = path
         payload = json.loads(path.read_text())
         self.token = payload["provider_capability"]
@@ -604,6 +856,76 @@ class ProviderTeamEndpointTests(unittest.IsolatedAsyncioTestCase):
                 )
             self.assertEqual(no_slug.exception.status_code, 422)
         send.assert_not_called()
+
+    async def test_skill_route_cannot_broadcast_or_mutate_another_skill(self) -> None:
+        agent_server.CROSS_CHAT_CAPABILITIES = {}
+        await self.issue(
+            {"team_read", "team_send", "team_skill_publish"},
+            [_skill_reference()],
+            source_prompt="Use @@deploy-sonic",
+        )
+        routes = await self.routes()
+        route_id = routes["deploy-sonic"]["route_id"]
+        with (
+            patch.object(
+                agent_server.SECURE_PEER_RUNTIME,
+                "team_send_message",
+                return_value={
+                    "message": {
+                        "id": "tmsg_skill_exact",
+                        "attachments": [],
+                        "recipients": [{"kind": "all"}],
+                        "skill": {"slug": "deploy-sonic", "version": 2},
+                        "title": "Deploy SONIC",
+                    }
+                },
+            ) as send,
+            patch.object(
+                agent_server,
+                "record_team_message_sent_event",
+                new_callable=AsyncMock,
+            ),
+        ):
+            with self.assertRaises(HTTPException) as general:
+                await agent_server.send_provider_team_message(
+                    route_id,
+                    agent_server.AgentTeamSendRequest(
+                        body="broadcast",
+                        idempotency_key="skill-route-message",
+                    ),
+                    self.request("POST"),
+                )
+            self.assertEqual(general.exception.status_code, 409)
+
+            with self.assertRaises(HTTPException) as wrong_skill:
+                await agent_server.send_provider_team_message(
+                    route_id,
+                    agent_server.AgentTeamSendRequest(
+                        kind="skill",
+                        title="Wrong",
+                        body="# wrong",
+                        skill={"slug": "another-skill"},
+                        idempotency_key="skill-route-wrong-slug",
+                    ),
+                    self.request("POST"),
+                )
+            self.assertEqual(wrong_skill.exception.status_code, 409)
+            send.assert_not_called()
+
+            receipt = await agent_server.send_provider_team_message(
+                route_id,
+                agent_server.AgentTeamSendRequest(
+                    kind="skill",
+                    title="Deploy SONIC",
+                    body="# exact",
+                    skill={"slug": "deploy-sonic"},
+                    idempotency_key="skill-route-exact-slug",
+                ),
+                self.request("POST"),
+            )
+            self.assertEqual(receipt["message_id"], "tmsg_skill_exact")
+            self.assertEqual(receipt["skill_version"], 2)
+            send.assert_called_once()
 
     async def test_send_rejects_protected_or_missing_attachments(self) -> None:
         routes = await self.routes()

@@ -4199,6 +4199,205 @@ class SecurePeerRuntime:
             )
         return realms[0]
 
+    def resolve_team_references(
+        self,
+        references: list[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Resolve frozen ``@@`` grants against the current Hub projection.
+
+        A structured client record is not authority by itself: the opaque ID,
+        visible label, team, recipient kind, and (for skills) slug must still
+        describe the same live Hub object when provider authority is minted.
+        Results may carry private routing metadata but are never returned to
+        the desktop or written into the provider authority file.
+        """
+
+        accessible_realms: dict[str, dict[str, Any]] = {}
+        for item in self.team_realms():
+            team_id = str(item.get("team_id") or "")
+            if team_id:
+                accessible_realms.setdefault(team_id, dict(item))
+        if not accessible_realms:
+            raise SecurePeerError(
+                "team_unavailable",
+                "This server is not connected to a Team Network",
+                409,
+            )
+        realms: dict[str, dict[str, Any]] = {}
+        servers: dict[str, dict[str, dict[str, Any]]] = {}
+        members: dict[str, dict[str, dict[str, Any]]] = {}
+        skills: dict[str, dict[str, dict[str, Any]]] = {}
+
+        def realm_for(team_id: str) -> dict[str, Any]:
+            if team_id not in realms:
+                realm = accessible_realms.get(team_id)
+                if realm is None:
+                    # A disconnected peer can recover without editing the
+                    # visible mention; keep this a transient availability
+                    # failure rather than classifying it as a stale target.
+                    raise SecurePeerError(
+                        "team_unavailable", "Unknown team for this server", 409
+                    )
+                realms[team_id] = realm
+            return realms[team_id]
+
+        def network_servers(team_id: str) -> dict[str, dict[str, Any]]:
+            if team_id in servers:
+                return servers[team_id]
+            realm = realm_for(team_id)
+            collected: dict[str, dict[str, Any]] = {}
+            cursor: str | None = None
+            seen_cursors: set[str] = set()
+            for _page in range(100):
+                if realm["realm"] == "host":
+                    with self._guard:
+                        store = self._hub_store
+                    if store is None or store.hub_id != realm.get("hub_id"):
+                        raise SecurePeerError(
+                            "team_unavailable", "Team Hub is unavailable", 409
+                        )
+                    projection = store.get_network(
+                        store.local_agent_mail_claims(team_id),
+                        team_id,
+                        after_server_id=cursor,
+                        limit=100,
+                    )
+                else:
+                    projection = self._team_hub_get(
+                        realm,
+                        f"/v1/teams/{quote(team_id, safe='')}/network",
+                        {"after_server_id": cursor, "limit": 100},
+                    )
+                for item in projection.get("servers") or []:
+                    if isinstance(item, Mapping) and item.get("id"):
+                        collected[str(item["id"])] = dict(item)
+                if projection.get("has_more") is not True:
+                    break
+                next_cursor = str(projection.get("next_after_server_id") or "")
+                if not next_cursor or next_cursor in seen_cursors:
+                    raise SecurePeerError(
+                        "team_reference_invalid",
+                        "Team Network recipient projection changed",
+                        409,
+                    )
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+            else:
+                raise SecurePeerError(
+                    "team_reference_invalid",
+                    "Team Network recipient projection exceeded its page limit",
+                    409,
+                )
+            servers[team_id] = collected
+            return collected
+
+        def team_members(team_id: str) -> dict[str, dict[str, Any]]:
+            if team_id in members:
+                return members[team_id]
+            realm = realm_for(team_id)
+            if realm["realm"] == "host":
+                with self._guard:
+                    store = self._hub_store
+                if store is None or store.hub_id != realm.get("hub_id"):
+                    raise SecurePeerError(
+                        "team_unavailable", "Team Hub is unavailable", 409
+                    )
+                projection = store.list_members(
+                    store.local_agent_mail_claims(team_id), team_id
+                )
+            else:
+                projection = self._team_hub_get(
+                    realm,
+                    f"/v1/teams/{quote(team_id, safe='')}/members",
+                    {},
+                )
+            collected = {
+                str(item["principal_id"]): dict(item)
+                for item in (projection.get("members") or [])
+                if isinstance(item, Mapping)
+                and item.get("principal_id")
+                and item.get("status") == "active"
+                and item.get("role") != "automation"
+            }
+            members[team_id] = collected
+            return collected
+
+        def team_skills(team_id: str) -> dict[str, dict[str, Any]]:
+            if team_id in skills:
+                return skills[team_id]
+            projection = self.team_list_skills(
+                include_archived=True,
+                team_id=team_id,
+            )
+            collected = {
+                str(item["id"]): dict(item)
+                for item in (projection.get("skills") or [])
+                if isinstance(item, Mapping) and item.get("id")
+            }
+            skills[team_id] = collected
+            return collected
+
+        resolved: list[dict[str, Any]] = []
+        for raw in references:
+            reference = dict(raw)
+            team_id = str(reference.get("team_id") or "")
+            target_id = str(reference.get("target_id") or "")
+            display_name = str(reference.get("display_name_snapshot") or "")
+            realm_for(team_id)
+            if reference.get("kind") == "skill":
+                target = team_skills(team_id).get(target_id)
+                if target is None or target.get("archived") is True:
+                    raise SecurePeerError(
+                        "team_reference_invalid",
+                        "Mentioned Team Network skill is unavailable",
+                        409,
+                    )
+                slug = str(target.get("slug") or "")
+                title = str(target.get("title") or "")
+                if not slug or display_name not in {slug, title}:
+                    raise SecurePeerError(
+                        "team_reference_invalid",
+                        "Mentioned Team Network skill changed",
+                        409,
+                    )
+                reference["authorized_skill_slug"] = slug
+            elif reference.get("recipient_kind") == "all":
+                if target_id != "all" or display_name != "all":
+                    raise SecurePeerError(
+                        "team_reference_invalid",
+                        "Team-wide references must use @@all",
+                        409,
+                    )
+            elif reference.get("recipient_kind") == "server":
+                target = network_servers(team_id).get(target_id)
+                if (
+                    target is None
+                    or str(target.get("display_name") or "") != display_name
+                ):
+                    raise SecurePeerError(
+                        "team_reference_invalid",
+                        "Mentioned Team Network server is unavailable or changed",
+                        409,
+                    )
+            elif reference.get("recipient_kind") == "human":
+                target = team_members(team_id).get(target_id)
+                if (
+                    target is None
+                    or str(target.get("display_name") or "") != display_name
+                ):
+                    raise SecurePeerError(
+                        "team_reference_invalid",
+                        "Mentioned Team Network member is unavailable or changed",
+                        409,
+                    )
+            else:
+                raise SecurePeerError(
+                    "team_reference_invalid", "Team Network reference is invalid", 409
+                )
+            resolved.append(reference)
+
+        return resolved
+
     def _team_hub_get(self, realm: dict[str, Any], path: str, query: dict[str, Any]) -> dict[str, Any]:
         clean = {
             key: ("1" if value is True else str(value))
@@ -4375,6 +4574,24 @@ class SecurePeerRuntime:
             )
         team_path = f"/v1/teams/{quote(realm['team_id'], safe='')}/network"
         kind = str(payload.get("kind") or "message")
+        if reference.get("kind") == "skill" and kind != "skill":
+            raise SecurePeerError(
+                "team_reference_invalid",
+                "A mentioned Team skill route cannot send a general message",
+                409,
+            )
+        if reference.get("kind") == "skill":
+            requested_slug = str(
+                (payload.get("skill") or {}).get("slug")
+                if isinstance(payload.get("skill"), Mapping)
+                else ""
+            ).strip().lower()
+            if requested_slug != str(reference.get("authorized_skill_slug") or ""):
+                raise SecurePeerError(
+                    "team_reference_invalid",
+                    "The requested skill does not match the mentioned Team skill",
+                    409,
+                )
         if reference.get("kind") == "skill":
             recipients = [{"kind": "all"}]
         elif reference.get("recipient_kind") == "all":
@@ -4696,7 +4913,7 @@ class SecurePeerRuntime:
             raise SecurePeerError("team_unavailable", "Team Hub is unavailable", 409)
         claims = store.local_agent_mail_claims(str(realm["team_id"]))
         for attachment in attachments:
-            public, path = store.open_team_attachment(
+            public, path = store.bound_team_attachment_local_path(
                 claims, str(realm["team_id"]), str(attachment.get("id") or "")
             )
             resolved.append({**public, "local_path": str(path)})

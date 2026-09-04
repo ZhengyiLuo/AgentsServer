@@ -606,6 +606,63 @@ class JobStoreTests(unittest.IsolatedAsyncioTestCase):
         start_turn.assert_not_awaited()
         self.assertEqual(events.await_args.args[1], "job_error")
 
+    async def test_changed_authoritative_team_target_pauses_instead_of_retrying(self) -> None:
+        store = agent_server.JobStore()
+        revision = agent_server.new_job_revision()
+        store.jobs["job_changed_team_target"] = {
+            "id": "job_changed_team_target",
+            "session_id": "source",
+            "title": "Tell server",
+            "prompt": "Tell @@SONIC status",
+            "chat_references": [],
+            "team_references": [{
+                "kind": "recipient",
+                "recipient_kind": "server",
+                "team_id": "team_alpha",
+                "target_id": "node_sonic",
+                "display_name_snapshot": "SONIC",
+                "source_text_start": 5,
+                "source_text_end": 12,
+                "grant_intent": True,
+            }],
+            "schedule_kind": "interval",
+            "interval_seconds": 60,
+            "loop": True,
+            "enabled": True,
+            "next_run_at": 100.0,
+            "scheduled_run_at": 100.0,
+            "run_count": 0,
+            "_revision": revision,
+        }
+        sessions = {
+            "source": {"id": "source", "backend": agent_server.BACKEND_CODEX}
+        }
+        start_turn = AsyncMock(
+            side_effect=agent_server.TeamReferenceTargetRepairRequired(
+                status_code=409,
+                detail="Team Network reference is unavailable or changed",
+            )
+        )
+        events = AsyncMock()
+        with (
+            patch.object(agent_server.STORE, "sessions", sessions),
+            patch.object(store, "save", new_callable=AsyncMock),
+            patch.object(agent_server, "append_event", events),
+            patch.object(agent_server, "start_turn", start_turn),
+        ):
+            with self.assertRaises(
+                agent_server.ScheduledJobChatReferenceRepairRequired
+            ):
+                await store.run_job("job_changed_team_target")
+
+        paused = store.jobs["job_changed_team_target"]
+        self.assertFalse(paused["enabled"])
+        self.assertIsNone(paused["next_run_at"])
+        self.assertIsNone(paused["scheduled_run_at"])
+        self.assertEqual(paused["run_count"], 0)
+        start_turn.assert_awaited_once()
+        self.assertEqual(events.await_args.args[1], "job_error")
+
     async def test_revocation_revision_fences_stale_dispatch_and_pause(self) -> None:
         store = agent_server.JobStore()
         reference = agent_server.ChatReference(

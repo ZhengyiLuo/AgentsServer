@@ -65,6 +65,7 @@ from .security import (
     read_secret_file,
     token_hash,
 )
+from .secure_peer import AttachmentFileLease
 
 
 NODE_CHALLENGE_TTL_SECONDS = 2 * 60
@@ -9358,11 +9359,20 @@ class HubStore:
 
     def open_team_attachment(
         self, claims: AccessClaims, team_id: str, attachment_id: str
-    ) -> tuple[dict[str, Any], Path]:
-        """Authorize a download and return the content-addressed file path."""
+    ) -> tuple[dict[str, Any], AttachmentFileLease]:
+        """Authorize a download and pin its exact inode before reclamation.
 
-        connection = self.connect()
+        The collector may unlink an expired orphan immediately after this
+        method returns. Opening a no-follow descriptor while serialized with
+        collection keeps an already-authorized stream valid without holding
+        the global attachment-control lock for the duration of a download.
+        """
+
+        attachment_lease = self.acquire_attachment_control_lease(self.data_dir)
+        connection: sqlite3.Connection | None = None
+        descriptor = -1
         try:
+            connection = self.connect()
             connection.execute("BEGIN")
             membership = self._require_network_scope(connection, claims, team_id, write=False)
             row = connection.execute(
@@ -9378,17 +9388,111 @@ class HubStore:
                     "attachment_unavailable", "Attachment upload is not complete", 409
                 )
             path = self._team_attachment_storage_path(str(row["storage_key"]))
-            if not path.is_file() or path.stat().st_size != int(row["byte_size"]):
-                raise HubError("attachment_unavailable", "Attachment bytes are unavailable", 404)
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            flags |= getattr(os, "O_NONBLOCK", 0)
+            try:
+                descriptor = os.open(path, flags)
+                info = os.fstat(descriptor)
+            except OSError as exc:
+                if descriptor >= 0:
+                    with suppress(OSError):
+                        os.close(descriptor)
+                    descriptor = -1
+                raise HubError(
+                    "attachment_unavailable", "Attachment bytes are unavailable", 404
+                ) from exc
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_size != int(row["byte_size"])
+            ):
+                os.close(descriptor)
+                descriptor = -1
+                raise HubError(
+                    "attachment_unavailable", "Attachment bytes are unavailable", 404
+                )
+            public = self._team_attachment_public(row)
+            connection.execute("COMMIT")
+            pinned_descriptor = descriptor
+            descriptor = -1
+            return public, AttachmentFileLease(
+                pinned_descriptor,
+                lambda: os.close(pinned_descriptor),
+            )
+        except BaseException:
+            if connection is not None and connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            if descriptor >= 0:
+                with suppress(OSError):
+                    os.close(descriptor)
+            if connection is not None:
+                connection.close()
+            self.release_attachment_control_lease(attachment_lease)
+
+    def bound_team_attachment_local_path(
+        self, claims: AccessClaims, team_id: str, attachment_id: str
+    ) -> tuple[dict[str, Any], Path]:
+        """Return a local path only for immutable message-bound content.
+
+        Unbound uploads can expire and be reclaimed, so callers that need a
+        path beyond this method's transaction must never receive one for those
+        rows. HTTP streaming uses :meth:`open_team_attachment` and its pinned
+        descriptor instead.
+        """
+
+        attachment_lease = self.acquire_attachment_control_lease(self.data_dir)
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = self.connect()
+            connection.execute("BEGIN")
+            membership = self._require_network_scope(
+                connection, claims, team_id, write=False
+            )
+            row = connection.execute(
+                "SELECT * FROM team_attachments WHERE team_id=? AND id=?",
+                (team_id, attachment_id),
+            ).fetchone()
+            if (
+                row is None
+                or row["message_id"] is None
+                or not self._team_attachment_row_visible(
+                    connection, claims, team_id, row, str(membership["role"])
+                )
+            ):
+                raise HubError("not_found", "Resource not found", 404)
+            if row["state"] != "ready":
+                raise HubError(
+                    "attachment_unavailable", "Attachment upload is not complete", 409
+                )
+            path = self._team_attachment_storage_path(str(row["storage_key"]))
+            try:
+                info = path.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise HubError(
+                    "attachment_unavailable", "Attachment bytes are unavailable", 404
+                ) from exc
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_size != int(row["byte_size"])
+            ):
+                raise HubError(
+                    "attachment_unavailable", "Attachment bytes are unavailable", 404
+                )
             public = self._team_attachment_public(row)
             connection.execute("COMMIT")
             return public, path
         except BaseException:
-            if connection.in_transaction:
+            if connection is not None and connection.in_transaction:
                 connection.execute("ROLLBACK")
             raise
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
+            self.release_attachment_control_lease(attachment_lease)
 
     def purge_expired_team_attachments(
         self,

@@ -1015,6 +1015,57 @@ class QueuedTurnPresentationTests(unittest.TestCase):
 
 
 class QueuedTurnEditTests(unittest.IsolatedAsyncioTestCase):
+    async def test_edit_rejects_legacy_hidden_display_reference(self) -> None:
+        original_sessions = agent_server.STORE.sessions
+        original_queue = agent_server.QUEUED_TURNS
+        item = {
+            "queued_id": "queued-hidden-display-edit",
+            "prompt": "Tell @@SONIC now",
+            "display_prompt": "Tell the team now",
+            "file_ids": [],
+            "chat_references": [],
+            "team_references": [
+                {
+                    "kind": "recipient",
+                    "recipient_kind": "server",
+                    "team_id": "team_alpha",
+                    "target_id": "node_sonic",
+                    "display_name_snapshot": "SONIC",
+                    "source_text_start": 5,
+                    "source_text_end": 12,
+                    "grant_intent": True,
+                }
+            ],
+            "client_capabilities": [],
+            "provider_cross_chat_route_snapshot": [],
+            "secure_peer_route_snapshots": [],
+            "cross_chat_obligation_ids": [],
+            "cross_chat_exchange_ids": [],
+            "backend": "codex",
+        }
+        original_item = {
+            **item,
+            "team_references": [dict(item["team_references"][0])],
+        }
+        try:
+            agent_server.STORE.sessions = {
+                "chat-edit": {"id": "chat-edit", "backend": "codex"}
+            }
+            agent_server.QUEUED_TURNS = {"chat-edit": deque([item])}
+            with patch.object(
+                agent_server, "managed_server_update_blocker", return_value=None
+            ):
+                with self.assertRaisesRegex(HTTPException, "display_prompt"):
+                    await agent_server.update_queued_turn(
+                        "chat-edit",
+                        "queued-hidden-display-edit",
+                        agent_server.UpdateQueuedTurnRequest(file_ids=[]),
+                    )
+            self.assertEqual(item, original_item)
+        finally:
+            agent_server.STORE.sessions = original_sessions
+            agent_server.QUEUED_TURNS = original_queue
+
     async def test_edit_preserves_exact_prompt_for_team_reference_offsets(self) -> None:
         original_sessions = agent_server.STORE.sessions
         original_queue = agent_server.QUEUED_TURNS
@@ -2579,6 +2630,94 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
             "saved Team target configuration is invalid",
         )
         self.assertNotIn("chat-1", agent_server.QUEUED_TURNS)
+
+    async def test_scheduler_discards_routed_turn_with_hidden_display_prompt(self) -> None:
+        agent_server.CURRENT_TURNS.clear()
+        hidden = {
+            "queued_id": "queued-hidden-display-reference",
+            "prompt": "Tell @@SONIC now",
+            "display_prompt": "Tell the team now",
+            "file_ids": [],
+            "backend": "codex",
+            "chat_references": [],
+            "team_references": [
+                {
+                    "kind": "recipient",
+                    "recipient_kind": "server",
+                    "team_id": "team_alpha",
+                    "target_id": "node_sonic",
+                    "display_name_snapshot": "SONIC",
+                    "source_text_start": 5,
+                    "source_text_end": 12,
+                    "grant_intent": True,
+                }
+            ],
+        }
+        agent_server.QUEUED_TURNS["chat-1"] = deque([hidden])
+        discard = AsyncMock()
+        with (
+            patch.object(agent_server, "terminally_discard_queued_turn", discard),
+            patch.object(
+                agent_server, "_start_turn_locked", new_callable=AsyncMock
+            ) as start,
+        ):
+            await agent_server._start_next_queued_turn_locked(
+                "chat-1", admission_backend="codex"
+            )
+
+        start.assert_not_awaited()
+        discard.assert_awaited_once_with(
+            "chat-1",
+            hidden,
+            "saved Team target configuration is invalid",
+        )
+
+    async def test_scheduler_does_not_retry_a_permanently_changed_team_target(self) -> None:
+        agent_server.CURRENT_TURNS.clear()
+        item = {
+            "queued_id": "queued-renamed-team-target",
+            "prompt": "Tell @@SONIC now",
+            "file_ids": [],
+            "backend": "codex",
+            "chat_references": [],
+            "team_references": [
+                {
+                    "kind": "recipient",
+                    "recipient_kind": "server",
+                    "team_id": "team_alpha",
+                    "target_id": "node_sonic",
+                    "display_name_snapshot": "SONIC",
+                    "source_text_start": 5,
+                    "source_text_end": 12,
+                    "grant_intent": True,
+                }
+            ],
+        }
+        agent_server.QUEUED_TURNS["chat-1"] = deque([item])
+        discard = AsyncMock()
+        with (
+            patch.object(agent_server, "terminally_discard_queued_turn", discard),
+            patch.object(
+                agent_server,
+                "_start_turn_locked",
+                new_callable=AsyncMock,
+                side_effect=agent_server.TeamReferenceTargetRepairRequired(
+                    status_code=409,
+                    detail="Team Network reference is unavailable or changed",
+                ),
+            ),
+            patch.object(agent_server, "retry_next_queued_turn_later") as retry,
+        ):
+            await agent_server._start_next_queued_turn_locked(
+                "chat-1", admission_backend="codex"
+            )
+
+        discard.assert_awaited_once_with(
+            "chat-1",
+            item,
+            "saved Team target configuration is invalid",
+        )
+        retry.assert_not_called()
 
     async def test_no_active_turn_promotes_without_replaying_old_text(self) -> None:
         append_durable_event = AsyncMock(return_value={})

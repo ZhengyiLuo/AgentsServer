@@ -4133,6 +4133,11 @@ class TeamReference(BaseModel):
                 raise ValueError("recipient references require recipient_kind")
             if self.recipient_kind == "all" and self.target_id != "all":
                 raise ValueError("team-wide recipients use target_id 'all'")
+            if (
+                self.recipient_kind == "all"
+                and self.display_name_snapshot != "all"
+            ):
+                raise ValueError("team-wide recipients use the visible token '@@all'")
         elif self.recipient_kind is not None:
             raise ValueError("skill references cannot carry recipient_kind")
         if self.source_text_end <= self.source_text_start:
@@ -4142,6 +4147,19 @@ class TeamReference(BaseModel):
 
 def team_reference_dicts(references: list[TeamReference] | None) -> list[dict[str, Any]]:
     return [reference.model_dump() for reference in (references or [])]
+
+
+def routed_references_match_visible_prompt(
+    prompt: Any,
+    display_prompt: Any,
+    chat_references: Any,
+    team_references: Any,
+) -> bool:
+    """Whether routed text is exactly the text projected to the user."""
+
+    return not (chat_references or team_references) or (
+        display_prompt is None or display_prompt == prompt
+    )
 
 
 class TurnRequest(BaseModel):
@@ -4168,6 +4186,23 @@ class TurnRequest(BaseModel):
     cross_chat_exchange_leg_id: str | None = Field(default=None, max_length=128)
     cross_chat_exchange_status: bool = False
     secure_peer_envelope_id: str | None = Field(default=None, max_length=128)
+
+    @model_validator(mode="after")
+    def _routed_references_match_the_visible_prompt(self) -> "TurnRequest":
+        # display_prompt is what the user sees in the timeline. A caller must
+        # not bind a route to a hidden request prompt while showing different
+        # text to the user. Internal/digest turns may still use a display
+        # projection when they carry no routed authority.
+        if not routed_references_match_visible_prompt(
+            self.prompt,
+            self.display_prompt,
+            self.chat_references,
+            self.team_references,
+        ):
+            raise ValueError(
+                "routed references require display_prompt to exactly match prompt"
+            )
+        return self
 
 
 class CrossChatHandoffRequest(BaseModel):
@@ -8539,6 +8574,17 @@ class JobStore:
                 scheduled_job_revision=job_revision,
                 scheduled_job_manual_run=manual,
             )
+        except TeamReferenceTargetRepairRequired as exc:
+            repair = ScheduledJobChatReferenceRepairRequired(
+                status_code=409,
+                detail="saved Team target configuration is invalid",
+            )
+            await self.pause_for_chat_reference_repair(
+                jid,
+                repair,
+                expected_revision=job_revision,
+            )
+            raise repair from exc
         except ScheduledJobChatReferenceRepairRequired as exc:
             await self.pause_for_chat_reference_repair(
                 jid,
@@ -12073,6 +12119,16 @@ async def enqueue_turn(
     provider_route_snapshot: list[dict[str, Any]] | None = None,
     secure_peer_route_snapshots: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    if not routed_references_match_visible_prompt(
+        req.prompt,
+        req.display_prompt,
+        req.chat_references,
+        req.team_references,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="routed references require display_prompt to exactly match prompt",
+        )
     req.file_ids = validate_session_file_ids(session_id, req.file_ids)
     queued_id = f"queued_{uuid.uuid4().hex[:16]}"
     obligation_ids: list[str] = []
@@ -13258,6 +13314,10 @@ class ScheduledJobChatReferenceRepairRequired(HTTPException):
     """A persisted job reference is unsafe to run until the user repairs it."""
 
 
+class TeamReferenceTargetRepairRequired(HTTPException):
+    """A frozen Team target no longer matches its visible ``@@`` token."""
+
+
 def provider_safe_scheduled_chat_reference_detail(exc: HTTPException) -> str:
     """Describe a saved-target failure without exposing its internal chat id."""
 
@@ -14077,6 +14137,26 @@ async def issue_cross_chat_capability(
         list(team_references or []),
         chat_references=references,
     )
+    resolved_team_references: list[dict[str, Any]] = []
+    if validated_team_references and AGENT_TOKEN:
+        try:
+            resolved_team_references = await asyncio.to_thread(
+                SECURE_PEER_RUNTIME.resolve_team_references,
+                team_reference_dicts(validated_team_references),
+            )
+        except (HubError, SecurePeerError, OSError, ValueError) as exc:
+            if str(getattr(exc, "code", "") or "") == "team_reference_invalid":
+                raise TeamReferenceTargetRepairRequired(
+                    status_code=409,
+                    detail="Team Network reference is unavailable or changed",
+                ) from exc
+            raise HTTPException(
+                status_code=max(
+                    400,
+                    min(599, int(getattr(exc, "status_code", 409) or 409)),
+                ),
+                detail="Team Network reference is unavailable or changed",
+            ) from exc
     grants = {
         (reference.session_id, reference.action)
         for reference in references
@@ -14135,8 +14215,8 @@ async def issue_cross_chat_capability(
     # Recipient identities never appear in the authority file or the prompt.
     team_routes: dict[str, dict[str, Any]] = {}
     if AGENT_TOKEN:
-        for reference in validated_team_references:
-            team_routes["team_" + secrets.token_hex(16)] = reference.model_dump()
+        for reference in resolved_team_references:
+            team_routes["team_" + secrets.token_hex(16)] = dict(reference)
     if not team_routes:
         effective_actions.discard("team_send")
         effective_actions.discard("team_skill_publish")
@@ -15791,6 +15871,19 @@ async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedT
                             candidate.get("chat_references") or []
                         ),
                     )
+                    if not routed_references_match_visible_prompt(
+                        candidate.get("prompt"),
+                        candidate.get("display_prompt"),
+                        candidate.get("chat_references"),
+                        candidate_team_references,
+                    ):
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                "routed references require display_prompt to "
+                                "exactly match prompt"
+                            ),
+                        )
                     candidate["team_references"] = team_reference_dicts(
                         candidate_team_references
                     )
@@ -17959,6 +18052,16 @@ async def _start_next_queued_turn_locked(
     # A permanently invalid grant is terminal for this exact queue item; record
     # the pop so restart recovery cannot resurrect it and retry indefinitely.
     try:
+        if not routed_references_match_visible_prompt(
+            item.get("prompt"),
+            item.get("display_prompt"),
+            item.get("chat_references"),
+            item.get("team_references"),
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="saved routed references do not match the visible prompt",
+            )
         queued_team_references = validate_team_references(
             str(item.get("prompt") or ""),
             item.get("team_references") or [],
@@ -18050,6 +18153,13 @@ async def _start_next_queued_turn_locked(
             # 409 while provider cleanup drains. Preserve this durable item so
             # an aborted delete can resume normally.
             await requeue_turn_front(session_id, item)
+            return
+        if isinstance(e, TeamReferenceTargetRepairRequired):
+            await terminally_discard_queued_turn(
+                session_id,
+                item,
+                "saved Team target configuration is invalid",
+            )
             return
         terminal_session_state = (
             session_id in DELETED_SESSION_TOMBSTONES
@@ -50907,6 +51017,16 @@ async def _start_turn_locked(
         raise HTTPException(status_code=404, detail="session not found")
     if sess.get("archived"):
         raise HTTPException(status_code=409, detail="archived chats cannot start turns")
+    if not routed_references_match_visible_prompt(
+        req.prompt,
+        req.display_prompt,
+        req.chat_references,
+        req.team_references,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="routed references require display_prompt to exactly match prompt",
+        )
     if scheduled_job_manual_run and (
         req.purpose != "scheduled_job" or not scheduled_job_revision
     ):
@@ -61748,6 +61868,11 @@ async def send_provider_team_message(
     reference = (capability.get("team_routes") or {}).get(route_id)
     if not isinstance(reference, dict):
         raise HTTPException(status_code=404, detail="Team Network route was not found")
+    if reference.get("kind") == "skill" and req.kind != "skill":
+        raise HTTPException(
+            status_code=409,
+            detail="a mentioned Team skill route can only publish that skill",
+        )
     if req.kind == "skill":
         if "team_skill_publish" not in capability.get("actions", set()):
             raise HTTPException(
@@ -61762,6 +61887,13 @@ async def send_provider_team_message(
                 status_code=409,
                 detail="skills can only be published to @@all or to a mentioned skill",
             )
+        if reference.get("kind") == "skill":
+            requested_slug = str((req.skill or {}).get("slug") or "").strip().lower()
+            if requested_slug != str(reference.get("authorized_skill_slug") or ""):
+                raise HTTPException(
+                    status_code=409,
+                    detail="the skill slug does not match the mentioned Team skill",
+                )
     request_digest = hashlib.sha256(
         json.dumps(
             [route_id, req.model_dump(), attachment_paths],

@@ -45,7 +45,6 @@ import tempfile
 import threading
 import time
 import unicodedata
-import urllib.request
 import uuid
 from collections import Counter, OrderedDict, defaultdict, deque
 from contextlib import asynccontextmanager, contextmanager, suppress
@@ -572,7 +571,6 @@ CLAUDE_CLI_MODEL_ALIASES = (
     ("sonnet", "Sonnet"),
     ("haiku", "Haiku"),
     ("opus[1m]", "Opus 1M"),
-    ("claude-opus-4-8[1m]", "Opus 4.8 1M"),
 )
 CLAUDE_CURRENT_MODEL_FALLBACKS = (
     ("claude-fable-5-1", "Fable 5.1", False),
@@ -585,9 +583,15 @@ CLAUDE_LEGACY_MODEL_FALLBACKS = (
     ("claude-fable-5", "Fable 5", False),
     ("claude-mythos-5", "Mythos 5 (limited access)", True),
     ("claude-opus-4-8", "Opus 4.8", False),
+    ("claude-opus-4-8[1m]", "Opus 4.8 1M", False),
 )
 CLAUDE_MODEL_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\-\[\]]{0,255}$")
 CLAUDE_MODELS_API_MAX_BYTES = 2 * 1024 * 1024
+CLAUDE_PROVIDER_SECRET_ENV_NAMES = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+)
 JOB_SCHEDULER_INTERVAL_SECONDS = float(agentsdock_setting("JOB_SCHEDULER_INTERVAL_SECONDS", "5"))
 JOB_BUSY_RETRY_SECONDS = int(agentsdock_setting("JOB_BUSY_RETRY_SECONDS", "60"))
 # Zero means scheduled jobs have no scheduler-specific concurrency ceiling.
@@ -41640,8 +41644,10 @@ def discover_codex_catalog() -> dict[str, Any]:
     }
 
 
-def parse_claude_help_model_options(help_text: str) -> list[dict[str, Any]]:
-    """Extract every model token advertised by Claude Code's public help.
+def parse_claude_help_model_option_groups(
+    help_text: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Extract alias and full-name groups from Claude Code's public help.
 
     Claude Code currently documents evergreen aliases and one full-name
     example in the wrapped ``--model`` option. The old parser stopped at the
@@ -41656,16 +41662,49 @@ def parse_claude_help_model_options(help_text: str) -> list[dict[str, Any]]:
         str(help_text or ""),
     )
     if match is None:
-        return []
-    options: list[dict[str, Any]] = []
-    for value in re.findall(
-        r"(?<![A-Za-z0-9])['\"`]([A-Za-z0-9][A-Za-z0-9._:/\-\[\]]{0,255})['\"`]",
-        match.group("body"),
-    ):
-        clean = value.strip()
-        if CLAUDE_MODEL_VALUE_RE.fullmatch(clean):
-            options.append(runtime_option(clean, title_model_label(clean)))
-    return options
+        return [], []
+
+    body = match.group("body")
+    full_name_marker = re.search(
+        r"\bor\s+(?:a\s+)?model(?:'s)?\s+full\s+name\b",
+        body,
+        re.IGNORECASE,
+    )
+    token_re = re.compile(
+        r"(?<![A-Za-z0-9])['\"`]([A-Za-z0-9][A-Za-z0-9._:/\-\[\]]{0,255})['\"`]"
+    )
+
+    def options_from(region: str) -> list[dict[str, Any]]:
+        return [
+            runtime_option(value, title_model_label(value))
+            for value in token_re.findall(region)
+            if CLAUDE_MODEL_VALUE_RE.fullmatch(value)
+        ]
+
+    if full_name_marker is not None:
+        return (
+            options_from(body[:full_name_marker.start()]),
+            options_from(body[full_name_marker.end():]),
+        )
+
+    # Older help has no explicit separator. Short identifier-like values are
+    # aliases; provider/platform IDs contain punctuation and remain full names.
+    alias_options: list[dict[str, Any]] = []
+    full_name_options: list[dict[str, Any]] = []
+    for option in options_from(body):
+        value = str(option.get("value") or "")
+        target = (
+            alias_options
+            if re.fullmatch(r"[a-z][a-z0-9_]*(?:\[[a-z0-9]+\])?", value)
+            else full_name_options
+        )
+        target.append(option)
+    return alias_options, full_name_options
+
+
+def parse_claude_help_model_options(help_text: str) -> list[dict[str, Any]]:
+    aliases, full_names = parse_claude_help_model_option_groups(help_text)
+    return [*aliases, *full_names]
 
 
 def parse_claude_models_api_payload(payload: Any) -> list[dict[str, Any]]:
@@ -41690,22 +41729,24 @@ def parse_claude_models_api_payload(payload: Any) -> list[dict[str, Any]]:
     return options
 
 
-class ClaudeCatalogNoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Never forward an Anthropic API key across an HTTP redirect."""
+def claude_models_api_base_url_allowed(parsed_base: Any) -> bool:
+    """Allow credentials over HTTPS, or plain HTTP only to loopback."""
 
-    def redirect_request(
-        self,
-        req: Any,
-        fp: Any,
-        code: int,
-        msg: str,
-        headers: Any,
-        newurl: str,
-    ) -> None:
-        return None
+    if parsed_base.scheme == "https" and parsed_base.hostname:
+        return True
+    if parsed_base.scheme != "http" or not parsed_base.hostname:
+        return False
+    host = parsed_base.hostname.rstrip(".").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
-def discover_claude_provider_models() -> list[dict[str, Any]]:
+def discover_claude_provider_models(
+) -> tuple[list[dict[str, Any]], Literal["unavailable", "success", "failed"]]:
     """Return models available to the configured Anthropic API account.
 
     Claude subscription/OAuth installs do not expose a model-list command, so
@@ -41716,50 +41757,85 @@ def discover_claude_provider_models() -> list[dict[str, Any]]:
 
     api_key = str(os.environ.get("ANTHROPIC_API_KEY") or "").strip()
     if not api_key:
-        return []
+        return [], "unavailable"
+    if "\r" in api_key or "\n" in api_key:
+        logger.warning("claude provider model discovery skipped: invalid credential format")
+        return [], "failed"
     base_url = str(
         os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"
     ).strip().rstrip("/")
     parsed_base = urlparse(base_url)
-    if parsed_base.scheme not in {"http", "https"} or not parsed_base.netloc:
-        logger.warning("claude provider model discovery skipped: invalid base URL")
-        return []
+    if not claude_models_api_base_url_allowed(parsed_base):
+        logger.warning("claude provider model discovery skipped: insecure or invalid base URL")
+        return [], "failed"
     endpoint = (
         f"{base_url}/models?limit=1000"
         if parsed_base.path.rstrip("/").endswith("/v1")
         else f"{base_url}/v1/models?limit=1000"
     )
-    request = urllib.request.Request(
-        endpoint,
-        headers={
-            "anthropic-version": "2023-06-01",
-            "x-api-key": api_key,
-            "accept": "application/json",
-            "user-agent": f"AgentsServer/{SERVER_VERSION}",
-        },
-        method="GET",
-    )
+    curl_bin = shutil.which("curl", path=runner_env().get("PATH"))
+    if not curl_bin:
+        logger.warning("claude provider model discovery skipped: curl unavailable")
+        return [], "unavailable"
+    timeout_seconds = max(0.5, min(RUNTIME_CATALOG_TIMEOUT_SECONDS, 6.0))
     try:
-        opener = urllib.request.build_opener(ClaudeCatalogNoRedirectHandler())
-        with opener.open(
-            request,
-            timeout=max(0.5, min(RUNTIME_CATALOG_TIMEOUT_SECONDS, 6.0)),
-        ) as response:
-            raw = response.read(CLAUDE_MODELS_API_MAX_BYTES + 1)
+        # Keep the key out of argv, the child environment, and disk by feeding
+        # curl's header-file syntax through stdin. curl's total-time limit is
+        # resistant to a peer that trickles bytes forever; subprocess.run's
+        # independent deadline kills and reaps curl if its own timer fails.
+        header_bytes = (
+            "anthropic-version: 2023-06-01\n"
+            f"x-api-key: {api_key}\n"
+            "accept: application/json\n"
+        ).encode("utf-8")
+        child_env = runner_env()
+        for secret_name in CLAUDE_PROVIDER_SECRET_ENV_NAMES:
+            child_env.pop(secret_name, None)
+        result = subprocess.run(
+            [
+                curl_bin,
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--connect-timeout",
+                f"{timeout_seconds:g}",
+                "--max-time",
+                f"{timeout_seconds:g}",
+                "--max-filesize",
+                str(CLAUDE_MODELS_API_MAX_BYTES),
+                "--header",
+                "@-",
+                "--user-agent",
+                f"AgentsServer/{SERVER_VERSION}",
+                endpoint,
+            ],
+            cwd=DEFAULT_CWD if Path(DEFAULT_CWD).exists() else str(Path.home()),
+            env=child_env,
+            input=header_bytes,
+            text=False,
+            capture_output=True,
+            timeout=timeout_seconds + 1.0,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"curl exited {result.returncode}")
+        raw = result.stdout
         if len(raw) > CLAUDE_MODELS_API_MAX_BYTES:
             raise ValueError("Claude Models API response exceeds size limit")
-        return parse_claude_models_api_payload(json.loads(raw.decode("utf-8")))
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            raise ValueError("Claude Models API returned an invalid payload")
+        return parse_claude_models_api_payload(payload), "success"
     except Exception as exc:
         logger.warning(
             "claude provider model discovery failed error_type=%s",
             type(exc).__name__,
         )
-        return []
+        return [], "failed"
 
 
 def claude_fallback_model_options() -> list[dict[str, Any]]:
-    options = [runtime_option(value, label) for value, label in CLAUDE_CLI_MODEL_ALIASES]
-    options.extend(
+    return [
         runtime_option(
             value,
             label,
@@ -41769,8 +41845,7 @@ def claude_fallback_model_options() -> list[dict[str, Any]]:
             *CLAUDE_CURRENT_MODEL_FALLBACKS,
             *CLAUDE_LEGACY_MODEL_FALLBACKS,
         )
-    )
-    return options
+    ]
 
 
 def parse_claude_help_catalog() -> dict[str, Any]:
@@ -41784,7 +41859,7 @@ def parse_claude_help_catalog() -> dict[str, Any]:
     )
     default_effort = os.environ.get("CLAUDE_EFFORT") or agentsdock_setting("CLAUDE_EFFORT", "")
     supports_ultracode = claude_supports_effort("ultracode")
-    provider_options = discover_claude_provider_models()
+    provider_options, provider_status = discover_claude_provider_models()
     help_text = ""
     help_available = False
     try:
@@ -41796,27 +41871,22 @@ def parse_claude_help_catalog() -> dict[str, Any]:
             type(exc).__name__,
         )
 
-    discovered_help_options = parse_claude_help_model_options(help_text)
+    discovered_help_aliases, discovered_help_full_names = (
+        parse_claude_help_model_option_groups(help_text)
+    )
     # Alias pointers remain first: unlike pinned fallback IDs, they follow a
     # new Claude release without requiring an AgentsServer update.
-    model_options.extend(
-        option
-        for option in discovered_help_options
-        if not str(option.get("value") or "").startswith("claude-")
-    )
+    model_options.extend(discovered_help_aliases)
     model_options.extend(runtime_option(value, label) for value, label in CLAUDE_CLI_MODEL_ALIASES)
-    if provider_options:
+    if provider_status == "success":
         # The API is account-scoped, so do not add pinned models that this
-        # credential did not return (notably limited-access Mythos models).
+        # credential did not return (notably limited-access Mythos models), or
+        # full-name examples from CLI help that may not be account-available.
         model_options.extend(provider_options)
     else:
         model_options.extend(claude_fallback_model_options())
-    model_options.extend(
-        option
-        for option in discovered_help_options
-        if str(option.get("value") or "").startswith("claude-")
-    )
-    if default_model and not any(
+        model_options.extend(discovered_help_full_names)
+    if provider_status != "success" and default_model and not any(
         str(option.get("value") or "") == default_model
         for option in model_options
     ):
@@ -41837,10 +41907,12 @@ def parse_claude_help_catalog() -> dict[str, Any]:
         effort_options.append(runtime_option("ultracode", "Ultracode"))
 
     model_sources = []
-    if provider_options:
+    if provider_status == "success":
         model_sources.append("Anthropic Models API")
     model_sources.append("claude --help" if help_available else "claude --help failed")
-    if not provider_options:
+    if provider_status != "success":
+        if provider_status == "failed":
+            model_sources.append("Anthropic Models API failed")
         model_sources.append("current fallback")
     effort_source = "claude --help" if help_available else "claude --help failed"
     return {

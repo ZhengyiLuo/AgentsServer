@@ -1013,6 +1013,92 @@ class QueuedTurnPresentationTests(unittest.TestCase):
 
 
 class QueuedTurnEditTests(unittest.IsolatedAsyncioTestCase):
+    async def test_edit_preserves_exact_prompt_for_team_reference_offsets(self) -> None:
+        original_sessions = agent_server.STORE.sessions
+        original_queue = agent_server.QUEUED_TURNS
+        prompt = "  😀 Tell @@DPark  "
+        mention = "@@DPark"
+        start = len("  😀 Tell ".encode("utf-16-le")) // 2
+        reference = agent_server.TeamReference(
+            kind="recipient",
+            recipient_kind="human",
+            team_id="team_alpha",
+            target_id="member_dpark",
+            display_name_snapshot="DPark",
+            source_text_start=start,
+            source_text_end=start + len(mention),
+            grant_intent=True,
+        )
+        item = {
+            "queued_id": "queued-team-edit",
+            "prompt": "old",
+            "display_prompt": "old",
+            "file_ids": [],
+            "chat_references": [],
+            "team_references": [],
+            "client_capabilities": [],
+            "provider_cross_chat_route_snapshot": [],
+            "secure_peer_route_snapshots": [],
+            "cross_chat_obligation_ids": [],
+            "cross_chat_exchange_ids": [],
+            "backend": "codex",
+            "position": 1,
+        }
+        append = AsyncMock()
+        try:
+            agent_server.STORE.sessions = {
+                "chat-edit": {
+                    "id": "chat-edit",
+                    "title": "Edit",
+                    "backend": "codex",
+                }
+            }
+            agent_server.QUEUED_TURNS = {
+                "chat-edit": deque([item])
+            }
+            with (
+                patch.object(
+                    agent_server,
+                    "managed_server_update_blocker",
+                    return_value=None,
+                ),
+                patch.object(
+                    agent_server,
+                    "append_durable_event",
+                    append,
+                ),
+            ):
+                response = await agent_server.update_queued_turn(
+                    "chat-edit",
+                    "queued-team-edit",
+                    agent_server.UpdateQueuedTurnRequest(
+                        prompt=prompt,
+                        team_references=[reference],
+                    ),
+                )
+
+            updated = response["item"]
+            self.assertEqual(updated["prompt"], prompt)
+            self.assertEqual(updated["display_prompt"], prompt)
+            self.assertEqual(
+                updated["team_references"][0]["source_text_start"],
+                start,
+            )
+            self.assertEqual(
+                updated["team_references"][0]["source_text_end"],
+                start + len(mention),
+            )
+            update_payload = append.await_args.args[2]
+            self.assertEqual(update_payload["request_prompt"], prompt)
+            self.assertEqual(update_payload["display_prompt"], prompt)
+            self.assertEqual(
+                update_payload["team_references"],
+                updated["team_references"],
+            )
+        finally:
+            agent_server.STORE.sessions = original_sessions
+            agent_server.QUEUED_TURNS = original_queue
+
     async def test_edit_updates_visible_prompt_lineage_and_recovery(self) -> None:
         original_sessions = agent_server.STORE.sessions
         original_queue = agent_server.QUEUED_TURNS

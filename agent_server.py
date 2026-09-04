@@ -4553,6 +4553,28 @@ def effective_claude_permission_mode(sess: dict[str, Any]) -> str:
     )
 
 
+def active_claude_permission_mode(
+    session_id: str,
+    active: dict[str, Any] | None,
+) -> str:
+    """Return the Claude mode frozen when the current turn was admitted.
+
+    Session settings may be edited during a turn for use by the next turn.
+    Permission callbacks for the current turn must not consult that newer
+    value, because switching to bypassPermissions would otherwise broaden an
+    already-running provider process.
+    """
+
+    captured = str((active or {}).get("claude_permission_mode") or "")
+    if captured in CLAUDE_PERMISSION_MODES:
+        return captured
+    # Compatibility for an in-memory owner created by an older development
+    # build. New turns always carry the captured field below.
+    return effective_claude_permission_mode(
+        STORE.sessions.get(session_id) or {}
+    )
+
+
 def effective_cursor_permission_mode(sess: dict[str, Any]) -> str:
     """Return one canonical headless Cursor permission mode."""
 
@@ -15353,8 +15375,12 @@ async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedT
                         ],
                     }
                     if req.prompt is not None:
-                        prompt = req.prompt.strip()
-                        if not prompt:
+                        # Reference spans are UTF-16 offsets into the exact
+                        # editor value. Validate emptiness without rewriting
+                        # the text, otherwise leading/trailing whitespace
+                        # displaces every persisted @/@@ chip after refresh.
+                        prompt = req.prompt
+                        if not prompt.strip():
                             raise HTTPException(status_code=400, detail="prompt is empty")
                         candidate["prompt"] = prompt
                         # A steered/requeued turn can carry separate raw,
@@ -38343,8 +38369,9 @@ async def handle_claude_tool_permission(
             # Explicit AskUserQuestion interactions remain user-facing questions.
             if (
                 tool_name != "AskUserQuestion"
-                and effective_claude_permission_mode(
-                    STORE.sessions.get(session_id) or {}
+                and active_claude_permission_mode(
+                    session_id,
+                    active,
                 ) == "bypassPermissions"
             ):
                 return PermissionResultAllow(updated_input=dict(input_data))
@@ -45292,6 +45319,9 @@ async def run_claude_sdk(
         "interactive_agent_sdk": True,
         "provider_model": str(sess.get("model") or ""),
         "provider_effort": str(sess.get("effort") or ""),
+        # Freeze process policy for the lifetime of this provider turn. The
+        # persisted session value may change concurrently for the next turn.
+        "claude_permission_mode": effective_claude_permission_mode(sess),
         "configuration_key": configuration_key,
         "provider_session_id": resume_provider_id,
         "provider_turn_ready": False,
@@ -56989,24 +57019,15 @@ async def ensure_claude_permission_mode_update_allowed(
     current: dict[str, Any],
     patch: dict[str, Any],
 ) -> None:
-    """Fence process policy changes without rejecting an idempotent save."""
+    """Allow a validated mode save for the next turn.
 
-    if "claude_permission_mode" not in patch:
-        return
-    requested = effective_claude_permission_mode({
-        "claude_permission_mode": patch.get("claude_permission_mode"),
-    })
-    if requested == effective_claude_permission_mode(current):
-        return
-    async with ACTIVE_LOCK:
-        if session_id in BUSY_SESSIONS or ACTIVE.get(session_id) is not None:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "wait for or stop the active Claude turn before changing "
-                    "its permission mode"
-                ),
-            )
+    ``_start_turn_locked`` snapshots the session before scheduling provider
+    work, and Claude's permission callback reads the captured ACTIVE value.
+    The lifecycle lock serializes that snapshot with this PATCH, so whichever
+    operation wins applies atomically to exactly the intended turn.
+    """
+
+    _ = session_id, current, patch
 
 
 async def ensure_backend_update_allowed(

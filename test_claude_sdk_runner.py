@@ -2092,29 +2092,45 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             agent_server.CLAUDE_DEFAULT_PERMISSION_MODE,
         )
 
-    async def test_permission_mode_change_is_fenced_but_noop_is_allowed(self) -> None:
+    async def test_permission_mode_change_is_saved_for_next_turn_while_active(self) -> None:
         self.session["claude_permission_mode"] = "default"
-        update = AsyncMock(return_value=self.session)
-        with patch.object(agent_server.STORE, "update", update):
-            with self.assertRaises(agent_server.HTTPException) as raised:
-                await agent_server.update_session(
-                    "chat-claude",
-                    agent_server.UpdateSessionRequest(
-                        claude_permission_mode="plan",
-                    ),
-                )
-            self.assertEqual(raised.exception.status_code, 409)
-            update.assert_not_awaited()
+        agent_server.ACTIVE = {
+            "chat-claude": {
+                "run_id": "run-claude",
+                "backend": agent_server.BACKEND_CLAUDE,
+                "transport": agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+                "claude_permission_mode": "default",
+            }
+        }
 
+        async def update_session_value(
+            _session_id: str,
+            values: dict[str, object],
+        ) -> dict[str, object]:
+            self.session.update(values)
+            return self.session
+
+        update = AsyncMock(side_effect=update_session_value)
+        with patch.object(agent_server.STORE, "update", update):
             result = await agent_server.update_session(
                 "chat-claude",
                 agent_server.UpdateSessionRequest(
-                    claude_permission_mode="default",
+                    claude_permission_mode="bypassPermissions",
                 ),
             )
 
-        self.assertEqual(result["session"]["claude_permission_mode"], "default")
+        self.assertEqual(
+            result["session"]["claude_permission_mode"],
+            "bypassPermissions",
+        )
         update.assert_awaited_once()
+        self.assertEqual(
+            agent_server.active_claude_permission_mode(
+                "chat-claude",
+                agent_server.ACTIVE["chat-claude"],
+            ),
+            "default",
+        )
 
     async def test_permission_mode_store_persists_and_null_resets(self) -> None:
         self.session["claude_permission_mode"] = "default"

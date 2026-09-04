@@ -50,7 +50,7 @@ from collections import Counter, OrderedDict, defaultdict, deque
 from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Literal
+from typing import Any, AsyncIterator, Iterable, Iterator, Literal
 from urllib.parse import quote, unquote, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -829,6 +829,29 @@ MAX_CODEX_APPROVAL_ITEM_CACHE = 256
 CODEX_PERMISSION_PROFILES_CACHE_SECONDS = 60.0
 CODEX_SESSION_CLEANUP_TIMEOUT_SECONDS = 15.0
 STOP_CONFIRM_TIMEOUT_SECONDS = 5.0
+# An explicit Stop that never finishes fenced queue promotion for the chat and
+# counted as a non-forceable restart blocker (2026-09-04 incident). Bound the
+# whole operation; on expiry the fence is released while teardown continues
+# detached, and the chat receives a visible error event.
+EXPLICIT_STOP_OPERATION_TIMEOUT_SECONDS = float(
+    agentsdock_setting("EXPLICIT_STOP_OPERATION_TIMEOUT_SECONDS", "90")
+)
+EXPLICIT_STOP_FENCE_RELEASE_TIMEOUT_SECONDS = 5.0
+# GET /api/health is polled by every client every few seconds. Queue
+# reconciliation is a repair pass, not a per-request duty; run it at most this
+# often from health polls so pollers cannot multiply promotion attempts.
+HEALTH_QUEUE_RECONCILE_INTERVAL_SECONDS = float(
+    agentsdock_setting("HEALTH_QUEUE_RECONCILE_INTERVAL_SECONDS", "15")
+)
+# A pending update-when-idle reservation parks new user messages so the server
+# can reach idleness. If a long-running turn keeps it pending, that parking
+# locked every other chat out for 27 minutes (2026-09-04). After this grace
+# period the user's own messages are admitted again and the update waits for
+# the next natural idle moment instead.
+SERVER_UPDATE_PENDING_INTERACTIVE_FENCE_SECONDS = float(
+    agentsdock_setting("SERVER_UPDATE_PENDING_INTERACTIVE_FENCE_SECONDS", "120")
+)
+QUEUE_FENCE_LOG_INTERVAL_SECONDS = 60.0
 CLAUDE_CONTEXT_USAGE_TIMEOUT_SECONDS = max(
     0.1,
     float(agentsdock_setting("CLAUDE_CONTEXT_USAGE_TIMEOUT_SECONDS", "2")),
@@ -5577,9 +5600,13 @@ class ServerRestartRequest(BaseModel):
             raise ValueError(
                 "force and force_confirmed must both be the JSON boolean true"
             )
-        if (self.force is True) != (self.expected_blocker_revision is not None):
+        # A forced restart is the emergency path. The blocker revision is an
+        # optional audit hint: when it is stale the restart still proceeds and
+        # the mismatch is recorded, because an operator who cannot obtain a
+        # fresh snapshot from a wedged server must still be able to restart it.
+        if self.expected_blocker_revision is not None and self.force is not True:
             raise ValueError(
-                "forced restart requires exactly one expected blocker revision"
+                "expected_blocker_revision requires a forced restart"
             )
         return self
 
@@ -11457,6 +11484,54 @@ def explicit_stop_in_progress(session_id: str) -> bool:
     return operation is not None and not operation.done()
 
 
+QUEUE_FENCE_LOGGED_AT: dict[tuple[str, str], float] = {}
+
+
+def queue_promotion_fence(session_id: str) -> str | None:
+    """Name the process-wide or per-chat fence that makes promotion a no-op.
+
+    Reconciliation used to schedule a promotion that then returned silently
+    from ``_start_next_queued_turn_locked``; with two clients polling health
+    that produced a per-second loop with no indication of the real blocker.
+    """
+
+    if explicit_stop_in_progress(session_id):
+        return "explicit_stop"
+    blocker = managed_server_update_blocker()
+    if blocker == MANAGED_SERVER_RESTART_ACTIVE_DETAIL:
+        return "server_restart"
+    if blocker:
+        return "server_update"
+    return None
+
+
+def log_queue_promotion_fence(session_id: str, fence: str, reason: str) -> None:
+    """Log a fenced promotion at most once per minute per chat and fence."""
+
+    now = time.monotonic()
+    key = (session_id, fence)
+    last = QUEUE_FENCE_LOGGED_AT.get(key)
+    if last is not None and now - last < QUEUE_FENCE_LOG_INTERVAL_SECONDS:
+        return
+    QUEUE_FENCE_LOGGED_AT[key] = now
+    if len(QUEUE_FENCE_LOGGED_AT) > 4096:
+        stale = [
+            entry_key
+            for entry_key, logged_at in QUEUE_FENCE_LOGGED_AT.items()
+            if now - logged_at >= QUEUE_FENCE_LOG_INTERVAL_SECONDS
+        ]
+        for entry_key in stale:
+            QUEUE_FENCE_LOGGED_AT.pop(entry_key, None)
+    logger.warning(
+        "queue promotion fenced session=%s fence=%s reason=%s "
+        "visible_queue_count=%s",
+        session_id,
+        fence,
+        reason,
+        len(QUEUED_TURNS.get(session_id) or ()),
+    )
+
+
 def explicit_stop_session_ids() -> set[str]:
     """Snapshot chats whose detached Stop cleanup still blocks replacement."""
 
@@ -16309,6 +16384,13 @@ async def reconcile_idle_queue_session(
     Stop-held queue head.
     """
 
+    fence = queue_promotion_fence(session_id)
+    if fence is not None:
+        # Promotion cannot start anything while this fence holds, so do not
+        # schedule a no-op task per poll. Name the fence instead.
+        log_queue_promotion_fence(session_id, fence, reason)
+        return False
+
     recovered_guards: list[str] = []
     should_schedule = False
     cancelled_waiter: asyncio.Task[Any] | None = None
@@ -16456,7 +16538,10 @@ async def reconcile_idle_queue_session(
     if cancelled_waiter is not None:
         cancelled_waiter.cancel()
     if recovered_guards or should_schedule:
-        logger.warning(
+        # Repairing a stale guard is noteworthy; merely scheduling the head of
+        # an idle queue is routine and was logging ~25 lines a minute.
+        logger.log(
+            logging.WARNING if recovered_guards else logging.DEBUG,
             "idle queue reconciled session=%s reason=%s recovered_guards=%s "
             "scheduled=%s promoted_queued_id=%s visible_queue_count=%s",
             session_id,
@@ -17849,6 +17934,38 @@ async def retry_next_queued_turn_later(session_id: str, delay_seconds: int | Non
     await start_next_queued_turn(session_id)
 
 
+QUEUE_RETRY_TASKS: dict[str, asyncio.Task[Any]] = {}
+
+
+def schedule_queued_turn_retry(
+    session_id: str,
+    delay_seconds: int | None = None,
+) -> bool:
+    """Arm at most one delayed promotion retry per chat.
+
+    Every deferred admission used to spawn its own untracked retry task, and
+    every health poll scheduled another promotion that deferred again, so the
+    number of concurrent retry timers grew by one per poll (2026-09-04: ~20
+    admission attempts per second per chat after 27 minutes). Returns whether a
+    new retry was armed.
+    """
+
+    existing = QUEUE_RETRY_TASKS.get(session_id)
+    if existing is not None and not existing.done():
+        return False
+    task = asyncio.create_task(
+        retry_next_queued_turn_later(session_id, delay_seconds)
+    )
+    QUEUE_RETRY_TASKS[session_id] = task
+
+    def release_retry_owner(completed: asyncio.Task[Any]) -> None:
+        if QUEUE_RETRY_TASKS.get(session_id) is completed:
+            QUEUE_RETRY_TASKS.pop(session_id, None)
+
+    task.add_done_callback(release_retry_owner)
+    return True
+
+
 async def wait_for_steered_turn_slot(session_id: str) -> None:
     waiter_task = asyncio.current_task()
 
@@ -17992,6 +18109,7 @@ async def _start_next_queued_turn_locked(
     # operation until provider/subagent cleanup is complete, without blocking
     # route reads or new queue writes in the meantime.
     if explicit_stop_in_progress(session_id):
+        log_queue_promotion_fence(session_id, "explicit_stop", "queue_start")
         return
     async with QUEUE_LOCK:
         if session_id in STEERING_SESSIONS:
@@ -18197,7 +18315,7 @@ async def _start_next_queued_turn_locked(
                     "queued_id": item.get("queued_id"),
                     "message": f"Queued turn deferred: {e.detail}",
                 })
-            asyncio.create_task(retry_next_queued_turn_later(session_id))
+            schedule_queued_turn_retry(session_id)
             return
         logger.warning("queued turn failed session=%s queued_id=%s: %s", session_id, item.get("queued_id"), e.detail)
         await append_event(session_id, "error", {
@@ -18243,7 +18361,7 @@ async def _start_next_queued_turn_locked(
                     "secure_peer_envelope_id": item.get("secure_peer_envelope_id"),
                     "message": f"Cross-chat delivery retry deferred: {concise_error_message(e)}",
                 })
-            asyncio.create_task(retry_next_queued_turn_later(session_id))
+            schedule_queued_turn_retry(session_id)
             return
         logger.warning("queued turn failed session=%s queued_id=%s: %s", session_id, item.get("queued_id"), e)
         await append_event(session_id, "error", {
@@ -51352,8 +51470,10 @@ async def _start_turn_locked(
         update_blocker = managed_server_update_admission_blocker()
         if update_blocker:
             if update_blocker == MANAGED_SERVER_UPDATE_PENDING_DETAIL:
-                raise ManagedServerUpdatePendingError()
-            raise HTTPException(status_code=503, detail=update_blocker)
+                if not interactive_turn_may_bypass_pending_update(req):
+                    raise ManagedServerUpdatePendingError()
+            else:
+                raise HTTPException(status_code=503, detail=update_blocker)
         requested_backend = str(
             req.backend or sess.get("backend") or DEFAULT_BACKEND
         ).strip().lower()
@@ -52121,6 +52241,14 @@ SERVER_RESTART_SIGNAL_DELAY_SECONDS = 0.5
 SERVER_RESTART_FORCE_KILL_DELAY_SECONDS = 3.0
 SERVER_RESTART_ACCEPTED_STALE_SECONDS = 10.0
 SERVER_RESTART_COOLDOWN_SECONDS = 30.0
+# A forced (emergency) restart must never wait on server state that may itself
+# be the reason the operator is restarting. Every lock, probe, and snapshot on
+# that path is bounded by these timeouts and degrades to an audited best-effort
+# snapshot instead of refusing or hanging.
+SERVER_RESTART_FORCE_LOCK_TIMEOUT_SECONDS = 2.0
+SERVER_RESTART_FORCE_PROBE_TIMEOUT_SECONDS = 2.0
+SERVER_RESTART_FORCE_HUB_SNAPSHOT_TIMEOUT_SECONDS = 5.0
+SERVER_RESTART_STATUS_LOCK_TIMEOUT_SECONDS = 2.0
 SERVER_RESTART_MAX_BODY_BYTES = 2_048
 SERVER_RESTART_BLOCKER_SNAPSHOT_VERSION = 2
 SERVER_RESTART_COUNT_LIMIT = 1_000_000
@@ -52214,6 +52342,65 @@ def managed_server_update_admission_blocker() -> str | None:
     if managed_server_update_is_pending():
         return MANAGED_SERVER_UPDATE_PENDING_DETAIL
     return None
+
+
+PENDING_UPDATE_BYPASS_LOGGED_AT: dict[str, float] = {"at": float("-inf")}
+
+
+def pending_server_update_age_seconds(
+    status: dict[str, Any] | None = None,
+) -> float | None:
+    """Return how long the update-when-idle reservation has been pending."""
+
+    current = status if status is not None else read_server_update_status()
+    if not managed_server_update_is_pending(current):
+        return None
+    for name in ("pending_at", "updated_at"):
+        raw = str(current.get(name) or "").strip()
+        if not raw:
+            continue
+        try:
+            candidate = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if candidate.tzinfo is None:
+            candidate = candidate.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - candidate).total_seconds())
+    return None
+
+
+def interactive_turn_may_bypass_pending_update(req: "TurnRequest") -> bool:
+    """Admit a user's own message once a pending update has parked chats too long.
+
+    Parking every new message lets the server reach idleness quickly when the
+    active work is short. When a long turn keeps the reservation pending, the
+    parking locks the user out of every chat (27 minutes on 2026-09-04). After
+    ``SERVER_UPDATE_PENDING_INTERACTIVE_FENCE_SECONDS`` the user's interactive
+    turns run again and the update waits for the next natural idle moment.
+    Internal, scheduled, and cross-chat turns stay parked.
+    """
+
+    if (
+        req.purpose
+        or req.cross_chat_envelope_id is not None
+        or req.cross_chat_exchange_id is not None
+        or req.cross_chat_exchange_leg_id is not None
+        or req.cross_chat_exchange_status
+        or req.secure_peer_envelope_id is not None
+    ):
+        return False
+    age = pending_server_update_age_seconds()
+    if age is None or age < SERVER_UPDATE_PENDING_INTERACTIVE_FENCE_SECONDS:
+        return False
+    now = time.monotonic()
+    if now - PENDING_UPDATE_BYPASS_LOGGED_AT["at"] >= QUEUE_FENCE_LOG_INTERVAL_SECONDS:
+        PENDING_UPDATE_BYPASS_LOGGED_AT["at"] = now
+        logger.warning(
+            "pending server update has parked chats for %.0fs; admitting "
+            "interactive turns until the server is naturally idle",
+            age,
+        )
+    return True
 
 
 def live_unsafe_http_mutation_ids_locked() -> list[str]:
@@ -52435,6 +52622,9 @@ def public_server_restart_status(
         raw_snapshot = current.get("_forced_work_snapshot")
         snapshot = raw_snapshot if isinstance(raw_snapshot, dict) else {}
         result["interrupted_work"] = public_server_restart_work_counts(snapshot)
+        raw_audit = current.get("_forced_audit")
+        if isinstance(raw_audit, dict):
+            result["forced_audit"] = public_forced_restart_audit(raw_audit)
     if blocker_snapshot is not None:
         result["blocker_snapshot"] = blocker_snapshot
     for name in (
@@ -52582,6 +52772,35 @@ def public_server_restart_work_counts(snapshot: dict[str, Any]) -> dict[str, Any
             if isinstance(value, int) and not isinstance(value, bool)
             else 0
         )
+    return result
+
+
+FORCED_RESTART_AUDIT_FLAGS = (
+    "snapshot_degraded",
+    "blockers_changed_after_confirmation",
+    "blocker_revision_omitted",
+    "safety_blockers_overridden",
+    "cooldown_overridden",
+    "superseded_pending_restart",
+    "update_in_progress_overridden",
+    "team_hub_snapshot_skipped",
+)
+
+
+def public_forced_restart_audit(audit: dict[str, Any]) -> dict[str, Any]:
+    """Return the bounded, boolean-only public view of a forced restart audit."""
+
+    result: dict[str, Any] = {
+        name: audit.get(name) is True for name in FORCED_RESTART_AUDIT_FLAGS
+    }
+    reasons = audit.get("snapshot_degraded_reasons")
+    if isinstance(reasons, list):
+        result["snapshot_degraded_reasons"] = [
+            str(reason)[:64] for reason in reasons[:8] if str(reason).strip()
+        ]
+    update_phase = str(audit.get("update_phase") or "").strip()
+    if update_phase:
+        result["update_phase"] = update_phase[:64]
     return result
 
 
@@ -52753,19 +52972,109 @@ def server_restart_blocker_snapshot_locked(
         "has_forceable_blockers": forceable_blockers,
         "has_safety_blockers": safety_blockers,
         "has_blockers": forceable_blockers or safety_blockers,
+        # A forced restart overrides every blocker above (see
+        # accept_forced_server_restart). Clients must never disable their
+        # emergency restart control based on the counts in this snapshot.
+        "force_restart_available": True,
     }
 
 
-async def current_server_restart_blocker_snapshot() -> dict[str, Any]:
-    async with ACTIVE_LOCK:
-        async with QUEUE_LOCK:
-            async with UNSAFE_HTTP_MUTATION_ADMISSION_LOCK:
-                tmux_cgroup_state = await asyncio.to_thread(
-                    server_restart_tmux_cgroup_state
+@asynccontextmanager
+async def bounded_lock(
+    lock: asyncio.Lock,
+    timeout_seconds: float,
+) -> AsyncIterator[bool]:
+    """Hold ``lock`` if it can be acquired within ``timeout_seconds``.
+
+    Yields ``True`` when the lock is held and ``False`` when the wait timed
+    out. Restart status and emergency restart paths use this so a lock that is
+    wedged by the very fault an operator is trying to escape cannot make the
+    restart control hang or refuse.
+    """
+
+    acquired = False
+    try:
+        await asyncio.wait_for(
+            lock.acquire(),
+            timeout=max(0.0, float(timeout_seconds)),
+        )
+        acquired = True
+    except (TimeoutError, asyncio.TimeoutError):
+        acquired = False
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            lock.release()
+
+
+async def bounded_restart_tmux_cgroup_state(
+    timeout_seconds: float,
+) -> tuple[dict[str, Any], bool]:
+    """Probe the tmux cgroup state without letting the probe hang the caller."""
+
+    probe = asyncio.ensure_future(
+        asyncio.to_thread(server_restart_tmux_cgroup_state)
+    )
+    try:
+        state = await asyncio.wait_for(
+            asyncio.shield(probe),
+            timeout=max(0.0, float(timeout_seconds)),
+        )
+        return (state if isinstance(state, dict) else {}), False
+    except (TimeoutError, asyncio.TimeoutError):
+        probe.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+        return {"tmux_server_cgroup_unknown": True}, True
+    except Exception:
+        return {"tmux_server_cgroup_unknown": True}, True
+
+
+async def current_server_restart_blocker_snapshot(
+    *,
+    lock_timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Snapshot restart blockers, degrading instead of hanging on wedged locks.
+
+    ``lock_timeout_seconds`` defaults to
+    ``SERVER_RESTART_STATUS_LOCK_TIMEOUT_SECONDS``. When any admission lock or
+    the tmux probe cannot be obtained in time the snapshot is still computed
+    from the current in-memory state (the loop is single-threaded, so the
+    read is consistent) and marked ``snapshot_degraded`` so clients can show
+    that the counts are best-effort.
+    """
+
+    timeout = (
+        SERVER_RESTART_STATUS_LOCK_TIMEOUT_SECONDS
+        if lock_timeout_seconds is None
+        else float(lock_timeout_seconds)
+    )
+    degraded: list[str] = []
+    async with bounded_lock(ACTIVE_LOCK, timeout) as active_held:
+        if not active_held:
+            degraded.append("active_lock")
+        async with bounded_lock(QUEUE_LOCK, timeout) as queue_held:
+            if not queue_held:
+                degraded.append("queue_lock")
+            async with bounded_lock(
+                UNSAFE_HTTP_MUTATION_ADMISSION_LOCK,
+                timeout,
+            ) as mutation_held:
+                if not mutation_held:
+                    degraded.append("mutation_admission_lock")
+                tmux_cgroup_state, probe_timed_out = (
+                    await bounded_restart_tmux_cgroup_state(
+                        SERVER_RESTART_FORCE_PROBE_TIMEOUT_SECONDS
+                    )
                 )
-                return server_restart_blocker_snapshot_locked(
+                if probe_timed_out:
+                    degraded.append("tmux_probe")
+                snapshot = server_restart_blocker_snapshot_locked(
                     tmux_cgroup_state=tmux_cgroup_state,
                 )
+    if degraded:
+        snapshot["snapshot_degraded"] = True
+        snapshot["snapshot_degraded_reasons"] = degraded
+    return snapshot
 
 
 def server_restart_request_fingerprint(body: ServerRestartRequest) -> str:
@@ -52865,19 +53174,31 @@ def force_kill_managed_server_after_deadline(
     request_id: str,
     pid: int,
 ) -> None:
-    """Guarantee an explicitly forced managed restart cannot drain forever."""
+    """Guarantee an explicitly forced managed restart cannot drain forever.
+
+    This watchdog runs inside the process that was asked to restart. If that
+    process is still alive when the deadline passes, graceful shutdown has
+    hung (background tasks, provider children, wedged locks) and the operator
+    explicitly asked for a forced restart, so the process is killed
+    unconditionally. It deliberately does not re-read the restart journal: a
+    concurrent status write, a superseding request, or a journal that could
+    not be persisted must not be able to cancel an emergency restart.
+    """
 
     time.sleep(SERVER_RESTART_FORCE_KILL_DELAY_SECONDS)
+    if pid != os.getpid():
+        # Never signal a process other than the one that armed this watchdog.
+        return
     with SERVER_RESTART_SIGNAL_LOCK:
-        status = read_server_restart_status()
-        if (
-            str(status.get("request_id") or "") != request_id
-            or str(status.get("phase") or "") != "signaling"
-            or str(status.get("_source_instance_id") or "")
-            != SERVER_INSTANCE_ID
-            or status.get("_forced") is not True
-        ):
-            return
+        with suppress(Exception):
+            write_server_restart_status(
+                phase="signaling",
+                request_id=request_id,
+                message=(
+                    "AgentsServer did not stop after SIGTERM; forcing the "
+                    "managed process to exit so its user service relaunches."
+                ),
+            )
         with suppress(ProcessLookupError):
             os.kill(pid, signal.SIGKILL)
 
@@ -55368,9 +55689,26 @@ async def secure_peer_hub_proxy_endpoint(
     return Response(content=result.body, status_code=result.status, headers=headers)
 
 
+HEALTH_QUEUE_RECONCILE_STATE: dict[str, float] = {"last_at": float("-inf")}
+
+
+async def reconcile_idle_queued_turns_from_health_poll() -> bool:
+    """Run the queue repair pass from health at most once per interval."""
+
+    now = time.monotonic()
+    if (
+        now - HEALTH_QUEUE_RECONCILE_STATE["last_at"]
+        < HEALTH_QUEUE_RECONCILE_INTERVAL_SECONDS
+    ):
+        return False
+    HEALTH_QUEUE_RECONCILE_STATE["last_at"] = now
+    await reconcile_idle_queued_turns(reason="health_poll")
+    return True
+
+
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    await reconcile_idle_queued_turns(reason="health_poll")
+    await reconcile_idle_queued_turns_from_health_poll()
     async with ACTIVE_LOCK:
         active = sorted(BUSY_SESSIONS)
     async with QUEUE_LOCK:
@@ -56144,6 +56482,237 @@ def require_server_restart_control(request: Request) -> None:
         )
 
 
+def signal_forced_server_restart(request_id: str) -> None:
+    """Signal an emergency restart without depending on the restart journal.
+
+    Runs on a dedicated thread after the accepted response has had time to
+    flush. Unlike the cooperative path, a journal that cannot be read or
+    written, a superseding record, or a wedged event loop cannot stop this
+    worker: it arms the hard-kill watchdog first and then sends SIGTERM to
+    this process so the managed user service relaunches it.
+    """
+
+    time.sleep(SERVER_RESTART_SIGNAL_DELAY_SECONDS)
+    pid = os.getpid()
+    with SERVER_RESTART_SIGNAL_LOCK:
+        try:
+            status = read_server_restart_status()
+            if (
+                str(status.get("request_id") or "") == request_id
+                and str(status.get("phase") or "") == "signaling"
+            ):
+                # A duplicate worker for the same request already signaled;
+                # its watchdog owns the hard kill.
+                return
+        except Exception:
+            status = {}
+        with suppress(Exception):
+            write_server_restart_status(
+                phase="signaling",
+                request_id=request_id,
+                _source_instance_id=SERVER_INSTANCE_ID,
+                _forced=True,
+                message=(
+                    "AgentsServer is force restarting; reconnecting clients "
+                    "will briefly go offline."
+                ),
+            )
+        threading.Thread(
+            target=force_kill_managed_server_after_deadline,
+            args=(request_id, pid),
+            daemon=True,
+            name="agents-server-force-restart",
+        ).start()
+        with suppress(Exception):
+            os.kill(pid, signal.SIGTERM)
+
+
+def start_forced_server_restart_signal_thread(request_id: str) -> None:
+    threading.Thread(
+        target=signal_forced_server_restart,
+        args=(request_id,),
+        daemon=True,
+        name="agents-server-forced-restart-signal",
+    ).start()
+
+
+async def accept_forced_server_restart(
+    body: ServerRestartRequest,
+    *,
+    request_id: str,
+    request_fingerprint: str,
+) -> dict[str, Any]:
+    """Accept an emergency restart without refusing or waiting on server state.
+
+    Guarantees for ``force: true`` + ``force_confirmed: true``:
+
+    * Only header authentication, the managed-service proof (both already
+      checked by ``require_server_restart_control``) and the exact target
+      identity/instance are required.
+    * Everything the cooperative path refuses on is audited instead: the
+      restart cooldown, a pending or stale restart record, an active managed
+      update, safety-critical work (maintenance, deletions, HTTP mutations,
+      goal reconfiguration), a stale or omitted blocker revision, and a Team
+      Hub snapshot failure.
+    * No lock or probe is awaited beyond its bounded timeout; a wedged lock
+      degrades the audit snapshot rather than hanging the request.
+    * The journal is best effort: if it cannot be written the restart still
+      proceeds, because the journal exists to explain the restart, not to
+      authorize it.
+    * SIGTERM is sent from a dedicated thread and a hard-kill watchdog
+      guarantees the process exits even when graceful shutdown hangs.
+    """
+
+    if (
+        body.expected_server_identity != server_identity()
+        or body.expected_server_instance_id != SERVER_INSTANCE_ID
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=server_restart_error_detail(
+                "server_restart_target_changed",
+                "The connected AgentsServer instance changed before restart confirmation.",
+                action="Refresh the server connection and confirm the restart again.",
+                retryable=True,
+            ),
+        )
+
+    audit: dict[str, Any] = {}
+    degraded_reasons: list[str] = []
+    async with bounded_lock(
+        SERVER_UPDATE_OPERATION_LOCK,
+        SERVER_RESTART_FORCE_LOCK_TIMEOUT_SECONDS,
+    ) as operation_lock_held:
+        if not operation_lock_held:
+            degraded_reasons.append("update_operation_lock")
+        try:
+            restart_status = reconcile_stale_server_restart_acceptance()
+        except Exception:
+            restart_status = {"phase": "idle"}
+            degraded_reasons.append("restart_journal_unreadable")
+        if str(restart_status.get("request_id") or "") == request_id:
+            accepted_fingerprint = str(
+                restart_status.get("_request_fingerprint") or ""
+            )
+            if not accepted_fingerprint or not hmac.compare_digest(
+                accepted_fingerprint,
+                request_fingerprint,
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=server_restart_error_detail(
+                        "server_restart_request_changed",
+                        "The restart request ID was already used with different confirmation details.",
+                        action=(
+                            "Refresh the server connection and use a new request ID "
+                            "for a newly confirmed restart."
+                        ),
+                    ),
+                )
+            if (
+                str(restart_status.get("phase") or "") == "accepted"
+                and str(restart_status.get("_source_instance_id") or "")
+                == SERVER_INSTANCE_ID
+            ):
+                start_forced_server_restart_signal_thread(request_id)
+            return public_server_restart_status(restart_status)
+
+        phase = str(restart_status.get("phase") or "")
+        if phase in SERVER_RESTART_ACTIVE_PHASES:
+            audit["superseded_pending_restart"] = True
+        elif (
+            phase in {"complete", "failed"}
+            and server_restart_status_age_seconds(restart_status)
+            < SERVER_RESTART_COOLDOWN_SECONDS
+        ):
+            audit["cooldown_overridden"] = True
+        try:
+            update_status = read_server_update_status()
+        except Exception:
+            update_status = {}
+        if managed_server_update_blocks_work(update_status):
+            audit["update_in_progress_overridden"] = True
+            audit["update_phase"] = str(update_status.get("phase") or "")
+
+        snapshot = await current_server_restart_blocker_snapshot(
+            lock_timeout_seconds=SERVER_RESTART_FORCE_LOCK_TIMEOUT_SECONDS,
+        )
+        if snapshot.get("snapshot_degraded") is True:
+            degraded_reasons.extend(
+                str(reason)
+                for reason in snapshot.get("snapshot_degraded_reasons") or ()
+            )
+        if body.expected_blocker_revision is None:
+            audit["blocker_revision_omitted"] = True
+        elif not hmac.compare_digest(
+            str(body.expected_blocker_revision),
+            str(snapshot.get("revision") or ""),
+        ):
+            audit["blockers_changed_after_confirmation"] = True
+        if snapshot.get("has_safety_blockers") is True:
+            audit["safety_blockers_overridden"] = True
+        if degraded_reasons:
+            audit["snapshot_degraded"] = True
+            audit["snapshot_degraded_reasons"] = degraded_reasons
+
+        try:
+            await asyncio.wait_for(
+                TEAM_HUB_RUNTIME.prepare_maintenance(
+                    "server-restart",
+                    persistent_fence=False,
+                ),
+                timeout=SERVER_RESTART_FORCE_HUB_SNAPSHOT_TIMEOUT_SECONDS,
+            )
+        except (Exception, asyncio.TimeoutError):
+            audit["team_hub_snapshot_skipped"] = True
+            with suppress(Exception):
+                await asyncio.wait_for(
+                    TEAM_HUB_RUNTIME.reopen_admission(),
+                    timeout=SERVER_RESTART_FORCE_LOCK_TIMEOUT_SECONDS,
+                )
+
+        now = update_utc_now()
+        journal_changes: dict[str, Any] = dict(
+            phase="accepted",
+            request_id=request_id,
+            _source_instance_id=SERVER_INSTANCE_ID,
+            _request_fingerprint=request_fingerprint,
+            _forced=True,
+            _forced_work_snapshot=public_server_restart_work_counts(snapshot),
+            _forced_audit=audit,
+            message=(
+                "AgentsServer accepted the forced restart; any active work "
+                "will be interrupted while its user service relaunches."
+            ),
+            requested_at=now,
+            completed_at=None,
+            failed_at=None,
+        )
+        try:
+            restart_status = write_server_restart_status(**journal_changes)
+        except Exception as exc:
+            logger.error(
+                "forced restart journal could not be written; restarting anyway "
+                "request_id=%s error_type=%s",
+                request_id,
+                type(exc).__name__,
+            )
+            restart_status = {**journal_changes, "updated_at": now}
+        with suppress(Exception):
+            await asyncio.wait_for(
+                TEAM_HUB_RUNTIME.reopen_admission(),
+                timeout=SERVER_RESTART_FORCE_LOCK_TIMEOUT_SECONDS,
+            )
+
+    logger.warning(
+        "forced server restart accepted request_id=%s audit=%s",
+        request_id,
+        json.dumps(public_forced_restart_audit(audit), sort_keys=True),
+    )
+    start_forced_server_restart_signal_thread(request_id)
+    return public_server_restart_status(restart_status)
+
+
 @app.get("/api/admin/restart")
 async def server_restart_status_endpoint(request: Request) -> dict[str, Any]:
     require_server_restart_control(request)
@@ -56153,8 +56722,47 @@ async def server_restart_status_endpoint(request: Request) -> dict[str, Any]:
     )
 
 
+def log_server_restart_denial(
+    body: ServerRestartRequest,
+    exc: HTTPException,
+) -> None:
+    """Record why a restart was refused; clients rarely surface the detail."""
+
+    detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+    snapshot = detail.get("blocker_snapshot")
+    counts = (
+        public_server_restart_work_counts(snapshot)
+        if isinstance(snapshot, dict)
+        else {}
+    )
+    logger.warning(
+        "server restart denied status=%s code=%s forced=%s message=%s blockers=%s",
+        exc.status_code,
+        str(detail.get("code") or "")[:64],
+        body.force is True and body.force_confirmed is True,
+        str(detail.get("message") or "")[:200],
+        json.dumps(counts, sort_keys=True),
+    )
+
+
 @app.post("/api/admin/restart", status_code=202)
 async def restart_server_endpoint(
+    body: ServerRestartRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> dict[str, Any]:
+    try:
+        return await _restart_server_endpoint_impl(
+            body,
+            request,
+            background_tasks,
+        )
+    except HTTPException as exc:
+        log_server_restart_denial(body, exc)
+        raise
+
+
+async def _restart_server_endpoint_impl(
     body: ServerRestartRequest,
     request: Request,
     background_tasks: BackgroundTasks,
@@ -56163,6 +56771,15 @@ async def restart_server_endpoint(
     request_id = str(body.request_id)
     forced = body.force is True and body.force_confirmed is True
     request_fingerprint = server_restart_request_fingerprint(body)
+
+    if forced:
+        # Emergency path: never refuse or hang on server state. See
+        # accept_forced_server_restart for the exact guarantees.
+        return await accept_forced_server_restart(
+            body,
+            request_id=request_id,
+            request_fingerprint=request_fingerprint,
+        )
 
     async with SERVER_UPDATE_OPERATION_LOCK:
         restart_status = reconcile_stale_server_restart_acceptance()
@@ -62871,13 +63488,55 @@ async def run_explicit_stop_operation(
     session_id: str,
     admission_ready: asyncio.Event,
 ) -> dict[str, Any]:
-    """Finish one explicit Stop after its short serialized admission edge."""
+    """Finish one explicit Stop after its short serialized admission edge.
 
+    The operation is bounded by ``EXPLICIT_STOP_OPERATION_TIMEOUT_SECONDS``.
+    A Stop whose provider interrupt or subagent teardown never settles used to
+    hold the explicit-stop fence forever: queued messages could not promote,
+    and the chat counted as a non-forceable restart blocker. On expiry the
+    teardown keeps running detached, the fence is released, and the chat gets
+    a visible error event explaining what happened.
+    """
+
+    stop_task = asyncio.create_task(
+        stop_turn(session_id, _admission_ready=admission_ready)
+    )
+    DETACHED_STOP_TASKS.add(stop_task)
+    stop_task.add_done_callback(DETACHED_STOP_TASKS.discard)
     try:
-        return await stop_turn(
-            session_id,
-            _admission_ready=admission_ready,
+        done, _pending = await asyncio.wait(
+            {stop_task},
+            timeout=max(1.0, float(EXPLICIT_STOP_OPERATION_TIMEOUT_SECONDS)),
         )
+        if done:
+            return stop_task.result()
+        logger.error(
+            "explicit Stop did not finish within %.0fs session=%s; releasing "
+            "the stop fence while teardown continues",
+            EXPLICIT_STOP_OPERATION_TIMEOUT_SECONDS,
+            session_id,
+        )
+        with suppress(Exception):
+            await append_event(session_id, "error", {
+                "stop_timeout": True,
+                "message": (
+                    "Stop did not finish within "
+                    f"{int(EXPLICIT_STOP_OPERATION_TIMEOUT_SECONDS)} seconds. "
+                    "The stop fence was released so new messages and server "
+                    "restarts can proceed; the agent process may still be "
+                    "shutting down."
+                ),
+            })
+        return {
+            "ok": False,
+            "stopped": False,
+            "pending": True,
+            "timed_out": True,
+            "message": (
+                "Stop is taking longer than expected; the chat was unblocked "
+                "while the agent process finishes shutting down."
+            ),
+        }
     finally:
         # An admission exception/cancellation must also wake the endpoint;
         # otherwise it would retain the lifecycle lock while this finalizer
@@ -62886,7 +63545,18 @@ async def run_explicit_stop_operation(
         # Clearing the narrow fence is itself serialized with turn admission.
         # A queued successor can therefore either observe this operation or
         # own the next turn slot, never slip between cleanup and fence release.
-        async with session_lifecycle_lock(session_id):
+        # The lock wait is bounded: a wedged lifecycle lock must not keep the
+        # fence alive after the operation itself has ended.
+        async with bounded_lock(
+            session_lifecycle_lock(session_id),
+            EXPLICIT_STOP_FENCE_RELEASE_TIMEOUT_SECONDS,
+        ) as lock_held:
+            if not lock_held:
+                logger.error(
+                    "explicit Stop fence release could not take the lifecycle "
+                    "lock session=%s; releasing the fence anyway",
+                    session_id,
+                )
             current_task = asyncio.current_task()
             if EXPLICIT_STOP_OPERATIONS.get(session_id) is current_task:
                 EXPLICIT_STOP_OPERATIONS.pop(session_id, None)
@@ -62894,6 +63564,9 @@ async def run_explicit_stop_operation(
         # attempt made before the explicit-operation fence was removed is a
         # harmless no-op, so provide one final wake after releasing it.
         schedule_next_queued_turn(session_id)
+
+
+DETACHED_STOP_TASKS: set[asyncio.Task[Any]] = set()
 
 
 @app.post("/api/sessions/{session_id}/stop")

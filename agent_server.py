@@ -17952,6 +17952,26 @@ async def _start_next_queued_turn_locked(
         )
         return
 
+    # Queue records are durable and may have been written by an older build or
+    # restored after an interrupted update. Validate their structured Team
+    # references before rebuilding TurnRequest so a missing/stale/hidden span
+    # cannot escape as a Pydantic error after the item has already been popped.
+    # A permanently invalid grant is terminal for this exact queue item; record
+    # the pop so restart recovery cannot resurrect it and retry indefinitely.
+    try:
+        queued_team_references = validate_team_references(
+            str(item.get("prompt") or ""),
+            item.get("team_references") or [],
+            chat_references=item.get("chat_references") or [],
+        )
+    except HTTPException:
+        await terminally_discard_queued_turn(
+            session_id,
+            item,
+            "saved Team target configuration is invalid",
+        )
+        return
+
     req = TurnRequest(
         prompt=str(item.get("prompt") or ""),
         file_ids=list(item.get("file_ids") or []),
@@ -17965,12 +17985,7 @@ async def _start_next_queued_turn_locked(
         source_session_id=item.get("source_session_id"),
         target_session_id=item.get("target_session_id"),
         chat_references=list(item.get("chat_references") or []),
-        team_references=[
-            reference
-            if isinstance(reference, TeamReference)
-            else TeamReference(**reference)
-            for reference in list(item.get("team_references") or [])
-        ],
+        team_references=queued_team_references,
         cross_chat_envelope_id=item.get("cross_chat_envelope_id"),
         cross_chat_exchange_id=item.get("cross_chat_exchange_id"),
         cross_chat_exchange_leg_id=item.get("cross_chat_exchange_leg_id"),

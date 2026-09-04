@@ -2531,6 +2531,55 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(agent_server.QUEUED_TURNS["chat-1"]), 1)
         start.assert_not_awaited()
 
+    async def test_scheduler_terminally_discards_stale_team_reference(self) -> None:
+        agent_server.CURRENT_TURNS.clear()
+        stale = {
+            "queued_id": "queued-stale-team-reference",
+            "prompt": "This prompt no longer names a team recipient.",
+            "file_ids": [],
+            "backend": "codex",
+            "chat_references": [],
+            "team_references": [
+                {
+                    "kind": "recipient",
+                    "recipient_kind": "server",
+                    "team_id": "team_alpha",
+                    "target_id": "node_sonic",
+                    "display_name_snapshot": "SONIC",
+                    "source_text_start": 0,
+                    "source_text_end": 7,
+                    "grant_intent": True,
+                }
+            ],
+        }
+        agent_server.QUEUED_TURNS["chat-1"] = deque([stale])
+        discard = AsyncMock()
+
+        with (
+            patch.object(
+                agent_server,
+                "terminally_discard_queued_turn",
+                discard,
+            ),
+            patch.object(
+                agent_server,
+                "_start_turn_locked",
+                new_callable=AsyncMock,
+            ) as start,
+        ):
+            await agent_server._start_next_queued_turn_locked(
+                "chat-1",
+                admission_backend="codex",
+            )
+
+        start.assert_not_awaited()
+        discard.assert_awaited_once_with(
+            "chat-1",
+            stale,
+            "saved Team target configuration is invalid",
+        )
+        self.assertNotIn("chat-1", agent_server.QUEUED_TURNS)
+
     async def test_no_active_turn_promotes_without_replaying_old_text(self) -> None:
         append_durable_event = AsyncMock(return_value={})
 

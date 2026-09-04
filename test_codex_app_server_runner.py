@@ -3419,6 +3419,89 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             ["queued-at-completion", "queued-after-completion"],
         )
 
+    async def test_terminal_cleanup_detaches_steer_before_handler_barrier(self) -> None:
+        turn = FakeTurn([completed_notification()])
+
+        class GatedTerminalManager(FakeManager):
+            def __init__(self) -> None:
+                super().__init__(turn)
+                self.handler_wait_started = asyncio.Event()
+                self.release_handler_wait = asyncio.Event()
+
+            async def wait_for_notification_handler(
+                self,
+                handler: object,
+                thread_id: str,
+            ) -> None:
+                self.notification_barriers.append((handler, thread_id))
+                self.handler_wait_started.set()
+                await self.release_handler_wait.wait()
+
+        manager = GatedTerminalManager()
+        queued = {
+            "queued_id": "queued-after-terminal-drain",
+            "prompt": "Keep this queued after the provider completes",
+            "file_ids": [],
+            "backend": agent_server.BACKEND_CODEX,
+        }
+        agent_server.QUEUED_TURNS["chat-native"] = deque([queued])
+        stack, _events, _finished, _exec_fallback = self.runner_patches(manager)
+        with stack:
+            runner = asyncio.create_task(
+                agent_server.run_codex_app_server(
+                    "chat-native",
+                    "run-original",
+                    "Original request",
+                    dict(self.session),
+                    Path(self.cwd) / ".runner-test-manifest.json",
+                    allow_exec_fallback=True,
+                    allow_resume_rollover=False,
+                )
+            )
+            try:
+                # This barrier is after the terminal loop's one-time steer
+                # drain, but before ACTIVE/BUSY ownership is released.
+                await asyncio.wait_for(
+                    manager.handler_wait_started.wait(),
+                    timeout=1,
+                )
+                self.assertFalse(runner.done())
+                async with agent_server.ACTIVE_LOCK:
+                    active = agent_server.ACTIVE["chat-native"]
+                    self.assertFalse(active["provider_turn_ready"])
+                    self.assertIsNone(active["native_steer_queue"])
+
+                result = await asyncio.wait_for(
+                    agent_server.run_queued_turn_now(
+                        "chat-native",
+                        "queued-after-terminal-drain",
+                    ),
+                    timeout=1,
+                )
+
+                self.assertFalse(result["ok"])
+                self.assertTrue(result["deferred"])
+                self.assertEqual(result["remaining"], 1)
+                self.assertEqual(
+                    [
+                        item["queued_id"]
+                        for item in agent_server.QUEUED_TURNS["chat-native"]
+                    ],
+                    ["queued-after-terminal-drain"],
+                )
+                self.assertFalse(
+                    agent_server.QUEUED_TURNS["chat-native"][0].get(
+                        "_paused_after_stop",
+                        False,
+                    )
+                )
+                self.assertNotIn("chat-native", agent_server.RUN_NOW_REQUESTS)
+                self.assertNotIn("chat-native", agent_server.RUN_NOW_TURNS)
+                self.assertNotIn("chat-native", agent_server.STEERING_SESSIONS)
+            finally:
+                manager.release_handler_wait.set()
+                await asyncio.wait_for(runner, timeout=2)
+
     async def test_completion_during_steer_ack_is_terminally_uncertain(self) -> None:
         turn = GatedSteerTurn()
         manager = FakeManager(turn)

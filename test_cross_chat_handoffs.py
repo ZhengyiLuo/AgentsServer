@@ -519,13 +519,11 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             )
             await entered.wait()
             task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+            release.set()
             with self.assertRaises(asyncio.CancelledError):
                 await task
-            release.set()
-            for _ in range(20):
-                if submit.await_count:
-                    break
-                await asyncio.sleep(0)
         submit.assert_awaited_once()
 
     async def test_request_cancel_during_instruction_create_still_submits_once(self) -> None:
@@ -590,13 +588,57 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             )
             await entered.wait()
             task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+            release.set()
             with self.assertRaises(asyncio.CancelledError):
                 await task
-            release.set()
-            await asyncio.wait_for(submitted.wait(), timeout=2)
+            self.assertTrue(submitted.is_set())
         submit.assert_awaited_once()
         records = await agent_server.CROSS_CHAT.for_source_run("run_create_cancel")
         self.assertEqual(len(records), 1)
+
+    async def test_request_cancel_waits_for_exchange_response_acceptance(self) -> None:
+        request = Request({
+            "type": "http",
+            "headers": [
+                (b"x-agentsdock-provider-capability", b"test-capability")
+            ],
+            "client": ("127.0.0.1", 1234),
+        })
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed_accept(*_args, **_kwargs):
+            entered.set()
+            await release.wait()
+            return ({"_secure_peer": True}, {}, True)
+
+        with patch.object(
+            agent_server,
+            "create_authorized_cross_chat_exchange_response",
+            side_effect=delayed_accept,
+        ):
+            task = asyncio.create_task(
+                agent_server.submit_authorized_cross_chat_exchange_response(
+                    "exchange-cancel",
+                    agent_server.CrossChatExchangeResponseRequest(
+                        inbound_leg_id="leg-inbound",
+                        body="settle this response",
+                        idempotency_key="response-cancel-key",
+                    ),
+                    request,
+                )
+            )
+            await entered.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
 
     async def test_chat_reference_validation_rejects_self_archive_and_overlap(self) -> None:
         self_ref = agent_server.ChatReference(

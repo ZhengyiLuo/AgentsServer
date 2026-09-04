@@ -156,8 +156,8 @@ def restart_environment(root: Path):
         ))
         stack.enter_context(patch.object(
             agent_server,
-            "UNSAFE_HTTP_MUTATIONS_IN_FLIGHT",
-            0,
+            "UNSAFE_HTTP_MUTATION_TASKS",
+            {},
         ))
         yield
 
@@ -994,7 +994,7 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
                     ),
                     call_next,
                 )
-                in_flight = agent_server.UNSAFE_HTTP_MUTATIONS_IN_FLIGHT
+                in_flight = agent_server.unsafe_http_mutation_count_locked()
 
         self.assertEqual(response.status_code, 403)
         self.assertFalse(called)
@@ -1333,12 +1333,37 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertNotIn(private_value, public_json)
 
+    def test_blocker_revision_binds_mutation_identity_without_exposing_it(self):
+        first_task = MagicMock()
+        first_task.done.return_value = False
+        replacement_task = MagicMock()
+        replacement_task.done.return_value = False
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with restart_environment(root):
+                agent_server.UNSAFE_HTTP_MUTATION_TASKS["private-mutation-a"] = (
+                    first_task
+                )
+                first = agent_server.server_restart_blocker_snapshot_locked()
+                agent_server.UNSAFE_HTTP_MUTATION_TASKS.clear()
+                agent_server.UNSAFE_HTTP_MUTATION_TASKS["private-mutation-b"] = (
+                    replacement_task
+                )
+                replacement = agent_server.server_restart_blocker_snapshot_locked()
+
+        self.assertEqual(first["mutation_count"], 1)
+        self.assertEqual(replacement["mutation_count"], 1)
+        self.assertNotEqual(first["revision"], replacement["revision"])
+        public_json = json.dumps((first, replacement))
+        self.assertNotIn("private-mutation-a", public_json)
+        self.assertNotIn("private-mutation-b", public_json)
+
     async def test_safety_critical_work_blocks_normal_and_force_restart(self):
         scenarios = (
             ({"SERVER_MAINTENANCE_SESSIONS": {"chat"}}, "server_maintenance_count"),
             ({"DELETING_SESSIONS": {"chat"}}, "deleting_session_count"),
             ({"CODEX_GOALS_RECONFIGURING": True}, "codex_goals_reconfiguring"),
-            ({"UNSAFE_HTTP_MUTATIONS_IN_FLIGHT": 1}, "mutation_count"),
+            ({"UNSAFE_HTTP_MUTATION_TASKS": {"mutation": asyncio.current_task()}}, "mutation_count"),
         )
         for changes, count_name in scenarios:
             for force in (False, True):
@@ -1608,7 +1633,7 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
                 )
                 await entered.wait()
                 self.assertEqual(
-                    agent_server.UNSAFE_HTTP_MUTATIONS_IN_FLIGHT,
+                    agent_server.unsafe_http_mutation_count_locked(),
                     1,
                 )
                 with self.assertRaises(HTTPException) as raised:
@@ -1622,7 +1647,7 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(raised.exception.detail["mutation_count"], 1)
-        self.assertEqual(agent_server.UNSAFE_HTTP_MUTATIONS_IN_FLIGHT, 0)
+        self.assertEqual(agent_server.unsafe_http_mutation_count_locked(), 0)
 
     async def test_new_http_mutations_are_rejected_after_restart_drain(self):
         called = False
@@ -1672,7 +1697,7 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         async def call_next(_request: Request) -> Response:
             nonlocal observed_count
-            observed_count = agent_server.UNSAFE_HTTP_MUTATIONS_IN_FLIGHT
+            observed_count = agent_server.unsafe_http_mutation_count_locked()
             return Response("accepted", status_code=202)
 
         with tempfile.TemporaryDirectory() as temporary:

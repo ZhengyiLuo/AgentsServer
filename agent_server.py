@@ -12830,7 +12830,10 @@ async def update_session_event_metadata(session_id: str, event: dict[str, Any]) 
     run_id = str(event.get("run_id") or "").strip()
     active_run_changed = False
     compaction_state_changed = False
-    if event_type == "turn_started" and run_id:
+    imported_event = event.get("imported") is True or run_id.startswith("import_")
+    if event_type == "turn_started" and run_id and not imported_event:
+        # Imported history is a replay of old transcript messages; it never
+        # represents a live run and must not make the chat look busy.
         sess["active_run"] = {
             key: event[key]
             for key in (
@@ -19985,6 +19988,119 @@ async def recover_abandoned_turns_after_start(
             recovered,
         )
     return recovered
+
+
+def clear_imported_active_runs() -> int:
+    """Drop persisted active_run records that point at history import runs.
+
+    Older servers set ``active_run`` from imported ``turn_started`` events and
+    nothing ever cleared it, so a stopped chat stayed "running" in every
+    client until its next real turn.
+    """
+
+    cleared = 0
+    for session in STORE.sessions.values():
+        active = session.get("active_run")
+        if isinstance(active, dict) and str(active.get("run_id") or "").startswith("import_"):
+            session.pop("active_run", None)
+            cleared += 1
+    if cleared:
+        logger.warning("cleared %d stale imported active_run record(s)", cleared)
+    return cleared
+
+
+def is_imported_history_event(event: dict[str, Any]) -> bool:
+    return event.get("imported") is True or str(event.get("run_id") or "").startswith("import_")
+
+
+def prune_duplicate_imported_history_sync(
+    session_id: str,
+    *,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Remove imported turns that duplicate messages already on the timeline.
+
+    Earlier servers re-imported the same transcript tail on every chat open,
+    appending thousands of duplicate ``turn_started``/``assistant_text`` rows.
+    This keeps the first occurrence of every message (native or imported) and
+    drops later imported copies, together with import markers whose whole run
+    was duplicated. The rewrite is atomic; sequence numbers are preserved (gaps
+    are fine for clients).
+    """
+
+    path = events_path(session_id)
+    summary: dict[str, Any] = {
+        "dry_run": dry_run,
+        "events_before": 0,
+        "removed_events": 0,
+        "removed_runs": 0,
+        "bytes_before": 0,
+        "bytes_after": 0,
+    }
+    if not path.exists():
+        return summary
+    raw_lines = path.read_bytes().split(b"\n")
+    summary["bytes_before"] = path.stat().st_size
+    parsed: list[tuple[bytes, dict[str, Any] | None]] = []
+    for raw in raw_lines:
+        if not raw.strip():
+            parsed.append((raw, None))
+            continue
+        try:
+            parsed.append((raw, json.loads(raw)))
+        except Exception:
+            parsed.append((raw, None))
+    summary["events_before"] = sum(1 for _raw, event in parsed if event is not None)
+
+    seen: Counter[tuple[str, str]] = Counter()
+    kept_per_import_run: Counter[str] = Counter()
+    drop_indexes: set[int] = set()
+    for index, (_raw, event) in enumerate(parsed):
+        if event is None:
+            continue
+        event_type = str(event.get("type") or "")
+        if event_type == "turn_started":
+            key = history_dedup_key("user", event.get("prompt"))
+        elif event_type == "assistant_text":
+            key = history_dedup_key("assistant", event.get("text"))
+        else:
+            continue
+        if is_imported_history_event(event):
+            run_id = str(event.get("run_id") or "")
+            if seen.get(key):
+                drop_indexes.add(index)
+                continue
+            kept_per_import_run[run_id] += 1
+        seen[key] += 1
+    for index, (_raw, event) in enumerate(parsed):
+        if event is None or not is_imported_history_event(event):
+            continue
+        event_type = str(event.get("type") or "")
+        if event_type in {"history_imported", "turn_finished"}:
+            run_id = str(event.get("run_id") or "")
+            if run_id and kept_per_import_run.get(run_id, 0) == 0:
+                drop_indexes.add(index)
+    removed_runs = {
+        str(event.get("run_id") or "")
+        for index, (_raw, event) in enumerate(parsed)
+        if index in drop_indexes and event is not None
+        and str(event.get("type") or "") == "history_imported"
+    }
+    summary["removed_events"] = len(drop_indexes)
+    summary["removed_runs"] = len(removed_runs)
+    kept = [raw for index, (raw, _event) in enumerate(parsed) if index not in drop_indexes]
+    rewritten = b"\n".join(kept)
+    summary["bytes_after"] = len(rewritten)
+    if dry_run or not drop_indexes:
+        summary["bytes_after"] = summary["bytes_before"] if not drop_indexes else summary["bytes_after"]
+        return summary
+    tmp = path.with_suffix(".jsonl.prune-tmp")
+    with tmp.open("wb") as stream:
+        stream.write(rewritten)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(tmp, path)
+    return summary
 
 
 async def recover_abandoned_codex_compactions_after_start(
@@ -37199,6 +37315,17 @@ async def sync_provider_history(
             "source_path": None,
             "message": "No provider session ID set.",
         }
+    # Every chat open used to re-parse the whole transcript (tens of MB).
+    # Skip the parse when the transcript file has not changed since the last
+    # sync; the stamp lives on the in-memory session only.
+    stamp = await asyncio.to_thread(provider_history_source_stamp, sess)
+    live_session = STORE.sessions.get(session_id) or {}
+    if stamp is not None and live_session.get("_history_sync_source_stamp") == stamp:
+        return {
+            "imported": 0,
+            "source_path": stamp[0],
+            "message": "Provider transcript unchanged since the last sync.",
+        }
     source_path, items = await asyncio.to_thread(provider_history, sess, limit)
     if not source_path or not items:
         return {
@@ -37207,6 +37334,8 @@ async def sync_provider_history(
             "message": "No provider transcript found.",
         }
     fresh = await asyncio.to_thread(unsynced_history_items, session_id, items)
+    if stamp is not None and live_session:
+        live_session["_history_sync_source_stamp"] = stamp
     if not fresh:
         return {
             "imported": 0,
@@ -37214,6 +37343,28 @@ async def sync_provider_history(
             "message": "Already up to date with the provider transcript.",
         }
     return await append_imported_history(sess, source_path, fresh)
+
+
+def provider_history_source_stamp(sess: dict[str, Any]) -> list[Any] | None:
+    """Return [path, size, mtime_ns] of the chat's provider transcript, if any."""
+
+    backend = str(sess.get("backend") or DEFAULT_BACKEND).lower()
+    provider_id = session_provider_id(sess)
+    if not provider_id:
+        return None
+    if backend == BACKEND_CLAUDE:
+        path = find_claude_history(provider_id)
+    elif backend == BACKEND_CODEX:
+        path = find_codex_history(provider_id)
+    else:
+        return None
+    if not path:
+        return None
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return [str(path), int(stat.st_size), int(stat.st_mtime_ns)]
 
 
 async def run_provider_history_sync(session_id: str) -> None:
@@ -37296,6 +37447,7 @@ async def append_imported_history(
                 "text": item["text"],
                 "imported": True,
             }))
+    imported_events.append(imported_history_terminal_event(run_id, backend))
     for event_type, payload in imported_events:
         await append_event(session_id, event_type, payload)
     return {
@@ -37303,6 +37455,18 @@ async def append_imported_history(
         "source_path": str(source_path),
         "message": message,
     }
+
+
+def imported_history_terminal_event(run_id: str, backend: str) -> tuple[str, dict[str, Any]]:
+    """Close an import run so no client can mistake replayed history for a live turn."""
+
+    return ("turn_finished", {
+        "run_id": run_id,
+        "backend": backend,
+        "imported": True,
+        "result_text": "",
+        "message": "Imported history replay finished.",
+    })
 
 
 async def append_staged_imported_history(
@@ -37339,6 +37503,7 @@ async def append_staged_imported_history(
                 "text": item["text"],
                 "imported": True,
             }))
+    imported_events.append(imported_history_terminal_event(run_id, backend))
     written = await append_imported_events(session_id, imported_events)
     if written != len(imported_events):
         raise RuntimeError("history event batch was not fully persisted")
@@ -56447,6 +56612,7 @@ async def lifespan(app: FastAPI):
         else ""
     )
     reconcile_server_restart_status_after_startup()
+    clear_imported_active_runs()
     await reconcile_server_update_status_after_startup()
     abandoned_compaction_count = (
         await recover_abandoned_codex_compactions_after_start(
@@ -60757,6 +60923,60 @@ async def import_history(session_id: str, req: ImportHistoryRequest) -> dict[str
         raise HTTPException(status_code=404, detail="session not found")
     result = await import_session_history(sess, force=req.force, limit=req.limit)
     return {"ok": True, **result}
+
+
+class PruneImportedHistoryRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    dry_run: bool = True
+
+
+@app.post("/api/sessions/{session_id}/history/prune-duplicates")
+async def prune_imported_history(
+    session_id: str,
+    req: PruneImportedHistoryRequest,
+) -> dict[str, Any]:
+    """Remove duplicate imported transcript rows left by older servers.
+
+    Defaults to a dry run that only reports what would be removed. The real
+    prune rewrites the chat's event log atomically while the chat is idle.
+    """
+
+    sess = STORE.sessions.get(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="session not found")
+    ensure_session_not_deleting(session_id)
+    async with ACTIVE_LOCK:
+        if session_id in BUSY_SESSIONS or session_id in SERVER_MAINTENANCE_SESSIONS:
+            raise HTTPException(
+                status_code=409,
+                detail="wait for the active turn to finish before pruning history",
+            )
+    async with event_delivery_lock(session_id):
+        summary = await asyncio.to_thread(
+            prune_duplicate_imported_history_sync,
+            session_id,
+            dry_run=req.dry_run,
+        )
+        if not req.dry_run and summary["removed_events"]:
+            await forget_event_seq(session_id)
+            clear_imported_active_runs()
+            logger.warning(
+                "pruned duplicate imported history session=%s removed_events=%d removed_runs=%d",
+                session_id,
+                summary["removed_events"],
+                summary["removed_runs"],
+            )
+    if not req.dry_run and summary["removed_events"]:
+        with suppress(Exception):
+            await append_event(session_id, "history_imported", {
+                "pruned": True,
+                "message": (
+                    f"Removed {summary['removed_events']} duplicate imported "
+                    "message(s) from this chat's history."
+                ),
+            })
+    return {"ok": True, **summary}
 
 
 @app.post("/api/sessions/{session_id}/digest")

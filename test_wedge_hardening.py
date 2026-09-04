@@ -655,6 +655,115 @@ class ExchangeReplayAfterThreadRotationTests(unittest.TestCase):
         self.assertNotIn(self.marker, fresh)
 
 
+class ImportedHistoryLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_imported_turns_never_set_active_run(self):
+        sessions = {"chat": {"id": "chat", "backend": agent_server.BACKEND_CODEX}}
+        with patch.object(agent_server.STORE, "sessions", sessions), \
+             patch.object(agent_server.STORE, "save", AsyncMock()):
+            await agent_server.update_session_event_metadata("chat", {
+                "type": "turn_started",
+                "run_id": "import_abc123",
+                "imported": True,
+                "prompt": "old message",
+                "ts": "2026-09-04T10:00:00Z",
+            })
+            self.assertNotIn("active_run", sessions["chat"])
+            await agent_server.update_session_event_metadata("chat", {
+                "type": "turn_started",
+                "run_id": "run_live",
+                "prompt": "new message",
+                "ts": "2026-09-04T10:00:01Z",
+            })
+            self.assertEqual(sessions["chat"]["active_run"]["run_id"], "run_live")
+
+    def test_stale_imported_active_run_is_cleared_at_startup(self):
+        sessions = {
+            "a": {"id": "a", "active_run": {"run_id": "import_dead"}},
+            "b": {"id": "b", "active_run": {"run_id": "run_live"}},
+        }
+        with patch.object(agent_server.STORE, "sessions", sessions):
+            self.assertEqual(agent_server.clear_imported_active_runs(), 1)
+        self.assertNotIn("active_run", sessions["a"])
+        self.assertEqual(sessions["b"]["active_run"]["run_id"], "run_live")
+
+    async def test_import_batch_ends_with_a_terminal_event(self):
+        appended: list[tuple[str, dict]] = []
+
+        async def record(session_id, event_type, payload):
+            appended.append((event_type, payload))
+            return {"seq": len(appended), **payload}
+
+        sess = {"id": "chat", "backend": agent_server.BACKEND_CODEX, "codex_thread_id": "t1"}
+        with patch.object(agent_server, "append_event", new=record):
+            await agent_server.append_imported_history(
+                sess, Path("/tmp/rollout.jsonl"), [{"kind": "user", "text": "hello"}],
+            )
+        self.assertEqual([kind for kind, _ in appended], ["history_imported", "turn_started", "turn_finished"])
+        self.assertTrue(appended[-1][1]["imported"])
+        self.assertEqual(appended[-1][1]["run_id"], appended[1][1]["run_id"])
+
+    async def test_sync_skips_unchanged_transcripts(self):
+        sess = {"id": "chat", "backend": agent_server.BACKEND_CODEX, "codex_thread_id": "t1"}
+        live = {"chat": dict(sess)}
+        stamp = ["/tmp/rollout.jsonl", 10, 20]
+        with patch.object(agent_server.STORE, "sessions", live), \
+             patch.object(agent_server, "provider_history_source_stamp", return_value=stamp), \
+             patch.object(
+                 agent_server,
+                 "provider_history",
+                 return_value=(Path("/tmp/rollout.jsonl"), [{"kind": "user", "text": "x"}]),
+             ) as parse, \
+             patch.object(agent_server, "unsynced_history_items", return_value=[]):
+            first = await agent_server.sync_provider_history(dict(sess))
+            second = await agent_server.sync_provider_history(dict(sess))
+        self.assertEqual(parse.call_count, 1)
+        self.assertIn("Already up to date", first["message"])
+        self.assertIn("unchanged", second["message"])
+
+
+class PruneImportedHistoryTests(unittest.TestCase):
+    def write_log(self, path: Path, events: list[dict]) -> None:
+        path.write_text("".join(json.dumps(e) + "\n" for e in events))
+
+    def test_duplicate_imported_rows_are_removed_and_first_copies_kept(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "events.jsonl"
+            events = [
+                {"seq": 1, "type": "turn_started", "run_id": "run_a", "prompt": "hello"},
+                {"seq": 2, "type": "assistant_text", "run_id": "run_a", "text": "hi there"},
+                {"seq": 3, "type": "turn_finished", "run_id": "run_a"},
+                {"seq": 4, "type": "history_imported", "run_id": "import_1"},
+                {"seq": 5, "type": "turn_started", "run_id": "import_1", "imported": True, "prompt": "hello"},
+                {"seq": 6, "type": "assistant_text", "run_id": "import_1", "imported": True, "text": "hi  there"},
+                {"seq": 7, "type": "history_imported", "run_id": "import_2"},
+                {"seq": 8, "type": "turn_started", "run_id": "import_2", "imported": True, "prompt": "hello"},
+                {"seq": 9, "type": "assistant_text", "run_id": "import_2", "imported": True, "text": "brand new reply"},
+                {"seq": 10, "type": "turn_finished", "run_id": "import_2", "imported": True},
+            ]
+            self.write_log(log, events)
+            with patch.object(agent_server, "events_path", return_value=log):
+                dry = agent_server.prune_duplicate_imported_history_sync("chat", dry_run=True)
+                self.assertEqual(dry["removed_events"], 4)
+                self.assertEqual(dry["removed_runs"], 1)
+                self.assertEqual(len(log.read_text().splitlines()), 10)
+                real = agent_server.prune_duplicate_imported_history_sync("chat", dry_run=False)
+            remaining = [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
+        self.assertEqual(real["removed_events"], 4)
+        self.assertEqual([e["seq"] for e in remaining], [1, 2, 3, 7, 9, 10])
+
+    def test_prune_without_duplicates_leaves_the_file_untouched(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "events.jsonl"
+            self.write_log(log, [
+                {"seq": 1, "type": "turn_started", "run_id": "run_a", "prompt": "hello"},
+            ])
+            before = log.read_bytes()
+            with patch.object(agent_server, "events_path", return_value=log):
+                summary = agent_server.prune_duplicate_imported_history_sync("chat", dry_run=False)
+            self.assertEqual(summary["removed_events"], 0)
+            self.assertEqual(log.read_bytes(), before)
+
+
 class DarwinMetricsTests(unittest.TestCase):
     def test_elapsed_time_parsing(self):
         self.assertEqual(agent_server.parse_elapsed_seconds("05:33"), 333)

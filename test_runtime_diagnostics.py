@@ -656,7 +656,7 @@ class RuntimeDiagnosticTests(unittest.TestCase):
 """
         with patch.object(agent_server, "run_catalog_command", return_value=help_text), patch.object(
             agent_server, "claude_supports_effort", return_value=False
-        ):
+        ), patch.object(agent_server, "discover_claude_provider_models", return_value=[]):
             catalog = agent_server.parse_claude_help_catalog()
         self.assertEqual(
             [option["value"] for option in catalog["efforts"]],
@@ -670,12 +670,135 @@ class RuntimeDiagnosticTests(unittest.TestCase):
 """
         with patch.object(agent_server, "run_catalog_command", return_value=help_text), patch.object(
             agent_server, "claude_supports_effort", return_value=True
-        ):
+        ), patch.object(agent_server, "discover_claude_provider_models", return_value=[]):
             catalog = agent_server.parse_claude_help_catalog()
         self.assertEqual(
             [option["value"] for option in catalog["efforts"]],
             ["", "low", "medium", "high", "xhigh", "max", "ultracode"],
         )
+
+    def test_claude_help_model_parser_keeps_aliases_and_full_name_example(self) -> None:
+        help_text = """\
+  --model <model>                       Provide an alias for the latest model
+                                        (e.g. 'fable', 'opus', or 'sonnet') or
+                                        a model's full name (e.g.
+                                        'claude-fable-5-1').
+  -n, --name <name>                     Set a display name
+"""
+        self.assertEqual(
+            [
+                option["value"]
+                for option in agent_server.parse_claude_help_model_options(help_text)
+            ],
+            ["fable", "opus", "sonnet", "claude-fable-5-1"],
+        )
+
+    def test_claude_catalog_fallback_includes_current_official_models(self) -> None:
+        help_text = """\
+  --model <model>                       Provide an alias for the latest model
+                                        (e.g. 'fable', 'opus', or 'sonnet')
+"""
+        with patch.object(agent_server, "run_catalog_command", return_value=help_text), patch.object(
+            agent_server, "claude_supports_effort", return_value=False
+        ), patch.object(agent_server, "discover_claude_provider_models", return_value=[]):
+            catalog = agent_server.parse_claude_help_catalog()
+
+        by_value = {option["value"]: option for option in catalog["models"]}
+        self.assertIn("fable", by_value)
+        self.assertIn("opus", by_value)
+        self.assertIn("sonnet", by_value)
+        self.assertEqual(by_value["claude-fable-5-1"]["label"], "Fable 5.1")
+        self.assertEqual(by_value["claude-mythos-5-1"]["availability"], "limited")
+        self.assertIn("claude-opus-5", by_value)
+        self.assertIn("claude-sonnet-5", by_value)
+        self.assertIn("current fallback", catalog["model_source"])
+
+    def test_claude_catalog_uses_account_scoped_models_without_extra_pins(self) -> None:
+        provider_options = [
+            agent_server.runtime_option("claude-account-model-7", "Account Model 7")
+        ]
+        help_text = """\
+  --model <model>                       Provide an alias for the latest model
+                                        (e.g. 'fable', 'opus', or 'sonnet')
+"""
+        with patch.object(agent_server, "run_catalog_command", return_value=help_text), patch.object(
+            agent_server, "claude_supports_effort", return_value=False
+        ), patch.object(
+            agent_server,
+            "discover_claude_provider_models",
+            return_value=provider_options,
+        ):
+            catalog = agent_server.parse_claude_help_catalog()
+
+        values = [option["value"] for option in catalog["models"]]
+        self.assertIn("fable", values)
+        self.assertIn("claude-account-model-7", values)
+        self.assertNotIn("claude-fable-5-1", values)
+        self.assertIn("Anthropic Models API", catalog["model_source"])
+        self.assertNotIn("current fallback", catalog["model_source"])
+
+    def test_claude_models_api_discovery_is_account_scoped_and_bounded(self) -> None:
+        payload = json.dumps({
+            "data": [
+                {"id": "claude-fable-5-1", "display_name": "Claude Fable 5.1"},
+                {"id": "not valid whitespace", "display_name": "Invalid"},
+            ]
+        }).encode("utf-8")
+        captured: dict[str, object] = {}
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self, size: int) -> bytes:
+                captured["read_size"] = size
+                return payload
+
+        class Opener:
+            def open(self, request, timeout: float):
+                captured["request"] = request
+                captured["timeout"] = timeout
+                return Response()
+
+        with patch.dict(
+            agent_server.os.environ,
+            {
+                "ANTHROPIC_API_KEY": "test-secret-never-log",
+                "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+            },
+        ), patch.object(
+            agent_server.urllib.request,
+            "build_opener",
+            return_value=Opener(),
+        ) as build_opener:
+            options = agent_server.discover_claude_provider_models()
+
+        self.assertEqual(
+            options,
+            [{"value": "claude-fable-5-1", "label": "Claude Fable 5.1"}],
+        )
+        request = captured["request"]
+        self.assertEqual(request.full_url, "https://api.anthropic.com/v1/models?limit=1000")
+        self.assertEqual(request.get_header("X-api-key"), "test-secret-never-log")
+        self.assertEqual(
+            captured["read_size"],
+            agent_server.CLAUDE_MODELS_API_MAX_BYTES + 1,
+        )
+        self.assertIsInstance(
+            build_opener.call_args.args[0],
+            agent_server.ClaudeCatalogNoRedirectHandler,
+        )
+
+    def test_claude_models_api_is_not_contacted_without_api_key(self) -> None:
+        with patch.dict(agent_server.os.environ, {"ANTHROPIC_API_KEY": ""}), patch.object(
+            agent_server.urllib.request,
+            "build_opener",
+        ) as build_opener:
+            self.assertEqual(agent_server.discover_claude_provider_models(), [])
+        build_opener.assert_not_called()
 
     def test_claude_effort_probe_rejects_unknown_values(self) -> None:
         warning = "Warning: Unknown --effort value 'ultracode' - ignoring it and using the default effort."

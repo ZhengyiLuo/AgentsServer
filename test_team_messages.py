@@ -293,6 +293,33 @@ class TeamMessagesServiceTests(unittest.TestCase):
         future = self.get(self.member, f"{self.base}/messages?box=inbox&since=2999-01-01T00:00:00Z")
         self.assertEqual(future["messages"], [])
 
+    def test_inbox_delivery_matches_the_requested_owned_address(self) -> None:
+        member_id = self.member["principal"]["id"]
+        guest_id = self.guest["principal"]["id"]
+        sent = self.send(
+            self.owner,
+            [
+                {"kind": "human", "id": member_id},
+                {"kind": "human", "id": guest_id},
+            ],
+            body="Address-specific delivery",
+        )
+
+        store = self.app.state.store
+        original_owned_addresses = store._team_owned_addresses
+        store._team_owned_addresses = lambda *_args, **_kwargs: [
+            ("human", member_id),
+            ("human", guest_id),
+        ]
+        self.addCleanup(setattr, store, "_team_owned_addresses", original_owned_addresses)
+
+        inbox = self.get(
+            self.member,
+            f"{self.base}/messages?box=inbox&address_kind=human&address_id={guest_id}",
+        )
+        self.assertEqual([item["id"] for item in inbox["messages"]], [sent["id"]])
+        self.assertEqual(inbox["messages"][0]["delivery"]["id"], guest_id)
+
     def test_reply_links_to_an_existing_message_only(self) -> None:
         root = self.send(self.owner, [{"kind": "all"}], body="root")
         reply = self.send(

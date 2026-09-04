@@ -7156,6 +7156,7 @@ class HubStore:
         *,
         include_body: bool,
         owned: list[tuple[str, str]] | None = None,
+        delivery_address: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
         team_id = str(row["team_id"])
         message_id = str(row["id"])
@@ -7203,6 +7204,14 @@ class HubStore:
                 )
                 in owned
             ]
+            if delivery_address is not None:
+                delivery_kind, delivery_id = delivery_address
+                mine = [
+                    recipient
+                    for recipient in mine
+                    if recipient["kind"] == delivery_kind
+                    and recipient["id"] == delivery_id
+                ]
             item["delivery"] = mine[0] if mine else None
         return item
 
@@ -7733,6 +7742,9 @@ class HubStore:
                     row,
                     include_body=False,
                     owned=owned if box == "inbox" else None,
+                    delivery_address=(str(address_kind), str(address_id))
+                    if box == "inbox"
+                    else None,
                 )
                 for row in visible
             ]

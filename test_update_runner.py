@@ -601,6 +601,7 @@ class UpdateRunnerTests(unittest.TestCase):
 
         self.assertEqual(statuses[-1]["phase"], "complete")
         self.assertEqual(statuses[-1]["installed_version"], "1.2.4")
+        self.assertFalse(statuses[-1]["update_available"])
         self.assertEqual(statuses[-1]["track"], "stable")
         self.assertIsNone(statuses[-1]["heartbeat_at"])
         self.assertIsNone(statuses[-1]["elapsed_seconds"])
@@ -868,6 +869,7 @@ class UpdateRunnerTests(unittest.TestCase):
         identity_check.assert_called_once()
         self.assertEqual(statuses[-1]["phase"], "complete")
         self.assertEqual(statuses[-1]["installed_version"], "1.2.4")
+        self.assertFalse(statuses[-1]["update_available"])
         self.assertEqual(statuses[-1]["track"], "stable")
 
     def test_pre_restart_idle_check_rejects_late_work(self):

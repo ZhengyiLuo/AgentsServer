@@ -1077,6 +1077,7 @@ def run_update(args: argparse.Namespace) -> None:
         status_path,
         expected_update_id=update_id,
         phase="complete",
+        update_available=False,
         message=f"AgentsServer {version} is installed and healthy.",
         track=track,
         installed_version=version,

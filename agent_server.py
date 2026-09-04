@@ -51663,6 +51663,19 @@ def read_server_update_status() -> dict[str, Any]:
         value["track"] = server_release_track(SERVER_VERSION)
     value["current_version"] = SERVER_VERSION
     value["api_contract_version"] = API_CONTRACT_VERSION
+    # Older detached runners left the pre-install availability bit behind on
+    # their terminal success row.  Derive the public invariant from the
+    # verified installed/target version so an upgraded server self-heals the
+    # stale durable record without requiring another update check.
+    if str(value.get("phase") or "") == "current" or (
+        str(value.get("phase") or "") == "complete"
+        and SERVER_VERSION
+        in {
+            str(value.get("installed_version") or ""),
+            str(value.get("target_version") or ""),
+        }
+    ):
+        value["update_available"] = False
     return value
 
 

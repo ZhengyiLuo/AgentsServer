@@ -760,6 +760,29 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("installed and healthy", status["message"])
         self.assertTrue(status["finished_at"])
 
+    async def test_status_normalizes_a_terminal_success_with_stale_availability(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(agent_server, "SERVER_VERSION", "1.1.0"), \
+             patch.object(
+                 agent_server,
+                 "SERVER_UPDATE_STATUS_FILE",
+                 Path(temporary) / "status.json",
+             ):
+            agent_server.write_server_update_status(
+                update_id="completed-update",
+                phase="complete",
+                target_version="1.1.0",
+                installed_version="1.1.0",
+                latest_version="1.1.0",
+                update_available=True,
+                message="AgentsServer 1.1.0 is installed and healthy.",
+            )
+            status = await agent_server.server_update_status()
+
+        self.assertEqual(status["phase"], "complete")
+        self.assertFalse(status["update_available"])
+        self.assertEqual(status["current_version"], "1.1.0")
+
     async def test_status_keeps_target_current_drained_while_updater_is_alive(self):
         with tempfile.TemporaryDirectory() as temporary, \
              patch.object(agent_server, "SERVER_VERSION", "1.1.0"), \

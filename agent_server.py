@@ -265,6 +265,11 @@ SERVER_UPDATE_LOG_FILE = SERVER_ADMIN_ROOT / "server-update.log"
 SERVER_RESTART_STATUS_FILE = SERVER_ADMIN_ROOT / "server-restart.json"
 CODEX_SETTINGS_FILE = SERVER_ADMIN_ROOT / "codex-settings.json"
 ABANDONED_FORK_THREADS_FILE = SERVER_ADMIN_ROOT / "abandoned-fork-threads.json"
+# Process-group ids of provider children this server spawned in their own
+# session (``start_new_session=True``). A SIGKILL of the server cannot reach
+# them, so the hard-kill watchdog and the next startup reap them from here.
+PROVIDER_CHILDREN_FILE = SERVER_ADMIN_ROOT / "provider-children.json"
+PROVIDER_CHILD_PROC_ROOT = Path("/proc")
 SERVER_UPDATE_PUBLIC_KEY = SERVER_ROOT / "release-public-key.pem"
 SERVER_UPDATE_RUNNER = SERVER_ROOT / "update_runner.py"
 CLAUDE_PROJECTS_ROOT = Path(os.environ.get("CLAUDE_PROJECTS_ROOT", Path.home() / ".claude" / "projects"))
@@ -40148,6 +40153,8 @@ async def codex_app_server_manager() -> CodexAppServerManager:
                             "mcpServerOpenaiFormElicitation": True,
                         },
                     },
+                    on_process_started=register_codex_app_server_child,
+                    on_process_exited=unregister_codex_app_server_child,
                 )
                 manager.add_notification_handler(project_codex_notification)
                 manager.add_notification_handler(cache_codex_approval_item)
@@ -52636,6 +52643,11 @@ SERVER_RESTART_PHASES = {"idle", "accepted", "signaling", "complete", "failed"}
 SERVER_RESTART_ACTIVE_PHASES = {"accepted", "signaling"}
 SERVER_RESTART_SIGNAL_DELAY_SECONDS = 0.5
 SERVER_RESTART_FORCE_KILL_DELAY_SECONDS = 3.0
+# A cooperative restart still arms the hard-kill watchdog: uvicorn waits on
+# background tasks/websockets and a Codex child may ignore SIGTERM, so without
+# a deadline the port can stay closed forever. This budget must exceed the
+# uvicorn graceful window plus the bounded lifespan shutdown phases.
+SERVER_RESTART_GRACEFUL_KILL_DELAY_SECONDS = 30.0
 SERVER_RESTART_ACCEPTED_STALE_SECONDS = 10.0
 SERVER_RESTART_COOLDOWN_SECONDS = 30.0
 # A forced (emergency) restart must never wait on server state that may itself
@@ -53567,22 +53579,240 @@ def server_restart_safety_work_message(
     )
 
 
+PROVIDER_CHILDREN_LOCK = threading.Lock()
+PROVIDER_CHILD_PROBE_TIMEOUT_SECONDS = 1.0
+
+
+def _provider_child_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def read_provider_children_registry() -> list[dict[str, Any]]:
+    """Return the registered provider children, dropping malformed entries."""
+
+    try:
+        value = json.loads(PROVIDER_CHILDREN_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+    raw_children = value.get("children") if isinstance(value, dict) else None
+    children: list[dict[str, Any]] = []
+    for entry in raw_children if isinstance(raw_children, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        pid = _provider_child_int(entry.get("pid"))
+        pgid = _provider_child_int(entry.get("pgid"))
+        if pid is None or pgid is None:
+            continue
+        children.append({
+            "pid": pid,
+            "pgid": pgid,
+            "kind": str(entry.get("kind") or "")[:64],
+            "started_at": str(entry.get("started_at") or "")[:64],
+            "owner_pid": _provider_child_int(entry.get("owner_pid")),
+        })
+    return children
+
+
+def write_provider_children_registry(children: list[dict[str, Any]]) -> None:
+    atomic_update_json(PROVIDER_CHILDREN_FILE, {"children": list(children)})
+
+
+def register_provider_child(
+    pid: int,
+    pgid: int | None,
+    *,
+    kind: str = "codex-app-server",
+) -> None:
+    """Record a provider child that lives in its own process group."""
+
+    if _provider_child_int(pid) is None or _provider_child_int(pgid) is None:
+        # Without a provably owned process group there is nothing safe to
+        # signal later; never record a bare pid as a kill target.
+        return
+    with PROVIDER_CHILDREN_LOCK:
+        children = [
+            entry
+            for entry in read_provider_children_registry()
+            if entry["pid"] != pid
+        ]
+        children.append({
+            "pid": int(pid),
+            "pgid": int(pgid),
+            "kind": kind,
+            "started_at": update_utc_now(),
+            "owner_pid": os.getpid(),
+        })
+        write_provider_children_registry(children)
+
+
+def unregister_provider_child(pid: int) -> None:
+    with PROVIDER_CHILDREN_LOCK:
+        children = read_provider_children_registry()
+        remaining = [entry for entry in children if entry["pid"] != pid]
+        if len(remaining) != len(children) or not PROVIDER_CHILDREN_FILE.exists():
+            write_provider_children_registry(remaining)
+
+
+def register_codex_app_server_child(pid: int, pgid: int | None) -> None:
+    with suppress(Exception):
+        register_provider_child(pid, pgid, kind="codex-app-server")
+
+
+def unregister_codex_app_server_child(pid: int, _pgid: int | None) -> None:
+    with suppress(Exception):
+        unregister_provider_child(pid)
+
+
+def provider_child_process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _provider_child_ps(pid: int, column: str) -> str:
+    try:
+        completed = subprocess.run(
+            ["ps", "-o", f"{column}=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=PROVIDER_CHILD_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except Exception:
+        return ""
+    return str(completed.stdout or "").strip()
+
+
+def provider_child_command_line(pid: int) -> str:
+    """Best-effort command line of ``pid`` (empty when unknown)."""
+
+    proc_cmdline = PROVIDER_CHILD_PROC_ROOT / str(pid) / "cmdline"
+    if proc_cmdline.exists():
+        with suppress(OSError):
+            raw = proc_cmdline.read_bytes()
+            return raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
+    return _provider_child_ps(pid, "command")
+
+
+def provider_child_parent_pid(pid: int) -> int | None:
+    proc_stat = PROVIDER_CHILD_PROC_ROOT / str(pid) / "stat"
+    if proc_stat.exists():
+        with suppress(OSError, ValueError, IndexError):
+            text = proc_stat.read_text()
+            # ``pid (comm) state ppid ...``; comm may contain spaces/parens.
+            fields = text[text.rindex(")") + 2 :].split()
+            return int(fields[1])
+    text = _provider_child_ps(pid, "ppid")
+    with suppress(ValueError):
+        return int(text)
+    return None
+
+
+def kill_registered_provider_children() -> int:
+    """SIGKILL every registered provider group whose leader is still Codex.
+
+    Used by the hard-kill watchdog right before it kills this server: provider
+    children run in their own session, so killing the server alone would
+    orphan them (a multi-GB Codex app-server kept running after one incident).
+    Every probe is best-effort and nothing here may raise.
+    """
+
+    killed = 0
+    for entry in read_provider_children_registry():
+        pid = entry["pid"]
+        pgid = entry["pgid"]
+        with suppress(Exception):
+            if not provider_child_process_exists(pid):
+                continue
+            if "codex" not in provider_child_command_line(pid).lower():
+                continue
+            os.killpg(pgid, signal.SIGKILL)
+            killed += 1
+    return killed
+
+
+def sweep_orphaned_provider_children() -> int:
+    """Reap provider children the previous server instance left behind.
+
+    An entry whose leader is alive, has been reparented to pid 1, and is still
+    a Codex process belongs to nobody: kill its group. The registry is then
+    rewritten with only live entries this process owns (normally none).
+    """
+
+    reaped = 0
+    surviving: list[dict[str, Any]] = []
+    own_pid = os.getpid()
+    with PROVIDER_CHILDREN_LOCK:
+        children = read_provider_children_registry()
+        for entry in children:
+            pid = entry["pid"]
+            pgid = entry["pgid"]
+            try:
+                if not provider_child_process_exists(pid):
+                    continue
+                parent_pid = provider_child_parent_pid(pid)
+                if parent_pid == own_pid:
+                    surviving.append(entry)
+                    continue
+                if parent_pid != 1:
+                    continue
+                if "codex" not in provider_child_command_line(pid).lower():
+                    continue
+                with suppress(ProcessLookupError, PermissionError):
+                    os.killpg(pgid, signal.SIGKILL)
+                reaped += 1
+                logger.warning(
+                    "reaped orphaned provider child kind=%s pid=%d pgid=%d",
+                    entry.get("kind") or "unknown",
+                    pid,
+                    pgid,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "provider child sweep skipped pid=%d error=%s",
+                    pid,
+                    concise_error_message(exc),
+                )
+        if children or PROVIDER_CHILDREN_FILE.exists():
+            with suppress(Exception):
+                write_provider_children_registry(surviving)
+    return reaped
+
+
 def force_kill_managed_server_after_deadline(
     request_id: str,
     pid: int,
+    delay_seconds: float | None = None,
 ) -> None:
-    """Guarantee an explicitly forced managed restart cannot drain forever.
+    """Guarantee a managed restart cannot drain forever.
 
     This watchdog runs inside the process that was asked to restart. If that
     process is still alive when the deadline passes, graceful shutdown has
-    hung (background tasks, provider children, wedged locks) and the operator
-    explicitly asked for a forced restart, so the process is killed
-    unconditionally. It deliberately does not re-read the restart journal: a
+    hung (background tasks, provider children, wedged locks), so the process
+    is killed unconditionally. Forced restarts use the short
+    ``SERVER_RESTART_FORCE_KILL_DELAY_SECONDS``; cooperative restarts pass the
+    longer ``SERVER_RESTART_GRACEFUL_KILL_DELAY_SECONDS`` so a healthy drain
+    can finish first. It deliberately does not re-read the restart journal: a
     concurrent status write, a superseding request, or a journal that could
     not be persisted must not be able to cancel an emergency restart.
+
+    Registered provider children are killed by process group first: they run
+    in their own session, so SIGKILL of this pid alone would orphan them.
     """
 
-    time.sleep(SERVER_RESTART_FORCE_KILL_DELAY_SECONDS)
+    time.sleep(
+        SERVER_RESTART_FORCE_KILL_DELAY_SECONDS
+        if delay_seconds is None
+        else max(0.0, float(delay_seconds))
+    )
     if pid != os.getpid():
         # Never signal a process other than the one that armed this watchdog.
         return
@@ -53596,6 +53826,8 @@ def force_kill_managed_server_after_deadline(
                     "managed process to exit so its user service relaunches."
                 ),
             )
+        with suppress(Exception):
+            kill_registered_provider_children()
         with suppress(ProcessLookupError):
             os.kill(pid, signal.SIGKILL)
 
@@ -53630,13 +53862,24 @@ def signal_managed_server_restart(request_id: str) -> None:
         )
         try:
             pid = os.getpid()
-            if status.get("_forced") is True:
-                threading.Thread(
-                    target=force_kill_managed_server_after_deadline,
-                    args=(request_id, pid),
-                    daemon=True,
-                    name="agents-server-force-restart",
-                ).start()
+            # Always arm the watchdog. A cooperative drain that wedges (uvicorn
+            # waiting on tasks/websockets, a Codex child ignoring SIGTERM)
+            # would otherwise leave the port closed forever; only the deadline
+            # differs between a forced and a cooperative restart.
+            threading.Thread(
+                target=force_kill_managed_server_after_deadline,
+                args=(
+                    request_id,
+                    pid,
+                    (
+                        SERVER_RESTART_FORCE_KILL_DELAY_SECONDS
+                        if status.get("_forced") is True
+                        else SERVER_RESTART_GRACEFUL_KILL_DELAY_SECONDS
+                    ),
+                ),
+                daemon=True,
+                name="agents-server-force-restart",
+            ).start()
             os.kill(pid, signal.SIGTERM)
         except Exception:
             write_server_restart_status(
@@ -54561,11 +54804,62 @@ TEAM_HUB_RUNTIME = ManagedTeamHubHost(
 )
 
 
+SERVER_SHUTDOWN_PHASE_TIMEOUT_SECONDS = 10.0
+
+
+async def join_cancelled_tasks(*tasks: Any) -> None:
+    """Await already-cancelled tasks without letting any of them raise."""
+
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def bounded_shutdown_phase(
+    name: str,
+    awaitable: Any,
+    *,
+    timeout: float | None = None,
+) -> bool:
+    """Run one lifespan shutdown phase under a deadline; never raise.
+
+    A single wedged join (a provider that ignores SIGTERM, a lock held by a
+    dead task) must not prevent the phases after it - in particular provider
+    teardown - from running. Returns True when the phase completed in time.
+    """
+
+    budget = SERVER_SHUTDOWN_PHASE_TIMEOUT_SECONDS if timeout is None else timeout
+    try:
+        await asyncio.wait_for(awaitable, timeout=budget)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "shutdown phase %s did not finish within %.0fs; continuing",
+            name,
+            budget,
+        )
+        return False
+    except asyncio.CancelledError:
+        # Matches the previous per-await suppress: a cancelled join never
+        # aborts the remaining teardown.
+        return False
+    except Exception as exc:
+        logger.warning(
+            "shutdown phase %s failed error=%s",
+            name,
+            concise_error_message(exc),
+        )
+        return False
+    return True
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await STORE.load()
     await JOBS.load()
     ensure_dirs()
+    # A forced kill of the previous instance cannot reach provider children in
+    # their own sessions; reap anything the registry says was left behind.
+    with suppress(Exception):
+        await asyncio.to_thread(sweep_orphaned_provider_children)
     SECURE_PEER_RUNTIME.set_delivery_target_validator(
         secure_peer_delivery_target_available
     )
@@ -54715,6 +55009,10 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        # Every phase below is bounded by SERVER_SHUTDOWN_PHASE_TIMEOUT_SECONDS
+        # (see bounded_shutdown_phase) so one stuck join cannot starve the
+        # provider teardown that follows it. The order is load-bearing.
+        #
         # Stop startup reconciliation before taking the delivery-task
         # snapshot; otherwise it could enqueue a new retry owner after the
         # shutdown cancellation pass.
@@ -54723,46 +55021,56 @@ async def lifespan(app: FastAPI):
         digest_recovery_task.cancel()
         queue_recovery_task.cancel()
         server_update_pending_waiter_task.cancel()
-        with suppress(asyncio.CancelledError, Exception):
-            await cross_chat_recovery_task
-        with suppress(asyncio.CancelledError, Exception):
-            await cross_chat_expiry_task
-        with suppress(asyncio.CancelledError, Exception):
-            await digest_recovery_task
-        with suppress(asyncio.CancelledError, Exception):
-            await queue_recovery_task
-        with suppress(asyncio.CancelledError, Exception):
-            await server_update_pending_waiter_task
+        await bounded_shutdown_phase(
+            "startup-reconciliation",
+            join_cancelled_tasks(
+                cross_chat_recovery_task,
+                cross_chat_expiry_task,
+                digest_recovery_task,
+                queue_recovery_task,
+                server_update_pending_waiter_task,
+            ),
+        )
         direct_delivery_tasks = tuple(CROSS_CHAT_DIRECT_DELIVERY_TASKS)
         for direct_delivery_task in direct_delivery_tasks:
             direct_delivery_task.cancel()
-        for direct_delivery_task in direct_delivery_tasks:
-            with suppress(asyncio.CancelledError, Exception):
-                await direct_delivery_task
+        await bounded_shutdown_phase(
+            "cross-chat-direct-delivery",
+            join_cancelled_tasks(*direct_delivery_tasks),
+        )
         status_wake_tasks = tuple(CROSS_CHAT_STATUS_WAKE_TASKS)
         for status_wake_task in status_wake_tasks:
             status_wake_task.cancel()
-        for status_wake_task in status_wake_tasks:
-            with suppress(asyncio.CancelledError, Exception):
-                await status_wake_task
-        with suppress(Exception):
-            await TERMINAL_ATTACHMENTS.close_admission_and_all(permanent=True)
-        await PORT_TUNNELS.close_all()
+        await bounded_shutdown_phase(
+            "cross-chat-status-wake",
+            join_cancelled_tasks(*status_wake_tasks),
+        )
+        await bounded_shutdown_phase(
+            "terminal-attachments",
+            TERMINAL_ATTACHMENTS.close_admission_and_all(permanent=True),
+        )
+        await bounded_shutdown_phase("port-tunnels", PORT_TUNNELS.close_all())
         secure_peer_task.cancel()
         secure_peer_connector_task.cancel()
         secure_peer_response_outbox_task.cancel()
-        with suppress(asyncio.CancelledError, Exception):
-            await secure_peer_task
-        with suppress(asyncio.CancelledError, Exception):
-            await secure_peer_connector_task
-        with suppress(asyncio.CancelledError, Exception):
-            await secure_peer_response_outbox_task
-        await TEAM_HUB_RUNTIME.shutdown()
-        await asyncio.to_thread(SECURE_PEER_RUNTIME.shutdown)
-        with suppress(Exception):
-            await close_claude_sdk_manager()
-        with suppress(Exception):
-            await close_codex_app_server_manager()
+        await bounded_shutdown_phase(
+            "secure-peer-loops",
+            join_cancelled_tasks(
+                secure_peer_task,
+                secure_peer_connector_task,
+                secure_peer_response_outbox_task,
+            ),
+        )
+        await bounded_shutdown_phase("team-hub", TEAM_HUB_RUNTIME.shutdown())
+        await bounded_shutdown_phase(
+            "secure-peer-runtime",
+            asyncio.to_thread(SECURE_PEER_RUNTIME.shutdown),
+        )
+        await bounded_shutdown_phase("claude-sdk", close_claude_sdk_manager())
+        await bounded_shutdown_phase(
+            "codex-app-server",
+            close_codex_app_server_manager(),
+        )
         # Provider finalizers may enqueue one last durable status/outbox task
         # while their managers close. No producer remains after both manager
         # joins, so this second drain is the terminal task boundary.
@@ -54772,25 +55080,30 @@ async def lifespan(app: FastAPI):
         })
         for trailing_cross_chat_task in trailing_cross_chat_tasks:
             trailing_cross_chat_task.cancel()
-        for trailing_cross_chat_task in trailing_cross_chat_tasks:
-            with suppress(asyncio.CancelledError, Exception):
-                await trailing_cross_chat_task
+        await bounded_shutdown_phase(
+            "cross-chat-trailing",
+            join_cancelled_tasks(*trailing_cross_chat_tasks),
+        )
         abandoned_fork_cleanup_task.cancel()
         host_monitor_task.cancel()
         history_search_task.cancel()
         runtime_probe_task.cancel()
-        with suppress(asyncio.CancelledError, Exception):
-            await abandoned_fork_cleanup_task
-        with suppress(asyncio.CancelledError):
-            await host_monitor_task
-        with suppress(asyncio.CancelledError):
-            await history_search_task
-        with suppress(asyncio.CancelledError):
-            await runtime_probe_task
+        await bounded_shutdown_phase(
+            "background-loops",
+            join_cancelled_tasks(
+                abandoned_fork_cleanup_task,
+                host_monitor_task,
+                history_search_task,
+                runtime_probe_task,
+            ),
+        )
         # Provider HTTP calls cannot survive this process. All background and
         # provider-turn owners that can touch a live exchange are now joined;
         # wake and detach leftovers under their stable per-exchange locks.
-        await settle_cross_chat_live_waiters_for_shutdown()
+        await bounded_shutdown_phase(
+            "cross-chat-live-waiters",
+            settle_cross_chat_live_waiters_for_shutdown(),
+        )
 
 
 class AgentsServerCORSMiddleware(CORSMiddleware):
@@ -66607,8 +66920,20 @@ def main() -> int:
         # preview does not support header-trusting proxy operation.
         proxy_headers=False,
         server_header=False,
+        # Without this uvicorn waits forever for open websockets/background
+        # work after SIGTERM, and the restart watchdog is the only way out.
+        timeout_graceful_shutdown=uvicorn_graceful_shutdown_seconds(),
     )
     return 0
+
+
+def uvicorn_graceful_shutdown_seconds() -> int:
+    raw = agentsdock_setting("UVICORN_GRACEFUL_SHUTDOWN_SECONDS", "20")
+    try:
+        value = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 20
+    return max(1, value)
 
 
 if __name__ == "__main__":

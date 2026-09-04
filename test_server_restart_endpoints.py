@@ -116,6 +116,13 @@ def restart_environment(root: Path):
             "SERVER_UPDATE_STATUS_FILE",
             root / "admin" / "server-update.json",
         ))
+        # The hard-kill watchdog consults the provider-child registry before
+        # SIGKILL; keep the test from reading the real state directory.
+        stack.enter_context(patch.object(
+            agent_server,
+            "PROVIDER_CHILDREN_FILE",
+            root / "admin" / "provider-children.json",
+        ))
         stack.enter_context(patch.object(agent_server, "AGENT_TOKEN", TOKEN))
         stack.enter_context(patch.object(
             agent_server,
@@ -280,8 +287,12 @@ class ServerRestartStateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             request_id = str(uuid.uuid4())
+            # Behavior change: every managed restart now arms the hard-kill
+            # watchdog thread. With time.sleep patched a real thread would
+            # SIGKILL the test runner, so the thread is stubbed here.
             with restart_environment(root), \
                  patch.object(agent_server.time, "sleep"), \
+                 patch.object(agent_server.threading, "Thread"), \
                  patch.object(agent_server.os, "getpid", return_value=321), \
                  patch.object(agent_server.os, "kill") as kill:
                 agent_server.write_server_restart_status(
@@ -301,6 +312,7 @@ class ServerRestartStateTests(unittest.TestCase):
             request_id = str(uuid.uuid4())
             with restart_environment(root), \
                  patch.object(agent_server.time, "sleep"), \
+                 patch.object(agent_server.threading, "Thread"), \
                  patch.object(agent_server.os, "kill", side_effect=OSError("denied")):
                 agent_server.write_server_restart_status(
                     phase="accepted",
@@ -332,9 +344,15 @@ class ServerRestartStateTests(unittest.TestCase):
                 )
                 agent_server.signal_managed_server_restart(request_id)
 
+        # Behavior change: the watchdog is now armed for every managed
+        # restart; a forced restart selects the short emergency deadline.
         thread.assert_called_once_with(
             target=agent_server.force_kill_managed_server_after_deadline,
-            args=(request_id, 321),
+            args=(
+                request_id,
+                321,
+                agent_server.SERVER_RESTART_FORCE_KILL_DELAY_SECONDS,
+            ),
             daemon=True,
             name="agents-server-force-restart",
         )
@@ -442,6 +460,7 @@ class ServerRestartStateTests(unittest.TestCase):
             request_id = str(uuid.uuid4())
             with restart_environment(root), \
                  patch.object(agent_server.time, "sleep"), \
+                 patch.object(agent_server.threading, "Thread"), \
                  patch.object(agent_server.os, "getpid", return_value=321), \
                  patch.object(agent_server.os, "kill") as kill:
                 agent_server.write_server_restart_status(
@@ -1975,6 +1994,7 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
             request_id = str(uuid.uuid4())
             with restart_environment(root), \
                  patch.object(agent_server.time, "sleep"), \
+                 patch.object(agent_server.threading, "Thread"), \
                  patch.object(
                      agent_server.os,
                      "kill",

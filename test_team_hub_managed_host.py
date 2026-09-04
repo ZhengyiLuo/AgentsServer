@@ -73,6 +73,8 @@ def replace_then_crash(source, target):
         os._exit(72)
 
 def write_journal_then_crash(root, journal):
+    if crash_point == "prejournal" and journal["state"] == "prepared":
+        os._exit(75)
     original_write_journal(root, journal)
     if crash_point == "commit" and journal["state"] == "committed":
         os._exit(73)
@@ -1047,6 +1049,73 @@ sys.exit(10)
                 ):
                     HubStore(data_dir, managed_host_identity=HOST_A)
             preflight.assert_not_called()
+            self.assertEqual(store.database_path.read_bytes(), database_before)
+
+    def test_prejournal_restore_crash_is_cleaned_before_database_open(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "hub"
+            store = HubStore(data_dir, managed_host_identity=HOST_A)
+            hub_id = store.hub_id
+            operation_id = "restore-crash-prejournal"
+            snapshot = store.maintenance_snapshot_and_fence(
+                "server-update",
+                operation_id=operation_id,
+            )
+            live_before = {
+                "database": store.database_path.read_bytes(),
+                "key": store.signing_key_path.read_bytes(),
+                "proof": store.bootstrap_proof_path.read_bytes(),
+                "fence": store.maintenance_fence_path.read_bytes(),
+            }
+
+            crashed = self.run_restore_until_crash(
+                data_dir,
+                snapshot,
+                hub_id=hub_id,
+                operation_id=operation_id,
+                crash_point="prejournal",
+            )
+            self.assertEqual(crashed.returncode, 75, crashed.stderr)
+            self.assertFalse((data_dir / ".restore-transaction.json").exists())
+            self.assertEqual(len(list(data_dir.glob(".restore-[0-9]*-*"))), 1)
+
+            recovered = HubStore(data_dir, managed_host_identity=HOST_A)
+            self.assertEqual(recovered.hub_id, hub_id)
+            self.assertEqual(store.database_path.read_bytes(), live_before["database"])
+            self.assertEqual(store.signing_key_path.read_bytes(), live_before["key"])
+            self.assertEqual(store.bootstrap_proof_path.read_bytes(), live_before["proof"])
+            self.assertEqual(store.maintenance_fence_path.read_bytes(), live_before["fence"])
+            self.assertEqual(list(data_dir.glob(".restore-[0-9]*-*")), [])
+
+            reopened = HubStore(data_dir, managed_host_identity=HOST_A)
+            self.assertEqual(reopened.hub_id, hub_id)
+            self.assertEqual(list(data_dir.glob(".restore-[0-9]*-*")), [])
+
+    def test_unsafe_orphan_restore_generation_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data_dir = root / "hub"
+            store = HubStore(data_dir, managed_host_identity=HOST_A)
+            database_before = store.database_path.read_bytes()
+            outside = root / "outside"
+            outside.mkdir()
+            marker = outside / "keep.txt"
+            marker.write_text("do not delete", encoding="utf-8")
+            orphan = data_dir / ".restore-999-0123456789abcdef"
+            orphan.symlink_to(outside, target_is_directory=True)
+
+            with mock.patch.object(
+                HubStore,
+                "_preflight_managed_host_binding",
+            ) as preflight:
+                with self.assertRaisesRegex(
+                    PermissionError,
+                    "restore transaction target is unsafe",
+                ):
+                    HubStore(data_dir, managed_host_identity=HOST_A)
+            preflight.assert_not_called()
+            self.assertTrue(orphan.is_symlink())
+            self.assertEqual(marker.read_text(encoding="utf-8"), "do not delete")
             self.assertEqual(store.database_path.read_bytes(), database_before)
 
     def test_offline_restore_verifies_identity_and_restores_db_key_and_proofs(self) -> None:

@@ -265,10 +265,22 @@ class HubStore:
                     if time.monotonic() >= deadline:
                         raise RuntimeError("Team Hub local control is busy")
                     time.sleep(0.025)
-            if cls._restore_transaction_pending(root):
+            if cls._restore_recovery_pending(root):
                 attachment_lease = cls.acquire_attachment_control_lease(root)
                 try:
-                    cls._recover_interrupted_restore_unlocked(root)
+                    journal_pending = cls._restore_transaction_pending(root)
+                    protected_staging: Path | None = None
+                    if journal_pending:
+                        _journal, protected_staging, _old, _new = (
+                            cls._read_restore_transaction_journal(root)
+                        )
+                    cls._cleanup_abandoned_restore_staging_unlocked(
+                        root,
+                        protected_staging=protected_staging,
+                    )
+                    if journal_pending:
+                        cls._recover_interrupted_restore_unlocked(root)
+                    cls._cleanup_abandoned_restore_staging_unlocked(root)
                 finally:
                     cls.release_attachment_control_lease(attachment_lease)
             yield
@@ -339,7 +351,7 @@ class HubStore:
         ensure_private_directory(self.data_dir)
         # A restore swaps several independent filesystem objects. Complete or
         # roll back any durable transaction before SQLite can observe them.
-        if self._restore_transaction_pending(self.data_dir):
+        if self._restore_recovery_pending(self.data_dir):
             with self.maintenance_control_lock(self.data_dir):
                 pass
         self.team_attachment_max_bytes = _positive_int_env(
@@ -620,6 +632,64 @@ class HubStore:
         except FileNotFoundError:
             return False
         return True
+
+    @classmethod
+    def _restore_recovery_pending(cls, root: Path) -> bool:
+        if cls._restore_transaction_pending(root):
+            return True
+        try:
+            with os.scandir(root) as entries:
+                return any(
+                    RESTORE_STAGING_NAME_RE.fullmatch(entry.name) is not None
+                    for entry in entries
+                )
+        except FileNotFoundError:
+            return False
+
+    @classmethod
+    def _cleanup_abandoned_restore_staging_unlocked(
+        cls,
+        root: Path,
+        *,
+        protected_staging: Path | None = None,
+    ) -> None:
+        """Remove only validated pre-journal restore generations.
+
+        The caller owns the maintenance and attachment locks, so an exact
+        unjournaled generation cannot still be active. A valid journal's
+        staging path is excluded until commit/rollback recovery consumes it.
+        """
+
+        candidates: list[Path] = []
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if RESTORE_STAGING_NAME_RE.fullmatch(entry.name) is None:
+                    continue
+                candidate = root / entry.name
+                if protected_staging is not None and candidate == protected_staging:
+                    continue
+                candidates.append(candidate)
+
+        # Validate every candidate before deleting any of them. An unsafe
+        # lookalike therefore fails closed without partially cleaning state.
+        for candidate in candidates:
+            if not cls._restore_target_exists(candidate, "directory"):
+                continue  # pragma: no cover - scandir observed the entry.
+            for directory, directory_names, file_names in os.walk(
+                candidate,
+                topdown=True,
+                followlinks=False,
+            ):
+                current = Path(directory)
+                cls._restore_target_exists(current, "directory")
+                for name in directory_names:
+                    cls._restore_target_exists(current / name, "directory")
+                for name in file_names:
+                    cls._restore_target_exists(current / name, "file")
+
+        for candidate in sorted(candidates, key=lambda path: path.name):
+            shutil.rmtree(candidate)
+            cls._fsync_directory(root)
 
     @staticmethod
     def _restore_target_kind(name: str) -> str:

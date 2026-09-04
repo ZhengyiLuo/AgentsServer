@@ -99,6 +99,8 @@ TEAM_ATTACHMENT_UPLOAD_TTL_SECONDS = 24 * 60 * 60
 MAX_TEAM_SKILLS_PER_TEAM = 500
 MAX_TEAM_SKILL_VERSIONS = 200
 MAX_TEAM_SKILL_TAGS = 8
+RESTORE_TRANSACTION_JOURNAL_NAME = ".restore-transaction.json"
+RESTORE_STAGING_NAME_RE = re.compile(r"^\.restore-[1-9][0-9]*-[0-9a-f]{16}$")
 TEAM_SKILL_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 TEAM_SKILL_TAG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 TEAM_ATTACHMENT_FILE_NAME_RE = re.compile(r"^[^\x00-\x1f\x7f/\\]{1,255}$")
@@ -263,6 +265,12 @@ class HubStore:
                     if time.monotonic() >= deadline:
                         raise RuntimeError("Team Hub local control is busy")
                     time.sleep(0.025)
+            if cls._restore_transaction_pending(root):
+                attachment_lease = cls.acquire_attachment_control_lease(root)
+                try:
+                    cls._recover_interrupted_restore_unlocked(root)
+                finally:
+                    cls.release_attachment_control_lease(attachment_lease)
             yield
         finally:
             with suppress(OSError):
@@ -329,6 +337,11 @@ class HubStore:
             else None
         )
         ensure_private_directory(self.data_dir)
+        # A restore swaps several independent filesystem objects. Complete or
+        # roll back any durable transaction before SQLite can observe them.
+        if self._restore_transaction_pending(self.data_dir):
+            with self.maintenance_control_lock(self.data_dir):
+                pass
         self.team_attachment_max_bytes = _positive_int_env(
             "AGENTSDOCK_TEAM_ATTACHMENT_MAX_BYTES",
             DEFAULT_TEAM_ATTACHMENT_MAX_BYTES,
@@ -599,6 +612,370 @@ class HubStore:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+
+    @staticmethod
+    def _restore_transaction_pending(root: Path) -> bool:
+        try:
+            (root / RESTORE_TRANSACTION_JOURNAL_NAME).lstat()
+        except FileNotFoundError:
+            return False
+        return True
+
+    @staticmethod
+    def _restore_target_kind(name: str) -> str:
+        if name == "attachments":
+            return "directory"
+        if name in {
+            "team-hub.sqlite3",
+            "access-token-signing.key",
+            "team-hub.sqlite3-wal",
+            "team-hub.sqlite3-shm",
+            "bootstrap-owner.proof",
+            "maintenance-fence.json",
+        } or re.fullmatch(r"[A-Za-z0-9_]{8,240}\.proof", name):
+            return "file"
+        raise RuntimeError("Team Hub restore transaction target is invalid")
+
+    @classmethod
+    def _restore_target_exists(cls, path: Path, kind: str) -> bool:
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return False
+        if info.st_uid != os.getuid():
+            raise PermissionError("Team Hub restore transaction target is unsafe")
+        if kind == "file":
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o600
+            ):
+                raise PermissionError("Team Hub restore transaction target is unsafe")
+        elif kind == "directory":
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or stat.S_IMODE(info.st_mode) != 0o700
+            ):
+                raise PermissionError("Team Hub restore transaction target is unsafe")
+        else:  # pragma: no cover - only validated journal values reach this helper.
+            raise RuntimeError("Team Hub restore transaction target is invalid")
+        return True
+
+    @classmethod
+    def _restore_transaction_targets(
+        cls,
+        raw: Any,
+    ) -> dict[str, str]:
+        if not isinstance(raw, list) or len(raw) > 4104:
+            raise RuntimeError("Team Hub restore transaction journal is invalid")
+        targets: dict[str, str] = {}
+        for entry in raw:
+            if not isinstance(entry, dict) or set(entry) != {"name", "kind"}:
+                raise RuntimeError("Team Hub restore transaction journal is invalid")
+            name = entry.get("name")
+            kind = entry.get("kind")
+            if (
+                not isinstance(name, str)
+                or not isinstance(kind, str)
+                or kind != cls._restore_target_kind(name)
+                or name in targets
+            ):
+                raise RuntimeError("Team Hub restore transaction journal is invalid")
+            targets[name] = kind
+        return targets
+
+    @classmethod
+    def _restore_transaction_generation(
+        cls,
+        raw: Any,
+        new_targets: dict[str, str],
+    ) -> dict[str, Any]:
+        if not isinstance(raw, dict) or set(raw) != {
+            "database_sha256",
+            "signing_key_sha256",
+            "proofs",
+            "attachments",
+        }:
+            raise RuntimeError("Team Hub restore transaction journal is invalid")
+        for field in ("database_sha256", "signing_key_sha256"):
+            if (
+                not isinstance(raw.get(field), str)
+                or re.fullmatch(r"[0-9a-f]{64}", raw[field]) is None
+            ):
+                raise RuntimeError("Team Hub restore transaction journal is invalid")
+        raw_proofs = raw.get("proofs")
+        if not isinstance(raw_proofs, list) or len(raw_proofs) > 4096:
+            raise RuntimeError("Team Hub restore transaction journal is invalid")
+        proof_names = {
+            name
+            for name in new_targets
+            if name == "bootstrap-owner.proof"
+            or re.fullmatch(r"[A-Za-z0-9_]{8,240}\.proof", name)
+        }
+        proof_digests: dict[str, str] = {}
+        for entry in raw_proofs:
+            if not isinstance(entry, dict) or set(entry) != {"name", "sha256"}:
+                raise RuntimeError("Team Hub restore transaction journal is invalid")
+            name = entry.get("name")
+            digest = entry.get("sha256")
+            if (
+                not isinstance(name, str)
+                or name not in proof_names
+                or name in proof_digests
+                or not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            ):
+                raise RuntimeError("Team Hub restore transaction journal is invalid")
+            proof_digests[name] = digest
+        if proof_digests.keys() != proof_names:
+            raise RuntimeError("Team Hub restore transaction journal is invalid")
+        attachments = raw.get("attachments")
+        if (
+            not isinstance(attachments, dict)
+            or set(attachments) != {"file_count", "byte_size", "sha256"}
+            or isinstance(attachments.get("file_count"), bool)
+            or not isinstance(attachments.get("file_count"), int)
+            or attachments["file_count"] < 0
+            or isinstance(attachments.get("byte_size"), bool)
+            or not isinstance(attachments.get("byte_size"), int)
+            or attachments["byte_size"] < 0
+            or not isinstance(attachments.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", attachments["sha256"]) is None
+        ):
+            raise RuntimeError("Team Hub restore transaction journal is invalid")
+        return raw
+
+    @classmethod
+    def _read_restore_transaction_journal(
+        cls,
+        root: Path,
+    ) -> tuple[dict[str, Any], Path, dict[str, str], dict[str, str]]:
+        raw = cls._read_private_regular_file(
+            root / RESTORE_TRANSACTION_JOURNAL_NAME,
+            maximum_bytes=512 * 1024,
+        )
+        try:
+            journal = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Team Hub restore transaction journal is invalid") from exc
+        if (
+            not isinstance(journal, dict)
+            or set(journal)
+            != {
+                "format",
+                "state",
+                "staging",
+                "old_targets",
+                "new_targets",
+                "new_generation",
+            }
+            or journal.get("format") != 1
+            or journal.get("state") not in {"prepared", "committed"}
+            or not isinstance(journal.get("staging"), str)
+            or RESTORE_STAGING_NAME_RE.fullmatch(journal["staging"]) is None
+        ):
+            raise RuntimeError("Team Hub restore transaction journal is invalid")
+        old_targets = cls._restore_transaction_targets(journal["old_targets"])
+        new_targets = cls._restore_transaction_targets(journal["new_targets"])
+        if (
+            not {"team-hub.sqlite3", "access-token-signing.key", "maintenance-fence.json"}
+            .issubset(old_targets)
+            or not {"team-hub.sqlite3", "access-token-signing.key", "attachments"}
+            .issubset(new_targets)
+            or {"team-hub.sqlite3-wal", "team-hub.sqlite3-shm", "maintenance-fence.json"}
+            & new_targets.keys()
+        ):
+            raise RuntimeError("Team Hub restore transaction journal is invalid")
+        cls._restore_transaction_generation(journal["new_generation"], new_targets)
+        staging = root / journal["staging"]
+        if staging.parent != root:
+            raise RuntimeError("Team Hub restore transaction journal is invalid")
+        return journal, staging, old_targets, new_targets
+
+    @classmethod
+    def _write_restore_transaction_journal(
+        cls,
+        root: Path,
+        journal: dict[str, Any],
+    ) -> None:
+        # Validate the exact record before making it the recovery authority.
+        old_targets = cls._restore_transaction_targets(journal.get("old_targets"))
+        new_targets = cls._restore_transaction_targets(journal.get("new_targets"))
+        if (
+            set(journal)
+            != {
+                "format",
+                "state",
+                "staging",
+                "old_targets",
+                "new_targets",
+                "new_generation",
+            }
+            or journal.get("format") != 1
+            or journal.get("state") not in {"prepared", "committed"}
+            or not isinstance(journal.get("staging"), str)
+            or RESTORE_STAGING_NAME_RE.fullmatch(journal["staging"]) is None
+            or not {"team-hub.sqlite3", "access-token-signing.key", "maintenance-fence.json"}
+            .issubset(old_targets)
+            or not {"team-hub.sqlite3", "access-token-signing.key", "attachments"}
+            .issubset(new_targets)
+            or {"team-hub.sqlite3-wal", "team-hub.sqlite3-shm", "maintenance-fence.json"}
+            & new_targets.keys()
+            or len(old_targets) > 4104
+        ):
+            raise RuntimeError("Team Hub restore transaction journal is invalid")
+        cls._restore_transaction_generation(journal.get("new_generation"), new_targets)
+        payload = canonical_json(journal) + b"\n"
+        temporary = root / (
+            ".restore-transaction.tmp-"
+            f"{os.getpid()}-{secrets.token_hex(8)}"
+        )
+        descriptor = -1
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(temporary, flags, 0o600)
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(descriptor, payload[offset:])
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            os.replace(temporary, root / RESTORE_TRANSACTION_JOURNAL_NAME)
+            cls._fsync_directory(root)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            with suppress(FileNotFoundError):
+                temporary.unlink()
+
+    @classmethod
+    def _recover_interrupted_restore_unlocked(cls, root: Path) -> None:
+        """Resolve one durable restore transaction before SQLite opens.
+
+        A prepared transaction always rolls back. A committed transaction has
+        already fsynced and verified the complete replacement generation, so
+        recovery keeps it and only finishes cleanup. Every recovery rename is
+        itself replay-safe if the process is interrupted again.
+        """
+
+        journal, staging, old_targets, new_targets = (
+            cls._read_restore_transaction_journal(root)
+        )
+        staging_exists = cls._restore_target_exists(staging, "directory")
+        if journal["state"] == "prepared":
+            previous = staging / "previous"
+            previous_exists = False
+            if staging_exists:
+                previous_exists = cls._restore_target_exists(previous, "directory")
+            if previous_exists:
+                discarded = staging / "recovery-discarded"
+                ensure_private_directory(discarded)
+                cls._fsync_directory(staging)
+                for name in sorted(old_targets.keys() | new_targets.keys()):
+                    kind = old_targets.get(name, new_targets.get(name))
+                    assert kind is not None
+                    target = root / name
+                    prior = previous / name
+                    prior_exists = cls._restore_target_exists(prior, kind)
+                    target_exists = cls._restore_target_exists(target, kind)
+                    if name in old_targets:
+                        if prior_exists:
+                            if target_exists:
+                                discard = discarded / f"{name}-{secrets.token_hex(8)}"
+                                os.replace(target, discard)
+                                cls._fsync_directory(root)
+                                cls._fsync_directory(discarded)
+                            os.replace(prior, target)
+                            cls._fsync_directory(previous)
+                            cls._fsync_directory(root)
+                        elif not target_exists:
+                            raise RuntimeError(
+                                "Team Hub restore transaction cannot recover old state"
+                            )
+                    else:
+                        if prior_exists:
+                            raise RuntimeError(
+                                "Team Hub restore transaction journal is inconsistent"
+                            )
+                        if target_exists:
+                            discard = discarded / f"{name}-{secrets.token_hex(8)}"
+                            os.replace(target, discard)
+                            cls._fsync_directory(root)
+                            cls._fsync_directory(discarded)
+
+            for name, kind in old_targets.items():
+                if not cls._restore_target_exists(root / name, kind):
+                    raise RuntimeError(
+                        "Team Hub restore transaction cannot recover old state"
+                    )
+            for name, kind in new_targets.items():
+                if name not in old_targets and cls._restore_target_exists(root / name, kind):
+                    raise RuntimeError(
+                        "Team Hub restore transaction rollback is incomplete"
+                    )
+        else:
+            for name, kind in new_targets.items():
+                if not cls._restore_target_exists(root / name, kind):
+                    raise RuntimeError(
+                        "Team Hub committed restore transaction is incomplete"
+                    )
+            for name, kind in old_targets.items():
+                if name not in new_targets and cls._restore_target_exists(root / name, kind):
+                    raise RuntimeError(
+                        "Team Hub committed restore transaction is inconsistent"
+                    )
+            generation = cls._restore_transaction_generation(
+                journal["new_generation"], new_targets
+            )
+            if (
+                not hmac.compare_digest(
+                    cls._sha256_private_regular_file(root / "team-hub.sqlite3"),
+                    generation["database_sha256"],
+                )
+                or not hmac.compare_digest(
+                    cls._sha256_private_regular_file(root / "access-token-signing.key"),
+                    generation["signing_key_sha256"],
+                )
+            ):
+                raise RuntimeError(
+                    "Team Hub committed restore transaction generation is invalid"
+                )
+            for proof in generation["proofs"]:
+                if not hmac.compare_digest(
+                    cls._sha256_private_regular_file(root / proof["name"]),
+                    proof["sha256"],
+                ):
+                    raise RuntimeError(
+                        "Team Hub committed restore transaction generation is invalid"
+                    )
+            connection = sqlite3.connect(
+                f"file:{root / 'team-hub.sqlite3'}?mode=ro&immutable=1",
+                uri=True,
+                isolation_level=None,
+            )
+            connection.row_factory = sqlite3.Row
+            try:
+                attachment_files = cls._team_attachment_snapshot_files(connection)
+            finally:
+                connection.close()
+            if cls._attachment_generation_summary(
+                root / "attachments",
+                attachment_files,
+                exact_tree=True,
+                require_root=True,
+            ) != generation["attachments"]:
+                raise RuntimeError(
+                    "Team Hub committed restore transaction generation is invalid"
+                )
+
+        if staging_exists:
+            shutil.rmtree(staging)
+            cls._fsync_directory(root)
+        journal_path = root / RESTORE_TRANSACTION_JOURNAL_NAME
+        journal_path.unlink()
+        cls._fsync_directory(root)
 
     @classmethod
     def _team_attachment_snapshot_files(
@@ -1666,8 +2043,6 @@ class HubStore:
         else:
             staging = root / f".restore-{os.getpid()}-{secrets.token_hex(8)}"
             ensure_private_directory(staging)
-        installed: list[Path] = []
-        moved_old: list[tuple[Path, Path]] = []
         connection: sqlite3.Connection | None = None
         try:
             staged_database = staging / "team-hub.sqlite3"
@@ -1856,8 +2231,6 @@ class HubStore:
 
             old_directory = staging / "previous"
             ensure_private_directory(old_directory)
-            failed_directory = staging / "failed"
-            ensure_private_directory(failed_directory)
             managed_targets = {
                 root / "team-hub.sqlite3",
                 root / "access-token-signing.key",
@@ -1869,35 +2242,7 @@ class HubStore:
             for entry in root.glob("*.proof"):
                 if re.fullmatch(r"[A-Za-z0-9_]{8,240}\.proof", entry.name):
                     managed_targets.add(entry)
-            for target in sorted(managed_targets, key=lambda item: item.name):
-                try:
-                    info = target.lstat()
-                except FileNotFoundError:
-                    continue
-                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid():
-                    raise PermissionError("Team Hub live state contains an unsafe file")
-                prior = old_directory / target.name
-                os.replace(target, prior)
-                moved_old.append((prior, target))
-
             attachment_target = root / "attachments"
-            try:
-                attachment_info = attachment_target.lstat()
-            except FileNotFoundError:
-                pass
-            else:
-                if (
-                    not stat.S_ISDIR(attachment_info.st_mode)
-                    or attachment_info.st_uid != os.getuid()
-                    or stat.S_IMODE(attachment_info.st_mode) != 0o700
-                ):
-                    raise PermissionError(
-                        "Team Hub live attachment state contains an unsafe directory"
-                    )
-                prior = old_directory / "attachments"
-                os.replace(attachment_target, prior)
-                moved_old.append((prior, attachment_target))
-
             replacements = [
                 (staged_database, root / "team-hub.sqlite3"),
                 (staged_key, root / "access-token-signing.key"),
@@ -1907,9 +2252,57 @@ class HubStore:
                 for filename in sorted(proof_entries)
             )
             replacements.append((staged_attachments, attachment_target))
+
+            old_targets: dict[str, str] = {}
+            for target in sorted(managed_targets, key=lambda item: item.name):
+                kind = cls._restore_target_kind(target.name)
+                if cls._restore_target_exists(target, kind):
+                    old_targets[target.name] = kind
+            if cls._restore_target_exists(attachment_target, "directory"):
+                old_targets[attachment_target.name] = "directory"
+            new_targets = {
+                target.name: cls._restore_target_kind(target.name)
+                for _source, target in replacements
+            }
+            for source, target in replacements:
+                if not cls._restore_target_exists(source, new_targets[target.name]):
+                    raise RuntimeError("Team Hub staged restore generation is incomplete")
+
+            if proof_entries:
+                cls._fsync_directory(staged_proofs)
+            cls._fsync_directory(old_directory)
+            cls._fsync_directory(staging)
+            journal = {
+                "format": 1,
+                "state": "prepared",
+                "staging": staging.name,
+                "old_targets": [
+                    {"name": name, "kind": old_targets[name]}
+                    for name in sorted(old_targets)
+                ],
+                "new_targets": [
+                    {"name": name, "kind": new_targets[name]}
+                    for name in sorted(new_targets)
+                ],
+                "new_generation": {
+                    "database_sha256": manifest["database_sha256"],
+                    "signing_key_sha256": manifest["signing_key_sha256"],
+                    "proofs": [
+                        {"name": filename, "sha256": proof_entries[filename][1]}
+                        for filename in sorted(proof_entries)
+                    ],
+                    "attachments": attachment_summary,
+                },
+            }
+            cls._write_restore_transaction_journal(root, journal)
+
+            for name in sorted(old_targets):
+                os.replace(root / name, old_directory / name)
+            cls._fsync_directory(old_directory)
+            cls._fsync_directory(root)
             for source, target in replacements:
                 os.replace(source, target)
-                installed.append(target)
+            cls._fsync_directory(staging)
             cls._fsync_directory(root)
             if (
                 cls._sha256_private_regular_file(root / "team-hub.sqlite3")
@@ -1925,25 +2318,39 @@ class HubStore:
                 != attachment_summary
             ):
                 raise RuntimeError("Team Hub restored state verification failed")
+            committed_journal = dict(journal)
+            committed_journal["state"] = "committed"
+            cls._write_restore_transaction_journal(root, committed_journal)
+            cls._recover_interrupted_restore_unlocked(root)
         except BaseException:
             if connection is not None:
                 connection.close()
-            for target in reversed(installed):
+            recovered_committed = False
+            if not verify_only and cls._restore_transaction_pending(root):
                 try:
-                    os.replace(target, failed_directory / target.name)
-                except FileNotFoundError:
-                    pass
-            for prior, target in reversed(moved_old):
-                if prior.exists():
-                    os.replace(prior, target)
-            with suppress(OSError):
-                cls._fsync_directory(root)
+                    pending_journal, _staging, _old, _new = (
+                        cls._read_restore_transaction_journal(root)
+                    )
+                    recovered_committed = pending_journal["state"] == "committed"
+                    cls._recover_interrupted_restore_unlocked(root)
+                except BaseException as recovery_error:
+                    raise RuntimeError(
+                        "Team Hub interrupted restore recovery failed"
+                    ) from recovery_error
+            if recovered_committed:
+                return
             raise
         finally:
             if verification_directory is not None:
                 verification_directory.cleanup()
-            elif staging.exists() and not staging.is_symlink():
-                shutil.rmtree(staging, ignore_errors=True)
+            elif not cls._restore_transaction_pending(root):
+                try:
+                    staging_info = staging.lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    if stat.S_ISDIR(staging_info.st_mode):
+                        shutil.rmtree(staging, ignore_errors=True)
 
     def renew_bootstrap_proof(self) -> Path:
         timestamp = _now()

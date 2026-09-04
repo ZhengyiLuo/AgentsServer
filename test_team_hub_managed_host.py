@@ -3,9 +3,12 @@ from __future__ import annotations
 from dataclasses import replace
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +29,126 @@ HOST_B = "server-host-b-12345678"
 
 
 class ManagedHostTests(unittest.TestCase):
+    @staticmethod
+    def run_restore_until_crash(
+        data_dir: Path,
+        snapshot: Path,
+        *,
+        hub_id: str,
+        operation_id: str,
+        crash_point: str,
+    ) -> subprocess.CompletedProcess[str]:
+        script = r"""
+import os
+from pathlib import Path
+import sys
+from unittest import mock
+
+from agentsdock_team_hub.store import HubStore
+
+data_dir = Path(sys.argv[1])
+snapshot = Path(sys.argv[2])
+hub_id = sys.argv[3]
+operation_id = sys.argv[4]
+crash_point = sys.argv[5]
+original_replace = os.replace
+original_write_journal = HubStore._write_restore_transaction_journal
+
+def replace_then_crash(source, target):
+    original_replace(source, target)
+    source_path = Path(source)
+    target_path = Path(target)
+    if (
+        crash_point == "retire"
+        and target_path.parent.name == "previous"
+        and target_path.name == "team-hub.sqlite3"
+    ):
+        os._exit(71)
+    if (
+        crash_point == "install"
+        and target_path.parent == data_dir
+        and target_path.name == "access-token-signing.key"
+        and source_path.parent.name.startswith(".restore-")
+    ):
+        os._exit(72)
+
+def write_journal_then_crash(root, journal):
+    original_write_journal(root, journal)
+    if crash_point == "commit" and journal["state"] == "committed":
+        os._exit(73)
+
+with mock.patch(
+    "agentsdock_team_hub.store.os.replace", side_effect=replace_then_crash
+), mock.patch.object(
+    HubStore,
+    "_write_restore_transaction_journal",
+    side_effect=write_journal_then_crash,
+):
+    HubStore.restore_maintenance_snapshot(
+        data_dir,
+        snapshot,
+        expected_host_identity=sys.argv[6],
+        expected_hub_id=hub_id,
+        expected_operation_id=operation_id,
+    )
+sys.exit(10)
+"""
+        return subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(data_dir),
+                str(snapshot),
+                hub_id,
+                operation_id,
+                crash_point,
+                HOST_A,
+            ],
+            cwd=Path(__file__).parent,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    @staticmethod
+    def run_recovery_until_crash(data_dir: Path) -> subprocess.CompletedProcess[str]:
+        script = r"""
+import os
+from pathlib import Path
+import sys
+from unittest import mock
+
+from agentsdock_team_hub.store import HubStore
+
+data_dir = Path(sys.argv[1])
+original_replace = os.replace
+
+def replace_then_crash(source, target):
+    original_replace(source, target)
+    source_path = Path(source)
+    target_path = Path(target)
+    if (
+        source_path.parent.name == "previous"
+        and target_path.parent == data_dir
+        and target_path.name == "team-hub.sqlite3"
+    ):
+        os._exit(74)
+
+with mock.patch(
+    "agentsdock_team_hub.store.os.replace", side_effect=replace_then_crash
+):
+    HubStore(data_dir, managed_host_identity=sys.argv[2])
+sys.exit(10)
+"""
+        return subprocess.run(
+            [sys.executable, "-c", script, str(data_dir), HOST_A],
+            cwd=Path(__file__).parent,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
     def test_managed_server_mount_health_requires_issuable_claims(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             application = create_app(
@@ -735,14 +858,18 @@ class ManagedHostTests(unittest.TestCase):
                 "fence": store.maintenance_fence_path.read_bytes(),
                 "attachment": live_path.read_bytes(),
             }
-            original_fsync = HubStore._fsync_directory
+            original_write_journal = HubStore._write_restore_transaction_journal
 
-            def fail_commit(path: Path) -> None:
-                if Path(path) == data_dir:
+            def fail_commit(path: Path, journal: dict[str, object]) -> None:
+                if journal["state"] == "committed":
                     raise OSError("forced restore commit failure")
-                original_fsync(path)
+                original_write_journal(path, journal)
 
-            with mock.patch.object(HubStore, "_fsync_directory", side_effect=fail_commit):
+            with mock.patch.object(
+                HubStore,
+                "_write_restore_transaction_journal",
+                side_effect=fail_commit,
+            ):
                 with self.assertRaisesRegex(OSError, "forced restore commit failure"):
                     HubStore.restore_maintenance_snapshot(
                         data_dir,
@@ -756,6 +883,171 @@ class ManagedHostTests(unittest.TestCase):
             self.assertEqual(store.maintenance_fence_path.read_bytes(), live_before["fence"])
             self.assertEqual(live_path.read_bytes(), live_before["attachment"])
             self.assertEqual(list(data_dir.glob(".restore-*")), [])
+
+    def test_restore_crash_recovery_rolls_back_or_commits_one_exact_generation(self) -> None:
+        expected_exit = {"retire": 71, "install": 72, "commit": 73}
+        for crash_point in expected_exit:
+            with self.subTest(crash_point=crash_point), tempfile.TemporaryDirectory() as temporary:
+                data_dir = Path(temporary) / "hub"
+                store = HubStore(data_dir, managed_host_identity=HOST_A)
+                proof = store.bootstrap_proof_path.read_text().strip()
+                bundle = store.bootstrap(
+                    proof,
+                    "owner@example.com",
+                    "Owner",
+                    "Owner Mac",
+                )
+                claims = store.verify_access(bundle["access_token"])
+                team_id = bundle["teams"][0]["id"]
+
+                snapshot_bytes = b"snapshot generation attachment"
+                snapshot_digest = hashlib.sha256(snapshot_bytes).hexdigest()
+                snapshot_attachment = store.declare_team_attachment(
+                    claims,
+                    team_id,
+                    {
+                        "file_name": "snapshot.txt",
+                        "media_type": "text/plain",
+                        "byte_size": len(snapshot_bytes),
+                        "sha256": snapshot_digest,
+                        "idempotency_key": f"restore-crash-snapshot-{crash_point}",
+                    },
+                )["attachment"]
+                store.write_team_attachment_chunk(
+                    claims,
+                    team_id,
+                    snapshot_attachment["id"],
+                    offset=0,
+                    total=len(snapshot_bytes),
+                    data=snapshot_bytes,
+                )
+                operation_id = f"restore-crash-{crash_point}"
+                snapshot = store.maintenance_snapshot_and_fence(
+                    "server-update",
+                    operation_id=operation_id,
+                )
+                fence_bytes = store.maintenance_fence_path.read_bytes()
+                self.assertTrue(
+                    store.clear_maintenance_fence(
+                        expected_reason="server-update",
+                        expected_operation_id=operation_id,
+                        expected_snapshot=snapshot,
+                    )
+                )
+
+                candidate_bytes = b"candidate generation attachment"
+                candidate_digest = hashlib.sha256(candidate_bytes).hexdigest()
+                candidate_attachment = store.declare_team_attachment(
+                    claims,
+                    team_id,
+                    {
+                        "file_name": "candidate.txt",
+                        "media_type": "text/plain",
+                        "byte_size": len(candidate_bytes),
+                        "sha256": candidate_digest,
+                        "idempotency_key": f"restore-crash-candidate-{crash_point}",
+                    },
+                )["attachment"]
+                store.write_team_attachment_chunk(
+                    claims,
+                    team_id,
+                    candidate_attachment["id"],
+                    offset=0,
+                    total=len(candidate_bytes),
+                    data=candidate_bytes,
+                )
+                store.maintenance_fence_path.write_bytes(fence_bytes)
+                store.maintenance_fence_path.chmod(0o600)
+
+                crashed = self.run_restore_until_crash(
+                    data_dir,
+                    snapshot,
+                    hub_id=store.hub_id,
+                    operation_id=operation_id,
+                    crash_point=crash_point,
+                )
+                self.assertEqual(
+                    crashed.returncode,
+                    expected_exit[crash_point],
+                    crashed.stderr,
+                )
+                self.assertTrue(
+                    (data_dir / ".restore-transaction.json").exists()
+                )
+
+                if crash_point == "install":
+                    recovery_crashed = self.run_recovery_until_crash(data_dir)
+                    self.assertEqual(
+                        recovery_crashed.returncode,
+                        74,
+                        recovery_crashed.stderr,
+                    )
+                    self.assertTrue(
+                        (data_dir / ".restore-transaction.json").exists()
+                    )
+
+                recovered = HubStore(data_dir, managed_host_identity=HOST_A)
+                connection = recovered.connect()
+                try:
+                    attachment_ids = {
+                        str(row["id"])
+                        for row in connection.execute(
+                            "SELECT id FROM team_attachments"
+                        )
+                    }
+                finally:
+                    connection.close()
+                snapshot_path = (
+                    data_dir / "attachments" / snapshot_digest[:2] / snapshot_digest
+                )
+                candidate_path = (
+                    data_dir / "attachments" / candidate_digest[:2] / candidate_digest
+                )
+                if crash_point == "commit":
+                    self.assertEqual(attachment_ids, {snapshot_attachment["id"]})
+                    self.assertFalse(candidate_path.exists())
+                    self.assertIsNone(recovered.maintenance_fence())
+                else:
+                    self.assertEqual(
+                        attachment_ids,
+                        {snapshot_attachment["id"], candidate_attachment["id"]},
+                    )
+                    self.assertEqual(candidate_path.read_bytes(), candidate_bytes)
+                    self.assertIsNotNone(recovered.maintenance_fence())
+                self.assertEqual(snapshot_path.read_bytes(), snapshot_bytes)
+                self.assertFalse(
+                    (data_dir / ".restore-transaction.json").exists()
+                )
+                self.assertEqual(list(data_dir.glob(".restore-[0-9]*-*")), [])
+
+                # Recovery is a no-op after completion and cannot flip the
+                # chosen generation on a later open.
+                reopened = HubStore(data_dir, managed_host_identity=HOST_A)
+                self.assertEqual(
+                    reopened.maintenance_fence() is None,
+                    crash_point == "commit",
+                )
+
+    def test_invalid_restore_journal_fails_closed_before_database_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "hub"
+            store = HubStore(data_dir, managed_host_identity=HOST_A)
+            database_before = store.database_path.read_bytes()
+            journal = data_dir / ".restore-transaction.json"
+            journal.write_text("{}\n", encoding="utf-8")
+            journal.chmod(0o600)
+
+            with mock.patch.object(
+                HubStore,
+                "_preflight_managed_host_binding",
+            ) as preflight:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "restore transaction journal is invalid",
+                ):
+                    HubStore(data_dir, managed_host_identity=HOST_A)
+            preflight.assert_not_called()
+            self.assertEqual(store.database_path.read_bytes(), database_before)
 
     def test_offline_restore_verifies_identity_and_restores_db_key_and_proofs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

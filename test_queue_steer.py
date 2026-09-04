@@ -379,6 +379,7 @@ class StopTurnProviderReadinessTests(unittest.IsolatedAsyncioTestCase):
                 CURRENT_TURNS={},
                 STOP_REQUESTS=set(),
                 STOPPED_RUNS=set(),
+                EXPLICIT_STOP_OPERATIONS={},
                 RUN_METADATA={},
                 SESSION_TURN_TASKS={},
                 CODEX_NATIVE_ACTION_TASKS={},
@@ -436,6 +437,205 @@ class StopTurnProviderReadinessTests(unittest.IsolatedAsyncioTestCase):
         start_locked.assert_not_awaited()
         append_durable_event.assert_awaited_once()
         self.assertFalse(queue_start_tasks)
+
+    async def test_stalled_explicit_stop_cleanup_does_not_block_chat_access(
+        self,
+    ) -> None:
+        cleanup_started = asyncio.Event()
+        finish_cleanup = asyncio.Event()
+        lifecycle_locks: dict[str, asyncio.Lock] = {}
+
+        async def stalled_queue_pause(
+            *_args: object,
+            **_kwargs: object,
+        ) -> int:
+            cleanup_started.set()
+            await finish_cleanup.wait()
+            return 0
+
+        session = {
+            "id": "chat-1",
+            "backend": agent_server.BACKEND_CODEX,
+            "provider_cross_chat_routes": [],
+        }
+        mark_read = AsyncMock(return_value=session)
+        enqueue = AsyncMock(return_value={
+            "queued": True,
+            "queued_id": "queued-during-stop",
+        })
+        with (
+            patch.object(agent_server.STORE, "sessions", {"chat-1": session}),
+            patch.object(agent_server.STORE, "mark_read", mark_read),
+            patch.multiple(
+                agent_server,
+                ACTIVE={},
+                BUSY_SESSIONS=set(),
+                CURRENT_TURNS={},
+                STOP_REQUESTS=set(),
+                STOPPED_RUNS=set(),
+                EXPLICIT_STOP_OPERATIONS={},
+                SESSION_TURN_TASKS={},
+                CODEX_NATIVE_ACTION_TASKS={},
+                QUEUED_TURNS={},
+                RUN_NOW_TURNS={},
+                STEERING_SESSIONS=set(),
+                QUEUE_START_TASKS={},
+                SESSION_LIFECYCLE_LOCKS=lifecycle_locks,
+                CODEX_APP_SERVER_MANAGER=None,
+                append_durable_event=AsyncMock(return_value={}),
+                cancel_codex_interactions=AsyncMock(),
+                cancel_claude_interactions=AsyncMock(),
+                pause_queued_turns_after_explicit_stop=AsyncMock(
+                    side_effect=stalled_queue_pause
+                ),
+                settle_idle_codex_goal_for_stop=AsyncMock(return_value={}),
+                enqueue_turn=enqueue,
+                managed_server_update_blocker=lambda: None,
+            ),
+            patch.object(agent_server, "schedule_next_queued_turn") as schedule,
+        ):
+            stop_task = asyncio.create_task(
+                agent_server.stop_turn_endpoint("chat-1")
+            )
+            await asyncio.wait_for(cleanup_started.wait(), timeout=0.5)
+            try:
+                self.assertTrue(agent_server.explicit_stop_in_progress("chat-1"))
+                self.assertFalse(
+                    agent_server.session_lifecycle_lock("chat-1").locked()
+                )
+
+                routes, read, queued = await asyncio.wait_for(
+                    asyncio.gather(
+                        agent_server.list_agent_handoff_routes("chat-1"),
+                        agent_server.mark_session_read(
+                            "chat-1",
+                            agent_server.ReadSessionRequest(
+                                last_read_agent_event_seq=42
+                            ),
+                        ),
+                        agent_server.post_turn(
+                            "chat-1",
+                            agent_server.TurnRequest(
+                                prompt="Queue while Stop cleanup is stalled."
+                            ),
+                        ),
+                    ),
+                    timeout=0.5,
+                )
+
+                self.assertEqual(routes, {
+                    "routes": [],
+                    "max_routes": agent_server.PROVIDER_CROSS_CHAT_ROUTE_LIMIT,
+                })
+                self.assertEqual(read["session"], agent_server.public_session(session))
+                self.assertTrue(queued["queued"])
+                mark_read.assert_awaited_once_with("chat-1", 42)
+                enqueue.assert_awaited_once()
+                self.assertFalse(stop_task.done())
+            finally:
+                finish_cleanup.set()
+                result = await asyncio.wait_for(stop_task, timeout=0.5)
+
+        self.assertTrue(result["stopped"])
+        self.assertFalse(agent_server.explicit_stop_in_progress("chat-1"))
+        schedule.assert_called_once_with("chat-1")
+
+    async def test_cancelled_stop_waiter_does_not_cancel_admitted_cleanup(
+        self,
+    ) -> None:
+        cleanup_started = asyncio.Event()
+        finish_cleanup = asyncio.Event()
+        operations: dict[str, asyncio.Task[dict[str, object]]] = {}
+
+        async def stalled_queue_pause(_session_id: str) -> int:
+            cleanup_started.set()
+            await finish_cleanup.wait()
+            return 0
+
+        session = {"id": "chat-1", "backend": agent_server.BACKEND_CODEX}
+        with (
+            patch.object(agent_server.STORE, "sessions", {"chat-1": session}),
+            patch.multiple(
+                agent_server,
+                ACTIVE={},
+                BUSY_SESSIONS=set(),
+                CURRENT_TURNS={},
+                STOP_REQUESTS=set(),
+                STOPPED_RUNS=set(),
+                EXPLICIT_STOP_OPERATIONS=operations,
+                SESSION_TURN_TASKS={},
+                CODEX_NATIVE_ACTION_TASKS={},
+                QUEUED_TURNS={},
+                RUN_NOW_TURNS={},
+                STEERING_SESSIONS=set(),
+                QUEUE_START_TASKS={},
+                SESSION_LIFECYCLE_LOCKS={},
+                CODEX_APP_SERVER_MANAGER=None,
+                pause_queued_turns_after_explicit_stop=AsyncMock(
+                    side_effect=stalled_queue_pause
+                ),
+                cancel_codex_interactions=AsyncMock(),
+                cancel_claude_interactions=AsyncMock(),
+                settle_idle_codex_goal_for_stop=AsyncMock(return_value={}),
+                managed_server_update_blocker=lambda: None,
+            ),
+            patch.object(agent_server, "schedule_next_queued_turn"),
+        ):
+            waiter = asyncio.create_task(
+                agent_server.stop_turn_endpoint("chat-1")
+            )
+            await asyncio.wait_for(cleanup_started.wait(), timeout=0.5)
+            operation = operations["chat-1"]
+            waiter.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await waiter
+
+            self.assertFalse(operation.cancelled())
+            self.assertFalse(operation.done())
+            self.assertTrue(agent_server.explicit_stop_in_progress("chat-1"))
+
+            finish_cleanup.set()
+            result = await asyncio.wait_for(operation, timeout=0.5)
+
+        self.assertTrue(result["stopped"])
+        self.assertFalse(operations)
+
+    async def test_detached_stop_cleanup_blocks_update_and_forced_restart(
+        self,
+    ) -> None:
+        finish_cleanup = asyncio.Event()
+        operation = asyncio.create_task(finish_cleanup.wait())
+        try:
+            with patch.multiple(
+                agent_server,
+                ACTIVE={},
+                BUSY_SESSIONS=set(),
+                CURRENT_TURNS={},
+                SERVER_MAINTENANCE_SESSIONS=set(),
+                EXPLICIT_STOP_OPERATIONS={"chat-1": operation},
+                QUEUED_TURNS={},
+                RUN_NOW_TURNS={},
+                DELETING_SESSIONS=set(),
+                CODEX_GOALS_RECONFIGURING=False,
+                UNSAFE_HTTP_MUTATIONS_IN_FLIGHT=0,
+                CODEX_APP_SERVER_MANAGER=None,
+                CLAUDE_SDK_MANAGER=None,
+                CODEX_NATIVE_ACTION_TASKS={},
+                CODEX_PENDING_INTERACTIONS={},
+            ):
+                self.assertEqual(
+                    agent_server.server_update_active_session_ids_locked(),
+                    ["chat-1"],
+                )
+                snapshot = agent_server.server_restart_blocker_snapshot_locked(
+                    tmux_cgroup_state={}
+                )
+
+            self.assertEqual(snapshot["server_maintenance_count"], 1)
+            self.assertTrue(snapshot["has_safety_blockers"])
+        finally:
+            finish_cleanup.set()
+            await operation
 
     async def test_cross_chat_queue_failures_deliver_after_both_lifecycle_locks_release(
         self,
@@ -2009,7 +2209,11 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
             await force_send
             await explicit_stop
 
-        stop_turn.assert_awaited_once_with("chat-1")
+        stop_turn.assert_awaited_once()
+        self.assertEqual(stop_turn.await_args.args, ("chat-1",))
+        self.assertTrue(
+            stop_turn.await_args.kwargs["_admission_ready"].is_set()
+        )
 
     async def test_stop_after_promotion_holds_run_now_and_clears_cached_success(
         self,

@@ -1700,7 +1700,10 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stopped, {"stopped": True})
         self.assertEqual(codex["interaction"]["status"], "resolved")
         self.assertEqual(claude["interaction"]["status"], "resolved")
-        stop_turn.assert_awaited_once_with("active-chat")
+        stop_turn.assert_awaited_once()
+        stop_args, stop_kwargs = stop_turn.await_args
+        self.assertEqual(stop_args, ("active-chat",))
+        self.assertIsInstance(stop_kwargs.get("_admission_ready"), asyncio.Event)
         resolve_codex.assert_awaited_once()
         resolve_claude.assert_awaited_once()
 

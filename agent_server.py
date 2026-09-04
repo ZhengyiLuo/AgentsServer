@@ -8990,6 +8990,13 @@ CLAUDE_STOP_FENCE_SESSIONS: set[str] = set()
 CURRENT_TURNS: dict[str, dict[str, Any]] = {}
 STOP_REQUESTS: set[str] = set()
 STOPPED_RUNS: set[str] = set()
+# Explicit Stop owns only the short admission edge under the session lifecycle
+# lock.  The provider/subagent teardown can then continue without making
+# unrelated per-chat reads or durable queue admissions wait behind it.  The
+# operation task remains a separate admission fence until teardown finishes,
+# so a replacement turn cannot bind while cleanup for the old owner is still
+# running.
+EXPLICIT_STOP_OPERATIONS: dict[str, asyncio.Task[dict[str, Any]]] = {}
 ACTIVE_LOCK = asyncio.Lock()
 QUEUED_TURNS: dict[str, deque[dict[str, Any]]] = {}
 RUN_NOW_TURNS: dict[str, dict[str, Any]] = {}
@@ -10961,6 +10968,23 @@ def session_lifecycle_lock(session_id: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         SESSION_LIFECYCLE_LOCKS[session_id] = lock
     return lock
+
+
+def explicit_stop_in_progress(session_id: str) -> bool:
+    """Return whether explicit Stop still owns turn-admission cleanup."""
+
+    operation = EXPLICIT_STOP_OPERATIONS.get(session_id)
+    return operation is not None and not operation.done()
+
+
+def explicit_stop_session_ids() -> set[str]:
+    """Snapshot chats whose detached Stop cleanup still blocks replacement."""
+
+    return {
+        session_id
+        for session_id, operation in EXPLICIT_STOP_OPERATIONS.items()
+        if not operation.done()
+    }
 
 
 def ensure_session_not_initializing(session_id: str) -> None:
@@ -16167,6 +16191,11 @@ async def _run_queued_turn_now_once(
 ) -> dict[str, Any]:
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
+    if explicit_stop_in_progress(session_id):
+        raise HTTPException(
+            status_code=409,
+            detail="Stop is still finishing for this chat; retry Force Send shortly",
+        )
 
     async with ACTIVE_LOCK:
         active_turn = dict(ACTIVE.get(session_id) or {})
@@ -17070,6 +17099,12 @@ async def _start_next_queued_turn_locked(
     *,
     admission_backend: str | None,
 ) -> None:
+    # Explicit Stop releases the broad lifecycle lock after its admission
+    # fence is committed.  Keep queued promotion behind the narrower Stop
+    # operation until provider/subagent cleanup is complete, without blocking
+    # route reads or new queue writes in the meantime.
+    if explicit_stop_in_progress(session_id):
+        return
     async with QUEUE_LOCK:
         if session_id in STEERING_SESSIONS:
             return
@@ -48750,7 +48785,11 @@ async def _start_turn_locked(
                 status_code=409,
                 detail="wait for Codex session maintenance to finish",
             )
-        if session_id in BUSY_SESSIONS or has_prior_queue:
+        if (
+            session_id in BUSY_SESSIONS
+            or has_prior_queue
+            or explicit_stop_in_progress(session_id)
+        ):
             if queue_if_busy:
                 should_queue = True
             else:
@@ -49954,12 +49993,16 @@ def server_restart_blocker_snapshot_locked(
 ) -> dict[str, Any]:
     """Snapshot restart blockers while admission locks are held by the caller."""
 
+    explicit_stop_ids = explicit_stop_session_ids()
     maintenance_session_ids = sorted(
-        str(session_id) for session_id in SERVER_MAINTENANCE_SESSIONS
+        str(session_id)
+        for session_id in SERVER_MAINTENANCE_SESSIONS | explicit_stop_ids
     )
     active_session_ids = sorted(
         str(session_id)
-        for session_id in BUSY_SESSIONS - SERVER_MAINTENANCE_SESSIONS
+        for session_id in BUSY_SESSIONS
+        - SERVER_MAINTENANCE_SESSIONS
+        - explicit_stop_ids
     )
     deleting_session_ids = sorted(str(session_id) for session_id in DELETING_SESSIONS)
     queued_tokens: list[tuple[str, str, int, str, bool, bool]] = []
@@ -50347,6 +50390,16 @@ def server_update_blocker_counts(
         ),
         "in_flight_server_changes": max(0, int(mutation_count)),
     }
+
+
+def server_update_active_session_ids_locked() -> list[str]:
+    """Return chat-scoped work that must drain before a managed update."""
+
+    return sorted(
+        BUSY_SESSIONS
+        | SERVER_MAINTENANCE_SESSIONS
+        | explicit_stop_session_ids()
+    )
 
 
 def server_update_has_blockers(blocker_counts: dict[str, int]) -> bool:
@@ -53701,8 +53754,8 @@ async def _start_server_update(
         async with ACTIVE_LOCK:
             async with QUEUE_LOCK:
                 async with UNSAFE_HTTP_MUTATION_ADMISSION_LOCK:
-                    active_session_ids = sorted(
-                        BUSY_SESSIONS | SERVER_MAINTENANCE_SESSIONS
+                    active_session_ids = (
+                        server_update_active_session_ids_locked()
                     )
                     queued_turn_count = update_blocking_queued_turn_count_locked()
                     mutation_count = unsafe_http_mutation_count_locked()
@@ -59048,16 +59101,62 @@ async def post_run_queued_turn_now(
         ) from exc
 
 
+async def run_explicit_stop_operation(
+    session_id: str,
+    admission_ready: asyncio.Event,
+) -> dict[str, Any]:
+    """Finish one explicit Stop after its short serialized admission edge."""
+
+    try:
+        return await stop_turn(
+            session_id,
+            _admission_ready=admission_ready,
+        )
+    finally:
+        # An admission exception/cancellation must also wake the endpoint;
+        # otherwise it would retain the lifecycle lock while this finalizer
+        # waits to acquire that same lock.
+        admission_ready.set()
+        # Clearing the narrow fence is itself serialized with turn admission.
+        # A queued successor can therefore either observe this operation or
+        # own the next turn slot, never slip between cleanup and fence release.
+        async with session_lifecycle_lock(session_id):
+            current_task = asyncio.current_task()
+            if EXPLICIT_STOP_OPERATIONS.get(session_id) is current_task:
+                EXPLICIT_STOP_OPERATIONS.pop(session_id, None)
+        # Stop normally schedules the queue when appropriate.  A schedule
+        # attempt made before the explicit-operation fence was removed is a
+        # harmless no-op, so provide one final wake after releasing it.
+        schedule_next_queued_turn(session_id)
+
+
 @app.post("/api/sessions/{session_id}/stop")
 async def stop_turn_endpoint(session_id: str) -> dict[str, Any]:
-    # Serialize explicit Stop with turn admission. Without this fence, an idle
-    # Stop could snapshot an old Claude supervisor, a new turn could bind it,
-    # and the old Stop could then evict the replacement turn.
+    # Serialize only Stop admission with turn admission. Provider interrupts,
+    # subagent teardown, and bounded terminal confirmation continue under the
+    # narrower EXPLICIT_STOP_OPERATIONS fence so unrelated route reads and
+    # queue writes do not wait behind slow cleanup.
     async with session_lifecycle_lock(session_id):
         update_blocker = managed_server_update_blocker()
         if update_blocker:
             raise HTTPException(status_code=503, detail=update_blocker)
-        return await stop_turn(session_id)
+        operation = EXPLICIT_STOP_OPERATIONS.get(session_id)
+        if operation is None or operation.done():
+            admission_ready = asyncio.Event()
+            operation = asyncio.create_task(
+                run_explicit_stop_operation(session_id, admission_ready)
+            )
+            EXPLICIT_STOP_OPERATIONS[session_id] = operation
+            # stop_turn sets this immediately after it has fenced the observed
+            # owner under ACTIVE_LOCK. The explicit-operation entry itself
+            # prevents queued promotion while the durable queue pause and all
+            # provider cleanup continue outside this broad lock. It is also
+            # set on admission failure so this lock can never be stranded.
+            await admission_ready.wait()
+
+    # Every waiter is observational. A renderer timeout or HTTP disconnect
+    # must not cancel teardown after Stop has fenced the provider owner.
+    return await asyncio.shield(operation)
 
 
 async def quarantine_codex_goal_thread(
@@ -59322,6 +59421,7 @@ async def stop_turn(
     cascade_claude_subagents: bool = True,
     hard_terminalize_on_timeout: bool = True,
     pause_queued_turns_on_stop: bool = True,
+    _admission_ready: asyncio.Event | None = None,
 ) -> dict[str, Any]:
     deferred = False
     native_interrupt_reserved = False
@@ -59423,10 +59523,11 @@ async def stop_turn(
                 and not task.done()
             )
         ]
-    if not deferred and stopping_run_id:
-        # Revoke helper authority as soon as Stop is admitted, before waiting
-        # for a provider interrupt acknowledgement or local task teardown.
-        await revoke_cross_chat_capability(stopping_run_id)
+    # The observed owner is now fenced synchronously under ACTIVE_LOCK.  The
+    # explicit-operation entry blocks replacement admission, so release the
+    # broad lifecycle lock before any durable queue IO or provider cleanup.
+    if _admission_ready is not None:
+        _admission_ready.set()
     subagent_stop = empty_subagent_stop_result()
     session = STORE.sessions.get(session_id) or {}
     pause_queued_successors = bool(
@@ -59500,6 +59601,21 @@ async def stop_turn(
                     CLAUDE_STOP_FENCE_SESSIONS.add(session_id)
                     SERVER_MAINTENANCE_SESSIONS.add(session_id)
 
+    if deferred:
+        return {
+            "ok": True,
+            "stopped": False,
+            "deferred": True,
+            "message": "The provider had not accepted the current turn yet, so it was left running.",
+        }
+    if pause_queued_successors:
+        await pause_queued_turns_after_explicit_stop(session_id)
+    if not deferred and stopping_run_id:
+        # ACTIVE.stop_requested / STOPPED_RUNS already closes provider helper
+        # authority synchronously. Remove the capability record before any
+        # provider interrupt or subagent teardown, but outside the broad
+        # lifecycle-lock admission edge.
+        await revoke_cross_chat_capability(stopping_run_id)
     root_thread_id = str(
         (active or {}).get("provider_thread_id")
         or (active or {}).get("provider_session_id")
@@ -59518,15 +59634,6 @@ async def stop_turn(
             root_thread_id,
             manager=CODEX_APP_SERVER_MANAGER,
         )
-    if deferred:
-        return {
-            "ok": True,
-            "stopped": False,
-            "deferred": True,
-            "message": "The provider had not accepted the current turn yet, so it was left running.",
-        }
-    if pause_queued_successors:
-        await pause_queued_turns_after_explicit_stop(session_id)
     if not active and not busy:
         await settle_stopped_claude_subagents()
     # ACTIVE is now fenced with stop_requested under the same lock consulted

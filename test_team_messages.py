@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import unittest
 import uuid
+from unittest import mock
 
 from fastapi.testclient import TestClient
 
@@ -292,6 +293,133 @@ class TeamMessagesServiceTests(unittest.TestCase):
         self.assertEqual(len(filtered["messages"]), 1)
         future = self.get(self.member, f"{self.base}/messages?box=inbox&since=2999-01-01T00:00:00Z")
         self.assertEqual(future["messages"], [])
+
+    def test_receipt_outbox_is_atomic_per_recipient_and_idempotent(self) -> None:
+        member_id = self.member["principal"]["id"]
+        sent = self.send(self.owner, [{"kind": "human", "id": member_id}])
+        store = self.app.state.store
+        connection = store.connect()
+        try:
+            recipient_id = str(
+                connection.execute(
+                    "SELECT id FROM team_message_recipients WHERE message_id=?",
+                    (sent["id"],),
+                ).fetchone()[0]
+            )
+        finally:
+            connection.close()
+
+        delivered_key = _key()
+        delivered_request = {
+            "state": "delivered",
+            "idempotency_key": delivered_key,
+        }
+        with mock.patch.object(
+            store,
+            "_outbox",
+            side_effect=RuntimeError("forced receipt outbox failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "forced receipt outbox failure"):
+                self.client.post(
+                    f"{self.base}/messages/{sent['id']}/receipts",
+                    headers=self.auth(self.member),
+                    json=delivered_request,
+                )
+
+        connection = store.connect()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT state FROM team_message_recipients WHERE id=?",
+                    (recipient_id,),
+                ).fetchone()[0],
+                "available",
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM audit_events WHERE action='team.message.receipt'"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM request_idempotency "
+                    "WHERE operation='team.message.receipt'"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM outbox_events "
+                    "WHERE aggregate_type='team_message_recipient' AND aggregate_id=?",
+                    (recipient_id,),
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+
+        first = self.post(
+            self.member,
+            f"{self.base}/messages/{sent['id']}/receipts",
+            delivered_request,
+        )
+        replay = self.post(
+            self.member,
+            f"{self.base}/messages/{sent['id']}/receipts",
+            delivered_request,
+        )
+        self.assertEqual(first, replay)
+        read_key = _key()
+        read_request = {"state": "read", "idempotency_key": read_key}
+        self.post(
+            self.member,
+            f"{self.base}/messages/{sent['id']}/receipts",
+            read_request,
+        )
+        self.post(
+            self.member,
+            f"{self.base}/messages/{sent['id']}/receipts",
+            read_request,
+        )
+        # A monotonic no-op under a distinct request key is audited but does
+        # not claim another state-change effect in the outbox.
+        self.post(
+            self.member,
+            f"{self.base}/messages/{sent['id']}/receipts",
+            {"state": "delivered", "idempotency_key": _key()},
+        )
+
+        connection = store.connect()
+        try:
+            events = connection.execute(
+                """
+                SELECT aggregate_type,aggregate_id,event_type,state
+                FROM outbox_events
+                WHERE aggregate_type='team_message_recipient' AND aggregate_id=?
+                ORDER BY created_at,event_type
+                """,
+                (recipient_id,),
+            ).fetchall()
+            self.assertEqual(
+                [tuple(row) for row in events],
+                [
+                    (
+                        "team_message_recipient",
+                        recipient_id,
+                        "team.message.delivered",
+                        "pending",
+                    ),
+                    (
+                        "team_message_recipient",
+                        recipient_id,
+                        "team.message.read",
+                        "pending",
+                    ),
+                ],
+            )
+        finally:
+            connection.close()
 
     def test_inbox_delivery_matches_the_requested_owned_address(self) -> None:
         member_id = self.member["principal"]["id"]
@@ -629,6 +757,88 @@ class TeamMessagesServiceTests(unittest.TestCase):
         duplicate = self.declare(self.owner, payload, name="copy.bin")["attachment"]
         self.assertEqual(duplicate["state"], "ready")
         self.assertEqual(duplicate["received_bytes"], len(payload))
+
+    def test_attachment_declaration_outbox_is_atomic_and_idempotent(self) -> None:
+        payload = b"declaration outbox"
+        request = {
+            "file_name": "outbox.txt",
+            "media_type": "text/plain",
+            "byte_size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "idempotency_key": _key(),
+        }
+        store = self.app.state.store
+        with mock.patch.object(
+            store,
+            "_outbox",
+            side_effect=RuntimeError("forced declaration outbox failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "forced declaration outbox failure"):
+                self.client.post(
+                    f"{self.base}/attachments",
+                    headers=self.auth(self.owner),
+                    json=request,
+                )
+
+        connection = store.connect()
+        try:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM team_attachments").fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM audit_events "
+                    "WHERE action='team.attachment.declare'"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM request_idempotency "
+                    "WHERE operation='team.attachment.declare'"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+
+        first = self.post(self.owner, f"{self.base}/attachments", request)
+        replay = self.post(self.owner, f"{self.base}/attachments", request)
+        self.assertEqual(first, replay)
+        attachment_id = first["attachment"]["id"]
+        connection = store.connect()
+        try:
+            events = connection.execute(
+                """
+                SELECT aggregate_type,aggregate_id,event_type,state
+                FROM outbox_events
+                WHERE aggregate_type='team_attachment' AND aggregate_id=?
+                  AND event_type='team.attachment.declared'
+                """,
+                (attachment_id,),
+            ).fetchall()
+            self.assertEqual(
+                [tuple(row) for row in events],
+                [
+                    (
+                        "team_attachment",
+                        attachment_id,
+                        "team.attachment.declared",
+                        "pending",
+                    )
+                ],
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM audit_events "
+                    "WHERE action='team.attachment.declare' AND resource_id=?",
+                    (attachment_id,),
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            connection.close()
 
     def test_attachment_hash_mismatch_fails_closed(self) -> None:
         payload = b"x" * 3000

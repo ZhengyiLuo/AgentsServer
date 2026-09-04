@@ -107,8 +107,15 @@ from team_hub_host import (
     configured_team_hub_hosts,
     configured_team_hub_mode,
 )
-from agentsdock_team_hub.service import MANAGED_SERVER_SESSION_SCOPE_KEY
-from agentsdock_team_hub.store import HubError, MANAGED_SERVER_PRINCIPAL_ID
+from agentsdock_team_hub.service import (
+    MANAGED_SERVER_SESSION_SCOPE_KEY,
+    attachment_content_response,
+)
+from agentsdock_team_hub.store import (
+    TEAM_ATTACHMENT_CHUNK_BYTES,
+    HubError,
+    MANAGED_SERVER_PRINCIPAL_ID,
+)
 from agentsdock_team_hub.secure_peer import SecurePeerError
 from secure_peer_runtime import SECURE_PEER_HEARTBEAT_SECONDS, SecurePeerRuntime
 
@@ -53508,6 +53515,23 @@ TEAM_HUB_SERVER_SESSION_ROUTE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("POST", re.compile(r"^/v1/teams/[^/]+/network/skills/[^/]+/(?:pin|archive)$")),
 )
 
+SECURE_PEER_ATTACHMENT_CONTENT_PATH_RE = re.compile(
+    r"^/api/team-hub-secure/(?P<connection>[0-9a-f-]{36})/v1/teams/"
+    r"(?P<team>[A-Za-z0-9][A-Za-z0-9._:-]{0,239})/network/attachments/"
+    r"(?P<attachment>[A-Za-z0-9][A-Za-z0-9._:-]{0,239})/content$"
+)
+SECURE_PEER_CONTENT_RANGE_RE = re.compile(
+    r"^bytes (?P<start>[0-9]{1,15})-(?P<end>[0-9]{1,15})/"
+    r"(?P<total>[0-9]{1,15})$"
+)
+SECURE_PEER_ATTACHMENT_RANGE_RE = re.compile(
+    r"^bytes=(?P<start>[0-9]{0,15})-(?P<end>[0-9]{0,15})$"
+)
+
+
+def secure_peer_attachment_content_match(path: str) -> re.Match[str] | None:
+    return SECURE_PEER_ATTACHMENT_CONTENT_PATH_RE.fullmatch(str(path or ""))
+
 
 def is_team_hub_server_session_route_allowed(method: str, path: str) -> bool:
     """Allow only shared server/team operations through the core-auth proxy."""
@@ -53758,6 +53782,90 @@ def secure_peer_post_transport_error(request: Request) -> tuple[int, str] | None
     return None
 
 
+def secure_peer_attachment_put_transport_error(
+    request: Request,
+) -> tuple[int, str] | None:
+    """Validate the attachment-only local binary ingress before reading it."""
+
+    raw_headers = request.scope.get("headers", [])
+    if any(bytes(name).lower() == b"transfer-encoding" for name, _ in raw_headers):
+        return 400, "attachment uploads do not accept transfer encoding"
+    lengths = [
+        value for name, value in raw_headers if bytes(name).lower() == b"content-length"
+    ]
+    if len(lengths) != 1:
+        return (
+            411 if not lengths else 400,
+            "attachment upload content length is invalid",
+        )
+    try:
+        raw_length = lengths[0].decode("ascii")
+        size = int(raw_length, 10)
+    except (UnicodeDecodeError, ValueError):
+        return 400, "attachment upload content length is invalid"
+    if raw_length != str(size) or not 1 <= size <= TEAM_ATTACHMENT_CHUNK_BYTES:
+        return 413, "attachment upload chunk size is invalid"
+    content_types = [
+        value for name, value in raw_headers if bytes(name).lower() == b"content-type"
+    ]
+    if content_types != [b"application/octet-stream"]:
+        return 415, "attachment uploads require application/octet-stream"
+    ranges = [
+        value for name, value in raw_headers if bytes(name).lower() == b"content-range"
+    ]
+    if len(ranges) != 1:
+        return 400, "attachment upload Content-Range is invalid"
+    try:
+        match = SECURE_PEER_CONTENT_RANGE_RE.fullmatch(ranges[0].decode("ascii"))
+    except UnicodeDecodeError:
+        match = None
+    if match is None:
+        return 400, "attachment upload Content-Range is invalid"
+    start, end, total = (
+        int(match.group("start")),
+        int(match.group("end")),
+        int(match.group("total")),
+    )
+    if end < start or end - start + 1 != size or end >= total:
+        return 422, "attachment upload Content-Range is invalid"
+    return None
+
+
+def secure_peer_attachment_read_transport_error(
+    request: Request,
+) -> tuple[int, str] | None:
+    """Reject bodies and non-binary metadata on attachment GET/HEAD."""
+
+    raw_headers = request.scope.get("headers", [])
+    if any(bytes(name).lower() == b"transfer-encoding" for name, _ in raw_headers):
+        return 400, "attachment downloads do not accept transfer encoding"
+    lengths = [
+        value for name, value in raw_headers if bytes(name).lower() == b"content-length"
+    ]
+    if len(lengths) > 1 or (lengths and lengths[0] != b"0"):
+        return 400, "attachment downloads cannot carry a body"
+    if any(
+        bytes(name).lower() in {b"content-type", b"content-range"}
+        for name, _ in raw_headers
+    ):
+        return 422, "attachment downloads cannot carry upload headers"
+    ranges = [value for name, value in raw_headers if bytes(name).lower() == b"range"]
+    if len(ranges) > 1:
+        return 400, "attachment download Range is invalid"
+    if ranges:
+        try:
+            match = SECURE_PEER_ATTACHMENT_RANGE_RE.fullmatch(
+                ranges[0].decode("ascii")
+            )
+        except UnicodeDecodeError:
+            match = None
+        if match is None or (
+            match.group("start") == "" and match.group("end") == ""
+        ):
+            return 422, "attachment download Range is invalid"
+    return None
+
+
 @app.middleware("http")
 async def require_agent_token(request: Request, call_next):
     # Starlette otherwise redirects a bare mount path and builds Location from
@@ -53785,6 +53893,9 @@ async def require_agent_token(request: Request, call_next):
     )
     secure_peer_proxy_route = request.url.path.startswith(
         "/api/team-hub-secure/"
+    )
+    secure_peer_attachment_route = (
+        secure_peer_attachment_content_match(request.url.path) is not None
     )
     team_hub_server_session_route = request.url.path.startswith(
         TEAM_HUB_SERVER_SESSION_MOUNT_PATH + "/"
@@ -53907,7 +54018,21 @@ async def require_agent_token(request: Request, call_next):
         if not request_exact_secure_peer_control_authorized(request):
             return JSONResponse({"detail": "unauthorized"}, status_code=401)
         if request.method.upper() in {"POST", "PUT", "PATCH"}:
-            transport_error = secure_peer_post_transport_error(request)
+            transport_error = (
+                secure_peer_attachment_put_transport_error(request)
+                if secure_peer_attachment_route and request.method.upper() == "PUT"
+                else secure_peer_post_transport_error(request)
+            )
+            if transport_error is not None:
+                status_code, detail = transport_error
+                return JSONResponse({"detail": detail}, status_code=status_code)
+        elif secure_peer_attachment_route and request.method.upper() in {"GET", "HEAD"}:
+            if request.url.query:
+                return JSONResponse(
+                    {"detail": "attachment downloads do not accept a query"},
+                    status_code=422,
+                )
+            transport_error = secure_peer_attachment_read_transport_error(request)
             if transport_error is not None:
                 status_code, detail = transport_error
                 return JSONResponse({"detail": detail}, status_code=status_code)
@@ -54474,7 +54599,7 @@ async def secure_peer_route_revoke_endpoint(
 
 @app.api_route(
     "/api/team-hub-secure/{connection_id}/{hub_path:path}",
-    methods=["GET", "POST"],
+    methods=["GET", "POST", "PUT", "HEAD"],
 )
 async def secure_peer_hub_proxy_endpoint(
     connection_id: str,
@@ -54486,6 +54611,76 @@ async def secure_peer_hub_proxy_endpoint(
     path = "/" + hub_path
     if not path.startswith("/v1/") or "//" in path or "\\" in path:
         raise HTTPException(status_code=404, detail="Resource not found")
+    attachment_match = secure_peer_attachment_content_match(request.url.path)
+    if attachment_match is not None:
+        if request.url.query:
+            raise HTTPException(
+                status_code=422,
+                detail="Attachment content transport does not accept a query",
+            )
+        if attachment_match.group("connection") != clean_id:
+            raise HTTPException(status_code=404, detail="Resource not found")
+        team_id = attachment_match.group("team")
+        attachment_id = attachment_match.group("attachment")
+        try:
+            if request.method == "PUT":
+                body = await asyncio.wait_for(request.body(), timeout=60.0)
+                result = await asyncio.to_thread(
+                    SECURE_PEER_RUNTIME.proxy_team_attachment_chunk,
+                    clean_id,
+                    team_id,
+                    attachment_id,
+                    content_range=str(request.headers.get("content-range") or ""),
+                    body=body,
+                )
+                headers = {name: value for name, value in result.headers}
+                headers["cache-control"] = "no-store"
+                headers["pragma"] = "no-cache"
+                return Response(
+                    content=result.body,
+                    status_code=result.status,
+                    headers=headers,
+                )
+            if request.method == "HEAD":
+                result = await asyncio.to_thread(
+                    SECURE_PEER_RUNTIME.proxy_team_attachment_head,
+                    clean_id,
+                    team_id,
+                    attachment_id,
+                )
+                headers = {name: value for name, value in result.headers}
+                headers["cache-control"] = "private, max-age=0"
+                headers["x-content-type-options"] = "nosniff"
+                return Response(status_code=result.status, headers=headers)
+            if request.method == "GET":
+                cache_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        SECURE_PEER_RUNTIME.open_cached_team_attachment,
+                        clean_id,
+                        team_id,
+                        attachment_id,
+                    )
+                )
+                try:
+                    attachment, local_lease = await asyncio.shield(cache_task)
+                except asyncio.CancelledError:
+                    def close_abandoned_cache_lease(done: asyncio.Task) -> None:
+                        with suppress(BaseException):
+                            _attachment, abandoned_lease = done.result()
+                            abandoned_lease.close()
+
+                    cache_task.add_done_callback(close_abandoned_cache_lease)
+                    raise
+                try:
+                    return attachment_content_response(
+                        request, attachment, local_lease
+                    )
+                except BaseException:
+                    local_lease.close()
+                    raise
+            raise HTTPException(status_code=405, detail="Method not allowed")
+        except SecurePeerError as exc:
+            return secure_peer_error_response(exc)
     if request.method == "GET":
         raw_headers = [
             (bytes(name).lower(), bytes(value).strip())
@@ -54510,6 +54705,8 @@ async def secure_peer_hub_proxy_endpoint(
     # Content-Length and stream an unbounded chunked body; GET has no body in
     # this proxy contract, so the ASGI receive channel is intentionally left
     # unread and the response closes the request.
+    if request.method not in {"GET", "POST"}:
+        raise HTTPException(status_code=404, detail="Resource not found")
     body = b"" if request.method == "GET" else await request.body()
     # Forward only ordinary content negotiation. The core token and any Hub
     # bearer are intentionally consumed/removed at this local boundary.

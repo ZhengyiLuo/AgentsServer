@@ -90,6 +90,11 @@ MAX_TEAM_MESSAGE_PREVIEW_CHARS = 280
 DEFAULT_TEAM_ATTACHMENT_MAX_BYTES = 512 * 1024 * 1024
 DEFAULT_TEAM_ATTACHMENT_QUOTA_BYTES = 50 * 1024 * 1024 * 1024
 TEAM_ATTACHMENT_CHUNK_BYTES = 8 * 1024 * 1024
+# The secure-peer Content-Length and Content-Range grammar permits at most
+# fifteen decimal digits. Keep persisted Hub settings inside that protocol
+# ceiling so health never advertises a file size the binary lane will reject.
+MAX_TEAM_ATTACHMENT_PROTOCOL_BYTES = 999_999_999_999_999
+MAX_SQLITE_SIGNED_INTEGER = 9_223_372_036_854_775_807
 TEAM_ATTACHMENT_UPLOAD_TTL_SECONDS = 24 * 60 * 60
 MAX_TEAM_SKILLS_PER_TEAM = 500
 MAX_TEAM_SKILL_VERSIONS = 200
@@ -141,7 +146,7 @@ def _now(value: int | None = None) -> int:
     return now_seconds() if value is None else int(value)
 
 
-def _positive_int_env(name: str, default: int) -> int:
+def _positive_int_env(name: str, default: int, *, maximum: int) -> int:
     """Read a host-level size limit; malformed or non-positive values fall back."""
 
     raw = os.environ.get(name, "").strip()
@@ -151,7 +156,7 @@ def _positive_int_env(name: str, default: int) -> int:
         value = int(raw)
     except ValueError:
         return default
-    return value if value > 0 else default
+    return value if 0 < value <= maximum else default
 
 
 def _row_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -279,10 +284,12 @@ class HubStore:
         self.team_attachment_max_bytes = _positive_int_env(
             "AGENTSDOCK_TEAM_ATTACHMENT_MAX_BYTES",
             DEFAULT_TEAM_ATTACHMENT_MAX_BYTES,
+            maximum=MAX_TEAM_ATTACHMENT_PROTOCOL_BYTES,
         )
         self.team_attachment_quota_bytes = _positive_int_env(
             "AGENTSDOCK_TEAM_ATTACHMENT_QUOTA_BYTES",
             DEFAULT_TEAM_ATTACHMENT_QUOTA_BYTES,
+            maximum=MAX_SQLITE_SIGNED_INTEGER,
         )
         self.instance_id = _id("hub_instance")
         self.hub_id = ""

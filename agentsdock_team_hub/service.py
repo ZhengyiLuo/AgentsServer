@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import hashlib
 import ipaddress
 import json
+import os
 from pathlib import Path
 import re
 import threading
@@ -18,6 +19,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .auth import AuthenticationError, AuthorizationError
+from .secure_peer import AttachmentFileLease
 from .store import (
     MAX_NETWORK_BODY_BYTES,
     MAX_NETWORK_PAGE_ITEMS,
@@ -261,7 +263,7 @@ class TeamSkillArchiveRequest(StrictModel):
 def attachment_content_response(
     request: Request,
     attachment: dict[str, Any],
-    path: Path,
+    path: Path | int | AttachmentFileLease,
 ) -> Response:
     """Stream one ready attachment with byte-range support for video seeking."""
 
@@ -276,6 +278,17 @@ def attachment_content_response(
         "ETag": f'"{attachment["sha256"]}"',
     }
     start, end, status = 0, size - 1, 200
+    descriptor = path.descriptor if isinstance(path, AttachmentFileLease) else path
+
+    def close_source() -> None:
+        if isinstance(path, AttachmentFileLease):
+            path.close()
+        elif type(path) is int:
+            try:
+                os.close(path)
+            except OSError:
+                pass
+
     range_header = request.headers.get("range")
     if range_header:
         match = _RANGE_RE.fullmatch(range_header.strip())
@@ -297,6 +310,7 @@ def attachment_content_response(
                     invalid = True
                 end = min(end, size - 1)
         if invalid:
+            close_source()
             return Response(
                 status_code=416,
                 headers={**headers, "Content-Range": f"bytes */{size}"},
@@ -307,9 +321,28 @@ def attachment_content_response(
     headers["Content-Length"] = str(length)
     media_type = str(attachment["media_type"])
     if request.method == "HEAD":
+        close_source()
         return Response(status_code=status, headers=headers, media_type=media_type)
 
     def stream():
+        if type(descriptor) is int:
+            try:
+                offset = start
+                remaining = length
+                while remaining > 0:
+                    block = os.pread(
+                        descriptor,
+                        min(_ATTACHMENT_STREAM_BLOCK_BYTES, remaining),
+                        offset,
+                    )
+                    if not block:
+                        break
+                    offset += len(block)
+                    remaining -= len(block)
+                    yield block
+            finally:
+                close_source()
+            return
         with open(path, "rb") as handle:
             handle.seek(start)
             remaining = length

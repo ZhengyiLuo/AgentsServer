@@ -10,6 +10,7 @@ credentials can be revoked even while the Hub application is unavailable.
 
 from __future__ import annotations
 
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import base64
@@ -26,6 +27,7 @@ import secrets
 import socket
 import sqlite3
 import ssl
+import stat
 import threading
 import time
 from typing import Any, Callable, Iterable, Mapping
@@ -72,6 +74,12 @@ SECURE_STATE_LIVE_BYTES_LIMIT = 128 * 1024 * 1024
 MAX_PAIRING_BODY_BYTES = 64 * 1024
 MAX_PROXY_BODY_BYTES = 65_536
 MAX_RESPONSE_BODY_BYTES = 2 * 1024 * 1024
+MAX_ATTACHMENT_CHUNK_BYTES = 8 * 1024 * 1024
+# The Hub's per-file limit is configurable.  This is only the wire-format
+# ceiling implied by the 15-digit Content-Range grammar; the gateway applies
+# the live Hub limit before dispatching or streaming bytes.
+MAX_ATTACHMENT_PROTOCOL_BYTES = 999_999_999_999_999
+MAX_ATTACHMENT_BYTES = 512 * 1024 * 1024
 MAX_HEADERS = 48
 MAX_HEADER_VALUE_BYTES = 8192
 MAX_HEADER_BLOCK_BYTES = 32 * 1024
@@ -144,6 +152,57 @@ class ProxyResponse:
     status: int
     headers: tuple[tuple[str, str], ...]
     body: bytes
+
+
+@dataclass(frozen=True)
+class AttachmentProxyRequest:
+    """One authenticated request on the attachment-only binary lane."""
+
+    method: str
+    path: str
+    headers: tuple[tuple[str, str], ...]
+    body: bytes
+    peer: PeerAuthorization
+
+
+@dataclass(frozen=True)
+class AttachmentProxyResponse:
+    """A bounded inline response or an already-open authorized file slice."""
+
+    status: int
+    headers: tuple[tuple[str, str], ...]
+    body: bytes = b""
+    descriptor: int | None = None
+    offset: int = 0
+    length: int = 0
+    finalizer: Callable[[], None] | None = None
+    cancelled: Callable[[], bool] | None = None
+
+
+class AttachmentFileLease:
+    """Own a pinned local attachment descriptor until HTTP streaming finishes."""
+
+    __slots__ = ("descriptor", "_release", "_guard", "_closed")
+
+    def __init__(self, descriptor: int, release: Callable[[], None]) -> None:
+        self.descriptor = descriptor
+        self._release = release
+        self._guard = threading.Lock()
+        self._closed = False
+
+    def close(self) -> None:
+        with self._guard:
+            if self._closed:
+                return
+            self._closed = True
+        with suppress(Exception):
+            self._release()
+
+    def __del__(self) -> None:
+        # Covers a cancelled local request whose worker completed after the
+        # awaiting coroutine disappeared. Normal response paths close eagerly.
+        with suppress(Exception):
+            self.close()
 
 
 def _now(value: int | float | None = None) -> int:
@@ -4175,7 +4234,18 @@ _TEAM_ROUTE_RE = re.compile(
 )
 _CHANNEL_MESSAGES_RE = re.compile(rf"^/v1/channels/(?P<channel>{_HUB_SEGMENT})/messages$")
 _NETWORK_ROUTE_RE = re.compile(
-    rf"^/v1/teams/(?P<team>{_HUB_SEGMENT})/network(?P<suffix>(?:/{_HUB_SEGMENT}){{0,3}})$"
+    rf"^/v1/teams/(?P<team>{_HUB_SEGMENT})/network(?P<suffix>(?:/{_HUB_SEGMENT}){{0,4}})$"
+)
+_ATTACHMENT_CONTENT_ROUTE_RE = re.compile(
+    rf"^/v1/teams/(?P<team>{_HUB_SEGMENT})/network/attachments/"
+    rf"(?P<attachment>{_HUB_SEGMENT})/content$"
+)
+_ATTACHMENT_CONTENT_RANGE_RE = re.compile(
+    r"^bytes (?P<start>[0-9]{1,15})-(?P<end>[0-9]{1,15})/"
+    r"(?P<total>[0-9]{1,15})$"
+)
+_ATTACHMENT_RANGE_RE = re.compile(
+    r"^bytes=(?P<start>[0-9]{0,15})-(?P<end>[0-9]{0,15})$"
 )
 _BLOCKED_PROXY_PREFIXES = (
     "/v1/bootstrap",
@@ -4220,6 +4290,237 @@ _STRIP_RESPONSE_HEADERS = {
     "set-cookie",
     "content-length",
 }
+
+
+def is_attachment_proxy_path(path: str) -> bool:
+    return isinstance(path, str) and _ATTACHMENT_CONTENT_ROUTE_RE.fullmatch(path) is not None
+
+
+def sanitize_attachment_proxy_request(
+    peer: PeerAuthorization,
+    method: str,
+    path: str,
+    query: str,
+    headers: Iterable[tuple[str, str]],
+    body: bytes,
+    *,
+    maximum_attachment_bytes: int = MAX_ATTACHMENT_BYTES,
+) -> AttachmentProxyRequest:
+    """Authorize the only routes allowed to escape the JSON proxy bounds."""
+
+    if (
+        type(maximum_attachment_bytes) is not int
+        or not 1 <= maximum_attachment_bytes <= MAX_ATTACHMENT_PROTOCOL_BYTES
+    ):
+        raise SecurePeerError(
+            "hub_unavailable", "Team Hub attachment limit is invalid", 503
+        )
+    normalized_method = str(method).upper()
+    match = (
+        _ATTACHMENT_CONTENT_ROUTE_RE.fullmatch(path)
+        if isinstance(path, str) and len(path) <= 1024 and "%" not in path and "\\" not in path
+        else None
+    )
+    if match is None or match.group("team") != peer.team_id:
+        raise SecurePeerError("route_forbidden", "Hub route is not permitted", 403)
+    if normalized_method not in {"PUT", "GET", "HEAD"}:
+        raise SecurePeerError("method_not_allowed", "Proxy method is not permitted", 405)
+    if query:
+        raise SecurePeerError("invalid_request", "Query is not accepted for this route", 422)
+    required_scope = "teamspace.write" if normalized_method == "PUT" else "teamspace.read"
+    if required_scope not in peer.scopes:
+        raise SecurePeerError("forbidden", "Peer scope does not permit this Hub request", 403)
+    if not isinstance(body, bytes):
+        raise SecurePeerError("invalid_request", "Attachment request body is invalid", 400)
+
+    incoming = list(headers)
+    if len(incoming) > MAX_HEADERS:
+        raise SecurePeerError("invalid_request", "Too many request headers", 431)
+    seen: set[str] = set()
+    forwarded: list[tuple[str, str]] = []
+    allowed = {"accept", "content-type", "content-range", "range"}
+    for raw_name, raw_value in incoming:
+        name = str(raw_name).strip().lower()
+        value = str(raw_value).strip()
+        if (
+            not name
+            or len(name) > 80
+            or len(value.encode("utf-8", "strict")) > MAX_HEADER_VALUE_BYTES
+            or "\r" in value
+            or "\n" in value
+            or name in seen
+        ):
+            raise SecurePeerError("invalid_request", "Proxy request headers are invalid", 400)
+        seen.add(name)
+        if (
+            name in _STRIP_REQUEST_HEADERS
+            or name.startswith("x-forwarded-")
+            or name.startswith("x-team-hub-")
+            or name.startswith("x-agentsdock-")
+            or name.startswith("sec-")
+        ):
+            continue
+        if name in allowed:
+            forwarded.append((name, value))
+
+    values = dict(forwarded)
+    if normalized_method == "PUT":
+        if not 1 <= len(body) <= MAX_ATTACHMENT_CHUNK_BYTES:
+            raise SecurePeerError("request_too_large", "Attachment chunk size is invalid", 413)
+        if values.get("content-type") != "application/octet-stream":
+            raise SecurePeerError(
+                "invalid_request", "Content-Type must be application/octet-stream", 415
+            )
+        content_range = values.get("content-range")
+        range_match = (
+            _ATTACHMENT_CONTENT_RANGE_RE.fullmatch(content_range)
+            if content_range is not None
+            else None
+        )
+        if range_match is None:
+            raise SecurePeerError("invalid_request", "Content-Range is invalid", 422)
+        start = int(range_match.group("start"))
+        end = int(range_match.group("end"))
+        total = int(range_match.group("total"))
+        if (
+            end < start
+            or end - start + 1 != len(body)
+            or end >= total
+            or not 1 <= total <= maximum_attachment_bytes
+            or "range" in values
+        ):
+            raise SecurePeerError("invalid_request", "Content-Range is invalid", 422)
+    else:
+        if body or "content-type" in values or "content-range" in values:
+            raise SecurePeerError(
+                "invalid_request", "Attachment download requests cannot carry a body", 422
+            )
+        range_value = values.get("range")
+        if range_value is not None:
+            range_match = _ATTACHMENT_RANGE_RE.fullmatch(range_value)
+            if range_match is None or (
+                range_match.group("start") == "" and range_match.group("end") == ""
+            ):
+                raise SecurePeerError("invalid_request", "Range is invalid", 422)
+
+    return AttachmentProxyRequest(
+        normalized_method,
+        path,
+        tuple(forwarded),
+        body,
+        peer,
+    )
+
+
+def sanitize_attachment_proxy_response(
+    response: AttachmentProxyResponse,
+    *,
+    maximum_attachment_bytes: int = MAX_ATTACHMENT_PROTOCOL_BYTES,
+) -> AttachmentProxyResponse:
+    """Validate an adapter response before exposing it on the mTLS socket."""
+
+    if (
+        type(maximum_attachment_bytes) is not int
+        or not 1 <= maximum_attachment_bytes <= MAX_ATTACHMENT_PROTOCOL_BYTES
+    ):
+        raise SecurePeerError(
+            "hub_unavailable", "Team Hub attachment limit is invalid", 503
+        )
+    if (
+        not isinstance(response, AttachmentProxyResponse)
+        or type(response.status) is not int
+        or not 200 <= response.status <= 599
+        or 300 <= response.status <= 399
+    ):
+        raise SecurePeerError("upstream_invalid", "Hub returned an invalid response", 502)
+    incoming = list(response.headers)
+    if len(incoming) > MAX_HEADERS:
+        raise SecurePeerError("upstream_invalid", "Hub returned too many headers", 502)
+    allowed_headers = {
+        "accept-ranges",
+        "cache-control",
+        "content-disposition",
+        "content-range",
+        "content-type",
+        "etag",
+        "x-content-type-options",
+    }
+    headers: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for raw_name, raw_value in incoming:
+        name = str(raw_name).lower().strip()
+        value = str(raw_value)
+        if (
+            not name
+            or len(name) > 80
+            or len(value.encode("utf-8", "strict")) > MAX_HEADER_VALUE_BYTES
+            or "\r" in value
+            or "\n" in value
+            or name in seen
+        ):
+            raise SecurePeerError("upstream_invalid", "Hub returned invalid headers", 502)
+        seen.add(name)
+        if name in allowed_headers:
+            headers.append((name, value))
+
+    body = response.body
+    descriptor = response.descriptor
+    offset = response.offset
+    length = response.length
+    if descriptor is None:
+        if not isinstance(body, bytes) or len(body) > MAX_RESPONSE_BODY_BYTES:
+            raise SecurePeerError("upstream_invalid", "Hub response is too large", 502)
+        if (
+            offset != 0
+            or length not in {0, len(body)}
+            or response.finalizer is not None
+            or response.cancelled is not None
+        ):
+            raise SecurePeerError("upstream_invalid", "Hub returned an invalid response", 502)
+        length = len(body)
+    else:
+        if type(descriptor) is not int or descriptor < 0:
+            raise SecurePeerError(
+                "upstream_invalid", "Hub returned an invalid attachment", 502
+            )
+        try:
+            info = os.fstat(descriptor)
+        except (OSError, ValueError) as exc:
+            raise SecurePeerError("upstream_invalid", "Hub attachment is unavailable", 502) from exc
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or not isinstance(body, bytes)
+            or body
+            or type(offset) is not int
+            or type(length) is not int
+            or offset < 0
+            or length < 0
+            or offset + length > info.st_size
+            or length > maximum_attachment_bytes
+            or not callable(response.finalizer)
+            or not callable(response.cancelled)
+        ):
+            raise SecurePeerError("upstream_invalid", "Hub returned an invalid attachment", 502)
+    return AttachmentProxyResponse(
+        response.status,
+        tuple(headers),
+        body=body,
+        descriptor=descriptor,
+        offset=offset,
+        length=length,
+        finalizer=response.finalizer,
+        cancelled=response.cancelled,
+    )
+
+
+def finalize_attachment_proxy_response(response: Any) -> None:
+    """Release one adapter/runtime stream lease without masking the caller."""
+
+    finalizer = getattr(response, "finalizer", None)
+    if callable(finalizer):
+        with suppress(Exception):
+            finalizer()
 
 
 def sanitize_proxy_request(
@@ -4674,8 +4975,13 @@ class SecurePeerGateway:
         bind_ip: str,
         port: int = 7851,
         *,
-        forwarder: Callable[[ProxyRequest], ProxyResponse] | None = None,
+        forwarder: Callable[
+            [ProxyRequest | AttachmentProxyRequest],
+            ProxyResponse | AttachmentProxyResponse,
+        ]
+        | None = None,
         resource_team_resolver: Callable[[str, str], str | None] | None = None,
+        attachment_max_bytes: int | Callable[[], int] = MAX_ATTACHMENT_BYTES,
         relay_enabled: bool | Callable[[], bool] = False,
         peer_heartbeat: Callable[[PeerAuthorization], None] | None = None,
         peer_revoker: Callable[[PeerAuthorization, str], Mapping[str, Any]]
@@ -4686,6 +4992,7 @@ class SecurePeerGateway:
         self.port = canonical_peer_port(port)
         self.forwarder = forwarder
         self.resource_team_resolver = resource_team_resolver
+        self.attachment_max_bytes = attachment_max_bytes
         self.relay_enabled = relay_enabled
         self.peer_heartbeat = peer_heartbeat
         self.peer_revoker = peer_revoker
@@ -4704,6 +5011,26 @@ class SecurePeerGateway:
             )
         except Exception:
             return False
+
+    def _attachment_bytes_limit(self) -> int:
+        try:
+            value = (
+                self.attachment_max_bytes()
+                if callable(self.attachment_max_bytes)
+                else self.attachment_max_bytes
+            )
+        except Exception as exc:
+            raise SecurePeerError(
+                "hub_unavailable", "Team Hub attachment limit is unavailable", 503
+            ) from exc
+        if (
+            type(value) is not int
+            or not 1 <= value <= MAX_ATTACHMENT_PROTOCOL_BYTES
+        ):
+            raise SecurePeerError(
+                "hub_unavailable", "Team Hub attachment limit is invalid", 503
+            )
+        return value
 
     def _peer_relay_available(self, peer: PeerAuthorization) -> bool:
         return self._relay_available() and self.store.cross_chat_authorized(peer)
@@ -4761,6 +5088,8 @@ class SecurePeerGateway:
             "relay_claim": (120, 4_000),
             "relay_receipt": (240, 8_000),
             "proxy": (600, 20_000),
+            "attachment_read": (1_200, 40_000),
+            "attachment_upload": (1_200, 40_000),
         }
         if action not in limits:
             raise ValueError("authenticated rate action is invalid")
@@ -4874,6 +5203,42 @@ class SecurePeerGateway:
                     if not isinstance(value, dict):
                         raise SecurePeerError("invalid_request", "Request body must be a JSON object", 422)
                     return value
+
+                def _attachment_body(self) -> bytes:
+                    """Read one fixed-size binary chunk without entering JSON parsing."""
+
+                    if self.headers.get_all("Transfer-Encoding", failobj=[]):
+                        raise SecurePeerError(
+                            "invalid_request", "Transfer-Encoding is not accepted", 400
+                        )
+                    lengths = self.headers.get_all("Content-Length", failobj=[])
+                    if len(lengths) != 1:
+                        raise SecurePeerError(
+                            "invalid_request", "Exactly one Content-Length is required", 411
+                        )
+                    raw = lengths[0]
+                    if not raw.isdigit() or str(int(raw)) != raw:
+                        raise SecurePeerError(
+                            "invalid_request", "Content-Length is invalid", 400
+                        )
+                    length = int(raw)
+                    if not 1 <= length <= MAX_ATTACHMENT_CHUNK_BYTES:
+                        raise SecurePeerError(
+                            "request_too_large", "Attachment chunk size is invalid", 413
+                        )
+                    if self._exact_header("Content-Type", required=True) != "application/octet-stream":
+                        raise SecurePeerError(
+                            "invalid_request",
+                            "Content-Type must be application/octet-stream",
+                            415,
+                        )
+                    self.connection.settimeout(60)
+                    body = self.rfile.read(length)
+                    if len(body) != length:
+                        raise SecurePeerError(
+                            "invalid_request", "Request body is truncated", 400
+                        )
+                    return body
 
                 def _peer(self, *, allow_pending_renewal: bool = False) -> PeerAuthorization:
                     certificate = self.connection.getpeercert(binary_form=True)
@@ -5014,6 +5379,41 @@ class SecurePeerGateway:
                             return
                         if path.startswith("/v1/hub/"):
                             self._proxy(path, query, b"")
+                            return
+                        raise SecurePeerError("not_found", "Resource not found", 404)
+                    except SecurePeerError as exc:
+                        self._error(exc)
+                    except Exception:
+                        self._error(SecurePeerError("internal_error", "Internal server error", 500))
+
+                def do_HEAD(self) -> None:  # noqa: N802
+                    try:
+                        path, query = self._split()
+                        self._validate_headers()
+                        if path.startswith("/v1/hub/"):
+                            self._proxy(path, query, b"")
+                            return
+                        raise SecurePeerError("not_found", "Resource not found", 404)
+                    except SecurePeerError as exc:
+                        self._error(exc)
+                    except Exception:
+                        self._error(SecurePeerError("internal_error", "Internal server error", 500))
+
+                def do_PUT(self) -> None:  # noqa: N802
+                    try:
+                        path, query = self._split()
+                        self._validate_headers()
+                        if query:
+                            raise SecurePeerError(
+                                "invalid_request", "Query is not accepted", 422
+                            )
+                        target_path = path[len("/v1/hub") :] if path.startswith("/v1/hub/") else ""
+                        if is_attachment_proxy_path(target_path):
+                            # Authenticate before accepting up to an 8 MiB
+                            # body from the TLS socket. The proxy repeats the
+                            # check at dispatch to close revocation races.
+                            self._peer()
+                            self._proxy(path, "", self._attachment_body())
                             return
                         raise SecurePeerError("not_found", "Resource not found", 404)
                     except SecurePeerError as exc:
@@ -5197,8 +5597,73 @@ class SecurePeerGateway:
                     if gateway.forwarder is None:
                         raise SecurePeerError("hub_unavailable", "Team Hub proxy is unavailable", 503)
                     peer = self._peer()
-                    self._peer_rate(peer, "proxy")
                     target_path = path[len("/v1/hub") :]
+                    if is_attachment_proxy_path(target_path):
+                        self._peer_rate(
+                            peer,
+                            "attachment_upload" if self.command == "PUT" else "attachment_read",
+                        )
+                        request = sanitize_attachment_proxy_request(
+                            peer,
+                            self.command,
+                            target_path,
+                            query,
+                            tuple((name, value) for name, value in self.headers.items()),
+                            body,
+                            maximum_attachment_bytes=gateway._attachment_bytes_limit(),
+                        )
+                        raw_response = gateway.forwarder(request)
+                        try:
+                            response = sanitize_attachment_proxy_response(
+                                raw_response,
+                                maximum_attachment_bytes=MAX_ATTACHMENT_PROTOCOL_BYTES,
+                            )
+                        except BaseException:
+                            finalize_attachment_proxy_response(raw_response)
+                            raise
+                        try:
+                            # Once the status line is emitted, any file/socket
+                            # failure must terminate this connection. Emitting
+                            # a second JSON status line would corrupt the bytes
+                            # promised by Content-Length.
+                            try:
+                                self.send_response(response.status)
+                                for name, value in response.headers:
+                                    self.send_header(name, value)
+                                self.send_header("Content-Length", str(response.length))
+                                self.send_header("Connection", "close")
+                                self.end_headers()
+                                if self.command != "HEAD":
+                                    if response.descriptor is None:
+                                        self.wfile.write(response.body)
+                                    else:
+                                        remaining = response.length
+                                        offset = response.offset
+                                        while remaining > 0:
+                                            if response.cancelled is not None and response.cancelled():
+                                                raise OSError("Hub attachment stream was revoked")
+                                            block = os.pread(
+                                                response.descriptor,
+                                                min(1024 * 1024, remaining),
+                                                offset,
+                                            )
+                                            if not block:
+                                                raise OSError(
+                                                    "Hub attachment was truncated"
+                                                )
+                                            if response.cancelled is not None and response.cancelled():
+                                                raise OSError("Hub attachment stream was revoked")
+                                            self.wfile.write(block)
+                                            remaining -= len(block)
+                                            offset += len(block)
+                            except Exception:
+                                self.close_connection = True
+                                return
+                            self.close_connection = True
+                            return
+                        finally:
+                            finalize_attachment_proxy_response(response)
+                    self._peer_rate(peer, "proxy")
                     request = sanitize_proxy_request(
                         peer,
                         self.command,
@@ -5668,9 +6133,15 @@ class SecurePeerClient:
         context: ssl.SSLContext,
         no_sni: bool = False,
         maximum_response: int = MAX_RESPONSE_BODY_BYTES,
+        timeout_seconds: float | None = None,
     ) -> tuple[int, list[tuple[str, str]], bytes, bytes]:
         connection_type = _NoSNIHTTPSConnection if no_sni else http.client.HTTPSConnection
-        connection = connection_type(host, port, timeout=self.timeout_seconds, context=context)
+        request_timeout = (
+            self.timeout_seconds if timeout_seconds is None else float(timeout_seconds)
+        )
+        if not 0.1 <= request_timeout <= 600.0:
+            raise ValueError("client request timeout is invalid")
+        connection = connection_type(host, port, timeout=request_timeout, context=context)
         encoded: bytes | None
         # ``http.client`` treats header names case-insensitively, while a Python
         # dict does not.  Normalize caller-provided names before adding our
@@ -5736,14 +6207,16 @@ class SecurePeerClient:
                 transfers
                 or len(lengths) != 1
                 or not lengths[0].isdigit()
-                or len(lengths[0]) > 10
+                or len(lengths[0]) > len(str(MAX_ATTACHMENT_PROTOCOL_BYTES))
             ):
                 raise SecurePeerError("remote_invalid", "Peer response length is invalid", 502)
             length = int(lengths[0])
-            if length > maximum_response:
+            if length > MAX_ATTACHMENT_PROTOCOL_BYTES:
+                raise SecurePeerError("remote_invalid", "Peer response length is invalid", 502)
+            if method.upper() != "HEAD" and length > maximum_response:
                 raise SecurePeerError("remote_invalid", "Peer response is too large", 502)
-            response_body = response.read(length + 1)
-            if len(response_body) != length:
+            response_body = b"" if method.upper() == "HEAD" else response.read(length + 1)
+            if method.upper() != "HEAD" and len(response_body) != length:
                 raise SecurePeerError("remote_invalid", "Peer response is truncated", 502)
             return response.status, response_headers, response_body, leaf
         except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
@@ -7135,6 +7608,272 @@ class SecurePeerClient:
         return sanitize_proxy_response(
             ProxyResponse(status, tuple(response_headers), raw)
         )
+
+    @staticmethod
+    def _attachment_response_headers(
+        status: int,
+        response_headers: Iterable[tuple[str, str]],
+    ) -> tuple[tuple[str, str], ...]:
+        if not 200 <= status <= 599 or 300 <= status <= 399:
+            raise SecurePeerError("remote_invalid", "Peer returned an invalid response", 502)
+        allowed = {
+            "accept-ranges",
+            "cache-control",
+            "content-disposition",
+            "content-length",
+            "content-range",
+            "content-type",
+            "etag",
+            "x-content-type-options",
+        }
+        result: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for raw_name, raw_value in response_headers:
+            name = str(raw_name).strip().lower()
+            value = str(raw_value)
+            if (
+                not name
+                or name in seen
+                or len(name) > 80
+                or len(value.encode("latin-1", "strict")) > MAX_HEADER_VALUE_BYTES
+                or "\r" in value
+                or "\n" in value
+            ):
+                raise SecurePeerError("remote_invalid", "Peer returned invalid headers", 502)
+            seen.add(name)
+            if name in allowed:
+                result.append((name, value))
+        return tuple(result)
+
+    def upload_attachment_chunk(
+        self,
+        connection_id: str,
+        hub_path: str,
+        *,
+        content_range: str,
+        body: bytes,
+    ) -> ProxyResponse:
+        """Send one bounded, fixed-range attachment chunk over pinned mTLS."""
+
+        if not is_attachment_proxy_path(hub_path):
+            raise ValueError("attachment path is invalid")
+        if not isinstance(body, bytes) or not 1 <= len(body) <= MAX_ATTACHMENT_CHUNK_BYTES:
+            raise ValueError("attachment chunk is invalid")
+        with self._route_guard:
+            self._require_active_connection_locked(connection_id, relay_required=False)
+            row = self._connection_row(connection_id)
+            status, response_headers, raw, _leaf = self._request(
+                row["host_ip"],
+                int(row["port"]),
+                "PUT",
+                "/v1/hub" + hub_path,
+                body=body,
+                headers={
+                    "content-type": "application/octet-stream",
+                    "content-range": content_range,
+                },
+                context=self._pinned_context(row, mutual_tls=True),
+                # A final chunk performs a whole-file hash and fsync before
+                # replying. Keep the socket bounded but do not inherit the
+                # ordinary 10-second JSON-control timeout.
+                timeout_seconds=max(self.timeout_seconds, 300.0),
+            )
+            if status >= 400:
+                self._decode_json_response(status, response_headers, raw)
+            return ProxyResponse(
+                status,
+                self._attachment_response_headers(status, response_headers),
+                raw,
+            )
+
+    def head_attachment(
+        self, connection_id: str, hub_path: str
+    ) -> ProxyResponse:
+        """Read immutable attachment metadata without downloading its body."""
+
+        if not is_attachment_proxy_path(hub_path):
+            raise ValueError("attachment path is invalid")
+        with self._route_guard:
+            self._require_active_connection_locked(connection_id, relay_required=False)
+            row = self._connection_row(connection_id)
+            status, response_headers, raw, _leaf = self._request(
+                row["host_ip"],
+                int(row["port"]),
+                "HEAD",
+                "/v1/hub" + hub_path,
+                context=self._pinned_context(row, mutual_tls=True),
+                maximum_response=MAX_ATTACHMENT_PROTOCOL_BYTES,
+            )
+            if status >= 400:
+                # HEAD intentionally has no error body. Preserve a small typed
+                # failure without trusting an absent JSON envelope. A 401 is
+                # kept as an unconfirmed revoke signal so the runtime can use
+                # the separately pinned revocation-status endpoint before it
+                # retires the durable connection.
+                raise SecurePeerError(
+                    "peer_revoked" if status == 401 else "attachment_unavailable",
+                    (
+                        "Secure peer authorization is no longer active"
+                        if status == 401
+                        else "Remote Team attachment is unavailable"
+                    ),
+                    status,
+                )
+            return ProxyResponse(
+                status,
+                self._attachment_response_headers(status, response_headers),
+                raw,
+            )
+
+    def read_attachment_range(
+        self,
+        connection_id: str,
+        hub_path: str,
+        range_header: str,
+        *,
+        maximum_response: int = MAX_ATTACHMENT_CHUNK_BYTES,
+    ) -> ProxyResponse:
+        """Read one bounded range; full downloads must use download_attachment_to."""
+
+        if not is_attachment_proxy_path(hub_path):
+            raise ValueError("attachment path is invalid")
+        if not 1 <= int(maximum_response) <= MAX_ATTACHMENT_BYTES:
+            raise ValueError("maximum response is invalid")
+        if _ATTACHMENT_RANGE_RE.fullmatch(str(range_header)) is None:
+            raise ValueError("attachment range is invalid")
+        with self._route_guard:
+            self._require_active_connection_locked(connection_id, relay_required=False)
+            row = self._connection_row(connection_id)
+            status, response_headers, raw, _leaf = self._request(
+                row["host_ip"],
+                int(row["port"]),
+                "GET",
+                "/v1/hub" + hub_path,
+                headers={"range": str(range_header)},
+                context=self._pinned_context(row, mutual_tls=True),
+                maximum_response=int(maximum_response),
+            )
+            if status >= 400 and status != 416:
+                self._decode_json_response(status, response_headers, raw)
+            return ProxyResponse(
+                status,
+                self._attachment_response_headers(status, response_headers),
+                raw,
+            )
+
+    def download_attachment_to(
+        self,
+        connection_id: str,
+        hub_path: str,
+        destination: Path,
+        *,
+        expected_size: int,
+    ) -> tuple[tuple[str, str], ...]:
+        """Stream a full attachment to a new file without buffering it in RAM."""
+
+        if not is_attachment_proxy_path(hub_path):
+            raise ValueError("attachment path is invalid")
+        if (
+            type(expected_size) is not int
+            or not 1 <= expected_size <= MAX_ATTACHMENT_PROTOCOL_BYTES
+        ):
+            raise ValueError("attachment size is invalid")
+        destination = Path(destination)
+        with self._route_guard:
+            self._require_active_connection_locked(connection_id, relay_required=False)
+            row = self._connection_row(connection_id)
+            connection = http.client.HTTPSConnection(
+                row["host_ip"],
+                int(row["port"]),
+                timeout=max(self.timeout_seconds, 30.0),
+                context=self._pinned_context(row, mutual_tls=True),
+            )
+            try:
+                connection.request(
+                    "GET",
+                    "/v1/hub" + hub_path,
+                    headers={"Accept": "application/octet-stream", "Connection": "close"},
+                )
+                response = connection.getresponse()
+                response_headers = response.getheaders()
+                transfers = [
+                    value
+                    for name, value in response_headers
+                    if name.lower() == "transfer-encoding"
+                ]
+                lengths = [
+                    value
+                    for name, value in response_headers
+                    if name.lower() == "content-length"
+                ]
+                if (
+                    transfers
+                    or len(lengths) != 1
+                    or not lengths[0].isdigit()
+                    or int(lengths[0]) > MAX_ATTACHMENT_PROTOCOL_BYTES
+                ):
+                    raise SecurePeerError(
+                        "remote_invalid", "Peer response length is invalid", 502
+                    )
+                length = int(lengths[0])
+                if response.status >= 400:
+                    if length > MAX_RESPONSE_BODY_BYTES:
+                        raise SecurePeerError(
+                            "remote_invalid", "Peer error response is too large", 502
+                        )
+                    raw = response.read(length + 1)
+                    if len(raw) != length:
+                        raise SecurePeerError(
+                            "remote_invalid", "Peer response is truncated", 502
+                        )
+                    self._decode_json_response(response.status, response_headers, raw)
+                if response.status != 200 or length != expected_size:
+                    raise SecurePeerError(
+                        "remote_invalid", "Peer attachment size changed", 502
+                    )
+                clean_headers = self._attachment_response_headers(
+                    response.status, response_headers
+                )
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(destination, flags, 0o600)
+                try:
+                    remaining = length
+                    while remaining:
+                        block = response.read(min(1024 * 1024, remaining))
+                        if not block:
+                            raise SecurePeerError(
+                                "remote_invalid", "Peer attachment is truncated", 502
+                            )
+                        view = memoryview(block)
+                        while view:
+                            written = os.write(descriptor, view)
+                            if written <= 0:
+                                raise OSError("Team attachment cache write stalled")
+                            view = view[written:]
+                        remaining -= len(block)
+                    if response.read(1):
+                        raise SecurePeerError(
+                            "remote_invalid", "Peer attachment exceeded its length", 502
+                        )
+                    os.fsync(descriptor)
+                except BaseException:
+                    with suppress(OSError):
+                        os.close(descriptor)
+                    with suppress(OSError):
+                        destination.unlink()
+                    raise
+                else:
+                    os.close(descriptor)
+                return clean_headers
+            except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+                with suppress(OSError):
+                    destination.unlink()
+                raise SecurePeerError(
+                    "transport_failed", "Secure peer connection failed", 502
+                ) from exc
+            finally:
+                connection.close()
 
     def list_remote_routes(self, connection_id: str) -> list[dict[str, Any]]:
         row = self._connection_row(connection_id)

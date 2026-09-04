@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 import uuid
 from unittest import mock
@@ -124,6 +125,12 @@ class TeamMessagesServiceTests(unittest.TestCase):
                 "idempotency_key": _key(),
             },
         )
+
+    def upload(self, bundle: dict, payload: bytes, *, name: str = "demo.bin") -> dict:
+        attachment = self.declare(bundle, payload, name=name)["attachment"]
+        response = self.put_chunk(bundle, attachment["id"], payload, 0, len(payload) - 1)
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()["attachment"]
 
     # -- health -------------------------------------------------------------
 
@@ -840,6 +847,82 @@ class TeamMessagesServiceTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_failed_skill_cas_keeps_ready_attachment_bindable_for_retry(self) -> None:
+        first = self.skill_post(
+            self.owner,
+            "attachment-retry",
+            "Attachment retry",
+            "# v1",
+        )["message"]
+        payload = b"retry after a stale skill edit"
+        attachment = self.upload(self.owner, payload, name="retry.md")
+        request = {
+            "kind": "skill",
+            "title": "Attachment retry v2",
+            "body": "# v2",
+            "recipients": [{"kind": "all"}],
+            "attachment_ids": [attachment["id"]],
+            "skill": {
+                "slug": "attachment-retry",
+                "expected_version": 99,
+            },
+            "idempotency_key": _key(),
+        }
+
+        conflict = self.post(self.owner, f"{self.base}/messages", request, expected=409)
+        self.assertEqual(conflict["error"]["code"], "skill_version_conflict")
+        still_ready = self.get(
+            self.owner, f"{self.base}/attachments/{attachment['id']}"
+        )["attachment"]
+        self.assertEqual(still_ready["state"], "ready")
+        self.assertIsNone(still_ready["message_id"])
+
+        retried = self.post(
+            self.owner,
+            f"{self.base}/messages",
+            {
+                **request,
+                "skill": {
+                    "slug": "attachment-retry",
+                    "expected_version": first["skill"]["version"],
+                },
+                "idempotency_key": _key(),
+            },
+        )["message"]
+        self.assertEqual(retried["skill"]["version"], 2)
+        self.assertEqual(retried["attachments"][0]["id"], attachment["id"])
+        self.assertEqual(retried["attachments"][0]["message_id"], retried["id"])
+
+    def test_failed_message_request_keeps_ready_attachment_bindable_for_retry(self) -> None:
+        payload = b"retry after an unavailable recipient"
+        attachment = self.upload(self.owner, payload, name="request-retry.txt")
+        failed = self.post(
+            self.owner,
+            f"{self.base}/messages",
+            {
+                "kind": "message",
+                "body": "first attempt",
+                "recipients": [{"kind": "server", "id": "node_missing0000"}],
+                "attachment_ids": [attachment["id"]],
+                "idempotency_key": _key(),
+            },
+            expected=404,
+        )
+        self.assertEqual(failed["error"]["code"], "recipient_unavailable")
+        still_ready = self.get(
+            self.owner, f"{self.base}/attachments/{attachment['id']}"
+        )["attachment"]
+        self.assertIsNone(still_ready["message_id"])
+
+        retried = self.send(
+            self.owner,
+            [{"kind": "all"}],
+            body="second attempt",
+            attachment_ids=[attachment["id"]],
+        )
+        self.assertEqual(retried["attachments"][0]["id"], attachment["id"])
+        self.assertEqual(retried["attachments"][0]["message_id"], retried["id"])
+
     def test_attachment_hash_mismatch_fails_closed(self) -> None:
         payload = b"x" * 3000
         wrong = hashlib.sha256(b"different").hexdigest()
@@ -933,23 +1016,274 @@ class TeamMessagesServiceTests(unittest.TestCase):
         self.assertEqual(response.status_code, 404, response.text)
         del guest
 
-    def test_expired_incomplete_uploads_are_purged_but_ready_files_stay(self) -> None:
+    def test_expired_unbound_uploads_are_purged_in_bounded_batches(self) -> None:
         store = self.app.state.store
         payload = b"z" * 100
         stale = self.declare(self.owner, payload, name="stale.bin")["attachment"]
         self.put_chunk(self.owner, stale["id"], payload, 0, 49)
-        finished = self.declare(self.owner, b"q" * 20, name="done.bin")["attachment"]
-        self.assertEqual(
-            self.put_chunk(self.owner, finished["id"], b"q" * 20, 0, 19).status_code, 200
+        orphan = self.upload(self.owner, b"q" * 20, name="orphan.bin")
+        survivor = self.upload(self.owner, b"s" * 20, name="bound.bin")
+        message = self.send(
+            self.owner,
+            [{"kind": "all"}],
+            body="durable attachment",
+            attachment_ids=[survivor["id"]],
         )
         far_future = 10**10
-        removed = store.purge_expired_team_attachments(far_future)
-        self.assertEqual(removed, 1)
+        self.assertEqual(store.purge_expired_team_attachments(far_future, limit=1), 1)
+        self.assertEqual(store.purge_expired_team_attachments(far_future, limit=1), 1)
+        self.assertEqual(store.purge_expired_team_attachments(far_future, limit=1), 0)
         self.get(self.owner, f"{self.base}/attachments/{stale['id']}", expected=404)
+        self.get(self.owner, f"{self.base}/attachments/{orphan['id']}", expected=404)
         self.assertEqual(
-            self.get(self.owner, f"{self.base}/attachments/{finished['id']}")["attachment"]["state"],
+            self.get(self.owner, f"{self.base}/attachments/{survivor['id']}")["attachment"][
+                "message_id"
+            ],
+            message["id"],
+        )
+        self.assertEqual(
+            self.get(self.owner, f"{self.base}/attachments/{survivor['id']}")["attachment"][
+                "state"
+            ],
             "ready",
         )
+
+    def test_expired_ready_orphan_does_not_permanently_consume_quota(self) -> None:
+        store = self.app.state.store
+        payload = b"o" * 32
+        orphan = self.upload(self.owner, payload, name="quota-orphan.bin")
+        orphan_path = self.data_dir / "attachments" / orphan["sha256"][:2] / orphan["sha256"]
+        self.assertTrue(orphan_path.is_file())
+
+        connection = store.connect()
+        try:
+            row = connection.execute(
+                "SELECT created_at FROM team_attachments WHERE id=?", (orphan["id"],)
+            ).fetchone()
+            assert row is not None
+            expired_at = int(row["created_at"]) + 1
+            connection.execute(
+                "UPDATE team_attachments SET expires_at=? WHERE id=?",
+                (expired_at, orphan["id"]),
+            )
+        finally:
+            connection.close()
+
+        store.team_attachment_quota_bytes = len(payload)
+        replacement_payload = b"n" * len(payload)
+        with (
+            mock.patch.object(store, "purge_expired_team_attachments", return_value=0),
+            mock.patch("agentsdock_team_hub.store._now", return_value=expired_at + 1),
+        ):
+            replacement = self.declare(
+                self.owner,
+                replacement_payload,
+                name="replacement.bin",
+            )["attachment"]
+        self.assertEqual(replacement["state"], "uploading")
+        # Quota admission excludes expired unbound rows even if a bounded
+        # opportunistic sweep has not reached them yet.
+        self.assertTrue(orphan_path.exists())
+        self.assertEqual(store.purge_expired_team_attachments(expired_at + 1), 1)
+        self.get(self.owner, f"{self.base}/attachments/{orphan['id']}", expected=404)
+        self.assertFalse(orphan_path.exists())
+
+    def test_expired_declaration_replay_requires_a_fresh_idempotency_key(self) -> None:
+        store = self.app.state.store
+        payload = b"expired idempotency response"
+        request = {
+            "file_name": "expired-replay.bin",
+            "media_type": "application/octet-stream",
+            "byte_size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "idempotency_key": _key(),
+        }
+        attachment = self.post(
+            self.owner, f"{self.base}/attachments", request
+        )["attachment"]
+        response = self.put_chunk(
+            self.owner, attachment["id"], payload, 0, len(payload) - 1
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        connection = store.connect()
+        try:
+            row = connection.execute(
+                "SELECT created_at FROM team_attachments WHERE id=?", (attachment["id"],)
+            ).fetchone()
+            assert row is not None
+            expired_at = int(row["created_at"]) + 1
+            connection.execute(
+                "UPDATE team_attachments SET expires_at=? WHERE id=?",
+                (expired_at, attachment["id"]),
+            )
+        finally:
+            connection.close()
+        self.assertEqual(store.purge_expired_team_attachments(expired_at + 1), 1)
+
+        with mock.patch("agentsdock_team_hub.store._now", return_value=expired_at + 1):
+            replay = self.post(
+                self.owner, f"{self.base}/attachments", request, expected=409
+            )
+            fresh = self.post(
+                self.owner,
+                f"{self.base}/attachments",
+                {**request, "idempotency_key": _key()},
+            )["attachment"]
+        self.assertEqual(replay["error"]["code"], "attachment_unavailable")
+        self.assertEqual(fresh["state"], "uploading")
+
+    def test_reclaiming_ready_duplicates_preserves_shared_and_bound_blob(self) -> None:
+        store = self.app.state.store
+        payload = b"content addressed shared bytes"
+        bound = self.upload(self.owner, payload, name="bound-copy.bin")
+        message = self.send(
+            self.owner,
+            [{"kind": "all"}],
+            body="owns shared bytes",
+            attachment_ids=[bound["id"]],
+        )
+        expired = self.declare(self.owner, payload, name="expired-copy.bin")["attachment"]
+        live = self.declare(self.owner, payload, name="live-copy.bin")["attachment"]
+        self.assertEqual(expired["state"], "ready")
+        self.assertEqual(live["state"], "ready")
+        shared_path = self.data_dir / "attachments" / bound["sha256"][:2] / bound["sha256"]
+
+        connection = store.connect()
+        try:
+            row = connection.execute(
+                "SELECT created_at FROM team_attachments WHERE id=?", (expired["id"],)
+            ).fetchone()
+            assert row is not None
+            expired_at = int(row["created_at"]) + 1
+            connection.execute(
+                "UPDATE team_attachments SET expires_at=? WHERE id=?",
+                (expired_at, expired["id"]),
+            )
+        finally:
+            connection.close()
+
+        self.assertEqual(store.purge_expired_team_attachments(expired_at + 1), 1)
+        self.assertTrue(shared_path.is_file())
+        self.get(self.owner, f"{self.base}/attachments/{expired['id']}", expected=404)
+        self.assertEqual(
+            self.get(self.owner, f"{self.base}/attachments/{live['id']}")["attachment"][
+                "state"
+            ],
+            "ready",
+        )
+
+        # Once the other unbound reference expires, the message-bound reference
+        # still protects the physical blob indefinitely.
+        self.assertEqual(store.purge_expired_team_attachments(10**10), 1)
+        self.assertTrue(shared_path.is_file())
+        download = self.client.get(
+            f"{self.base}/attachments/{bound['id']}/content",
+            headers=self.auth(self.owner),
+        )
+        self.assertEqual(download.status_code, 200, download.text)
+        self.assertEqual(download.content, payload)
+        self.assertEqual(
+            self.get(self.owner, f"{self.base}/attachments/{bound['id']}")["attachment"][
+                "message_id"
+            ],
+            message["id"],
+        )
+
+    def test_declaration_waits_for_reclaimer_before_deciding_blob_is_ready(self) -> None:
+        store = self.app.state.store
+        payload = b"serialize ready deduplication with physical reclamation"
+        orphan = self.upload(self.owner, payload, name="race-orphan.bin")
+        connection = store.connect()
+        try:
+            row = connection.execute(
+                "SELECT created_at FROM team_attachments WHERE id=?", (orphan["id"],)
+            ).fetchone()
+            assert row is not None
+            expired_at = int(row["created_at"]) + 1
+            connection.execute(
+                "UPDATE team_attachments SET expires_at=? WHERE id=?",
+                (expired_at, orphan["id"]),
+            )
+        finally:
+            connection.close()
+
+        claims = store.verify_access(self.owner["access_token"])
+        original_purge = store.purge_expired_team_attachments
+        original_storage_path = store._team_attachment_storage_path
+        collector_at_unlink = threading.Event()
+        allow_unlink = threading.Event()
+        declaration_done = threading.Event()
+        outcomes: dict[str, object] = {}
+
+        def controlled_storage_path(storage_key: str) -> Path:
+            if threading.current_thread().name == "attachment-reclaimer":
+                collector_at_unlink.set()
+                if not allow_unlink.wait(2):
+                    raise RuntimeError("test did not release attachment reclaimer")
+            return original_storage_path(storage_key)
+
+        def controlled_purge(*args, **kwargs) -> int:
+            if threading.current_thread().name == "attachment-declarer":
+                return 0
+            return original_purge(*args, **kwargs)
+
+        def reclaim() -> None:
+            try:
+                outcomes["removed"] = store.purge_expired_team_attachments(expired_at + 1)
+            except BaseException as exc:  # pragma: no cover - asserted below
+                outcomes["reclaim_error"] = exc
+
+        def declare_replacement() -> None:
+            try:
+                outcomes["declared"] = store.declare_team_attachment(
+                    claims,
+                    self.team_id,
+                    {
+                        "file_name": "race-replacement.bin",
+                        "media_type": "application/octet-stream",
+                        "byte_size": len(payload),
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                        "idempotency_key": _key(),
+                    },
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                outcomes["declare_error"] = exc
+            finally:
+                declaration_done.set()
+
+        with (
+            mock.patch.object(
+                store, "_team_attachment_storage_path", side_effect=controlled_storage_path
+            ),
+            mock.patch.object(
+                store, "purge_expired_team_attachments", side_effect=controlled_purge
+            ),
+        ):
+            collector = threading.Thread(target=reclaim, name="attachment-reclaimer")
+            declarer = threading.Thread(target=declare_replacement, name="attachment-declarer")
+            declarer_started = False
+            collector.start()
+            try:
+                self.assertTrue(collector_at_unlink.wait(2))
+                declarer.start()
+                declarer_started = True
+                self.assertFalse(declaration_done.wait(0.1))
+            finally:
+                allow_unlink.set()
+            collector.join(2)
+            if declarer_started:
+                declarer.join(2)
+
+        self.assertFalse(collector.is_alive())
+        self.assertTrue(declarer_started)
+        self.assertFalse(declarer.is_alive())
+        self.assertNotIn("reclaim_error", outcomes)
+        self.assertNotIn("declare_error", outcomes)
+        self.assertEqual(outcomes["removed"], 1)
+        declared = outcomes["declared"]
+        assert isinstance(declared, dict)
+        self.assertEqual(declared["attachment"]["state"], "uploading")
 
 
 if __name__ == "__main__":

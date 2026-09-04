@@ -820,6 +820,7 @@ TEAM_HUB_RELEASE_FILES=(
   migrations/0007_local_agent_mail.sql
   migrations/0008_managed_server_session.sql
   migrations/0009_team_messages.sql
+  migrations/0010_team_attachment_orphan_reclamation.sql
 )
 
 for name in "${RELEASE_FILES[@]}"; do

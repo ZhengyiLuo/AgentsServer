@@ -96,6 +96,9 @@ TEAM_ATTACHMENT_CHUNK_BYTES = 8 * 1024 * 1024
 MAX_TEAM_ATTACHMENT_PROTOCOL_BYTES = 999_999_999_999_999
 MAX_SQLITE_SIGNED_INTEGER = 9_223_372_036_854_775_807
 TEAM_ATTACHMENT_UPLOAD_TTL_SECONDS = 24 * 60 * 60
+# Opportunistic cleanup is intentionally bounded so an ordinary declaration
+# cannot turn into an unbounded maintenance request after a long offline period.
+TEAM_ATTACHMENT_RECLAIM_BATCH = 128
 MAX_TEAM_SKILLS_PER_TEAM = 500
 MAX_TEAM_SKILL_VERSIONS = 200
 MAX_TEAM_SKILL_TAGS = 8
@@ -8248,10 +8251,11 @@ class HubStore:
                         or attachment["state"] != "ready"
                         or attachment["message_id"] is not None
                         or attachment["uploaded_by_principal_id"] != claims.principal_id
+                        or int(attachment["expires_at"]) <= timestamp
                     ):
                         raise HubError(
                             "attachment_unavailable",
-                            "An attachment is missing, unfinished, or already used",
+                            "An attachment is missing, unfinished, expired, or already used",
                             409,
                         )
                     attachment_rows.append(attachment)
@@ -8395,13 +8399,14 @@ class HubStore:
                         """
                         UPDATE team_attachments SET message_id=?
                         WHERE team_id=? AND id=? AND message_id IS NULL AND state='ready'
+                          AND expires_at>?
                         """,
-                        (message_id, team_id, attachment["id"]),
+                        (message_id, team_id, attachment["id"], timestamp),
                     )
                     if bound.rowcount != 1:
                         raise HubError(
                             "attachment_unavailable",
-                            "An attachment is missing, unfinished, or already used",
+                            "An attachment is missing, unfinished, expired, or already used",
                             409,
                         )
                 skill_version_id: str | None = None
@@ -8803,8 +8808,23 @@ class HubStore:
                 "sha256": storage_key,
             }
         )
-        connection = self.connect()
+        # A failed message/skill request deliberately leaves a ready upload
+        # available for retry. Once that bounded window expires, reclaim a small
+        # batch before admitting more bytes. The quota query below independently
+        # excludes every expired unbound row, so a backlog cannot wedge uploads.
+        self.purge_expired_team_attachments(
+            timestamp,
+            team_id=team_id,
+            limit=TEAM_ATTACHMENT_RECLAIM_BATCH,
+        )
+        # Keep the duplicate-ready decision and row insertion serialized with
+        # collector unlinking. Otherwise a declaration that read the soon-to-be
+        # deleted ready row could publish a new ready reference after the
+        # collector commits but before it unlinks the shared blob.
+        attachment_lease = self.acquire_attachment_control_lease(self.data_dir)
+        connection: sqlite3.Connection | None = None
         try:
+            connection = self.connect()
             with _write_transaction(connection):
                 self._require_network_scope(connection, claims, team_id, write=True)
                 cached = self._idempotency_lookup(
@@ -8816,13 +8836,38 @@ class HubStore:
                     fingerprint,
                 )
                 if cached is not None:
+                    cached_attachment = cached.get("attachment")
+                    cached_attachment_id = (
+                        cached_attachment.get("id")
+                        if isinstance(cached_attachment, dict)
+                        else None
+                    )
+                    existing = (
+                        connection.execute(
+                            "SELECT message_id,expires_at FROM team_attachments "
+                            "WHERE team_id=? AND id=?",
+                            (team_id, cached_attachment_id),
+                        ).fetchone()
+                        if isinstance(cached_attachment_id, str)
+                        else None
+                    )
+                    if existing is None or (
+                        existing["message_id"] is None
+                        and int(existing["expires_at"]) <= timestamp
+                    ):
+                        raise HubError(
+                            "attachment_unavailable",
+                            "Attachment declaration expired; declare it again with a new idempotency key",
+                            409,
+                        )
                     return cached
                 used = connection.execute(
                     """
                     SELECT COALESCE(SUM(byte_size),0) FROM team_attachments
                     WHERE team_id=? AND state IN ('uploading','ready')
+                      AND (message_id IS NOT NULL OR expires_at>?)
                     """,
-                    (team_id,),
+                    (team_id, timestamp),
                 ).fetchone()[0]
                 if int(used) + byte_size > self.team_attachment_quota_bytes:
                     raise HubError(
@@ -8835,9 +8880,10 @@ class HubStore:
                     """
                     SELECT 1 FROM team_attachments
                     WHERE team_id=? AND storage_key=? AND state='ready' AND byte_size=?
+                      AND (message_id IS NOT NULL OR expires_at>?)
                     LIMIT 1
                     """,
-                    (team_id, storage_key, byte_size),
+                    (team_id, storage_key, byte_size, timestamp),
                 ).fetchone()
                 already_stored = (
                     duplicate_ready is not None
@@ -8916,7 +8962,9 @@ class HubStore:
                 )
                 return response
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
+            self.release_attachment_control_lease(attachment_lease)
 
     def write_team_attachment_chunk(
         self,
@@ -8989,6 +9037,14 @@ class HubStore:
                 ).fetchone()
                 if row is None or row["uploaded_by_principal_id"] != claims.principal_id:
                     raise HubError("not_found", "Resource not found", 404)
+                if row["message_id"] is None and int(row["expires_at"]) <= timestamp:
+                    raise _TeamAttachmentFailure(
+                        HubError(
+                            "attachment_unavailable",
+                            "Attachment upload expired; declare it again",
+                            409,
+                        )
+                    )
                 byte_size = int(row["byte_size"])
                 if total != byte_size:
                     raise HubError("invalid_request", "Attachment range total is wrong", 422)
@@ -9073,9 +9129,14 @@ class HubStore:
                     connection.execute(
                         """
                         UPDATE team_attachments
-                        SET received_bytes=?,state='ready',ready_at=? WHERE id=?
+                        SET received_bytes=?,state='ready',ready_at=?,expires_at=? WHERE id=?
                         """,
-                        (byte_size, timestamp, attachment_id),
+                        (
+                            byte_size,
+                            timestamp,
+                            timestamp + TEAM_ATTACHMENT_UPLOAD_TTL_SECONDS,
+                            attachment_id,
+                        ),
                     )
                     self._audit(
                         connection,
@@ -9112,7 +9173,10 @@ class HubStore:
         membership_role: str,
     ) -> bool:
         if row["message_id"] is None:
-            return row["uploaded_by_principal_id"] == claims.principal_id
+            return (
+                row["uploaded_by_principal_id"] == claims.principal_id
+                and int(row["expires_at"]) > _now()
+            )
         message = connection.execute(
             self._team_message_select() + " WHERE m.team_id=? AND m.id=?",
             (team_id, row["message_id"]),
@@ -9181,32 +9245,69 @@ class HubStore:
         finally:
             connection.close()
 
-    def purge_expired_team_attachments(self, now: int | None = None) -> int:
-        """Remove declared uploads that never finished; never touch ready files."""
+    def purge_expired_team_attachments(
+        self,
+        now: int | None = None,
+        *,
+        team_id: str | None = None,
+        limit: int = TEAM_ATTACHMENT_RECLAIM_BATCH,
+    ) -> int:
+        """Reclaim a bounded batch of expired, unbound attachment declarations.
+
+        Ready uploads remain bindable for their full TTL even after a message or
+        skill request fails. A content-addressed blob is removed only after its
+        last ready metadata reference is gone; message-bound rows are never
+        candidates.
+        """
 
         timestamp = _now(now)
+        if type(limit) is not int or not 1 <= limit <= 4096:
+            raise ValueError("attachment reclaim limit must be between 1 and 4096")
         attachment_lease = self.acquire_attachment_control_lease(self.data_dir)
         connection: sqlite3.Connection | None = None
-        removed = 0
+        stale: list[sqlite3.Row] = []
+        removable_storage_keys: set[str] = set()
         try:
             connection = self.connect()
             with _write_transaction(connection):
-                stale = connection.execute(
-                    """
-                    SELECT id FROM team_attachments
-                    WHERE state IN ('uploading','failed') AND message_id IS NULL
-                      AND expires_at<=?
-                    """,
-                    (timestamp,),
-                ).fetchall()
+                query = """
+                    SELECT id,storage_key,state FROM team_attachments
+                    WHERE message_id IS NULL AND expires_at<=?
+                """
+                parameters: list[Any] = [timestamp]
+                if team_id is not None:
+                    query += " AND team_id=?"
+                    parameters.append(team_id)
+                query += " ORDER BY expires_at,id LIMIT ?"
+                parameters.append(limit)
+                stale = connection.execute(query, parameters).fetchall()
                 for row in stale:
                     connection.execute(
                         "DELETE FROM team_attachments WHERE id=?", (row["id"],)
                     )
-                    with suppress(OSError):
-                        self._team_attachment_staging_path(str(row["id"])).unlink()
-                    removed += 1
-            return removed
+                for storage_key in {
+                    str(row["storage_key"]) for row in stale if row["state"] == "ready"
+                }:
+                    still_referenced = connection.execute(
+                        """
+                        SELECT 1 FROM team_attachments
+                        WHERE storage_key=? AND state='ready'
+                        LIMIT 1
+                        """,
+                        (storage_key,),
+                    ).fetchone()
+                    if still_referenced is None:
+                        removable_storage_keys.add(storage_key)
+
+            # Do not unlink before the metadata deletion commits: a rollback
+            # must never leave a still-bindable row without its bytes.
+            for row in stale:
+                with suppress(OSError):
+                    self._team_attachment_staging_path(str(row["id"])).unlink()
+            for storage_key in removable_storage_keys:
+                with suppress(OSError):
+                    self._team_attachment_storage_path(storage_key).unlink()
+            return len(stale)
         finally:
             if connection is not None:
                 connection.close()

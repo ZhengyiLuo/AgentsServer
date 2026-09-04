@@ -5907,6 +5907,11 @@ class CodexInteractionResponseRequest(BaseModel):
     response: dict[str, Any]
 
 
+class CodexRotateRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=500)
+    summary: bool = True
+
+
 class ClaudeInteractionResponseRequest(BaseModel):
     response: dict[str, Any]
 
@@ -7240,8 +7245,13 @@ class SessionStore:
                     "codex_token_usage_snapshot",
                     "_codex_token_usage_checkpoint",
                     "_codex_token_usage_terminal",
+                    # Thread hygiene is per provider thread: a fresh thread
+                    # starts with zero compactions and no hygiene warning.
+                    "codex_compaction_count",
+                    "_codex_hygiene_warned",
                 ):
                     sess.pop(key, None)
+                sess["codex_thread_started_at"] = now_iso()
                 usage_signal = clear_provider_context_usage_locked(
                     sess,
                     BACKEND_CODEX,
@@ -9425,6 +9435,39 @@ CODEX_SUBAGENT_LIVE_GENERATIONS: dict[str, int] = {}
 # so a semantic-page rebuild never iterates a dictionary that is changing.
 CODEX_SUBAGENT_INDEX_LOCK = threading.RLock()
 CODEX_COMPACTION_TERMINAL_HISTORY_LIMIT = 128
+
+
+def codex_hygiene_int_setting(name: str, default: int) -> int:
+    """Read one env-overridable hygiene threshold, never failing at import."""
+
+    raw = env_setting(name, None, f"AGENTSDOCK_{name}")
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+# A Codex thread's on-disk rollout grows without bound and every resume
+# re-reads it. Past these sizes resumes become slow enough to look wedged, so
+# the runtime snapshot surfaces a warning and suggests starting a fresh thread.
+CODEX_ROLLOUT_WARN_BYTES = codex_hygiene_int_setting(
+    "CODEX_ROLLOUT_WARN_BYTES", 150 * 1024 * 1024
+)
+CODEX_ROLLOUT_OVERSIZED_BYTES = codex_hygiene_int_setting(
+    "CODEX_ROLLOUT_OVERSIZED_BYTES", 400 * 1024 * 1024
+)
+CODEX_COMPACTION_WARN_COUNT = codex_hygiene_int_setting(
+    "CODEX_COMPACTION_WARN_COUNT", 100
+)
+CODEX_ROTATED_THREAD_HISTORY_LIMIT = 32
+CODEX_ROLLOUT_PATH_CACHE: dict[str, Path] = {}
+CODEX_ROLLOUT_PATH_MISSES: dict[str, float] = {}
+CODEX_ROLLOUT_MISS_TTL_SECONDS = 30.0
+CODEX_ROLLOUT_HEAD_BYTES = 64 * 1024
+CODEX_HYGIENE_TASKS: dict[str, set[asyncio.Task[Any]]] = {}
 CODEX_PENDING_INTERACTIONS: dict[str, dict[str, Any]] = {}
 CODEX_PENDING_INTERACTIONS_LOCK = asyncio.Lock()
 CLAUDE_PENDING_INTERACTIONS: dict[str, dict[str, Any]] = {}
@@ -12081,6 +12124,8 @@ def should_bump_session_updated_at(event_type: str, event: dict[str, Any]) -> bo
         "codex_goal_budget_limited",
         "codex_compaction_started",
         "codex_compaction_completed",
+        "codex_thread_hygiene",
+        "codex_thread_rotated",
         "codex_rollback",
         "codex_review_started",
         "codex_review_finished",
@@ -12156,6 +12201,13 @@ async def update_session_event_metadata(session_id: str, event: dict[str, Any]) 
                     compaction_state_changed = True
                 if lifecycle_key in terminal_keys:
                     terminal_keys.remove(lifecycle_key)
+                else:
+                    # Monotonic per-thread tally of compactions that reached a
+                    # terminal row; replays of an already-terminal key do not
+                    # count. Reset when the provider thread changes.
+                    sess["codex_compaction_count"] = (
+                        codex_compaction_count(sess) + 1
+                    )
                 terminal_keys.append(lifecycle_key)
                 terminal_keys = terminal_keys[-CODEX_COMPACTION_TERMINAL_HISTORY_LIMIT:]
                 compaction_state_changed = True
@@ -23819,6 +23871,11 @@ def native_codex_compaction_terminal_aliases(
     omitted after the owning ACTIVE record has been released. Thread+turn and
     thread+item remain safe aliases; thread alone does not, because it could
     suppress a later legitimate compaction on the same conversation.
+
+    The thread+turn alias is only produced while the item id is unknown. One
+    long turn can compact several times, each with its own item id, so a
+    lookup that carries an item id must never be satisfied by the turn alias
+    of an earlier compaction in the same turn.
     """
 
     thread_id = str(thread_id or "").strip()
@@ -23830,7 +23887,8 @@ def native_codex_compaction_terminal_aliases(
     aliases = [
         f"codex:compaction:{native_codex_compaction_id(thread_id, turn_id, item_id)}"
     ]
-    for kind, value in (("turn", turn_id), ("item", item_id)):
+    alias_parts = (("item", item_id),) if item_id else (("turn", turn_id),)
+    for kind, value in alias_parts:
         if not value:
             continue
         encoded = json.dumps(
@@ -23850,7 +23908,14 @@ def codex_native_compaction_was_terminal(
     turn_id: str | None,
     item_id: str | None,
 ) -> bool:
-    """Return whether this provider compaction already reached a terminal row."""
+    """Return whether this provider compaction already reached a terminal row.
+
+    A notification that carries an item id is matched only by its exact
+    identity or its thread+item alias. The thread+turn alias remembered for an
+    earlier compaction is deliberately ignored here, otherwise the second and
+    later automatic compactions of one turn would be treated as replays and
+    never mirrored into the timeline.
+    """
 
     aliases = set(native_codex_compaction_terminal_aliases(
         thread_id,
@@ -23891,6 +23956,15 @@ def remember_codex_native_compaction_terminal(
         turn_id,
         item_id,
     )
+    if str(item_id or "").strip() and str(turn_id or "").strip():
+        # Also remember the turn-only identity. App-server can replay the
+        # lifecycle of this compaction with the item id omitted; that sparse
+        # replay must still be recognised, while a lookup carrying a new item
+        # id never consults this alias (see codex_native_compaction_was_terminal).
+        aliases = tuple(dict.fromkeys((
+            *aliases,
+            *native_codex_compaction_terminal_aliases(thread_id, turn_id, None),
+        )))
     if not aliases:
         return
     alias_set = set(aliases)
@@ -35287,6 +35361,293 @@ def find_codex_history(provider_id: str) -> Path | None:
     return selected
 
 
+def codex_compaction_count(sess: dict[str, Any]) -> int:
+    """Return the persisted per-thread compaction tally, tolerating bad data."""
+
+    value = sess.get("codex_compaction_count")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return max(0, value)
+
+
+def codex_rollout_head_matches(path: Path, thread_id: str) -> bool:
+    """Return whether the rollout's first record claims this thread id.
+
+    Only the head is read, bounded, and a head that carries no id is accepted
+    on the filename alone. A head that names a different thread rejects the
+    file so a stale or hand-copied rollout cannot masquerade as this thread.
+    """
+
+    try:
+        with path.open("rb") as stream:
+            raw = stream.readline(CODEX_ROLLOUT_HEAD_BYTES + 1)
+    except OSError:
+        return False
+    if not raw or len(raw) > CODEX_ROLLOUT_HEAD_BYTES:
+        return True
+    try:
+        record = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return True
+    if not isinstance(record, dict):
+        return True
+    payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+    head_id = str(payload.get("id") or payload.get("session_id") or "").strip()
+    return not head_id or head_id == thread_id
+
+
+def codex_rollout_path(thread_id: str) -> Path | None:
+    """Locate ``rollout-*-<thread_id>.jsonl`` under CODEX_SESSIONS_ROOT.
+
+    Blocking filesystem work; call from a worker thread. Hits are cached per
+    thread id and re-validated with one stat. Misses are cached briefly so a
+    thread whose rollout has not been flushed yet does not trigger a directory
+    walk on every runtime snapshot.
+    """
+
+    clean_id = provider_session_identifier(thread_id)
+    if clean_id is None:
+        return None
+    cached = CODEX_ROLLOUT_PATH_CACHE.get(clean_id)
+    if cached is not None:
+        if cached.is_file():
+            return cached
+        CODEX_ROLLOUT_PATH_CACHE.pop(clean_id, None)
+    missed_at = CODEX_ROLLOUT_PATH_MISSES.get(clean_id)
+    now = time.monotonic()
+    if missed_at is not None and now - missed_at < CODEX_ROLLOUT_MISS_TTL_SECONDS:
+        return None
+    if not CODEX_SESSIONS_ROOT.exists():
+        CODEX_ROLLOUT_PATH_MISSES[clean_id] = now
+        return None
+    suffix = f"-{clean_id}.jsonl"
+    selected: Path | None = None
+    selected_mtime = -1.0
+    for path in bounded_jsonl_paths(CODEX_SESSIONS_ROOT):
+        name = path.name
+        if not (name.startswith("rollout-") and name.endswith(suffix)):
+            continue
+        if not codex_rollout_head_matches(path, clean_id):
+            continue
+        with suppress(OSError):
+            mtime = path.stat().st_mtime
+            if mtime > selected_mtime:
+                selected = path
+                selected_mtime = mtime
+    if selected is None:
+        CODEX_ROLLOUT_PATH_MISSES[clean_id] = now
+        if len(CODEX_ROLLOUT_PATH_MISSES) > 1024:
+            stale = [
+                key
+                for key, stamp in CODEX_ROLLOUT_PATH_MISSES.items()
+                if now - stamp >= CODEX_ROLLOUT_MISS_TTL_SECONDS
+            ]
+            for key in stale:
+                CODEX_ROLLOUT_PATH_MISSES.pop(key, None)
+        return None
+    CODEX_ROLLOUT_PATH_MISSES.pop(clean_id, None)
+    CODEX_ROLLOUT_PATH_CACHE[clean_id] = selected
+    return selected
+
+
+def codex_rollout_stats(thread_id: str) -> dict[str, Any]:
+    """Blocking helper: rollout path, size, and mtime for one thread."""
+
+    path = codex_rollout_path(thread_id)
+    if path is None:
+        return {"rollout_path": None, "rollout_bytes": None, "rollout_mtime": None}
+    try:
+        stat = path.stat()
+    except OSError:
+        return {"rollout_path": str(path), "rollout_bytes": None, "rollout_mtime": None}
+    return {
+        "rollout_path": str(path),
+        "rollout_bytes": int(stat.st_size),
+        "rollout_mtime": iso_from_timestamp(stat.st_mtime),
+    }
+
+
+async def codex_thread_hygiene(session: dict[str, Any]) -> dict[str, Any]:
+    """Describe how bloated the chat's current Codex thread has become."""
+
+    thread_id = str(session_provider_id(session) or "").strip()
+    stats: dict[str, Any] = {
+        "rollout_path": None,
+        "rollout_bytes": None,
+        "rollout_mtime": None,
+    }
+    if thread_id and str(session.get("backend") or DEFAULT_BACKEND) == BACKEND_CODEX:
+        try:
+            stats = await asyncio.to_thread(codex_rollout_stats, thread_id)
+        except Exception as exc:
+            logger.debug(
+                "codex rollout stats unavailable thread=%s: %s",
+                thread_id,
+                concise_error_message(exc),
+            )
+    return {
+        **stats,
+        "compaction_count": codex_compaction_count(session),
+        "thread_started_at": session.get("codex_thread_started_at"),
+    }
+
+
+def codex_thread_hygiene_warning(hygiene: dict[str, Any]) -> str | None:
+    """Return None, "large", or "oversized" for one hygiene snapshot."""
+
+    rollout_bytes = hygiene.get("rollout_bytes")
+    size = (
+        int(rollout_bytes)
+        if isinstance(rollout_bytes, int) and not isinstance(rollout_bytes, bool)
+        else 0
+    )
+    if size >= CODEX_ROLLOUT_OVERSIZED_BYTES:
+        return "oversized"
+    count = hygiene.get("compaction_count")
+    compactions = (
+        int(count) if isinstance(count, int) and not isinstance(count, bool) else 0
+    )
+    if size >= CODEX_ROLLOUT_WARN_BYTES or compactions >= CODEX_COMPACTION_WARN_COUNT:
+        return "large"
+    return None
+
+
+def codex_thread_hygiene_public(hygiene: dict[str, Any]) -> dict[str, Any]:
+    """Attach the warning level and thresholds for runtime consumers."""
+
+    return {
+        **hygiene,
+        "warning": codex_thread_hygiene_warning(hygiene),
+        "thresholds": {
+            "rollout_warn_bytes": CODEX_ROLLOUT_WARN_BYTES,
+            "rollout_oversized_bytes": CODEX_ROLLOUT_OVERSIZED_BYTES,
+            "compaction_warn_count": CODEX_COMPACTION_WARN_COUNT,
+        },
+    }
+
+
+CODEX_HYGIENE_WARNING_RANK = {None: 0, "large": 1, "oversized": 2}
+
+
+def format_byte_size(value: int | None) -> str:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return "unknown size"
+    if value >= 1024 * 1024 * 1024:
+        return f"{value / (1024 * 1024 * 1024):.1f} GB"
+    if value >= 1024 * 1024:
+        return f"{value / (1024 * 1024):.0f} MB"
+    if value >= 1024:
+        return f"{value / 1024:.0f} KB"
+    return f"{value} bytes"
+
+
+def codex_thread_hygiene_message(
+    warning: str,
+    hygiene: dict[str, Any],
+) -> str:
+    size_text = format_byte_size(hygiene.get("rollout_bytes"))
+    count = hygiene.get("compaction_count")
+    compactions = (
+        int(count) if isinstance(count, int) and not isinstance(count, bool) else 0
+    )
+    detail = f"its on-disk rollout is {size_text}"
+    if compactions:
+        detail += f" after {compactions} context compaction(s)"
+    if warning == "oversized":
+        return (
+            f"This Codex thread is oversized: {detail}. Resuming it is slow and "
+            "the app-server may stall or time out. Use \"Start fresh thread\" "
+            "to rotate to a new thread with a handoff summary."
+        )
+    return (
+        f"This Codex thread is getting large: {detail}. Long threads resume "
+        "slowly and compaction gets less effective. Consider \"Start fresh "
+        "thread\" to rotate to a new thread with a handoff summary."
+    )
+
+
+async def warn_codex_thread_hygiene(
+    session_id: str,
+    thread_id: str,
+    run_id: str | None,
+) -> None:
+    """Append one visible warning the first time a thread crosses a level."""
+
+    session = STORE.sessions.get(session_id)
+    if not session or str(session_provider_id(session) or "") != thread_id:
+        return
+    hygiene = await codex_thread_hygiene(session)
+    warning = codex_thread_hygiene_warning(hygiene)
+    if warning is None:
+        return
+    async with STORE._lock:
+        current = STORE.sessions.get(session_id)
+        if not current or str(session_provider_id(current) or "") != thread_id:
+            return
+        warned = current.get("_codex_hygiene_warned")
+        warned_level = (
+            str(warned.get("level") or "") or None
+            if isinstance(warned, dict)
+            and str(warned.get("thread_id") or "") == thread_id
+            else None
+        )
+        if (
+            CODEX_HYGIENE_WARNING_RANK.get(warning, 0)
+            <= CODEX_HYGIENE_WARNING_RANK.get(warned_level, 0)
+        ):
+            return
+        current["_codex_hygiene_warned"] = {
+            "thread_id": thread_id,
+            "level": warning,
+            "warned_at": now_iso(),
+        }
+        await STORE.save()
+    await append_event(
+        session_id,
+        "codex_thread_hygiene",
+        {
+            "run_id": run_id or None,
+            "backend": BACKEND_CODEX,
+            "thread_id": thread_id,
+            "warning": warning,
+            "rollout_path": hygiene.get("rollout_path"),
+            "rollout_bytes": hygiene.get("rollout_bytes"),
+            "compaction_count": hygiene.get("compaction_count"),
+            "suggested_action": "codex_rotate",
+            "message": codex_thread_hygiene_message(warning, hygiene),
+        },
+    )
+
+
+def schedule_codex_thread_hygiene_check(
+    session_id: str,
+    thread_id: str,
+    run_id: str | None,
+) -> None:
+    """Fire-and-forget hygiene check so a turn start is never delayed by it."""
+
+    if not thread_id:
+        return
+
+    async def runner() -> None:
+        try:
+            await warn_codex_thread_hygiene(session_id, thread_id, run_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug(
+                "codex thread hygiene check failed session=%s: %s",
+                session_id,
+                concise_error_message(exc),
+            )
+
+    register_session_task(
+        CODEX_HYGIENE_TASKS,
+        session_id,
+        asyncio.create_task(runner()),
+    )
+
+
 def parse_claude_history(path: Path, limit: int | None) -> list[dict[str, str]]:
     items: deque[dict[str, str]] = deque(maxlen=normalized_history_import_limit(limit))
     for event in bounded_jsonl_events(path):
@@ -43519,6 +43880,7 @@ async def acquire_codex_run_thread(
     ensure_kwargs: dict[str, Any] = {}
     if expected_run_id is not None:
         ensure_kwargs["expected_run_id"] = expected_run_id
+    resumed_existing_thread = bool(str(session_provider_id(sess) or "").strip())
     provider_id, _instruction_hash = await ensure_codex_app_server_thread(
         manager,
         session_id,
@@ -43526,6 +43888,10 @@ async def acquire_codex_run_thread(
         cwd,
         **ensure_kwargs,
     )
+    if resumed_existing_thread and provider_id:
+        # A brand-new thread has nothing on disk yet. Only resumed threads can
+        # have grown large; warn off the turn's critical path.
+        schedule_codex_thread_hygiene_check(session_id, provider_id, expected_run_id)
     return provider_id
 
 
@@ -59409,6 +59775,9 @@ async def codex_runtime_snapshot(session_id: str) -> dict[str, Any]:
         permission_cache_key,
         manager,
     ) or []
+    thread_hygiene = codex_thread_hygiene_public(
+        await codex_thread_hygiene(session)
+    )
     return {
         "available": available,
         "transport": CODEX_TRANSPORT,
@@ -59426,6 +59795,12 @@ async def codex_runtime_snapshot(session_id: str) -> dict[str, Any]:
         "pending_interactions": pending,
         "permission_profiles": permission_profiles,
         "background_terminals_supported": CODEX_BACKGROUND_TERMINALS_SUPPORTED,
+        "thread_hygiene": thread_hygiene,
+        "rotated_threads": [
+            dict(item)
+            for item in (session.get("codex_rotated_threads") or [])
+            if isinstance(item, dict)
+        ],
         "policy": {
             "approval_policy": (
                 session.get("codex_approval_policy")
@@ -59898,6 +60273,192 @@ async def load_codex_runtime(session_id: str) -> dict[str, Any]:
 
         assert runtime is not None
         return runtime
+
+
+def codex_rotation_handoff_reason(reason: str | None) -> str:
+    clean = compact_memory_text(str(reason or "").strip(), 500)
+    return (
+        f"The user started a fresh Codex thread. Reason: {clean}"
+        if clean
+        else "The user started a fresh Codex thread to leave an oversized one."
+    )
+
+
+@app.post("/api/sessions/{session_id}/codex/rotate")
+async def rotate_codex_thread(
+    session_id: str,
+    req: CodexRotateRequest | None = None,
+) -> dict[str, Any]:
+    """Unbind the chat's Codex thread so the next turn starts a fresh one.
+
+    The AgentsDock timeline is untouched. When requested, a compact handoff
+    summary of the conversation is seeded into the next thread as developer
+    context, exactly like a memory fork, so the fresh thread is not amnesiac.
+    """
+
+    req = req or CodexRotateRequest()
+    async with session_lifecycle_lock(session_id):
+        ensure_session_not_deleting(session_id)
+        session = STORE.sessions.get(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="session not found")
+        if str(session.get("backend") or DEFAULT_BACKEND) != BACKEND_CODEX:
+            raise HTTPException(
+                status_code=409,
+                detail="Codex thread rotation requires a Codex chat",
+            )
+        if CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC:
+            raise HTTPException(
+                status_code=503,
+                detail="Codex thread rotation requires the app-server transport",
+            )
+
+        async with ACTIVE_LOCK:
+            if (
+                session_id in BUSY_SESSIONS
+                or session_id in SERVER_MAINTENANCE_SESSIONS
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "wait for the active Codex turn to finish before "
+                        "starting a fresh thread"
+                    ),
+                )
+            if QUEUED_TURNS.get(session_id):
+                raise HTTPException(
+                    status_code=409,
+                    detail="clear the queued turns before starting a fresh thread",
+                )
+
+        provider_id = str(session_provider_id(session) or "").strip()
+        if not provider_id:
+            # Nothing to rotate away from; the next turn already starts fresh.
+            runtime = await codex_runtime_snapshot(session_id)
+            return {**runtime, "rotated": False, "rotated_thread_id": None}
+
+        handoff_reason = codex_rotation_handoff_reason(req.reason)
+        summary_text = ""
+        if req.summary:
+            try:
+                summary_text = await asyncio.to_thread(
+                    build_fork_memory,
+                    dict(session),
+                    session_id,
+                    reason=handoff_reason,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "codex rotation handoff summary failed session=%s: %s",
+                    session_id,
+                    concise_error_message(exc),
+                )
+                summary_text = ""
+        hygiene = await codex_thread_hygiene(session)
+        rotated_at = now_iso()
+        reason_text = compact_memory_text(str(req.reason or "").strip(), 500) or None
+
+        quarantined_goal_thread = False
+        usage_signal: dict[str, Any] | None = None
+        async with STORE._lock:
+            current = STORE.sessions.get(session_id)
+            if not current or str(session_provider_id(current) or "") != provider_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="the Codex thread changed; retry",
+                )
+            current_goal = current.get("codex_goal")
+            if (
+                isinstance(current_goal, dict)
+                and str(current_goal.get("status") or "") == "active"
+            ):
+                current["codex_goal"] = {**current_goal, "status": "paused"}
+                quarantined_goal_thread = True
+            current["session_id"] = None
+            current["codex_thread_id"] = None
+            for key in (
+                "codex_instruction_hash",
+                "codex_instruction_version",
+                "codex_thread_status",
+                "codex_compaction_count",
+                "codex_thread_started_at",
+                "_codex_hygiene_warned",
+                "_active_codex_compactions",
+            ):
+                current.pop(key, None)
+            usage_signal = clear_provider_context_usage_locked(
+                current,
+                BACKEND_CODEX,
+                provider_session_id=None,
+                state="cleared",
+            )
+            if summary_text:
+                current["memory_seed"] = summary_text
+                current["memory_seed_used"] = False
+                current["memory_forked"] = True
+                current["memory_fork_reason"] = compact_memory_text(handoff_reason, 2000)
+            else:
+                # Never let a stale seed from an earlier fork resurface just
+                # because the provider id is empty again.
+                current["memory_seed"] = None
+                current["memory_seed_used"] = False
+            history = [
+                dict(item)
+                for item in (current.get("codex_rotated_threads") or [])
+                if isinstance(item, dict)
+            ]
+            history.append({
+                "thread_id": provider_id,
+                "rotated_at": rotated_at,
+                "reason": reason_text,
+                "rollout_bytes": hygiene.get("rollout_bytes"),
+                "compaction_count": hygiene.get("compaction_count"),
+            })
+            current["codex_rotated_threads"] = history[
+                -CODEX_ROTATED_THREAD_HISTORY_LIMIT:
+            ]
+            current["updated_at"] = rotated_at
+            await STORE.save()
+
+        if CODEX_THREAD_SESSION_INDEX.get(provider_id) == session_id:
+            CODEX_THREAD_SESSION_INDEX.pop(provider_id, None)
+        CODEX_GOAL_SYNC_GENERATIONS.pop(session_id, None)
+        if quarantined_goal_thread:
+            CODEX_QUARANTINED_GOAL_THREADS[provider_id] = session_id
+        manager = CODEX_APP_SERVER_MANAGER
+        if manager is not None and manager.is_thread_loaded(provider_id):
+            with suppress(Exception):
+                await evict_codex_app_server_thread(
+                    manager,
+                    provider_id,
+                    reinsert_on_failure=False,
+                )
+        if usage_signal is not None:
+            await broadcast_provider_runtime_changed(session_id, usage_signal)
+        await append_event(
+            session_id,
+            "codex_thread_rotated",
+            {
+                "backend": BACKEND_CODEX,
+                "old_thread_id": provider_id,
+                "reason": reason_text,
+                "rollout_bytes": hygiene.get("rollout_bytes"),
+                "compaction_count": hygiene.get("compaction_count"),
+                "summary_included": bool(summary_text),
+                "message": (
+                    "Started a fresh Codex thread. The next message opens a new "
+                    "provider thread"
+                    + (
+                        " seeded with a handoff summary of this conversation."
+                        if summary_text
+                        else " without carrying over provider context."
+                    )
+                    + (f" Reason: {reason_text}" if reason_text else "")
+                ),
+            },
+        )
+        runtime = await codex_runtime_snapshot(session_id)
+        return {**runtime, "rotated": True, "rotated_thread_id": provider_id}
 
 
 @app.post(

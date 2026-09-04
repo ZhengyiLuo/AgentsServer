@@ -506,6 +506,257 @@ class ManagedHostTests(unittest.TestCase):
             generations = list((data_dir / "maintenance-backups").glob("snapshot_*"))
             self.assertEqual(len(generations), 3)
 
+    def test_snapshot_restores_ready_and_resumable_attachment_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "hub"
+            store = HubStore(data_dir, managed_host_identity=HOST_A)
+            proof = store.bootstrap_proof_path.read_text().strip()
+            bundle = store.bootstrap(
+                proof,
+                "owner@example.com",
+                "Owner",
+                "Owner Mac",
+            )
+            claims = store.verify_access(bundle["access_token"])
+            team_id = bundle["teams"][0]["id"]
+
+            ready_bytes = b"ready attachment generation"
+            ready_digest = hashlib.sha256(ready_bytes).hexdigest()
+            ready = store.declare_team_attachment(
+                claims,
+                team_id,
+                {
+                    "file_name": "ready.txt",
+                    "media_type": "text/plain",
+                    "byte_size": len(ready_bytes),
+                    "sha256": ready_digest,
+                    "idempotency_key": "snapshot-ready-attachment",
+                },
+            )["attachment"]
+            store.write_team_attachment_chunk(
+                claims,
+                team_id,
+                ready["id"],
+                offset=0,
+                total=len(ready_bytes),
+                data=ready_bytes,
+            )
+
+            pending_bytes = b"resumable attachment generation"
+            pending_digest = hashlib.sha256(pending_bytes).hexdigest()
+            pending = store.declare_team_attachment(
+                claims,
+                team_id,
+                {
+                    "file_name": "pending.txt",
+                    "media_type": "text/plain",
+                    "byte_size": len(pending_bytes),
+                    "sha256": pending_digest,
+                    "idempotency_key": "snapshot-pending-attachment",
+                },
+            )["attachment"]
+            prefix = pending_bytes[:11]
+            store.write_team_attachment_chunk(
+                claims,
+                team_id,
+                pending["id"],
+                offset=0,
+                total=len(pending_bytes),
+                data=prefix,
+            )
+
+            snapshot = store.maintenance_snapshot_and_fence(
+                "server-update",
+                operation_id="update-attachments",
+            )
+            manifest = json.loads((snapshot / "manifest.json").read_text())
+            self.assertEqual(manifest["format"], 2)
+            self.assertEqual(manifest["attachments"]["file_count"], 2)
+            self.assertEqual(
+                manifest["attachments"]["byte_size"],
+                len(ready_bytes) + len(prefix),
+            )
+            snapshot_ready = snapshot / "attachments" / ready_digest[:2] / ready_digest
+            snapshot_pending = (
+                snapshot / "attachments" / "uploads" / f"{pending['id']}.part"
+            )
+            self.assertEqual(snapshot_ready.read_bytes(), ready_bytes)
+            self.assertEqual(snapshot_pending.read_bytes(), prefix)
+            HubStore.verify_maintenance_snapshot(
+                data_dir,
+                snapshot,
+                expected_host_identity=HOST_A,
+                expected_hub_id=store.hub_id,
+                expected_operation_id="update-attachments",
+            )
+
+            live_ready = data_dir / "attachments" / ready_digest[:2] / ready_digest
+            live_pending = data_dir / "attachments" / "uploads" / f"{pending['id']}.part"
+            live_ready.write_bytes(b"x" * len(ready_bytes))
+            live_pending.write_bytes(b"y" * len(prefix))
+            extra = data_dir / "attachments" / "uploads" / "newer.part"
+            extra.write_bytes(b"newer generation")
+            extra.chmod(0o600)
+
+            HubStore.restore_maintenance_snapshot(
+                data_dir,
+                snapshot,
+                expected_host_identity=HOST_A,
+                expected_hub_id=store.hub_id,
+                expected_operation_id="update-attachments",
+            )
+            self.assertEqual(live_ready.read_bytes(), ready_bytes)
+            self.assertEqual(live_pending.read_bytes(), prefix)
+            self.assertFalse(extra.exists())
+            connection = sqlite3.connect(data_dir / "team-hub.sqlite3")
+            try:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT state,received_bytes FROM team_attachments WHERE id=?",
+                        (ready["id"],),
+                    ).fetchone(),
+                    ("ready", len(ready_bytes)),
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT state,received_bytes FROM team_attachments WHERE id=?",
+                        (pending["id"],),
+                    ).fetchone(),
+                    ("uploading", len(prefix)),
+                )
+            finally:
+                connection.close()
+
+    def test_snapshot_rejects_missing_attachment_before_live_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "hub"
+            store = HubStore(data_dir, managed_host_identity=HOST_A)
+            proof = store.bootstrap_proof_path.read_text().strip()
+            bundle = store.bootstrap(
+                proof,
+                "owner@example.com",
+                "Owner",
+                "Owner Mac",
+            )
+            claims = store.verify_access(bundle["access_token"])
+            team_id = bundle["teams"][0]["id"]
+            payload = b"must remain available"
+            digest = hashlib.sha256(payload).hexdigest()
+            attachment = store.declare_team_attachment(
+                claims,
+                team_id,
+                {
+                    "file_name": "required.txt",
+                    "media_type": "text/plain",
+                    "byte_size": len(payload),
+                    "sha256": digest,
+                    "idempotency_key": "snapshot-required-attachment",
+                },
+            )["attachment"]
+            store.write_team_attachment_chunk(
+                claims,
+                team_id,
+                attachment["id"],
+                offset=0,
+                total=len(payload),
+                data=payload,
+            )
+            snapshot = store.maintenance_snapshot_and_fence(
+                "server-update",
+                operation_id="update-missing-attachment",
+            )
+            live_path = data_dir / "attachments" / digest[:2] / digest
+            live_before = {
+                "database": store.database_path.read_bytes(),
+                "key": store.signing_key_path.read_bytes(),
+                "fence": store.maintenance_fence_path.read_bytes(),
+                "attachment": live_path.read_bytes(),
+            }
+            (snapshot / "attachments" / digest[:2] / digest).unlink()
+
+            with self.assertRaisesRegex(RuntimeError, "attachment tree"):
+                HubStore.verify_maintenance_snapshot(
+                    data_dir,
+                    snapshot,
+                    expected_host_identity=HOST_A,
+                    expected_hub_id=store.hub_id,
+                    expected_operation_id="update-missing-attachment",
+                )
+            self.assertEqual(store.database_path.read_bytes(), live_before["database"])
+            self.assertEqual(store.signing_key_path.read_bytes(), live_before["key"])
+            self.assertEqual(store.maintenance_fence_path.read_bytes(), live_before["fence"])
+            self.assertEqual(live_path.read_bytes(), live_before["attachment"])
+
+    def test_attachment_directory_rolls_back_after_restore_install_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "hub"
+            store = HubStore(data_dir, managed_host_identity=HOST_A)
+            proof = store.bootstrap_proof_path.read_text().strip()
+            bundle = store.bootstrap(
+                proof,
+                "owner@example.com",
+                "Owner",
+                "Owner Mac",
+            )
+            claims = store.verify_access(bundle["access_token"])
+            team_id = bundle["teams"][0]["id"]
+            payload = b"snapshot attachment"
+            digest = hashlib.sha256(payload).hexdigest()
+            attachment = store.declare_team_attachment(
+                claims,
+                team_id,
+                {
+                    "file_name": "rollback.txt",
+                    "media_type": "text/plain",
+                    "byte_size": len(payload),
+                    "sha256": digest,
+                    "idempotency_key": "snapshot-rollback-attachment",
+                },
+            )["attachment"]
+            store.write_team_attachment_chunk(
+                claims,
+                team_id,
+                attachment["id"],
+                offset=0,
+                total=len(payload),
+                data=payload,
+            )
+            snapshot = store.maintenance_snapshot_and_fence(
+                "server-update",
+                operation_id="update-attachment-rollback",
+            )
+            live_path = data_dir / "attachments" / digest[:2] / digest
+            changed = b"changed attachment!"
+            self.assertEqual(len(changed), len(payload))
+            live_path.write_bytes(changed)
+            live_before = {
+                "database": store.database_path.read_bytes(),
+                "key": store.signing_key_path.read_bytes(),
+                "fence": store.maintenance_fence_path.read_bytes(),
+                "attachment": live_path.read_bytes(),
+            }
+            original_fsync = HubStore._fsync_directory
+
+            def fail_commit(path: Path) -> None:
+                if Path(path) == data_dir:
+                    raise OSError("forced restore commit failure")
+                original_fsync(path)
+
+            with mock.patch.object(HubStore, "_fsync_directory", side_effect=fail_commit):
+                with self.assertRaisesRegex(OSError, "forced restore commit failure"):
+                    HubStore.restore_maintenance_snapshot(
+                        data_dir,
+                        snapshot,
+                        expected_host_identity=HOST_A,
+                        expected_hub_id=store.hub_id,
+                        expected_operation_id="update-attachment-rollback",
+                    )
+            self.assertEqual(store.database_path.read_bytes(), live_before["database"])
+            self.assertEqual(store.signing_key_path.read_bytes(), live_before["key"])
+            self.assertEqual(store.maintenance_fence_path.read_bytes(), live_before["fence"])
+            self.assertEqual(live_path.read_bytes(), live_before["attachment"])
+            self.assertEqual(list(data_dir.glob(".restore-*")), [])
+
     def test_offline_restore_verifies_identity_and_restores_db_key_and_proofs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             data_dir = Path(temporary) / "hub"

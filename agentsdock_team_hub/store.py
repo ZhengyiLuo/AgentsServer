@@ -131,6 +131,15 @@ class _TeamAttachmentFailure(Exception):
 
 
 @dataclass(frozen=True)
+class _TeamAttachmentSnapshotFile:
+    """One file required to make attachment metadata restorable."""
+
+    relative_path: str
+    byte_size: int
+    content_sha256: str | None
+
+
+@dataclass(frozen=True)
 class AccessClaims:
     principal_id: str
     session_id: str
@@ -258,6 +267,45 @@ class HubStore:
         finally:
             with suppress(OSError):
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+    @classmethod
+    def acquire_attachment_control_lease(
+        cls,
+        data_dir: Path,
+        *,
+        timeout_seconds: float = 30.0,
+    ) -> int:
+        """Serialize attachment file mutation with maintenance snapshots."""
+
+        if fcntl is None:
+            raise RuntimeError("Team Hub attachment locking is unavailable")
+        root = Path(os.path.abspath(os.path.expanduser(os.fspath(data_dir))))
+        descriptor = cls._open_lock_file(root / "attachment-control.lock")
+        deadline = time.monotonic() + max(0.1, float(timeout_seconds))
+        try:
+            while True:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return descriptor
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("Team Hub attachment control is busy")
+                    time.sleep(0.025)
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    @staticmethod
+    def release_attachment_control_lease(descriptor: int | None) -> None:
+        if descriptor is None:
+            return
+        if fcntl is None:
+            os.close(descriptor)
+            return
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
             os.close(descriptor)
 
     def __init__(
@@ -551,6 +599,197 @@ class HubStore:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+
+    @classmethod
+    def _team_attachment_snapshot_files(
+        cls,
+        connection: sqlite3.Connection,
+    ) -> list[_TeamAttachmentSnapshotFile]:
+        """Derive the exact external files required by one database image."""
+
+        schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if schema_version < 9:
+            return []
+        try:
+            rows = connection.execute(
+                """
+                SELECT id,storage_key,sha256,state,byte_size,received_bytes
+                FROM team_attachments ORDER BY id
+                """
+            ).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise RuntimeError("Team Hub snapshot attachment schema is invalid") from exc
+        files: dict[str, _TeamAttachmentSnapshotFile] = {}
+        for row in rows:
+            attachment_id = str(row["id"])
+            storage_key = str(row["storage_key"])
+            raw_digest = row["sha256"]
+            state = str(row["state"])
+            byte_size = int(row["byte_size"])
+            received_bytes = int(row["received_bytes"])
+            if (
+                re.fullmatch(r"[A-Za-z0-9_]{8,240}", attachment_id) is None
+                or re.fullmatch(r"[0-9a-f]{64}", storage_key) is None
+                or not isinstance(raw_digest, bytes)
+                or not hmac.compare_digest(raw_digest, bytes.fromhex(storage_key))
+                or state not in {"uploading", "ready", "failed"}
+                or byte_size < 1
+                or not 0 <= received_bytes <= byte_size
+            ):
+                raise RuntimeError("Team Hub snapshot attachment metadata is invalid")
+            if state == "ready":
+                if received_bytes != byte_size:
+                    raise RuntimeError("Team Hub snapshot attachment metadata is invalid")
+                spec = _TeamAttachmentSnapshotFile(
+                    relative_path=f"{storage_key[:2]}/{storage_key}",
+                    byte_size=byte_size,
+                    content_sha256=storage_key,
+                )
+            elif state == "uploading" and received_bytes > 0:
+                spec = _TeamAttachmentSnapshotFile(
+                    relative_path=f"uploads/{attachment_id}.part",
+                    byte_size=received_bytes,
+                    content_sha256=None,
+                )
+            else:
+                continue
+            previous = files.get(spec.relative_path)
+            if previous is not None and previous != spec:
+                raise RuntimeError("Team Hub snapshot attachment metadata is invalid")
+            files[spec.relative_path] = spec
+        return [files[path] for path in sorted(files)]
+
+    @classmethod
+    def _attachment_generation_summary(
+        cls,
+        root: Path,
+        files: list[_TeamAttachmentSnapshotFile],
+        *,
+        exact_tree: bool,
+        require_root: bool,
+    ) -> dict[str, Any]:
+        """Verify one private attachment tree and return its anchored digest."""
+
+        if not root.exists():
+            if require_root or files:
+                raise RuntimeError("Team Hub snapshot attachment tree is missing")
+            return {
+                "file_count": 0,
+                "byte_size": 0,
+                "sha256": hashlib.sha256().hexdigest(),
+            }
+        try:
+            cls._validate_private_directory_without_mutation(root)
+            expected_paths = {item.relative_path for item in files}
+            expected_directories = {""}
+            for relative_path in expected_paths:
+                pieces = relative_path.split("/")
+                expected_directories.update(
+                    "/".join(pieces[:index]) for index in range(1, len(pieces))
+                )
+            if exact_tree:
+                actual_paths: set[str] = set()
+                actual_directories = {""}
+                for directory, directory_names, file_names in os.walk(
+                    root, topdown=True, followlinks=False
+                ):
+                    current = Path(directory)
+                    cls._validate_private_directory_without_mutation(current)
+                    relative_directory = current.relative_to(root).as_posix()
+                    if relative_directory == ".":
+                        relative_directory = ""
+                    for name in directory_names:
+                        child = current / name
+                        info = child.lstat()
+                        if (
+                            not stat.S_ISDIR(info.st_mode)
+                            or info.st_uid != os.getuid()
+                            or stat.S_IMODE(info.st_mode) != 0o700
+                        ):
+                            raise PermissionError(
+                                "Team Hub snapshot attachment directory is unsafe"
+                            )
+                        actual_directories.add(
+                            "/".join(part for part in (relative_directory, name) if part)
+                        )
+                    for name in file_names:
+                        relative = "/".join(
+                            part for part in (relative_directory, name) if part
+                        )
+                        actual_paths.add(relative)
+                if actual_paths != expected_paths or actual_directories != expected_directories:
+                    raise RuntimeError("Team Hub snapshot attachment tree is invalid")
+
+            digest = hashlib.sha256()
+            total_bytes = 0
+            for item in files:
+                path = root.joinpath(*item.relative_path.split("/"))
+                parent = path.parent
+                while parent != root:
+                    cls._validate_private_directory_without_mutation(parent)
+                    parent = parent.parent
+                info = path.lstat()
+                if not stat.S_ISREG(info.st_mode) or int(info.st_size) != item.byte_size:
+                    raise RuntimeError("Team Hub snapshot attachment file size is invalid")
+                file_digest = cls._sha256_private_regular_file(path)
+                if item.content_sha256 is not None and not hmac.compare_digest(
+                    file_digest, item.content_sha256
+                ):
+                    raise RuntimeError("Team Hub snapshot attachment digest is invalid")
+                record = canonical_json(
+                    {
+                        "path": item.relative_path,
+                        "byte_size": item.byte_size,
+                        "sha256": file_digest,
+                    }
+                )
+                digest.update(len(record).to_bytes(8, "big"))
+                digest.update(record)
+                total_bytes += item.byte_size
+            return {
+                "file_count": len(files),
+                "byte_size": total_bytes,
+                "sha256": digest.hexdigest(),
+            }
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("Team Hub snapshot attachment tree is invalid") from exc
+
+    @classmethod
+    def _copy_attachment_generation(
+        cls,
+        source_root: Path,
+        destination_root: Path,
+        files: list[_TeamAttachmentSnapshotFile],
+    ) -> dict[str, Any]:
+        """Copy only files required by the database into a fresh private tree."""
+
+        ensure_private_directory(destination_root)
+        if files:
+            cls._validate_private_directory_without_mutation(source_root)
+        for item in files:
+            source = source_root.joinpath(*item.relative_path.split("/"))
+            source_parent = source.parent
+            while source_parent != source_root:
+                cls._validate_private_directory_without_mutation(source_parent)
+                source_parent = source_parent.parent
+            destination = destination_root.joinpath(*item.relative_path.split("/"))
+            ensure_private_directory(destination.parent)
+            cls._copy_private_regular_file(source, destination)
+        summary = cls._attachment_generation_summary(
+            destination_root,
+            files,
+            exact_tree=True,
+            require_root=True,
+        )
+        directories = sorted(
+            (path for path in destination_root.rglob("*") if path.is_dir()),
+            key=lambda path: len(path.parts),
+            reverse=True,
+        )
+        for directory in directories:
+            cls._fsync_directory(directory)
+        cls._fsync_directory(destination_root)
+        return summary
 
     def connect(self) -> sqlite3.Connection:
         return open_database(self.database_path)
@@ -988,11 +1227,11 @@ class HubStore:
         """Checkpoint and durably snapshot the bound Hub before replacement.
 
         SQLite's online backup captures the complete logical database after a
-        successful WAL checkpoint. The signing key and a manifest containing
-        only hashes and stable identities are written into the same private
-        generation; the manifest is written last and the directory rename is
-        the commit point. Existing verified generations are pruned only after
-        the new generation is complete.
+        successful WAL checkpoint. The signing key, exact attachment tree, and
+        a manifest containing only hashes and stable identities are written
+        into the same private generation; the manifest is written last and the
+        directory rename is the commit point. Existing verified generations
+        are pruned only after the new generation is complete.
         """
 
         if self.managed_host_identity is None:
@@ -1007,6 +1246,7 @@ class HubStore:
         ensure_private_directory(temporary)
         source: sqlite3.Connection | None = None
         destination: sqlite3.Connection | None = None
+        attachment_lease = self.acquire_attachment_control_lease(self.data_dir)
         try:
             source = self.connect()
             snapshot_time = _now()
@@ -1060,6 +1300,7 @@ class HubStore:
                 or str(binding[1]) != self.managed_host_identity
             ):
                 raise RuntimeError("Team Hub maintenance backup identity verification failed")
+            attachment_files = self._team_attachment_snapshot_files(destination)
             proof_rows: list[tuple[str, str, bytes]] = []
             bootstrap_claims = destination.execute(
                 """
@@ -1133,10 +1374,15 @@ class HubStore:
                             "sha256": hashlib.sha256(proof_bytes).hexdigest(),
                         }
                     )
+            attachment_summary = self._copy_attachment_generation(
+                self.data_dir / "attachments",
+                temporary / "attachments",
+                attachment_files,
+            )
             database_digest = self._sha256_private_regular_file(database_copy)
             key_digest = hashlib.sha256(key).hexdigest()
             manifest = {
-                "format": 1,
+                "format": 2,
                 "reason": clean_reason,
                 "hub_id": self.hub_id,
                 "host_server_identity": self.managed_host_identity,
@@ -1144,6 +1390,7 @@ class HubStore:
                 "database_sha256": database_digest,
                 "signing_key_sha256": key_digest,
                 "proofs": proof_manifest,
+                "attachments": attachment_summary,
                 "created_at": _iso8601(_now()),
             }
             create_secret_file(
@@ -1196,6 +1443,8 @@ class HubStore:
             if temporary.exists() and not temporary.is_symlink():
                 shutil.rmtree(temporary, ignore_errors=True)
             raise
+        finally:
+            self.release_attachment_control_lease(attachment_lease)
 
     @classmethod
     def verify_maintenance_snapshot(
@@ -1213,15 +1462,19 @@ class HubStore:
         root = Path(os.path.abspath(os.path.expanduser(os.fspath(data_dir))))
         cls._validate_private_directory_without_mutation(root)
         with cls.maintenance_control_lock(root):
-            cls._restore_maintenance_snapshot_unlocked(
-                root,
-                snapshot_dir,
-                expected_host_identity=expected_host_identity,
-                expected_hub_id=expected_hub_id,
-                expected_operation_id=expected_operation_id,
-                expected_reason=expected_reason,
-                verify_only=True,
-            )
+            attachment_lease = cls.acquire_attachment_control_lease(root)
+            try:
+                cls._restore_maintenance_snapshot_unlocked(
+                    root,
+                    snapshot_dir,
+                    expected_host_identity=expected_host_identity,
+                    expected_hub_id=expected_hub_id,
+                    expected_operation_id=expected_operation_id,
+                    expected_reason=expected_reason,
+                    verify_only=True,
+                )
+            finally:
+                cls.release_attachment_control_lease(attachment_lease)
 
     @classmethod
     def restore_maintenance_snapshot(
@@ -1237,15 +1490,19 @@ class HubStore:
         lease = cls.acquire_managed_runtime_lease(data_dir)
         try:
             with cls.maintenance_control_lock(data_dir):
-                cls._restore_maintenance_snapshot_unlocked(
-                    data_dir,
-                    snapshot_dir,
-                    expected_host_identity=expected_host_identity,
-                    expected_hub_id=expected_hub_id,
-                    expected_operation_id=expected_operation_id,
-                    expected_reason=expected_reason,
-                    verify_only=False,
-                )
+                attachment_lease = cls.acquire_attachment_control_lease(data_dir)
+                try:
+                    cls._restore_maintenance_snapshot_unlocked(
+                        data_dir,
+                        snapshot_dir,
+                        expected_host_identity=expected_host_identity,
+                        expected_hub_id=expected_hub_id,
+                        expected_operation_id=expected_operation_id,
+                        expected_reason=expected_reason,
+                        verify_only=False,
+                    )
+                finally:
+                    cls.release_attachment_control_lease(attachment_lease)
         finally:
             cls.release_managed_runtime_lease(lease)
 
@@ -1307,7 +1564,7 @@ class HubStore:
             manifest = json.loads(manifest_bytes)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise RuntimeError("Team Hub snapshot manifest is invalid") from exc
-        required_manifest_keys = {
+        base_manifest_keys = {
             "format",
             "reason",
             "hub_id",
@@ -1318,12 +1575,20 @@ class HubStore:
             "proofs",
             "created_at",
         }
-        if not isinstance(manifest, dict) or set(manifest) != required_manifest_keys:
+        if not isinstance(manifest, dict):
+            raise RuntimeError("Team Hub snapshot manifest is invalid")
+        snapshot_format = manifest.get("format")
+        if snapshot_format == 1:
+            required_manifest_keys = base_manifest_keys
+        elif snapshot_format == 2:
+            required_manifest_keys = base_manifest_keys | {"attachments"}
+        else:
+            raise RuntimeError("Team Hub snapshot manifest is invalid")
+        if set(manifest) != required_manifest_keys:
             raise RuntimeError("Team Hub snapshot manifest is invalid")
         schema_version = manifest.get("schema_version")
         if (
-            manifest.get("format") != 1
-            or manifest.get("hub_id") != hub_id
+            manifest.get("hub_id") != hub_id
             or manifest.get("host_server_identity") != host_identity
             or manifest.get("reason") != expected_reason
             or isinstance(schema_version, bool)
@@ -1348,6 +1613,25 @@ class HubStore:
             digest = manifest.get(digest_name)
             if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
                 raise RuntimeError("Team Hub snapshot manifest digest is invalid")
+
+        attachment_manifest: dict[str, Any] | None = None
+        if snapshot_format == 2:
+            raw_attachments = manifest.get("attachments")
+            if (
+                not isinstance(raw_attachments, dict)
+                or set(raw_attachments) != {"file_count", "byte_size", "sha256"}
+                or isinstance(raw_attachments.get("file_count"), bool)
+                or not isinstance(raw_attachments.get("file_count"), int)
+                or raw_attachments["file_count"] < 0
+                or isinstance(raw_attachments.get("byte_size"), bool)
+                or not isinstance(raw_attachments.get("byte_size"), int)
+                or raw_attachments["byte_size"] < 0
+                or not isinstance(raw_attachments.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", raw_attachments["sha256"])
+                is None
+            ):
+                raise RuntimeError("Team Hub snapshot attachment manifest is invalid")
+            attachment_manifest = raw_attachments
 
         raw_proofs = manifest.get("proofs")
         if not isinstance(raw_proofs, list) or len(raw_proofs) > 4096:
@@ -1525,14 +1809,55 @@ class HubStore:
             }
             if not active_at_snapshot.issubset(proof_entries):
                 raise RuntimeError("Team Hub snapshot omits an active local proof")
+            attachment_files = cls._team_attachment_snapshot_files(connection)
+            if snapshot_format == 2:
+                attachment_source = snapshot / "attachments"
+                attachment_summary = cls._attachment_generation_summary(
+                    attachment_source,
+                    attachment_files,
+                    exact_tree=True,
+                    require_root=True,
+                )
+                if attachment_summary != attachment_manifest:
+                    raise RuntimeError("Team Hub snapshot attachment manifest is invalid")
+            else:
+                # Format 1 predates external attachment generations. A schema-9
+                # snapshot can still be rolled back safely only while its exact
+                # content-addressed files remain in the fenced live tree. A
+                # partial upload has no digest in the legacy manifest, so it
+                # cannot be attributed to that snapshot generation safely.
+                if any(item.content_sha256 is None for item in attachment_files):
+                    raise RuntimeError(
+                        "Legacy Team Hub snapshot omits a resumable attachment generation"
+                    )
+                # New files are excluded when the staged generation is
+                # assembled below.
+                attachment_source = root / "attachments"
+                attachment_summary = cls._attachment_generation_summary(
+                    attachment_source,
+                    attachment_files,
+                    exact_tree=False,
+                    require_root=bool(attachment_files),
+                )
             connection.close()
             connection = None
 
             if verify_only:
                 return
 
+            staged_attachments = staging / "attachments"
+            staged_attachment_summary = cls._copy_attachment_generation(
+                attachment_source,
+                staged_attachments,
+                attachment_files,
+            )
+            if staged_attachment_summary != attachment_summary:
+                raise RuntimeError("Team Hub snapshot attachment generation changed")
+
             old_directory = staging / "previous"
             ensure_private_directory(old_directory)
+            failed_directory = staging / "failed"
+            ensure_private_directory(failed_directory)
             managed_targets = {
                 root / "team-hub.sqlite3",
                 root / "access-token-signing.key",
@@ -1555,6 +1880,24 @@ class HubStore:
                 os.replace(target, prior)
                 moved_old.append((prior, target))
 
+            attachment_target = root / "attachments"
+            try:
+                attachment_info = attachment_target.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                if (
+                    not stat.S_ISDIR(attachment_info.st_mode)
+                    or attachment_info.st_uid != os.getuid()
+                    or stat.S_IMODE(attachment_info.st_mode) != 0o700
+                ):
+                    raise PermissionError(
+                        "Team Hub live attachment state contains an unsafe directory"
+                    )
+                prior = old_directory / "attachments"
+                os.replace(attachment_target, prior)
+                moved_old.append((prior, attachment_target))
+
             replacements = [
                 (staged_database, root / "team-hub.sqlite3"),
                 (staged_key, root / "access-token-signing.key"),
@@ -1563,6 +1906,7 @@ class HubStore:
                 (staged_proofs / filename, root / filename)
                 for filename in sorted(proof_entries)
             )
+            replacements.append((staged_attachments, attachment_target))
             for source, target in replacements:
                 os.replace(source, target)
                 installed.append(target)
@@ -1572,6 +1916,13 @@ class HubStore:
                 != manifest["database_sha256"]
                 or cls._sha256_private_regular_file(root / "access-token-signing.key")
                 != manifest["signing_key_sha256"]
+                or cls._attachment_generation_summary(
+                    attachment_target,
+                    attachment_files,
+                    exact_tree=True,
+                    require_root=True,
+                )
+                != attachment_summary
             ):
                 raise RuntimeError("Team Hub restored state verification failed")
         except BaseException:
@@ -1579,7 +1930,7 @@ class HubStore:
                 connection.close()
             for target in reversed(installed):
                 try:
-                    target.unlink()
+                    os.replace(target, failed_directory / target.name)
                 except FileNotFoundError:
                     pass
             for prior, target in reversed(moved_old):
@@ -7855,6 +8206,7 @@ class HubStore:
                 ]
                 if not rows:
                     raise HubError("forbidden", "This message is not addressed to the caller", 403)
+                changed_recipient_ids: list[str] = []
                 for recipient in rows:
                     current = str(recipient["state"])
                     if current == "read" or (current == "delivered" and state == "delivered"):
@@ -7876,6 +8228,7 @@ class HubStore:
                             """,
                             (timestamp, timestamp, recipient["id"]),
                         )
+                    changed_recipient_ids.append(str(recipient["id"]))
                 updated = [
                     self._team_recipient_public(recipient)
                     for recipient in self._team_message_recipients(connection, team_id, message_id)
@@ -7905,6 +8258,15 @@ class HubStore:
                     {"state": state},
                     timestamp,
                 )
+                for recipient_id in changed_recipient_ids:
+                    self._outbox(
+                        connection,
+                        team_id,
+                        "team_message_recipient",
+                        recipient_id,
+                        f"team.message.{state}",
+                        timestamp,
+                    )
                 return response
         finally:
             connection.close()
@@ -8067,6 +8429,14 @@ class HubStore:
                     {"byte_size": byte_size, "deduplicated": already_stored},
                     timestamp,
                 )
+                self._outbox(
+                    connection,
+                    team_id,
+                    "team_attachment",
+                    attachment_id,
+                    "team.attachment.declared",
+                    timestamp,
+                )
                 return response
         finally:
             connection.close()
@@ -8090,8 +8460,10 @@ class HubStore:
         if type(offset) is not int or offset < 0 or type(total) is not int or total < 1:
             raise HubError("invalid_request", "Attachment range is invalid", 422)
         timestamp = _now()
-        connection = self.connect()
+        attachment_lease = self.acquire_attachment_control_lease(self.data_dir)
+        connection: sqlite3.Connection | None = None
         try:
+            connection = self.connect()
             try:
                 return self._write_team_attachment_chunk_locked(
                     connection,
@@ -8116,7 +8488,9 @@ class HubStore:
                     )
                 raise failure.error from None
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
+            self.release_attachment_control_lease(attachment_lease)
 
     def _write_team_attachment_chunk_locked(
         self,
@@ -8334,9 +8708,11 @@ class HubStore:
         """Remove declared uploads that never finished; never touch ready files."""
 
         timestamp = _now(now)
-        connection = self.connect()
+        attachment_lease = self.acquire_attachment_control_lease(self.data_dir)
+        connection: sqlite3.Connection | None = None
         removed = 0
         try:
+            connection = self.connect()
             with _write_transaction(connection):
                 stale = connection.execute(
                     """
@@ -8355,7 +8731,9 @@ class HubStore:
                     removed += 1
             return removed
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
+            self.release_attachment_control_lease(attachment_lease)
 
     # -- skills -------------------------------------------------------------
 

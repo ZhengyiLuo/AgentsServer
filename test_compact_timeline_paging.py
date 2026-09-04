@@ -456,6 +456,59 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
             + agent_server.SEMANTIC_TIMELINE_ESSENTIAL_PAGE_OVERFLOW_LIMIT,
         )
 
+    def test_emergency_alerts_remain_exact_semantic_landmarks_inside_turns_and_jobs(self) -> None:
+        events = [
+            self.event(1, "turn_started", run_id="chat-run", prompt="Watch production"),
+            self.event(
+                2,
+                "emergency_alert_raised",
+                run_id="chat-run",
+                emergency_alert_id="emergency_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                message="Chat run needs acknowledgement.",
+            ),
+            self.event(3, "turn_finished", run_id="chat-run", result_text="Paused."),
+            self.event(4, "job_started", run_id="job-run", job_id="job-1", job_title="Watchdog"),
+            self.event(
+                5,
+                "emergency_alert_raised",
+                run_id="job-run",
+                purpose="scheduled_job",
+                job_id="job-1",
+                emergency_alert_id="emergency_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                message="Scheduled run needs acknowledgement.",
+            ),
+            self.event(6, "job_finished", run_id="job-run", job_id="job-1", job_title="Watchdog"),
+        ]
+        self.write_events(events)
+
+        index = agent_server.build_timeline_index(self.session_id)
+        emergency_landmarks = [
+            landmark
+            for landmark in index["landmarks"]
+            if landmark["title"] == "Emergency Alert Raised"
+        ]
+        self.assertEqual(
+            [(landmark["key"], landmark["start_seq"]) for landmark in emergency_landmarks],
+            [("event:event-2", 2), ("event:event-5", 5)],
+        )
+
+        page = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            limit=10,
+            tail=False,
+        )
+        self.assertEqual(
+            [
+                event["emergency_alert_id"]
+                for event in page["events"]
+                if event["type"] == "emergency_alert_raised"
+            ],
+            [
+                "emergency_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "emergency_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ],
+        )
+
     def test_semantic_cursor_keeps_interleaved_job_segments_chronological(self) -> None:
         events: list[dict[str, object]] = []
         seq = 0

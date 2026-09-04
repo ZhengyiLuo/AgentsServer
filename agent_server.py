@@ -24644,6 +24644,23 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                     record["timestamp"] = event.get("ts")
                 continue
 
+            # Emergency alerts are independently actionable timeline rows.
+            # Never bury one inside its owning provider turn or scheduled-job
+            # summary: notification navigation needs a stable exact landmark,
+            # and semantic paging must return the raw event so the inline
+            # Acknowledge control remains reachable from old history.
+            if event_type == "emergency_alert_raised":
+                record = ensure_record(
+                    f"event:{event.get('id') or seq}",
+                    "system",
+                    event,
+                )
+                record["title"] = "Emergency Alert Raised"
+                record["preview"] = (
+                    timeline_index_event_text(event) or record["title"]
+                )
+                continue
+
             if (
                 event_type in TIMELINE_INDEX_JOB_TYPES
                 or event.get("purpose") == "scheduled_job"
@@ -25888,6 +25905,8 @@ def collect_semantic_timeline_events(
                         active_turn_key = None
                     if run_id:
                         current_turn_by_run.pop(run_id, None)
+            elif event_type == "emergency_alert_raised":
+                key = f"event:{event.get('id') or seq}"
             else:
                 codex_lifecycle_key = timeline_index_codex_lifecycle_key(event)
                 job_id = explicit_job_id or (

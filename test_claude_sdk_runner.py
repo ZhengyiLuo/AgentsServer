@@ -2003,8 +2003,12 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                 "claude_sdk_owner_token": manager.owner_token,
                 "claude_permission_run_id": "run-claude",
                 "claude_permissions_open": True,
+                "claude_permission_mode": "bypassPermissions",
             }
         }
+        # The persisted setting can change while a turn is active. Permission
+        # callbacks must keep using the policy captured when this turn began.
+        self.session["claude_permission_mode"] = "default"
         append_event = AsyncMock(return_value={})
         update_metadata = AsyncMock()
         with patch.dict(sys.modules, fake_claude_sdk_modules()), patch.object(

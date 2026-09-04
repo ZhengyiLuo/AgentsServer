@@ -1951,6 +1951,53 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         append_event.assert_not_awaited()
         update_metadata.assert_not_awaited()
 
+    async def test_bypass_permission_mode_never_creates_approval_interaction(self) -> None:
+        self.session["claude_permission_mode"] = "bypassPermissions"
+        manager = FakeClaudeManager()
+        manager.active_run_id = "run-claude"
+        agent_server.CLAUDE_SDK_MANAGER = manager
+        agent_server.ACTIVE = {
+            "chat-claude": {
+                "run_id": "run-claude",
+                "backend": agent_server.BACKEND_CLAUDE,
+                "transport": agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+                "interactive_agent_sdk": True,
+                "stop_requested": False,
+                "claude_sdk_owner_token": manager.owner_token,
+                "claude_permission_run_id": "run-claude",
+                "claude_permissions_open": True,
+            }
+        }
+        append_event = AsyncMock(return_value={})
+        update_metadata = AsyncMock()
+        with patch.dict(sys.modules, fake_claude_sdk_modules()), patch.object(
+            agent_server,
+            "append_event",
+            append_event,
+        ), patch.object(
+            agent_server,
+            "update_claude_pending_session_metadata",
+            update_metadata,
+        ):
+            for tool_name, input_data in (
+                ("Read", {"file_path": "/tmp/read-only.txt"}),
+                ("Bash", {"command": "pwd"}),
+            ):
+                with self.subTest(tool_name=tool_name):
+                    result = await agent_server.handle_claude_tool_permission(
+                        "chat-claude",
+                        tool_name,
+                        input_data,
+                        {"tool_use_id": f"tool-{tool_name}"},
+                        owner_token=manager.owner_token,
+                    )
+                    self.assertIsInstance(result, FakePermissionResultAllow)
+                    self.assertEqual(result.updated_input, input_data)
+
+        self.assertFalse(agent_server.CLAUDE_PENDING_INTERACTIONS)
+        append_event.assert_not_awaited()
+        update_metadata.assert_not_awaited()
+
     async def test_permission_mode_runtime_contract_and_public_session(self) -> None:
         self.session["claude_permission_mode"] = "acceptEdits"
         with patch.object(

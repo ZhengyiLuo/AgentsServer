@@ -358,6 +358,114 @@ class SecurePeerHubAdapter:
             ),
         }
 
+    @classmethod
+    def _team_message_body(cls, request: ProxyRequest) -> dict[str, Any]:
+        """Shape-check a Team Messages V2 create request; the store validates values."""
+
+        value = cls._object_body(
+            request,
+            allowed={
+                "kind",
+                "title",
+                "body",
+                "body_format",
+                "recipients",
+                "attachment_ids",
+                "in_reply_to_message_id",
+                "skill",
+                "provenance",
+                "idempotency_key",
+            },
+            required={"kind", "body", "recipients", "idempotency_key"},
+        )
+        recipients = value.get("recipients")
+        if (
+            not isinstance(recipients, list)
+            or not 1 <= len(recipients) <= 16
+            or any(
+                not isinstance(item, dict) or not set(item).issubset({"kind", "id"})
+                for item in recipients
+            )
+        ):
+            raise HubError("invalid_request", "Request body is invalid", 422)
+        skill = value.get("skill")
+        if skill is not None and (
+            not isinstance(skill, dict)
+            or not set(skill).issubset(
+                {"slug", "summary", "tags", "change_note", "expected_version"}
+            )
+        ):
+            raise HubError("invalid_request", "Request body is invalid", 422)
+        value["idempotency_key"] = cls._identifier(value["idempotency_key"], minimum=8)
+        return value
+
+    @classmethod
+    def _team_receipt_body(cls, request: ProxyRequest) -> dict[str, Any]:
+        value = cls._object_body(
+            request,
+            allowed={"state", "idempotency_key"},
+            required={"state", "idempotency_key"},
+        )
+        if value.get("state") not in {"delivered", "read"}:
+            raise HubError("invalid_request", "Request body is invalid", 422)
+        return {
+            "state": value["state"],
+            "idempotency_key": cls._identifier(value["idempotency_key"], minimum=8),
+        }
+
+    @classmethod
+    def _team_attachment_body(cls, request: ProxyRequest) -> dict[str, Any]:
+        value = cls._object_body(
+            request,
+            allowed={"file_name", "media_type", "byte_size", "sha256", "idempotency_key"},
+            required={"file_name", "media_type", "byte_size", "sha256", "idempotency_key"},
+        )
+        value["idempotency_key"] = cls._identifier(value["idempotency_key"], minimum=8)
+        return value
+
+    @classmethod
+    def _team_skill_flag_body(cls, request: ProxyRequest, flag: str) -> dict[str, Any]:
+        value = cls._object_body(
+            request,
+            allowed={flag, "idempotency_key"},
+            required={flag, "idempotency_key"},
+        )
+        if type(value.get(flag)) is not bool:
+            raise HubError("invalid_request", "Request body is invalid", 422)
+        return {
+            flag: value[flag],
+            "idempotency_key": cls._identifier(value["idempotency_key"], minimum=8),
+        }
+
+    @staticmethod
+    def _team_query(request: ProxyRequest, *, allowed: set[str]) -> dict[str, str]:
+        """Bound Team Messages V2 query strings without mailbox-specific rules."""
+
+        try:
+            pairs = parse_qsl(request.query, keep_blank_values=True, strict_parsing=True)
+        except ValueError as exc:
+            raise HubError("invalid_request", "Query is invalid", 422) from exc
+        if len(pairs) != len({key for key, _value in pairs}) or any(
+            key not in allowed for key, _value in pairs
+        ):
+            raise HubError("invalid_request", "Query is invalid", 422)
+        values = dict(pairs)
+        for key in ("after_sequence", "limit"):
+            if key in values and (
+                not values[key].isdigit() or str(int(values[key])) != values[key]
+            ):
+                raise HubError("invalid_request", "Query is invalid", 422)
+        if "limit" in values and not 1 <= int(values["limit"]) <= 100:
+            raise HubError("invalid_request", "Query is invalid", 422)
+        for key in ("address_id", "from_id"):
+            if key in values:
+                values[key] = SecurePeerHubAdapter._resource_id(values[key])
+        return values
+
+    @staticmethod
+    def _query_flag(values: dict[str, str], key: str) -> bool:
+        return values.get(key, "0") in {"1", "true"}
+
     @staticmethod
     def _query(
         request: ProxyRequest,
@@ -484,6 +592,71 @@ class SecurePeerHubAdapter:
                     result = self.store.get_network_request(
                         claims, team_id, self._resource_id(pieces[3])
                     )
+                elif len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "messages"]:
+                    values = self._team_query(
+                        request,
+                        allowed={
+                            "box",
+                            "address_kind",
+                            "address_id",
+                            "unread",
+                            "from_kind",
+                            "from_id",
+                            "since",
+                            "after_sequence",
+                            "limit",
+                        },
+                    )
+                    result = self.store.list_team_messages(
+                        claims,
+                        team_id,
+                        box=values.get("box", "inbox"),
+                        address_kind=values.get("address_kind"),
+                        address_id=values.get("address_id"),
+                        unread=self._query_flag(values, "unread"),
+                        from_kind=values.get("from_kind"),
+                        from_id=values.get("from_id"),
+                        since=values.get("since"),
+                        after_sequence=int(values.get("after_sequence", "0")),
+                        limit=int(values.get("limit", "50")),
+                    )
+                elif len(pieces) == 4 and pieces[1:3] == [_NETWORK_CHILD, "messages"]:
+                    result = self.store.get_team_message(
+                        claims, team_id, self._resource_id(pieces[3])
+                    )
+                elif len(pieces) == 4 and pieces[1:3] == [_NETWORK_CHILD, "attachments"]:
+                    result = self.store.get_team_attachment(
+                        claims, team_id, self._resource_id(pieces[3])
+                    )
+                elif len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "skills"]:
+                    values = self._team_query(request, allowed={"include_archived", "slug"})
+                    result = self.store.list_team_skills(
+                        claims,
+                        team_id,
+                        include_archived=self._query_flag(values, "include_archived"),
+                        slug=values.get("slug"),
+                    )
+                elif len(pieces) == 4 and pieces[1:3] == [_NETWORK_CHILD, "skills"]:
+                    result = self.store.get_team_skill(
+                        claims, team_id, self._resource_id(pieces[3])
+                    )
+                elif (
+                    len(pieces) == 5
+                    and pieces[1:3] == [_NETWORK_CHILD, "skills"]
+                    and pieces[4] == "versions"
+                ):
+                    result = self.store.list_team_skill_versions(
+                        claims, team_id, self._resource_id(pieces[3])
+                    )
+                elif (
+                    len(pieces) == 6
+                    and pieces[1:3] == [_NETWORK_CHILD, "skills"]
+                    and pieces[4] == "versions"
+                    and pieces[5].isdigit()
+                ):
+                    result = self.store.get_team_skill_version(
+                        claims, team_id, self._resource_id(pieces[3]), int(pieces[5])
+                    )
                 else:  # The gateway sanitizer should make this unreachable.
                     raise HubError("not_found", "Resource not found", 404)
             elif request.method == "POST" and path.startswith(_TEAM_PREFIX):
@@ -533,6 +706,42 @@ class SecurePeerHubAdapter:
                         team_id,
                         self._resource_id(pieces[3]),
                         self._network_text_body(request, mode="reply"),
+                    )
+                elif len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "messages"]:
+                    result = self.store.create_team_message(
+                        claims, team_id, self._team_message_body(request)
+                    )
+                elif (
+                    len(pieces) == 5
+                    and pieces[1:3] == [_NETWORK_CHILD, "messages"]
+                    and pieces[4] == "receipts"
+                ):
+                    result = self.store.record_team_message_receipt(
+                        claims,
+                        team_id,
+                        self._resource_id(pieces[3]),
+                        self._team_receipt_body(request),
+                    )
+                elif len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "attachments"]:
+                    result = self.store.declare_team_attachment(
+                        claims, team_id, self._team_attachment_body(request)
+                    )
+                elif (
+                    len(pieces) == 5
+                    and pieces[1:3] == [_NETWORK_CHILD, "skills"]
+                    and pieces[4] in {"pin", "archive"}
+                ):
+                    flag = "pinned" if pieces[4] == "pin" else "archived"
+                    setter = (
+                        self.store.set_team_skill_pinned
+                        if flag == "pinned"
+                        else self.store.set_team_skill_archived
+                    )
+                    result = setter(
+                        claims,
+                        team_id,
+                        self._resource_id(pieces[3]),
+                        self._team_skill_flag_body(request, flag),
                     )
                 else:
                     raise HubError("not_found", "Resource not found", 404)

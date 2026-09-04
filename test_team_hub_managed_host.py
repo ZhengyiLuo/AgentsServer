@@ -322,6 +322,11 @@ class ManagedHostTests(unittest.TestCase):
             ):
                 connection.execute(f"DROP TRIGGER {trigger}")
             for table in (
+                "team_skill_versions",
+                "team_attachments",
+                "team_message_recipients",
+                "team_messages",
+                "team_skills",
                 "network_passive_requests",
                 "network_deliveries",
                 "network_mailbox_items",
@@ -351,6 +356,11 @@ class ManagedHostTests(unittest.TestCase):
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_insert")
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_update")
             for table in (
+                "team_skill_versions",
+                "team_attachments",
+                "team_message_recipients",
+                "team_messages",
+                "team_skills",
                 "network_passive_requests",
                 "network_deliveries",
                 "network_mailbox_items",
@@ -677,7 +687,7 @@ class ManagedHostTests(unittest.TestCase):
             self.assertEqual(migrated.bootstrap_proof_path.read_bytes(), expected_proof)
             connection = migrated.connect()
             try:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 9)
                 self.assertEqual(
                     connection.execute(
                         "SELECT count(*) FROM bootstrap_delegations"
@@ -771,7 +781,7 @@ class ManagedHostTests(unittest.TestCase):
                 try:
                     self.assertEqual(
                         connection.execute("PRAGMA user_version").fetchone()[0],
-                        8,
+                        9,
                     )
                     preserved = connection.execute(
                         "SELECT * FROM channels WHERE id=?", (old_board_id,)

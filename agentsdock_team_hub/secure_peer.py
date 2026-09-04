@@ -4332,6 +4332,75 @@ def sanitize_proxy_request(
                 and normalized_method == "POST"
             ):
                 route_allowed = True
+            # Team Messages V2 JSON routes. Attachment *content* is deliberately
+            # absent here: bytes travel on the separate binary lane.
+            elif pieces == ["messages"] and normalized_method in {"GET", "POST"}:
+                route_allowed = True
+                allow_query = normalized_method == "GET"
+                allowed_query_keys = {
+                    "box",
+                    "address_kind",
+                    "address_id",
+                    "unread",
+                    "from_kind",
+                    "from_id",
+                    "since",
+                    "after_sequence",
+                    "limit",
+                }
+            elif (
+                len(pieces) == 2
+                and pieces[0] == "messages"
+                and normalized_method == "GET"
+            ):
+                route_allowed = True
+            elif (
+                len(pieces) == 3
+                and pieces[0] == "messages"
+                and pieces[2] == "receipts"
+                and normalized_method == "POST"
+            ):
+                route_allowed = True
+            elif pieces == ["attachments"] and normalized_method == "POST":
+                route_allowed = True
+            elif (
+                len(pieces) == 2
+                and pieces[0] == "attachments"
+                and normalized_method == "GET"
+            ):
+                route_allowed = True
+            elif pieces == ["skills"] and normalized_method == "GET":
+                route_allowed = True
+                allow_query = True
+                allowed_query_keys = {"include_archived", "slug"}
+            elif (
+                len(pieces) == 2
+                and pieces[0] == "skills"
+                and normalized_method == "GET"
+            ):
+                route_allowed = True
+            elif (
+                len(pieces) == 3
+                and pieces[0] == "skills"
+                and pieces[2] == "versions"
+                and normalized_method == "GET"
+            ):
+                route_allowed = True
+            elif (
+                len(pieces) == 4
+                and pieces[0] == "skills"
+                and pieces[2] == "versions"
+                and pieces[3].isdigit()
+                and normalized_method == "GET"
+            ):
+                route_allowed = True
+            elif (
+                len(pieces) == 3
+                and pieces[0] == "skills"
+                and pieces[2] in {"pin", "archive"}
+                and normalized_method == "POST"
+            ):
+                route_allowed = True
             if not route_allowed:
                 raise SecurePeerError("route_forbidden", "Hub route is not permitted", 403)
             required_scope = (
@@ -4375,13 +4444,35 @@ def sanitize_proxy_request(
             values["after_server_id"]
         ) is None:
             raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
-        if "address_kind" in values and values["address_kind"] not in {"server", "agent"}:
-            raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
-        if "address_id" in values and (
-            not values["address_id"]
-            or len(values["address_id"]) > 240
-            or any(ord(character) < 33 or ord(character) > 126 for character in values["address_id"])
+        messages_route = path.endswith("/network/messages")
+        if "address_kind" in values and values["address_kind"] not in (
+            {"server", "human"} if messages_route else {"server", "agent"}
         ):
+            raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
+        for identifier_key in ("address_id", "from_id"):
+            if identifier_key in values and (
+                not values[identifier_key]
+                or len(values[identifier_key]) > 240
+                or any(
+                    ord(character) < 33 or ord(character) > 126
+                    for character in values[identifier_key]
+                )
+            ):
+                raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
+        if "box" in values and values["box"] not in {"inbox", "feed", "sent"}:
+            raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
+        for flag_key in ("unread", "include_archived"):
+            if flag_key in values and values[flag_key] not in {"0", "1", "true", "false"}:
+                raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
+        if "from_kind" in values and values["from_kind"] not in {"server", "human"}:
+            raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
+        if "since" in values and (
+            not values["since"]
+            or len(values["since"]) > 40
+            or any(ord(character) < 33 or ord(character) > 126 for character in values["since"])
+        ):
+            raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
+        if "slug" in values and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", values["slug"]) is None:
             raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         if path.endswith("/network/mailbox") and normalized_method == "GET" and not {
             "address_kind",

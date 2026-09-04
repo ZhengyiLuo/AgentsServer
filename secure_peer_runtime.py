@@ -6,6 +6,7 @@ from contextlib import suppress
 from datetime import datetime, timezone
 import hashlib
 import json
+import mimetypes
 import os
 from pathlib import Path
 import socket
@@ -13,7 +14,7 @@ import stat
 import threading
 import time
 from typing import Any, Mapping
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 import uuid
 
 from agentsdock_team_hub.secure_peer import (
@@ -3486,6 +3487,377 @@ class SecurePeerRuntime:
             target_id=target_id,
             message=message,
         )
+
+    # ------------------------------------------------------------------
+    # Team Messages V2: the local server acts as its own node on the Hub.
+    # Host realm talks to the in-process HubStore with process-local claims;
+    # peer realm goes through the pinned mTLS connection.  Attachment bytes in
+    # the peer realm need the binary lane and are rejected until it lands.
+
+    def team_realms(self) -> list[dict[str, Any]]:
+        """Every team this server can act in, in deterministic order."""
+
+        realms: list[dict[str, Any]] = []
+        with self._guard:
+            host_store = self._hub_store
+            active = next(
+                (
+                    dict(item)
+                    for item in self.client.list_connections()
+                    if item.get("active")
+                    and item.get("status") == "connected"
+                    and "teamspace.read" in set(item.get("scopes") or [])
+                ),
+                None,
+            )
+        if host_store is not None:
+            for team_id in host_store.local_agent_mail_team_ids():
+                realms.append({
+                    "realm": "host",
+                    "team_id": team_id,
+                    "hub_id": host_store.hub_id,
+                    "server_identity": self.server_identity,
+                    "can_write": True,
+                })
+        if active is not None:
+            realms.append({
+                "realm": "secure_peer",
+                "connection_id": str(active.get("connection_id") or ""),
+                "team_id": str(active.get("team_id") or ""),
+                "hub_id": str(active.get("hub_id") or ""),
+                "host_server_identity": str(active.get("host_server_identity") or ""),
+                "certificate_fingerprint": str(active.get("certificate_fingerprint") or ""),
+                "can_write": "teamspace.write" in set(active.get("scopes") or []),
+            })
+        return realms
+
+    def team_realm(self, team_id: str | None = None) -> dict[str, Any]:
+        realms = self.team_realms()
+        if not realms:
+            raise SecurePeerError(
+                "team_unavailable", "This server is not connected to a Team Network", 409
+            )
+        if team_id:
+            for realm in realms:
+                if realm["team_id"] == team_id:
+                    return realm
+            raise SecurePeerError("team_unavailable", "Unknown team for this server", 404)
+        if len(realms) > 1:
+            raise SecurePeerError(
+                "team_ambiguous",
+                "This server belongs to several teams; pass --team "
+                + ", ".join(realm["team_id"] for realm in realms),
+                409,
+            )
+        return realms[0]
+
+    def _team_hub_get(self, realm: dict[str, Any], path: str, query: dict[str, Any]) -> dict[str, Any]:
+        clean = {
+            key: ("1" if value is True else str(value))
+            for key, value in query.items()
+            if value not in (None, "", False)
+        }
+        if realm["realm"] == "host":
+            return self._team_host_call(realm, "GET", path, clean, None)
+        response = self.proxy(
+            str(realm["connection_id"]),
+            "GET",
+            path,
+            query=urlencode(clean),
+            headers={"accept": "application/json"},
+            body=None,
+        )
+        return self._decoded_proxy_json(response)
+
+    def _team_hub_post(self, realm: dict[str, Any], path: str, body: dict[str, Any]) -> dict[str, Any]:
+        if realm["realm"] == "host":
+            return self._team_host_call(realm, "POST", path, {}, body)
+        if not realm.get("can_write"):
+            raise SecurePeerError(
+                "forbidden", "This server's Team Network connection is read-only", 403
+            )
+        response = self.proxy(
+            str(realm["connection_id"]),
+            "POST",
+            path,
+            query="",
+            headers={"accept": "application/json", "content-type": "application/json"},
+            body=json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        )
+        return self._decoded_proxy_json(response)
+
+    def _team_host_call(
+        self,
+        realm: dict[str, Any],
+        method: str,
+        path: str,
+        query: dict[str, str],
+        body: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Serve a host-realm Team Messages call directly from the HubStore."""
+
+        with self._guard:
+            store = self._hub_store
+        if store is None or store.hub_id != realm.get("hub_id"):
+            raise SecurePeerError("team_unavailable", "Team Hub is unavailable", 409)
+        team_id = str(realm["team_id"])
+        claims = store.local_agent_mail_claims(team_id)
+        prefix = f"/v1/teams/{quote(team_id, safe='')}/network/"
+        if not path.startswith(prefix):
+            raise SecurePeerError("route_forbidden", "Hub route is not permitted", 403)
+        pieces = [piece for piece in path[len(prefix):].split("/") if piece]
+        flag = lambda key: query.get(key, "0") in {"1", "true"}  # noqa: E731
+        if method == "GET" and pieces == ["messages"]:
+            return store.list_team_messages(
+                claims,
+                team_id,
+                box=query.get("box", "inbox"),
+                address_kind=query.get("address_kind"),
+                address_id=query.get("address_id"),
+                unread=flag("unread"),
+                from_kind=query.get("from_kind"),
+                from_id=query.get("from_id"),
+                since=query.get("since"),
+                after_sequence=int(query.get("after_sequence", "0")),
+                limit=int(query.get("limit", "50")),
+            )
+        if method == "GET" and len(pieces) == 2 and pieces[0] == "messages":
+            return store.get_team_message(claims, team_id, pieces[1])
+        if method == "POST" and pieces == ["messages"]:
+            return store.create_team_message(claims, team_id, dict(body or {}))
+        if method == "POST" and len(pieces) == 3 and pieces[0] == "messages" and pieces[2] == "receipts":
+            return store.record_team_message_receipt(claims, team_id, pieces[1], dict(body or {}))
+        if method == "GET" and pieces == ["skills"]:
+            return store.list_team_skills(
+                claims, team_id, include_archived=flag("include_archived"), slug=query.get("slug")
+            )
+        if method == "GET" and len(pieces) == 2 and pieces[0] == "skills":
+            return store.get_team_skill(claims, team_id, pieces[1])
+        if method == "GET" and len(pieces) == 4 and pieces[0] == "skills" and pieces[2] == "versions":
+            return store.get_team_skill_version(claims, team_id, pieces[1], int(pieces[3]))
+        if method == "GET" and len(pieces) == 2 and pieces[0] == "attachments":
+            return store.get_team_attachment(claims, team_id, pieces[1])
+        if method == "POST" and pieces == ["attachments"]:
+            return store.declare_team_attachment(claims, team_id, dict(body or {}))
+        raise SecurePeerError("route_forbidden", "Hub route is not permitted", 403)
+
+    def team_list_messages(
+        self,
+        *,
+        box: str,
+        team_id: str | None = None,
+        unread: bool = False,
+        since: str | None = None,
+        after_sequence: int = 0,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        realm = self.team_realm(team_id)
+        result = self._team_hub_get(
+            realm,
+            f"/v1/teams/{quote(realm['team_id'], safe='')}/network/messages",
+            {
+                "box": box,
+                "unread": unread,
+                "since": since,
+                "after_sequence": after_sequence,
+                "limit": limit,
+            },
+        )
+        result["team_id"] = realm["team_id"]
+        return result
+
+    def team_get_message(self, message_id: str, *, team_id: str | None = None) -> dict[str, Any]:
+        realm = self.team_realm(team_id)
+        result = self._team_hub_get(
+            realm,
+            f"/v1/teams/{quote(realm['team_id'], safe='')}/network/messages/{quote(message_id, safe='')}",
+            {},
+        )
+        result["team_id"] = realm["team_id"]
+        return result
+
+    def team_list_skills(self, *, include_archived: bool = False, team_id: str | None = None) -> dict[str, Any]:
+        realm = self.team_realm(team_id)
+        result = self._team_hub_get(
+            realm,
+            f"/v1/teams/{quote(realm['team_id'], safe='')}/network/skills",
+            {"include_archived": include_archived},
+        )
+        result["team_id"] = realm["team_id"]
+        return result
+
+    def team_get_skill(
+        self,
+        slug: str,
+        *,
+        version: int | None = None,
+        team_id: str | None = None,
+    ) -> dict[str, Any]:
+        realm = self.team_realm(team_id)
+        team_path = f"/v1/teams/{quote(realm['team_id'], safe='')}/network/skills"
+        listed = self._team_hub_get(realm, team_path, {"slug": slug, "include_archived": True})
+        skills = listed.get("skills") if isinstance(listed, dict) else None
+        if not isinstance(skills, list) or len(skills) != 1 or not isinstance(skills[0], dict):
+            raise SecurePeerError("not_found", f"No team skill named {slug!r}", 404)
+        skill_id = str(skills[0].get("id") or "")
+        if version is None:
+            result = self._team_hub_get(realm, f"{team_path}/{quote(skill_id, safe='')}", {})
+        else:
+            result = self._team_hub_get(
+                realm, f"{team_path}/{quote(skill_id, safe='')}/versions/{int(version)}", {}
+            )
+        result["team_id"] = realm["team_id"]
+        return result
+
+    def team_send_message(
+        self,
+        reference: Mapping[str, Any],
+        *,
+        payload: Mapping[str, Any],
+        attachment_paths: list[str],
+        idempotency_key: str,
+        provenance: Mapping[str, str],
+    ) -> dict[str, Any]:
+        """Create one team message for a frozen @@ reference, with attachments."""
+
+        realm = self.team_realm(str(reference.get("team_id") or "") or None)
+        if not realm.get("can_write"):
+            raise SecurePeerError(
+                "forbidden", "This server's Team Network connection is read-only", 403
+            )
+        team_path = f"/v1/teams/{quote(realm['team_id'], safe='')}/network"
+        kind = str(payload.get("kind") or "message")
+        if reference.get("kind") == "skill":
+            recipients = [{"kind": "all"}]
+        elif reference.get("recipient_kind") == "all":
+            recipients = [{"kind": "all"}]
+        else:
+            recipients = [
+                {"kind": str(reference.get("recipient_kind")), "id": str(reference.get("target_id"))}
+            ]
+        attachment_ids: list[str] = []
+        for index, path in enumerate(attachment_paths):
+            attachment_ids.append(
+                self._team_upload_attachment(
+                    realm,
+                    Path(path),
+                    idempotency_key=f"{idempotency_key}:attachment:{index}",
+                )
+            )
+        body: dict[str, Any] = {
+            "kind": kind,
+            "body": str(payload.get("body") or ""),
+            "body_format": str(payload.get("body_format") or "markdown"),
+            "recipients": recipients,
+            "attachment_ids": attachment_ids,
+            "provenance": dict(provenance),
+            "idempotency_key": idempotency_key,
+        }
+        if payload.get("title"):
+            body["title"] = str(payload["title"])
+        skill = payload.get("skill")
+        if kind == "skill":
+            details = dict(skill or {})
+            if reference.get("kind") == "skill" and not details.get("slug"):
+                raise SecurePeerError(
+                    "invalid_request", "Publishing to a mentioned skill requires --skill-slug", 422
+                )
+            body["skill"] = details
+        return self._team_hub_post(realm, f"{team_path}/messages", body)
+
+    def _team_upload_attachment(
+        self,
+        realm: dict[str, Any],
+        path: Path,
+        *,
+        idempotency_key: str,
+    ) -> str:
+        """Stream one local file into the Hub and return its attachment id."""
+
+        if not path.is_file():
+            raise SecurePeerError("invalid_request", f"Attachment is not a file: {path}", 422)
+        size = path.stat().st_size
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while True:
+                block = handle.read(1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        declared = self._team_hub_post(
+            realm,
+            f"/v1/teams/{quote(realm['team_id'], safe='')}/network/attachments",
+            {
+                "file_name": path.name,
+                "media_type": media_type,
+                "byte_size": size,
+                "sha256": digest.hexdigest(),
+                "idempotency_key": idempotency_key,
+            },
+        )
+        attachment = declared.get("attachment") if isinstance(declared, dict) else None
+        if not isinstance(attachment, dict) or not attachment.get("id"):
+            raise SecurePeerError("team_unavailable", "Team Hub returned an invalid attachment", 502)
+        attachment_id = str(attachment["id"])
+        if attachment.get("state") == "ready":
+            return attachment_id
+        chunk_bytes = int(declared.get("chunk_bytes") or (8 * 1024 * 1024))
+        if realm["realm"] != "host":
+            raise SecurePeerError(
+                "attachment_unavailable",
+                "Attachments to a remote Team Hub need the binary lane; not available yet",
+                501,
+            )
+        with self._guard:
+            store = self._hub_store
+        if store is None:
+            raise SecurePeerError("team_unavailable", "Team Hub is unavailable", 409)
+        claims = store.local_agent_mail_claims(str(realm["team_id"]))
+        offset = 0
+        with path.open("rb") as handle:
+            while offset < size:
+                chunk = handle.read(chunk_bytes)
+                if not chunk:
+                    break
+                store.write_team_attachment_chunk(
+                    claims,
+                    str(realm["team_id"]),
+                    attachment_id,
+                    offset=offset,
+                    total=size,
+                    data=chunk,
+                )
+                offset += len(chunk)
+        return attachment_id
+
+    def team_attachment_local_paths(
+        self,
+        attachments: list[Mapping[str, Any]],
+        *,
+        team_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Resolve ready attachments to local files; host realm serves storage paths."""
+
+        realm = self.team_realm(team_id)
+        if realm["realm"] != "host":
+            raise SecurePeerError(
+                "attachment_unavailable",
+                "Downloading attachments from a remote Team Hub needs the binary lane; not available yet",
+                501,
+            )
+        with self._guard:
+            store = self._hub_store
+        if store is None:
+            raise SecurePeerError("team_unavailable", "Team Hub is unavailable", 409)
+        claims = store.local_agent_mail_claims(str(realm["team_id"]))
+        resolved: list[dict[str, Any]] = []
+        for attachment in attachments:
+            public, path = store.open_team_attachment(
+                claims, str(realm["team_id"]), str(attachment.get("id") or "")
+            )
+            resolved.append({**public, "local_path": str(path)})
+        return resolved
 
     def shutdown(self) -> None:
         self.close_host_admission()

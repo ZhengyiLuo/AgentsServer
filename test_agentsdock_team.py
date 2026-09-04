@@ -1,0 +1,557 @@
+"""Team Messages V2 agent side: references, gating, helper CLI, endpoints."""
+
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+from fastapi import HTTPException
+from pydantic import ValidationError
+from starlette.requests import Request
+
+import agent_server
+import agentsdock_team
+from agentsdock_team_hub.secure_peer import SecurePeerError
+
+
+def _server_reference(**overrides) -> agent_server.TeamReference:
+    fields = {
+        "kind": "recipient",
+        "recipient_kind": "server",
+        "team_id": "team_alpha_0001",
+        "target_id": "node_sonic_0001",
+        "display_name_snapshot": "SONIC",
+        "source_text_start": 5,
+        "source_text_end": 12,
+    }
+    fields.update(overrides)
+    return agent_server.TeamReference(**fields)
+
+
+def _all_reference() -> agent_server.TeamReference:
+    return agent_server.TeamReference(
+        kind="recipient",
+        recipient_kind="all",
+        team_id="team_alpha_0001",
+        target_id="all",
+        display_name_snapshot="all",
+    )
+
+
+class TeamReferenceModelTests(unittest.TestCase):
+    def test_recipient_shapes_are_validated(self) -> None:
+        self.assertEqual(_server_reference().recipient_kind, "server")
+        with self.assertRaises(ValidationError):
+            agent_server.TeamReference(
+                kind="recipient", team_id="team_alpha_0001", target_id="node_x"
+            )
+        with self.assertRaises(ValidationError):
+            _server_reference(recipient_kind="all", target_id="node_sonic_0001")
+        with self.assertRaises(ValidationError):
+            agent_server.TeamReference(
+                kind="skill",
+                recipient_kind="server",
+                team_id="team_alpha_0001",
+                target_id="tskill_1",
+            )
+        with self.assertRaises(ValidationError):
+            _server_reference(source_text_start=9, source_text_end=3)
+        with self.assertRaises(ValidationError):
+            _server_reference(grant_intent=False)
+
+    def test_turn_request_keeps_team_references_apart_from_chat_references(self) -> None:
+        request = agent_server.TurnRequest(
+            prompt="Tell @@SONIC the build is green",
+            team_references=[_server_reference().model_dump()],
+        )
+        self.assertEqual(request.chat_references, [])
+        self.assertEqual(request.team_references[0].target_id, "node_sonic_0001")
+        self.assertEqual(
+            agent_server.team_reference_dicts(request.team_references)[0]["kind"],
+            "recipient",
+        )
+
+
+class TeamPurposeGatingTests(unittest.TestCase):
+    def test_ordinary_turns_and_jobs_may_read_but_deliveries_may_not(self) -> None:
+        for purpose in (None, "", "scheduled_job"):
+            self.assertTrue(agent_server.provider_turn_may_read_team(purpose))
+            self.assertTrue(agent_server.provider_turn_may_send_team(purpose))
+        for purpose in (
+            "cross_chat_handoff_delivery",
+            "secure_peer_handoff_delivery",
+            "handoff_digest",
+            "handoff_digest_delivery",
+        ):
+            self.assertFalse(agent_server.provider_turn_may_read_team(purpose))
+            self.assertFalse(agent_server.provider_turn_may_send_team(purpose))
+
+    def test_skill_publish_requires_all_or_skill_reference(self) -> None:
+        self.assertFalse(
+            agent_server.team_reference_requests_skill_publish([_server_reference()])
+        )
+        self.assertTrue(agent_server.team_reference_requests_skill_publish([_all_reference()]))
+        self.assertTrue(
+            agent_server.team_reference_requests_skill_publish([
+                agent_server.TeamReference(
+                    kind="skill", team_id="team_alpha_0001", target_id="tskill_1"
+                )
+            ])
+        )
+
+
+class FakeResponse:
+    def __init__(self, payload: dict):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self) -> bytes:
+        return json.dumps(self.payload).encode("utf-8")
+
+
+class AgentsDockTeamCLITests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    def authority(self, mode: int = 0o600) -> str:
+        path = self.root / "authority.json"
+        path.write_text(json.dumps({
+            "provider_capability": "provider-secret",
+            "source_session_id": "source",
+        }))
+        path.chmod(mode)
+        return str(path)
+
+    def test_reads_stay_loopback_and_carry_the_capability_header(self) -> None:
+        requests = []
+
+        class Opener:
+            def open(self, request, timeout):
+                requests.append((request, timeout))
+                return FakeResponse({"messages": [], "has_more": False, "team_id": "team_alpha_0001"})
+
+        with (
+            patch.dict(agentsdock_team.os.environ, {"AGENTSDOCK_SERVER_URL": "http://127.0.0.1:7850"}),
+            patch.object(agentsdock_team.urllib.request, "build_opener", return_value=Opener()),
+        ):
+            result = agentsdock_team.main([
+                "--authority-file", self.authority(), "inbox", "--unread", "--limit", "5",
+            ])
+        self.assertEqual(result, 0)
+        request, _timeout = requests[0]
+        self.assertTrue(request.full_url.startswith("http://127.0.0.1:7850/api/agent/team/messages?"))
+        self.assertIn("box=inbox", request.full_url)
+        self.assertIn("unread=1", request.full_url)
+        self.assertIn("limit=5", request.full_url)
+        self.assertEqual(request.get_header("X-agentsdock-provider-capability"), "provider-secret")
+
+    def test_remote_url_and_unsafe_authority_are_rejected(self) -> None:
+        with patch.dict(agentsdock_team.os.environ, {"AGENTSDOCK_SERVER_URL": "http://example.com"}):
+            self.assertEqual(
+                agentsdock_team.main(["--authority-file", self.authority(), "skills"]), 2
+            )
+        with patch.dict(agentsdock_team.os.environ, {"AGENTSDOCK_SERVER_URL": "http://127.0.0.1:7850"}):
+            self.assertEqual(
+                agentsdock_team.main(["--authority-file", self.authority(0o644), "skills"]), 2
+            )
+
+    def test_send_reads_body_from_stdin_and_validates_attachments(self) -> None:
+        attachment = self.root / "runbook.md"
+        attachment.write_text("# Runbook\n")
+        captured = []
+
+        class Opener:
+            def open(self, request, timeout):
+                captured.append(json.loads(request.data.decode("utf-8")))
+                return FakeResponse({
+                    "ok": True,
+                    "route_id": "team_" + "a" * 32,
+                    "message_id": "tmsg_1",
+                    "kind": "message",
+                    "accepted": True,
+                    "duplicate": False,
+                    "attachments": 1,
+                })
+
+        stdin = io.StringIO("Build is **green**.\n")
+        with (
+            patch.dict(agentsdock_team.os.environ, {"AGENTSDOCK_SERVER_URL": "http://127.0.0.1:7850"}),
+            patch.object(agentsdock_team.urllib.request, "build_opener", return_value=Opener()),
+            patch.object(agentsdock_team.sys, "stdin", stdin),
+        ):
+            result = agentsdock_team.main([
+                "--authority-file", self.authority(), "send",
+                "--route", "team_" + "a" * 32,
+                "--attach", str(attachment),
+            ])
+        self.assertEqual(result, 0)
+        payload = captured[0]
+        self.assertEqual(payload["body"], "Build is **green**.")
+        self.assertEqual(payload["kind"], "message")
+        self.assertEqual(payload["attachments"], [str(attachment.resolve())])
+        self.assertTrue(payload["idempotency_key"].startswith("team_cli_"))
+
+        with (
+            patch.dict(agentsdock_team.os.environ, {"AGENTSDOCK_SERVER_URL": "http://127.0.0.1:7850"}),
+            patch.object(agentsdock_team.sys, "stdin", io.StringIO("body")),
+        ):
+            self.assertEqual(
+                agentsdock_team.main([
+                    "--authority-file", self.authority(), "send",
+                    "--route", "team_" + "a" * 32, "--attach", "relative/path.md",
+                ]),
+                2,
+            )
+            self.assertEqual(
+                agentsdock_team.main([
+                    "--authority-file", self.authority(), "send",
+                    "--route", "team_" + "a" * 32, "--attach", str(self.root / "missing.md"),
+                ]),
+                2,
+            )
+            self.assertEqual(
+                agentsdock_team.main([
+                    "--authority-file", self.authority(), "send",
+                    "--route", "team_" + "a" * 32, "--kind", "skill", "--title", "T",
+                ]),
+                2,
+                "skill sends require --skill-slug",
+            )
+
+    def test_send_rejects_tty_stdin(self) -> None:
+        class TTY(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        with (
+            patch.dict(agentsdock_team.os.environ, {"AGENTSDOCK_SERVER_URL": "http://127.0.0.1:7850"}),
+            patch.object(agentsdock_team.sys, "stdin", TTY("x")),
+        ):
+            self.assertEqual(
+                agentsdock_team.main([
+                    "--authority-file", self.authority(), "send", "--route", "team_" + "b" * 32,
+                ]),
+                2,
+            )
+
+
+class ProviderTeamEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.previous = {
+            name: getattr(agent_server, name)
+            for name in (
+                "CURRENT_TURNS",
+                "ACTIVE",
+                "BUSY_SESSIONS",
+                "CROSS_CHAT_CAPABILITIES",
+                "CROSS_CHAT_AUTHORITY_ROOT",
+                "AGENT_TOKEN",
+            )
+        }
+        self.previous_sessions = agent_server.STORE.sessions
+        agent_server.STORE.sessions = {"source": {"id": "source", "backend": "codex"}}
+        agent_server.CURRENT_TURNS = {"source": {"run_id": "run_team"}}
+        agent_server.ACTIVE = {"source": {"run_id": "run_team"}}
+        agent_server.BUSY_SESSIONS = {"source"}
+        agent_server.CROSS_CHAT_CAPABILITIES = {}
+        agent_server.CROSS_CHAT_AUTHORITY_ROOT = self.root / "authority"
+        agent_server.AGENT_TOKEN = "test-agent-token"
+        self.references = [_server_reference(), _all_reference()]
+        await self.issue({"team_read", "team_send", "team_skill_publish"}, self.references)
+
+    async def asyncTearDown(self) -> None:
+        agent_server.STORE.sessions = self.previous_sessions
+        for name, value in self.previous.items():
+            setattr(agent_server, name, value)
+        self.temporary.cleanup()
+
+    async def issue(self, actions: set[str], references) -> None:
+        path = await agent_server.issue_cross_chat_capability(
+            "source",
+            "run_team",
+            [],
+            actions=set(actions),
+            team_references=list(references) if references else None,
+            team_read_enabled="team_read" in actions,
+        )
+        self.authority_path = path
+        payload = json.loads(path.read_text())
+        self.token = payload["provider_capability"]
+        self.assertNotIn("node_sonic_0001", path.read_text())
+
+    def request(self, method: str = "GET", path: str = "/api/agent/team/routes") -> Request:
+        return Request({
+            "type": "http",
+            "method": method,
+            "path": path,
+            "headers": [(b"x-agentsdock-provider-capability", self.token.encode())],
+            "query_string": b"",
+            "scheme": "http",
+            "server": ("127.0.0.1", 7850),
+            "client": ("127.0.0.1", 41000),
+        })
+
+    async def routes(self) -> dict[str, dict]:
+        listed = await agent_server.list_provider_team_routes(self.request())
+        return {route["display_name"]: route for route in listed["routes"]}
+
+    async def test_routes_are_opaque_and_never_expose_hub_identities(self) -> None:
+        listed = await agent_server.list_provider_team_routes(self.request())
+        self.assertEqual(len(listed["routes"]), 2)
+        self.assertTrue(listed["skill_publish"])
+        for route in listed["routes"]:
+            self.assertRegex(route["route_id"], r"^team_[0-9a-f]{32}$")
+            self.assertNotIn("target_id", route)
+            self.assertNotIn("team_id", route)
+        by_name = {route["display_name"]: route for route in listed["routes"]}
+        self.assertFalse(by_name["SONIC"]["allows_skill"])
+        self.assertEqual(by_name["SONIC"]["recipient_kind"], "server")
+        self.assertTrue(by_name["Team"]["allows_skill"])
+        self.assertEqual(by_name["Team"]["recipient_kind"], "all")
+
+    async def test_read_endpoints_delegate_to_the_runtime_and_mark_content_untrusted(self) -> None:
+        with patch.object(
+            agent_server.SECURE_PEER_RUNTIME,
+            "team_list_messages",
+            return_value={"messages": [], "has_more": False, "team_id": "team_alpha_0001"},
+        ) as listed:
+            result = await agent_server.list_provider_team_messages(
+                self.request(), box="inbox", unread=True, limit=500
+            )
+        listed.assert_called_once_with(
+            box="inbox", team_id=None, unread=True, since=None, after_sequence=0, limit=100
+        )
+        self.assertIn("team-authored", result["notice"])
+        with self.assertRaises(HTTPException) as raised:
+            await agent_server.list_provider_team_messages(self.request(), box="drafts")
+        self.assertEqual(raised.exception.status_code, 422)
+        with patch.object(
+            agent_server.SECURE_PEER_RUNTIME,
+            "team_get_skill",
+            return_value={"skill": {"slug": "deploy-sonic", "attachments": []}, "team_id": "t"},
+        ) as skill:
+            result = await agent_server.get_provider_team_skill(" Deploy-SONIC ", self.request())
+        skill.assert_called_once_with("deploy-sonic", version=None, team_id=None)
+        self.assertEqual(result["skill"]["slug"], "deploy-sonic")
+        with self.assertRaises(HTTPException) as bad_slug:
+            await agent_server.get_provider_team_skill("bad slug!", self.request())
+        self.assertEqual(bad_slug.exception.status_code, 422)
+        with patch.object(
+            agent_server.SECURE_PEER_RUNTIME,
+            "team_get_message",
+            side_effect=SecurePeerError("team_unavailable", "no network", 409),
+        ):
+            with self.assertRaises(HTTPException) as unavailable:
+                await agent_server.get_provider_team_message("tmsg_1", self.request())
+        self.assertEqual(unavailable.exception.status_code, 409)
+        self.assertTrue(str(unavailable.exception.detail).startswith("team_unavailable"))
+
+    async def test_read_requires_the_team_read_action(self) -> None:
+        agent_server.CROSS_CHAT_CAPABILITIES = {}
+        await self.issue({"publish"}, None)
+        with self.assertRaises(HTTPException) as raised:
+            await agent_server.list_provider_team_skills(self.request())
+        self.assertEqual(raised.exception.status_code, 403)
+        with self.assertRaises(HTTPException) as routes:
+            await agent_server.list_provider_team_routes(self.request())
+        self.assertEqual(routes.exception.status_code, 403)
+
+    async def test_send_is_once_per_route_gated_for_skills_and_idempotent(self) -> None:
+        routes = await self.routes()
+        attachment = self.root / "notes.md"
+        attachment.write_text("# notes\n")
+
+        def fake_send(reference, *, payload, attachment_paths, idempotency_key, provenance):
+            self.assertEqual(provenance["via"], "agent")
+            self.assertEqual(provenance["chat_id"], "source")
+            self.assertEqual(provenance["backend"], "codex")
+            self.assertTrue(idempotency_key.startswith("agent_team_"))
+            skill = payload.get("skill") if payload.get("kind") == "skill" else None
+            return {
+                "message": {
+                    "id": "tmsg_" + reference["target_id"],
+                    "title": payload.get("title"),
+                    "attachments": [{"id": f"tatt_{index}"} for index, _ in enumerate(attachment_paths)],
+                    "recipients": [{"kind": reference.get("recipient_kind"), "display_name": "x"}],
+                    "skill": {"slug": skill["slug"], "version": 1} if skill else None,
+                }
+            }
+
+        recorded = AsyncMock()
+        with (
+            patch.object(agent_server.SECURE_PEER_RUNTIME, "team_send_message", side_effect=fake_send) as send,
+            patch.object(agent_server, "record_team_message_sent_event", recorded),
+        ):
+            receipt = await agent_server.send_provider_team_message(
+                routes["SONIC"]["route_id"],
+                agent_server.AgentTeamSendRequest(
+                    body="Build is green.",
+                    attachments=[str(attachment)],
+                    idempotency_key="send-0001-key",
+                ),
+                self.request("POST"),
+            )
+            self.assertEqual(receipt["ok"], True)
+            self.assertEqual(receipt["message_id"], "tmsg_node_sonic_0001")
+            self.assertEqual(receipt["attachments"], 1)
+            self.assertFalse(receipt["duplicate"])
+            self.assertEqual(send.call_args.kwargs["attachment_paths"], [str(attachment.resolve())])
+            recorded.assert_awaited_once()
+
+            replay = await agent_server.send_provider_team_message(
+                routes["SONIC"]["route_id"],
+                agent_server.AgentTeamSendRequest(
+                    body="Build is green.",
+                    attachments=[str(attachment)],
+                    idempotency_key="send-0001-key",
+                ),
+                self.request("POST"),
+            )
+            self.assertTrue(replay["duplicate"])
+            self.assertEqual(send.call_count, 1)
+
+            with self.assertRaises(HTTPException) as reused:
+                await agent_server.send_provider_team_message(
+                    routes["SONIC"]["route_id"],
+                    agent_server.AgentTeamSendRequest(body="Again", idempotency_key="send-0002-key"),
+                    self.request("POST"),
+                )
+            self.assertEqual(reused.exception.status_code, 409)
+
+            with self.assertRaises(HTTPException) as wrong_target:
+                await agent_server.send_provider_team_message(
+                    routes["SONIC"]["route_id"],
+                    agent_server.AgentTeamSendRequest(
+                        kind="skill", title="Deploy", body="# steps",
+                        skill={"slug": "deploy-sonic"}, idempotency_key="send-0003-key",
+                    ),
+                    self.request("POST"),
+                )
+            self.assertEqual(wrong_target.exception.status_code, 409)
+
+            skill_receipt = await agent_server.send_provider_team_message(
+                routes["Team"]["route_id"],
+                agent_server.AgentTeamSendRequest(
+                    kind="skill", title="Deploy SONIC", body="# steps",
+                    skill={"slug": "deploy-sonic", "summary": "how"}, idempotency_key="send-0004-key",
+                ),
+                self.request("POST"),
+            )
+            self.assertEqual(skill_receipt["skill_slug"], "deploy-sonic")
+            self.assertEqual(skill_receipt["skill_version"], 1)
+            self.assertEqual(send.call_count, 2)
+
+    async def test_skill_sends_need_the_publish_action_and_an_all_route(self) -> None:
+        agent_server.CROSS_CHAT_CAPABILITIES = {}
+        await self.issue({"team_read", "team_send"}, self.references)
+        routes = await self.routes()
+        with patch.object(agent_server.SECURE_PEER_RUNTIME, "team_send_message") as send:
+            with self.assertRaises(HTTPException) as denied:
+                await agent_server.send_provider_team_message(
+                    routes["Team"]["route_id"],
+                    agent_server.AgentTeamSendRequest(
+                        kind="skill", title="T", body="# x", skill={"slug": "x-skill"},
+                        idempotency_key="send-0005-key",
+                    ),
+                    self.request("POST"),
+                )
+            self.assertEqual(denied.exception.status_code, 403)
+            with self.assertRaises(HTTPException) as no_slug:
+                await agent_server.send_provider_team_message(
+                    routes["Team"]["route_id"],
+                    agent_server.AgentTeamSendRequest(
+                        kind="skill", title="T", body="# x", idempotency_key="send-0006-key",
+                    ),
+                    self.request("POST"),
+                )
+            self.assertEqual(no_slug.exception.status_code, 422)
+        send.assert_not_called()
+
+    async def test_send_rejects_protected_or_missing_attachments(self) -> None:
+        routes = await self.routes()
+        for path, status in (
+            (str(self.authority_path), 403),
+            ("relative.md", 422),
+            (str(self.root / "missing.md"), 422),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await agent_server.send_provider_team_message(
+                    routes["SONIC"]["route_id"],
+                    agent_server.AgentTeamSendRequest(
+                        body="x", attachments=[path], idempotency_key="send-0007-key",
+                    ),
+                    self.request("POST"),
+                )
+            self.assertEqual(raised.exception.status_code, status, path)
+
+    async def test_failed_send_releases_the_route_for_a_retry(self) -> None:
+        routes = await self.routes()
+        recorded = AsyncMock()
+        with (
+            patch.object(
+                agent_server.SECURE_PEER_RUNTIME,
+                "team_send_message",
+                side_effect=SecurePeerError("team_unavailable", "hub offline", 409),
+            ),
+            patch.object(agent_server, "record_team_message_sent_event", recorded),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await agent_server.send_provider_team_message(
+                    routes["SONIC"]["route_id"],
+                    agent_server.AgentTeamSendRequest(body="x", idempotency_key="send-0008-key"),
+                    self.request("POST"),
+                )
+        self.assertEqual(raised.exception.status_code, 409)
+        recorded.assert_not_awaited()
+        with (
+            patch.object(
+                agent_server.SECURE_PEER_RUNTIME,
+                "team_send_message",
+                return_value={"message": {"id": "tmsg_ok", "attachments": [], "recipients": [], "skill": None, "title": None}},
+            ),
+            patch.object(agent_server, "record_team_message_sent_event", AsyncMock()),
+        ):
+            receipt = await agent_server.send_provider_team_message(
+                routes["SONIC"]["route_id"],
+                agent_server.AgentTeamSendRequest(body="x", idempotency_key="send-0008-key"),
+                self.request("POST"),
+            )
+        self.assertEqual(receipt["message_id"], "tmsg_ok")
+
+    async def test_authority_block_advertises_the_team_helper(self) -> None:
+        block = agent_server.cross_chat_provider_authority_block(
+            [],
+            self.authority_path,
+            "source",
+            {"team_read", "team_send", "team_skill_publish"},
+            team_references=self.references,
+        )
+        self.assertIn("$AGENTSDOCK_TEAM_CLI", block)
+        self.assertIn("inbox", block)
+        self.assertIn("routes`", block)
+        self.assertIn("--kind skill", block)
+        self.assertIn("a server, the whole team", block)
+        self.assertNotIn("node_sonic_0001", block)
+        read_only = agent_server.cross_chat_provider_authority_block(
+            [], self.authority_path, "source", {"team_read"}
+        )
+        self.assertIn("read-only", read_only)
+        self.assertNotIn("send --route", read_only)
+
+
+if __name__ == "__main__":
+    unittest.main()

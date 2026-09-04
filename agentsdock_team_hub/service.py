@@ -10,17 +10,22 @@ import re
 import threading
 import time
 from typing import Annotated, Any, Literal
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .auth import AuthenticationError, AuthorizationError
 from .store import (
     MAX_NETWORK_BODY_BYTES,
     MAX_NETWORK_PAGE_ITEMS,
+    MAX_TEAM_MESSAGE_ATTACHMENTS,
+    MAX_TEAM_MESSAGE_BODY_BYTES,
+    MAX_TEAM_MESSAGE_RECIPIENTS,
+    MAX_TEAM_SKILL_TAGS,
+    TEAM_ATTACHMENT_CHUNK_BYTES,
     AccessClaims,
     HubError,
     HubStore,
@@ -28,6 +33,17 @@ from .store import (
 
 
 MAX_JSON_BODY_BYTES = 65_536
+# Team attachment bytes use one narrowly allowlisted binary lane instead of the
+# JSON body pipeline: PUT chunks up to TEAM_ATTACHMENT_CHUNK_BYTES, GET/HEAD
+# with Range. Nothing else escapes the JSON limits below.
+TEAM_ATTACHMENT_CONTENT_RE = re.compile(
+    r"^/v1/teams/[^/]+/network/attachments/[^/]+/content$"
+)
+_CONTENT_RANGE_RE = re.compile(
+    r"^bytes (?P<start>[0-9]{1,15})-(?P<end>[0-9]{1,15})/(?P<total>[0-9]{1,15})$"
+)
+_RANGE_RE = re.compile(r"^bytes=(?P<start>[0-9]{0,15})-(?P<end>[0-9]{0,15})$")
+_ATTACHMENT_STREAM_BLOCK_BYTES = 1024 * 1024
 BODY_READ_TIMEOUT_SECONDS = 10.0
 HOSTNAME_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 TAILSCALE_SERVE_HEADERS_INFO = "https://tailscale.com/s/serve-headers"
@@ -187,6 +203,126 @@ class NetworkReplyRequest(StrictModel):
 class NetworkReceiptRequest(StrictModel):
     state: Literal["delivered", "read"]
     idempotency_key: str = Field(min_length=8, max_length=240)
+
+
+class TeamRecipientRequest(StrictModel):
+    kind: Literal["server", "human", "all"]
+    id: str | None = Field(default=None, min_length=1, max_length=240)
+
+
+class TeamSkillDetailsRequest(StrictModel):
+    slug: str = Field(min_length=1, max_length=64)
+    summary: str = Field(default="", max_length=280)
+    tags: list[str] = Field(default_factory=list, max_length=MAX_TEAM_SKILL_TAGS)
+    change_note: str = Field(default="", max_length=280)
+    expected_version: int | None = Field(default=None, ge=1)
+
+
+class TeamMessageRequest(StrictModel):
+    kind: Literal["message", "skill"]
+    title: str | None = Field(default=None, min_length=1, max_length=160)
+    body: str = Field(min_length=1, max_length=MAX_TEAM_MESSAGE_BODY_BYTES)
+    body_format: Literal["plain", "markdown"] = "markdown"
+    recipients: list[TeamRecipientRequest] = Field(
+        min_length=1, max_length=MAX_TEAM_MESSAGE_RECIPIENTS
+    )
+    attachment_ids: list[str] = Field(
+        default_factory=list, max_length=MAX_TEAM_MESSAGE_ATTACHMENTS
+    )
+    in_reply_to_message_id: str | None = Field(default=None, min_length=8, max_length=240)
+    skill: TeamSkillDetailsRequest | None = None
+    provenance: dict[str, str] | None = None
+    idempotency_key: str = Field(min_length=8, max_length=240)
+
+
+class TeamReceiptRequest(StrictModel):
+    state: Literal["delivered", "read"]
+    idempotency_key: str = Field(min_length=8, max_length=240)
+
+
+class TeamAttachmentDeclareRequest(StrictModel):
+    file_name: str = Field(min_length=1, max_length=255)
+    media_type: str = Field(min_length=3, max_length=160)
+    byte_size: int = Field(ge=1)
+    sha256: str = Field(min_length=64, max_length=64)
+    idempotency_key: str = Field(min_length=8, max_length=240)
+
+
+class TeamSkillPinRequest(StrictModel):
+    pinned: bool
+    idempotency_key: str = Field(min_length=8, max_length=240)
+
+
+class TeamSkillArchiveRequest(StrictModel):
+    archived: bool
+    idempotency_key: str = Field(min_length=8, max_length=240)
+
+
+def attachment_content_response(
+    request: Request,
+    attachment: dict[str, Any],
+    path: Path,
+) -> Response:
+    """Stream one ready attachment with byte-range support for video seeking."""
+
+    size = int(attachment["byte_size"])
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": (
+            "inline; filename*=UTF-8''" + quote(str(attachment["file_name"]), safe="")
+        ),
+        "Cache-Control": "private, max-age=0",
+        "X-Content-Type-Options": "nosniff",
+        "ETag": f'"{attachment["sha256"]}"',
+    }
+    start, end, status = 0, size - 1, 200
+    range_header = request.headers.get("range")
+    if range_header:
+        match = _RANGE_RE.fullmatch(range_header.strip())
+        invalid = match is None
+        if not invalid:
+            raw_start, raw_end = match["start"], match["end"]
+            if raw_start == "" and raw_end == "":
+                invalid = True
+            elif raw_start == "":
+                suffix = int(raw_end)
+                if suffix == 0:
+                    invalid = True
+                else:
+                    start, end = max(0, size - suffix), size - 1
+            else:
+                start = int(raw_start)
+                end = int(raw_end) if raw_end else size - 1
+                if start >= size or end < start:
+                    invalid = True
+                end = min(end, size - 1)
+        if invalid:
+            return Response(
+                status_code=416,
+                headers={**headers, "Content-Range": f"bytes */{size}"},
+            )
+        status = 206
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    length = end - start + 1
+    headers["Content-Length"] = str(length)
+    media_type = str(attachment["media_type"])
+    if request.method == "HEAD":
+        return Response(status_code=status, headers=headers, media_type=media_type)
+
+    def stream():
+        with open(path, "rb") as handle:
+            handle.seek(start)
+            remaining = length
+            while remaining > 0:
+                block = handle.read(min(_ATTACHMENT_STREAM_BLOCK_BYTES, remaining))
+                if not block:
+                    break
+                remaining -= len(block)
+                yield block
+
+    return StreamingResponse(
+        stream(), status_code=status, headers=headers, media_type=media_type
+    )
 
 
 SecurePeerScope = Literal[
@@ -546,7 +682,12 @@ def create_app(
                     "Vary": "Origin",
                 },
             )
-        if request.method == "POST":
+        binary_lane_path = _mounted_route_path(request)
+        binary_upload = (
+            request.method == "PUT"
+            and TEAM_ATTACHMENT_CONTENT_RE.fullmatch(binary_lane_path) is not None
+        )
+        if request.method == "POST" or binary_upload:
             try:
                 maintenance_fenced = store.maintenance_fence() is not None
             except Exception:
@@ -567,7 +708,7 @@ def create_app(
                 ).hexdigest()
             else:
                 peer = request.client.host if request.client is not None else "unknown"
-            route_path = _mounted_route_path(request)
+            route_path = binary_lane_path
             sensitive_limits = {
                 "/v1/bootstrap/redeem": 8,
                 "/v1/owner-recovery/redeem": 8,
@@ -577,8 +718,11 @@ def create_app(
                 "/v1/node-enrollments/challenge": 30,
                 "/v1/node-enrollments/redeem": 30,
             }
-            action = route_path if route_path in sensitive_limits else "other_post"
-            limit = sensitive_limits.get(route_path, 120)
+            if binary_upload:
+                action, limit = "attachment_upload", 1_200
+            else:
+                action = route_path if route_path in sensitive_limits else "other_post"
+                limit = sensitive_limits.get(route_path, 120)
             if (
                 not rate_limiter.allow(peer, action, limit)
                 or not rate_limiter.allow("*", action, limit * 100)
@@ -589,7 +733,25 @@ def create_app(
         lengths = values.get(b"content-length", [])
         if len(lengths) > 1:
             return _error("invalid_request", "Duplicate Content-Length is not accepted", 400)
-        if request.method in {"POST", "PUT", "PATCH"}:
+        if binary_upload:
+            # Attachment chunks: exact octet-stream body, one Content-Range, no
+            # JSON parsing. The route handler and store re-validate the range.
+            if len(lengths) != 1:
+                return _error("invalid_request", "Exactly one Content-Length is required", 400)
+            try:
+                raw_length = lengths[0].decode("ascii")
+                body_length = int(raw_length, 10)
+            except (UnicodeDecodeError, ValueError):
+                return _error("invalid_request", "Content-Length is invalid", 400)
+            if raw_length != str(body_length) or not 1 <= body_length <= TEAM_ATTACHMENT_CHUNK_BYTES:
+                return _error("request_too_large", "Attachment chunk size is invalid", 413)
+            if values.get(b"content-type", []) != [b"application/octet-stream"]:
+                return _error(
+                    "invalid_request", "Content-Type must be application/octet-stream", 415
+                )
+            if len(values.get(b"content-range", [])) != 1:
+                return _error("invalid_request", "Exactly one Content-Range is required", 400)
+        elif request.method in {"POST", "PUT", "PATCH"}:
             if len(lengths) != 1:
                 return _error("invalid_request", "Exactly one Content-Length is required", 400)
             try:
@@ -1003,6 +1165,143 @@ def create_app(
         return store.create_network_request_reply(
             claims, team_id, request_id, body.model_dump()
         )
+
+    @app.get("/v1/teams/{team_id}/network/messages")
+    def team_messages(
+        team_id: str,
+        claims: Auth,
+        box: Annotated[Literal["inbox", "feed", "sent"], Query()] = "inbox",
+        address_kind: Annotated[Literal["server", "human"] | None, Query()] = None,
+        address_id: Annotated[str | None, Query(min_length=1, max_length=240)] = None,
+        unread: Annotated[bool, Query()] = False,
+        from_kind: Annotated[Literal["server", "human"] | None, Query()] = None,
+        from_id: Annotated[str | None, Query(min_length=1, max_length=240)] = None,
+        since: Annotated[str | None, Query(min_length=1, max_length=40)] = None,
+        after_sequence: Annotated[
+            int, Query(ge=0, le=9_223_372_036_854_775_807)
+        ] = 0,
+        limit: Annotated[int, Query(ge=1, le=MAX_NETWORK_PAGE_ITEMS)] = 50,
+    ) -> dict[str, Any]:
+        return store.list_team_messages(
+            claims,
+            team_id,
+            box=box,
+            address_kind=address_kind,
+            address_id=address_id,
+            unread=unread,
+            from_kind=from_kind,
+            from_id=from_id,
+            since=since,
+            after_sequence=after_sequence,
+            limit=limit,
+        )
+
+    @app.post("/v1/teams/{team_id}/network/messages")
+    def create_team_message(
+        team_id: str,
+        body: TeamMessageRequest,
+        claims: Auth,
+    ) -> dict[str, Any]:
+        return store.create_team_message(claims, team_id, body.model_dump())
+
+    @app.get("/v1/teams/{team_id}/network/messages/{message_id}")
+    def team_message(team_id: str, message_id: str, claims: Auth) -> dict[str, Any]:
+        return store.get_team_message(claims, team_id, message_id)
+
+    @app.post("/v1/teams/{team_id}/network/messages/{message_id}/receipts")
+    def team_message_receipt(
+        team_id: str,
+        message_id: str,
+        body: TeamReceiptRequest,
+        claims: Auth,
+    ) -> dict[str, Any]:
+        return store.record_team_message_receipt(
+            claims, team_id, message_id, body.model_dump()
+        )
+
+    @app.post("/v1/teams/{team_id}/network/attachments")
+    def declare_team_attachment(
+        team_id: str,
+        body: TeamAttachmentDeclareRequest,
+        claims: Auth,
+    ) -> dict[str, Any]:
+        return store.declare_team_attachment(claims, team_id, body.model_dump())
+
+    @app.get("/v1/teams/{team_id}/network/attachments/{attachment_id}")
+    def team_attachment(
+        team_id: str, attachment_id: str, claims: Auth
+    ) -> dict[str, Any]:
+        return store.get_team_attachment(claims, team_id, attachment_id)
+
+    @app.put("/v1/teams/{team_id}/network/attachments/{attachment_id}/content")
+    async def upload_team_attachment_chunk(
+        team_id: str,
+        attachment_id: str,
+        request: Request,
+        claims: Auth,
+    ) -> dict[str, Any]:
+        match = _CONTENT_RANGE_RE.fullmatch(request.headers.get("content-range", "").strip())
+        if match is None:
+            raise HubError("invalid_request", "Content-Range is required", 422)
+        start, end, total = int(match["start"]), int(match["end"]), int(match["total"])
+        if end < start or total < 1 or end >= total:
+            raise HubError("invalid_request", "Content-Range is invalid", 422)
+        data = await asyncio.wait_for(request.body(), timeout=BODY_READ_TIMEOUT_SECONDS * 6)
+        if len(data) != end - start + 1:
+            raise HubError("invalid_request", "Chunk length does not match Content-Range", 422)
+        return store.write_team_attachment_chunk(
+            claims, team_id, attachment_id, offset=start, total=total, data=data
+        )
+
+    @app.api_route(
+        "/v1/teams/{team_id}/network/attachments/{attachment_id}/content",
+        methods=["GET", "HEAD"],
+    )
+    def download_team_attachment(
+        team_id: str,
+        attachment_id: str,
+        request: Request,
+        claims: Auth,
+    ) -> Response:
+        attachment, path = store.open_team_attachment(claims, team_id, attachment_id)
+        return attachment_content_response(request, attachment, path)
+
+    @app.get("/v1/teams/{team_id}/network/skills")
+    def team_skills(
+        team_id: str,
+        claims: Auth,
+        include_archived: Annotated[bool, Query()] = False,
+        slug: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
+    ) -> dict[str, Any]:
+        return store.list_team_skills(
+            claims, team_id, include_archived=include_archived, slug=slug
+        )
+
+    @app.get("/v1/teams/{team_id}/network/skills/{skill_id}")
+    def team_skill(team_id: str, skill_id: str, claims: Auth) -> dict[str, Any]:
+        return store.get_team_skill(claims, team_id, skill_id)
+
+    @app.get("/v1/teams/{team_id}/network/skills/{skill_id}/versions")
+    def team_skill_versions(team_id: str, skill_id: str, claims: Auth) -> dict[str, Any]:
+        return store.list_team_skill_versions(claims, team_id, skill_id)
+
+    @app.get("/v1/teams/{team_id}/network/skills/{skill_id}/versions/{version}")
+    def team_skill_version(
+        team_id: str, skill_id: str, version: int, claims: Auth
+    ) -> dict[str, Any]:
+        return store.get_team_skill_version(claims, team_id, skill_id, version)
+
+    @app.post("/v1/teams/{team_id}/network/skills/{skill_id}/pin")
+    def pin_team_skill(
+        team_id: str, skill_id: str, body: TeamSkillPinRequest, claims: Auth
+    ) -> dict[str, Any]:
+        return store.set_team_skill_pinned(claims, team_id, skill_id, body.model_dump())
+
+    @app.post("/v1/teams/{team_id}/network/skills/{skill_id}/archive")
+    def archive_team_skill(
+        team_id: str, skill_id: str, body: TeamSkillArchiveRequest, claims: Auth
+    ) -> dict[str, Any]:
+        return store.set_team_skill_archived(claims, team_id, skill_id, body.model_dump())
 
     @app.get("/v1/teams/{team_id}/channels")
     def channels(team_id: str, claims: Auth) -> dict[str, Any]:

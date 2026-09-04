@@ -1099,6 +1099,28 @@ Workspace-files capability v4 adds no-overwrite creation. Post
 descriptor-relative, rejects symlinked parents and existing destinations, and
 is unavailable for archived chats.
 
+## Imported provider history
+
+Opening a chat catches its timeline up with messages added to the provider
+transcript outside AgentsDock. The sync anchors on the newest timeline
+messages, skips the parse when the transcript file is unchanged, refuses to
+import a transcript that matches nothing on a populated timeline, and closes
+every import batch with a `turn_finished` marked `imported: true`. Imported
+turns never set a chat's active run, so replayed history can never make a
+stopped chat look busy.
+
+Servers before 0.1.26-beta.30 could append the same transcript tail on every
+open. To remove those duplicates from a chat's event log:
+
+```text
+POST /api/sessions/{session_id}/history/prune-duplicates
+{"dry_run": true}
+```
+
+The default dry run reports how many events and import runs would be
+removed; `{"dry_run": false}` rewrites the log atomically while the chat is
+idle, keeping the first occurrence of every message.
+
 ## Whole-History Search
 
 `GET /api/search?q=<query>&limit=<chat-count>` searches user, assistant, error,

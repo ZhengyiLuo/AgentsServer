@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from pathlib import Path
 import tempfile
 import time
@@ -247,6 +248,19 @@ class TeamHubServiceTests(unittest.TestCase):
             "member@example.com", "Replacement Mac"
         )
         proof = proof_path.read_text().strip()
+        # Issuance is the host operator's lost-device action. It invalidates
+        # existing access and refresh authority before the proof is delivered.
+        self.assertEqual(
+            self.client.get("/v1/session", headers=self.auth(member)).status_code,
+            401,
+        )
+        self.assertEqual(
+            self.client.post(
+                "/v1/sessions/refresh",
+                json={"refresh_token": member["refresh_token"]},
+            ).status_code,
+            401,
+        )
         remote_http = TestClient(
             self.app, base_url="http://testserver", client=("192.0.2.9", 41000)
         )
@@ -319,6 +333,9 @@ class TeamHubServiceTests(unittest.TestCase):
                     for row in events
                 )
             )
+            issue_event = next(row for row in events if row["action"] == "device_recovery.issue")
+            issue_metadata = json.loads(issue_event["metadata_json"])
+            self.assertEqual(issue_metadata["revoked_session_count"], 1)
             self.assertEqual(
                 connection.execute(
                     """
@@ -331,6 +348,30 @@ class TeamHubServiceTests(unittest.TestCase):
             )
         finally:
             connection.close()
+
+    def test_device_recovery_issue_failure_rolls_back_revocation(self) -> None:
+        owner = self.bootstrap()
+        member = self.invite_and_redeem(owner, "member@example.com", "member")
+        store = self.app.state.store
+        proof_files_before = set(self.data_dir.glob("owner_recovery_*.proof"))
+
+        with mock.patch.object(store, "_audit", side_effect=OSError("audit unavailable")):
+            with self.assertRaisesRegex(OSError, "audit unavailable"):
+                store.issue_device_recovery("member@example.com", "Replacement Mac")
+
+        self.assertEqual(
+            self.client.get("/v1/session", headers=self.auth(member)).status_code,
+            200,
+        )
+        refreshed = self.client.post(
+            "/v1/sessions/refresh",
+            json={"refresh_token": member["refresh_token"]},
+        )
+        self.assertEqual(refreshed.status_code, 200, refreshed.text)
+        self.assertEqual(
+            set(self.data_dir.glob("owner_recovery_*.proof")),
+            proof_files_before,
+        )
 
     def test_device_recovery_expiry_suspension_and_concurrent_consumption(self) -> None:
         owner = self.bootstrap()

@@ -292,6 +292,51 @@ class PollingAccessLogFilterTests(unittest.TestCase):
         )
         self.assertTrue(log_filter.filter(record))
 
+    def test_redacts_websocket_query_tokens_before_logging(self) -> None:
+        log_filter = agent_server.PollingAccessLogFilter()
+        secret = "admin-secret-that-must-not-reach-disk"
+        paths = [
+            f"/api/sessions/chat/events?after=5&token={secret}&visible=true",
+            f"/api/sessions/chat/events?after=5&%74o%6Ben={secret}&visible=true",
+        ]
+        websocket_formats = [
+            ('%s - "WebSocket %s" [accepted]', ("127.0.0.1:1234",)),
+            ('%s - "WebSocket %s" 403', ("127.0.0.1:1234",)),
+            ('%s - "WebSocket %s" %d', ("127.0.0.1:1234", 4401)),
+        ]
+        for path in paths:
+            for message, surrounding_args in websocket_formats:
+                with self.subTest(path=path, message=message):
+                    args = (
+                        surrounding_args[0],
+                        path,
+                        *surrounding_args[1:],
+                    )
+                    record = logging.LogRecord(
+                        "uvicorn.error",
+                        logging.INFO,
+                        __file__,
+                        1,
+                        message,
+                        args,
+                        None,
+                    )
+                    self.assertTrue(log_filter.filter(record))
+                    rendered = record.getMessage()
+                    self.assertNotIn(secret, rendered)
+                    self.assertIn("<redacted>", rendered)
+                    self.assertIn("visible=true", rendered)
+
+        path = f"/api/sessions/chat/events?after=5&token={secret}&visible=true"
+        for uses_args in (True, False):
+            with self.subTest(args=uses_args):
+                record = self.record("GET", path, 101, args=uses_args)
+                self.assertTrue(log_filter.filter(record))
+                rendered = record.getMessage()
+                self.assertNotIn(secret, rendered)
+                self.assertIn("token=<redacted>", rendered)
+                self.assertIn("visible=true", rendered)
+
 
 class RepeatedMessageFilterTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -364,6 +409,8 @@ class ConfigureServerLoggingTests(unittest.TestCase):
             root.propagate = False
             access = logging.getLogger(f"test-access-{id(self)}")
             access.propagate = False
+            error = logging.getLogger(f"test-error-{id(self)}")
+            error.propagate = False
             server = logging.getLogger(f"test-server-{id(self)}")
             server.propagate = False
             with patch.dict(
@@ -374,6 +421,7 @@ class ConfigureServerLoggingTests(unittest.TestCase):
                     state_dir,
                     root_logger=root,
                     access_logger=access,
+                    error_logger=error,
                     server_logger=server,
                 )
             try:
@@ -386,6 +434,7 @@ class ConfigureServerLoggingTests(unittest.TestCase):
                     state_dir / "logs" / "agents-server.log",
                 )
                 self.assertIn(installed.access_filter, access.filters)
+                self.assertIn(installed.access_filter, error.filters)
                 self.assertIn(installed.repeat_filter, server.filters)
                 self.assertEqual(len(root.handlers), 2)
                 self.assertIsInstance(installed.stream_handler, logging.StreamHandler)
@@ -401,6 +450,7 @@ class ConfigureServerLoggingTests(unittest.TestCase):
                     root.removeHandler(handler)
                     handler.close()
                 access.removeFilter(installed.access_filter)
+                error.removeFilter(installed.access_filter)
                 server.removeFilter(installed.repeat_filter)
 
     def test_rotation_settings_fall_back_on_invalid_values(self) -> None:

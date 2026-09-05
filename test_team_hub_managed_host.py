@@ -633,6 +633,34 @@ sys.exit(10)
             generations = list((data_dir / "maintenance-backups").glob("snapshot_*"))
             self.assertEqual(len(generations), 3)
 
+    def test_snapshot_preserves_fenced_generation_and_cleans_abandoned_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "hub"
+            store = HubStore(data_dir, managed_host_identity=HOST_A)
+            fenced = store.maintenance_snapshot_and_fence(
+                "server-update",
+                operation_id="update-protected",
+                keep=3,
+            )
+            backups = data_dir / "maintenance-backups"
+            abandoned = backups / ".snapshot_00000000000000000001_0123456789abcdef.tmp"
+            abandoned.mkdir(mode=0o700)
+            orphan = abandoned / "orphan.bin"
+            orphan.write_bytes(b"unfinished")
+            orphan.chmod(0o600)
+            unrelated = backups / ".snapshot_not_a_generation.tmp"
+            unrelated.mkdir(mode=0o700)
+
+            for index in range(4):
+                store.maintenance_snapshot(f"forced-restart-{index}", keep=3)
+
+            self.assertTrue(fenced.is_dir())
+            self.assertFalse(abandoned.exists())
+            self.assertTrue(unrelated.is_dir())
+            generations = list(backups.glob("snapshot_*"))
+            self.assertEqual(len(generations), 4)
+            self.assertIn(fenced, generations)
+
     def test_snapshot_restores_ready_and_resumable_attachment_generation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             data_dir = Path(temporary) / "hub"

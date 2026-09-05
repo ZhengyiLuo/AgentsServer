@@ -1667,6 +1667,115 @@ class JobStoreTests(unittest.IsolatedAsyncioTestCase):
         events.assert_awaited_once()
         self.assertEqual(events.await_args.args[1], "job_deferred")
 
+    async def test_scheduler_preserves_one_shot_after_typed_admission_race(
+        self,
+    ) -> None:
+        store = agent_server.JobStore()
+        session_id = "sess_one_shot_admission_race"
+        occurrence = 1.0
+        store.jobs["job_due"] = {
+            "id": "job_due",
+            "session_id": session_id,
+            "title": "One-shot maintenance race",
+            "prompt": "Run once after maintenance",
+            "schedule_kind": "interval",
+            "interval_seconds": 60,
+            "timezone": "UTC",
+            "schedule_start_at": occurrence,
+            "enabled": True,
+            "loop": False,
+            "max_runs": 1,
+            "run_count": 0,
+            "next_run_at": occurrence,
+            "scheduled_run_at": occurrence,
+            "_revision": agent_server.new_job_revision(),
+        }
+        sleep_count = 0
+
+        async def one_scheduler_iteration(_delay: float) -> None:
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count > 1:
+                raise asyncio.CancelledError
+
+        reason = "wait for provider session maintenance to finish"
+        events = AsyncMock()
+        with (
+            patch.object(agent_server.STORE, "sessions", {
+                session_id: {"id": session_id, "archived": False},
+            }),
+            patch.object(agent_server.time, "time", return_value=2.0),
+            patch.object(agent_server, "JOB_DEFER_EVENT_MIN_SECONDS", 0),
+            patch.object(
+                agent_server.asyncio,
+                "sleep",
+                side_effect=one_scheduler_iteration,
+            ),
+            patch.object(
+                agent_server,
+                "scheduled_job_blocker",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch.object(store, "save", new_callable=AsyncMock),
+            patch.object(
+                store,
+                "run_job",
+                new_callable=AsyncMock,
+                side_effect=agent_server.TransientAdmissionWait(
+                    status_code=409,
+                    detail=reason,
+                ),
+            ),
+            patch.object(agent_server, "append_event", events),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await store.scheduler_loop()
+
+        current = store.jobs["job_due"]
+        self.assertTrue(current["enabled"])
+        self.assertEqual(current["run_count"], 0)
+        self.assertEqual(current["scheduled_run_at"], occurrence)
+        self.assertEqual(
+            current["next_run_at"],
+            2.0 + max(agent_server.JOB_BUSY_RETRY_SECONDS, 5),
+        )
+        self.assertEqual(current["last_defer_reason"], reason)
+        self.assertEqual(events.await_args.args[1], "job_deferred")
+
+    def test_scheduler_classifies_transient_turn_admission_as_deferral(self) -> None:
+        for status_code, detail in (
+            (503, "agent launch deferred: server already has 10 active agent run(s)"),
+            (409, "wait for session maintenance to finish"),
+        ):
+            with self.subTest(status_code=status_code):
+                error = agent_server.TransientAdmissionWait(
+                    status_code=status_code,
+                    detail=detail,
+                )
+                self.assertEqual(
+                    agent_server.scheduled_job_lifecycle_admission_defer_reason(
+                        error
+                    ),
+                    detail,
+                )
+
+    def test_scheduler_classifies_explicit_stop_race_as_deferral(self) -> None:
+        error = agent_server.TransientAdmissionWait(
+            status_code=409,
+            detail="session already has a running turn",
+        )
+        self.assertEqual(
+            agent_server.scheduled_job_lifecycle_admission_defer_reason(error),
+            "session already has a running turn",
+        )
+
+    def test_scheduler_does_not_classify_untyped_conflict_as_deferral(self) -> None:
+        error = HTTPException(status_code=409, detail="unrelated conflict")
+        self.assertIsNone(
+            agent_server.scheduled_job_lifecycle_admission_defer_reason(error)
+        )
+
     async def test_scheduler_update_race_does_not_defer_over_edited_cron_revision(
         self,
     ) -> None:

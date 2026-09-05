@@ -106,6 +106,9 @@ MAX_TEAM_SKILL_VERSIONS = 200
 MAX_TEAM_SKILL_TAGS = 8
 RESTORE_TRANSACTION_JOURNAL_NAME = ".restore-transaction.json"
 RESTORE_STAGING_NAME_RE = re.compile(r"^\.restore-[1-9][0-9]*-[0-9a-f]{16}$")
+SNAPSHOT_STAGING_NAME_RE = re.compile(
+    r"^\.snapshot_[0-9]{20}_[0-9a-f]{16}\.tmp$"
+)
 TEAM_SKILL_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 TEAM_SKILL_TAG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 TEAM_ATTACHMENT_FILE_NAME_RE = re.compile(r"^[^\x00-\x1f\x7f/\\]{1,255}$")
@@ -697,6 +700,42 @@ class HubStore:
         for candidate in sorted(candidates, key=lambda path: path.name):
             shutil.rmtree(candidate)
             cls._fsync_directory(root)
+
+    @classmethod
+    def _cleanup_abandoned_snapshot_staging_unlocked(cls, backups: Path) -> None:
+        """Remove validated snapshot temporaries left by a killed process.
+
+        The caller owns both the maintenance-control and attachment leases, so
+        no matching temporary can still belong to a live snapshot writer.
+        Validate every candidate before deleting any to fail closed on unsafe
+        lookalikes.
+        """
+
+        candidates: list[Path] = []
+        with os.scandir(backups) as entries:
+            for entry in entries:
+                if SNAPSHOT_STAGING_NAME_RE.fullmatch(entry.name) is not None:
+                    candidates.append(backups / entry.name)
+
+        for candidate in candidates:
+            if not cls._restore_target_exists(candidate, "directory"):
+                continue  # pragma: no cover - scandir observed the entry.
+            for directory, directory_names, file_names in os.walk(
+                candidate,
+                topdown=True,
+                followlinks=False,
+            ):
+                current = Path(directory)
+                cls._restore_target_exists(current, "directory")
+                for name in directory_names:
+                    cls._restore_target_exists(current / name, "directory")
+                for name in file_names:
+                    cls._restore_target_exists(current / name, "file")
+
+        for candidate in sorted(candidates, key=lambda path: path.name):
+            shutil.rmtree(candidate)
+        if candidates:
+            cls._fsync_directory(backups)
 
     @staticmethod
     def _restore_target_kind(name: str) -> str:
@@ -1697,11 +1736,12 @@ class HubStore:
         generation = f"snapshot_{time.time_ns():020d}_{secrets.token_hex(8)}"
         temporary = backups / f".{generation}.tmp"
         final = backups / generation
-        ensure_private_directory(temporary)
         source: sqlite3.Connection | None = None
         destination: sqlite3.Connection | None = None
         attachment_lease = self.acquire_attachment_control_lease(self.data_dir)
         try:
+            self._cleanup_abandoned_snapshot_staging_unlocked(backups)
+            ensure_private_directory(temporary)
             source = self.connect()
             snapshot_time = _now()
             # A delegated bootstrap proof is scoped to the live AgentsServer
@@ -1886,7 +1926,15 @@ class HubStore:
                 key=lambda entry: entry.name,
                 reverse=True,
             )
+            fence = self.maintenance_fence()
+            protected_generation = (
+                str(fence["snapshot"])
+                if fence is not None
+                else None
+            )
             for expired in generations[retained:]:
+                if expired.name == protected_generation:
+                    continue
                 shutil.rmtree(expired)
             return final
         except BaseException:
@@ -4573,6 +4621,38 @@ class HubStore:
                 ).fetchall()
                 if len(memberships) != 1:
                     raise HubError("recovery_unavailable", "Device recovery is unavailable", 409)
+                principal_id = str(memberships[0]["principal_id"])
+                revoked_session_count = int(
+                    connection.execute(
+                        """
+                        SELECT count(*) FROM device_sessions
+                        WHERE human_principal_id = ? AND revoked_at IS NULL
+                        """,
+                        (principal_id,),
+                    ).fetchone()[0]
+                )
+                # Issuing recovery is the host operator's lost-device action.
+                # Revoke the old authority in this same transaction so the
+                # compromised device does not stay live while the replacement
+                # proof is transported (or if that proof is never redeemed).
+                connection.execute(
+                    """
+                    UPDATE device_sessions SET revoked_at = ?
+                    WHERE human_principal_id = ? AND revoked_at IS NULL
+                    """,
+                    (timestamp, principal_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE refresh_tokens SET revoked_at = ?
+                    WHERE consumed_at IS NULL AND revoked_at IS NULL
+                      AND device_session_id IN (
+                        SELECT id FROM device_sessions
+                        WHERE human_principal_id = ?
+                      )
+                    """,
+                    (timestamp, principal_id),
+                )
                 superseded_ids = [
                     str(row["id"])
                     for row in connection.execute(
@@ -4581,7 +4661,7 @@ class HubStore:
                         WHERE owner_principal_id = ? AND consumed_at IS NULL
                           AND revoked_at IS NULL
                         """,
-                        (memberships[0]["principal_id"],),
+                        (principal_id,),
                     )
                 ]
                 connection.execute(
@@ -4590,7 +4670,7 @@ class HubStore:
                     WHERE owner_principal_id = ? AND consumed_at IS NULL
                       AND revoked_at IS NULL
                     """,
-                    (timestamp, memberships[0]["principal_id"]),
+                    (timestamp, principal_id),
                 )
                 proof, digest = opaque_secret("owner-recovery")
                 claim_id = _id("owner_recovery")
@@ -4606,7 +4686,7 @@ class HubStore:
                     (
                         claim_id,
                         memberships[0]["team_id"],
-                        memberships[0]["principal_id"],
+                        principal_id,
                         digest,
                         label,
                         timestamp,
@@ -4626,7 +4706,8 @@ class HubStore:
                     "accepted",
                     {
                         "authority": "local_host_recovery",
-                        "subject_principal_id": str(memberships[0]["principal_id"]),
+                        "subject_principal_id": principal_id,
+                        "revoked_session_count": revoked_session_count,
                     },
                     timestamp,
                 )

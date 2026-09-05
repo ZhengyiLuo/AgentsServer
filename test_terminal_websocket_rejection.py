@@ -9,8 +9,12 @@ import agent_server
 class RecordingWebSocket:
     def __init__(self) -> None:
         self.calls: list[tuple[str, int | None]] = []
+        self.accepted_subprotocol: str | None = None
+        self.headers: dict[str, str] = {}
+        self.query_params: dict[str, str] = {}
 
-    async def accept(self) -> None:
+    async def accept(self, *, subprotocol: str | None = None) -> None:
+        self.accepted_subprotocol = subprotocol
         self.calls.append(("accept", None))
 
     async def close(self, code: int = 1000) -> None:
@@ -53,6 +57,68 @@ class HeldTerminalWebSocket(RecordingWebSocket):
 
 
 class TerminalWebSocketRejectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_capable_client_gets_fixed_protocol_before_terminal_close(self) -> None:
+        encoded = agent_server.base64.urlsafe_b64encode(
+            b"server-token",
+        ).decode("ascii").rstrip("=")
+        offered = f"agentsdock-token.{encoded}"
+        websocket = RecordingWebSocket()
+        websocket.headers = {
+            "sec-websocket-protocol": (
+                f"{agent_server.TERMINAL_WEBSOCKET_PROTOCOL}, {offered}"
+            ),
+        }
+        with patch.object(
+            agent_server,
+            "AGENT_TOKEN",
+            "server-token",
+        ), patch.dict(agent_server.STORE.sessions, {}, clear=True):
+            await agent_server.session_terminal(  # type: ignore[arg-type]
+                "missing-terminal",
+                websocket,
+            )
+
+        self.assertEqual(
+            websocket.accepted_subprotocol,
+            agent_server.TERMINAL_WEBSOCKET_PROTOCOL,
+        )
+        self.assertEqual(websocket.calls, [
+            ("accept", None),
+            ("close", 4404),
+        ])
+
+    async def test_invalid_token_still_gets_fixed_protocol_before_unauthorized_close(
+        self,
+    ) -> None:
+        encoded = agent_server.base64.urlsafe_b64encode(
+            b"wrong-token",
+        ).decode("ascii").rstrip("=")
+        websocket = RecordingWebSocket()
+        websocket.headers = {
+            "sec-websocket-protocol": (
+                f"{agent_server.TERMINAL_WEBSOCKET_PROTOCOL}, "
+                f"agentsdock-token.{encoded}"
+            ),
+        }
+        with patch.object(
+            agent_server,
+            "AGENT_TOKEN",
+            "server-token",
+        ), patch.dict(agent_server.STORE.sessions, {}, clear=True):
+            await agent_server.session_terminal(  # type: ignore[arg-type]
+                "unauthorized-terminal",
+                websocket,
+            )
+
+        self.assertEqual(
+            websocket.accepted_subprotocol,
+            agent_server.TERMINAL_WEBSOCKET_PROTOCOL,
+        )
+        self.assertEqual(websocket.calls, [
+            ("accept", None),
+            ("close", 4401),
+        ])
+
     async def assert_rejected_after_accept(
         self,
         session_id: str,

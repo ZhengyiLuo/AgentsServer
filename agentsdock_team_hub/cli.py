@@ -36,7 +36,11 @@ def _parser() -> argparse.ArgumentParser:
     proof.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
 
     recovery = subcommands.add_parser(
-        "owner-recovery", help="issue a local one-time owner device recovery proof"
+        "owner-recovery",
+        help=(
+            "revoke the owner's existing device sessions and issue a local "
+            "one-time recovery proof"
+        ),
     )
     recovery.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     recovery.add_argument("--email", required=True)
@@ -44,7 +48,11 @@ def _parser() -> argparse.ArgumentParser:
     recovery.add_argument("--team-id")
 
     device_recovery = subcommands.add_parser(
-        "device-recovery", help="issue a local one-time member device recovery proof"
+        "device-recovery",
+        help=(
+            "revoke a member's existing device sessions and issue a local "
+            "one-time recovery proof"
+        ),
     )
     device_recovery.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     device_recovery.add_argument("--email", required=True)

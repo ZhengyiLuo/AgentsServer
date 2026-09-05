@@ -2422,6 +2422,7 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             stop_turn.await_args.kwargs["_admission_ready"].is_set()
         )
+        self.assertFalse(stop_turn.await_args.kwargs["schedule_queue"])
         schedule_next.assert_called_once_with("chat-1")
 
     async def test_stop_after_promotion_holds_run_now_and_clears_cached_success(

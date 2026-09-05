@@ -12,18 +12,95 @@ class FakeWebSocket:
     def __init__(self) -> None:
         self.events: list[dict[str, object]] = []
         self.accepted = False
+        self.accepted_subprotocol: str | None = None
+        self.headers: dict[str, str] = {}
+        self.query_params: dict[str, str] = {}
 
     async def send_json(self, event: dict[str, object]) -> None:
         self.events.append(event)
 
-    async def accept(self) -> None:
+    async def accept(self, *, subprotocol: str | None = None) -> None:
         self.accepted = True
+        self.accepted_subprotocol = subprotocol
 
     async def receive_text(self) -> str:
         raise agent_server.WebSocketDisconnect()
 
 
 class EventWebSocketCatchupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_token_only_client_gets_its_authenticated_protocol_selected(self) -> None:
+        encoded = agent_server.base64.urlsafe_b64encode(
+            b"server-token",
+        ).decode("ascii").rstrip("=")
+        offered = f"agentsdock-token.{encoded}"
+        socket = FakeWebSocket()
+        socket.headers = {
+            "sec-websocket-protocol": (
+                f"{agent_server.EVENTS_WEBSOCKET_PROTOCOL}, {offered}"
+            ),
+        }
+        with tempfile.TemporaryDirectory() as root, patch.object(
+            agent_server,
+            "AGENT_TOKEN",
+            "server-token",
+        ), patch.dict(
+            agent_server.STORE.sessions,
+            {"protocol-chat": {"id": "protocol-chat"}},
+            clear=True,
+        ), patch.object(
+            agent_server,
+            "events_path",
+            return_value=Path(root) / "events.jsonl",
+        ), patch.object(
+            agent_server,
+            "fork_internal_run_ids",
+            return_value=set(),
+        ):
+            await agent_server.session_events(
+                "protocol-chat",
+                socket,  # type: ignore[arg-type]
+                visible=True,
+            )
+
+        self.assertTrue(socket.accepted)
+        self.assertEqual(
+            socket.accepted_subprotocol,
+            agent_server.EVENTS_WEBSOCKET_PROTOCOL,
+        )
+
+    async def test_unauthenticated_server_still_selects_fixed_event_protocol(self) -> None:
+        socket = FakeWebSocket()
+        socket.headers = {
+            "sec-websocket-protocol": agent_server.EVENTS_WEBSOCKET_PROTOCOL,
+        }
+        with tempfile.TemporaryDirectory() as root, patch.object(
+            agent_server,
+            "AGENT_TOKEN",
+            "",
+        ), patch.dict(
+            agent_server.STORE.sessions,
+            {"protocol-chat": {"id": "protocol-chat"}},
+            clear=True,
+        ), patch.object(
+            agent_server,
+            "events_path",
+            return_value=Path(root) / "events.jsonl",
+        ), patch.object(
+            agent_server,
+            "fork_internal_run_ids",
+            return_value=set(),
+        ):
+            await agent_server.session_events(
+                "protocol-chat",
+                socket,  # type: ignore[arg-type]
+                visible=True,
+            )
+
+        self.assertEqual(
+            socket.accepted_subprotocol,
+            agent_server.EVENTS_WEBSOCKET_PROTOCOL,
+        )
+
     async def test_catchup_drains_more_than_one_page_without_raw_events(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "events.jsonl"

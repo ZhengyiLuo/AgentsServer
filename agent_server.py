@@ -612,6 +612,8 @@ EMERGENCY_MESSAGE_MAX_CHARS = 500
 EMERGENCY_REQUESTS_PER_RUN = 3
 EMERGENCY_ACTIVE_ALERT_LIMIT = 32
 EMERGENCY_WEBSOCKET_PROTOCOL = "agentsdock-emergency-v1"
+EVENTS_WEBSOCKET_PROTOCOL = "agentsdock-events-v1"
+TERMINAL_WEBSOCKET_PROTOCOL = "agentsdock-terminal-v1"
 EMERGENCY_AUTHORITY_DENIED_PURPOSES = {
     "cross_chat_handoff_delivery",
     "secure_peer_handoff_delivery",
@@ -718,6 +720,10 @@ CLAUDE_SDK_MAX_LOADED_CHATS = max(
     1,
     int(agentsdock_setting("CLAUDE_SDK_MAX_LOADED_CHATS", "4")),
 )
+CLAUDE_SDK_CONNECT_TIMEOUT_SECONDS = max(
+    5.0,
+    float(agentsdock_setting("CLAUDE_SDK_CONNECT_TIMEOUT_SECONDS", "30")),
+)
 CLAUDE_SDK_IDLE_TTL_SECONDS = max(
     30,
     int(agentsdock_setting("CLAUDE_SDK_IDLE_TTL_SECONDS", "300")),
@@ -791,6 +797,32 @@ HOST_MONITOR_INTERVAL_SECONDS = float(agentsdock_setting("HOST_MONITOR_INTERVAL_
 HOST_HEALTH_MAX_BYTES = int(agentsdock_setting("HOST_HEALTH_MAX_BYTES", str(20 * 1024 * 1024)))
 IDLE_WARN_SECONDS = int(agentsdock_setting("IDLE_WARN_SECONDS", "1800"))
 IDLE_KILL_SECONDS = int(agentsdock_setting("IDLE_KILL_SECONDS", "21600"))
+CLAUDE_SDK_PRE_ACK_TIMEOUT_SECONDS = max(
+    30.0,
+    float(agentsdock_setting("CLAUDE_SDK_PRE_ACK_TIMEOUT_SECONDS", "600")),
+)
+CLAUDE_SDK_TURN_TIMEOUT_SECONDS = max(
+    CLAUDE_SDK_PRE_ACK_TIMEOUT_SECONDS,
+    float(
+        agentsdock_setting(
+            "CLAUDE_SDK_TURN_TIMEOUT_SECONDS",
+            str(IDLE_KILL_SECONDS),
+        )
+    ),
+)
+CLAUDE_SDK_IDLE_TIMEOUT_SECONDS = max(
+    30.0,
+    float(
+        agentsdock_setting(
+            "CLAUDE_SDK_IDLE_TIMEOUT_SECONDS",
+            str(IDLE_KILL_SECONDS),
+        )
+    ),
+)
+CLAUDE_SDK_IDLE_WARN_SECONDS = max(
+    1.0,
+    min(float(IDLE_WARN_SECONDS), CLAUDE_SDK_IDLE_TIMEOUT_SECONDS / 2),
+)
 # A Codex app-server notification can be silently dropped if it arrives for a
 # subscription that already closed (see _route_notification in
 # codex_app_server.py) - the turn then waits forever with zero visible
@@ -1015,14 +1047,19 @@ MAX_CODEX_APPROVAL_ITEM_CACHE = 256
 CODEX_PERMISSION_PROFILES_CACHE_SECONDS = 60.0
 CODEX_SESSION_CLEANUP_TIMEOUT_SECONDS = 15.0
 STOP_CONFIRM_TIMEOUT_SECONDS = 5.0
-# An explicit Stop that never finishes fenced queue promotion for the chat and
-# counted as a non-forceable restart blocker (2026-09-04 incident). Bound the
-# whole operation; on expiry the fence is released while teardown continues
-# detached, and the chat receives a visible error event.
+# Bound the user-visible Stop operation so callers do not hang forever. Its
+# cancellation-hostile inner teardown remains a fail-closed per-chat fence on
+# expiry: admitting a successor would let late Stop effects cancel or mutate
+# that new turn. The always-available forced server restart is the recovery
+# path when the exact teardown itself never settles.
 EXPLICIT_STOP_OPERATION_TIMEOUT_SECONDS = float(
     agentsdock_setting("EXPLICIT_STOP_OPERATION_TIMEOUT_SECONDS", "90")
 )
 EXPLICIT_STOP_FENCE_RELEASE_TIMEOUT_SECONDS = 5.0
+CLAUDE_STOP_FENCE_ATTEMPT_TIMEOUT_SECONDS = max(
+    1.0,
+    float(agentsdock_setting("CLAUDE_STOP_FENCE_ATTEMPT_TIMEOUT_SECONDS", "15")),
+)
 # GET /api/health is polled by every client every few seconds. Queue
 # reconciliation is a repair pass, not a per-request duty; run it at most this
 # often from health polls so pollers cannot multiply promotion attempts.
@@ -1139,12 +1176,6 @@ def configure_atomic_workspace_rename() -> tuple[Any | None, int]:
 
 WORKSPACE_ATOMIC_RENAME, WORKSPACE_ATOMIC_RENAME_FLAG = configure_atomic_workspace_rename()
 WORKSPACE_MUTATIONS_AVAILABLE = WORKSPACE_SECURE_OPEN_AVAILABLE and WORKSPACE_ATOMIC_RENAME is not None
-AGENT_TOKEN = env_setting(
-    "AGENTSDOCK_AGENT_TOKEN",
-    "",
-    "ZENITHDOCK_AGENT_TOKEN",
-    "ZENITHBOT_AGENT_TOKEN",
-) or ""
 PROVIDER_SECRET_ENV_NAMES = (
     "AGENTSDOCK_AGENT_TOKEN",
     "ZENITHDOCK_AGENT_TOKEN",
@@ -1152,6 +1183,30 @@ PROVIDER_SECRET_ENV_NAMES = (
     "AGENTSDOCK_PUBLISH_TOKEN",
     "AGENTSDOCK_PROVIDER_AUTHORITY_FILE",
 )
+AGENT_TOKEN = env_setting(
+    "AGENTSDOCK_AGENT_TOKEN",
+    "",
+    "ZENITHDOCK_AGENT_TOKEN",
+    "ZENITHBOT_AGENT_TOKEN",
+) or ""
+
+
+def scrub_server_secret_environment() -> tuple[str, ...]:
+    """Remove server-only bearer material before any child can inherit it."""
+
+    removed: list[str] = []
+    for name in PROVIDER_SECRET_ENV_NAMES:
+        if name in os.environ:
+            removed.append(name)
+            os.environ.pop(name, None)
+    return tuple(removed)
+
+
+# Authentication uses the captured immutable value above. Keeping its source
+# variables in the process environment would expose the admin bearer to any
+# subprocess that forgets an explicit env (including the Claude SDK's `-v`
+# probe and repository-configured Git filters).
+SCRUBBED_SERVER_SECRET_ENV_NAMES = scrub_server_secret_environment()
 SERVER_BIND_ADDRESS = agentsdock_setting("AGENT_BIND", "0.0.0.0")
 SERVER_PORT = int(agentsdock_setting("AGENT_PORT", "7850"))
 SERVER_INSTANCE_ID = uuid.uuid4().hex
@@ -4140,10 +4195,11 @@ def request_client_is_loopback(request: Request) -> bool:
     return bool(client and network_host_is_loopback(str(client.host or "")))
 
 
-def websocket_authorized(ws: WebSocket) -> bool:
+def websocket_token_subprotocol(ws: WebSocket) -> str | None:
+    """Return the first exact token protocol that authenticates this socket."""
+
     if not AGENT_TOKEN:
-        return True
-    protocol_tokens: list[str] = []
+        return None
     for value in websocket_requested_protocols(ws):
         if not value.startswith("agentsdock-token."):
             continue
@@ -4152,16 +4208,35 @@ def websocket_authorized(ws: WebSocket) -> bool:
             continue
         with suppress(Exception):
             padding = "=" * (-len(encoded) % 4)
-            protocol_tokens.append(
-                base64.urlsafe_b64decode(encoded + padding).decode("utf-8")
-            )
+            candidate = base64.urlsafe_b64decode(
+                encoded + padding
+            ).decode("utf-8")
+            if token_matches(candidate):
+                return value
+    return None
+
+
+def websocket_authorized(ws: WebSocket) -> bool:
+    if not AGENT_TOKEN:
+        return True
     return (
         token_matches(bearer_token(ws.headers.get("authorization")))
         or token_matches(ws.headers.get("x-agentsdock-token"))
         or token_matches(ws.headers.get("x-zenithdock-token"))
         or token_matches(ws.query_params.get("token"))
-        or any(token_matches(token) for token in protocol_tokens)
+        or websocket_token_subprotocol(ws) is not None
     )
+
+
+def websocket_endpoint_subprotocol(
+    ws: WebSocket,
+    endpoint_protocol: str,
+) -> str | None:
+    """Select a fixed non-secret protocol, with token-only compatibility."""
+
+    if endpoint_protocol in websocket_requested_protocols(ws):
+        return endpoint_protocol
+    return websocket_token_subprotocol(ws)
 
 
 def websocket_requested_protocols(ws: WebSocket) -> list[str]:
@@ -10011,6 +10086,14 @@ SERVER_MAINTENANCE_SESSIONS: set[str] = set()
 # owned until a later explicit Stop can complete the audit marker. This blocks
 # managed restart admission without pretending the evicted process is alive.
 CLAUDE_STOP_FENCE_SESSIONS: set[str] = set()
+# A durable stop marker can fail after the Claude supervisor is already gone.
+# Keep one bounded, observable retry owner per chat instead of requiring the
+# user to press Stop again to release update/turn admission.
+CLAUDE_STOP_FENCE_RETRY_TASKS: dict[str, asyncio.Task[Any]] = {}
+CLAUDE_STOP_FENCE_RETRY_DELAYS_SECONDS = (5.0, 15.0, 30.0, 60.0)
+CLAUDE_STOP_FENCE_ATTEMPT_LOCKS: dict[str, asyncio.Lock] = {}
+CLAUDE_STOP_FENCE_ATTEMPT_TASKS: dict[str, set[asyncio.Task[Any]]] = {}
+SERVER_SHUTTING_DOWN = False
 CURRENT_TURNS: dict[str, dict[str, Any]] = {}
 STOP_REQUESTS: set[str] = set()
 STOPPED_RUNS: set[str] = set()
@@ -10021,6 +10104,11 @@ STOPPED_RUNS: set[str] = set()
 # so a replacement turn cannot bind while cleanup for the old owner is still
 # running.
 EXPLICIT_STOP_OPERATIONS: dict[str, asyncio.Task[dict[str, Any]]] = {}
+# The inner provider teardown can outlive the bounded explicit Stop operation.
+# Keep that child keyed by session so Delete cannot remove durable state while
+# the old owner can still append events or mutate lifecycle bookkeeping.
+DETACHED_STOP_TASKS: set[asyncio.Task[Any]] = set()
+DETACHED_STOP_TASKS_BY_SESSION: dict[str, set[asyncio.Task[Any]]] = {}
 ACTIVE_LOCK = asyncio.Lock()
 QUEUED_TURNS: dict[str, deque[dict[str, Any]]] = {}
 RUN_NOW_TURNS: dict[str, dict[str, Any]] = {}
@@ -12222,6 +12310,24 @@ def explicit_stop_in_progress(session_id: str) -> bool:
     return operation is not None and not operation.done()
 
 
+def detached_stop_in_progress(session_id: str) -> bool:
+    """Return whether an inner Stop teardown still owns this session."""
+
+    return any(
+        not task.done()
+        for task in DETACHED_STOP_TASKS_BY_SESSION.get(session_id, ())
+    )
+
+
+def stop_cleanup_in_progress(session_id: str) -> bool:
+    """Return whether either layer of explicit Stop can affect this chat."""
+
+    return (
+        explicit_stop_in_progress(session_id)
+        or detached_stop_in_progress(session_id)
+    )
+
+
 QUEUE_FENCE_LOGGED_AT: dict[tuple[str, str], float] = {}
 
 
@@ -12233,7 +12339,7 @@ def queue_promotion_fence(session_id: str) -> str | None:
     that produced a per-second loop with no indication of the real blocker.
     """
 
-    if explicit_stop_in_progress(session_id):
+    if stop_cleanup_in_progress(session_id):
         return "explicit_stop"
     blocker = managed_server_update_blocker()
     if blocker == MANAGED_SERVER_RESTART_ACTIVE_DETAIL:
@@ -12273,11 +12379,17 @@ def log_queue_promotion_fence(session_id: str, fence: str, reason: str) -> None:
 def explicit_stop_session_ids() -> set[str]:
     """Snapshot chats whose detached Stop cleanup still blocks replacement."""
 
-    return {
+    outer = {
         session_id
         for session_id, operation in EXPLICIT_STOP_OPERATIONS.items()
         if not operation.done()
     }
+    inner = {
+        session_id
+        for session_id, tasks in DETACHED_STOP_TASKS_BY_SESSION.items()
+        if any(not task.done() for task in tasks)
+    }
+    return outer | inner
 
 
 def ensure_session_not_initializing(session_id: str) -> None:
@@ -18047,7 +18159,7 @@ async def _run_queued_turn_now_once(
 ) -> dict[str, Any]:
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
-    if explicit_stop_in_progress(session_id):
+    if stop_cleanup_in_progress(session_id):
         raise HTTPException(
             status_code=409,
             detail="Stop is still finishing for this chat; retry Force Send shortly",
@@ -19013,7 +19125,7 @@ async def discard_delivery_after_repeated_deferrals(
     """
     if (
         session_id in BUSY_SESSIONS
-        or explicit_stop_in_progress(session_id)
+        or stop_cleanup_in_progress(session_id)
         or managed_server_update_admission_blocker() is not None
     ):
         return False
@@ -19041,7 +19153,7 @@ async def _start_next_queued_turn_locked(
     # fence is committed.  Keep queued promotion behind the narrower Stop
     # operation until provider/subagent cleanup is complete, without blocking
     # route reads or new queue writes in the meantime.
-    if explicit_stop_in_progress(session_id):
+    if stop_cleanup_in_progress(session_id):
         log_queue_promotion_fence(session_id, "explicit_stop", "queue_start")
         return
     async with QUEUE_LOCK:
@@ -19329,6 +19441,8 @@ async def _start_next_queued_turn_locked(
 
 
 def schedule_next_queued_turn(session_id: str) -> None:
+    if SERVER_SHUTTING_DOWN:
+        return
     asyncio.create_task(start_next_queued_turn(session_id))
 
 
@@ -38244,6 +38358,9 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
         public["unacknowledged_emergency_count"] = emergency_count
     if not summary:
         public["provider_jobs_access"] = effective_provider_jobs_access(sess)
+        public["claude_stop_fence_pending"] = (
+            str(sess.get("id") or "") in CLAUDE_STOP_FENCE_SESSIONS
+        )
         public["codex_goal_time_budget_exhausted"] = (
             codex_goal_time_budget_is_exhausted(sess)
         )
@@ -38968,9 +39085,27 @@ async def scheduled_job_blocker(session_id: str) -> str | None:
         update_blocker = managed_server_update_admission_blocker()
         if update_blocker:
             return update_blocker
+        session = STORE.sessions.get(session_id) or {}
+        backend = str(
+            session.get("backend") or DEFAULT_BACKEND
+        ).strip().lower()
+        if CODEX_GOALS_RECONFIGURING and backend == BACKEND_CODEX:
+            return "wait for Codex goals configuration to finish"
+        if session_id in SERVER_MAINTENANCE_SESSIONS:
+            return (
+                "wait for Claude Stop recovery to finish"
+                if session_id in CLAUDE_STOP_FENCE_SESSIONS
+                else "wait for provider session maintenance to finish"
+            )
+        if stop_cleanup_in_progress(session_id):
+            return "chat is finishing an explicit Stop"
         if session_id in BUSY_SESSIONS:
             return "chat already has a running turn"
         active_count = len(BUSY_SESSIONS)
+
+    global_blocker = await turn_start_blocker()
+    if global_blocker:
+        return global_blocker
 
     if JOB_MAX_ACTIVE_RUNS > 0 and active_count >= JOB_MAX_ACTIVE_RUNS:
         return f"{active_count} active agent run(s)"
@@ -41794,6 +41929,7 @@ async def claude_sdk_manager() -> ClaudeSDKSupervisorManager:
             manager = ClaudeSDKSupervisorManager(
                 max_clients=CLAUDE_SDK_MAX_LOADED_CHATS,
                 idle_ttl_seconds=CLAUDE_SDK_IDLE_TTL_SECONDS,
+                connect_timeout_seconds=CLAUDE_SDK_CONNECT_TIMEOUT_SECONDS,
                 control_timeout_seconds=CLAUDE_MCP_CONTROL_TIMEOUT_SECONDS,
             )
             CLAUDE_SDK_MANAGER = manager
@@ -41909,6 +42045,7 @@ async def stop_idle_claude_background_subagents(
             # a potentially live process cannot be determined.
             result["pending"] = ["claude-background-work"]
             result["errors"].append(concise_error_message(exc))
+            result["fence_committed"] = False
             return result
     try:
         snapshot = build_claude_subagent_snapshot(
@@ -41974,6 +42111,220 @@ async def stop_idle_claude_background_subagents(
         result["errors"].append(concise_error_message(exc))
     result["interrupted"] = subagent_ids
     return result
+
+
+def claude_stop_fence_attempt_lock(session_id: str) -> asyncio.Lock:
+    lock = CLAUDE_STOP_FENCE_ATTEMPT_LOCKS.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        CLAUDE_STOP_FENCE_ATTEMPT_LOCKS[session_id] = lock
+    return lock
+
+
+def discard_unused_claude_stop_fence_attempt_lock(session_id: str) -> None:
+    if CLAUDE_STOP_FENCE_ATTEMPT_TASKS.get(session_id):
+        return
+    lock = CLAUDE_STOP_FENCE_ATTEMPT_LOCKS.get(session_id)
+    if lock is not None and not lock.locked():
+        CLAUDE_STOP_FENCE_ATTEMPT_LOCKS.pop(session_id, None)
+
+
+async def stop_idle_claude_background_subagents_bounded(
+    session_id: str,
+    *,
+    emit_event: bool,
+) -> dict[str, Any]:
+    """Run one serialized fence attempt without trusting cancellation."""
+
+    async def attempt() -> dict[str, Any]:
+        async with claude_stop_fence_attempt_lock(session_id):
+            return await stop_idle_claude_background_subagents(
+                session_id,
+                emit_event=emit_event,
+            )
+
+    task = asyncio.create_task(
+        attempt(),
+        name=f"claude-stop-fence-attempt:{session_id}",
+    )
+    register_session_task(
+        CLAUDE_STOP_FENCE_ATTEMPT_TASKS,
+        session_id,
+        task,
+    )
+    def attempt_finished(completed: asyncio.Task[Any]) -> None:
+        if not completed.cancelled():
+            completed.exception()
+        discard_unused_claude_stop_fence_attempt_lock(session_id)
+
+    task.add_done_callback(attempt_finished)
+    try:
+        done, _pending = await asyncio.wait(
+            {task},
+            timeout=CLAUDE_STOP_FENCE_ATTEMPT_TIMEOUT_SECONDS,
+        )
+    except BaseException:
+        task.cancel()
+        raise
+    if done:
+        return task.result()
+
+    task.cancel()
+    logger.error(
+        "Claude stop fence attempt timed out after %.0fs session=%s",
+        CLAUDE_STOP_FENCE_ATTEMPT_TIMEOUT_SECONDS,
+        session_id,
+    )
+    return {
+        **empty_subagent_stop_result(),
+        "pending": ["claude-stop-fence"],
+        "errors": ["Claude stop fence persistence timed out"],
+        "fence_committed": False,
+    }
+
+
+async def retry_claude_stop_fence(session_id: str) -> None:
+    """Retry an idle Claude child-stop marker until it is durable or obsolete."""
+
+    attempt = 0
+    while True:
+        delay = CLAUDE_STOP_FENCE_RETRY_DELAYS_SECONDS[
+            min(attempt, len(CLAUDE_STOP_FENCE_RETRY_DELAYS_SECONDS) - 1)
+        ]
+        attempt += 1
+        await asyncio.sleep(max(0.0, float(delay)))
+
+        session = STORE.sessions.get(session_id)
+        async with ACTIVE_LOCK:
+            if session_id not in CLAUDE_STOP_FENCE_SESSIONS:
+                return
+            if (
+                not isinstance(session, dict)
+                or str(session.get("backend") or DEFAULT_BACKEND)
+                != BACKEND_CLAUDE
+            ):
+                CLAUDE_STOP_FENCE_SESSIONS.discard(session_id)
+                SERVER_MAINTENANCE_SESSIONS.discard(session_id)
+                discard_unused_claude_stop_fence_attempt_lock(session_id)
+                return
+            if (
+                session_id in ACTIVE
+                or session_id in BUSY_SESSIONS
+                or stop_cleanup_in_progress(session_id)
+            ):
+                continue
+            # Reassert the fail-closed admission lease in case an unrelated
+            # late cleanup discarded the coarse maintenance membership.
+            SERVER_MAINTENANCE_SESSIONS.add(session_id)
+
+        try:
+            result = await stop_idle_claude_background_subagents_bounded(
+                session_id,
+                emit_event=False,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Claude stop fence retry raised session=%s attempt=%s error=%s",
+                session_id,
+                attempt,
+                concise_error_message(exc),
+            )
+            continue
+        if not bool(result.get("fence_committed", False)):
+            logger.warning(
+                "Claude stop fence retry deferred session=%s attempt=%s errors=%s",
+                session_id,
+                attempt,
+                result.get("errors") or [],
+            )
+            continue
+
+        released = False
+        async with ACTIVE_LOCK:
+            if (
+                session_id in CLAUDE_STOP_FENCE_SESSIONS
+                and session_id not in ACTIVE
+                and session_id not in BUSY_SESSIONS
+                and not stop_cleanup_in_progress(session_id)
+            ):
+                CLAUDE_STOP_FENCE_SESSIONS.discard(session_id)
+                SERVER_MAINTENANCE_SESSIONS.discard(session_id)
+                released = True
+        if released:
+            discard_unused_claude_stop_fence_attempt_lock(session_id)
+            logger.info(
+                "Claude stop fence recovered session=%s attempts=%s",
+                session_id,
+                attempt,
+            )
+            schedule_next_queued_turn(session_id)
+            return
+
+
+def schedule_claude_stop_fence_retry(session_id: str) -> None:
+    """Start the single retry owner for one failed Claude stop fence."""
+
+    if SERVER_SHUTTING_DOWN:
+        return
+    current = CLAUDE_STOP_FENCE_RETRY_TASKS.get(session_id)
+    if current is not None and not current.done():
+        return
+    task = asyncio.create_task(
+        retry_claude_stop_fence(session_id),
+        name=f"claude-stop-fence-retry:{session_id}",
+    )
+    CLAUDE_STOP_FENCE_RETRY_TASKS[session_id] = task
+
+    def retry_finished(completed: asyncio.Task[Any]) -> None:
+        if CLAUDE_STOP_FENCE_RETRY_TASKS.get(session_id) is completed:
+            CLAUDE_STOP_FENCE_RETRY_TASKS.pop(session_id, None)
+        if completed.cancelled():
+            return
+        error = completed.exception()
+        if error is not None:
+            logger.error(
+                "Claude stop fence retry failed session=%s",
+                session_id,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    task.add_done_callback(retry_finished)
+
+
+async def cancel_claude_stop_fence_retry(
+    session_id: str,
+    *,
+    clear_fence: bool,
+) -> bool:
+    """Cancel and join one retry owner during deletion or explicit cleanup."""
+
+    current = asyncio.current_task()
+    retry_task = CLAUDE_STOP_FENCE_RETRY_TASKS.pop(session_id, None)
+    tasks = {
+        task
+        for task in (
+            retry_task,
+            *tuple(CLAUDE_STOP_FENCE_ATTEMPT_TASKS.get(session_id) or ()),
+        )
+        if task is not None and task is not current and not task.done()
+    }
+    for task in tasks:
+        task.cancel()
+    pending: set[asyncio.Task[Any]] = set()
+    if tasks:
+        _done, pending = await asyncio.wait(
+            tasks,
+            timeout=max(0.01, STOP_CONFIRM_TIMEOUT_SECONDS),
+        )
+    if clear_fence:
+        async with ACTIVE_LOCK:
+            CLAUDE_STOP_FENCE_SESSIONS.discard(session_id)
+            SERVER_MAINTENANCE_SESSIONS.discard(session_id)
+        if not pending:
+            CLAUDE_STOP_FENCE_ATTEMPT_LOCKS.pop(session_id, None)
+    return not pending
 
 
 async def interrupt_claude_sdk_run_bounded(
@@ -45278,6 +45629,13 @@ def build_claude_sdk_options(
     """Build one stable, chat-scoped SDK process configuration."""
 
     env = agent_runner_env(session_id)
+    # Claude Agent SDK overlays ``options.env`` onto the server process's
+    # environment rather than replacing it.  Missing keys therefore inherit
+    # into the provider-controlled CLI even though ``agent_runner_env``
+    # removes them.  Explicitly shadow every server/provider authority secret
+    # with an empty value at this final transport boundary.
+    for secret_name in PROVIDER_SECRET_ENV_NAMES:
+        env[secret_name] = ""
     cli_path = claude_sdk_cli_path(env)
     system_prompt = session_system_prompt(session_id, sess, manifest_path)
     provider_id = resolve_claude_resume_provider(sess, cwd)[0]
@@ -48239,6 +48597,7 @@ async def run_claude_sdk(
     provider_persisted_id = str(resume_provider_id or "")
     result_details: dict[str, Any] | None = None
     stream_error: str | None = None
+    delivery_unknown = False
     cancelled_error: asyncio.CancelledError | None = None
     retire_supervisor = False
     pending_steer: dict[str, Any] | None = None
@@ -48247,6 +48606,10 @@ async def run_claude_sdk(
     first_activity_task: asyncio.Task[bool] | None = None
     provider_ready_tasks: set[asyncio.Task[bool]] = set()
     outputs_finished_run_ids: set[str] = set()
+    logical_started_monotonic = time.monotonic()
+    last_activity_monotonic = logical_started_monotonic
+    provider_acknowledged = initial_provider_ready
+    idle_warning_emitted = False
     manifest_watch_task: asyncio.Task[Any] | None = asyncio.create_task(
         watch_manifest_artifacts(
             session_id,
@@ -48355,8 +48718,93 @@ async def run_claude_sdk(
                 active.pop("logical_transition_predecessor_run_id", None)
                 active.pop("logical_transition_authority_nonce", None)
 
+    async def sdk_deadline_expired(
+        now_monotonic: float | None = None,
+    ) -> bool:
+        nonlocal provider_acknowledged
+        nonlocal last_activity_monotonic
+        nonlocal idle_warning_emitted
+        nonlocal stream_error
+        nonlocal retire_supervisor
+        nonlocal delivery_unknown
+
+        observed_at = (
+            time.monotonic()
+            if now_monotonic is None
+            else now_monotonic
+        )
+        acknowledged_now = bool(
+            getattr(current_handle, "acknowledged", False)
+        )
+        if acknowledged_now and not provider_acknowledged:
+            provider_acknowledged = True
+            last_activity_monotonic = observed_at
+            idle_warning_emitted = False
+        elapsed = observed_at - logical_started_monotonic
+        idle = observed_at - last_activity_monotonic
+        if (
+            not provider_acknowledged
+            and elapsed >= CLAUDE_SDK_PRE_ACK_TIMEOUT_SECONDS
+        ):
+            stream_error = (
+                "Claude SDK did not confirm prompt delivery within "
+                f"{CLAUDE_SDK_PRE_ACK_TIMEOUT_SECONDS:g}s. The prompt "
+                "was not replayed."
+            )
+            delivery_unknown = True
+            retire_supervisor = True
+            logger.warning(
+                "Claude SDK pre-ACK timeout session=%s run=%s",
+                session_id,
+                current_run_id,
+            )
+            return True
+        if (
+            provider_acknowledged
+            and idle >= CLAUDE_SDK_IDLE_WARN_SECONDS
+            and not idle_warning_emitted
+        ):
+            await append_event(session_id, "idle_warning", {
+                "run_id": current_run_id,
+                "idle_seconds": int(idle),
+            })
+            idle_warning_emitted = True
+        if (
+            provider_acknowledged
+            and idle >= CLAUDE_SDK_IDLE_TIMEOUT_SECONDS
+        ):
+            stream_error = (
+                "Claude SDK produced no provider activity for "
+                f"{CLAUDE_SDK_IDLE_TIMEOUT_SECONDS:g}s."
+            )
+            delivery_unknown = not provider_acknowledged
+            retire_supervisor = True
+            logger.warning(
+                "Claude SDK idle timeout session=%s run=%s",
+                session_id,
+                current_run_id,
+            )
+            return True
+        if elapsed >= CLAUDE_SDK_TURN_TIMEOUT_SECONDS:
+            stream_error = (
+                "Claude SDK exceeded the absolute turn timeout of "
+                f"{CLAUDE_SDK_TURN_TIMEOUT_SECONDS:g}s."
+            )
+            delivery_unknown = not provider_acknowledged
+            retire_supervisor = True
+            logger.warning(
+                "Claude SDK absolute timeout session=%s run=%s",
+                session_id,
+                current_run_id,
+            )
+            return True
+        return False
+
     try:
         while True:
+            now_monotonic = time.monotonic()
+            if await sdk_deadline_expired(now_monotonic):
+                break
             if message_task is None:
                 message_task = asyncio.create_task(current_handle.__anext__())
             if pending_steer is None and steer_task is None:
@@ -48366,10 +48814,41 @@ async def run_claude_sdk(
                 waiters.add(steer_task)
             if first_activity_task is not None:
                 waiters.add(first_activity_task)
+            elapsed = now_monotonic - logical_started_monotonic
+            idle = now_monotonic - last_activity_monotonic
+            timeout_candidates = [
+                5.0,
+                max(0.01, CLAUDE_SDK_TURN_TIMEOUT_SECONDS - elapsed),
+            ]
+            if provider_acknowledged:
+                idle_deadline = (
+                    CLAUDE_SDK_IDLE_TIMEOUT_SECONDS
+                    if idle_warning_emitted
+                    else CLAUDE_SDK_IDLE_WARN_SECONDS
+                )
+                timeout_candidates.append(max(0.01, idle_deadline - idle))
+            else:
+                timeout_candidates.append(
+                    max(0.01, CLAUDE_SDK_PRE_ACK_TIMEOUT_SECONDS - elapsed)
+                )
             done, _pending = await asyncio.wait(
                 waiters,
+                timeout=max(0.01, min(timeout_candidates)),
                 return_when=asyncio.FIRST_COMPLETED,
             )
+
+            if not done:
+                if await sdk_deadline_expired():
+                    break
+                continue
+            if message_task in done:
+                # A provider frame ready at the deadline is current activity;
+                # give it the idle lease while still enforcing the absolute
+                # and pre-ACK bounds below.
+                last_activity_monotonic = time.monotonic()
+                idle_warning_emitted = False
+            if await sdk_deadline_expired():
+                break
 
             if (
                 first_activity_task is not None
@@ -48516,6 +48995,11 @@ async def run_claude_sdk(
                 result_details = None
             else:
                 message_task = None
+                last_activity_monotonic = time.monotonic()
+                provider_acknowledged = bool(
+                    getattr(current_handle, "acknowledged", False)
+                ) or provider_acknowledged
+                idle_warning_emitted = False
                 await cancel_first_activity_watchdog()
                 message_provider_id = str(
                     claude_sdk_field(message, "session_id") or ""
@@ -48935,6 +49419,11 @@ async def run_claude_sdk(
                 getattr(candidate_handle, "acknowledged", False)
                 and not getattr(candidate_handle, "done", False)
             )
+            logical_started_monotonic = time.monotonic()
+            last_activity_monotonic = logical_started_monotonic
+            provider_acknowledged = candidate_provider_ready
+            idle_warning_emitted = False
+            delivery_unknown = False
             async with ACTIVE_LOCK:
                 active = ACTIVE.get(session_id)
                 if active:
@@ -49286,6 +49775,7 @@ async def run_claude_sdk(
                     "backend": BACKEND_CLAUDE,
                     "transport": CLAUDE_TRANSPORT_AGENT_SDK,
                     "message": f"Claude SDK stream failed: {stream_error}",
+                    **({"delivery_unknown": True} if delivery_unknown else {}),
                     **run_event_metadata(current_run_id),
                 })
         if result_error and not stopped:
@@ -49360,6 +49850,7 @@ async def run_claude_sdk(
                     ),
                     "result_text": result_text,
                     "stopped": stopped,
+                    **({"delivery_unknown": True} if delivery_unknown else {}),
                     **run_event_metadata(current_run_id),
                 })
         RUN_METADATA.pop(current_run_id, None)
@@ -53550,17 +54041,24 @@ async def _start_turn_locked(
         if session_id in SERVER_MAINTENANCE_SESSIONS:
             raise TransientAdmissionWait(
                 status_code=409,
-                detail="wait for Codex session maintenance to finish",
+                detail=(
+                    "wait for Claude Stop recovery to finish"
+                    if session_id in CLAUDE_STOP_FENCE_SESSIONS
+                    else "wait for provider session maintenance to finish"
+                ),
             )
         if (
             session_id in BUSY_SESSIONS
             or has_prior_queue
-            or explicit_stop_in_progress(session_id)
+            or stop_cleanup_in_progress(session_id)
         ):
             if queue_if_busy:
                 should_queue = True
             else:
-                raise HTTPException(status_code=409, detail="session already has a running turn")
+                raise TransientAdmissionWait(
+                    status_code=409,
+                    detail="session already has a running turn",
+                )
         else:
             BUSY_SESSIONS.add(session_id)
             CURRENT_TURNS[session_id] = {
@@ -54310,7 +54808,7 @@ SERVER_RESTART_FORCE_KILL_DELAY_SECONDS = 3.0
 SERVER_SHUTDOWN_PHASE_TIMEOUT_SECONDS = 5.0
 # Number of bounded_shutdown_phase calls in the lifespan teardown; keep in sync
 # so the cooperative watchdog budget below honours every phase.
-SERVER_SHUTDOWN_PHASE_COUNT = 15
+SERVER_SHUTDOWN_PHASE_COUNT = 16
 
 
 def configured_uvicorn_graceful_shutdown_seconds() -> float:
@@ -54387,16 +54885,18 @@ class ManagedServerUpdatePendingError(HTTPException):
 def scheduled_job_lifecycle_admission_defer_reason(
     error: Exception,
 ) -> str | None:
-    """Return a retry reason only for the server lifecycle admission fence.
+    """Return a retry reason for a transient turn-admission fence.
 
     The scheduler checks its blockers before dispatch, but the managed updater
-    or restart path can establish its fence after that check and before
-    ``start_turn`` reserves the chat. That rejection did not execute the due
-    occurrence, so it must be parked rather than recorded as a failed run.
-    Other HTTP 503 responses can be durable provider/configuration failures and
-    keep the ordinary failure/recurrence behavior.
+    or another transient admission path can establish its fence after that
+    check and before ``start_turn`` reserves the chat. That rejection did not
+    execute the due occurrence, so it must be parked rather than recorded as a
+    failed run. Other HTTP errors can be durable provider/configuration
+    failures and keep the ordinary failure/recurrence behavior.
     """
 
+    if isinstance(error, TransientAdmissionWait):
+        return str(error.detail or "").strip() or "turn admission deferred"
     if not isinstance(error, HTTPException) or error.status_code != 503:
         return None
     reason = str(error.detail or "").strip()
@@ -56521,6 +57021,8 @@ async def bounded_shutdown_phase(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global SERVER_SHUTTING_DOWN
+    SERVER_SHUTTING_DOWN = False
     await STORE.load()
     # Prime the managed-service ownership proof once, off the loop, so the
     # restart controls never depend on a fresh launchctl/cgroup probe later.
@@ -56682,6 +57184,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        SERVER_SHUTTING_DOWN = True
         # Every phase below is bounded by SERVER_SHUTDOWN_PHASE_TIMEOUT_SECONDS
         # (see bounded_shutdown_phase) so one stuck join cannot starve the
         # provider teardown that follows it. The order is load-bearing.
@@ -56696,6 +57199,31 @@ async def lifespan(app: FastAPI):
             "sessions-flush-early",
             STORE.flush_pending_save(),
         )
+        explicit_stop_tasks = tuple({
+            *EXPLICIT_STOP_OPERATIONS.values(),
+            *DETACHED_STOP_TASKS,
+        })
+        for explicit_stop_task in explicit_stop_tasks:
+            explicit_stop_task.cancel()
+        await bounded_shutdown_phase(
+            "explicit-stop-operations",
+            join_cancelled_tasks(*explicit_stop_tasks),
+        )
+        health_queue_reconcile_task = HEALTH_QUEUE_RECONCILE_STATE.get("task")
+        if isinstance(health_queue_reconcile_task, asyncio.Task):
+            health_queue_reconcile_task.cancel()
+        claude_stop_fence_retry_tasks = tuple(
+            CLAUDE_STOP_FENCE_RETRY_TASKS.values()
+        )
+        claude_stop_fence_attempt_tasks = tuple(
+            task
+            for tasks in CLAUDE_STOP_FENCE_ATTEMPT_TASKS.values()
+            for task in tasks
+        )
+        for claude_stop_fence_retry_task in claude_stop_fence_retry_tasks:
+            claude_stop_fence_retry_task.cancel()
+        for claude_stop_fence_attempt_task in claude_stop_fence_attempt_tasks:
+            claude_stop_fence_attempt_task.cancel()
         cross_chat_recovery_task.cancel()
         cross_chat_expiry_task.cancel()
         digest_recovery_task.cancel()
@@ -56709,6 +57237,13 @@ async def lifespan(app: FastAPI):
                 digest_recovery_task,
                 queue_recovery_task,
                 server_update_pending_waiter_task,
+                *(
+                    (health_queue_reconcile_task,)
+                    if isinstance(health_queue_reconcile_task, asyncio.Task)
+                    else ()
+                ),
+                *claude_stop_fence_retry_tasks,
+                *claude_stop_fence_attempt_tasks,
             ),
         )
         direct_delivery_tasks = tuple(CROSS_CHAT_DIRECT_DELIVERY_TASKS)
@@ -58085,7 +58620,10 @@ async def secure_peer_hub_proxy_endpoint(
     return Response(content=result.body, status_code=result.status, headers=headers)
 
 
-HEALTH_QUEUE_RECONCILE_STATE: dict[str, float] = {"last_at": float("-inf")}
+HEALTH_QUEUE_RECONCILE_STATE: dict[str, Any] = {
+    "last_at": float("-inf"),
+    "task": None,
+}
 SESSION_SNAPSHOT_RECONCILE_AT: dict[str, float] = {}
 
 
@@ -58117,16 +58655,40 @@ async def reconcile_idle_queue_session_from_snapshot(session_id: str) -> bool:
 
 
 async def reconcile_idle_queued_turns_from_health_poll() -> bool:
-    """Run the queue repair pass from health at most once per interval."""
+    """Schedule one queue repair pass without putting it on health's latency path."""
 
+    if SERVER_SHUTTING_DOWN:
+        return False
+    state = HEALTH_QUEUE_RECONCILE_STATE
+    running = state.get("task")
+    if isinstance(running, asyncio.Task) and not running.done():
+        return False
     now = time.monotonic()
     if (
-        now - HEALTH_QUEUE_RECONCILE_STATE["last_at"]
+        now - float(state.get("last_at", float("-inf")))
         < HEALTH_QUEUE_RECONCILE_INTERVAL_SECONDS
     ):
         return False
-    HEALTH_QUEUE_RECONCILE_STATE["last_at"] = now
-    await reconcile_idle_queued_turns(reason="health_poll")
+    state["last_at"] = now
+    task = asyncio.create_task(
+        reconcile_idle_queued_turns(reason="health_poll"),
+        name="health-queue-reconcile",
+    )
+    state["task"] = task
+
+    def reconcile_finished(completed: asyncio.Task[Any]) -> None:
+        if state.get("task") is completed:
+            state["task"] = None
+        if completed.cancelled():
+            return
+        error = completed.exception()
+        if error is not None:
+            logger.error(
+                "health queue reconcile failed",
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    task.add_done_callback(reconcile_finished)
     return True
 
 
@@ -58161,6 +58723,18 @@ async def health() -> dict[str, Any]:
             and bool(tmux["available"])
         ),
         "capabilities": {
+            "websocket_auth_v1": {
+                "available": True,
+                "required": False,
+                "version": 1,
+                "message": (
+                    "Event and terminal sockets support URL-free token "
+                    "authentication."
+                ),
+                "action": None,
+                "event_protocol": EVENTS_WEBSOCKET_PROTOCOL,
+                "terminal_protocol": TERMINAL_WEBSOCKET_PROTOCOL,
+            },
             "team_hub_v1": current_team_hub_capability(),
             "agent_team_mail_v1": {
                 "available": bool(
@@ -58469,6 +59043,7 @@ async def health() -> dict[str, Any]:
         "websocket_runtime_version": websockets.__version__,
         "active": active,
         "active_count": len(active),
+        "claude_stop_fence_count": len(CLAUDE_STOP_FENCE_SESSIONS),
         "queued": queued,
         # Additive updater contract. Older clients continue to render the
         # complete queue map, while beta.8+ detached runners distinguish
@@ -62354,6 +62929,7 @@ async def claude_runtime_snapshot(session_id: str) -> dict[str, Any]:
         "interactive_capability": CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY,
         "persisted_session": bool(claude_provider_id_for_session(session)),
         "session_loaded": loaded,
+        "stop_fence_pending": session_id in CLAUDE_STOP_FENCE_SESSIONS,
         "status": status,
         "pending_interactions": pending,
         "policy": {
@@ -63231,6 +63807,10 @@ async def delete_session(session_id: str) -> dict[str, Any]:
             # A previous delete can have committed before its request was
             # canceled. Retry any tracked bridge retirement on idempotent
             # deletion instead of returning while stale work remains alive.
+            await cancel_claude_stop_fence_retry(
+                session_id,
+                clear_fence=True,
+            )
             await retire_session_port_tunnels(
                 session_id,
                 code=PORT_TUNNEL_CLOSE_NOT_FOUND,
@@ -63242,9 +63822,42 @@ async def delete_session(session_id: str) -> dict[str, Any]:
                 "deleted": False,
                 "deleted_jobs": deleted_jobs,
             }
+        if (
+            stop_cleanup_in_progress(session_id)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Explicit Stop cleanup is still finishing; the session "
+                    "was not deleted. Retry shortly."
+                ),
+            )
         DELETING_SESSIONS.add(session_id)
         deleted = False
         try:
+            if (
+                session_id in CLAUDE_STOP_FENCE_SESSIONS
+                or session_id in CLAUDE_STOP_FENCE_RETRY_TASKS
+                or any(
+                    not task.done()
+                    for task in CLAUDE_STOP_FENCE_ATTEMPT_TASKS.get(
+                        session_id,
+                        (),
+                    )
+                )
+            ):
+                fence_retry_stopped = await cancel_claude_stop_fence_retry(
+                    session_id,
+                    clear_fence=False,
+                )
+                if not fence_retry_stopped:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Claude Stop recovery is still finishing; the "
+                            "session was not deleted. Retry shortly."
+                        ),
+                    )
             session = STORE.sessions.get(session_id) or {}
             provider_thread_ids = {
                 thread_id
@@ -63563,6 +64176,13 @@ async def delete_session(session_id: str) -> dict[str, Any]:
                 deleted = await STORE.delete(session_id)
                 DELETED_SESSION_TOMBSTONES.add(session_id)
                 DELETING_SESSIONS.discard(session_id)
+            if session_id in CLAUDE_STOP_FENCE_SESSIONS:
+                # No retry/attempt task remains after the bounded pre-delete
+                # join above. Clear synchronously after the durable delete so
+                # request cancellation cannot strand a process-local blocker.
+                CLAUDE_STOP_FENCE_SESSIONS.discard(session_id)
+                SERVER_MAINTENANCE_SESSIONS.discard(session_id)
+                CLAUDE_STOP_FENCE_ATTEMPT_LOCKS.pop(session_id, None)
             await retire_session_port_tunnels(
                 session_id,
                 code=PORT_TUNNEL_CLOSE_NOT_FOUND,
@@ -63576,9 +64196,11 @@ async def delete_session(session_id: str) -> dict[str, Any]:
                 "deleted": deleted,
                 "deleted_jobs": deleted_jobs,
             }
-        except Exception:
+        except BaseException:
             if deleted:
                 DELETED_SESSION_TOMBSTONES.add(session_id)
+            elif session_id in CLAUDE_STOP_FENCE_SESSIONS:
+                schedule_claude_stop_fence_retry(session_id)
             DELETING_SESSIONS.discard(session_id)
             raise
 
@@ -66180,17 +66802,43 @@ async def run_explicit_stop_operation(
 
     The operation is bounded by ``EXPLICIT_STOP_OPERATION_TIMEOUT_SECONDS``.
     A Stop whose provider interrupt or subagent teardown never settles used to
-    hold the explicit-stop fence forever: queued messages could not promote,
-    and the chat counted as a non-forceable restart blocker. On expiry the
-    teardown keeps running detached, the fence is released, and the chat gets
-    a visible error event explaining what happened.
+    leave its HTTP operation pending forever. On expiry that outer operation
+    returns a visible timeout, while the exact inner teardown stays keyed as an
+    admission/delete/restart fence until its session-wide effects are finished.
     """
 
     stop_task = asyncio.create_task(
-        stop_turn(session_id, _admission_ready=admission_ready)
+        stop_turn(
+            session_id,
+            schedule_queue=False,
+            _admission_ready=admission_ready,
+        )
     )
     DETACHED_STOP_TASKS.add(stop_task)
     stop_task.add_done_callback(DETACHED_STOP_TASKS.discard)
+    register_session_task(DETACHED_STOP_TASKS_BY_SESSION, session_id, stop_task)
+    outer_fence_released = False
+    queue_wake_scheduled = False
+
+    def wake_queue_once() -> None:
+        nonlocal queue_wake_scheduled
+
+        if queue_wake_scheduled:
+            return
+        queue_wake_scheduled = True
+        schedule_next_queued_turn(session_id)
+
+    def detached_stop_finished(completed: asyncio.Task[Any]) -> None:
+        if not completed.cancelled():
+            with suppress(BaseException):
+                completed.exception()
+        # Normal completion is woken exactly once by the outer finalizer. A
+        # child that outlives that outer fence owns the one wake after its
+        # keyed session-wide effects have finished.
+        if outer_fence_released:
+            wake_queue_once()
+
+    stop_task.add_done_callback(detached_stop_finished)
     try:
         done, _pending = await asyncio.wait(
             {stop_task},
@@ -66199,8 +66847,8 @@ async def run_explicit_stop_operation(
         if done:
             return stop_task.result()
         logger.error(
-            "explicit Stop did not finish within %.0fs session=%s; releasing "
-            "the stop fence while teardown continues",
+            "explicit Stop did not finish within %.0fs session=%s; returning "
+            "a timeout while teardown retains the admission fence",
             EXPLICIT_STOP_OPERATION_TIMEOUT_SECONDS,
             session_id,
         )
@@ -66210,9 +66858,9 @@ async def run_explicit_stop_operation(
                 "message": (
                     "Stop did not finish within "
                     f"{int(EXPLICIT_STOP_OPERATION_TIMEOUT_SECONDS)} seconds. "
-                    "The stop fence was released so new messages and server "
-                    "restarts can proceed; the agent process may still be "
-                    "shutting down."
+                    "New messages remain queued and server restart waits "
+                    "until the agent process finishes shutting down. Use "
+                    "Force Restart if cleanup does not finish."
                 ),
             })
         return {
@@ -66221,8 +66869,9 @@ async def run_explicit_stop_operation(
             "pending": True,
             "timed_out": True,
             "message": (
-                "Stop is taking longer than expected; the chat was unblocked "
-                "while the agent process finishes shutting down."
+                "Stop is taking longer than expected; new turns remain "
+                "queued while the agent process finishes shutting down. Use "
+                "Force Restart if cleanup does not finish."
             ),
         }
     finally:
@@ -66248,14 +66897,11 @@ async def run_explicit_stop_operation(
             current_task = asyncio.current_task()
             if EXPLICIT_STOP_OPERATIONS.get(session_id) is current_task:
                 EXPLICIT_STOP_OPERATIONS.pop(session_id, None)
-        # Stop normally schedules the queue when appropriate.  A schedule
-        # attempt made before the explicit-operation fence was removed is a
-        # harmless no-op, so provide one final wake after releasing it.
-        schedule_next_queued_turn(session_id)
-
-
-DETACHED_STOP_TASKS: set[asyncio.Task[Any]] = set()
-
+        outer_fence_released = True
+        # A prompt child completion is now safe to wake after the outer fence
+        # is gone. A still-live child owns that one wake through its callback.
+        if stop_task.done():
+            wake_queue_once()
 
 @app.post("/api/sessions/{session_id}/stop")
 async def stop_turn_endpoint(session_id: str) -> dict[str, Any]:
@@ -66269,6 +66915,14 @@ async def stop_turn_endpoint(session_id: str) -> dict[str, Any]:
             raise HTTPException(status_code=503, detail=update_blocker)
         operation = EXPLICIT_STOP_OPERATIONS.get(session_id)
         if operation is None or operation.done():
+            if detached_stop_in_progress(session_id):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Explicit Stop cleanup is still finishing; retry "
+                        "shortly."
+                    ),
+                )
             admission_ready = asyncio.Event()
             operation = asyncio.create_task(
                 run_explicit_stop_operation(session_id, admission_ready)
@@ -66720,8 +67374,9 @@ async def stop_turn(
         # Cancellation anywhere after this point must leave update admission
         # excluded unless the durable child-stop marker confirms completion.
         subagent_stop["fence_committed"] = False
+        retry_required = False
         try:
-            subagent_stop = await stop_idle_claude_background_subagents(
+            subagent_stop = await stop_idle_claude_background_subagents_bounded(
                 session_id,
                 emit_event=emit_event,
             )
@@ -66731,9 +67386,13 @@ async def stop_turn(
                 if fence_committed:
                     CLAUDE_STOP_FENCE_SESSIONS.discard(session_id)
                     SERVER_MAINTENANCE_SESSIONS.discard(session_id)
+                    discard_unused_claude_stop_fence_attempt_lock(session_id)
                 else:
                     CLAUDE_STOP_FENCE_SESSIONS.add(session_id)
                     SERVER_MAINTENANCE_SESSIONS.add(session_id)
+                    retry_required = True
+            if retry_required:
+                schedule_claude_stop_fence_retry(session_id)
 
     if deferred:
         return {
@@ -68000,29 +68659,33 @@ async def session_terminal(
     rows: int = 36,
     cwd: str | None = None,
 ) -> None:
+    selected_subprotocol = websocket_endpoint_subprotocol(
+        ws,
+        TERMINAL_WEBSOCKET_PROTOCOL,
+    )
     if not websocket_authorized(ws):
-        await ws.accept()
+        await ws.accept(subprotocol=selected_subprotocol)
         await ws.close(code=4401)
         return
     if session_id not in STORE.sessions:
-        await ws.accept()
+        await ws.accept(subprotocol=selected_subprotocol)
         await ws.close(code=4404)
         return
     if bool(STORE.sessions[session_id].get("archived")):
-        await ws.accept()
+        await ws.accept(subprotocol=selected_subprotocol)
         await ws.close(code=4409)
         return
 
     cols, lines = terminal_dimensions(columns, rows)
     reserved = await TERMINAL_ATTACHMENTS.reserve(session_id, ws)
     if not reserved:
-        await ws.accept()
+        await ws.accept(subprotocol=selected_subprotocol)
         await ws.close(code=1012)
         return
     process: subprocess.Popen[bytes] | None = None
     master_fd: int | None = None
     try:
-        await ws.accept()
+        await ws.accept(subprotocol=selected_subprotocol)
         process, master_fd, name = await TERMINAL_ATTACHMENTS.spawn(
             session_id,
             ws,
@@ -68122,13 +68785,17 @@ async def session_events(
     after: int = 0,
     visible: bool | None = None,
 ) -> None:
+    selected_subprotocol = websocket_endpoint_subprotocol(
+        ws,
+        EVENTS_WEBSOCKET_PROTOCOL,
+    )
     if not websocket_authorized(ws):
         await ws.close(code=4401)
         return
     if session_id not in STORE.sessions:
         await ws.close(code=4404)
         return
-    await ws.accept()
+    await ws.accept(subprotocol=selected_subprotocol)
     try:
         cursor = max(0, int(after or 0))
         if visible is None:
@@ -68925,6 +69592,11 @@ POLLING_ACCESS_LOG_PATH_RE = re.compile(
 ACCESS_LOG_MESSAGE_RE = re.compile(
     r'"(?P<method>[A-Z]+) (?P<path>\S+) HTTP/[0-9.]+" (?P<status>[0-9]{3})'
 )
+ACCESS_LOG_TOKEN_QUERY_RE = re.compile(
+    r"(?P<prefix>[?&](?:t|%74)(?:o|%6f)(?:k|%6b)"
+    r"(?:e|%65)(?:n|%6e)=)[^&\s\"]*",
+    re.IGNORECASE,
+)
 
 
 def server_log_rotation_settings() -> tuple[int, int]:
@@ -68961,8 +69633,17 @@ def is_polling_access_log_request(method: Any, path: Any, status: Any) -> bool:
     return POLLING_ACCESS_LOG_PATH_RE.match(route) is not None
 
 
+def redact_access_log_token(value: Any) -> str:
+    """Remove bearer query values before any access-log handler sees them."""
+
+    return ACCESS_LOG_TOKEN_QUERY_RE.sub(
+        lambda match: f"{match.group('prefix')}<redacted>",
+        str(value or ""),
+    )
+
+
 class PollingAccessLogFilter(logging.Filter):
-    """Drop uvicorn access lines for successful client polls.
+    """Redact URL credentials and drop successful client polling noise.
 
     uvicorn logs ``'%s - "%s %s HTTP/%s" %d'`` with
     ``(client, method, path, http_version, status)`` as ``record.args``; the
@@ -68972,8 +69653,23 @@ class PollingAccessLogFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args
-        if isinstance(args, tuple) and len(args) >= 5:
-            return not is_polling_access_log_request(args[1], args[2], args[4])
+        if isinstance(args, tuple):
+            redacted_args = tuple(
+                redact_access_log_token(value)
+                if isinstance(value, str)
+                else value
+                for value in args
+            )
+            if redacted_args != args:
+                record.args = redacted_args
+            if len(redacted_args) >= 5 and "HTTP/" in str(record.msg):
+                return not is_polling_access_log_request(
+                    redacted_args[1],
+                    redacted_args[2],
+                    redacted_args[4],
+                )
+        if isinstance(record.msg, str):
+            record.msg = redact_access_log_token(record.msg)
         try:
             match = ACCESS_LOG_MESSAGE_RE.search(record.getMessage())
         except Exception:
@@ -69086,6 +69782,7 @@ def configure_server_logging(
     level: int = logging.INFO,
     root_logger: logging.Logger | None = None,
     access_logger: logging.Logger | None = None,
+    error_logger: logging.Logger | None = None,
     server_logger: logging.Logger | None = None,
 ) -> ServerLoggingHandlers:
     """Install the stderr handler, a rotating file, and the noise filters.
@@ -69121,7 +69818,15 @@ def configure_server_logging(
             concise_error_message(exc),
         )
     access_filter = PollingAccessLogFilter()
-    (access_logger or logging.getLogger("uvicorn.access")).addFilter(access_filter)
+    access_target = access_logger or logging.getLogger("uvicorn.access")
+    error_target = error_logger or logging.getLogger("uvicorn.error")
+    access_target.addFilter(access_filter)
+    if error_target is not access_target:
+        # Uvicorn emits WebSocket accepted/rejected/closed request lines on
+        # uvicorn.error with the raw query path in tuple arg 1, not through its
+        # HTTP access logger. The same filter redacts those tuple shapes while
+        # limiting polling suppression to HTTP-formatted records.
+        error_target.addFilter(access_filter)
     repeat_filter = RepeatedMessageFilter()
     (server_logger or logger).addFilter(repeat_filter)
     return ServerLoggingHandlers(

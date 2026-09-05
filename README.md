@@ -295,6 +295,10 @@ PYTHONPATH=~/.local/share/agents-server/current \
   --email member@example.com --device-label "Member Mac"
 ```
 
+Issuing a device-recovery proof immediately revokes every existing device
+session and live refresh token for that person. Deliver and redeem the printed
+proof path on the replacement device within ten minutes.
+
 If you override the install or state directory, use the exact operator commands
 printed by `install.sh` at the end of a host-mode install.
 

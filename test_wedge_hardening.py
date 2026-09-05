@@ -150,7 +150,7 @@ class HealthReconcileTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             agent_server,
             "HEALTH_QUEUE_RECONCILE_STATE",
-            {"last_at": float("-inf")},
+            {"last_at": float("-inf"), "task": None},
         ) as state, patch.object(
             agent_server,
             "reconcile_idle_queued_turns",
@@ -169,19 +169,69 @@ class HealthReconcileTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(
                 await agent_server.reconcile_idle_queued_turns_from_health_poll()
             )
+            await state["task"]
             reconcile.assert_awaited_once_with(reason="health_poll")
             state["last_at"] = float("-inf")
             self.assertTrue(
                 await agent_server.reconcile_idle_queued_turns_from_health_poll()
             )
+            await state["task"]
             self.assertEqual(reconcile.await_count, 2)
+
+    async def test_health_poll_does_not_wait_for_a_blocked_reconcile(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_reconcile(*, reason):
+            self.assertEqual(reason, "health_poll")
+            started.set()
+            await release.wait()
+            return 0
+
+        state = {"last_at": float("-inf"), "task": None}
+        with patch.object(
+            agent_server,
+            "HEALTH_QUEUE_RECONCILE_STATE",
+            state,
+        ), patch.object(
+            agent_server,
+            "reconcile_idle_queued_turns",
+            side_effect=blocked_reconcile,
+        ):
+            scheduled = await asyncio.wait_for(
+                agent_server.reconcile_idle_queued_turns_from_health_poll(),
+                timeout=0.1,
+            )
+            self.assertTrue(scheduled)
+            await asyncio.wait_for(started.wait(), timeout=0.1)
+            self.assertFalse(
+                await agent_server.reconcile_idle_queued_turns_from_health_poll()
+            )
+            release.set()
+            await asyncio.wait_for(state["task"], timeout=0.1)
+
+    async def test_shutdown_fence_prevents_new_reconcile_and_queue_tasks(self):
+        with patch.object(agent_server, "SERVER_SHUTTING_DOWN", True), \
+             patch.object(agent_server.asyncio, "create_task") as create_task:
+            self.assertFalse(
+                await agent_server.reconcile_idle_queued_turns_from_health_poll()
+            )
+            agent_server.schedule_next_queued_turn("chat")
+            agent_server.schedule_claude_stop_fence_retry("chat")
+        create_task.assert_not_called()
 
 
 class ExplicitStopDeadlineTests(unittest.IsolatedAsyncioTestCase):
     async def test_hung_stop_releases_fence_and_reports_timeout(self):
         release = asyncio.Event()
 
-        async def hung_stop(session_id, *, _admission_ready=None):
+        async def hung_stop(
+            session_id,
+            *,
+            schedule_queue=True,
+            _admission_ready=None,
+        ):
+            self.assertFalse(schedule_queue)
             if _admission_ready is not None:
                 _admission_ready.set()
             await release.wait()
@@ -196,6 +246,7 @@ class ExplicitStopDeadlineTests(unittest.IsolatedAsyncioTestCase):
              patch.object(agent_server, "EXPLICIT_STOP_OPERATIONS", {}) as fences, \
              patch.object(agent_server, "EXPLICIT_STOP_OPERATION_TIMEOUT_SECONDS", 1.0), \
              patch.object(agent_server, "DETACHED_STOP_TASKS", set()) as detached, \
+             patch.object(agent_server, "DETACHED_STOP_TASKS_BY_SESSION", {}), \
              patch.object(agent_server, "SESSION_LIFECYCLE_LOCKS", {}), \
              patch.object(agent_server, "append_event", new=record_event), \
              patch.object(agent_server, "schedule_next_queued_turn") as schedule, \
@@ -213,18 +264,47 @@ class ExplicitStopDeadlineTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("chat", fences)
             # Teardown keeps running detached until the provider settles.
             self.assertEqual(len(detached), 1)
+            self.assertTrue(agent_server.detached_stop_in_progress("chat"))
+            self.assertTrue(agent_server.stop_cleanup_in_progress("chat"))
+            self.assertEqual(
+                agent_server.queue_promotion_fence("chat"),
+                "explicit_stop",
+            )
+            self.assertEqual(agent_server.explicit_stop_session_ids(), {"chat"})
+            self.assertEqual(
+                await agent_server.scheduled_job_blocker("chat"),
+                "chat is finishing an explicit Stop",
+            )
+            with self.assertRaises(HTTPException) as repeat_stop:
+                await agent_server.stop_turn_endpoint("chat")
+            self.assertEqual(repeat_stop.exception.status_code, 409)
+            with self.assertRaises(HTTPException) as delete_raised:
+                await agent_server.delete_session("chat")
+            self.assertEqual(delete_raised.exception.status_code, 409)
+            self.assertIn("Stop cleanup", str(delete_raised.exception.detail))
             release.set()
             await asyncio.gather(*detached, return_exceptions=True)
+            await asyncio.sleep(0)
+            self.assertFalse(agent_server.detached_stop_in_progress("chat"))
+            self.assertFalse(agent_server.stop_cleanup_in_progress("chat"))
+            self.assertEqual(agent_server.explicit_stop_session_ids(), set())
         self.assertTrue(result["timed_out"])
         self.assertFalse(result["stopped"])
         self.assertTrue(result["pending"])
+        self.assertIn("remain queued", result["message"])
         self.assertEqual([kind for kind, _ in events], ["error"])
         self.assertTrue(events[0][1]["stop_timeout"])
-        schedule.assert_called_with("chat")
+        schedule.assert_called_once_with("chat")
         self.assertTrue(any("did not finish" in line for line in logs.output))
 
     async def test_prompt_stop_returns_its_result_and_clears_fence(self):
-        async def quick_stop(session_id, *, _admission_ready=None):
+        async def quick_stop(
+            session_id,
+            *,
+            schedule_queue=True,
+            _admission_ready=None,
+        ):
+            self.assertFalse(schedule_queue)
             if _admission_ready is not None:
                 _admission_ready.set()
             return {"ok": True, "stopped": True}
@@ -232,7 +312,10 @@ class ExplicitStopDeadlineTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(agent_server, "stop_turn", new=quick_stop), \
              patch.object(agent_server, "EXPLICIT_STOP_OPERATIONS", {}) as fences, \
              patch.object(agent_server, "SESSION_LIFECYCLE_LOCKS", {}), \
-             patch.object(agent_server, "schedule_next_queued_turn"), \
+             patch.object(
+                 agent_server,
+                 "schedule_next_queued_turn",
+             ) as schedule, \
              patch.object(
                  agent_server,
                  "managed_server_update_blocker",
@@ -241,6 +324,7 @@ class ExplicitStopDeadlineTests(unittest.IsolatedAsyncioTestCase):
             result = await agent_server.stop_turn_endpoint("chat")
         self.assertEqual(result, {"ok": True, "stopped": True})
         self.assertEqual(fences, {})
+        schedule.assert_called_once_with("chat")
 
 
 class PendingUpdateNeverFencesTests(unittest.IsolatedAsyncioTestCase):

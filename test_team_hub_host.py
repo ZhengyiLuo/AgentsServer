@@ -839,7 +839,7 @@ class VendoredTeamHubParityTests(unittest.TestCase):
         expected = {
             "__init__.py": "154fbe20574096cff3a5012d8720d51e024c5f077cc1044c3ea6cd5ad6f96861",
             "auth.py": "8f3ff2c2bf12845041acdb5f3f489cef4a9d827feca4de6b3925e4456be98f3d",
-            "cli.py": "3e5ca2a0eb87b71379df48e97e0b2513b84aefecba5de0b7ff936965338c38a1",
+            "cli.py": "19ac402cceb29b5bb05cd31e507fffe38bc67f40433df336b1f95e4c3aace31d",
             "database.py": "c7a9bb1e132e6eba5d20de358e3c83b43d36a893d324643a944ae54a802cfcab",
             "migrations/0001_identity_auth.sql": "f55a62bf6dec527e1f71df91975deaf371e2af8b6e457b9d5577437e914dc186",
             "migrations/0002_teamspace_ledger.sql": "9681100d3d6eb3986e133d761ce9d000dbcf10b5e50954c96bd168391ecacbf3",
@@ -856,7 +856,7 @@ class VendoredTeamHubParityTests(unittest.TestCase):
             "secure_peer.py": "f5f666b78527220c20462a7abdc6552aa217100b02818080756b52ad7a0de2fa",
             "secure_peer_hub.py": "83c67c53a906877da9ab75029bbe87837a2b81fd2f45d6c12ef61b0ecf415f3d",
             "service.py": "c5b2e58f519cc4f23b0f4823a10f24cedbdafd46c8e6a0dd1c3728d3dbf009c0",
-            "store.py": "1c5d25b4382e366b58c146d8e6debc01e8e6b4a5e77eb9710f1e169eb048dfc9",
+            "store.py": "ae7442c00700f03b8f0350be4ca97ab266cac4540d58519a7c48a90a897bdddf",
         }
         entries = list(vendored.rglob("*"))
         for path in entries:

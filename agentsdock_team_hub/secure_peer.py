@@ -8590,34 +8590,63 @@ class SecurePeerClient:
         headers: Mapping[str, str] | None = None,
         body: Mapping[str, Any] | bytes | None = None,
     ) -> ProxyResponse:
+        normalized_method = str(method).upper()
+        prepared: tuple[str, int, ssl.SSLContext] | None = None
         with self._route_guard:
-            self._require_active_connection_locked(
+            row = self._require_active_connection_locked(
                 connection_id,
                 relay_required=False,
             )
+            # Load and validate the exact pinned CA/client credential while
+            # connection retirement is fenced.  Read-only Teamspace requests
+            # may then perform their remote round trip concurrently.  This is
+            # the same authority-snapshot boundary used by attachment reads:
+            # a request admitted before retirement may finish, while every
+            # later request must validate the new durable state.  Mutations
+            # deliberately retain the route guard for the complete request.
+            if row is not None:
+                prepared = (
+                    str(row["host_ip"]),
+                    int(row["port"]),
+                    self._pinned_context(row, mutual_tls=True),
+                )
+            if normalized_method not in {"GET", "HEAD"}:
+                response = self._proxy_locked(
+                    connection_id,
+                    normalized_method,
+                    hub_path,
+                    query=query,
+                    headers=headers,
+                    body=body,
+                    prepared=prepared,
+                )
+            else:
+                response = None
+        if response is None:
             response = self._proxy_locked(
                 connection_id,
-                method,
+                normalized_method,
                 hub_path,
                 query=query,
                 headers=headers,
                 body=body,
+                prepared=prepared,
             )
-            # Proxy errors normally remain byte-for-byte upstream responses.
-            # A pinned host's structured terminal revocation is the one
-            # exception: surface it as a typed error so the runtime can retire
-            # this exact credential before returning the same failure locally.
-            if response.status == 401:
-                try:
-                    self._decode_json_response(
-                        response.status,
-                        list(response.headers),
-                        response.body,
-                    )
-                except SecurePeerError as exc:
-                    if exc.code == "peer_revoked" and exc.status_code == 401:
-                        raise
-            return response
+        # Proxy errors normally remain byte-for-byte upstream responses.  A
+        # pinned host's structured terminal revocation is the one exception:
+        # surface it as a typed error so the runtime can retire this exact
+        # credential before returning the same failure locally.
+        if response.status == 401:
+            try:
+                self._decode_json_response(
+                    response.status,
+                    list(response.headers),
+                    response.body,
+                )
+            except SecurePeerError as exc:
+                if exc.code == "peer_revoked" and exc.status_code == 401:
+                    raise
+        return response
 
     def _proxy_locked(
         self,
@@ -8628,14 +8657,27 @@ class SecurePeerClient:
         query: str = "",
         headers: Mapping[str, str] | None = None,
         body: Mapping[str, Any] | bytes | None = None,
+        prepared: tuple[str, int, ssl.SSLContext] | None = None,
     ) -> ProxyResponse:
         if not hub_path.startswith("/v1/"):
             raise ValueError("Hub path must begin with /v1/")
-        row = self._connection_row(connection_id)
+        if prepared is None:
+            row = self._connection_row(connection_id)
+            prepared = (
+                str(row["host_ip"]),
+                int(row["port"]),
+                self._pinned_context(row, mutual_tls=True),
+            )
+        host, port, context = prepared
         suffix = "?" + query if query else ""
         status, response_headers, raw, _leaf = self._request(
-            row["host_ip"], int(row["port"]), method.upper(), "/v1/hub" + hub_path + suffix,
-            body=body, headers=headers, context=self._pinned_context(row, mutual_tls=True)
+            host,
+            port,
+            method.upper(),
+            "/v1/hub" + hub_path + suffix,
+            body=body,
+            headers=headers,
+            context=context,
         )
         return sanitize_proxy_response(
             ProxyResponse(status, tuple(response_headers), raw)

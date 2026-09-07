@@ -1028,6 +1028,7 @@ class SecurePeerStoreTests(unittest.TestCase):
             mock.patch.object(
                 client,
                 "_require_active_connection_locked",
+                return_value=None,
             ),
             mock.patch.object(
                 client,
@@ -1063,6 +1064,7 @@ class SecurePeerStoreTests(unittest.TestCase):
                 mock.patch.object(
                     client,
                     "_require_active_connection_locked",
+                    return_value=None,
                 ),
                 mock.patch.object(
                     client,
@@ -1074,6 +1076,102 @@ class SecurePeerStoreTests(unittest.TestCase):
                     client.proxy(connection_id, "GET", "/v1/teams"),
                     response,
                 )
+
+    def test_client_proxy_overlaps_read_io_but_keeps_mutations_fenced(self) -> None:
+        client = SecurePeerClient(
+            self.root / "concurrent-proxy-client",
+            "proxy-peer-001",
+            "Proxy peer",
+            clock=self.clock,
+        )
+        connection_id = _uuid()
+        row = {"host_ip": "192.0.2.20", "port": 7851}
+        two_reads_entered = threading.Event()
+        release_reads = threading.Event()
+        call_guard = threading.Lock()
+        entered_reads = 0
+        errors: list[BaseException] = []
+
+        def read_request(*_args, **_kwargs):
+            nonlocal entered_reads
+            with call_guard:
+                entered_reads += 1
+                if entered_reads == 2:
+                    two_reads_entered.set()
+            if not release_reads.wait(5):
+                raise TimeoutError("concurrent proxy reads were not released")
+            return 200, [("content-type", "application/json")], b"{}", b"leaf"
+
+        with (
+            mock.patch.object(
+                client, "_require_active_connection_locked", return_value=row
+            ),
+            mock.patch.object(client, "_pinned_context", return_value=object()),
+            mock.patch.object(client, "_request", side_effect=read_request),
+        ):
+            readers = [
+                threading.Thread(
+                    target=lambda: self._capture_thread_error(
+                        errors,
+                        lambda: client.proxy(
+                            connection_id,
+                            "GET",
+                            "/v1/teams",
+                        ),
+                    )
+                )
+                for _index in range(2)
+            ]
+            for reader in readers:
+                reader.start()
+            try:
+                self.assertTrue(
+                    two_reads_entered.wait(2),
+                    "read-only peer requests were serialized during remote I/O",
+                )
+            finally:
+                release_reads.set()
+            for reader in readers:
+                reader.join(5)
+                self.assertFalse(reader.is_alive())
+        self.assertEqual(errors, [])
+
+        mutation_entered = threading.Event()
+        release_mutation = threading.Event()
+
+        def mutation_request(*_args, **_kwargs):
+            mutation_entered.set()
+            if not release_mutation.wait(5):
+                raise TimeoutError("proxy mutation was not released")
+            return 200, [("content-type", "application/json")], b"{}", b"leaf"
+
+        with (
+            mock.patch.object(
+                client, "_require_active_connection_locked", return_value=row
+            ),
+            mock.patch.object(client, "_pinned_context", return_value=object()),
+            mock.patch.object(client, "_request", side_effect=mutation_request),
+        ):
+            writer = threading.Thread(
+                target=lambda: self._capture_thread_error(
+                    errors,
+                    lambda: client.proxy(
+                        connection_id,
+                        "POST",
+                        "/v1/teams/team-1/network/messages",
+                        body=b"{}",
+                    ),
+                )
+            )
+            writer.start()
+            self.assertTrue(mutation_entered.wait(2))
+            try:
+                self.assertFalse(client._route_guard.acquire(timeout=0.1))
+            finally:
+                release_mutation.set()
+            writer.join(5)
+            self.assertFalse(writer.is_alive())
+        self.assertEqual(errors, [])
 
     def test_pairing_capacity_is_transactional_and_prunes_old_terminal_rows(self) -> None:
         _key, request = self.request()

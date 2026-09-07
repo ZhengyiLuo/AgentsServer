@@ -3445,72 +3445,122 @@ class SecurePeerRuntime:
             query=query,
             body=body,
         )
-        with self._outbound_guard:
-            active = next(
-                (
-                    item
-                    for item in self.client.list_connections()
-                    if item.get("active")
-                ),
-                None,
+        # GETs carry no durable outbound intent.  Snapshot the exact active
+        # connection under the retirement fence, then let independent reads
+        # use the peer transport concurrently.  Connection-changing and write
+        # paths retain the guard through their complete remote operation.
+        if str(method).upper() == "GET" and reply_parent_path is None:
+            with self._outbound_guard:
+                active = self._require_active_proxy_connection(connection_id)
+            return self._proxy_with_active_connection(
+                active,
+                connection_id,
+                method,
+                path,
+                query=query,
+                headers=headers,
+                body=body,
+                reply_parent_path=None,
             )
-            if active is None or active.get("connection_id") != connection_id:
-                raise SecurePeerError(
-                    "connection_unavailable",
-                    "Secure peer connection is unavailable",
-                    404,
-                )
-            try:
-                if reply_parent_path is not None:
-                    parent_response = self.client.proxy(
-                        connection_id,
-                        "GET",
-                        reply_parent_path,
-                        query="",
-                        headers={"accept": "application/json"},
-                        body=None,
-                    )
-                    parent = self._decoded_proxy_json(
-                        parent_response,
-                        preserve_not_found=True,
-                    )
-                    item = parent.get("item")
-                    sender = item.get("from") if isinstance(item, Mapping) else None
-                    recipient = item.get("to") if isinstance(item, Mapping) else None
-                    allowed_participant_kinds = {"server", "human"}
-                    if (
-                        not isinstance(sender, Mapping)
-                        or not isinstance(recipient, Mapping)
-                        or sender.get("kind") not in allowed_participant_kinds
-                        or recipient.get("kind") not in allowed_participant_kinds
-                    ):
-                        raise SecurePeerError(
-                            "invalid_request",
-                            "Agent-addressed peer replies are retired",
-                            422,
-                        )
-                return self.client.proxy(
+        with self._outbound_guard:
+            active = self._require_active_proxy_connection(connection_id)
+            return self._proxy_with_active_connection(
+                active,
+                connection_id,
+                method,
+                path,
+                query=query,
+                headers=headers,
+                body=body,
+                reply_parent_path=reply_parent_path,
+            )
+
+    def _require_active_proxy_connection(
+        self,
+        connection_id: str,
+    ) -> Mapping[str, Any]:
+        active = next(
+            (
+                item
+                for item in self.client.list_connections()
+                if item.get("active")
+            ),
+            None,
+        )
+        if active is None or active.get("connection_id") != connection_id:
+            raise SecurePeerError(
+                "connection_unavailable",
+                "Secure peer connection is unavailable",
+                404,
+            )
+        return active
+
+    def _proxy_with_active_connection(
+        self,
+        active: Mapping[str, Any],
+        connection_id: str,
+        method: str,
+        path: str,
+        *,
+        query: str,
+        headers: Mapping[str, str] | None,
+        body: bytes | None,
+        reply_parent_path: str | None,
+    ):
+        try:
+            if reply_parent_path is not None:
+                parent_response = self.client.proxy(
                     connection_id,
-                    method,
-                    path,
-                    query=query,
-                    headers=headers,
-                    body=body,
+                    "GET",
+                    reply_parent_path,
+                    query="",
+                    headers={"accept": "application/json"},
+                    body=None,
                 )
-            except SecurePeerError as exc:
+                parent = self._decoded_proxy_json(
+                    parent_response,
+                    preserve_not_found=True,
+                )
+                item = parent.get("item")
+                sender = item.get("from") if isinstance(item, Mapping) else None
+                recipient = item.get("to") if isinstance(item, Mapping) else None
+                allowed_participant_kinds = {"server", "human"}
                 if (
-                    self._is_unconfirmed_peer_revocation(exc)
-                    and self._remote_revocation_confirmed(connection_id) is True
+                    not isinstance(sender, Mapping)
+                    or not isinstance(recipient, Mapping)
+                    or sender.get("kind") not in allowed_participant_kinds
+                    or recipient.get("kind") not in allowed_participant_kinds
                 ):
-                    try:
-                        self._retire_remote_revoked_active_connection(active, {})
-                    except Exception as retire_error:
-                        if self.logger is not None:
-                            self.logger.warning(
-                                "secure peer local revocation retirement deferred error_type=%s",
-                                type(retire_error).__name__,
-                            )
-                raise
+                    raise SecurePeerError(
+                        "invalid_request",
+                        "Agent-addressed peer replies are retired",
+                        422,
+                    )
+            return self.client.proxy(
+                connection_id,
+                method,
+                path,
+                query=query,
+                headers=headers,
+                body=body,
+            )
+        except SecurePeerError as exc:
+            if self._is_unconfirmed_peer_revocation(exc):
+                # A read may have released the ordinary outbound fence.  Take
+                # it again across the pinned confirmation and durable local
+                # retirement so certificate renewal/role switching cannot
+                # cross this terminal trust transition.
+                with self._outbound_guard:
+                    if self._remote_revocation_confirmed(connection_id) is True:
+                        try:
+                            self._retire_remote_revoked_active_connection(active, {})
+                        except Exception as retire_error:
+                            if self.logger is not None:
+                                self.logger.warning(
+                                    "secure peer local revocation retirement deferred error_type=%s",
+                                    type(retire_error).__name__,
+                                )
+            raise
 
     @staticmethod
     def _enforce_inbox_only_outbound_proxy(

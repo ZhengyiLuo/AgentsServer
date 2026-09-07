@@ -49,6 +49,12 @@ class ParseConfigEnvFileTests(unittest.TestCase):
         self.assertEqual(parsed["C"], '"unbalanced')
         self.assertEqual(parsed["D"], "plain=value=with=equals")
 
+    def test_decodes_installer_json_quoted_server_names(self) -> None:
+        parsed = agent_server.parse_config_env_file(
+            'AGENTSDOCK_SERVER_NAME="Studio \\"M1\\""\n'
+        )
+        self.assertEqual(parsed["AGENTSDOCK_SERVER_NAME"], 'Studio "M1"')
+
     def test_malformed_lines_are_skipped_not_raised(self) -> None:
         # This runs during import; one stray hand-edited line must never
         # stop the server from starting.
@@ -124,6 +130,25 @@ class LoadConfigEnvFileTests(unittest.TestCase):
         self.assertEqual(os.environ["AGENTSDOCK_AGENT_TOKEN"], "live-token")
         self.assertNotIn("AGENTSDOCK_AGENT_TOKEN", applied)
         self.assertEqual(applied, ["COMPANY_API_KEY"])
+
+    def test_live_mutable_role_and_name_override_stale_launchd_values(self) -> None:
+        self._cleanup("AGENTSDOCK_SERVER_NAME", "AGENTSDOCK_TEAM_HUB_MODE")
+        os.environ["AGENTSDOCK_SERVER_NAME"] = "Old name"
+        os.environ["AGENTSDOCK_TEAM_HUB_MODE"] = "disabled"
+        self.path.write_text(
+            'AGENTSDOCK_SERVER_NAME="Studio"\n'
+            "AGENTSDOCK_TEAM_HUB_MODE=host\n",
+            encoding="utf-8",
+        )
+
+        applied = agent_server.load_config_env_file(self.path)
+
+        self.assertEqual(os.environ["AGENTSDOCK_SERVER_NAME"], "Studio")
+        self.assertEqual(os.environ["AGENTSDOCK_TEAM_HUB_MODE"], "host")
+        self.assertEqual(
+            applied,
+            ["AGENTSDOCK_SERVER_NAME", "AGENTSDOCK_TEAM_HUB_MODE"],
+        )
 
     def test_missing_file_is_not_an_error(self) -> None:
         self.assertEqual(

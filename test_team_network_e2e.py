@@ -473,6 +473,14 @@ class TeamNetworkE2EAcceptanceTests(unittest.TestCase):
         member_node_id = host_servers[MEMBER_SERVER_IDENTITY]["id"]
         self.assertTrue(host_servers[HOST_SERVER_IDENTITY]["is_host"])
         self.assertEqual(host_servers[HOST_SERVER_IDENTITY]["display_name"], "Sonic")
+        self.assertEqual(
+            host_servers[HOST_SERVER_IDENTITY]["recipient_display_name"],
+            "Network owner",
+        )
+        self.assertEqual(
+            host_servers[MEMBER_SERVER_IDENTITY]["recipient_display_name"],
+            host_servers[MEMBER_SERVER_IDENTITY]["display_name"],
+        )
         self.assertEqual(peer_servers[HOST_SERVER_IDENTITY]["display_name"], "Sonic")
         self.assertTrue(host_servers[HOST_SERVER_IDENTITY]["owned_by_caller"])
         self.assertFalse(host_servers[MEMBER_SERVER_IDENTITY]["owned_by_caller"])
@@ -484,7 +492,7 @@ class TeamNetworkE2EAcceptanceTests(unittest.TestCase):
             "team_id": network.team_id,
             "recipient_kind": "server",
             "target_id": host_node_id,
-            "display_name_snapshot": "Sonic",
+            "display_name_snapshot": "Network owner",
         }
         self.assertEqual(
             network.member.resolve_team_references([host_reference]),
@@ -494,13 +502,13 @@ class TeamNetworkE2EAcceptanceTests(unittest.TestCase):
             network.member.resolve_team_references([
                 {
                     **host_reference,
-                    "display_name_snapshot": "Host server",
+                    "display_name_snapshot": "Sonic",
                 }
             ])
         self.assertEqual(stale_alias.exception.code, "team_reference_invalid")
         remote_routes = network.member.agent_mail_route_profiles()
         self.assertIn(
-            (host_node_id, "Sonic"),
+            (host_node_id, "Network owner"),
             {
                 (route["destination_id"], route["display_name"])
                 for route in remote_routes

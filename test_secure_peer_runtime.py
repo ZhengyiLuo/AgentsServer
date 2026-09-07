@@ -412,6 +412,7 @@ class SecurePeerRuntimeTests(unittest.TestCase):
                     "id": target_id,
                     "server_identity": "sonic_server_identity",
                     "display_name": "Sonic",
+                    "recipient_display_name": "Network owner",
                     "status": "active",
                     "is_host": True,
                     "owned_by_caller": False,
@@ -432,7 +433,7 @@ class SecurePeerRuntimeTests(unittest.TestCase):
                 "team_id": "team_1",
                 "recipient_kind": "server",
                 "target_id": target_id,
-                "display_name_snapshot": "Sonic",
+                "display_name_snapshot": "Network owner",
             }
             try:
                 with mock.patch.object(
@@ -448,7 +449,7 @@ class SecurePeerRuntimeTests(unittest.TestCase):
                         runtime.resolve_team_references([
                             {
                                 **reference,
-                                "display_name_snapshot": "Visible local alias",
+                                "display_name_snapshot": "Sonic",
                             }
                         ])
                 self.assertEqual(stale.exception.code, "team_reference_invalid")
@@ -517,6 +518,7 @@ class SecurePeerRuntimeTests(unittest.TestCase):
                     {
                         "id": "node_host_12345678",
                         "display_name": "Sonic",
+                        "recipient_display_name": "Network owner",
                         "status": "active",
                         "owned_by_caller": False,
                         "server_identity": "host_identity",
@@ -567,7 +569,7 @@ class SecurePeerRuntimeTests(unittest.TestCase):
             ],
             [
                 ("server", "node_remote_12345678", "Remote", None),
-                ("server", "node_host_12345678", "Sonic", None),
+                ("server", "node_host_12345678", "Network owner", None),
             ],
         )
         self.assertNotIn(

@@ -46,6 +46,7 @@ from agentsdock_team_hub.secure_peer import (
     sas_words,
 )
 from agentsdock_team_hub.security import canonical_json
+from secure_peer_runtime import SecurePeerRuntime
 
 
 def _uuid() -> str:
@@ -2769,6 +2770,88 @@ class SecurePeerLiveTLSTests(unittest.TestCase):
             idempotency_key=_uuid(),
         )
         return self.client.poll_pairing(connection["connection_id"])
+
+    def test_host_role_pause_fences_mutation_and_revalidates_member_on_resume(self) -> None:
+        approved = self.pair_and_approve()
+        connection_id = approved["connection_id"]
+        active = self.client.set_active_connection(
+            connection_id,
+            expected_current=None,
+        )
+        runtime = SecurePeerRuntime(
+            Path(self.temporary.name) / "runtime",
+            server_identity=self.client.server_identity,
+            server_instance_id="instance-host-pause-12345678",
+            display_name="Live peer",
+        )
+        runtime.client = self.client
+
+        paused = runtime.pause_member_for_host()
+        self.assertEqual(paused["connection_id"], connection_id)
+        self.assertFalse(self.client.get_connection(connection_id)["active"])
+        for operation in (
+            lambda: runtime.deactivate_connection(
+                connection_id,
+                expected_host_server_identity=active["host_server_identity"],
+                expected_hub_id=active["hub_id"],
+            ),
+            lambda: runtime.forget_connection(
+                connection_id,
+                expected_host_server_identity=active["host_server_identity"],
+                expected_hub_id=active["hub_id"],
+                expected_certificate_fingerprint=active[
+                    "certificate_fingerprint"
+                ],
+            ),
+        ):
+            with self.assertRaises(SecurePeerError) as raised:
+                operation()
+            self.assertEqual(raised.exception.code, "host_role_active")
+
+        restored = runtime.resume_member_after_host()
+        self.assertEqual(restored["connection_id"], connection_id)
+        self.assertTrue(restored["active"])
+        self.assertEqual(restored["status"], "connected")
+        self.assertGreaterEqual(
+            restored["last_validated_at"],
+            int(paused["last_validated_at"] or 0),
+        )
+
+    def test_host_role_resume_keeps_member_paused_when_health_fails(self) -> None:
+        approved = self.pair_and_approve()
+        connection_id = approved["connection_id"]
+        self.client.set_active_connection(connection_id, expected_current=None)
+        runtime = SecurePeerRuntime(
+            Path(self.temporary.name) / "runtime-health-failure",
+            server_identity=self.client.server_identity,
+            server_instance_id="instance-host-pause-failure-12345678",
+            display_name="Live peer",
+        )
+        runtime.client = self.client
+        runtime.pause_member_for_host()
+
+        with mock.patch.object(
+            self.client,
+            "_request",
+            side_effect=SecurePeerError(
+                "peer_unavailable",
+                "peer is offline",
+                503,
+            ),
+        ), self.assertRaises(SecurePeerError):
+            runtime.resume_member_after_host()
+
+        paused = self.client.get_connection(connection_id)
+        self.assertFalse(paused["active"])
+        self.assertEqual(paused["status"], "deactivated")
+        with self.assertRaises(SecurePeerError) as blocked:
+            runtime.activate_pairing(
+                approved["pairing_id"],
+                expected_connection_id=connection_id,
+                expected_host_server_identity=approved["host_server_identity"],
+                expected_hub_id=approved["hub_id"],
+            )
+        self.assertEqual(blocked.exception.code, "host_role_active")
 
     def test_outgoing_pending_pairing_expires_offline_and_retires_authority(
         self,

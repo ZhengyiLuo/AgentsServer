@@ -6,7 +6,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -16,6 +16,7 @@ import agentsdock_team_hub.store as team_hub_store_module
 from team_hub_host import (
     TEAM_HUB_MODE_DISABLED,
     TEAM_HUB_MODE_HOST,
+    TEAM_HUB_TRANSPORT_LOOPBACK,
     TEAM_HUB_TRANSPORT_TAILSCALE_SERVE,
     TEAM_HUB_TRANSPORT_DIRECT_IP,
     ManagedTeamHubHost,
@@ -73,6 +74,124 @@ def direct_ip_host(root: Path, instance_id: str) -> ManagedTeamHubHost:
 
 
 class ManagedTeamHubHostTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_failed_peer_detach_reopens_live_host_admission(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        class _PeerManager:
+            reopened = 0
+
+            def detach_host_hub(self, *, hub_store) -> None:
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError("test did not release peer detach")
+                raise RuntimeError("peer detach failed")
+
+            def reopen_host_admission(self) -> None:
+                self.reopened += 1
+
+        with tempfile.TemporaryDirectory() as temporary:
+            manager = _PeerManager()
+            runtime = ManagedTeamHubHost(
+                mode=TEAM_HUB_MODE_HOST,
+                data_dir=Path(temporary) / "team-hub",
+                server_identity=HOST_ID,
+                server_instance_id="instance-cancel-detach-12345678",
+                managed_host_display_name="Studio",
+                allowed_hosts={"127.0.0.1"},
+                transport=TEAM_HUB_TRANSPORT_LOOPBACK,
+                hub_url=None,
+                routes={TEAM_HUB_TRANSPORT_LOOPBACK: None},
+                secure_peer_manager=manager,
+            )
+            runtime._delegate = object()
+            runtime._store = object()
+            runtime._accepting = True
+            with patch.object(
+                runtime,
+                "_close_and_drain",
+                new=AsyncMock(return_value=None),
+            ):
+                operation = asyncio.create_task(runtime.disable_live_host())
+                self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                operation.cancel()
+                release.set()
+                with self.assertRaises(RuntimeError):
+                    await operation
+
+            self.assertTrue(runtime.designated_host)
+            self.assertTrue(runtime._accepting)
+            self.assertEqual(manager.reopened, 1)
+
+    async def test_live_demotion_then_verified_reactivation_preserves_hub(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "team-hub"
+            runtime = ManagedTeamHubHost(
+                mode=TEAM_HUB_MODE_HOST,
+                data_dir=data_dir,
+                server_identity=HOST_ID,
+                server_instance_id="instance-live-role-12345678",
+                managed_host_display_name="Studio",
+                allowed_hosts={"127.0.0.1"},
+                transport=TEAM_HUB_TRANSPORT_LOOPBACK,
+                hub_url=None,
+                routes={TEAM_HUB_TRANSPORT_LOOPBACK: None},
+            )
+            runtime.initialize()
+            original_hub_id = runtime.store.hub_id
+
+            disabled = await runtime.disable_live_host()
+            self.assertFalse(disabled["designated_host"])
+            self.assertTrue((data_dir / "team-hub.sqlite3").is_file())
+
+            hub_id, snapshot, operation_id, device, inode = (
+                HubStore.prepare_managed_host_reactivation(
+                    data_dir,
+                    expected_host_identity=HOST_ID,
+                )
+            )
+            HubStore.adopt_prepared_host_reactivation(
+                data_dir,
+                expected_host_identity=HOST_ID,
+                expected_hub_id=hub_id,
+                expected_operation_id=operation_id,
+                expected_snapshot=snapshot,
+                expected_device=device,
+                expected_inode=inode,
+            )
+            HubStore.publish_managed_startup_authority(
+                data_dir,
+                expected_host_identity=HOST_ID,
+                expected_hub_id=hub_id,
+                expected_reason="host-reactivation",
+                expected_operation_id=operation_id,
+                expected_snapshot=snapshot,
+            )
+            enabled = runtime.enable_live_host(
+                transport=TEAM_HUB_TRANSPORT_LOOPBACK,
+                hub_url=None,
+                routes={TEAM_HUB_TRANSPORT_LOOPBACK: None},
+                allowed_hosts={"127.0.0.1"},
+                managed_host_display_name="Studio renamed",
+                reactivation_hub_id=hub_id,
+                reactivation_operation_id=operation_id,
+                reactivation_snapshot=snapshot,
+            )
+            HubStore.clear_managed_startup_authority(
+                data_dir,
+                expected_host_identity=HOST_ID,
+                expected_hub_id=hub_id,
+                expected_reason="host-reactivation",
+                expected_operation_id=operation_id,
+                expected_snapshot=snapshot,
+            )
+
+            self.assertTrue(enabled["available"])
+            self.assertTrue(enabled["designated_host"])
+            self.assertEqual(enabled["hub_id"], original_hub_id)
+            self.assertFalse((data_dir / "maintenance-fence.json").exists())
+            await runtime.disable_live_host()
+
     async def test_direct_ip_endpoint_requires_explicit_exact_plaintext_route(self) -> None:
         self.assertEqual(
             configured_team_hub_endpoint(
@@ -1650,10 +1769,10 @@ class VendoredTeamHubParityTests(unittest.TestCase):
             "migrations/0013_team_message_revisions.sql": "d321c7940618ab8bae688713982ff2019ab97a0cecf2efe1b3575aa23cce57cf",
             "migrations/__init__.py": "aaf340c45c8d39c2939814977ba4cef8eb6b3bd0671b0f7542ebe06f5431d6ec",
             "security.py": "0c1895c7443e7be07a2f53c7e4c4228e3ee04c65d6cd36f039b7bbba1813e4fa",
-            "secure_peer.py": "9457bfec7aaaf45d600aca3da23403449ccbe8d4338a8be55e056716739c9478",
+            "secure_peer.py": "a46e55809e3593feca7338188789b7e6657a7219357af75c5b975204681111ac",
             "secure_peer_hub.py": "259636fd314e5bd1e0325092170f97c7d862f826e348f4c0ec52db1a79ad6c5e",
             "service.py": "0bdc37c091d10c7c34ed4ffd4ddecbd06b9368b317bac449361a867935a0aad1",
-            "store.py": "56cf9f345544fbd41f44d05cc906659d30eb0d87cc1f3078cf77533dbbe4f8e6",
+            "store.py": "da56c8f7f803acc02541f84387eb4d5579efbbc497608b52c1bfca5c0c548818",
         }
         entries = list(vendored.rglob("*"))
         for path in entries:

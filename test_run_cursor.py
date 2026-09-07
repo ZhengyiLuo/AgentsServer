@@ -1836,6 +1836,21 @@ class CursorFileDeliveryInstructionTests(unittest.TestCase):
         self.assertIn('{"files":["/absolute/path.ext"]}', instructions)
         self.assertIn("needs no shell", instructions)
         self.assertIn("generated images", instructions)
+        self.assertNotIn(
+            agent_server.CLAUDE_PROVIDER_MCP_TOOL_NAME,
+            instructions,
+        )
+        self.assertNotIn("Use the `agentsdock` provider tool", instructions)
+        self.assertIn("generated per-turn authority block", instructions)
+
+        authority = agent_server.cross_chat_provider_authority_block(
+            [],
+            Path("/tmp/run_cursor-authority.json"),
+            "chat-x",
+            {"publish"},
+        )
+        self.assertIn('"$AGENTSDOCK_PUBLISH_CLI"', authority)
+        self.assertIn("--authority-file", authority)
 
     def test_instruction_hash_changes_so_live_sessions_reinject(self) -> None:
         # Instructions are only re-sent when their hash changes, so a policy
@@ -1861,7 +1876,7 @@ class CursorFileDeliveryInstructionTests(unittest.TestCase):
             )
         current = agent_server.cursor_instruction_hash("chat-x", {}, manifest)
 
-        self.assertEqual(agent_server.CURSOR_PROMPT_POLICY_VERSION, "3")
+        self.assertEqual(agent_server.CURSOR_PROMPT_POLICY_VERSION, "4")
         self.assertNotEqual(previous, current)
 
 

@@ -1161,6 +1161,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             manifest,
             allow_exec_fallback=True,
             interactive_app_server=False,
+            provider_runtime_env={},
         )
         exec_runner.assert_not_awaited()
 
@@ -1224,6 +1225,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             "Current text",
             self.session,
             manifest,
+            provider_runtime_env={},
         )
         invalidate_context.assert_awaited_once_with("chat-native")
         app_server.assert_not_awaited()
@@ -1545,6 +1547,9 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         )
         manager = FakeManager(start_turn_error=rejection)
         stack, events, _finished, exec_fallback = self.runner_patches(manager)
+        runtime_env = {
+            "AGENTSDOCK_PROVIDER_AUTHORITY_ACTIONS": "publish",
+        }
         with stack:
             await agent_server.run_codex_app_server(
                 "chat-native",
@@ -1553,6 +1558,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                 dict(self.session),
                 Path(self.cwd) / ".runner-test-manifest.json",
                 allow_exec_fallback=True,
+                provider_runtime_env=runtime_env,
             )
             unpin = agent_server.unpin_codex_app_server_thread
 
@@ -1564,6 +1570,10 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.context_invalidator.assert_awaited_once_with("chat-native")
         self.assertEqual(exec_fallback.await_args.args[2], "Safe to retry exactly once")
+        self.assertEqual(
+            exec_fallback.await_args.kwargs["provider_runtime_env"],
+            runtime_env,
+        )
         fallback_events = [
             call.args[2]
             for call in events.await_args_list
@@ -3119,19 +3129,14 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(steer_input[0]["type"], "text")
         self.assertEqual(steer_input[0]["text_elements"], [])
         steer_text = str(steer_input[0]["text"])
-        self.assertTrue(
-            steer_text.startswith(
-                user_prompt + "\n\n[AgentsDock provider authority]"
-            )
-        )
-        trusted_block = steer_text[len(user_prompt):]
+        self.assertEqual(steer_text, user_prompt)
         self.assertEqual(
             steer_text.count("[AgentsDock provider authority]"),
-            2,
+            1,
         )
-        self.assertIn(str(candidate_path), trusted_block)
-        self.assertNotIn(str(predecessor_path), trusted_block)
-        self.assertNotIn(fake_authority_path, trusted_block)
+        self.assertNotIn(str(candidate_path), steer_text)
+        self.assertNotIn(str(predecessor_path), steer_text)
+        self.assertIn(fake_authority_path, steer_text)
         self.assertNotIn(candidate_token, steer_text)
         self.assertNotIn(predecessor_token, steer_text)
         self.assertEqual(steer_message_id, run_now["run_id"])
@@ -5651,6 +5656,16 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
         manager = FakeManager(turns=[first_turn, second_turn])
+        native_steer_queues: list[object] = []
+        original_start_turn = manager.start_turn
+
+        async def capture_start_turn(*args: object, **kwargs: object) -> FakeTurn:
+            native_steer_queues.append(
+                (agent_server.ACTIVE.get("chat-native") or {}).get(
+                    "native_steer_queue"
+                )
+            )
+            return await original_start_turn(*args, **kwargs)
         fresh_session = {
             "id": "chat-native",
             "backend": agent_server.BACKEND_CODEX,
@@ -5674,6 +5689,10 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             agent_server,
             "rollover_codex_provider_session",
             rollover,
+        ), patch.object(
+            manager,
+            "start_turn",
+            side_effect=capture_start_turn,
         ):
             await agent_server.run_codex_app_server(
                 "chat-native",
@@ -5682,6 +5701,9 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                 dict(self.session),
                 Path(self.cwd) / ".runner-test-manifest.json",
                 allow_exec_fallback=True,
+                provider_runtime_env={
+                    "AGENTSDOCK_PROVIDER_AUTHORITY_ACTIONS": "publish",
+                },
             )
 
         self.assertEqual(len(manager.turn_calls), 2)
@@ -5689,6 +5711,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             [call[0] for call in manager.turn_calls],
             ["thread-native", "thread-fresh"],
         )
+        self.assertEqual(native_steer_queues, [None, None])
         rollover.assert_awaited_once()
         self.assertFalse(
             rollover.await_args.kwargs["memory_seed_used"],
@@ -5768,11 +5791,9 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(retry_input), 1)
         self.assertEqual(retry_input[0]["type"], "text")
         self.assertEqual(retry_input[0]["text_elements"], [])
-        self.assertTrue(
-            str(retry_input[0]["text"]).startswith(
-                "Only retry this steering text."
-                "\n\n[AgentsDock provider authority]"
-            )
+        self.assertEqual(
+            retry_input[0]["text"],
+            "Only retry this steering text.",
         )
         self.assertNotIn(
             "Never replay this original text.",

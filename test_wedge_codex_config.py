@@ -183,13 +183,18 @@ class CodexThreadParamsConfigTests(unittest.IsolatedAsyncioTestCase):
             "thread_config": thread_config,
         }))
 
+    def expected_config(self, config: dict[str, object]) -> dict[str, object]:
+        return {**config, **agent_server.codex_provider_mcp_config()}
+
     def test_thread_params_carry_bounded_defaults_without_settings(self) -> None:
         params = agent_server.codex_thread_params({"id": "chat"}, "/repo")
 
         # Sent as dotted -c style keys so only the leaf is overridden.
         self.assertEqual(
             params["config"],
-            {"agents.max_concurrent_threads_per_session": 4},
+            self.expected_config({
+                "agents.max_concurrent_threads_per_session": 4,
+            }),
         )
         # Existing keys are untouched by the additive config object.
         self.assertEqual(params["cwd"], "/repo")
@@ -220,12 +225,12 @@ class CodexThreadParamsConfigTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs(agent_server.logger, level="WARNING") as logs:
             params = agent_server.codex_thread_params(session, "/repo")
 
-        self.assertEqual(params["config"], {
+        self.assertEqual(params["config"], self.expected_config({
             "agents.max_concurrent_threads_per_session": 2,
             "agents.enabled": False,
             "model_auto_compact_token_limit": 200_000,
             "model_auto_compact_token_limit_scope": "thread",
-        })
+        }))
         offenders = " ".join(record.getMessage() for record in logs.records)
         self.assertIn("'agents.bogus'", offenders)
         self.assertIn("'sandbox_mode'", offenders)
@@ -238,12 +243,59 @@ class CodexThreadParamsConfigTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             params["config"],
-            {"agents.max_concurrent_threads_per_session": 1},
+            self.expected_config({
+                "agents.max_concurrent_threads_per_session": 1,
+            }),
+        )
+
+    def test_reserved_provider_mcp_does_not_replace_user_agentsdock_server(self) -> None:
+        with patch.object(
+            agent_server,
+            "codex_effective_thread_config",
+            return_value={
+                "mcp_servers": {
+                    "agentsdock": {
+                        "command": "/tmp/untrusted",
+                        "args": ["steal"],
+                        "url": "https://example.invalid/mcp",
+                    },
+                },
+            },
+        ):
+            params = agent_server.codex_thread_params({"id": "chat"}, "/repo")
+
+        config = params["config"]
+        prefix = f"mcp_servers.{agent_server.CODEX_PROVIDER_MCP_NAME}"
+        self.assertEqual(
+            config["mcp_servers.agentsdock.command"],
+            "/tmp/untrusted",
+        )
+        self.assertEqual(
+            config["mcp_servers.agentsdock.url"],
+            "https://example.invalid/mcp",
+        )
+        self.assertNotIn(f"{prefix}.command", config)
+        self.assertNotIn(f"{prefix}.args", config)
+        self.assertEqual(
+            config[f"{prefix}.url"],
+            (
+                f"http://127.0.0.1:{agent_server.SERVER_PORT}"
+                f"{agent_server.CODEX_PROVIDER_MCP_PATH}"
+            ),
+        )
+        self.assertEqual(
+            config[f"{prefix}.http_headers"],
+            {
+                agent_server.CODEX_PROVIDER_MCP_HEADER_NAME:
+                    agent_server.CODEX_PROVIDER_MCP_HEADER_SECRET,
+            },
         )
 
     async def test_thread_start_and_resume_send_config(self) -> None:
         self.write_settings({"agents": {"max_concurrent_threads_per_session": 3}})
-        expected = {"agents.max_concurrent_threads_per_session": 3}
+        expected = self.expected_config({
+            "agents.max_concurrent_threads_per_session": 3,
+        })
         session = {
             "id": "chat-1",
             "backend": agent_server.BACKEND_CODEX,
@@ -315,7 +367,9 @@ class CodexThreadParamsConfigTests(unittest.IsolatedAsyncioTestCase):
         params = manager.fork_thread.await_args.args[1]
         self.assertEqual(
             params["config"],
-            {"agents.max_concurrent_threads_per_session": 2},
+            self.expected_config({
+                "agents.max_concurrent_threads_per_session": 2,
+            }),
         )
         self.assertTrue(params["deferGoalContinuation"])
 
@@ -380,7 +434,7 @@ class CodexForkTurnsInstructionTests(unittest.TestCase):
         self.assertLessEqual(len(core.strip().splitlines()), 18)
 
     def test_policy_version_bumped_so_existing_threads_migrate(self) -> None:
-        self.assertEqual(agent_server.CODEX_THREAD_POLICY_VERSION, "9")
+        self.assertEqual(agent_server.CODEX_THREAD_POLICY_VERSION, "10")
 
 
 class FakeFinalizationManager:

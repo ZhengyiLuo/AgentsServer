@@ -183,18 +183,20 @@ class CompactProviderAuthorityBlockTests(unittest.TestCase):
             "handle=route_x action=request_reply secure-peer=peer_y one-use async-response",
         )
 
-    def test_verbose_block_stays_default_for_backends_without_thread_instructions(self) -> None:
+    def test_verbose_block_remains_available_only_for_inline_compatibility(self) -> None:
         verbose = agent_server.cross_chat_provider_authority_block(
             [], AUTHORITY_PATH, CHAT_ID, {"publish", "jobs"}, "full",
         )
 
         self.assertIn("$AGENTSDOCK_PUBLISH_CLI", verbose)
         self.assertIn("Jobs (full access)", verbose)
-        self.assertTrue(agent_server.provider_authority_block_is_compact(agent_server.BACKEND_CODEX))
-        self.assertTrue(agent_server.provider_authority_block_is_compact(agent_server.BACKEND_CLAUDE))
-        self.assertFalse(agent_server.provider_authority_block_is_compact(agent_server.BACKEND_CURSOR))
-        self.assertFalse(agent_server.provider_authority_block_is_compact(None))
-        self.assertFalse(agent_server.provider_authority_block_is_compact(""))
+        payload = agent_server.ProviderTurnPayload(
+            "Exact user text.",
+            "",
+            {"AGENTSDOCK_PROVIDER_AUTHORITY_ACTIONS": "publish,jobs"},
+        )
+        self.assertEqual(payload.user_prompt, "Exact user text.")
+        self.assertEqual(payload.runtime_context, "")
 
 
 class ThreadInstructionTests(unittest.TestCase):
@@ -225,30 +227,17 @@ class ThreadInstructionTests(unittest.TestCase):
                 instructions.count(agent_server.CROSS_CHAT_DELIVERY_INSTRUCTIONS.strip()),
                 1,
             )
-            self.assertIn(
-                "--authority-file \"<authority file path from the current turn's "
-                "[AgentsDock provider authority] line>\"",
-                instructions,
-            )
-            for cli in (
-                "$AGENTSDOCK_JOBS_CLI",
-                "$AGENTSDOCK_PUBLISH_CLI",
-                "$AGENTSDOCK_EMERGENCY_CLI",
-                "$AGENTSDOCK_MAIL_CLI",
-                "$AGENTSDOCK_TEAM_CLI",
-                "$AGENTSDOCK_CHATS_CLI",
-            ):
-                self.assertIn(cli, instructions)
-            self.assertIn("never read, print, quote, copy, or expose it", instructions)
-            self.assertIn("jobs=read_only", instructions)
+            self.assertIn("run-bound AgentsDock provider tool", instructions)
+            self.assertIn("never user content", instructions)
+            self.assertNotIn("--authority-file", instructions)
+            self.assertNotIn("[AgentsDock provider authority]", instructions)
             self.assertIn("[End delivery]", instructions)
             self.assertIn("first leg delivered to this chat", instructions)
             # Static text must stay generic: no concrete authority path or chat id.
-            self.assertNotIn(".json", instructions.split("AgentsDock provider authority (usage")[1])
             self.assertNotIn("--chat-id chat-1", instructions)
 
     def test_policy_version_migrates_resumed_codex_threads(self) -> None:
-        self.assertEqual(agent_server.CODEX_THREAD_POLICY_VERSION, "9")
+        self.assertEqual(agent_server.CODEX_THREAD_POLICY_VERSION, "10")
 
     def test_static_addendum_is_format_safe(self) -> None:
         # Both preludes are rendered with str.format, so the appended static
@@ -443,7 +432,7 @@ class DeliveryEnvelopeTests(unittest.TestCase):
         self.assertIn("reply: none (terminal status notice; do not respond to the exchange)", status)
         self.assertIn("[Server-generated exchange status]", status)
         self.assertIn("kind=instruction leg=1/2", instruction)
-        self.assertIn("reply: optional one-time terminal reply route", instruction)
+        self.assertIn("reply: optional one-time terminal reply via Chats respond-current", instruction)
         self.assertIn("reply: exactly one terminal response remains", terminal)
         for prompt in (status, instruction, terminal):
             self.assertNotIn("Use the exact AgentsDock respond command", prompt)

@@ -41,14 +41,22 @@ class AgentPromptFormatTests(unittest.TestCase):
             }],
         )
 
-        for prompt in (claude_prompt, codex_prompt, cursor_prompt):
+        for prompt in (claude_prompt, codex_prompt):
             compact = " ".join(prompt.split())
             self.assertIn("pending=true", compact)
-            self.assertIn("wait --exchange EXCHANGE_ID", compact)
-            self.assertIn("--lease LIVE_RESPONSE_LEASE_ID", compact)
-            self.assertIn("foreground `wait` tool call", compact)
+            self.assertIn("call Chats `wait`", compact)
+            self.assertIn("exchange/inbound-leg/lease values", compact)
+            self.assertIn("one foreground call at a time", compact)
             self.assertIn("Never finish", compact)
-            self.assertIn("shell loop", compact)
+            self.assertIn("never loop", compact)
+
+        cursor_compact = " ".join(cursor_prompt.split())
+        self.assertIn("pending=true", cursor_compact)
+        self.assertIn("wait --exchange EXCHANGE_ID", cursor_compact)
+        self.assertIn("--lease LIVE_RESPONSE_LEASE_ID", cursor_compact)
+        self.assertIn("foreground `wait` tool call", cursor_compact)
+        self.assertIn("Never finish", cursor_compact)
+        self.assertIn("shell loop", cursor_compact)
 
 
 if __name__ == "__main__":

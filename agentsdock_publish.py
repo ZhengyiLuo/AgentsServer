@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import Any
 
 
+PROVIDER_RUNTIME_VALUE_MAX_BYTES = 4096
+
+
 class PublishCLIError(RuntimeError):
     """A concise user-facing publication failure."""
 
@@ -44,23 +47,113 @@ def host_is_loopback(host: str) -> bool:
     return address.is_loopback
 
 
-def loopback_server_url() -> str:
-    server_url = os.environ.get("AGENTSDOCK_SERVER_URL", "").strip().rstrip("/")
-    if not server_url:
+def canonical_http_origin(value: str, label: str) -> tuple[str, bool]:
+    raw = value.strip()
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        port = parsed.port or 80
+    except ValueError as exc:
+        raise PublishCLIError(f"{label} must be an HTTP origin") from exc
+    if (
+        parsed.scheme.lower() != "http"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise PublishCLIError(f"{label} must be an HTTP origin")
+    host = parsed.hostname.lower()
+    try:
+        address = ipaddress.ip_address(host)
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+            address = address.ipv4_mapped
+        host = address.compressed
+        loopback = address.is_loopback
+        url_host = f"[{host}]" if isinstance(address, ipaddress.IPv6Address) else host
+    except ValueError:
+        loopback = host == "localhost"
+        url_host = host
+    return f"http://{url_host}:{port}", loopback
+
+
+def validated_server_url(authority_origin: str = "") -> str:
+    raw_server_url = os.environ.get("AGENTSDOCK_SERVER_URL", "").strip()
+    if not raw_server_url:
         raise PublishCLIError("missing agent environment: AGENTSDOCK_SERVER_URL")
-    parsed = urllib.parse.urlsplit(server_url)
-    if parsed.scheme != "http" or not parsed.hostname:
-        raise PublishCLIError("AGENTSDOCK_SERVER_URL must be a loopback HTTP URL")
-    if not host_is_loopback(parsed.hostname):
-        raise PublishCLIError("refusing to send provider authority to a non-loopback server")
-    return server_url
+    server_origin, loopback = canonical_http_origin(
+        raw_server_url,
+        "AGENTSDOCK_SERVER_URL",
+    )
+    runtime_origin = bounded_identity_value(
+        os.environ.get("AGENTSDOCK_PROVIDER_SERVER_ORIGIN"),
+        "AGENTSDOCK_PROVIDER_SERVER_ORIGIN",
+    )
+    if runtime_origin:
+        canonical_runtime, _runtime_loopback = canonical_http_origin(
+            runtime_origin,
+            "AGENTSDOCK_PROVIDER_SERVER_ORIGIN",
+        )
+        if canonical_runtime != server_origin:
+            raise PublishCLIError(
+                "AGENTSDOCK_SERVER_URL conflicts with the live provider origin"
+            )
+    if loopback:
+        return raw_server_url.rstrip("/")
+    if not authority_origin:
+        raise PublishCLIError(
+            "non-loopback AGENTSDOCK_SERVER_URL must match the authority origin"
+        )
+    canonical_authority, _authority_loopback = canonical_http_origin(
+        authority_origin,
+        "authority provider_server_origin",
+    )
+    if canonical_authority != server_origin:
+        raise PublishCLIError(
+            "non-loopback AGENTSDOCK_SERVER_URL must match the authority origin"
+        )
+    return server_origin
+
+
+def loopback_server_url() -> str:
+    """Compatibility validator for legacy explicit loopback CLI calls."""
+
+    return validated_server_url()
+
+
+def bounded_identity_value(value: str | None, label: str) -> str:
+    clean = str(value or "").strip()
+    try:
+        size = len(clean.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise PublishCLIError(f"{label} is not valid UTF-8") from exc
+    if size > PROVIDER_RUNTIME_VALUE_MAX_BYTES:
+        raise PublishCLIError(f"{label} exceeds the provider runtime limit")
+    return clean
+
+
+def selected_authority_path(authority_file: str | None) -> Path:
+    explicit = bounded_identity_value(authority_file, "--authority-file")
+    ambient = bounded_identity_value(
+        os.environ.get("AGENTSDOCK_PROVIDER_AUTHORITY_FILE"),
+        "AGENTSDOCK_PROVIDER_AUTHORITY_FILE",
+    )
+    if explicit and ambient:
+        explicit_key = os.path.abspath(os.path.expanduser(explicit))
+        ambient_key = os.path.abspath(os.path.expanduser(ambient))
+        if explicit_key != ambient_key:
+            raise PublishCLIError(
+                "--authority-file conflicts with the live provider authority"
+            )
+    selected = explicit or ambient
+    if not selected:
+        raise PublishCLIError("--authority-file is required")
+    return Path(selected).expanduser()
 
 
 def provider_authority(authority_file: str | None) -> tuple[str, str]:
-    raw_path = str(authority_file or os.environ.get("AGENTSDOCK_PROVIDER_AUTHORITY_FILE") or "").strip()
-    if not raw_path:
-        raise PublishCLIError("--authority-file is required")
-    path = Path(raw_path).expanduser()
+    path = selected_authority_path(authority_file)
     try:
         if path.stat().st_mode & 0o077:
             raise PublishCLIError("authority file permissions are unsafe")
@@ -72,6 +165,37 @@ def provider_authority(authority_file: str | None) -> tuple[str, str]:
     if not capability or not source_session_id:
         raise PublishCLIError("authority file is invalid")
     return capability, source_session_id
+
+
+def authority_server_origin(authority_file: str | None) -> str:
+    path = selected_authority_path(authority_file)
+    try:
+        if path.stat().st_mode & 0o077:
+            raise PublishCLIError("authority file permissions are unsafe")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PublishCLIError(f"could not read authority file: {exc}") from exc
+    return bounded_identity_value(
+        payload.get("provider_server_origin"),
+        "authority provider_server_origin",
+    )
+
+
+def requested_chat_scope(
+    chat_id: str | None,
+    authority_chat_id: str,
+) -> str:
+    explicit = bounded_identity_value(chat_id, "--chat-id")
+    ambient = bounded_identity_value(
+        os.environ.get("AGENTSDOCK_CHAT_ID"),
+        "AGENTSDOCK_CHAT_ID",
+    )
+    if explicit and ambient and explicit != ambient:
+        raise PublishCLIError("--chat-id conflicts with AGENTSDOCK_CHAT_ID")
+    for candidate in (explicit, ambient):
+        if candidate and candidate != authority_chat_id:
+            raise PublishCLIError("--chat-id does not match the authority file")
+    return authority_chat_id
 
 
 def load_manifest(path: str) -> list[Any]:
@@ -125,12 +249,9 @@ def publish(
     publication_id: str | None = None,
     authority_file: str | None = None,
 ) -> dict[str, Any]:
-    server_url = loopback_server_url()
     capability, authority_chat_id = provider_authority(authority_file)
-    requested_chat_id = str(chat_id or os.environ.get("AGENTSDOCK_CHAT_ID") or "").strip()
-    if requested_chat_id and requested_chat_id != authority_chat_id:
-        raise PublishCLIError("--chat-id does not match the authority file")
-    chat_id = requested_chat_id or authority_chat_id
+    server_url = validated_server_url(authority_server_origin(authority_file))
+    chat_id = requested_chat_scope(chat_id, authority_chat_id)
     publication_id = publication_id or f"pub_{uuid.uuid4().hex}"
     encoded_chat_id = urllib.parse.quote(chat_id, safe="")
     body = json.dumps({
@@ -231,6 +352,7 @@ def publish(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Attach files to the currently active AgentsDock chat turn.",
+        allow_abbrev=False,
     )
     parser.add_argument(
         "--authority-file",

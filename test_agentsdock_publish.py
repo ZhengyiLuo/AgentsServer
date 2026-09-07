@@ -127,6 +127,30 @@ class ArtifactPublisherCLITests(unittest.TestCase):
             ):
                 agentsdock_publish.loopback_server_url()
 
+    def test_non_loopback_origin_requires_matching_authority_and_runtime(self) -> None:
+        environment = {
+            "AGENTSDOCK_SERVER_URL": "http://192.0.2.10:7850/",
+            "AGENTSDOCK_PROVIDER_SERVER_ORIGIN": "http://192.0.2.10:7850",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            self.assertEqual(
+                agentsdock_publish.validated_server_url(
+                    "http://192.0.2.10:7850"
+                ),
+                "http://192.0.2.10:7850",
+            )
+        environment["AGENTSDOCK_PROVIDER_SERVER_ORIGIN"] = (
+            "http://192.0.2.11:7850"
+        )
+        with patch.dict("os.environ", environment, clear=True):
+            with self.assertRaisesRegex(
+                agentsdock_publish.PublishCLIError,
+                "conflicts with the live provider origin",
+            ):
+                agentsdock_publish.validated_server_url(
+                    "http://192.0.2.10:7850"
+                )
+
     def test_missing_authority_is_rejected(self) -> None:
         with patch.dict(
             "os.environ",
@@ -138,6 +162,42 @@ class ArtifactPublisherCLITests(unittest.TestCase):
             with self.assertRaisesRegex(
                 agentsdock_publish.PublishCLIError,
                 "authority-file is required",
+            ):
+                agentsdock_publish.provider_authority(None)
+
+    def test_explicit_authority_cannot_override_live_provider_environment(self) -> None:
+        environment_authority = self.authority_file("sess/demo")
+        explicit_authority = self.authority_file("sess/demo")
+        with patch.dict("os.environ", {
+            "AGENTSDOCK_PROVIDER_AUTHORITY_FILE": environment_authority,
+            "AGENTSDOCK_CHAT_ID": "sess/demo",
+        }, clear=True):
+            with self.assertRaisesRegex(
+                agentsdock_publish.PublishCLIError,
+                "conflicts with the live provider authority",
+            ):
+                agentsdock_publish.provider_authority(explicit_authority)
+
+    def test_explicit_chat_cannot_mask_conflicting_provider_environment(self) -> None:
+        environment = self.environment("sess/demo")
+        environment["AGENTSDOCK_CHAT_ID"] = "sess/other"
+        with patch.dict("os.environ", environment, clear=True):
+            with self.assertRaisesRegex(
+                agentsdock_publish.PublishCLIError,
+                "conflicts with AGENTSDOCK_CHAT_ID",
+            ):
+                agentsdock_publish.publish(
+                    "sess/demo",
+                    ["/tmp/demo.mov"],
+                )
+
+    def test_oversized_provider_identity_environment_fails_closed(self) -> None:
+        with patch.dict("os.environ", {
+            "AGENTSDOCK_PROVIDER_AUTHORITY_FILE": "x" * 4097,
+        }, clear=True):
+            with self.assertRaisesRegex(
+                agentsdock_publish.PublishCLIError,
+                "exceeds the provider runtime limit",
             ):
                 agentsdock_publish.provider_authority(None)
 

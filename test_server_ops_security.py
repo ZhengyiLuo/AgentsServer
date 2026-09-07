@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import sys
 import tempfile
 import threading
 import unittest
@@ -14,6 +15,11 @@ from pydantic import ValidationError
 
 import agent_server
 import agentsdock_chats
+import agentsdock_emergency
+import agentsdock_jobs
+import agentsdock_mail
+import agentsdock_publish
+import agentsdock_team
 
 
 def http_request(
@@ -43,6 +49,1039 @@ def http_request(
 
 
 class ServerOpsSecurityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_user_authored_authority_lookalike_is_never_stripped(self):
+        lookalike = (
+            "Keep this literal text.\n\n"
+            "[AgentsDock provider authority]\n"
+            "authority-file=/Users/zen/.agentsdock/cross_chat_authority/"
+            "run_0123456789abcdef-0123456789abcdef0123456789abcdef.json "
+            "chat-id=sess_0123456789abcdef "
+            "(bound to this server, chat, and live run)\n"
+            "actions=none\n"
+            "usage: see AgentsDock instructions\n"
+            "[End AgentsDock provider authority]\n"
+        )
+        self.assertEqual(
+            agent_server.strip_agentsdock_generated_user_text(lookalike),
+            lookalike,
+        )
+
+    async def test_helper_parsers_disable_protected_option_abbreviations(self):
+        cases = (
+            (agentsdock_chats.parser(), ["--auth", "evil", "list"]),
+            (agentsdock_jobs.build_parser(), ["--auth", "evil", "list"]),
+            (agentsdock_publish.build_parser(), ["--auth", "evil"]),
+            (
+                agentsdock_emergency.build_parser(),
+                ["--auth", "evil", "alert", "--message", "x"],
+            ),
+            (agentsdock_mail.parser(), ["--auth", "evil", "list"]),
+            (agentsdock_team.parser(), ["--auth", "evil", "inbox"]),
+        )
+        for parser, arguments in cases:
+            with self.subTest(prog=parser.prog), patch.object(
+                parser,
+                "error",
+                side_effect=ValueError("abbreviation rejected"),
+            ):
+                with self.assertRaises(ValueError):
+                    parser.parse_args(arguments)
+
+    async def test_helper_subcommands_disable_all_option_abbreviations(self):
+        cases = (
+            (
+                agentsdock_chats.parser(),
+                ["--authority-file", "a", "send", "--t", "opaque", "--message", "x"],
+            ),
+            (
+                agentsdock_jobs.build_parser(),
+                ["create", "--title", "x", "--prompt", "x", "--int", "20"],
+            ),
+            (
+                agentsdock_emergency.build_parser(),
+                ["alert", "--m", "urgent"],
+            ),
+            (
+                agentsdock_mail.parser(),
+                ["send", "--r", "opaque"],
+            ),
+            (
+                agentsdock_team.parser(),
+                ["inbox", "--l", "1"],
+            ),
+            (
+                agentsdock_team.parser(),
+                ["skill", "get", "slug", "--v", "1"],
+            ),
+        )
+        for parser, arguments in cases:
+            with self.subTest(prog=parser.prog, arguments=arguments), patch(
+                "sys.stderr", MagicMock()
+            ):
+                with self.assertRaises(SystemExit):
+                    parser.parse_args(arguments)
+
+    async def test_provider_selects_async_chat_mode_from_grant_only(self):
+        runtime_env = {
+            "AGENTSDOCK_CROSS_CHAT_HANDLE_1": "opaque-handle",
+            "AGENTSDOCK_CROSS_CHAT_HANDLE_1_ACTION": "request_reply",
+            "AGENTSDOCK_CROSS_CHAT_HANDLE_1_ASYNC": "0",
+        }
+        for flag in ("--async-response", "--async"):
+            with self.subTest(flag=flag):
+                with self.assertRaises(agent_server.ProviderToolError):
+                    agent_server.resolve_provider_tool_arguments(
+                        "chats",
+                        ["ask", "--target-index", "1", flag],
+                        runtime_env,
+                    )
+        runtime_env["AGENTSDOCK_CROSS_CHAT_HANDLE_1_ASYNC"] = "1"
+        self.assertEqual(
+            agent_server.resolve_provider_tool_arguments(
+                "chats",
+                ["ask", "--target-index", "1"],
+                runtime_env,
+            ),
+            ["ask", "--target", "opaque-handle", "--async-response"],
+        )
+
+    async def test_provider_tool_cached_result_never_outlives_live_authority(self):
+        value = {"helper": "jobs", "arguments": ["list"]}
+        for backend, owner_kwargs in (
+            (
+                agent_server.BACKEND_CODEX,
+                {
+                    "provider_thread_id": "thread-live",
+                    "provider_turn_id": "turn-live",
+                },
+            ),
+            (
+                agent_server.BACKEND_CLAUDE,
+                {"claude_owner_token": "owner-live"},
+            ),
+        ):
+            with self.subTest(backend=backend):
+                capability = AsyncMock(
+                    return_value=(Path("/private/authority"), {})
+                )
+                executor = AsyncMock(return_value=("ok", False))
+                with patch.object(
+                    agent_server,
+                    "PROVIDER_TOOL_REPLAY",
+                    agent_server.OrderedDict(),
+                ), patch.object(
+                    agent_server,
+                    "PROVIDER_TOOL_REPLAY_LOCK",
+                    asyncio.Lock(),
+                ), patch.object(
+                    agent_server,
+                    "provider_tool_capability_snapshot",
+                    capability,
+                ), patch.object(
+                    agent_server,
+                    "execute_provider_tool",
+                    executor,
+                ):
+                    first = await agent_server.execute_provider_tool_once(
+                        "chat-live",
+                        "run_live",
+                        value,
+                        replay_key="same-call",
+                        backend=backend,
+                        **owner_kwargs,
+                    )
+                    self.assertEqual(first, ("ok", False))
+                    self.assertEqual(
+                        await agent_server.execute_provider_tool_once(
+                            "chat-live",
+                            "run_live",
+                            value,
+                            replay_key="same-call",
+                            backend=backend,
+                            **owner_kwargs,
+                        ),
+                        ("ok", False),
+                    )
+                    executor.assert_awaited_once()
+
+                    capability.side_effect = agent_server.ProviderToolError(
+                        "provider authority is not active"
+                    )
+                    with self.assertRaises(agent_server.ProviderToolError):
+                        await agent_server.execute_provider_tool_once(
+                            "chat-live",
+                            "run_live",
+                            value,
+                            replay_key="same-call",
+                            backend=backend,
+                            **owner_kwargs,
+                        )
+                    executor.assert_awaited_once()
+
+    async def test_provider_tool_replay_payload_cache_has_hard_bound(self):
+        value = {"helper": "jobs", "arguments": ["list"]}
+        capability = AsyncMock(return_value=(Path("/private/authority"), {}))
+        executor = AsyncMock(return_value=("x" * 100_000, False))
+        replay = agent_server.OrderedDict()
+        tombstones = agent_server.OrderedDict()
+        with patch.object(
+            agent_server,
+            "PROVIDER_TOOL_REPLAY",
+            replay,
+        ), patch.object(
+            agent_server,
+            "PROVIDER_TOOL_REPLAY_TOMBSTONES",
+            tombstones,
+        ), patch.object(
+            agent_server,
+            "PROVIDER_TOOL_REPLAY_LIMIT",
+            1,
+        ), patch.object(
+            agent_server,
+            "PROVIDER_TOOL_REPLAY_LOCK",
+            asyncio.Lock(),
+        ), patch.object(
+            agent_server,
+            "provider_tool_capability_snapshot",
+            capability,
+        ), patch.object(
+            agent_server,
+            "execute_provider_tool",
+            executor,
+        ):
+            for replay_key in ("call-1", "call-2"):
+                await agent_server.execute_provider_tool_once(
+                    "chat-live",
+                    "run_live",
+                    value,
+                    replay_key=replay_key,
+                    backend=agent_server.BACKEND_CODEX,
+                    provider_thread_id="thread-live",
+                    provider_turn_id="turn-live",
+                )
+            self.assertEqual(len(replay), 1)
+            self.assertEqual(len(tombstones), 1)
+            self.assertIn(("chat-live", "run_live", "call-1"), tombstones)
+            with self.assertRaises(agent_server.ProviderToolError):
+                await agent_server.execute_provider_tool_once(
+                    "chat-live",
+                    "run_live",
+                    value,
+                    replay_key="call-1",
+                    backend=agent_server.BACKEND_CODEX,
+                    provider_thread_id="thread-live",
+                    provider_turn_id="turn-live",
+                )
+            self.assertEqual(executor.await_count, 2)
+
+    async def test_provider_generated_context_and_tool_inputs_are_bounded(self):
+        exact_user_text = "User-authored text must remain byte-for-byte exact."
+        payload = agent_server.ProviderTurnPayload(
+            exact_user_text,
+            "runtime",
+            {},
+        )
+        self.assertEqual(payload.user_prompt, exact_user_text)
+        self.assertLessEqual(
+            len(agent_server.PROVIDER_THREAD_INSTRUCTION_ADDENDUM),
+            agent_server.MAX_PROVIDER_STATIC_INSTRUCTIONS_CHARS,
+        )
+        with self.assertRaises(agent_server.ProviderRuntimeContextError):
+            agent_server.validate_provider_runtime_context(
+                "\U0001f4e6" * (agent_server.MAX_PROVIDER_RUNTIME_CONTEXT_BYTES // 4 + 1)
+            )
+        with self.assertRaises(agent_server.ProviderToolError):
+            agent_server.validate_provider_tool_input({
+                "helper": "team",
+                "arguments": [
+                    "read",
+                    "x" * (agent_server.PROVIDER_TOOL_MAX_ARGUMENT_CHARS + 1),
+                ],
+            })
+        with self.assertRaises(agent_server.ProviderToolError):
+            agent_server.validate_provider_tool_input({
+                "helper": "team",
+                "arguments": ["send", "--route", "route"],
+                "stdin": "\U0001f4e6" * (
+                    agent_server.PROVIDER_TOOL_MAX_STDIN_BYTES // 4 + 1
+                ),
+            })
+        for malformed in ("\ud800", "prefix\udfff"):
+            with self.subTest(malformed=repr(malformed)):
+                with self.assertRaises(agent_server.ProviderToolError):
+                    agent_server.validate_provider_tool_input({
+                        "helper": "team",
+                        "arguments": ["read", malformed],
+                    })
+                with self.assertRaises(agent_server.ProviderToolError):
+                    agent_server.validate_provider_tool_input({
+                        "helper": "team",
+                        "arguments": ["send", "--route", "route"],
+                        "stdin": malformed,
+                    })
+        with self.assertRaises(agent_server.ProviderRuntimeContextError):
+            agent_server.validate_provider_runtime_context("\ud800")
+
+    async def test_provider_tool_rejects_huge_target_index_as_safe_error(self):
+        with self.assertRaises(agent_server.ProviderToolError):
+            agent_server.resolve_provider_tool_arguments(
+                "chats",
+                ["ask", "--target-index", "9" * 5_000],
+                {},
+            )
+
+    async def test_provider_tool_preserves_supported_message_and_job_boundaries(self):
+        route_body = "r" * agent_server.PROVIDER_CROSS_CHAT_ROUTE_BODY_MAX_CHARS
+        helper, arguments, stdin = agent_server.validate_provider_tool_input({
+            "helper": "chats",
+            "arguments": [
+                "send",
+                "--route",
+                "route_" + "a" * 32,
+                "--message",
+                route_body,
+            ],
+        })
+        self.assertEqual(helper, "chats")
+        self.assertEqual(arguments[-1], route_body)
+        self.assertEqual(stdin, "")
+
+        job_prompt = "j" * agent_server.MAX_JOB_PROMPT_CHARS
+        helper, arguments, _stdin = agent_server.validate_provider_tool_input({
+            "helper": "jobs",
+            "arguments": [
+                "create",
+                "--title",
+                "Boundary job",
+                "--prompt",
+                job_prompt,
+                "--interval-seconds",
+                "3600",
+            ],
+        })
+        self.assertEqual(helper, "jobs")
+        self.assertEqual(arguments[4], job_prompt)
+
+        direct_body = "d" * agent_server.CROSS_CHAT_HANDOFF_BODY_MAX_CHARS
+        _helper, arguments, _stdin = agent_server.validate_provider_tool_input({
+            "helper": "chats",
+            "arguments": [
+                "send",
+                "--target-index",
+                "1",
+                "--message",
+                direct_body,
+            ],
+        })
+        self.assertEqual(arguments[-1], direct_body)
+
+    async def test_provider_tool_rejects_abbreviated_identity_overrides(self):
+        for argument in (
+            "--a",
+            "--auth",
+            "--cha",
+            "--sess",
+            "--source",
+            "--run",
+            "--provider-t",
+            "--tok",
+            "--cap",
+            "--tar",
+            "--server-u",
+            "--en",
+        ):
+            with self.subTest(argument=argument):
+                with self.assertRaises(agent_server.ProviderToolError):
+                    agent_server.validate_provider_tool_input({
+                        "helper": "jobs",
+                        "arguments": [argument, "attacker", "list"],
+                    })
+
+    async def test_codex_provider_mcp_rejects_nonexclusive_transport_auth_before_body(self):
+        secret = "process-scoped-mcp-secret"
+        secret_name = agent_server.CODEX_PROVIDER_MCP_HEADER_NAME.lower().encode(
+            "ascii"
+        )
+
+        async def body_must_not_be_read():
+            self.fail("Codex provider MCP body was read before authentication")
+
+        header_cases = {
+            "missing": [],
+            "wrong": [(secret_name, b"wrong-secret")],
+            "duplicate": [
+                (secret_name, secret.encode("ascii")),
+                (secret_name, secret.encode("ascii")),
+            ],
+            "authorization": [
+                (secret_name, secret.encode("ascii")),
+                (b"authorization", b"Bearer ambient-authority"),
+            ],
+            "origin": [
+                (secret_name, secret.encode("ascii")),
+                (b"origin", b"https://attacker.example"),
+            ],
+            "cookie": [
+                (secret_name, secret.encode("ascii")),
+                (b"cookie", b"ambient=value"),
+            ],
+            "sec-fetch": [
+                (secret_name, secret.encode("ascii")),
+                (b"sec-fetch-site", b"cross-site"),
+            ],
+        }
+        for label, transport_headers in header_cases.items():
+            with self.subTest(case=label):
+                request = http_request(
+                    "POST",
+                    agent_server.CODEX_PROVIDER_MCP_PATH,
+                    headers=[
+                        (b"content-type", b"application/json"),
+                        (b"content-length", b"1"),
+                        *transport_headers,
+                    ],
+                    receive=body_must_not_be_read,
+                )
+                downstream = AsyncMock()
+                with patch.object(
+                    agent_server,
+                    "CODEX_PROVIDER_MCP_HEADER_SECRET",
+                    secret,
+                ):
+                    response = await agent_server.require_agent_token(
+                        request,
+                        downstream,
+                    )
+
+                self.assertEqual(response.status_code, 403)
+                downstream.assert_not_awaited()
+
+    async def test_codex_provider_mcp_returns_safe_error_for_non_utf8_scalar(self):
+        session_id = "chat-live"
+        thread_id = "thread-live"
+        turn_id = "turn-live"
+        run_id = "run_live"
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "run",
+                "arguments": {
+                    "helper": "team",
+                    "arguments": ["read", "\ud800"],
+                },
+                "_meta": {
+                    "callId": "call-malformed-unicode",
+                    "x-codex-turn-metadata": {
+                        "thread_id": thread_id,
+                        "turn_id": turn_id,
+                        "agentsdock_run_id": run_id,
+                        "agentsdock_run_proof": (
+                            agent_server.codex_provider_mcp_run_proof(
+                                session_id,
+                                thread_id,
+                                run_id,
+                            )
+                        ),
+                    },
+                },
+            },
+        }
+        body = json.dumps(payload).encode("utf-8")
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        request = http_request(
+            "POST",
+            agent_server.CODEX_PROVIDER_MCP_PATH,
+            headers=[
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode("ascii")),
+            ],
+            receive=receive,
+        )
+        request.state.codex_provider_mcp_authenticated = True
+        with patch.object(
+            agent_server.STORE,
+            "sessions",
+            {
+                session_id: {
+                    "id": session_id,
+                    "backend": agent_server.BACKEND_CODEX,
+                    "codex_thread_id": thread_id,
+                }
+            },
+        ), patch.object(
+            agent_server,
+            "ACTIVE",
+            {
+                session_id: {
+                    "run_id": run_id,
+                    "backend": agent_server.BACKEND_CODEX,
+                    "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
+                    "provider_thread_id": thread_id,
+                }
+            },
+        ), patch.object(
+            agent_server,
+            "BUSY_SESSIONS",
+            {session_id},
+        ), patch.object(
+            agent_server,
+            "ACTIVE_LOCK",
+            asyncio.Lock(),
+        ):
+            response = await agent_server.codex_provider_mcp(request)
+
+        decoded = json.loads(response.body)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(decoded["result"]["isError"])
+        self.assertIn("valid UTF-8", decoded["result"]["content"][0]["text"])
+
+    async def test_codex_provider_mcp_exact_turn_metadata_invokes_executor(self):
+        secret = "process-scoped-mcp-secret"
+        session_id = "chat-live"
+        thread_id = "thread-live"
+        turn_id = "turn-live"
+        run_id = "run_live"
+        arguments = {"helper": "jobs", "arguments": ["list"]}
+        proof = agent_server.codex_provider_mcp_run_proof(
+            session_id,
+            thread_id,
+            run_id,
+        )
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "run",
+                "arguments": arguments,
+                "_meta": {
+                    "callId": "call-live",
+                    "x-codex-turn-metadata": {
+                        "thread_id": thread_id,
+                        "turn_id": turn_id,
+                        # Top-level chats created through thread/fork retain
+                        # ancestry metadata; that alone is not a subagent.
+                        "forked_from_thread_id": "thread-parent",
+                        "agentsdock_run_id": run_id,
+                        "agentsdock_run_proof": proof,
+                    },
+                },
+            },
+        }
+        executor = AsyncMock(return_value=("provider result", False))
+        transport = httpx.ASGITransport(app=agent_server.app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://127.0.0.1:7850",
+        ) as client:
+            with patch.object(
+                agent_server,
+                "CODEX_PROVIDER_MCP_HEADER_SECRET",
+                secret,
+            ), patch.object(
+                agent_server.STORE,
+                "sessions",
+                {
+                    session_id: {
+                        "id": session_id,
+                        "backend": agent_server.BACKEND_CODEX,
+                        "codex_thread_id": thread_id,
+                    }
+                },
+            ), patch.object(
+                agent_server,
+                "ACTIVE",
+                {
+                    session_id: {
+                        "run_id": run_id,
+                        "backend": agent_server.BACKEND_CODEX,
+                        "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
+                        "provider_thread_id": thread_id,
+                        "provider_turn_id": turn_id,
+                        "provider_turn_ready": True,
+                        "stop_requested": False,
+                    }
+                },
+            ), patch.object(
+                agent_server,
+                "CURRENT_TURNS",
+                {session_id: {"run_id": run_id}},
+            ), patch.object(
+                agent_server,
+                "BUSY_SESSIONS",
+                {session_id},
+            ), patch.object(
+                agent_server,
+                "DELETING_SESSIONS",
+                set(),
+            ), patch.object(
+                agent_server,
+                "DELETED_SESSION_TOMBSTONES",
+                set(),
+            ), patch.object(
+                agent_server,
+                "ACTIVE_LOCK",
+                asyncio.Lock(),
+            ), patch.object(
+                agent_server,
+                "UNSAFE_HTTP_MUTATION_ADMISSION_LOCK",
+                asyncio.Lock(),
+            ), patch.object(
+                agent_server,
+                "UNSAFE_HTTP_MUTATION_TASKS",
+                {},
+            ), patch.object(
+                agent_server,
+                "managed_server_restart_blocks_work",
+                return_value=False,
+            ), patch.object(
+                agent_server,
+                "managed_server_update_blocks_work",
+                return_value=False,
+            ), patch.object(
+                agent_server,
+                "managed_server_force_update_is_pending",
+                return_value=False,
+            ), patch.object(
+                agent_server,
+                "execute_provider_tool_once",
+                executor,
+            ):
+                normal_response = await client.post(
+                    agent_server.CODEX_PROVIDER_MCP_PATH,
+                    json=payload,
+                    headers={
+                        agent_server.CODEX_PROVIDER_MCP_HEADER_NAME: secret,
+                    },
+                )
+
+                # A standalone scheduled job owns a live ephemeral thread,
+                # intentionally absent from persistent session identity.
+                agent_server.STORE.sessions[session_id][
+                    "codex_thread_id"
+                ] = "parked-chat-thread"
+                agent_server.ACTIVE[session_id][
+                    "standalone_provider_context"
+                ] = True
+                standalone_payload = json.loads(json.dumps(payload))
+                standalone_payload["id"] = 9
+                standalone_payload["params"]["_meta"]["callId"] = (
+                    "call-standalone"
+                )
+                standalone_response = await client.post(
+                    agent_server.CODEX_PROVIDER_MCP_PATH,
+                    json=standalone_payload,
+                    headers={
+                        agent_server.CODEX_PROVIDER_MCP_HEADER_NAME: secret,
+                    },
+                )
+
+        self.assertEqual(normal_response.status_code, 200)
+        self.assertEqual(normal_response.json(), {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "result": {
+                "content": [{"type": "text", "text": "provider result"}],
+                "isError": False,
+            },
+        })
+        self.assertEqual(standalone_response.status_code, 200)
+        self.assertEqual(standalone_response.json()["result"]["isError"], False)
+        self.assertEqual(executor.await_count, 2)
+        self.assertEqual(
+            executor.await_args_list[0].kwargs["replay_key"],
+            "codex:call-live",
+        )
+        executor.assert_awaited_with(
+            session_id,
+            run_id,
+            arguments,
+            replay_key="codex:call-standalone",
+            backend=agent_server.BACKEND_CODEX,
+            provider_thread_id=thread_id,
+            provider_turn_id=turn_id,
+        )
+
+    async def test_main_cli_port_updates_required_provider_endpoint(self):
+        original_bind = agent_server.SERVER_BIND_ADDRESS
+        original_port = agent_server.SERVER_PORT
+        run_server = MagicMock()
+        try:
+            with patch.object(
+                sys,
+                "argv",
+                ["agent_server.py", "--bind", "127.0.0.1", "--port", "17850"],
+            ), patch.object(
+                agent_server,
+                "configure_server_logging",
+            ), patch.object(
+                agent_server.uvicorn,
+                "run",
+                run_server,
+            ):
+                self.assertEqual(agent_server.main(), 0)
+
+            self.assertEqual(agent_server.SERVER_BIND_ADDRESS, "127.0.0.1")
+            self.assertEqual(agent_server.SERVER_PORT, 17850)
+            config = agent_server.codex_provider_mcp_config()
+            self.assertEqual(
+                config[
+                    f"mcp_servers.{agent_server.CODEX_PROVIDER_MCP_NAME}.url"
+                ],
+                "http://127.0.0.1:17850/api/agent/provider-tools/mcp",
+            )
+            run_server.assert_called_once()
+        finally:
+            agent_server.SERVER_BIND_ADDRESS = original_bind
+            agent_server.SERVER_PORT = original_port
+
+    async def test_codex_provider_mcp_config_supports_every_bind_family(self):
+        prefix = f"mcp_servers.{agent_server.CODEX_PROVIDER_MCP_NAME}.url"
+        cases = {
+            "0.0.0.0": "http://127.0.0.1:17850/api/agent/provider-tools/mcp",
+            "127.0.0.1": "http://127.0.0.1:17850/api/agent/provider-tools/mcp",
+            "localhost": "http://127.0.0.1:17850/api/agent/provider-tools/mcp",
+            "::": "http://[::1]:17850/api/agent/provider-tools/mcp",
+            "::1": "http://[::1]:17850/api/agent/provider-tools/mcp",
+            "192.0.2.40": "http://192.0.2.40:17850/api/agent/provider-tools/mcp",
+            "2001:db8::40": "http://[2001:db8::40]:17850/api/agent/provider-tools/mcp",
+        }
+        for bind_address, expected in cases.items():
+            with self.subTest(bind=bind_address), patch.object(
+                agent_server,
+                "SERVER_BIND_ADDRESS",
+                bind_address,
+            ), patch.object(agent_server, "SERVER_PORT", 17850):
+                self.assertEqual(
+                    agent_server.codex_provider_mcp_config()[prefix],
+                    expected,
+                )
+
+    async def test_provider_runner_env_uses_exact_origin_and_bypasses_proxies(self):
+        with patch.object(
+            agent_server,
+            "SERVER_BIND_ADDRESS",
+            "2001:db8::40",
+        ), patch.object(
+            agent_server,
+            "SERVER_PORT",
+            17850,
+        ), patch.dict(
+            agent_server.os.environ,
+            {
+                "HTTP_PROXY": "http://proxy.example:8080",
+                "HTTPS_PROXY": "http://proxy.example:8080",
+                "NO_PROXY": "example.test",
+                "no_proxy": "other.test",
+            },
+            clear=False,
+        ):
+            runner = agent_server.agent_runner_env("chat-specific-bind")
+            codex = agent_server.codex_app_server_env()
+
+        expected = "http://[2001:db8::40]:17850"
+        for environment in (runner, codex):
+            self.assertEqual(environment["AGENTSDOCK_SERVER_URL"], expected)
+            self.assertIn("2001:db8::40", environment["NO_PROXY"].split(","))
+            self.assertIn("[2001:db8::40]", environment["NO_PROXY"].split(","))
+            self.assertIn("2001:db8::40", environment["no_proxy"].split(","))
+            self.assertIn("[2001:db8::40]", environment["no_proxy"].split(","))
+        self.assertIn("example.test", runner["NO_PROXY"].split(","))
+        self.assertIn("other.test", runner["no_proxy"].split(","))
+
+    async def test_agent_helper_middleware_accepts_exact_specific_bind_peer(self):
+        token = "specific-bind-provider-capability"
+        token_hash = agent_server.hashlib.sha256(token.encode()).hexdigest()
+        request = http_request(
+            "GET",
+            "/api/agent/cross-chat/routes",
+            headers=[
+                (b"x-agentsdock-provider-capability", token.encode()),
+            ],
+        )
+        request.scope["client"] = ("192.0.2.40", 50000)
+        downstream = AsyncMock(
+            return_value=agent_server.JSONResponse({"routes": []})
+        )
+        with patch.object(
+            agent_server,
+            "SERVER_BIND_ADDRESS",
+            "192.0.2.40",
+        ), patch.object(
+            agent_server,
+            "CROSS_CHAT_CAPABILITIES",
+            {token_hash: {"source_run_id": "run-specific-bind"}},
+        ):
+            response = await agent_server.require_agent_token(
+                request,
+                downstream,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        downstream.assert_awaited_once_with(request)
+
+    async def test_codex_provider_mcp_accepts_only_exact_local_specific_bind_peer(self):
+        secret = "process-scoped-mcp-secret"
+
+        async def invoke(client_host: str, *, proxy_header: bool = False):
+            frames = [{
+                "type": "http.request",
+                "body": b"{}",
+                "more_body": False,
+            }]
+
+            async def receive():
+                return frames.pop(0)
+
+            headers = [
+                (b"content-type", b"application/json"),
+                (b"content-length", b"2"),
+                (
+                    agent_server.CODEX_PROVIDER_MCP_HEADER_NAME.lower().encode("ascii"),
+                    secret.encode("ascii"),
+                ),
+            ]
+            if proxy_header:
+                headers.append((b"x-forwarded-for", b"127.0.0.1"))
+            request = http_request(
+                "POST",
+                agent_server.CODEX_PROVIDER_MCP_PATH,
+                headers=headers,
+                receive=receive,
+            )
+            request.scope["client"] = (client_host, 50000)
+            downstream = AsyncMock(
+                return_value=agent_server.JSONResponse({"ok": True})
+            )
+            with patch.object(
+                agent_server,
+                "SERVER_BIND_ADDRESS",
+                "192.0.2.40",
+            ), patch.object(
+                agent_server,
+                "CODEX_PROVIDER_MCP_HEADER_SECRET",
+                secret,
+            ):
+                response = await agent_server.require_agent_token(
+                    request,
+                    downstream,
+                )
+            return response, downstream
+
+        accepted, accepted_downstream = await invoke("192.0.2.40")
+        self.assertEqual(accepted.status_code, 200)
+        accepted_downstream.assert_awaited_once()
+
+        remote, remote_downstream = await invoke("192.0.2.41")
+        self.assertEqual(remote.status_code, 403)
+        remote_downstream.assert_not_awaited()
+
+        proxied, proxied_downstream = await invoke(
+            "192.0.2.40",
+            proxy_header=True,
+        )
+        self.assertEqual(proxied.status_code, 403)
+        proxied_downstream.assert_not_awaited()
+
+    async def test_codex_provider_mcp_rejects_untrusted_turn_metadata(self):
+        session_id = "chat-live"
+        thread_id = "thread-live"
+        turn_id = "turn-live"
+        run_id = "run_live"
+        arguments = {"helper": "jobs", "arguments": ["list"]}
+        proof = agent_server.codex_provider_mcp_run_proof(
+            session_id,
+            thread_id,
+            run_id,
+        )
+        base_payload = {
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {
+                "name": "run",
+                "arguments": arguments,
+                "_meta": {
+                    "callId": "call-untrusted",
+                    "x-codex-turn-metadata": {
+                        "thread_id": thread_id,
+                        "turn_id": turn_id,
+                        "agentsdock_run_id": run_id,
+                        "agentsdock_run_proof": proof,
+                    },
+                },
+            },
+        }
+        sessions = {
+            session_id: {
+                "id": session_id,
+                "backend": agent_server.BACKEND_CODEX,
+                "codex_thread_id": thread_id,
+            }
+        }
+        active = {
+            session_id: {
+                "run_id": run_id,
+                "backend": agent_server.BACKEND_CODEX,
+                "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
+                "provider_thread_id": thread_id,
+            }
+        }
+        busy = {session_id}
+        executor = AsyncMock()
+
+        async def invoke(payload: dict) -> agent_server.Response:
+            body = json.dumps(payload).encode("utf-8")
+
+            async def receive():
+                return {
+                    "type": "http.request",
+                    "body": body,
+                    "more_body": False,
+                }
+
+            request = http_request(
+                "POST",
+                agent_server.CODEX_PROVIDER_MCP_PATH,
+                headers=[
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                ],
+                receive=receive,
+            )
+            request.state.codex_provider_mcp_authenticated = True
+            return await agent_server.codex_provider_mcp(request)
+
+        def reset_state() -> dict:
+            sessions.clear()
+            sessions[session_id] = {
+                "id": session_id,
+                "backend": agent_server.BACKEND_CODEX,
+                "codex_thread_id": thread_id,
+            }
+            active.clear()
+            active[session_id] = {
+                "run_id": run_id,
+                "backend": agent_server.BACKEND_CODEX,
+                "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
+                "provider_thread_id": thread_id,
+            }
+            busy.clear()
+            busy.add(session_id)
+            return json.loads(json.dumps(base_payload))
+
+        with patch.object(
+            agent_server.STORE,
+            "sessions",
+            sessions,
+        ), patch.object(
+            agent_server,
+            "ACTIVE",
+            active,
+        ), patch.object(
+            agent_server,
+            "BUSY_SESSIONS",
+            busy,
+        ), patch.object(
+            agent_server,
+            "DELETING_SESSIONS",
+            set(),
+        ), patch.object(
+            agent_server,
+            "DELETED_SESSION_TOMBSTONES",
+            set(),
+        ), patch.object(
+            agent_server,
+            "ACTIVE_LOCK",
+            asyncio.Lock(),
+        ), patch.object(
+            agent_server,
+            "execute_provider_tool_once",
+            executor,
+        ):
+            cases = []
+
+            payload = reset_state()
+            active.clear()
+            cases.append(("no active owner", payload, "Stale turn metadata"))
+
+            payload = reset_state()
+            active["chat-other"] = dict(active[session_id])
+            busy.add("chat-other")
+            cases.append(("two active owners", payload, "Stale turn metadata"))
+
+            payload = reset_state()
+            sessions["chat-other"] = {
+                "id": "chat-other",
+                "backend": agent_server.BACKEND_CODEX,
+                "codex_thread_id": thread_id,
+            }
+            cases.append(("two stored owners", payload, "Ambiguous thread owner"))
+
+            payload = reset_state()
+            sessions["chat-other"] = {
+                "id": "chat-other",
+                "backend": agent_server.BACKEND_CLAUDE,
+                # A backend switch parks the Codex identity; it remains an
+                # owner and must keep this thread ambiguous.
+                "codex_thread_id": thread_id,
+                "claude_session_id": "claude-other",
+            }
+            cases.append(("parked stored owner", payload, "Ambiguous thread owner"))
+
+            payload = reset_state()
+            payload["params"]["_meta"]["x-codex-turn-metadata"][
+                "agentsdock_run_proof"
+            ] = "0" * 64
+            cases.append(("wrong proof", payload, "Invalid turn proof"))
+
+            payload = reset_state()
+            payload["params"]["_meta"]["x-codex-turn-metadata"][
+                "parent_thread_id"
+            ] = "parent-thread"
+            cases.append((
+                "subagent marker",
+                payload,
+                "Subagent tool calls are forbidden",
+            ))
+
+            for label, payload, expected_message in cases:
+                with self.subTest(case=label):
+                    # Restore the state paired with each payload before invoking
+                    # it; the cases above deliberately mutate shared live maps.
+                    reset_state()
+                    if label == "no active owner":
+                        active.clear()
+                    elif label == "two active owners":
+                        active["chat-other"] = dict(active[session_id])
+                        busy.add("chat-other")
+                    elif label == "two stored owners":
+                        sessions["chat-other"] = {
+                            "id": "chat-other",
+                            "backend": agent_server.BACKEND_CODEX,
+                            "codex_thread_id": thread_id,
+                        }
+                    elif label == "parked stored owner":
+                        sessions["chat-other"] = {
+                            "id": "chat-other",
+                            "backend": agent_server.BACKEND_CLAUDE,
+                            "codex_thread_id": thread_id,
+                            "claude_session_id": "claude-other",
+                        }
+                    response = await invoke(payload)
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(
+                        json.loads(response.body)["error"],
+                        {"code": -32602, "message": expected_message},
+                    )
+
+        executor.assert_not_awaited()
+
     async def test_agent_helper_rejects_missing_unknown_and_ambiguous_capability_before_body(self):
         async def body_must_not_be_read():
             self.fail("agent-helper body was read before capability authentication")

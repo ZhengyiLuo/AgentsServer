@@ -257,6 +257,11 @@ class ExplicitStopDeadlineTests(unittest.IsolatedAsyncioTestCase):
                  "managed_server_update_blocker",
                  return_value=None,
              ), \
+             patch.object(
+                 agent_server,
+                 "managed_server_update_scheduled_job_blocker",
+                 return_value=None,
+             ), \
              self.assertLogs(agent_server.logger, level="ERROR") as logs:
             result = await asyncio.wait_for(
                 agent_server.stop_turn_endpoint("chat"),

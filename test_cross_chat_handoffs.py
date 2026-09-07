@@ -2671,7 +2671,17 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
                         ),
                     )
                 )
-                self.assertTrue(agent_server.is_agent_helper_route(method, sample))
+                if path == agent_server.CODEX_PROVIDER_MCP_PATH:
+                    # The process-private MCP has its own exact transport
+                    # secret and body gate; it must not inherit helper-header
+                    # bypass semantics.
+                    self.assertFalse(
+                        agent_server.is_agent_helper_route(method, sample)
+                    )
+                else:
+                    self.assertTrue(
+                        agent_server.is_agent_helper_route(method, sample)
+                    )
         self.assertTrue(registered)
         self.assertFalse(
             agent_server.is_agent_helper_route("POST", "/api/agent/future-route")

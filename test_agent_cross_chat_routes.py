@@ -1785,7 +1785,10 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         # Context diet: the envelope is a compact header; provenance prose
         # lives in the thread instructions.
         self.assertIn("[AgentsDock delivery kind=instruction leg=1/2 origin=route", prompt)
-        self.assertIn("optional one-time terminal reply route", prompt)
+        self.assertIn(
+            "optional one-time terminal reply via Chats respond-current",
+            prompt,
+        )
         self.assertIn("never add --request-response", prompt)
         self.assertNotIn(exchange["id"], prompt)
         self.assertNotIn(leg["id"], prompt)

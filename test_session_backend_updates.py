@@ -49,6 +49,15 @@ class SessionBackendUpdateFenceTests(unittest.IsolatedAsyncioTestCase):
         agent_server.SESSION_TURN_TASKS = self.previous_tasks
         agent_server.SESSION_LIFECYCLE_LOCKS = self.previous_lifecycle_locks
 
+    def provider_runtime_env_patch(self):
+        """Isolate backend-lifecycle tests from capability serialization."""
+
+        return patch.object(
+            agent_server,
+            "provider_authority_runtime_env",
+            AsyncMock(return_value={"AGENTSDOCK_CHAT_ID": self.session_id}),
+        )
+
     async def test_busy_first_turn_rejects_backend_change_without_provider_id(
         self,
     ) -> None:
@@ -378,6 +387,7 @@ class SessionBackendUpdateFenceTests(unittest.IsolatedAsyncioTestCase):
                 "issue_cross_chat_capability",
                 AsyncMock(return_value=agent_server.STATE_DIR / "test-authority.json"),
             ),
+            self.provider_runtime_env_patch(),
             patch.object(
                 agent_server,
                 "scrub_tmux_global_secret_environment",
@@ -459,6 +469,7 @@ class SessionBackendUpdateFenceTests(unittest.IsolatedAsyncioTestCase):
                 "issue_cross_chat_capability",
                 AsyncMock(return_value=agent_server.STATE_DIR / "test-authority.json"),
             ),
+            self.provider_runtime_env_patch(),
             patch.object(agent_server, "revoke_cross_chat_capability", revoke),
             patch.object(
                 agent_server.CROSS_CHAT,
@@ -557,6 +568,7 @@ class SessionBackendUpdateFenceTests(unittest.IsolatedAsyncioTestCase):
                 "issue_cross_chat_capability",
                 AsyncMock(return_value=agent_server.STATE_DIR / "test-authority.json"),
             ),
+            self.provider_runtime_env_patch(),
             patch.object(
                 agent_server,
                 "revoke_cross_chat_capability",
@@ -647,6 +659,7 @@ class SessionBackendUpdateFenceTests(unittest.IsolatedAsyncioTestCase):
                 "issue_cross_chat_capability",
                 AsyncMock(return_value=agent_server.STATE_DIR / "test-authority.json"),
             ),
+            self.provider_runtime_env_patch(),
             patch.object(
                 agent_server,
                 "revoke_cross_chat_capability",
@@ -742,6 +755,7 @@ class SessionBackendUpdateFenceTests(unittest.IsolatedAsyncioTestCase):
                 "issue_cross_chat_capability",
                 AsyncMock(return_value=agent_server.STATE_DIR / "test-authority.json"),
             ),
+            self.provider_runtime_env_patch(),
             patch.object(
                 agent_server,
                 "revoke_cross_chat_capability",

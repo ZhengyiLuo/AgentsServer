@@ -361,7 +361,12 @@ class StandaloneProviderContextTests(unittest.IsolatedAsyncioTestCase):
             ))
             stack.enter_context(patch.object(
                 agent_server,
-                "managed_server_update_blocker",
+                "managed_server_update_admission_blocker",
+                return_value=None,
+            ))
+            stack.enter_context(patch.object(
+                agent_server,
+                "managed_server_update_scheduled_job_blocker",
                 return_value=None,
             ))
             stack.enter_context(patch.object(
@@ -448,8 +453,15 @@ class StandaloneProviderContextTests(unittest.IsolatedAsyncioTestCase):
                     "action": "instruction",
                 })
                 launched_prompt = run_claude.await_args.args[2]
-                self.assertIn(f"handle={direct_handle}", launched_prompt)
-                self.assertNotIn("sess_target", launched_prompt)
+                self.assertEqual(launched_prompt, "scheduled prompt")
+                launched_env = run_claude.await_args.kwargs[
+                    "provider_runtime_env"
+                ]
+                self.assertEqual(
+                    launched_env["AGENTSDOCK_CROSS_CHAT_HANDLE_1"],
+                    direct_handle,
+                )
+                self.assertNotIn("sess_target", str(launched_env))
                 self.assertEqual(capability["provider_route_grants"], {})
                 self.assertNotIn(
                     "agent_cross_chat_routes",

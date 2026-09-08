@@ -17423,11 +17423,11 @@ async def _revoke_cross_chat_capability(run_id: str) -> None:
             paths.append(str(capability.get("authority_path") or ""))
             revoked_token_hashes.add(token_hash)
             CROSS_CHAT_CAPABILITIES.pop(token_hash, None)
-    affected_exchange_ids = {
+    affected_exchange_ids = sorted({
         key[0]
         for key, waiter in CROSS_CHAT_LIVE_RESPONSE_WAITERS.items()
         if str(waiter.get("token_hash") or "") in revoked_token_hashes
-    }
+    })
     for exchange_id in affected_exchange_ids:
         async with cross_chat_live_lease_lock(exchange_id):
             matching = [
@@ -17440,43 +17440,45 @@ async def _revoke_cross_chat_capability(run_id: str) -> None:
                 )
             ]
             for key, waiter in matching:
-                CROSS_CHAT_LIVE_RESPONSE_WAITERS.pop(key, None)
-                if not waiter["future"].done():
-                    waiter["future"].set_result({
-                        "ok": False,
-                        "error_code": "live_lease_owner_lost",
-                        "error": "live cross-chat response capability was revoked",
-                    })
-        exchange = await CROSS_CHAT.get_exchange(exchange_id)
-        if exchange is not None and str(exchange.get("status") or "") == "active":
-            active_leg = await CROSS_CHAT.get_exchange_leg(
-                str(exchange.get("active_leg_id") or "")
-            )
-            failed = await fail_cross_chat_exchange(
-                exchange_id,
-                leg_id=str((active_leg or {}).get("id") or "") or None,
-                error_code="live_lease_owner_lost",
-                error="live cross-chat response capability was revoked",
-            )
-            if failed is not None and active_leg is not None:
-                failed_leg = (
-                    await CROSS_CHAT.get_exchange_leg(
-                        str(active_leg.get("id") or "")
+                exchange, detached = (
+                    await downgrade_cross_chat_live_waiter_to_async_locked(
+                        exchange_id,
+                        waiter,
                     )
-                ) or active_leg
-                await close_cross_chat_exchange_target_owner(
-                    exchange_id,
-                    failed_leg,
-                    queued_reason=(
-                        "Removed queued cross-chat delivery because its "
-                        "live source run was stopped."
-                    ),
                 )
-                await maybe_deliver_cross_chat_exchange_failure_status(
-                    failed,
-                    failed_session_id=str(failed_leg.get("target_session_id") or ""),
-                    failed_leg=failed_leg,
-                )
+                if detached:
+                    continue
+                # A terminal exchange or a newer exact live leg may have won
+                # before revocation acquired its exchange fence. Revoke only
+                # this token's waiter; never reclassify or interrupt that
+                # durable winner.
+                if CROSS_CHAT_LIVE_RESPONSE_WAITERS.get(key) is waiter:
+                    CROSS_CHAT_LIVE_RESPONSE_WAITERS.pop(key, None)
+                waiter["abandoned"] = True
+                if not waiter["future"].done():
+                    if (
+                        exchange is not None
+                        and str(exchange.get("status") or "") == "active"
+                    ):
+                        waiter["future"].set_result(
+                            deferred_cross_chat_live_response(
+                                exchange_id,
+                                str(waiter.get("inbound_leg_id") or key[1]),
+                            )
+                        )
+                    else:
+                        waiter["future"].set_result({
+                            "ok": False,
+                            "error_code": str(
+                                (exchange or {}).get("error_code")
+                                or (exchange or {}).get("status")
+                                or "exchange_ended"
+                            ),
+                            "error": str(
+                                (exchange or {}).get("error")
+                                or "cross-chat exchange ended"
+                            ),
+                        })
     for raw_path in set(paths):
         if not raw_path:
             continue
@@ -34880,6 +34882,106 @@ async def cross_chat_live_lease_lock(
         yield
 
 
+async def downgrade_cross_chat_live_waiter_to_async_locked(
+    exchange_id: str,
+    waiter: dict[str, Any],
+) -> tuple[dict[str, Any] | None, bool]:
+    """Detach one exact live waiter while preserving its durable exchange.
+
+    The caller holds the exchange live-lease lock. A provider capability is
+    needed to authorize and attach the original Ask, but the accepted request
+    and its return route are then server-owned. If that provider run ends, the
+    exact active request (or its already-committed direct response child) is
+    downgraded to ordinary async delivery instead of failing the exchange or
+    stopping its recipient.
+    """
+
+    inbound_leg_id = str(waiter.get("inbound_leg_id") or "")
+    waiter_key = (exchange_id, inbound_leg_id)
+    if (
+        not inbound_leg_id
+        or CROSS_CHAT_LIVE_RESPONSE_WAITERS.get(waiter_key) is not waiter
+    ):
+        return await CROSS_CHAT.get_exchange(exchange_id), False
+
+    exchange = await CROSS_CHAT.get_exchange(exchange_id)
+    inbound = await CROSS_CHAT.get_exchange_leg(inbound_leg_id)
+    if exchange is None or inbound is None:
+        return exchange, False
+    owner_session_id = str(waiter.get("owner_session_id") or "")
+    owner_run_id = str(waiter.get("owner_run_id") or "")
+    if (
+        str(inbound.get("exchange_id") or "") != exchange_id
+        or str(inbound.get("source_session_id") or "") != owner_session_id
+        or str(
+            inbound.get("source_owner_run_id")
+            or inbound.get("source_run_id")
+            or ""
+        ) != owner_run_id
+    ):
+        return exchange, False
+
+    active_leg_id = str(exchange.get("active_leg_id") or "")
+    active_leg = await CROSS_CHAT.get_exchange_leg(active_leg_id)
+    exact_active_route = bool(
+        active_leg is not None
+        and str(active_leg.get("exchange_id") or "") == exchange_id
+        and (
+            active_leg_id == inbound_leg_id
+            or (
+                str(active_leg.get("parent_leg_id") or "") == inbound_leg_id
+                and str(active_leg.get("target_session_id") or "")
+                == owner_session_id
+            )
+        )
+    )
+    active_waiter = CROSS_CHAT_LIVE_RESPONSE_WAITERS.get(
+        (exchange_id, active_leg_id)
+    )
+    if (
+        active_leg_id != inbound_leg_id
+        and active_waiter is not None
+        and active_waiter is not waiter
+        and not bool(active_waiter.get("abandoned"))
+        and not active_waiter["future"].done()
+    ):
+        # The direct child has already become a live follow-up owned by its
+        # own exact waiter. A completed historical waiter from the preceding
+        # leg cannot downgrade that newer lease.
+        return exchange, False
+    if (
+        str(exchange.get("status") or "") != "active"
+        or not exact_active_route
+    ):
+        return exchange, False
+
+    if bool(exchange.get("live_response_lease")):
+        instance_id = str(exchange.get("live_response_instance_id") or "")
+        if instance_id != SERVER_INSTANCE_ID:
+            return exchange, False
+        exchange, _changed = await CROSS_CHAT.downgrade_live_exchange(
+            exchange_id,
+            active_leg_id=active_leg_id,
+            expected_instance_id=instance_id,
+        )
+    if (
+        exchange is None
+        or str(exchange.get("status") or "") != "active"
+        or bool(exchange.get("live_response_lease"))
+        or str(exchange.get("active_leg_id") or "") != active_leg_id
+    ):
+        return exchange, False
+
+    if CROSS_CHAT_LIVE_RESPONSE_WAITERS.get(waiter_key) is waiter:
+        CROSS_CHAT_LIVE_RESPONSE_WAITERS.pop(waiter_key, None)
+    waiter["abandoned"] = True
+    if not waiter["future"].done():
+        waiter["future"].set_result(
+            deferred_cross_chat_live_response(exchange_id, inbound_leg_id)
+        )
+    return exchange, True
+
+
 def cross_chat_live_heartbeat_seconds(requested: int | None) -> float:
     """Return a transport heartbeat interval, never a response deadline.
 
@@ -35056,7 +35158,7 @@ async def register_or_replay_cross_chat_live_waiter_locked(
     owner_run_id: str,
     capability_token: str,
     timeout_seconds: int | None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     try:
         return await register_cross_chat_live_waiter_locked(
             exchange,
@@ -35067,6 +35169,47 @@ async def register_or_replay_cross_chat_live_waiter_locked(
             timeout_seconds=timeout_seconds,
         )
     except HTTPException as exc:
+        if exc.status_code == 410:
+            # The request/response leg was durably accepted before waiter
+            # publication, but its originating provider run ended in that
+            # narrow interval. Preserve only that exact committed route as an
+            # async delivery; the revoked token cannot authorize any new leg.
+            exchange_id = str(exchange.get("id") or "")
+            inbound_leg_id = str(inbound_leg.get("id") or "")
+            current_exchange = await CROSS_CHAT.get_exchange(exchange_id)
+            current_leg = await CROSS_CHAT.get_exchange_leg(inbound_leg_id)
+            if (
+                current_exchange is not None
+                and current_leg is not None
+                and str(current_exchange.get("status") or "") == "active"
+                and bool(current_exchange.get("live_response_lease"))
+                and str(current_exchange.get("live_response_instance_id") or "")
+                == SERVER_INSTANCE_ID
+                and str(current_exchange.get("active_leg_id") or "")
+                == inbound_leg_id
+                and str(current_leg.get("exchange_id") or "") == exchange_id
+                and str(current_leg.get("source_session_id") or "")
+                == owner_session_id
+                and str(
+                    current_leg.get("source_owner_run_id")
+                    or current_leg.get("source_run_id")
+                    or ""
+                ) == owner_run_id
+            ):
+                current_exchange, _changed = (
+                    await CROSS_CHAT.downgrade_live_exchange(
+                        exchange_id,
+                        active_leg_id=inbound_leg_id,
+                        expected_instance_id=SERVER_INSTANCE_ID,
+                    )
+                )
+                if (
+                    current_exchange is not None
+                    and str(current_exchange.get("status") or "") == "active"
+                    and not bool(current_exchange.get("live_response_lease"))
+                ):
+                    return None
+            raise
         if exc.status_code != 409:
             raise
     exchange_id = str(exchange.get("id") or "")
@@ -35139,6 +35282,19 @@ async def require_cross_chat_live_waiter_owner_locked(
 
     async with CROSS_CHAT_CAPABILITY_LOCK:
         cross_chat_live_waiter_capability_locked(waiter)
+
+
+async def cross_chat_live_waiter_owner_is_active(
+    waiter: dict[str, Any],
+) -> bool:
+    """Return whether this waiter can still receive a live provider result."""
+
+    async with CROSS_CHAT_CAPABILITY_LOCK:
+        try:
+            cross_chat_live_waiter_capability_locked(waiter)
+        except HTTPException:
+            return False
+    return True
 
 
 async def grant_cross_chat_live_response_locked(
@@ -35332,10 +35488,10 @@ async def settle_cross_chat_live_waiter_failure(
 async def prune_expired_cross_chat_live_waiters() -> set[str]:
     """Compatibility no-op: live waiters no longer expire by elapsed time.
 
-    They are bounded by the exact provider run and are removed synchronously
-    when that run is revoked, an exchange is cancelled, or the server shuts
-    down.  Keeping this coroutine avoids a mixed-version call-site hazard
-    while removing the former semantic timeout/downgrade behavior.
+    A provider-run revocation downgrades its exact accepted exchange to the
+    server-owned async return route. Explicit exchange cancellation and server
+    shutdown still settle their exact waiters. Keeping this coroutine avoids
+    a mixed-version call-site hazard while removing elapsed-time semantics.
     """
 
     return set()
@@ -39399,13 +39555,27 @@ async def finalize_cross_chat_exchange_run(event: dict[str, Any]) -> None:
                 waiter = CROSS_CHAT_LIVE_RESPONSE_WAITERS.get(
                     (exchange_id, leg_id)
                 )
+                waiter_owner_active = bool(
+                    waiter is not None
+                    and not bool(waiter.get("abandoned"))
+                    and not waiter["future"].done()
+                    and await cross_chat_live_waiter_owner_is_active(waiter)
+                )
                 if (
                     waiter is None
                     or bool(waiter.get("abandoned"))
                     or waiter["future"].done()
+                    or not waiter_owner_active
                 ):
                     current = await CROSS_CHAT.get_exchange(exchange_id)
-                    if current is not None:
+                    if waiter is not None:
+                        exchange, fallback_to_async = (
+                            await downgrade_cross_chat_live_waiter_to_async_locked(
+                                exchange_id,
+                                waiter,
+                            )
+                        )
+                    elif current is not None:
                         exchange, _changed = await CROSS_CHAT.downgrade_live_exchange(
                             exchange_id,
                             active_leg_id=leg_id,
@@ -39413,18 +39583,18 @@ async def finalize_cross_chat_exchange_run(event: dict[str, Any]) -> None:
                                 current.get("live_response_instance_id") or ""
                             ),
                         )
-                    if (
+                        fallback_to_async = bool(
+                            exchange is not None
+                            and str(exchange.get("status") or "") == "active"
+                            and not bool(exchange.get("live_response_lease"))
+                        )
+                    if not fallback_to_async and (
                         exchange is not None
                         and str(exchange.get("status") or "") == "active"
                         and not bool(exchange.get("live_response_lease"))
                     ):
                         fallback_to_async = True
-                        if waiter is not None:
-                            CROSS_CHAT_LIVE_RESPONSE_WAITERS.pop(
-                                (exchange_id, leg_id),
-                                None,
-                            )
-                    else:
+                    if not fallback_to_async:
                         delivery_error = True
                 else:
                     try:
@@ -39462,7 +39632,13 @@ async def finalize_cross_chat_exchange_run(event: dict[str, Any]) -> None:
                         )
                     except HTTPException as exc:
                         if exc.status_code in {409, 410}:
-                            delivery_error = True
+                            exchange, fallback_to_async = (
+                                await downgrade_cross_chat_live_waiter_to_async_locked(
+                                    exchange_id,
+                                    waiter,
+                                )
+                            )
+                            delivery_error = not fallback_to_async
                         else:
                             raise
             if fallback_to_async:
@@ -74115,6 +74291,15 @@ async def submit_provider_route_handoff(
                         capability_token=provider_capability_header(request),
                         timeout_seconds=req.response_timeout_seconds,
                     )
+                    if live_waiter is None:
+                        exchange = (
+                            await CROSS_CHAT.get_exchange(str(exchange["id"]))
+                        ) or exchange
+                        live_wait_deferred = bool(
+                            str(exchange.get("status") or "") == "active"
+                            and bool(exchange.get("live_response_requested"))
+                            and not bool(exchange.get("live_response_lease"))
+                        )
             await append_cross_chat_exchange_registered(
                 exchange,
                 run_id=str(
@@ -74283,6 +74468,15 @@ async def submit_authorized_cross_chat_handoff(
                             capability_token=capability,
                             timeout_seconds=req.response_timeout_seconds,
                         )
+                        if live_waiter is None:
+                            exchange = (
+                                await CROSS_CHAT.get_exchange(str(exchange["id"]))
+                            ) or exchange
+                            live_wait_deferred = bool(
+                                str(exchange.get("status") or "") == "active"
+                                and bool(exchange.get("live_response_requested"))
+                                and not bool(exchange.get("live_response_lease"))
+                            )
                 await append_cross_chat_exchange_registered(
                     exchange,
                     run_id=str(
@@ -74459,6 +74653,14 @@ async def submit_authorized_cross_chat_exchange_response(
                 parent_waiter = CROSS_CHAT_LIVE_RESPONSE_WAITERS.get(
                     (exchange_id, req.inbound_leg_id)
                 )
+                parent_waiter_owner_active = bool(
+                    parent_waiter is not None
+                    and not bool(parent_waiter.get("abandoned"))
+                    and not parent_waiter["future"].done()
+                    and await cross_chat_live_waiter_owner_is_active(
+                        parent_waiter
+                    )
+                )
                 existing_child = next((
                     candidate
                     for candidate in await CROSS_CHAT.exchange_legs(exchange_id)
@@ -74509,6 +74711,28 @@ async def submit_authorized_cross_chat_exchange_response(
                         if replay_waiter is not None:
                             replay_receipt["_live_exchange"] = replay_exchange
                             replay_receipt["_live_waiter"] = replay_waiter
+                        elif req.request_response:
+                            replay_exchange = (
+                                await CROSS_CHAT.get_exchange(exchange_id)
+                            ) or replay_exchange
+                            if (
+                                str(replay_exchange.get("status") or "")
+                                == "active"
+                                and bool(
+                                    replay_exchange.get(
+                                        "live_response_requested"
+                                    )
+                                )
+                                and not bool(
+                                    replay_exchange.get("live_response_lease")
+                                )
+                            ):
+                                replay_receipt.update(
+                                    deferred_cross_chat_live_response(
+                                        exchange_id,
+                                        str(replay_leg.get("id") or ""),
+                                    )
+                                )
                         return replay_receipt
                 if (
                     current_exchange is not None
@@ -74528,29 +74752,36 @@ async def submit_authorized_cross_chat_exchange_response(
                     and (
                         parent_waiter is None
                         or bool(parent_waiter.get("abandoned"))
+                        or parent_waiter["future"].done()
+                        or not parent_waiter_owner_active
                     )
                 ):
-                    current_exchange, _changed = (
-                        await CROSS_CHAT.downgrade_live_exchange(
-                            exchange_id,
-                            active_leg_id=req.inbound_leg_id,
-                            expected_instance_id=str(
-                                current_exchange.get("live_response_instance_id")
-                                or ""
-                            ),
+                    if parent_waiter is not None:
+                        current_exchange, fallback_to_async = (
+                            await downgrade_cross_chat_live_waiter_to_async_locked(
+                                exchange_id,
+                                parent_waiter,
+                            )
                         )
-                    )
-                    if (
+                    else:
+                        current_exchange, _changed = (
+                            await CROSS_CHAT.downgrade_live_exchange(
+                                exchange_id,
+                                active_leg_id=req.inbound_leg_id,
+                                expected_instance_id=str(
+                                    current_exchange.get(
+                                        "live_response_instance_id"
+                                    )
+                                    or ""
+                                ),
+                            )
+                        )
+                    if not fallback_to_async and (
                         current_exchange is not None
                         and current_exchange.get("status") == "active"
                         and not bool(current_exchange.get("live_response_lease"))
                     ):
                         fallback_to_async = True
-                        if parent_waiter is not None:
-                            CROSS_CHAT_LIVE_RESPONSE_WAITERS.pop(
-                                (exchange_id, req.inbound_leg_id),
-                                None,
-                            )
                 if not fallback_to_async and (
                     current_exchange is None
                     or current_exchange.get("status") != "active"
@@ -74603,34 +74834,45 @@ async def submit_authorized_cross_chat_exchange_response(
                             )
                         )
                     except BaseException as exc:
-                        failed = await _fail_cross_chat_exchange_locked(
-                            exchange_id,
-                            leg_id=str(leg.get("id") or ""),
-                            error_code="live_lease_delivery_failed",
-                            error="live cross-chat response could not reach its waiting caller",
-                        )
-                        current_exchange = failed or exchange
-                        matching = [
-                            (key, waiter)
-                            for key, waiter in CROSS_CHAT_LIVE_RESPONSE_WAITERS.items()
-                            if key[0] == exchange_id
-                        ]
-                        for key, waiter in matching:
-                            CROSS_CHAT_LIVE_RESPONSE_WAITERS.pop(key, None)
-                            if not waiter["future"].done():
-                                waiter["future"].set_result({
-                                    "ok": False,
-                                    "error_code": "live_lease_delivery_failed",
-                                    "error": "live cross-chat response could not reach its waiting caller",
-                                })
-                        delivery_error = (
-                            exc
-                            if isinstance(exc, HTTPException)
-                            else HTTPException(
-                                status_code=409,
-                                detail="live cross-chat response delivery failed",
+                        if (
+                            isinstance(exc, HTTPException)
+                            and exc.status_code in {409, 410}
+                        ):
+                            current_exchange, fallback_to_async = (
+                                await downgrade_cross_chat_live_waiter_to_async_locked(
+                                    exchange_id,
+                                    parent_waiter,
+                                )
                             )
-                        )
+                        if not fallback_to_async:
+                            failed = await _fail_cross_chat_exchange_locked(
+                                exchange_id,
+                                leg_id=str(leg.get("id") or ""),
+                                error_code="live_lease_delivery_failed",
+                                error="live cross-chat response could not reach its waiting caller",
+                            )
+                            current_exchange = failed or exchange
+                            matching = [
+                                (key, waiter)
+                                for key, waiter in CROSS_CHAT_LIVE_RESPONSE_WAITERS.items()
+                                if key[0] == exchange_id
+                            ]
+                            for key, waiter in matching:
+                                CROSS_CHAT_LIVE_RESPONSE_WAITERS.pop(key, None)
+                                if not waiter["future"].done():
+                                    waiter["future"].set_result({
+                                        "ok": False,
+                                        "error_code": "live_lease_delivery_failed",
+                                        "error": "live cross-chat response could not reach its waiting caller",
+                                    })
+                            delivery_error = (
+                                exc
+                                if isinstance(exc, HTTPException)
+                                else HTTPException(
+                                    status_code=409,
+                                    detail="live cross-chat response delivery failed",
+                                )
+                            )
             if fallback_to_async:
                 live_response_lease = False
                 deferred_live_followup = bool(req.wait_for_response)

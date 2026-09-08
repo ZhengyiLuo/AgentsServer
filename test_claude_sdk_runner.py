@@ -4530,7 +4530,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         ))
         runtime_failure.assert_called_once()
 
-    async def test_absolute_timeout_bounds_an_active_sdk_turn(self) -> None:
+    async def test_configured_absolute_timeout_bounds_an_active_sdk_turn(self) -> None:
         handle = FakeClaudeRun()
         manager, append_event, append_finished, runtime_failure = (
             await self._run_sdk_timeout_case(
@@ -4553,7 +4553,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         ))
         runtime_failure.assert_called_once()
 
-    async def test_absolute_timeout_cannot_be_starved_by_ready_frames(self) -> None:
+    async def test_configured_absolute_timeout_cannot_be_starved_by_ready_frames(self) -> None:
         handle = NoisyClaudeRun()
         manager, append_event, append_finished, runtime_failure = (
             await self._run_sdk_timeout_case(
@@ -4575,6 +4575,120 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             for call in append_event.await_args_list
         ))
         runtime_failure.assert_called_once()
+
+    async def test_disabled_absolute_timeout_allows_long_active_turn(self) -> None:
+        class DelayedTerminalClaudeRun(FakeClaudeRun):
+            async def __anext__(self) -> object:
+                await asyncio.sleep(0.06)
+                return {
+                    "type": "result",
+                    "result": "completed after the old hard deadline",
+                    "session_id": "provider",
+                    "terminal_reason": "end_turn",
+                }
+
+        handle = DelayedTerminalClaudeRun()
+        manager, append_event, append_finished, runtime_failure = (
+            await self._run_sdk_timeout_case(
+                handle,
+                pre_ack_timeout=1.0,
+                post_ack_timeout=1.0,
+                turn_timeout=0.0,
+                idle_warn=0.5,
+                idle_timeout=1.0,
+                project_result={
+                    "session_id": "provider",
+                    "result_text": "completed after the old hard deadline",
+                    "is_error": False,
+                    "error": "",
+                    "subtype": "success",
+                    "terminal_reason": "end_turn",
+                    "aborted": False,
+                },
+            )
+        )
+
+        self.assertEqual(handle.interrupt_calls, 0)
+        self.assertEqual(manager.evict_calls, [])
+        self.assertEqual(append_finished.await_args.args[1]["exit_code"], 0)
+        self.assertFalse(any(
+            call.args[1] == "error"
+            and "absolute turn timeout" in call.args[2]["message"]
+            for call in append_event.await_args_list
+        ))
+        runtime_failure.assert_not_called()
+
+    async def test_pending_approval_pauses_idle_and_absolute_watchdogs(self) -> None:
+        interaction_id = "claudereq_waiting"
+
+        class ApprovalDelayedTerminalClaudeRun(FakeClaudeRun):
+            async def __anext__(self) -> object:
+                await asyncio.sleep(0.06)
+                await agent_server.resolve_claude_interaction(
+                    "chat-claude",
+                    interaction_id,
+                    {"decision": "accept"},
+                )
+                return {
+                    "type": "result",
+                    "result": "continued after approval",
+                    "session_id": "provider",
+                    "terminal_reason": "end_turn",
+                }
+
+        future = asyncio.get_running_loop().create_future()
+        pending = {
+            "id": interaction_id,
+            "session_id": "chat-claude",
+            "thread_id": "provider",
+            "turn_id": "run-claude",
+            "item_id": "tool-approval",
+            "method": "item/commandExecution/requestApproval",
+            "params": {},
+            "created_at": "2026-09-08T00:00:00Z",
+            "future": future,
+            "responded": False,
+            "resolution": "dismissed",
+        }
+        async with agent_server.CLAUDE_PENDING_INTERACTIONS_LOCK:
+            agent_server.CLAUDE_PENDING_INTERACTIONS[interaction_id] = pending
+        try:
+            handle = ApprovalDelayedTerminalClaudeRun()
+            manager, append_event, append_finished, runtime_failure = (
+                await self._run_sdk_timeout_case(
+                    handle,
+                    pre_ack_timeout=1.0,
+                    post_ack_timeout=0.01,
+                    turn_timeout=0.01,
+                    idle_warn=0.005,
+                    idle_timeout=0.01,
+                    project_result={
+                        "session_id": "provider",
+                        "result_text": "continued after approval",
+                        "is_error": False,
+                        "error": "",
+                        "subtype": "success",
+                        "terminal_reason": "end_turn",
+                        "aborted": False,
+                    },
+                )
+            )
+        finally:
+            async with agent_server.CLAUDE_PENDING_INTERACTIONS_LOCK:
+                agent_server.CLAUDE_PENDING_INTERACTIONS.pop(
+                    interaction_id,
+                    None,
+                )
+
+        self.assertTrue(future.done())
+        self.assertEqual(handle.interrupt_calls, 0)
+        self.assertEqual(manager.evict_calls, [])
+        self.assertEqual(append_finished.await_args.args[1]["exit_code"], 0)
+        self.assertFalse(any(
+            call.args[1] in {"idle_warning", "error"}
+            for call in append_event.await_args_list
+        ))
+        runtime_failure.assert_not_called()
 
     async def test_pending_live_cross_chat_wait_pauses_sdk_watchdogs(self) -> None:
         class DelayedTerminalClaudeRun(FakeClaudeRun):

@@ -858,14 +858,13 @@ CLAUDE_SDK_PRE_ACK_TIMEOUT_SECONDS = max(
     30.0,
     float(agentsdock_setting("CLAUDE_SDK_PRE_ACK_TIMEOUT_SECONDS", "600")),
 )
+# An active Claude turn has no useful wall-clock lifetime limit. Long-running
+# tool work and user approvals can legitimately span hours; cancel remains the
+# explicit terminal control. Operators that need a hard policy ceiling may set
+# a positive value, while zero (the default) disables only this absolute bound.
 CLAUDE_SDK_TURN_TIMEOUT_SECONDS = max(
-    CLAUDE_SDK_PRE_ACK_TIMEOUT_SECONDS,
-    float(
-        agentsdock_setting(
-            "CLAUDE_SDK_TURN_TIMEOUT_SECONDS",
-            str(IDLE_KILL_SECONDS),
-        )
-    ),
+    0.0,
+    float(agentsdock_setting("CLAUDE_SDK_TURN_TIMEOUT_SECONDS", "0")),
 )
 CLAUDE_SDK_IDLE_TIMEOUT_SECONDS = max(
     30.0,
@@ -25673,6 +25672,11 @@ def is_client_visible_event(event: dict[str, Any]) -> bool:
 
     if str(event.get("type") or "") == "_event_sequence_checkpoint":
         return False
+    if is_legacy_imported_claude_task_notification(event):
+        # Older releases imported Claude's SDK-generated workflow wake-up as
+        # a human turn. Keep the durable row for sequence/cursor continuity,
+        # but never expose it through HTTP, catch-up, websocket, or search.
+        return False
     cross_chat_owner = any(
         str(event.get(key) or "").strip()
         for key in (
@@ -40525,6 +40529,8 @@ def claude_transcript_preview(path: Path) -> str | None:
             continue
         if not isinstance(event, dict) or event.get("type") != "user":
             continue
+        if is_claude_task_notification_history_event(event):
+            continue
         text = compact_import_text(strip_agentsdock_generated_user_text(message_text(event.get("message"))))
         if text and not is_import_boilerplate(text):
             return text[:160]
@@ -40932,9 +40938,74 @@ def schedule_codex_thread_hygiene_check(
     )
 
 
+CLAUDE_TASK_NOTIFICATION_OPEN = "<task-notification>"
+CLAUDE_TASK_NOTIFICATION_CLOSE = "</task-notification>"
+
+
+def is_claude_task_notification_text(value: Any) -> bool:
+    """Recognize a complete legacy Claude workflow-control envelope.
+
+    New transcripts carry the authoritative ``origin.kind`` marker. This
+    bounded structural fallback exists only so already-imported beta rows can
+    be hidden without rewriting an append-only event log.
+    """
+
+    text = str(value or "").strip()
+    if (
+        not text.startswith(CLAUDE_TASK_NOTIFICATION_OPEN)
+        or not text.endswith(CLAUDE_TASK_NOTIFICATION_CLOSE)
+    ):
+        return False
+    inner = text[
+        len(CLAUDE_TASK_NOTIFICATION_OPEN) :
+        -len(CLAUDE_TASK_NOTIFICATION_CLOSE)
+    ]
+    return bool(
+        re.search(r"<task-id>[^<\r\n]{1,512}</task-id>", inner)
+        and (
+            "<status>" in inner
+            or "<output-file>" in inner
+            or "<summary>" in inner
+        )
+    )
+
+
+def is_claude_task_notification_history_event(event: dict[str, Any]) -> bool:
+    """Return whether Claude marked a transcript row as SDK task control."""
+
+    origin = event.get("origin")
+    return bool(
+        event.get("type") == "user"
+        and isinstance(origin, dict)
+        and str(origin.get("kind") or "") == "task-notification"
+    )
+
+
+def is_legacy_imported_claude_task_notification(
+    event: dict[str, Any],
+) -> bool:
+    """Hide only old imported Claude control rows, never live human turns."""
+
+    return bool(
+        str(event.get("type") or "") == "turn_started"
+        and str(event.get("backend") or "") == BACKEND_CLAUDE
+        and (
+            event.get("imported") is True
+            or str(event.get("run_id") or "").startswith("import_")
+        )
+        and is_claude_task_notification_text(event.get("prompt"))
+    )
+
+
 def claude_history_event_item(event: dict[str, Any]) -> dict[str, str] | None:
     event_type = event.get("type")
     if event_type == "user":
+        if is_claude_task_notification_history_event(event):
+            # Claude records its workflow wake-up as a user-role transcript
+            # item so the model can consume it. It is provider control state,
+            # not something the human typed; leave it in Claude's transcript
+            # and omit it only from the AgentsDock timeline projection.
+            return None
         return normalized_history_item(
             "user",
             strip_agentsdock_generated_user_text(message_text(event.get("message"))),
@@ -45949,6 +46020,28 @@ def public_claude_interaction(pending: dict[str, Any]) -> dict[str, Any]:
         "created_at": pending["created_at"],
         "auto_resolution_ms": None,
     }
+
+
+async def claude_run_has_pending_interaction(
+    session_id: str,
+    run_id: str,
+) -> bool:
+    """Return whether this exact Claude run is waiting for the user.
+
+    The interaction registry is the ownership authority. Reading it under its
+    lock prevents a just-resolved approval from extending an unrelated or
+    replacement run's watchdog lease.
+    """
+
+    async with CLAUDE_PENDING_INTERACTIONS_LOCK:
+        return any(
+            str(pending.get("session_id") or "") == session_id
+            and str(pending.get("turn_id") or "") == run_id
+            and not pending.get("responded")
+            and isinstance(pending.get("future"), asyncio.Future)
+            and not pending["future"].done()
+            for pending in CLAUDE_PENDING_INTERACTIONS.values()
+        )
 
 
 async def update_claude_pending_session_metadata(session_id: str) -> None:
@@ -54046,19 +54139,26 @@ async def run_claude_sdk(
             else now_monotonic
         )
         if deadline_clock_was_paused:
-            # Exclude only elapsed time during which this exact run owned a
-            # pending live lease.  Once the answer/cancel settles its future,
-            # both the idle and absolute watchdog clocks resume normally.
-            logical_started_monotonic += max(
+            # Exclude elapsed time during which this exact run was waiting on
+            # an authenticated peer or an unresolved user interaction. Once
+            # that wait settles, both watchdog clocks resume normally.
+            paused_for = max(
                 0.0,
                 observed_at - deadline_clock_checked_monotonic,
             )
+            logical_started_monotonic += paused_for
+            last_activity_monotonic += paused_for
         pending_live_wait = provider_run_owns_pending_cross_chat_live_wait(
             session_id,
             current_run_id,
         )
+        pending_user_interaction = await claude_run_has_pending_interaction(
+            session_id,
+            current_run_id,
+        )
+        watchdog_paused = pending_live_wait or pending_user_interaction
         deadline_clock_checked_monotonic = observed_at
-        deadline_clock_was_paused = pending_live_wait
+        deadline_clock_was_paused = watchdog_paused
         acknowledged_now = bool(
             getattr(current_handle, "acknowledged", False)
         )
@@ -54066,13 +54166,18 @@ async def run_claude_sdk(
             provider_acknowledged = True
             last_activity_monotonic = observed_at
             idle_warning_emitted = False
-        if pending_live_wait:
-            # Reaching the authenticated helper is itself proof that this
-            # logical provider turn is active, even if the SDK emits no frame
-            # while its tool call waits.
+        if watchdog_paused:
+            # Reaching the authenticated peer helper or publishing an
+            # exact-run approval is proof that this logical provider turn is
+            # active, even if the SDK emits no frame while it waits.
             provider_acknowledged = True
             last_activity_monotonic = observed_at
             idle_warning_emitted = False
+            if pending_user_interaction:
+                # The provider request itself is first activity. Do not let a
+                # completed post-ACK watchdog spin or fail as soon as the user
+                # answers after a long wait.
+                await cancel_first_activity_watchdog()
             return False
         elapsed = observed_at - logical_started_monotonic
         idle = observed_at - last_activity_monotonic
@@ -54119,7 +54224,10 @@ async def run_claude_sdk(
                 current_run_id,
             )
             return True
-        if elapsed >= CLAUDE_SDK_TURN_TIMEOUT_SECONDS:
+        if (
+            CLAUDE_SDK_TURN_TIMEOUT_SECONDS > 0
+            and elapsed >= CLAUDE_SDK_TURN_TIMEOUT_SECONDS
+        ):
             stream_error = (
                 "Claude SDK exceeded the absolute turn timeout of "
                 f"{CLAUDE_SDK_TURN_TIMEOUT_SECONDS:g}s."
@@ -54150,17 +54258,16 @@ async def run_claude_sdk(
                 waiters.add(first_activity_task)
             elapsed = now_monotonic - logical_started_monotonic
             idle = now_monotonic - last_activity_monotonic
-            timeout_candidates = [
-                5.0,
-                (
+            timeout_candidates = [5.0]
+            if CLAUDE_SDK_TURN_TIMEOUT_SECONDS > 0:
+                timeout_candidates.append(
                     CLAUDE_SDK_TURN_TIMEOUT_SECONDS
                     if deadline_clock_was_paused
                     else max(
                         0.01,
                         CLAUDE_SDK_TURN_TIMEOUT_SECONDS - elapsed,
                     )
-                ),
-            ]
+                )
             if provider_acknowledged:
                 idle_deadline = (
                     CLAUDE_SDK_IDLE_TIMEOUT_SECONDS

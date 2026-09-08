@@ -51,7 +51,7 @@ from collections import Counter, OrderedDict, defaultdict, deque
 from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, AsyncIterator, Iterable, Iterator, Literal
 from urllib.parse import quote, unquote, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -5013,6 +5013,7 @@ ARTIFACT_PUBLICATION_LOCK_STRIPES = tuple(asyncio.Lock() for _ in range(64))
 TIMELINE_PIN_LOCK_STRIPES = tuple(asyncio.Lock() for _ in range(64))
 TIMELINE_INDEX_CACHE_MAX = int(agentsdock_setting("TIMELINE_INDEX_CACHE_MAX", "24"))
 TIMELINE_INDEX_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
+TIMELINE_INDEX_PROJECTION_VERSION = 2
 # Retained as a compatibility/testing surface; synchronization uses the fixed
 # stripe pool below so deleted-session churn cannot leak one lock per chat.
 TIMELINE_INDEX_LOCKS: dict[str, threading.Lock] = {}
@@ -5027,7 +5028,7 @@ FORK_INTERNAL_RUN_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 FORK_INTERNAL_RUN_LOCKS: dict[str, threading.Lock] = {}
 HISTORY_SEARCH_DB = STATE_DIR / "history_search.sqlite3"
 HISTORY_SEARCH_LOCK = threading.Lock()
-HISTORY_SEARCH_INDEX_VERSION = "4"
+HISTORY_SEARCH_INDEX_VERSION = "5"
 HISTORY_SEARCH_DIRTY: set[str] = set()
 HISTORY_SEARCH_SYNC_INTERVAL_SECONDS = max(
     0.25, float(agentsdock_setting("HISTORY_SEARCH_SYNC_INTERVAL_SECONDS", "1.0"))
@@ -14982,7 +14983,8 @@ async def append_event(
         HISTORY_SEARCH_DIRTY.add(session_id)
         await update_session_event_metadata(session_id, event)
         if event_files_belong_to_session(event, session_id) and is_client_visible_event(event):
-            await HUB.broadcast(session_id, client_safe_event(event))
+            safe_event = client_safe_event(event)
+            await HUB.broadcast(session_id, safe_event)
     # Terminal cross-chat cleanup may append lifecycle rows to this same chat;
     # run it only after releasing the per-chat event delivery lock.
     if event_type == "turn_stopped":
@@ -15201,7 +15203,8 @@ async def append_durable_event_batch_locked(
                 )
             try:
                 if event_files_belong_to_session(event, session_id) and is_client_visible_event(event):
-                    await HUB.broadcast(session_id, client_safe_event(event))
+                    safe_event = client_safe_event(event)
+                    await HUB.broadcast(session_id, safe_event)
             except BaseException as exc:
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                     raise
@@ -23589,6 +23592,12 @@ def _prune_history_bookkeeping_connection(path: Path) -> sqlite3.Connection:
 def _prune_history_message_key(event: dict[str, Any]) -> tuple[str, str] | None:
     event_type = str(event.get("type") or "")
     if event_type == "turn_started":
+        # A copied provider-only boundary intentionally carries an empty
+        # prompt plus this durable marker. Every such row can share one import
+        # run id, so content deduplication must not collapse the boundaries and
+        # leave later assistant rows attached to the wrong user turn.
+        if event.get(TIMELINE_IMPORTED_PROMPT_HIDDEN_FIELD) is True:
+            return None
         return history_dedup_key("user", event.get("prompt"))
     if event_type == "assistant_text":
         return history_dedup_key("assistant", event.get("text"))
@@ -26674,6 +26683,21 @@ def event_files_belong_to_session(event: dict[str, Any], session_id: str | None 
 
 
 def client_safe_event(event: dict[str, Any]) -> dict[str, Any]:
+    """Return one client-safe persisted event.
+
+    Provider-history projection lives at this shared boundary so REST pages,
+    websocket replay, live broadcasts, and less common client readers cannot
+    accidentally diverge. Events without a durable session owner (for
+    example synthesized job summaries) still receive the ordinary field
+    redaction below.
+    """
+
+    projection_session_id = str(event.get("session_id") or "").strip()
+    if projection_session_id:
+        event = project_provider_history_event_for_egress(
+            event,
+            projection_session_id,
+        )
     safe = event
     if (
         "provider_cross_chat_route_snapshot" in event
@@ -27269,8 +27293,8 @@ def read_client_events_page(
                 continue
             if not is_client_visible_event(event):
                 continue
-            client_count += 1
             safe_event = client_safe_event(event)
+            client_count += 1
             if tail_out is not None:
                 tail_out.append(safe_event)
             elif len(out) < limit:
@@ -27603,6 +27627,7 @@ def read_visible_events_after_page(
                     continue
                 if not is_client_visible_event(event):
                     continue
+                event = client_safe_event(event)
                 if not is_visible_timeline_event(
                     event,
                     compact=compact,
@@ -27610,7 +27635,7 @@ def read_visible_events_after_page(
                 ):
                     continue
                 visible_count += 1
-                selected.appendleft(client_safe_event(event))
+                selected.appendleft(event)
     except Exception as exc:
         logger.warning("fast event delta failed session=%s: %s", session_id, exc)
         return read_visible_events_page(session_id, after=after, limit=limit, tail=False, compact=compact)
@@ -29099,6 +29124,80 @@ def timeline_index_event_is_hidden(event: dict[str, Any]) -> bool:
     )
 
 
+TIMELINE_IMPORTED_PROMPT_HIDDEN_FIELD = "_agentsdock_imported_prompt_hidden"
+
+
+def project_legacy_imported_provider_event(
+    event: dict[str, Any],
+    session_id: str,
+) -> dict[str, Any]:
+    """Hide or clean only legacy provider-import user records.
+
+    Native user turns, assistant output, partial markers, and ordinary pasted
+    text are never rewritten. The import provenance and generated run shape
+    are required because older durable events no longer retain Claude's richer
+    provider-origin metadata.
+    """
+
+    if (
+        str(event.get("type") or "") != "turn_started"
+        or event.get("imported") is not True
+        or not str(event.get("run_id") or "").startswith("import_")
+        or (
+            bool(str(event.get("session_id") or "").strip())
+            and str(event.get("session_id") or "").strip() != session_id
+        )
+        or str(event.get("backend") or "").strip().lower()
+        not in {BACKEND_CLAUDE, BACKEND_CODEX}
+        or not isinstance(event.get("prompt"), str)
+    ):
+        return event
+    prompt = str(event["prompt"])
+    generated_task_notification = bool(
+        event.get("provider_history_sanitized") is not True
+        and str(event.get("backend") or "").strip().lower() == BACKEND_CLAUDE
+        and CLAUDE_TASK_NOTIFICATION_RE.fullmatch(prompt.strip())
+    )
+    cleaned = strip_all_legacy_agentsdock_provider_authority_suffixes(
+        prompt,
+        # Provider-history provenance is already established above. Permit a
+        # structurally valid envelope from the chat where a migrated local
+        # transcript originally ran, while still validating its bound path,
+        # nonce, and embedded chat-id syntax.
+        expected_session_id=None,
+        allow_portable_authority_root=True,
+    )
+    if not generated_task_notification and cleaned == prompt:
+        return event
+    projected = dict(event)
+    if generated_task_notification or not cleaned.strip():
+        projected["prompt"] = ""
+        projected[TIMELINE_IMPORTED_PROMPT_HIDDEN_FIELD] = True
+    else:
+        projected["prompt"] = cleaned
+    return projected
+
+
+def project_provider_history_event_for_egress(
+    event: dict[str, Any],
+    session_id: str,
+) -> dict[str, Any]:
+    """Project one persisted provider-history row at an egress/context edge.
+
+    A generated provider-only user row has no user-authored content to carry,
+    but its empty turn boundary must remain: one imported run can contain
+    several user/assistant pairs, so dropping the row could attach a following
+    answer to the preceding question. The private semantic-only marker never
+    leaves this process.
+    """
+
+    projected = project_legacy_imported_provider_event(event, session_id)
+    if projected.get(TIMELINE_IMPORTED_PROMPT_HIDDEN_FIELD):
+        projected = dict(projected)
+        projected.pop(TIMELINE_IMPORTED_PROMPT_HIDDEN_FIELD, None)
+    return projected
+
+
 def timeline_index_retire_native_steer_turn(
     event: dict[str, Any],
     current_turn_by_run: dict[str, str],
@@ -29496,13 +29595,16 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
     )
     if (
         cached
+        and cached.get("projection_version") == TIMELINE_INDEX_PROJECTION_VERSION
         and cached.get("signature") == signature
         and int(cached.get("offset") or 0) >= stat.st_size
     ):
         return cached["payload"]
 
     can_append = bool(
-        cached and cached.get("inode") == stat.st_ino and
+        cached and
+        cached.get("projection_version") == TIMELINE_INDEX_PROJECTION_VERSION and
+        cached.get("inode") == stat.st_ino and
         cached.get("codex_scope_signature") == codex_scope_signature and
         "internal_status_run_ids" in cached and
         0 <= int(cached.get("offset") or 0) < stat.st_size
@@ -30058,6 +30160,10 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
             latest_seq = max(latest_seq, seq)
             if not is_client_visible_event(event):
                 continue
+            event = project_legacy_imported_provider_event(event, session_id)
+            hidden_imported_prompt = bool(
+                event.get(TIMELINE_IMPORTED_PROMPT_HIDDEN_FIELD)
+            )
             if (
                 event_type == "subagent_state"
                 and str(event.get("backend") or "") == BACKEND_CODEX
@@ -30138,7 +30244,8 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                     active_turn_key,
                 )
                 continue
-            visible_count += 1
+            if not hidden_imported_prompt:
+                visible_count += 1
             indexed_job_title = str(
                 event.get("job_title") or indexed_job.get("title") or ""
             ).strip()
@@ -30418,7 +30525,10 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                 key = f"turn:{run_key}"
                 base_record = by_key.get(key)
                 safe_start_offset = None
-                if base_record is not None and base_record.get("has_user"):
+                if base_record is not None and (
+                    base_record.get("has_turn_start")
+                    or base_record.get("has_user")
+                ):
                     # Replaying from a later repeated run ID needs to see the
                     # original turn first so the collector assigns the same
                     # ``:start-{seq}`` disambiguated key as the index.
@@ -30427,6 +30537,20 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                 active_turn_key = key
                 if run_id:
                     current_turn_by_run[run_id] = key
+                if hidden_imported_prompt:
+                    # Preserve routing for a following provider answer without
+                    # exposing the generated input. The placeholder retains
+                    # the turn boundary offset for tail semantic paging and is
+                    # omitted unless a later visible event fills the turn.
+                    record = ensure_record(
+                        key,
+                        "assistant",
+                        event,
+                        safe_start_offset=safe_start_offset,
+                    )
+                    record["has_turn_start"] = True
+                    record["_hidden_imported_prompt_only"] = True
+                    continue
                 if event.get("purpose") == "handoff_digest_delivery":
                     ensure_record(
                         key,
@@ -30441,6 +30565,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                     event,
                     safe_start_offset=safe_start_offset,
                 )
+                record["has_turn_start"] = True
                 record["has_user"] = True
                 prompt = compact_timeline_index_text(event.get("prompt"))
                 if prompt:
@@ -30458,6 +30583,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                     record["kind"] = "assistant"
                 response = compact_timeline_index_text(event.get("result_text") if event_type == "turn_finished" else event.get("text"))
                 if response:
+                    record.pop("_hidden_imported_prompt_only", None)
                     record["preview"] = response
                     if not record["title"]:
                         record["title"] = compact_timeline_index_text(response, 72)
@@ -30474,6 +30600,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                         continue
                     key = key or f"turn:seq-{seq}"
                     record = ensure_record(key, "media", event)
+                    record.pop("_hidden_imported_prompt_only", None)
                     file_name = compact_timeline_index_text(file_payload.get("title") or file_payload.get("filename"), 72)
                     if file_name and file_name not in record["file_names"]:
                         record["file_names"].append(file_name)
@@ -30490,6 +30617,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
                     record["thought_count"] += 1
                 text = timeline_index_event_text(event)
                 if text and not record.get("trace_preview"):
+                    record.pop("_hidden_imported_prompt_only", None)
                     record["trace_preview"] = text
                 continue
 
@@ -30569,7 +30697,11 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
         landmark_order = []
     for key in dirty_record_keys:
         stored = by_key.get(key)
-        if stored is not None:
+        if stored is not None and stored.get("_hidden_imported_prompt_only"):
+            landmarks_by_key.pop(key, None)
+            with suppress(ValueError):
+                landmark_order.remove(key)
+        elif stored is not None:
             landmarks_by_key[key] = landmark_from_record(stored)
 
     def landmark_key(key: str) -> tuple[int, int, str]:
@@ -30635,6 +30767,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
         *codex_scope_signature,
     )
     cache_entry = {
+        "projection_version": TIMELINE_INDEX_PROJECTION_VERSION,
         "signature": final_signature,
         "codex_scope_signature": codex_scope_signature,
         "payload": payload,
@@ -31442,6 +31575,10 @@ def collect_semantic_timeline_events(
                 continue
             if not is_client_visible_event(event):
                 continue
+            event = project_legacy_imported_provider_event(event, session_id)
+            hidden_imported_prompt = bool(
+                event.get(TIMELINE_IMPORTED_PROMPT_HIDDEN_FIELD)
+            )
             event_type = str(event.get("type") or "")
             if (
                 timeline_index_event_is_hidden(event)
@@ -31604,6 +31741,10 @@ def collect_semantic_timeline_events(
                         key = f"event:{event.get('id') or seq}"
 
             if not key or key not in selected_by_key:
+                continue
+            if hidden_imported_prompt:
+                # The event already updated logical-turn routing above. Its
+                # provider-only prompt is not part of the semantic response.
                 continue
             if event_type == "turn_stopped":
                 stopped_turn_keys.add(key)
@@ -32096,11 +32237,24 @@ HISTORY_SEARCH_LINE_MARKERS = tuple(
 def history_search_event_record(
     event: dict[str, Any],
     internal_run_ids: set[str] | None = None,
+    *,
+    expected_session_id: str | None = None,
 ) -> tuple[str, str] | None:
     if is_fork_internal_event(event, internal_run_ids):
         return None
     if not is_client_visible_event(event):
         return None
+    projection_session_id = (
+        str(expected_session_id or "").strip()
+        or str(event.get("session_id") or "").strip()
+    )
+    if projection_session_id:
+        event = project_legacy_imported_provider_event(
+            event,
+            projection_session_id,
+        )
+        if event.get(TIMELINE_IMPORTED_PROMPT_HIDDEN_FIELD):
+            return None
     event_type = str(event.get("type") or "")
     if event_type not in HISTORY_SEARCH_EVENT_TYPES and not event_type.endswith("_error"):
         return None
@@ -32255,7 +32409,11 @@ def sync_history_search_index(
                     event = json.loads(raw_line.decode("utf-8", "replace"))
                     if not event_files_belong_to_session(event, session_id):
                         continue
-                    record = history_search_event_record(event, internal_run_ids)
+                    record = history_search_event_record(
+                        event,
+                        internal_run_ids,
+                        expected_session_id=session_id,
+                    )
                     if record:
                         role, text = record
                         pending.append((
@@ -41225,11 +41383,14 @@ def is_import_boilerplate(text: str) -> bool:
     return any(stripped.startswith(prefix) for prefix in boilerplate_prefixes)
 
 
-def text_from_content(content: Any) -> str:
+def text_from_content(content: Any, *, compact: bool = True) -> str:
+    def finish(value: str) -> str:
+        return compact_import_text(value) if compact else value
+
     if content is None:
         return ""
     if isinstance(content, str):
-        return compact_import_text(content)
+        return finish(content)
     if isinstance(content, list):
         parts = []
         for block in content:
@@ -41239,19 +41400,19 @@ def text_from_content(content: Any) -> str:
                 block_type = block.get("type")
                 if block_type in {"text", "input_text", "output_text"} and block.get("text"):
                     parts.append(str(block["text"]))
-        return compact_import_text("\n".join(p for p in parts if p.strip()))
+        return finish("\n".join(p for p in parts if p.strip()))
     if isinstance(content, dict):
         if content.get("text"):
-            return compact_import_text(str(content["text"]))
+            return finish(str(content["text"]))
         if content.get("message"):
-            return compact_import_text(str(content["message"]))
+            return finish(str(content["message"]))
     return ""
 
 
-def message_text(message: Any) -> str:
+def message_text(message: Any, *, compact: bool = True) -> str:
     if isinstance(message, dict):
-        return text_from_content(message.get("content"))
-    return text_from_content(message)
+        return text_from_content(message.get("content"), compact=compact)
+    return text_from_content(message, compact=compact)
 
 
 def normalized_history_item(kind: str, text: str) -> dict[str, str] | None:
@@ -41589,11 +41750,11 @@ def claude_transcript_preview(path: Path) -> str | None:
             event = json.loads(raw_line)
         except (json.JSONDecodeError, UnicodeDecodeError):
             continue
-        if not isinstance(event, dict) or event.get("type") != "user":
+        if not isinstance(event, dict):
             continue
-        text = compact_import_text(strip_agentsdock_generated_user_text(message_text(event.get("message"))))
-        if text and not is_import_boilerplate(text):
-            return text[:160]
+        item = claude_history_event_item(event)
+        if item is not None and item.get("kind") == "user":
+            return str(item.get("text") or "")[:160]
     return None
 
 
@@ -41644,6 +41805,7 @@ def claude_fork_has_conversation(session_id: str) -> bool:
     """Return whether a provider-less Claude parent has context to preserve."""
 
     for event in iter_session_events(session_id):
+        event = project_provider_history_event_for_egress(event, session_id)
         event_type = str(event.get("type") or "")
         if event_type == "turn_started" and str(event.get("prompt") or "").strip():
             return True
@@ -41998,12 +42160,67 @@ def schedule_codex_thread_hygiene_check(
     )
 
 
-def claude_history_event_item(event: dict[str, Any]) -> dict[str, str] | None:
+CLAUDE_TASK_NOTIFICATION_ORIGIN = "task-notification"
+CLAUDE_TASK_NOTIFICATION_PROMPT_SOURCES = frozenset({"sdk", "system"})
+CLAUDE_TASK_NOTIFICATION_RE = re.compile(
+    r"\A<task-notification>\n"
+    r"<task-id>[A-Za-z0-9_-]{1,512}</task-id>\n"
+    r"<tool-use-id>[A-Za-z0-9_-]{1,512}</tool-use-id>\n"
+    r"(?:<output-file>[^<>\r\n]{1,8192}</output-file>\n)?"
+    r"<status>(?:completed|failed|stopped)</status>\n"
+    r"<summary>.+</summary>\n"
+    r"</task-notification>\Z",
+    re.DOTALL,
+)
+
+
+def claude_history_event_is_task_notification(event: dict[str, Any]) -> bool:
+    """Identify provider-generated task notices without hiding user tag text.
+
+    Current Claude transcripts carry an authoritative structured origin.  The
+    exact wrapper fallback is for older records that predate that field and is
+    intentionally gated by two independent provider-owned metadata fields.
+    """
+
+    if event.get("type") != "user":
+        return False
+    origin = event.get("origin")
+    if isinstance(origin, dict) and str(origin.get("kind") or ""):
+        return str(origin.get("kind")) == CLAUDE_TASK_NOTIFICATION_ORIGIN
+    if (
+        event.get("queueSkipAttachments") is not True
+        or str(event.get("promptSource") or "")
+        not in CLAUDE_TASK_NOTIFICATION_PROMPT_SOURCES
+        or event.get("isSidechain") is True
+        or event.get("userType") not in (None, "external")
+    ):
+        return False
+    message = event.get("message")
+    if not isinstance(message, dict) or message.get("role") not in (None, "user"):
+        return False
+    content = message.get("content")
+    return bool(
+        isinstance(content, str)
+        and CLAUDE_TASK_NOTIFICATION_RE.fullmatch(content.strip())
+    )
+
+
+def claude_history_event_item(
+    event: dict[str, Any],
+    *,
+    expected_session_id: str | None = None,
+) -> dict[str, str] | None:
     event_type = event.get("type")
     if event_type == "user":
+        if claude_history_event_is_task_notification(event):
+            return None
         return normalized_history_item(
             "user",
-            strip_agentsdock_generated_user_text(message_text(event.get("message"))),
+            strip_agentsdock_generated_user_text(
+                message_text(event.get("message"), compact=False),
+                expected_session_id=expected_session_id,
+                provider_history=True,
+            ),
         )
     if event_type == "assistant":
         return normalized_history_item(
@@ -42013,8 +42230,16 @@ def claude_history_event_item(event: dict[str, Any]) -> dict[str, str] | None:
     return None
 
 
-def append_claude_history_event(items: Any, event: dict[str, Any]) -> None:
-    item = claude_history_event_item(event)
+def append_claude_history_event(
+    items: Any,
+    event: dict[str, Any],
+    *,
+    expected_session_id: str | None = None,
+) -> None:
+    item = claude_history_event_item(
+        event,
+        expected_session_id=expected_session_id,
+    )
     if item is not None:
         add_history_item(items, item["kind"], item["text"])
 
@@ -42022,17 +42247,32 @@ def append_claude_history_event(items: Any, event: dict[str, Any]) -> None:
 def parse_claude_history_events(
     events: Iterable[dict[str, Any]],
     limit: int | None,
+    *,
+    expected_session_id: str | None = None,
 ) -> list[dict[str, str]]:
     items: deque[dict[str, str]] = deque(
         maxlen=normalized_history_import_limit(limit)
     )
     for event in events:
-        append_claude_history_event(items, event)
+        append_claude_history_event(
+            items,
+            event,
+            expected_session_id=expected_session_id,
+        )
     return list(items)
 
 
-def parse_claude_history(path: Path, limit: int | None) -> list[dict[str, str]]:
-    return parse_claude_history_events(bounded_jsonl_events(path), limit)
+def parse_claude_history(
+    path: Path,
+    limit: int | None,
+    *,
+    expected_session_id: str | None = None,
+) -> list[dict[str, str]]:
+    return parse_claude_history_events(
+        bounded_jsonl_events(path),
+        limit,
+        expected_session_id=expected_session_id,
+    )
 
 
 def strip_agentsdock_provider_context(text: str) -> str:
@@ -42106,9 +42346,328 @@ def strip_agentsdock_memory_context(text: str) -> str:
             return cleaned
 
 
-def strip_agentsdock_generated_user_text(text: str) -> str:
-    """Project legacy Codex user records back to their immutable user text."""
-    cleaned = strip_agentsdock_provider_context(text)
+LEGACY_PROVIDER_AUTHORITY_HEADER = "[AgentsDock provider authority]"
+LEGACY_PROVIDER_AUTHORITY_FOOTER = "[End AgentsDock provider authority]"
+LEGACY_PROVIDER_AUTHORITY_BINDING = "(bound to this server, chat, and live run)"
+LEGACY_PROVIDER_AUTHORITY_VERBOSE_LEAD = (
+    "This authority file is bound to this server, chat, and live run. Use it only through "
+    "the AgentsDock helper CLIs; never read, print, quote, copy, or expose it."
+)
+LEGACY_PROVIDER_AUTHORITY_VERBOSE_TAIL = (
+    "Do not read, print, quote, or expose the authority file."
+)
+LEGACY_PROVIDER_FINAL_RESULT_HANDOFF = (
+    "[AgentsDock final-result handoff]\n"
+    "Your successful non-empty final answer will be delivered once to the explicitly referenced chat. "
+    "Do not send it manually.\n"
+    "[End AgentsDock final-result handoff]"
+)
+LEGACY_PROVIDER_AUTHORITY_OPTIONAL_PREFIXES = (
+    "team-send mentions=",
+    "route-hints: ",
+    "handles: ",
+    "respond: ",
+)
+LEGACY_PROVIDER_AUTHORITY_LABELS = frozenset({
+    "cross_chat_instruction",
+    "cross_chat_request_reply",
+    "cross_chat_response",
+    "cross_chat_routes=durable",
+    "cross_chat_routes=job_grants",
+    "emergency",
+    "jobs=blocked",
+    "jobs=full",
+    "jobs=read_only",
+    "publish",
+    "secure_peer_instruction",
+    "secure_peer_request_reply",
+    "secure_peer_response",
+    "team_mail=prebound",
+    "team_mail",
+    "team_read",
+    "team_send",
+    "team_skill_publish",
+})
+
+
+def legacy_provider_authority_run_id(
+    authority_path: str,
+    *,
+    allow_portable_root: bool = False,
+) -> str | None:
+    """Validate a generated authority path without opening the capability."""
+
+    raw_path = str(authority_path or "")
+    if not raw_path or any(ord(character) < 32 for character in raw_path):
+        return None
+    native_path = Path(raw_path)
+    portable_path = next(
+        (
+            candidate
+            for candidate in (PurePosixPath(raw_path), PureWindowsPath(raw_path))
+            if candidate.is_absolute()
+            and candidate.parent.name == "cross_chat_authority"
+            and candidate.parent.parent.name == ".agentsdock"
+            and not any(part in {".", ".."} for part in candidate.parts)
+        ),
+        None,
+    )
+    filename = portable_path.name if portable_path is not None else native_path.name
+    match = re.fullmatch(
+        r"(run_[A-Za-z0-9_-]+)-([0-9a-f]{32})\.json",
+        filename,
+    )
+    if match is None:
+        return None
+    run_id, nonce = match.groups()
+    try:
+        expected_path = cross_chat_authority_path(run_id, nonce)
+    except ValueError:
+        return None
+    if native_path == expected_path:
+        return run_id
+    if (
+        allow_portable_root
+        and portable_path is not None
+    ):
+        return run_id
+    return None
+
+
+def legacy_compact_provider_authority_block_is_generated(
+    block: str,
+    *,
+    expected_session_id: str | None,
+    allow_portable_authority_root: bool = False,
+) -> bool:
+    lines = block.split("\n")
+    if len(lines) < 3 or lines[-1] != "usage: see AgentsDock instructions":
+        return False
+    binding_suffix = " " + LEGACY_PROVIDER_AUTHORITY_BINDING
+    if not lines[0].endswith(binding_suffix):
+        return False
+    try:
+        binding = shlex.split(lines[0][:-len(binding_suffix)])
+    except ValueError:
+        return False
+    if (
+        len(binding) != 2
+        or not binding[0].startswith("authority-file=")
+        or not binding[1].startswith("chat-id=")
+    ):
+        return False
+    authority_path = binding[0].removeprefix("authority-file=")
+    chat_id = binding[1].removeprefix("chat-id=")
+    if (
+        legacy_provider_authority_run_id(
+            authority_path,
+            allow_portable_root=allow_portable_authority_root,
+        ) is None
+        or provider_session_identifier(chat_id) is None
+        or (expected_session_id is not None and chat_id != expected_session_id)
+        or lines[0] != (
+            f"authority-file={shlex.quote(authority_path)} "
+            f"chat-id={shlex.quote(chat_id)} {LEGACY_PROVIDER_AUTHORITY_BINDING}"
+        )
+    ):
+        return False
+    if not lines[1].startswith("actions="):
+        return False
+    labels = lines[1].removeprefix("actions=").split(",")
+    if labels == ["none"]:
+        pass
+    elif (
+        not labels
+        or len(labels) != len(set(labels))
+        or any(label not in LEGACY_PROVIDER_AUTHORITY_LABELS for label in labels)
+    ):
+        return False
+    last_optional_index = -1
+    for line in lines[2:-1]:
+        if not line or any(character in line for character in "\r\x00"):
+            return False
+        for optional_index, prefix in enumerate(
+            LEGACY_PROVIDER_AUTHORITY_OPTIONAL_PREFIXES
+        ):
+            if line.startswith(prefix):
+                if line == prefix or optional_index <= last_optional_index:
+                    return False
+                last_optional_index = optional_index
+                break
+        else:
+            return False
+    return True
+
+
+def shell_word_after(text: str, marker: str) -> str | None:
+    """Parse only the first shell word after a generated command marker."""
+
+    marker_index = text.find(marker)
+    if marker_index < 0:
+        return None
+    fragment = text[marker_index + len(marker):]
+    lexer = shlex.shlex(fragment, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        return next(lexer)
+    except (StopIteration, ValueError):
+        return None
+
+
+def legacy_verbose_provider_authority_block_is_generated(
+    block: str,
+    *,
+    expected_session_id: str | None,
+    allow_portable_authority_root: bool = False,
+) -> bool:
+    lines = block.split("\n")
+    if (
+        len(lines) < 3
+        or lines[0] != LEGACY_PROVIDER_AUTHORITY_VERBOSE_LEAD
+        or lines[-1] != LEGACY_PROVIDER_AUTHORITY_VERBOSE_TAIL
+        or any(not line or any(character in line for character in "\r\x00") for line in lines)
+    ):
+        return False
+    authority_paths: list[str] = []
+    chat_ids: list[str] = []
+    for line in lines:
+        authority_marker = "--authority-file "
+        search_from = 0
+        while True:
+            marker_index = line.find(authority_marker, search_from)
+            if marker_index < 0:
+                break
+            if "$AGENTSDOCK_" not in line[:marker_index]:
+                return False
+            value = shell_word_after(line[marker_index:], authority_marker)
+            if value is None or legacy_provider_authority_run_id(
+                value,
+                allow_portable_root=allow_portable_authority_root,
+            ) is None:
+                return False
+            authority_paths.append(value)
+            search_from = marker_index + len(authority_marker)
+        chat_marker = "--chat-id "
+        search_from = 0
+        while True:
+            marker_index = line.find(chat_marker, search_from)
+            if marker_index < 0:
+                break
+            value = shell_word_after(line[marker_index:], chat_marker)
+            if value is None or provider_session_identifier(value) is None:
+                return False
+            chat_ids.append(value)
+            search_from = marker_index + len(chat_marker)
+    if not authority_paths or len(set(authority_paths)) != 1:
+        return False
+    if expected_session_id is not None and any(
+        chat_id != expected_session_id for chat_id in chat_ids
+    ):
+        return False
+    return True
+
+
+def strip_legacy_agentsdock_provider_authority_suffix(
+    text: str,
+    *,
+    expected_session_id: str | None = None,
+    allow_portable_authority_root: bool = False,
+) -> str:
+    """Remove only a complete, structurally valid generated legacy suffix."""
+
+    original = str(text or "")
+    candidate = original.rstrip()
+    final_result_suffix = "\n\n" + LEGACY_PROVIDER_FINAL_RESULT_HANDOFF
+    if candidate.endswith(final_result_suffix):
+        candidate = candidate[:-len(final_result_suffix)].rstrip()
+    footer = LEGACY_PROVIDER_AUTHORITY_FOOTER
+    if not candidate.endswith(footer):
+        return original
+    footer_index = len(candidate) - len(footer)
+    footer_has_newline = (
+        footer_index > 0 and candidate[footer_index - 1] == "\n"
+    )
+    block_end = footer_index - 1 if footer_has_newline else footer_index
+    header_at_start = LEGACY_PROVIDER_AUTHORITY_HEADER + "\n"
+    separated_header = "\n\n" + header_at_start
+    marker_index = candidate.rfind(separated_header, 0, block_end)
+    if marker_index >= 0:
+        block_start = marker_index + len(separated_header)
+        prefix = candidate[:marker_index]
+    elif candidate.startswith(header_at_start):
+        block_start = len(header_at_start)
+        prefix = ""
+    else:
+        return original
+    block = candidate[block_start:block_end].rstrip()
+    compact_generated = bool(
+        footer_has_newline
+        and legacy_compact_provider_authority_block_is_generated(
+            block,
+            expected_session_id=expected_session_id,
+            allow_portable_authority_root=allow_portable_authority_root,
+        )
+    )
+    verbose_generated = legacy_verbose_provider_authority_block_is_generated(
+        block,
+        expected_session_id=expected_session_id,
+        allow_portable_authority_root=allow_portable_authority_root,
+    )
+    if not (compact_generated or verbose_generated):
+        return original
+    return prefix
+
+
+def strip_all_legacy_agentsdock_provider_authority_suffixes(
+    text: str,
+    *,
+    expected_session_id: str | None = None,
+    allow_portable_authority_root: bool = False,
+) -> str:
+    """Remove every exact generated suffix while preserving lookalikes.
+
+    Provider input can contain a previously copied authority envelope before
+    AgentsDock appends the live envelope for the current run.  Removing only
+    the outer suffix would leave the older capability text available to later
+    clients or agent context and make repeated projections non-idempotent.
+    Each iteration still uses the strict structural validator above.
+    """
+
+    cleaned = str(text or "")
+    while True:
+        projected = strip_legacy_agentsdock_provider_authority_suffix(
+            cleaned,
+            expected_session_id=expected_session_id,
+            allow_portable_authority_root=allow_portable_authority_root,
+        )
+        if projected == cleaned:
+            return cleaned
+        cleaned = projected
+
+
+def strip_agentsdock_generated_user_text(
+    text: str,
+    *,
+    expected_session_id: str | None = None,
+    provider_history: bool = False,
+) -> str:
+    """Project a proven provider user record back to immutable user text.
+
+    Authority stripping requires provider-record provenance or an explicit
+    chat boundary. Generic callers may use this helper for legacy context and
+    memory wrappers, so treating an exact user-authored example as authority
+    at that boundary would silently delete legitimate quoted evidence.
+    """
+
+    cleaned = str(text or "")
+    if provider_history or expected_session_id is not None:
+        cleaned = strip_all_legacy_agentsdock_provider_authority_suffixes(
+            cleaned,
+            expected_session_id=expected_session_id,
+            allow_portable_authority_root=True,
+        )
+    cleaned = strip_agentsdock_provider_context(cleaned)
     cleaned = strip_agentsdock_memory_context(cleaned)
     cleaned, latest_file_ids = split_legacy_attached_files(
         cleaned,
@@ -42124,7 +42683,11 @@ def strip_agentsdock_generated_user_text(text: str) -> str:
     return cleaned
 
 
-def codex_history_event_item(event: dict[str, Any]) -> dict[str, str] | None:
+def codex_history_event_item(
+    event: dict[str, Any],
+    *,
+    expected_session_id: str | None = None,
+) -> dict[str, str] | None:
     event_type = event.get("type")
     payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
     if event_type == "event_msg":
@@ -42132,7 +42695,11 @@ def codex_history_event_item(event: dict[str, Any]) -> dict[str, str] | None:
         if payload_type == "user_message":
             return normalized_history_item(
                 "user",
-                strip_agentsdock_generated_user_text(str(payload.get("message") or "")),
+                strip_agentsdock_generated_user_text(
+                    str(payload.get("message") or ""),
+                    expected_session_id=expected_session_id,
+                    provider_history=True,
+                ),
             )
         if payload_type == "agent_message":
             return normalized_history_item(
@@ -42145,7 +42712,9 @@ def codex_history_event_item(event: dict[str, Any]) -> dict[str, str] | None:
             return normalized_history_item(
                 "user",
                 strip_agentsdock_generated_user_text(
-                    text_from_content(payload.get("content"))
+                    text_from_content(payload.get("content"), compact=False),
+                    expected_session_id=expected_session_id,
+                    provider_history=True,
                 ),
             )
         if role == "assistant":
@@ -42156,8 +42725,16 @@ def codex_history_event_item(event: dict[str, Any]) -> dict[str, str] | None:
     return None
 
 
-def append_codex_history_event(items: Any, event: dict[str, Any]) -> None:
-    item = codex_history_event_item(event)
+def append_codex_history_event(
+    items: Any,
+    event: dict[str, Any],
+    *,
+    expected_session_id: str | None = None,
+) -> None:
+    item = codex_history_event_item(
+        event,
+        expected_session_id=expected_session_id,
+    )
     if item is not None:
         add_history_item(items, item["kind"], item["text"])
 
@@ -42165,17 +42742,32 @@ def append_codex_history_event(items: Any, event: dict[str, Any]) -> None:
 def parse_codex_history_events(
     events: Iterable[dict[str, Any]],
     limit: int | None,
+    *,
+    expected_session_id: str | None = None,
 ) -> list[dict[str, str]]:
     items: deque[dict[str, str]] = deque(
         maxlen=normalized_history_import_limit(limit)
     )
     for event in events:
-        append_codex_history_event(items, event)
+        append_codex_history_event(
+            items,
+            event,
+            expected_session_id=expected_session_id,
+        )
     return list(items)
 
 
-def parse_codex_history(path: Path, limit: int | None) -> list[dict[str, str]]:
-    return parse_codex_history_events(bounded_jsonl_events(path), limit)
+def parse_codex_history(
+    path: Path,
+    limit: int | None,
+    *,
+    expected_session_id: str | None = None,
+) -> list[dict[str, str]]:
+    return parse_codex_history_events(
+        bounded_jsonl_events(path),
+        limit,
+        expected_session_id=expected_session_id,
+    )
 
 
 def session_provider_id(sess: dict[str, Any]) -> str | None:
@@ -42269,10 +42861,13 @@ def codex_transcript_preview(path: Path) -> str | None:
             if event_type == "event_msg" and payload.get("type") == "user_message":
                 text = str(payload.get("message") or "")
             elif event_type == "response_item" and payload.get("type") == "message" and payload.get("role") == "user":
-                text = text_from_content(payload.get("content"))
+                text = text_from_content(payload.get("content"), compact=False)
             if not text:
                 continue
-            text = compact_import_text(strip_agentsdock_generated_user_text(text))
+            text = compact_import_text(strip_agentsdock_generated_user_text(
+                text,
+                provider_history=True,
+            ))
             if text and not is_import_boilerplate(text):
                 return text[:160]
     return None
@@ -42803,6 +43398,7 @@ def parse_provider_history_delta(
     limit: int | None,
     expected_stat: dict[str, int],
     previous_last_item_digest: str,
+    expected_session_id: str | None = None,
 ) -> tuple[list[dict[str, str]], int, str, bool]:
     """Consume the front of an append-only delta without skipping messages."""
 
@@ -42824,9 +43420,15 @@ def parse_provider_history_delta(
         item = None
         if event is not None:
             if backend == BACKEND_CLAUDE:
-                item = claude_history_event_item(event)
+                item = claude_history_event_item(
+                    event,
+                    expected_session_id=expected_session_id,
+                )
             elif backend == BACKEND_CODEX:
-                item = codex_history_event_item(event)
+                item = codex_history_event_item(
+                    event,
+                    expected_session_id=expected_session_id,
+                )
         if item is None:
             cursor_offset = record_end
             continue
@@ -43585,6 +44187,7 @@ async def append_imported_history(
                 "backend": backend,
                 "prompt": item["text"],
                 "imported": True,
+                "provider_history_sanitized": True,
             }))
         elif item["kind"] == "assistant":
             imported_events.append(("assistant_text", {
@@ -43643,6 +44246,7 @@ async def append_staged_imported_history(
                 "backend": backend,
                 "prompt": item["text"],
                 "imported": True,
+                "provider_history_sanitized": True,
             }))
         elif item["kind"] == "assistant":
             imported_events.append(("assistant_text", {
@@ -44172,9 +44776,16 @@ def fork_event_file_ids(event: dict[str, Any]) -> list[str]:
 async def copy_fork_history(parent_id: str, child_id: str) -> int:
     # Fork history copy is an internal clone operation, not an API page. Do not
     # route it through read_events(), which clamps responses for UI pagination.
-    parent_events = await asyncio.to_thread(
+    stored_parent_events = await asyncio.to_thread(
         lambda: list(iter_session_events(parent_id))
     )
+    parent_events = [
+        # Internal clone keeps the hidden-boundary marker durable so the
+        # child's semantic index omits this empty provider-only turn while
+        # still routing a following imported assistant event correctly.
+        project_legacy_imported_provider_event(event, parent_id)
+        for event in stored_parent_events
+    ]
     internal_run_ids = {
         str(event.get("run_id"))
         for event in parent_events
@@ -44420,6 +45031,7 @@ def build_fork_memory(
     }
     events: deque[dict[str, Any]] = deque(maxlen=160)
     for event in iter_session_events(parent_id):
+        event = project_provider_history_event_for_egress(event, parent_id)
         run_id = str(event.get("run_id") or "").strip()
         event_type = str(event.get("type") or "")
         if (

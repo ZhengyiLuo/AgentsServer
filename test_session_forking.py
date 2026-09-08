@@ -3098,6 +3098,95 @@ class ForkMemoryTests(unittest.TestCase):
         self.assertIn("The fix is ready.", memory)
         self.assertNotIn("tool output 499", memory)
 
+    def test_legacy_provider_prompts_do_not_enter_fork_memory(self) -> None:
+        parent_id = "legacy-memory-parent"
+        authority = agent_server.cross_chat_provider_authority_block(
+            [],
+            agent_server.cross_chat_authority_path(
+                "run_memory_projection",
+                "fedcba0987654321fedcba0987654321",
+            ),
+            parent_id,
+            {"publish"},
+            "blocked",
+            compact=True,
+        )
+        notice = (
+            "<task-notification>\n"
+            "<task-id>task_mem01</task-id>\n"
+            "<tool-use-id>toolu_memory_projection_123</tool-use-id>\n"
+            "<status>completed</status>\n"
+            "<summary>Private memory notification</summary>\n"
+            "</task-notification>"
+        )
+        common = {
+            "session_id": parent_id,
+            "run_id": "import_memory_projection",
+            "backend": agent_server.BACKEND_CLAUDE,
+            "imported": True,
+        }
+        events = [
+            {
+                **common,
+                "type": "turn_started",
+                "prompt": "Retained memory request" + authority,
+            },
+            {
+                **common,
+                "type": "turn_started",
+                "prompt": notice,
+            },
+            {
+                **common,
+                "type": "assistant_text",
+                "text": "Retained answer after empty boundary",
+            },
+        ]
+        parent = {
+            "id": parent_id,
+            "title": "Parent",
+            "cwd": "/tmp",
+            "backend": agent_server.BACKEND_CLAUDE,
+        }
+        with patch.object(
+            agent_server,
+            "iter_session_events",
+            side_effect=lambda _session_id: iter(events),
+        ):
+            memory = agent_server.build_fork_memory(parent, parent_id)
+
+        self.assertIn("Retained memory request", memory)
+        self.assertIn("Retained answer after empty boundary", memory)
+        self.assertNotIn("AgentsDock provider authority", memory)
+        self.assertNotIn("Private memory notification", memory)
+
+    def test_provider_only_notice_is_not_claude_fork_conversation(self) -> None:
+        parent_id = "legacy-providerless-parent"
+        notice = (
+            "<task-notification>\n"
+            "<task-id>task_fork2</task-id>\n"
+            "<tool-use-id>toolu_providerless_fork_123</tool-use-id>\n"
+            "<status>completed</status>\n"
+            "<summary>Private providerless notification</summary>\n"
+            "</task-notification>"
+        )
+        event = {
+            "session_id": parent_id,
+            "type": "turn_started",
+            "run_id": "import_providerless_projection",
+            "backend": agent_server.BACKEND_CLAUDE,
+            "imported": True,
+            "prompt": notice,
+        }
+        with patch.object(
+            agent_server,
+            "iter_session_events",
+            return_value=iter([event]),
+        ):
+            self.assertFalse(
+                agent_server.claude_fork_has_conversation(parent_id)
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

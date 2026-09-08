@@ -609,6 +609,7 @@ class StagedHistoryBatchTests(unittest.IsolatedAsyncioTestCase):
             [event_type for event_type, _payload in event_specs],
             ["history_imported", "turn_started", "assistant_text", "turn_finished"],
         )
+        self.assertTrue(event_specs[1][1]["provider_history_sanitized"])
         self.assertTrue(event_specs[-1][1]["imported"])
 
     async def test_staged_history_rejects_an_incomplete_batch_write(self) -> None:

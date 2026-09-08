@@ -440,6 +440,8 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_provider_quiesce_has_a_bounded_retryable_timeout(self):
         never = asyncio.Event()
+        stragglers: dict[str, asyncio.Task] = {}
+        release_tasks: set[asyncio.Task] = set()
 
         async def block_forever():
             await never.wait()
@@ -456,9 +458,35 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
             agent_server,
             "MANAGED_UPDATE_PROVIDER_QUIESCE_TIMEOUT_SECONDS",
             0.01,
+        ), patch.object(
+            agent_server,
+            "CODEX_SESSION_CLEANUP_TIMEOUT_SECONDS",
+            0.0,
+        ), patch.object(
+            agent_server,
+            "MANAGED_UPDATE_PROVIDER_TEARDOWN_MARGIN_SECONDS",
+            0.0,
+        ), patch.object(
+            agent_server,
+            "MANAGED_UPDATE_PROVIDER_QUIESCE_STRAGGLERS",
+            stragglers,
+        ), patch.object(
+            agent_server,
+            "MANAGED_UPDATE_PROVIDER_FENCE_RELEASE_TASKS",
+            release_tasks,
+        ), patch.object(
+            agent_server,
+            "reopen_after_managed_update_provider_quiesce",
+            new_callable=AsyncMock,
         ):
             with self.assertRaises(HTTPException) as raised:
                 await agent_server.close_managed_update_provider_managers()
+
+            never.set()
+            await asyncio.gather(*tuple(stragglers.values()))
+            await asyncio.sleep(0)
+            if release_tasks:
+                await asyncio.gather(*tuple(release_tasks))
 
         self.assertEqual(raised.exception.status_code, 504)
         self.assertEqual(
@@ -466,6 +494,531 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
             "provider_quiesce_timeout",
         )
         self.assertTrue(raised.exception.detail["retryable"])
+
+    async def test_provider_quiesce_covers_nested_idle_supervisor_cleanup(self):
+        release = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        cleanup_cancelled = False
+
+        async def close_idle_supervisor():
+            nonlocal cleanup_cancelled
+            cleanup_started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cleanup_cancelled = True
+                raise
+
+        async def release_after_inner_deadline_started():
+            await cleanup_started.wait()
+            await asyncio.sleep(0.02)
+            release.set()
+
+        releaser = asyncio.create_task(release_after_inner_deadline_started())
+        try:
+            with patch.object(
+                agent_server,
+                "close_claude_sdk_manager",
+                side_effect=close_idle_supervisor,
+            ), patch.object(
+                agent_server,
+                "close_codex_app_server_manager",
+                side_effect=close_idle_supervisor,
+            ), patch.object(
+                agent_server,
+                "MANAGED_UPDATE_PROVIDER_QUIESCE_TIMEOUT_SECONDS",
+                0.005,
+            ), patch.object(
+                agent_server,
+                "CODEX_SESSION_CLEANUP_TIMEOUT_SECONDS",
+                0.03,
+            ), patch.object(
+                agent_server,
+                "MANAGED_UPDATE_PROVIDER_TEARDOWN_MARGIN_SECONDS",
+                0.02,
+            ):
+                await agent_server.close_managed_update_provider_managers()
+        finally:
+            release.set()
+            await releaser
+
+        self.assertFalse(cleanup_cancelled)
+
+    async def test_provider_quiesce_straggler_fences_replacement_until_terminal(self):
+        release = asyncio.Event()
+        cancellation_seen = False
+        stragglers: dict[str, asyncio.Task] = {}
+        release_tasks: set[asyncio.Task] = set()
+
+        async def slow_idle_supervisor():
+            nonlocal cancellation_seen
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancellation_seen = True
+                raise
+
+        async def close_immediately():
+            return None
+
+        reopen = AsyncMock()
+        with patch.object(
+            agent_server,
+            "close_claude_sdk_manager",
+            side_effect=slow_idle_supervisor,
+        ), patch.object(
+            agent_server,
+            "close_codex_app_server_manager",
+            side_effect=close_immediately,
+        ), patch.object(
+            agent_server,
+            "MANAGED_UPDATE_PROVIDER_QUIESCE_TIMEOUT_SECONDS",
+            0.005,
+        ), patch.object(
+            agent_server,
+            "CODEX_SESSION_CLEANUP_TIMEOUT_SECONDS",
+            0.0,
+        ), patch.object(
+            agent_server,
+            "MANAGED_UPDATE_PROVIDER_TEARDOWN_MARGIN_SECONDS",
+            0.0,
+        ), patch.object(
+            agent_server,
+            "MANAGED_UPDATE_PROVIDER_QUIESCE_STRAGGLERS",
+            stragglers,
+        ), patch.object(
+            agent_server,
+            "MANAGED_UPDATE_PROVIDER_FENCE_RELEASE_TASKS",
+            release_tasks,
+        ), patch.object(
+            agent_server,
+            "reopen_after_managed_update_provider_quiesce",
+            new=reopen,
+        ):
+            with self.assertRaises(HTTPException):
+                await agent_server.close_managed_update_provider_managers()
+
+            self.assertFalse(cancellation_seen)
+            self.assertTrue(
+                agent_server.managed_update_provider_quiesce_in_progress()
+            )
+            self.assertTrue(
+                agent_server.managed_server_update_blocks_work({"phase": "pending"})
+            )
+            self.assertIsNotNone(
+                agent_server.managed_server_update_admission_blocker()
+            )
+            old_close = stragglers["claude-sdk"]
+            release.set()
+            await asyncio.wait_for(asyncio.shield(old_close), timeout=1)
+            await asyncio.sleep(0)
+            if release_tasks:
+                await asyncio.gather(*tuple(release_tasks))
+
+            self.assertFalse(
+                agent_server.managed_update_provider_quiesce_in_progress()
+            )
+            self.assertFalse(cancellation_seen)
+            reopen.assert_awaited_once_with()
+
+    async def test_provider_manager_factories_reject_quiesce_straggler(self):
+        release = asyncio.Event()
+        old_close = asyncio.create_task(release.wait())
+        stragglers = {"codex-app-server": old_close}
+        codex_manager = MagicMock()
+        claude_manager = MagicMock()
+        store = MagicMock()
+        store.sessions = {
+            "chat": {
+                "id": "chat",
+                "backend": "codex",
+                "codex_thread_id": "thread-1",
+            }
+        }
+        with patch.object(
+            agent_server,
+            "MANAGED_UPDATE_PROVIDER_QUIESCE_STRAGGLERS",
+            stragglers,
+        ), patch.object(
+            agent_server,
+            "CODEX_APP_SERVER_MANAGER",
+            None,
+        ), patch.object(
+            agent_server,
+            "CLAUDE_SDK_MANAGER",
+            None,
+        ), patch.object(
+            agent_server,
+            "CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH",
+            None,
+        ), patch.object(
+            agent_server,
+            "CodexAppServerManager",
+            return_value=codex_manager,
+        ) as create_codex, patch.object(
+            agent_server,
+            "ClaudeSDKSupervisorManager",
+            return_value=claude_manager,
+        ) as create_claude, patch.object(
+            agent_server,
+            "STORE",
+            store,
+        ), patch.object(
+            agent_server,
+            "build_subagent_snapshot",
+            return_value={"session_id": "chat", "subagents": []},
+        ):
+            snapshot = await agent_server.get_session_subagents("chat", 64)
+            with self.assertRaises(HTTPException):
+                await agent_server.claude_sdk_manager()
+
+            self.assertEqual(snapshot["session_id"], "chat")
+            create_codex.assert_not_called()
+            create_claude.assert_not_called()
+
+            release.set()
+            await old_close
+            stragglers.clear()
+            self.assertIs(
+                await agent_server.codex_app_server_manager(),
+                codex_manager,
+            )
+            self.assertIs(
+                await agent_server.claude_sdk_manager(),
+                claude_manager,
+            )
+
+        create_codex.assert_called_once()
+        create_claude.assert_called_once()
+
+    async def test_codex_post_close_cleanup_blocks_replacement_generation(self):
+        cleanup_entered = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        old_manager = MagicMock()
+        old_manager.close = AsyncMock()
+        replacement = MagicMock()
+
+        async def slow_runtime_reset():
+            cleanup_entered.set()
+            await release_cleanup.wait()
+
+        with patch.object(
+            agent_server,
+            "CODEX_APP_SERVER_MANAGER",
+            old_manager,
+        ), patch.object(
+            agent_server,
+            "CODEX_APP_SERVER_MANAGER_EPOCH",
+            7,
+        ), patch.object(
+            agent_server,
+            "CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH",
+            None,
+        ), patch.object(
+            agent_server,
+            "CODEX_APP_SERVER_MANAGER_LOCK",
+            asyncio.Lock(),
+        ), patch.object(
+            agent_server,
+            "CODEX_APP_SERVER_THREAD_LRU_LOCK",
+            asyncio.Lock(),
+        ), patch.object(
+            agent_server,
+            "cancel_codex_interactions",
+            new=AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "cancel_codex_native_actions",
+            new=AsyncMock(),
+        ), patch.object(
+            agent_server,
+            "reset_codex_ephemeral_runtime_metadata",
+            side_effect=slow_runtime_reset,
+        ), patch.object(
+            agent_server,
+            "CodexAppServerManager",
+            return_value=replacement,
+        ) as create_replacement:
+            closing = asyncio.create_task(
+                agent_server.close_codex_app_server_manager()
+            )
+            await asyncio.wait_for(cleanup_entered.wait(), timeout=1)
+            with self.assertRaises(HTTPException):
+                await agent_server.codex_app_server_manager()
+            create_replacement.assert_not_called()
+
+            release_cleanup.set()
+            await closing
+            self.assertIs(
+                await agent_server.codex_app_server_manager(),
+                replacement,
+            )
+
+        old_manager.close.assert_awaited_once_with()
+        create_replacement.assert_called_once()
+
+    async def test_provider_quiesce_failure_keeps_fence_and_records_status(self):
+        release = asyncio.Event()
+        stragglers: dict[str, asyncio.Task] = {}
+        settlement_tasks: set[asyncio.Task] = set()
+        terminal_attachments = MagicMock()
+        terminal_attachments.reopen_if_update_inactive = AsyncMock()
+
+        async def fail_after_release():
+            await release.wait()
+            raise RuntimeError("provider close failed")
+
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            agent_server,
+            "SERVER_UPDATE_STATUS_FILE",
+            Path(temporary) / "status.json",
+        ), patch.object(
+            agent_server,
+            "SERVER_UPDATE_OPERATION_LOCK",
+            asyncio.Lock(),
+        ), patch.object(
+            agent_server,
+            "MANAGED_UPDATE_PROVIDER_QUIESCE_STRAGGLERS",
+            stragglers,
+        ), patch.object(
+            agent_server,
+            "MANAGED_UPDATE_PROVIDER_FENCE_RELEASE_TASKS",
+            settlement_tasks,
+        ), patch.object(
+            agent_server,
+            "TERMINAL_ATTACHMENTS",
+            terminal_attachments,
+        ):
+            agent_server.write_fresh_server_update_status(
+                phase="pending",
+                schedule_id="a" * 32,
+                target_version="1.1.0",
+                track="stable",
+                error_code="provider_quiesce_timeout",
+            )
+            failed_close = asyncio.create_task(fail_after_release())
+            agent_server.retain_managed_update_provider_quiesce_straggler(
+                "claude-sdk",
+                failed_close,
+            )
+            release.set()
+            await asyncio.gather(failed_close, return_exceptions=True)
+            await asyncio.sleep(0)
+            if settlement_tasks:
+                await asyncio.gather(*tuple(settlement_tasks))
+            status = agent_server.read_server_update_status()
+
+            self.assertTrue(
+                agent_server.managed_update_provider_quiesce_in_progress()
+            )
+            self.assertIs(stragglers["claude-sdk"], failed_close)
+            self.assertEqual(status["error_code"], "provider_quiesce_failed")
+            self.assertTrue(status["retryable"])
+            terminal_attachments.reopen_if_update_inactive.assert_not_awaited()
+
+    async def test_failed_provider_fence_survives_status_check_start_and_cancel(self):
+        schedule_id = "f" * 32
+        stragglers: dict[str, asyncio.Task] = {}
+
+        async def fail_close():
+            raise RuntimeError("provider close failed")
+
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            agent_server,
+            "SERVER_UPDATE_STATUS_FILE",
+            Path(temporary) / "status.json",
+        ), patch.object(
+            agent_server,
+            "SERVER_UPDATE_OPERATION_LOCK",
+            asyncio.Lock(),
+        ), patch.object(
+            agent_server,
+            "MANAGED_UPDATE_PROVIDER_QUIESCE_STRAGGLERS",
+            stragglers,
+        ), patch.object(
+            agent_server,
+            "signed_release_manifest",
+            new=AsyncMock(),
+        ) as signed_manifest:
+            failed_close = asyncio.create_task(fail_close())
+            await asyncio.gather(failed_close, return_exceptions=True)
+            stragglers["codex-app-server"] = failed_close
+            agent_server.write_fresh_server_update_status(
+                phase=agent_server.SERVER_UPDATE_PENDING_PHASE,
+                schedule_id=schedule_id,
+                target_version="1.1.0",
+                latest_version="1.1.0",
+                track="stable",
+                when_idle=True,
+                cancelable=True,
+                blocker_counts={
+                    "active_runs": 9,
+                    "queued_turns": 8,
+                    "provider_background_tasks": 7,
+                    "in_flight_server_changes": 6,
+                },
+                error_code="provider_quiesce_timeout",
+                error_action="Wait briefly.",
+                retryable=True,
+            )
+
+            status = await agent_server.server_update_status()
+            checked = await agent_server.check_server_update()
+            with self.assertRaises(HTTPException) as start_raised:
+                await agent_server._start_server_update(
+                    agent_server.ServerUpdateRequest(
+                        version="1.1.0",
+                        when_idle=True,
+                    ),
+                    expected_schedule_id=schedule_id,
+                )
+            with self.assertRaises(HTTPException) as cancel_raised:
+                await agent_server.cancel_server_update(
+                    agent_server.ServerUpdateCancelRequest(
+                        schedule_id=schedule_id,
+                    )
+                )
+            persisted = agent_server.read_server_update_status()
+
+        restart_action = (
+            agent_server.managed_update_provider_quiesce_failure_detail()["action"]
+        )
+        for current in (status, checked, persisted):
+            self.assertEqual(
+                current["phase"],
+                agent_server.SERVER_UPDATE_PENDING_PHASE,
+            )
+            self.assertEqual(current["schedule_id"], schedule_id)
+            self.assertEqual(current["error_code"], "provider_quiesce_failed")
+            self.assertEqual(current["error_action"], restart_action)
+            self.assertTrue(current["retryable"])
+        self.assertEqual(persisted["blocker_counts"], {
+            "active_runs": 0,
+            "queued_turns": 0,
+            "provider_background_tasks": 1,
+            "in_flight_server_changes": 0,
+        })
+        for raised in (start_raised.exception, cancel_raised.exception):
+            self.assertEqual(raised.status_code, 503)
+            self.assertEqual(raised.detail["code"], "provider_quiesce_failed")
+            self.assertEqual(raised.detail["action"], restart_action)
+        signed_manifest.assert_not_awaited()
+
+    async def test_fast_close_failure_with_slow_peer_installs_hard_fence(self):
+        stragglers: dict[str, asyncio.Task] = {}
+        settlement_tasks: set[asyncio.Task] = set()
+        release_slow_close = asyncio.Event()
+
+        async def fail_immediately():
+            raise RuntimeError("provider close failed")
+
+        async def close_slowly():
+            await release_slow_close.wait()
+
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            agent_server,
+            "SERVER_UPDATE_STATUS_FILE",
+            Path(temporary) / "status.json",
+        ), patch.object(
+            agent_server,
+            "SERVER_UPDATE_OPERATION_LOCK",
+            asyncio.Lock(),
+        ), patch.object(
+            agent_server,
+            "MANAGED_UPDATE_PROVIDER_QUIESCE_STRAGGLERS",
+            stragglers,
+        ), patch.object(
+            agent_server,
+            "MANAGED_UPDATE_PROVIDER_FENCE_RELEASE_TASKS",
+            settlement_tasks,
+        ), patch.object(
+            agent_server,
+            "close_claude_sdk_manager",
+            side_effect=close_slowly,
+        ), patch.object(
+            agent_server,
+            "close_codex_app_server_manager",
+            side_effect=fail_immediately,
+        ), patch.object(
+            agent_server,
+            "MANAGED_UPDATE_PROVIDER_QUIESCE_TIMEOUT_SECONDS",
+            0.005,
+        ), patch.object(
+            agent_server,
+            "CODEX_SESSION_CLEANUP_TIMEOUT_SECONDS",
+            0.0,
+        ), patch.object(
+            agent_server,
+            "MANAGED_UPDATE_PROVIDER_TEARDOWN_MARGIN_SECONDS",
+            0.0,
+        ):
+            agent_server.write_fresh_server_update_status(
+                phase="available",
+                latest_version="1.1.0",
+                error_code="provider_quiesce_timeout",
+            )
+            with self.assertRaises(HTTPException) as raised:
+                await agent_server.close_managed_update_provider_managers()
+            slow_close = stragglers["claude-sdk"]
+            release_slow_close.set()
+            await slow_close
+            await asyncio.sleep(0)
+            if settlement_tasks:
+                await asyncio.gather(*tuple(settlement_tasks))
+            status = agent_server.read_server_update_status()
+
+            self.assertEqual(raised.exception.status_code, 502)
+            self.assertEqual(
+                raised.exception.detail["code"],
+                "provider_quiesce_failed",
+            )
+            self.assertTrue(
+                agent_server.managed_update_provider_quiesce_in_progress()
+            )
+            self.assertIn("codex-app-server", stragglers)
+            self.assertNotIn("claude-sdk", stragglers)
+            self.assertEqual(status["error_code"], "provider_quiesce_failed")
+
+    async def test_provider_quiesce_reopen_uses_status_under_operation_lock(self):
+        operation_lock = asyncio.Lock()
+        terminal_attachments = MagicMock()
+        observed: list[dict] = []
+
+        async def observe_reopen(status):
+            observed.append(dict(status))
+            return False
+
+        terminal_attachments.reopen_if_update_inactive = observe_reopen
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            agent_server,
+            "SERVER_UPDATE_STATUS_FILE",
+            Path(temporary) / "status.json",
+        ), patch.object(
+            agent_server,
+            "SERVER_UPDATE_OPERATION_LOCK",
+            operation_lock,
+        ), patch.object(
+            agent_server,
+            "TERMINAL_ATTACHMENTS",
+            terminal_attachments,
+        ):
+            agent_server.write_fresh_server_update_status(
+                phase="pending",
+                schedule_id="b" * 32,
+                target_version="1.1.0",
+                track="stable",
+            )
+            await operation_lock.acquire()
+            reopening = asyncio.create_task(
+                agent_server.reopen_after_managed_update_provider_quiesce()
+            )
+            await asyncio.sleep(0)
+            self.assertEqual(observed, [])
+            agent_server.write_server_update_status(phase="starting")
+            operation_lock.release()
+            await reopening
+
+        self.assertEqual(observed[0]["phase"], "starting")
 
     def test_service_cgroup_probe_distinguishes_nonservice_from_unreadable_self_cgroup(self):
         with patch.object(agent_server.sys, "platform", "linux"), \
@@ -632,6 +1185,86 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("409:", status["message"])
         self.assertIsNone(admission_blocker)
         quiesce.assert_awaited_once_with(service_cgroup=cgroup)
+        terminal_attachments.reopen_admission.assert_awaited_once_with()
+        run_tmux.assert_not_called()
+
+    async def test_scheduled_provider_quiesce_timeout_restores_pending_reservation(self):
+        cgroup = "/user.slice/user@1000.service/app.slice/agents-server.service"
+        schedule_id = "d" * 32
+        blocker = HTTPException(
+            status_code=504,
+            detail=agent_server.managed_update_provider_quiesce_timeout_detail(),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "update_runner.py"
+            key = root / "release-public-key.pem"
+            status_path = root / "status.json"
+            runner.write_text("# runner\n")
+            key.write_text("public key\n")
+            terminal_attachments = MagicMock()
+            terminal_attachments.reopen_admission = AsyncMock()
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", status_path), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
+                 patch.object(
+                     agent_server,
+                     "ensure_managed_update_tmux_isolated",
+                     return_value=cgroup,
+                 ), \
+                 patch.object(
+                     agent_server,
+                     "quiesce_managed_update_service_cgroup",
+                     side_effect=blocker,
+                 ), \
+                 patch.object(
+                     agent_server,
+                     "TERMINAL_ATTACHMENTS",
+                     terminal_attachments,
+                 ), \
+                 patch.object(agent_server, "run_tmux") as run_tmux:
+                agent_server.write_fresh_server_update_status(
+                    phase="pending",
+                    schedule_id=schedule_id,
+                    target_version="1.1.0",
+                    latest_version="1.1.0",
+                    track="stable",
+                    when_idle=True,
+                    cancelable=True,
+                    pending_at="2026-09-08T00:00:00Z",
+                    blocker_counts={
+                        "active_runs": 3,
+                        "queued_turns": 2,
+                        "provider_background_tasks": 4,
+                        "in_flight_server_changes": 1,
+                    },
+                )
+                with self.assertRaises(HTTPException) as raised:
+                    await agent_server._start_server_update(
+                        agent_server.ServerUpdateRequest(
+                            version="1.1.0",
+                            when_idle=True,
+                        ),
+                        expected_schedule_id=schedule_id,
+                    )
+                status = agent_server.read_server_update_status()
+
+        self.assertEqual(raised.exception.status_code, 504)
+        self.assertEqual(status["phase"], "pending")
+        self.assertEqual(status["schedule_id"], schedule_id)
+        self.assertEqual(status["target_version"], "1.1.0")
+        self.assertTrue(status["cancelable"])
+        self.assertTrue(status["retryable"])
+        self.assertEqual(status["error_code"], "provider_quiesce_timeout")
+        self.assertEqual(status["blocker_counts"], {
+            "active_runs": 0,
+            "queued_turns": 0,
+            "provider_background_tasks": 1,
+            "in_flight_server_changes": 0,
+        })
         terminal_attachments.reopen_admission.assert_awaited_once_with()
         run_tmux.assert_not_called()
 
@@ -2463,6 +3096,58 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         terminal_attachments.reopen_if_update_inactive.assert_awaited_once_with(
             cancelled
         )
+
+    async def test_pending_quiesce_timeout_retries_without_rearming_jobs(self):
+        schedule_id = "f" * 32
+        timeout = HTTPException(
+            status_code=504,
+            detail=agent_server.managed_update_provider_quiesce_timeout_detail(),
+        )
+
+        async def stop_waiter(_delay):
+            raise asyncio.CancelledError
+
+        with tempfile.TemporaryDirectory() as temporary:
+            status_path = Path(temporary) / "status.json"
+            advance = AsyncMock(side_effect=timeout)
+            fail_pending = MagicMock()
+            resume_jobs = AsyncMock()
+            with patch.object(
+                agent_server,
+                "SERVER_UPDATE_STATUS_FILE",
+                status_path,
+            ), patch.object(
+                agent_server,
+                "advance_pending_server_update_once",
+                new=advance,
+            ), patch.object(
+                agent_server,
+                "fail_pending_server_update",
+                new=fail_pending,
+            ), patch.object(
+                agent_server.JOBS,
+                "resume_update_parked",
+                new=resume_jobs,
+            ), patch.object(
+                agent_server.asyncio,
+                "sleep",
+                side_effect=stop_waiter,
+            ):
+                agent_server.write_fresh_server_update_status(
+                    phase="pending",
+                    schedule_id=schedule_id,
+                    target_version="1.1.0",
+                    latest_version="1.1.0",
+                    track="stable",
+                    when_idle=True,
+                    cancelable=True,
+                )
+                with self.assertRaises(asyncio.CancelledError):
+                    await agent_server.server_update_pending_waiter_loop()
+
+        advance.assert_awaited_once_with()
+        fail_pending.assert_not_called()
+        resume_jobs.assert_not_awaited()
 
     async def test_cancel_losing_pending_to_start_race_is_not_cancelable(self):
         with tempfile.TemporaryDirectory() as temporary:

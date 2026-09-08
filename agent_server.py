@@ -108,6 +108,8 @@ from team_hub_host import (
     TEAM_HUB_MOUNT_PATH,
     TEAM_HUB_SERVER_SESSION_MOUNT_PATH,
     TEAM_HUB_TRANSPORT_DIRECT_IP,
+    TEAM_HUB_TRANSPORT_LOOPBACK,
+    TEAM_HUB_TRANSPORT_TAILSCALE_SERVE,
     ManagedTeamHubHost,
     configured_team_hub_endpoint,
     configured_team_hub_hosts,
@@ -120,6 +122,7 @@ from agentsdock_team_hub.service import (
 from agentsdock_team_hub.store import (
     TEAM_ATTACHMENT_CHUNK_BYTES,
     HubError,
+    HubStore,
     MANAGED_SERVER_PRINCIPAL_ID,
 )
 from agentsdock_team_hub.secure_peer import SecurePeerError
@@ -227,9 +230,22 @@ def parse_config_env_file(text: str) -> dict[str, str]:
             continue
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
+            if value[0] == '"':
+                try:
+                    decoded = json.loads(value)
+                except (TypeError, ValueError):
+                    decoded = value[1:-1]
+                value = decoded if isinstance(decoded, str) else value[1:-1]
+            else:
+                value = value[1:-1]
         values[name] = value
     return values
+
+
+CONFIG_ENV_RUNTIME_OVERRIDE_NAMES = {
+    "AGENTSDOCK_SERVER_NAME",
+    "AGENTSDOCK_TEAM_HUB_MODE",
+}
 
 
 def load_config_env_file(path: Path | None = None) -> list[str]:
@@ -242,10 +258,11 @@ def load_config_env_file(path: Path | None = None) -> list[str]:
     provider CLI, with nothing reporting that the file was ignored. Reading
     it here makes both platforms behave the same.
 
-    Existing process variables always win, so values injected by the service
-    manager (access token, state dir, port, PATH) can never be overridden by
-    a stale copy left behind in the file. Returns the names applied, for
-    logging; values are never logged.
+    Existing process variables always win except for the two live-mutable
+    canonical settings (server name and Team Hub role). This lets a launchd
+    process honor a role switch on its next launch without allowing the file
+    to override its token, port, paths, or other service-manager authority.
+    Returns the names applied, for logging; values are never logged.
     """
 
     target = CONFIG_ENV_FILE if path is None else path
@@ -255,7 +272,7 @@ def load_config_env_file(path: Path | None = None) -> list[str]:
         return []
     applied: list[str] = []
     for name, value in parse_config_env_file(text).items():
-        if name in os.environ:
+        if name in os.environ and name not in CONFIG_ENV_RUNTIME_OVERRIDE_NAMES:
             continue
         os.environ[name] = value
         applied.append(name)
@@ -309,6 +326,7 @@ SERVER_IDENTITY_FILE = STATE_DIR / "server-identity"
 SERVER_UPDATE_STATUS_FILE = SERVER_ADMIN_ROOT / "server-update.json"
 SERVER_UPDATE_LOG_FILE = SERVER_ADMIN_ROOT / "server-update.log"
 SERVER_RESTART_STATUS_FILE = SERVER_ADMIN_ROOT / "server-restart.json"
+TEAM_HUB_HOST_CONTROL_STATUS_FILE = SERVER_ADMIN_ROOT / "team-hub-host.json"
 CODEX_SETTINGS_FILE = SERVER_ADMIN_ROOT / "codex-settings.json"
 ABANDONED_FORK_THREADS_FILE = SERVER_ADMIN_ROOT / "abandoned-fork-threads.json"
 # Process-group ids of provider children this server spawned in their own
@@ -1395,7 +1413,7 @@ PROVIDER_TOOL_DESCRIPTION = (
     "chats send|ask --target-index N. For the current inbound reply use chats "
     "respond-current. Put mail/team message bodies in stdin."
 )
-API_CONTRACT_VERSION = 27
+API_CONTRACT_VERSION = 28
 SESSION_ORDER_STEP = 1000.0
 LOCAL_CROSS_CHAT_DELIVERY_PURPOSE = "cross_chat_handoff_delivery"
 SECURE_PEER_DELIVERY_PURPOSE = "secure_peer_handoff_delivery"
@@ -7797,6 +7815,49 @@ class ServerRestartRequest(BaseModel):
                 "expected_update_schedule_id requires a forced restart"
             )
         return self
+
+
+class TeamHubHostEnableRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    request_id: uuid.UUID
+    expected_server_identity: str = Field(min_length=8, max_length=240)
+    expected_server_instance_id: str = Field(min_length=8, max_length=240)
+    confirmed: Literal[True]
+    server_name: str = Field(min_length=1, max_length=160)
+
+    @field_validator("request_id", mode="before")
+    @classmethod
+    def require_canonical_uuid_v4(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            raise ValueError("request_id must be a canonical UUIDv4 string")
+        try:
+            parsed = uuid.UUID(value)
+        except (ValueError, AttributeError) as exc:
+            raise ValueError("request_id must be a canonical UUIDv4 string") from exc
+        if parsed.version != 4 or str(parsed) != value:
+            raise ValueError("request_id must be a canonical UUIDv4 string")
+        return value
+
+    @field_validator("confirmed", mode="before")
+    @classmethod
+    def require_literal_boolean_true(cls, value: Any) -> Any:
+        if value is not True:
+            raise ValueError("confirmed must be the JSON boolean true")
+        return value
+
+    @field_validator("server_name", mode="before")
+    @classmethod
+    def require_canonical_server_name(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            raise ValueError(SERVER_DISPLAY_NAME_ERROR)
+        try:
+            canonical = canonical_server_display_name(value, fallback="")
+        except RuntimeError as exc:
+            raise ValueError(str(exc)) from exc
+        if not value.strip() or canonical != value:
+            raise ValueError(SERVER_DISPLAY_NAME_ERROR)
+        return canonical
 
 
 class TeamHubBootstrapProofRequest(BaseModel):
@@ -62702,6 +62763,7 @@ SERVER_RESTART_COUNT_LIMIT = 1_000_000
 PRIVILEGED_NATIVE_UPDATE_MAX_BODY_BYTES = 4_096
 CODEX_GOALS_ADMIN_MAX_BODY_BYTES = 256
 TEAM_HUB_BOOTSTRAP_MAX_BODY_BYTES = 4_096
+TEAM_HUB_HOST_CONTROL_MAX_BODY_BYTES = 2_048
 SECURE_PEER_MAX_BODY_BYTES = 65_536
 UNSAFE_HTTP_MUTATION_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 UNSAFE_HTTP_MUTATION_ADMISSION_LOCK = asyncio.Lock()
@@ -62718,6 +62780,7 @@ MANAGED_SERVER_UPDATE_ACTIVE_DETAIL = "AgentsServer is preparing a managed updat
 MANAGED_SERVER_RESTART_ACTIVE_DETAIL = "AgentsServer is restarting"
 MANAGED_SERVER_SERVICE_KIND_CACHE: str | None = None
 SERVER_RESTART_SIGNAL_LOCK = threading.Lock()
+TEAM_HUB_HOST_CONTROL_LOCK = asyncio.Lock()
 
 
 class TransientAdmissionWait(HTTPException):
@@ -65639,6 +65702,483 @@ TEAM_HUB_RUNTIME = ManagedTeamHubHost(
     config_error=TEAM_HUB_CONFIG_ERROR,
     logger=logger,
 )
+if TEAM_HUB_MODE == TEAM_HUB_MODE_HOST:
+    try:
+        SECURE_PEER_RUNTIME.pause_member_for_host()
+    except Exception:
+        TEAM_HUB_RUNTIME.config_error = (
+            "The active Team Network Member connection could not be paused safely"
+        )
+else:
+    try:
+        SECURE_PEER_RUNTIME.resume_member_after_host()
+    except Exception as exc:
+        logger.error(
+            "saved Team Network Member connection could not resume "
+            "error_type=%s",
+            type(exc).__name__,
+        )
+
+TEAM_HUB_HOST_CONFIG_MAX_BYTES = 1024 * 1024
+TEAM_HUB_PRESERVED_STATE_NAMES = (
+    "team-hub.sqlite3",
+    "team-hub.sqlite3-wal",
+    "team-hub.sqlite3-shm",
+    "access-token-signing.key",
+    "maintenance-fence.json",
+)
+
+
+def _private_config_env_snapshot(path: Path) -> dict[str, Any]:
+    """Read one owner-only config file without following a final symlink."""
+
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        return {"exists": False, "content": b"", "mode": 0o600, "identity": None}
+    mode = stat.S_IMODE(before.st_mode)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_uid != os.getuid()
+        or mode & 0o077
+        or before.st_size > TEAM_HUB_HOST_CONFIG_MAX_BYTES
+    ):
+        raise PermissionError("AgentsServer configuration file is unsafe")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            (opened.st_dev, opened.st_ino, opened.st_size)
+            != (before.st_dev, before.st_ino, before.st_size)
+        ):
+            raise RuntimeError("AgentsServer configuration changed while reading")
+        content = bytearray()
+        while len(content) <= TEAM_HUB_HOST_CONFIG_MAX_BYTES:
+            chunk = os.read(descriptor, min(
+                64 * 1024,
+                TEAM_HUB_HOST_CONFIG_MAX_BYTES + 1 - len(content),
+            ))
+            if not chunk:
+                break
+            content.extend(chunk)
+        if len(content) > TEAM_HUB_HOST_CONFIG_MAX_BYTES:
+            raise RuntimeError("AgentsServer configuration file is too large")
+        after = path.lstat()
+        if (
+            (after.st_dev, after.st_ino, after.st_size)
+            != (opened.st_dev, opened.st_ino, opened.st_size)
+        ):
+            raise RuntimeError("AgentsServer configuration changed while reading")
+    finally:
+        os.close(descriptor)
+    return {
+        "exists": True,
+        "content": bytes(content),
+        "mode": mode,
+        "identity": (before.st_dev, before.st_ino, before.st_size),
+    }
+
+
+def _safe_config_parent(path: Path) -> tuple[Path, int]:
+    parent = path.parent
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = parent.lstat()
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) & 0o022
+    ):
+        raise PermissionError("AgentsServer configuration directory is unsafe")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    return parent, os.open(parent, flags)
+
+
+def _atomic_replace_config_env(
+    path: Path,
+    content: bytes,
+    *,
+    expected: dict[str, Any],
+    mode: int,
+) -> None:
+    if len(content) > TEAM_HUB_HOST_CONFIG_MAX_BYTES:
+        raise RuntimeError("AgentsServer configuration file is too large")
+    current = _private_config_env_snapshot(path)
+    if (
+        current["exists"] != expected["exists"]
+        or current.get("identity") != expected.get("identity")
+        or current["content"] != expected["content"]
+    ):
+        raise RuntimeError("AgentsServer configuration changed before commit")
+    _parent, directory = _safe_config_parent(path)
+    temporary = f".{path.name}.team-hub-{secrets.token_hex(12)}.tmp"
+    descriptor: int | None = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(temporary, flags, 0o600, dir_fd=directory)
+        written = 0
+        while written < len(content):
+            written += os.write(descriptor, content[written:])
+        os.fchmod(descriptor, mode & 0o700 or 0o600)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(
+            temporary,
+            path.name,
+            src_dir_fd=directory,
+            dst_dir_fd=directory,
+        )
+        os.fsync(directory)
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        with suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=directory)
+        raise
+    finally:
+        os.close(directory)
+
+
+def _team_hub_settings_content(
+    content: bytes,
+    mode: str,
+    server_name: str,
+) -> bytes:
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("AgentsServer configuration is not valid UTF-8") from exc
+    assignments = {
+        "AGENTSDOCK_TEAM_HUB_MODE": mode,
+        "AGENTSDOCK_SERVER_NAME": json.dumps(server_name, ensure_ascii=False),
+    }
+    assignment = re.compile(
+        r"^[ \t]*(?:export[ \t]+)?(AGENTSDOCK_(?:TEAM_HUB_MODE|SERVER_NAME))[ \t]*="
+    )
+    output: list[str] = []
+    replaced: set[str] = set()
+    for line in text.splitlines(keepends=True):
+        match = assignment.match(line)
+        if match is not None:
+            name = match.group(1)
+            if name not in replaced:
+                ending = "\r\n" if line.endswith("\r\n") else (
+                    "\n" if line.endswith("\n") else ""
+                )
+                output.append(f"{name}={assignments[name]}{ending}")
+                replaced.add(name)
+            continue
+        output.append(line)
+    for name in ("AGENTSDOCK_SERVER_NAME", "AGENTSDOCK_TEAM_HUB_MODE"):
+        if name in replaced:
+            continue
+        if output and not output[-1].endswith(("\n", "\r")):
+            output.append("\n")
+        output.append(f"{name}={assignments[name]}\n")
+    return "".join(output).encode("utf-8")
+
+
+def persist_team_hub_host_settings(
+    mode: Literal["host", "disabled"],
+    server_name: str,
+) -> dict[str, Any]:
+    previous = _private_config_env_snapshot(CONFIG_ENV_FILE)
+    updated = _team_hub_settings_content(previous["content"], mode, server_name)
+    try:
+        _atomic_replace_config_env(
+            CONFIG_ENV_FILE,
+            updated,
+            expected=previous,
+            mode=int(previous["mode"]),
+        )
+    except BaseException:
+        # os.replace is the commit point. A following directory fsync may
+        # report failure even though the exact intended generation is now
+        # installed; classify that outcome by securely rereading it.
+        installed = _private_config_env_snapshot(CONFIG_ENV_FILE)
+        if installed["content"] != updated:
+            raise
+    return {**previous, "written": updated}
+
+
+def restore_team_hub_host_settings(snapshot: dict[str, Any]) -> None:
+    current = _private_config_env_snapshot(CONFIG_ENV_FILE)
+    if current["content"] != snapshot.get("written"):
+        raise RuntimeError("AgentsServer configuration changed before rollback")
+    if snapshot.get("exists") is True:
+        restored = bytes(snapshot["content"])
+        try:
+            _atomic_replace_config_env(
+                CONFIG_ENV_FILE,
+                restored,
+                expected=current,
+                mode=int(snapshot["mode"]),
+            )
+        except BaseException:
+            if _private_config_env_snapshot(CONFIG_ENV_FILE)["content"] != restored:
+                raise
+        return
+    _parent, directory = _safe_config_parent(CONFIG_ENV_FILE)
+    try:
+        verified = _private_config_env_snapshot(CONFIG_ENV_FILE)
+        if (
+            verified.get("identity") != current.get("identity")
+            or verified["content"] != current["content"]
+        ):
+            raise RuntimeError("AgentsServer configuration changed before rollback")
+        try:
+            os.unlink(CONFIG_ENV_FILE.name, dir_fd=directory)
+            os.fsync(directory)
+        except BaseException:
+            try:
+                CONFIG_ENV_FILE.lstat()
+            except FileNotFoundError:
+                return
+            raise
+    finally:
+        os.close(directory)
+
+
+def team_hub_preserved_state_exists() -> bool:
+    for name in TEAM_HUB_PRESERVED_STATE_NAMES:
+        try:
+            (TEAM_HUB_DATA_DIR / name).lstat()
+        except FileNotFoundError:
+            continue
+        return True
+    try:
+        return any(
+            entry.name.endswith(".proof") and entry.is_file(follow_symlinks=False)
+            for entry in os.scandir(TEAM_HUB_DATA_DIR)
+        )
+    except FileNotFoundError:
+        return False
+
+
+def _private_team_hub_signing_key_exists() -> bool:
+    path = TEAM_HUB_DATA_DIR / "access-token-signing.key"
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) & 0o077
+        or info.st_size == 0
+    ):
+        raise PermissionError("Team Hub signing key is unsafe")
+    return True
+
+
+@contextmanager
+def team_hub_activation_lease() -> Iterator[None]:
+    """Serialize the complete cross-process live Host activation workflow."""
+
+    parent = TEAM_HUB_DATA_DIR.parent
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = os.open(
+        parent / f".{TEAM_HUB_DATA_DIR.name}.host-activation.lock",
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) & 0o077
+        ):
+            raise PermissionError("Team Hub activation lock is unsafe")
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        with suppress(OSError):
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _require_team_hub_runtime_lease(descriptor: int) -> None:
+    lock_path = (
+        TEAM_HUB_DATA_DIR.parent
+        / f".{TEAM_HUB_DATA_DIR.name}.managed-host.lock"
+    )
+    opened = os.fstat(descriptor)
+    current = lock_path.lstat()
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+    ):
+        raise RuntimeError("Team Hub runtime lease changed")
+
+
+def quarantine_partial_team_hub_creation(runtime_lease: int) -> Path:
+    """Move an unbound partial first-host generation aside without deleting it."""
+
+    _require_team_hub_runtime_lease(runtime_lease)
+    root = TEAM_HUB_DATA_DIR
+    parent = root.parent
+    try:
+        root_info = root.lstat()
+    except FileNotFoundError:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return root
+    if (
+        not stat.S_ISDIR(root_info.st_mode)
+        or root_info.st_uid != os.getuid()
+        or stat.S_IMODE(root_info.st_mode) & 0o077
+    ):
+        raise PermissionError("partial Team Hub directory is unsafe")
+    quarantine_root = parent / "team-hub-partial-creations"
+    quarantine_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    quarantine_info = quarantine_root.lstat()
+    if (
+        not stat.S_ISDIR(quarantine_info.st_mode)
+        or quarantine_info.st_uid != os.getuid()
+        or stat.S_IMODE(quarantine_info.st_mode) & 0o077
+    ):
+        raise PermissionError("Team Hub recovery directory is unsafe")
+    destination = quarantine_root / (
+        f"partial-{int(time.time())}-{secrets.token_hex(12)}"
+    )
+    parent_descriptor = os.open(
+        parent,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    quarantine_descriptor = os.open(
+        quarantine_root,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.rename(
+            root.name,
+            destination.name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=quarantine_descriptor,
+        )
+        os.fsync(quarantine_descriptor)
+        os.fsync(parent_descriptor)
+        os.mkdir(root.name, mode=0o700, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+    finally:
+        os.close(quarantine_descriptor)
+        os.close(parent_descriptor)
+    logger.warning(
+        "quarantined incomplete Team Hub host creation path=%s",
+        destination,
+    )
+    return destination
+
+
+def prepare_team_hub_state_for_live_activation() -> bool:
+    """Return whether a complete same-server Host should be reactivated.
+
+    Schema setup commits before the managed binding and signing key do. A
+    crash in that narrow first-create window must not make every future click
+    enter the preserved-host reactivation path. Incomplete, unbound state is
+    moved intact to a private recovery directory, then a fresh Hub can be
+    created at the canonical path.
+    """
+
+    if not team_hub_preserved_state_exists():
+        return False
+    runtime_lease = HubStore.acquire_managed_runtime_lease(TEAM_HUB_DATA_DIR)
+    try:
+        _require_team_hub_runtime_lease(runtime_lease)
+        database = TEAM_HUB_DATA_DIR / "team-hub.sqlite3"
+        try:
+            database.lstat()
+        except FileNotFoundError:
+            quarantine_partial_team_hub_creation(runtime_lease)
+            return False
+        state = HubStore.managed_host_state_without_source_mutation(
+            TEAM_HUB_DATA_DIR
+        )
+        binding = state.get("server_identity")
+        if binding is not None and not hmac.compare_digest(
+            str(binding), server_identity()
+        ):
+            raise RuntimeError(
+                "preserved Team Hub state is bound to a different AgentsServer host"
+            )
+        complete = binding is not None and _private_team_hub_signing_key_exists()
+        if complete:
+            return True
+        if state.get("globally_empty") is not True:
+            raise RuntimeError(
+                "incomplete Team Hub host state contains identity or team data and requires manual recovery"
+            )
+        quarantine_partial_team_hub_creation(runtime_lease)
+        return False
+    finally:
+        HubStore.release_managed_runtime_lease(runtime_lease)
+
+
+def requested_live_team_hub_configuration() -> dict[str, Any]:
+    snapshot = _private_config_env_snapshot(CONFIG_ENV_FILE)
+    values = parse_config_env_file(snapshot["content"].decode("utf-8"))
+
+    def setting(name: str) -> str:
+        return str(values.get(name, os.environ.get(name, "")) or "").strip()
+
+    requested_transport = setting("AGENTSDOCK_TEAM_HUB_TRANSPORT") or None
+    requested_url = setting("AGENTSDOCK_TEAM_HUB_URL") or None
+    transport, hub_url, public_host, config_error = configured_team_hub_endpoint(
+        TEAM_HUB_MODE_HOST,
+        requested_url,
+        requested_transport,
+        SERVER_PORT,
+    )
+    if config_error is not None or transport is None:
+        raise RuntimeError(config_error or "Team Hub host configuration is invalid")
+    routes: dict[str, str | None] = {transport: hub_url}
+    direct_url = setting("AGENTSDOCK_TEAM_HUB_DIRECT_IP_URL")
+    direct_public_host: str | None = None
+    if direct_url:
+        direct_transport, canonical_direct_url, direct_public_host, direct_error = (
+            configured_team_hub_endpoint(
+                TEAM_HUB_MODE_HOST,
+                direct_url,
+                TEAM_HUB_TRANSPORT_DIRECT_IP,
+                SERVER_PORT,
+            )
+        )
+        if direct_error is not None or direct_transport is None:
+            raise RuntimeError(direct_error or "Team Hub Direct IP route is invalid")
+        routes[direct_transport] = canonical_direct_url
+    allowed_hosts = configured_team_hub_hosts(
+        SERVER_BIND_ADDRESS,
+        setting("AGENTSDOCK_TEAM_HUB_ALLOWED_HOSTS"),
+    )
+    if public_host is not None:
+        allowed_hosts.add(public_host)
+    if direct_public_host is not None:
+        allowed_hosts.add(direct_public_host)
+    return {
+        "transport": transport,
+        "hub_url": hub_url,
+        "routes": routes,
+        "allowed_hosts": allowed_hosts,
+        "public_host": public_host,
+        "direct_ip_url": direct_url or None,
+        "direct_ip_public_host": direct_public_host,
+    }
 
 
 async def join_cancelled_tasks(*tasks: Any) -> None:
@@ -65737,6 +66277,28 @@ async def lifespan(app: FastAPI):
         secure_peer_delivery_target_available
     )
     await asyncio.to_thread(TEAM_HUB_RUNTIME.initialize)
+    try:
+        await asyncio.to_thread(recover_interrupted_team_hub_host_control)
+    except Exception as exc:
+        # Never hide an incomplete role transition. The runtime remains
+        # fenced and the persisted failure gives the operator a retry path
+        # without interrupting unrelated chats or agents.
+        logger.error(
+            "interrupted Team Hub host transition recovery failed "
+            "error_type=%s",
+            type(exc).__name__,
+        )
+        write_team_hub_host_control_status(
+            phase="failed",
+            message=(
+                "An interrupted Team Network role change could not be "
+                "recovered safely."
+            ),
+            failed_at=update_utc_now(),
+            error_code="team_hub_host_recovery_failed",
+            error_action="Retry the role change after inspecting Team Hub maintenance state.",
+            retryable=True,
+        )
     await asyncio.to_thread(scrub_tmux_global_secret_environment)
     await CROSS_CHAT.initialize()
     startup_restart_status = read_server_restart_status()
@@ -66760,6 +67322,10 @@ async def require_agent_token(request: Request, call_next):
         request.url.path == "/api/admin/update"
         or request.url.path.startswith("/api/admin/update/")
     )
+    team_hub_host_admin_route = (
+        request.url.path == "/api/admin/team-hub/host"
+        or request.url.path.startswith("/api/admin/team-hub/host/")
+    )
     codex_goals_admin_route = request.url.path == "/api/admin/codex/goals"
     secure_peer_admin_route = (
         request.url.path == "/api/admin/secure-peers/v1"
@@ -66790,6 +67356,7 @@ async def require_agent_token(request: Request, call_next):
         or secure_peer_proxy_route
         or team_hub_server_session_route
         or server_update_admin_route
+        or team_hub_host_admin_route
         or codex_goals_admin_route
         or codex_provider_mcp_route
     ):
@@ -66872,7 +67439,11 @@ async def require_agent_token(request: Request, call_next):
                 status_code, detail = body_error
                 return JSONResponse({"detail": detail}, status_code=status_code)
 
-    if server_update_admin_route or codex_goals_admin_route:
+    if (
+        server_update_admin_route
+        or team_hub_host_admin_route
+        or codex_goals_admin_route
+    ):
         if privileged_native_browser_request_forbidden(request):
             return JSONResponse({"detail": "forbidden"}, status_code=403)
         if not AGENT_TOKEN:
@@ -66887,10 +67458,25 @@ async def require_agent_token(request: Request, call_next):
             )
         if not request_exact_native_token_header_authorized(request):
             return JSONResponse({"detail": "unauthorized"}, status_code=401)
-        if (
-            server_update_admin_route
-            and request.method.upper() == "POST"
-        ):
+        if team_hub_host_admin_route and request.method.upper() == "POST":
+            declared_size, transport_error = privileged_native_json_transport(
+                request,
+                max_body_bytes=TEAM_HUB_HOST_CONTROL_MAX_BODY_BYTES,
+                label="Team Hub host control",
+                require_content_length=False,
+            )
+            if transport_error is not None:
+                status_code, detail = transport_error
+                return JSONResponse({"detail": detail}, status_code=status_code)
+            body_error = await prebuffer_bounded_request_body(
+                request,
+                max_body_bytes=TEAM_HUB_HOST_CONTROL_MAX_BODY_BYTES,
+                declared_size=declared_size,
+            )
+            if body_error is not None:
+                status_code, detail = body_error
+                return JSONResponse({"detail": detail}, status_code=status_code)
+        elif server_update_admin_route and request.method.upper() == "POST":
             declared_size, transport_error = privileged_native_json_transport(
                 request,
                 max_body_bytes=PRIVILEGED_NATIVE_UPDATE_MAX_BODY_BYTES,
@@ -66958,6 +67544,7 @@ async def require_agent_token(request: Request, call_next):
         and not agent_helper_route
         and not codex_provider_mcp_route
         and not team_hub_bootstrap_route
+        and not team_hub_host_admin_route
         and not secure_peer_admin_route
         and not secure_peer_proxy_route
         and not request_authorized(request)
@@ -67245,6 +67832,905 @@ def current_team_hub_capability() -> dict[str, Any]:
             ),
         }
     return SECURE_PEER_RUNTIME.team_hub_capability() or hosted
+
+
+TEAM_HUB_HOST_CONTROL_PHASES = {"idle", "starting", "complete", "failed"}
+
+
+class TeamHubHostControlFailure(RuntimeError):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        status_code: int = 503,
+        action: str | None = None,
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status_code = status_code
+        self.action = action
+        self.retryable = retryable
+
+
+def team_hub_host_control_error_detail(
+    error: TeamHubHostControlFailure,
+) -> dict[str, Any]:
+    detail: dict[str, Any] = {
+        "code": error.code,
+        "message": error.message[:500],
+        "retryable": error.retryable,
+    }
+    if error.action:
+        detail["action"] = error.action[:500]
+    return detail
+
+
+def read_team_hub_host_control_status() -> dict[str, Any]:
+    try:
+        value = json.loads(TEAM_HUB_HOST_CONTROL_STATUS_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        value = {}
+    if not isinstance(value, dict):
+        value = {}
+    phase = str(value.get("phase") or "idle")
+    value["phase"] = phase if phase in TEAM_HUB_HOST_CONTROL_PHASES else "idle"
+    return value
+
+
+def write_team_hub_host_control_status(**changes: Any) -> dict[str, Any]:
+    current = read_team_hub_host_control_status()
+    current.update(changes)
+    current["_source_instance_id"] = SERVER_INSTANCE_ID
+    current["updated_at"] = update_utc_now()
+    atomic_update_json(TEAM_HUB_HOST_CONTROL_STATUS_FILE, current)
+    return current
+
+
+def public_team_hub_host_control_status(
+    status: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    current = status if status is not None else read_team_hub_host_control_status()
+    if (
+        str(current.get("_source_instance_id") or "")
+        and str(current.get("_source_instance_id")) != SERVER_INSTANCE_ID
+        and not isinstance(current.get("_live_reactivation"), dict)
+    ):
+        current = {}
+    phase = str(current.get("phase") or "idle")
+    if phase not in TEAM_HUB_HOST_CONTROL_PHASES:
+        phase = "idle"
+    result: dict[str, Any] = {
+        "phase": phase,
+        "server_identity": server_identity(),
+        "server_instance_id": SERVER_INSTANCE_ID,
+        "server_name": AGENTSDOCK_SERVER_DISPLAY_NAME,
+        "reconnect_required": False,
+        "message": str(
+            current.get("message")
+            or (
+                "This server is the Team Network host."
+                if TEAM_HUB_RUNTIME.designated_host
+                else "This server is a Team Network member."
+            )
+        )[:500],
+        "team_hub": current_team_hub_capability(),
+    }
+    for name in (
+        "request_id",
+        "operation",
+        "updated_at",
+        "completed_at",
+        "failed_at",
+        "error_code",
+        "error_action",
+        "retryable",
+    ):
+        value = current.get(name)
+        if value is not None and value != "":
+            result[name] = value
+    return result
+
+
+def team_hub_host_control_capability() -> dict[str, Any]:
+    enabled = TEAM_HUB_RUNTIME.designated_host
+    authenticated = bool(AGENT_TOKEN)
+    return {
+        "available": authenticated,
+        "enabled": enabled,
+        "can_enable": authenticated and not enabled,
+        "can_disable": authenticated and enabled,
+        "required": False,
+        "version": 1,
+        "status_path": "/api/admin/team-hub/host",
+        "enable_path": "/api/admin/team-hub/host/enable",
+        "disable_path": "/api/admin/team-hub/host/disable",
+        "message": (
+            "This server is the Team Network host."
+            if enabled
+            else "This server can become the Team Network host without restarting."
+            if authenticated
+            else "Team Network host control requires authenticated AgentsServer mode."
+        ),
+        "action": (
+            None
+            if authenticated
+            else "Configure AgentsServer with an access token, then reconnect."
+        ),
+    }
+
+
+def require_team_hub_host_control_target(body: TeamHubHostEnableRequest) -> None:
+    if (
+        body.expected_server_identity != server_identity()
+        or body.expected_server_instance_id != SERVER_INSTANCE_ID
+    ):
+        raise TeamHubHostControlFailure(
+            "team_hub_host_target_changed",
+            "The connected AgentsServer instance changed before host confirmation.",
+            status_code=409,
+            action="Refresh the server connection before trying again.",
+            retryable=True,
+        )
+
+
+def _rollback_team_hub_reactivation(context: dict[str, Any]) -> None:
+    """Consume one exact preflight by restore or pre-adoption abort."""
+
+    common = {
+        "data_dir": TEAM_HUB_DATA_DIR,
+        "expected_host_identity": server_identity(),
+        "expected_hub_id": str(context["hub_id"]),
+        "expected_operation_id": str(context["operation_id"]),
+        "expected_snapshot": Path(context["snapshot"]),
+    }
+    if context.get("authority_published") is True:
+        with suppress(Exception):
+            HubStore.clear_managed_startup_authority(
+                expected_reason="host-reactivation",
+                **common,
+            )
+    if context.get("adopted") is True:
+        restore_error: BaseException | None = None
+        try:
+            HubStore.restore_host_reactivation_snapshot(
+                TEAM_HUB_DATA_DIR,
+                Path(context["snapshot"]),
+                expected_host_identity=server_identity(),
+                expected_hub_id=str(context["hub_id"]),
+                expected_operation_id=str(context["operation_id"]),
+            )
+        except BaseException as exc:
+            # The multi-file restore can commit before its final fsync reports
+            # an error. Confirm the exact receipt before deciding it failed.
+            restore_error = exc
+        try:
+            HubStore.confirm_restored_maintenance_snapshot(
+                TEAM_HUB_DATA_DIR,
+                Path(context["snapshot"]),
+                expected_host_identity=server_identity(),
+                expected_hub_id=str(context["hub_id"]),
+                expected_operation_id=str(context["operation_id"]),
+                expected_reason="host-reactivation",
+            )
+        except BaseException:
+            if restore_error is not None:
+                raise restore_error
+            raise
+        try:
+            HubStore.acknowledge_restored_maintenance_snapshot(
+                TEAM_HUB_DATA_DIR,
+                Path(context["snapshot"]),
+                expected_host_identity=server_identity(),
+                expected_hub_id=str(context["hub_id"]),
+                expected_operation_id=str(context["operation_id"]),
+                expected_reason="host-reactivation",
+            )
+        except BaseException:
+            HubStore.acknowledge_restored_maintenance_snapshot(
+                TEAM_HUB_DATA_DIR,
+                Path(context["snapshot"]),
+                expected_host_identity=server_identity(),
+                expected_hub_id=str(context["hub_id"]),
+                expected_operation_id=str(context["operation_id"]),
+                expected_reason="host-reactivation",
+                allow_missing=True,
+            )
+        return
+    if not HubStore.abort_prepared_host_reactivation(
+        expected_device=int(context["fence_device"]),
+        expected_inode=int(context["fence_inode"]),
+        **common,
+    ):
+        raise RuntimeError("exact Team Hub reactivation fence is missing")
+
+
+def team_hub_reactivation_control_consumed() -> bool:
+    """Return true only when no live rollback authority remains on disk."""
+
+    for name in (
+        "maintenance-fence.json",
+        ".host-reactivation-handoff.json",
+        ".managed-startup-authority.json",
+        ".restore-completion.json",
+        ".restore-transaction.json",
+    ):
+        try:
+            (TEAM_HUB_DATA_DIR / name).lstat()
+        except FileNotFoundError:
+            continue
+        return False
+    return True
+
+
+def activate_team_hub_host_sync(
+    server_name: str,
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    try:
+        with team_hub_activation_lease():
+            return _activate_team_hub_host_sync(server_name)
+    except BlockingIOError as exc:
+        raise TeamHubHostControlFailure(
+            "team_hub_host_activation_busy",
+            "Another process is changing this server's Team Network host role.",
+            status_code=409,
+            action="Retry after the current Host change finishes.",
+            retryable=True,
+        ) from exc
+
+
+def _activate_team_hub_host_sync(
+    server_name: str,
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    """Activate the local Hub with an exact preserved-state rollback fence."""
+
+    operation = "create"
+    context: dict[str, Any] | None = None
+    previous_names = (
+        TEAM_HUB_RUNTIME.managed_host_display_name,
+        SECURE_PEER_RUNTIME.display_name,
+    )
+    config_snapshot: dict[str, Any] | None = None
+    member_paused = False
+    try:
+        configuration = requested_live_team_hub_configuration()
+        if prepare_team_hub_state_for_live_activation():
+            operation = "reactivate"
+            (
+                hub_id,
+                snapshot,
+                operation_id,
+                fence_device,
+                fence_inode,
+            ) = HubStore.prepare_managed_host_reactivation(
+                TEAM_HUB_DATA_DIR,
+                expected_host_identity=server_identity(),
+            )
+            context = {
+                "hub_id": hub_id,
+                "snapshot": snapshot,
+                "operation_id": operation_id,
+                "fence_device": fence_device,
+                "fence_inode": fence_inode,
+                "adopted": False,
+                "authority_published": False,
+            }
+            adopt_arguments = {
+                "data_dir": TEAM_HUB_DATA_DIR,
+                "expected_host_identity": server_identity(),
+                "expected_hub_id": hub_id,
+                "expected_operation_id": operation_id,
+                "expected_snapshot": snapshot,
+                "expected_device": fence_device,
+                "expected_inode": fence_inode,
+            }
+            try:
+                HubStore.adopt_prepared_host_reactivation(**adopt_arguments)
+            except BaseException:
+                # Adoption is explicitly idempotent after a committed rename
+                # whose directory fsync reported an ambiguous error.
+                HubStore.adopt_prepared_host_reactivation(**adopt_arguments)
+            context["adopted"] = True
+            HubStore.publish_managed_startup_authority(
+                TEAM_HUB_DATA_DIR,
+                expected_host_identity=server_identity(),
+                expected_hub_id=hub_id,
+                expected_reason="host-reactivation",
+                expected_operation_id=operation_id,
+                expected_snapshot=snapshot,
+            )
+            context["authority_published"] = True
+            write_team_hub_host_control_status(
+                _live_reactivation={
+                    "hub_id": hub_id,
+                    "snapshot": str(snapshot),
+                    "operation_id": operation_id,
+                    "fence_device": fence_device,
+                    "fence_inode": fence_inode,
+                    "adopted": True,
+                    "authority_published": True,
+                }
+            )
+
+        SECURE_PEER_RUNTIME.pause_member_for_host()
+        member_paused = True
+        SECURE_PEER_RUNTIME.set_display_name(server_name)
+
+        def persist_role_and_name() -> None:
+            nonlocal config_snapshot
+            config_snapshot = persist_team_hub_host_settings(
+                "host",
+                server_name,
+            )
+
+        capability = TEAM_HUB_RUNTIME.enable_live_host(
+            transport=str(configuration["transport"]),
+            hub_url=configuration["hub_url"],
+            routes=dict(configuration["routes"]),
+            allowed_hosts=set(configuration["allowed_hosts"]),
+            managed_host_display_name=server_name,
+            reactivation_hub_id=(str(context["hub_id"]) if context else None),
+            reactivation_operation_id=(
+                str(context["operation_id"]) if context else None
+            ),
+            reactivation_snapshot=(Path(context["snapshot"]) if context else None),
+            commit_configuration=persist_role_and_name,
+        )
+    except Exception as exc:
+        rollback_errors: list[BaseException] = []
+        try:
+            SECURE_PEER_RUNTIME.set_display_name(previous_names[1])
+        except BaseException as rollback_exc:
+            rollback_errors.append(rollback_exc)
+        if config_snapshot is not None:
+            try:
+                restore_team_hub_host_settings(config_snapshot)
+            except BaseException as rollback_exc:
+                rollback_errors.append(rollback_exc)
+        if member_paused:
+            try:
+                SECURE_PEER_RUNTIME.resume_member_after_host()
+            except BaseException as rollback_exc:
+                rollback_errors.append(rollback_exc)
+        hub_rollback_settled = context is None
+        if context is not None:
+            try:
+                if not team_hub_reactivation_control_consumed():
+                    _rollback_team_hub_reactivation(context)
+                hub_rollback_settled = True
+            except BaseException as rollback_exc:
+                rollback_errors.append(rollback_exc)
+        if hub_rollback_settled and context is not None:
+            write_team_hub_host_control_status(_live_reactivation=None)
+        if rollback_errors:
+            raise TeamHubHostControlFailure(
+                "team_hub_host_rollback_failed",
+                "Team Network host activation failed and one or more prior settings could not be restored.",
+                action="Inspect the server configuration, saved Member connection, and Team Hub maintenance state before retrying.",
+            ) from rollback_errors[0]
+        raise TeamHubHostControlFailure(
+            "team_hub_host_activation_failed",
+            "This server could not activate the Team Network host.",
+            status_code=409,
+            action="Check the server's preserved Team Hub state and retry.",
+            retryable=True,
+        ) from exc
+
+    if context is not None:
+        try:
+            HubStore.clear_managed_startup_authority(
+                TEAM_HUB_DATA_DIR,
+                expected_host_identity=server_identity(),
+                expected_hub_id=str(context["hub_id"]),
+                expected_reason="host-reactivation",
+                expected_operation_id=str(context["operation_id"]),
+                expected_snapshot=Path(context["snapshot"]),
+            )
+        except Exception:
+            # Once the exact fence is gone this file is powerless; ordinary
+            # startup removes it. Do not undo a committed live activation.
+            logger.warning("could not clear powerless Team Hub startup authority")
+    return operation, capability, configuration
+
+
+def publish_team_hub_runtime_globals(
+    mode: Literal["host", "disabled"],
+    server_name: str,
+    configuration: dict[str, Any] | None = None,
+) -> None:
+    global TEAM_HUB_MODE, TEAM_HUB_TRANSPORT, TEAM_HUB_URL
+    global TEAM_HUB_PUBLIC_HOST, TEAM_HUB_ROUTES, TEAM_HUB_DIRECT_IP_URL
+    global TEAM_HUB_DIRECT_IP_PUBLIC_HOST, TEAM_HUB_ALLOWED_HOSTS
+    global AGENTSDOCK_SERVER_DISPLAY_NAME
+    AGENTSDOCK_SERVER_DISPLAY_NAME = server_name
+    os.environ["AGENTSDOCK_SERVER_NAME"] = server_name
+    os.environ["AGENTSDOCK_TEAM_HUB_MODE"] = mode
+    TEAM_HUB_MODE = mode
+    if mode == "host" and configuration is not None:
+        TEAM_HUB_TRANSPORT = str(configuration["transport"])
+        TEAM_HUB_URL = configuration["hub_url"]
+        TEAM_HUB_PUBLIC_HOST = configuration["public_host"]
+        TEAM_HUB_ROUTES = dict(configuration["routes"])
+        TEAM_HUB_DIRECT_IP_URL = str(configuration["direct_ip_url"] or "")
+        TEAM_HUB_DIRECT_IP_PUBLIC_HOST = configuration["direct_ip_public_host"]
+        TEAM_HUB_ALLOWED_HOSTS = set(configuration["allowed_hosts"])
+        return
+    TEAM_HUB_TRANSPORT = None
+    TEAM_HUB_URL = None
+    TEAM_HUB_PUBLIC_HOST = None
+    TEAM_HUB_ROUTES = {}
+    TEAM_HUB_DIRECT_IP_URL = ""
+    TEAM_HUB_DIRECT_IP_PUBLIC_HOST = None
+    TEAM_HUB_ALLOWED_HOSTS = configured_team_hub_hosts(
+        SERVER_BIND_ADDRESS,
+        os.environ.get("AGENTSDOCK_TEAM_HUB_ALLOWED_HOSTS"),
+    )
+
+
+def recover_interrupted_team_hub_host_control() -> None:
+    """Finish or roll back an exact live reactivation after process death."""
+
+    status = read_team_hub_host_control_status()
+    raw = status.get("_live_reactivation")
+    if not isinstance(raw, dict):
+        return
+    required = {
+        "hub_id",
+        "snapshot",
+        "operation_id",
+        "fence_device",
+        "fence_inode",
+        "adopted",
+        "authority_published",
+    }
+    if set(raw) != required or raw.get("adopted") is not True:
+        raise RuntimeError("Team Hub live reactivation record is invalid")
+    context = dict(raw)
+    snapshot = Path(str(context["snapshot"]))
+    if (
+        snapshot.parent != TEAM_HUB_DATA_DIR / "maintenance-backups"
+        or not snapshot.name.startswith("snapshot_")
+        or isinstance(context.get("fence_device"), bool)
+        or not isinstance(context.get("fence_device"), int)
+        or isinstance(context.get("fence_inode"), bool)
+        or not isinstance(context.get("fence_inode"), int)
+    ):
+        raise RuntimeError("Team Hub live reactivation record is invalid")
+    if TEAM_HUB_RUNTIME.designated_host:
+        store = TEAM_HUB_RUNTIME.store
+        if store is None:
+            raise RuntimeError("interrupted Team Hub host is unavailable")
+        if store.maintenance_fence() is not None:
+            if not TEAM_HUB_RUNTIME.clear_maintenance_sync(
+                "host-reactivation",
+                str(context["operation_id"]),
+                snapshot,
+            ):
+                raise RuntimeError("interrupted Team Hub fence is missing")
+        capability = TEAM_HUB_RUNTIME.capability()
+        if capability.get("available") is not True:
+            raise RuntimeError("interrupted Team Hub host did not recover")
+        with suppress(Exception):
+            HubStore.clear_managed_startup_authority(
+                TEAM_HUB_DATA_DIR,
+                expected_host_identity=server_identity(),
+                expected_hub_id=str(context["hub_id"]),
+                expected_reason="host-reactivation",
+                expected_operation_id=str(context["operation_id"]),
+                expected_snapshot=snapshot,
+            )
+        write_team_hub_host_control_status(
+            phase="complete",
+            operation="reactivate",
+            message="This server is now the Team Network host.",
+            completed_at=update_utc_now(),
+            failed_at=None,
+            error_code=None,
+            error_action=None,
+            retryable=None,
+            _live_reactivation=None,
+        )
+        return
+    # A crash can land after rollback has restored and acknowledged the exact
+    # snapshot but before the outer status journal clears its live marker. In
+    # that state every control artifact is already consumed and config still
+    # says Member, so replaying the destructive restore is neither possible
+    # nor necessary.
+    if team_hub_reactivation_control_consumed():
+        write_team_hub_host_control_status(
+            phase="failed",
+            message="The interrupted Team Network host change was rolled back.",
+            failed_at=update_utc_now(),
+            error_code="team_hub_host_interrupted",
+            error_action="Try the Host switch again.",
+            retryable=True,
+            _live_reactivation=None,
+        )
+        return
+    _rollback_team_hub_reactivation(context)
+    write_team_hub_host_control_status(
+        phase="failed",
+        message="The interrupted Team Network host change was rolled back.",
+        failed_at=update_utc_now(),
+        error_code="team_hub_host_interrupted",
+        error_action="Try the Host switch again.",
+        retryable=True,
+        _live_reactivation=None,
+    )
+
+
+async def reconcile_pending_team_hub_host_control() -> None:
+    """Settle an exact prior role journal before accepting another mutation."""
+
+    pending = read_team_hub_host_control_status().get("_live_reactivation")
+    if not isinstance(pending, dict):
+        return
+    try:
+        await asyncio.to_thread(recover_interrupted_team_hub_host_control)
+    except Exception as exc:
+        # Preserve the journal verbatim: it is the only authority that can
+        # recover a fenced generation after process restart.
+        raise TeamHubHostControlFailure(
+            "team_hub_host_recovery_pending",
+            "A previous Team Network role change still requires recovery.",
+            status_code=409,
+            action="Repair the saved Team Hub maintenance state, then retry.",
+            retryable=True,
+        ) from exc
+    if isinstance(
+        read_team_hub_host_control_status().get("_live_reactivation"),
+        dict,
+    ):
+        raise TeamHubHostControlFailure(
+            "team_hub_host_recovery_pending",
+            "A previous Team Network role change still requires recovery.",
+            status_code=409,
+            action="Retry after Team Hub maintenance recovery completes.",
+            retryable=True,
+        )
+
+
+async def enable_team_hub_host(
+    body: TeamHubHostEnableRequest,
+) -> dict[str, Any]:
+    request_id = str(body.request_id)
+    async with TEAM_HUB_HOST_CONTROL_LOCK:
+        require_team_hub_host_control_target(body)
+        await reconcile_pending_team_hub_host_control()
+        prior = read_team_hub_host_control_status()
+        if (
+            str(prior.get("request_id") or "") == request_id
+            and prior.get("phase") == "complete"
+            and TEAM_HUB_RUNTIME.designated_host
+            and AGENTSDOCK_SERVER_DISPLAY_NAME == body.server_name
+        ):
+            return public_team_hub_host_control_status(prior)
+        if TEAM_HUB_RUNTIME.designated_host:
+            previous_name = AGENTSDOCK_SERVER_DISPLAY_NAME
+            previous_hub_name = TEAM_HUB_RUNTIME.managed_host_display_name
+            previous_peer_name = SECURE_PEER_RUNTIME.display_name
+            operation = (
+                "already_host" if previous_name == body.server_name else "rename"
+            )
+            try:
+                configuration = await asyncio.to_thread(
+                    requested_live_team_hub_configuration
+                )
+                await asyncio.to_thread(
+                    SECURE_PEER_RUNTIME.set_display_name,
+                    body.server_name,
+                )
+                await asyncio.to_thread(
+                    TEAM_HUB_RUNTIME.rename_live_host,
+                    body.server_name,
+                )
+                await asyncio.to_thread(
+                    persist_team_hub_host_settings,
+                    "host",
+                    body.server_name,
+                )
+            except Exception as exc:
+                rollback_errors: list[BaseException] = []
+                try:
+                    await asyncio.to_thread(
+                        TEAM_HUB_RUNTIME.rename_live_host,
+                        previous_hub_name,
+                    )
+                except BaseException as rollback_exc:
+                    rollback_errors.append(rollback_exc)
+                try:
+                    await asyncio.to_thread(
+                        SECURE_PEER_RUNTIME.set_display_name,
+                        previous_peer_name,
+                    )
+                except BaseException as rollback_exc:
+                    rollback_errors.append(rollback_exc)
+                if rollback_errors:
+                    raise TeamHubHostControlFailure(
+                        "team_hub_host_rollback_failed",
+                        "The Team Network host rename failed and its live name could not be restored.",
+                        action="Inspect the Team Hub host before retrying the rename.",
+                    ) from rollback_errors[0]
+                raise TeamHubHostControlFailure(
+                    "team_hub_host_rename_failed",
+                    "AgentsServer could not persist the Team Network host name.",
+                    action="Check the server user's AgentsServer configuration permissions.",
+                    retryable=True,
+                ) from exc
+            publish_team_hub_runtime_globals(
+                "host",
+                body.server_name,
+                configuration,
+            )
+            completed = write_team_hub_host_control_status(
+                phase="complete",
+                request_id=request_id,
+                operation=operation,
+                message="This server is already the Team Network host.",
+                completed_at=update_utc_now(),
+                failed_at=None,
+                error_code=None,
+                error_action=None,
+                retryable=None,
+            )
+            return public_team_hub_host_control_status(completed)
+        if managed_server_restart_blocks_work():
+            raise TeamHubHostControlFailure(
+                "team_hub_host_restart_active",
+                "AgentsServer is restarting and cannot change its Team Network role.",
+                status_code=409,
+                action="Retry after the server reconnects.",
+                retryable=True,
+            )
+        update = read_server_update_status()
+        if str(update.get("phase") or "") in (
+            SERVER_UPDATE_ACTIVE_PHASES | {SERVER_UPDATE_PENDING_PHASE}
+        ):
+            raise TeamHubHostControlFailure(
+                "team_hub_host_update_active",
+                "AgentsServer cannot change its Team Network role during an update.",
+                status_code=409,
+                action="Finish or cancel the server update, then retry.",
+                retryable=True,
+            )
+        write_team_hub_host_control_status(
+            phase="starting",
+            request_id=request_id,
+            operation=None,
+            message="Enabling this server as the Team Network host.",
+            completed_at=None,
+            failed_at=None,
+            error_code=None,
+            error_action=None,
+            retryable=None,
+            _live_reactivation=None,
+        )
+        activation_task = asyncio.create_task(
+            asyncio.to_thread(activate_team_hub_host_sync, body.server_name)
+        )
+        try:
+            operation, _capability, configuration = (
+                await asyncio.shield(activation_task)
+            )
+        except asyncio.CancelledError as cancellation:
+            operation, _capability, configuration = (
+                await join_task_despite_caller_cancellation(activation_task)
+            )
+            cancellation_to_raise: asyncio.CancelledError | None = cancellation
+        except TeamHubHostControlFailure as exc:
+            write_team_hub_host_control_status(
+                phase="failed",
+                request_id=request_id,
+                message=exc.message,
+                failed_at=update_utc_now(),
+                error_code=exc.code,
+                error_action=exc.action,
+                retryable=exc.retryable,
+            )
+            raise
+        else:
+            cancellation_to_raise = None
+        publish_team_hub_runtime_globals("host", body.server_name, configuration)
+        completed = write_team_hub_host_control_status(
+            phase="complete",
+            request_id=request_id,
+            operation=operation,
+            message="This server is now the Team Network host.",
+            completed_at=update_utc_now(),
+            failed_at=None,
+            error_code=None,
+            error_action=None,
+            retryable=None,
+            _live_reactivation=None,
+        )
+        if cancellation_to_raise is not None:
+            raise cancellation_to_raise
+        return public_team_hub_host_control_status(completed)
+
+
+async def disable_team_hub_host(
+    body: TeamHubHostEnableRequest,
+) -> dict[str, Any]:
+    request_id = str(body.request_id)
+    async with TEAM_HUB_HOST_CONTROL_LOCK:
+        require_team_hub_host_control_target(body)
+        await reconcile_pending_team_hub_host_control()
+        prior = read_team_hub_host_control_status()
+        if (
+            str(prior.get("request_id") or "") == request_id
+            and prior.get("phase") == "complete"
+            and not TEAM_HUB_RUNTIME.designated_host
+            and AGENTSDOCK_SERVER_DISPLAY_NAME == body.server_name
+        ):
+            return public_team_hub_host_control_status(prior)
+        if not TEAM_HUB_RUNTIME.designated_host:
+            previous_name = AGENTSDOCK_SERVER_DISPLAY_NAME
+            previous_hub_name = TEAM_HUB_RUNTIME.managed_host_display_name
+            previous_peer_name = SECURE_PEER_RUNTIME.display_name
+            config_snapshot: dict[str, Any] | None = None
+            try:
+                config_snapshot = await asyncio.to_thread(
+                    persist_team_hub_host_settings,
+                    "disabled",
+                    body.server_name,
+                )
+                SECURE_PEER_RUNTIME.set_display_name(body.server_name)
+                TEAM_HUB_RUNTIME.managed_host_display_name = body.server_name
+                SECURE_PEER_RUNTIME.resume_member_after_host()
+            except Exception as exc:
+                rollback_errors: list[BaseException] = []
+                if config_snapshot is not None:
+                    try:
+                        await asyncio.to_thread(
+                            restore_team_hub_host_settings,
+                            config_snapshot,
+                        )
+                    except BaseException as rollback_exc:
+                        rollback_errors.append(rollback_exc)
+                try:
+                    SECURE_PEER_RUNTIME.set_display_name(previous_peer_name)
+                    TEAM_HUB_RUNTIME.managed_host_display_name = previous_hub_name
+                except BaseException as rollback_exc:
+                    rollback_errors.append(rollback_exc)
+                if rollback_errors:
+                    raise TeamHubHostControlFailure(
+                        "team_hub_member_rollback_failed",
+                        "The Team Network member change failed and its prior settings could not be restored.",
+                        action="Inspect the server's Team Network settings before retrying.",
+                    ) from rollback_errors[0]
+                raise TeamHubHostControlFailure(
+                    "team_hub_member_rename_failed",
+                    "AgentsServer could not persist the Team Network member name.",
+                    action="Check the server user's AgentsServer configuration permissions.",
+                    retryable=True,
+                ) from exc
+            publish_team_hub_runtime_globals("disabled", body.server_name)
+            completed = write_team_hub_host_control_status(
+                phase="complete",
+                request_id=request_id,
+                operation=(
+                    "already_member"
+                    if previous_name == body.server_name
+                    else "rename"
+                ),
+                message="This server is already a Team Network member.",
+                completed_at=update_utc_now(),
+                failed_at=None,
+                error_code=None,
+                error_action=None,
+                retryable=None,
+                _live_reactivation=None,
+            )
+            return public_team_hub_host_control_status(completed)
+        if managed_server_restart_blocks_work():
+            raise TeamHubHostControlFailure(
+                "team_hub_host_restart_active",
+                "AgentsServer is restarting and cannot change its Team Network role.",
+                status_code=409,
+                action="Retry after the server reconnects.",
+                retryable=True,
+            )
+        update = read_server_update_status()
+        if str(update.get("phase") or "") in (
+            SERVER_UPDATE_ACTIVE_PHASES | {SERVER_UPDATE_PENDING_PHASE}
+        ):
+            raise TeamHubHostControlFailure(
+                "team_hub_host_update_active",
+                "AgentsServer cannot change its Team Network role during an update.",
+                status_code=409,
+                action="Finish or cancel the server update, then retry.",
+                retryable=True,
+            )
+        try:
+            config_snapshot = await asyncio.to_thread(
+                persist_team_hub_host_settings,
+                "disabled",
+                body.server_name,
+            )
+        except Exception as exc:
+            raise TeamHubHostControlFailure(
+                "team_hub_member_persistence_failed",
+                "AgentsServer could not persist the Team Network member role.",
+                action="Check the server user's AgentsServer configuration permissions.",
+                retryable=True,
+            ) from exc
+        previous_name = AGENTSDOCK_SERVER_DISPLAY_NAME
+        SECURE_PEER_RUNTIME.set_display_name(body.server_name)
+        TEAM_HUB_RUNTIME.managed_host_display_name = body.server_name
+        demotion_task = asyncio.create_task(TEAM_HUB_RUNTIME.disable_live_host())
+        try:
+            await asyncio.shield(demotion_task)
+        except asyncio.CancelledError as cancellation:
+            await join_task_despite_caller_cancellation(demotion_task)
+            cancellation_to_raise: asyncio.CancelledError | None = cancellation
+        except Exception as exc:
+            try:
+                await asyncio.to_thread(
+                    restore_team_hub_host_settings,
+                    config_snapshot,
+                )
+            except Exception as rollback_exc:
+                raise TeamHubHostControlFailure(
+                    "team_hub_member_rollback_failed",
+                    "Team Network demotion failed and its persisted role could not be rolled back.",
+                    action="Inspect the AgentsServer configuration before restarting it.",
+                ) from rollback_exc
+            SECURE_PEER_RUNTIME.set_display_name(previous_name)
+            TEAM_HUB_RUNTIME.managed_host_display_name = previous_name
+            raise TeamHubHostControlFailure(
+                "team_hub_member_activation_failed",
+                "This server could not switch to the Team Network member role.",
+                action="Retry after current Team Network requests finish.",
+                retryable=True,
+            ) from exc
+        else:
+            cancellation_to_raise = None
+
+        # Demotion is committed: publish the Member projection before remote
+        # membership recovery, which can legitimately be delayed by an
+        # unavailable peer. A retry can consume the durable pause marker.
+        publish_team_hub_runtime_globals("disabled", body.server_name)
+        try:
+            await asyncio.to_thread(SECURE_PEER_RUNTIME.resume_member_after_host)
+        except Exception as exc:
+            write_team_hub_host_control_status(
+                phase="failed",
+                request_id=request_id,
+                operation="disable",
+                message=(
+                    "This server is a Team Network member, but its saved "
+                    "connection has not resumed yet."
+                ),
+                failed_at=update_utc_now(),
+                error_code="team_hub_member_resume_failed",
+                error_action="Retry Member mode to resume the saved Team Network connection.",
+                retryable=True,
+                _live_reactivation=None,
+            )
+            raise TeamHubHostControlFailure(
+                "team_hub_member_resume_failed",
+                "This server became a Member, but its preserved Team Network connection could not resume.",
+                status_code=409,
+                action="Retry Member mode after inspecting the saved Team Network connection.",
+                retryable=True,
+            ) from exc
+        completed = write_team_hub_host_control_status(
+            phase="complete",
+            request_id=request_id,
+            operation="disable",
+            message="This server is now a Team Network member.",
+            completed_at=update_utc_now(),
+            failed_at=None,
+            error_code=None,
+            error_action=None,
+            retryable=None,
+            _live_reactivation=None,
+        )
+        if cancellation_to_raise is not None:
+            raise cancellation_to_raise
+        return public_team_hub_host_control_status(completed)
 
 
 TEAM_HUB_HEALTH_CAPABILITY_STATE: dict[str, Any] = {
@@ -68185,6 +69671,7 @@ async def health() -> dict[str, Any]:
                 "terminal_protocol": TERMINAL_WEBSOCKET_PROTOCOL,
             },
             "team_hub_v1": team_hub_capability,
+            "team_hub_host_control_v1": team_hub_host_control_capability(),
             "agent_team_mail_v1": {
                 "available": bool(
                     AGENT_TOKEN and (SERVER_ROOT / "agentsdock_mail.py").is_file()
@@ -69405,6 +70892,50 @@ async def put_codex_goals_admin_endpoint(
 ) -> dict[str, Any]:
     require_native_admin_control(request)
     return await put_codex_goals_admin(req)
+
+
+@app.get("/api/admin/team-hub/host")
+async def team_hub_host_status_endpoint(request: Request) -> dict[str, Any]:
+    require_native_admin_control(request)
+    return public_team_hub_host_control_status()
+
+
+@app.post("/api/admin/team-hub/host/enable")
+async def team_hub_host_enable_endpoint(
+    body: TeamHubHostEnableRequest,
+    request: Request,
+) -> dict[str, Any]:
+    require_native_admin_control(request)
+    operation = asyncio.create_task(enable_team_hub_host(body))
+    try:
+        return await asyncio.shield(operation)
+    except asyncio.CancelledError as cancellation:
+        await join_task_despite_caller_cancellation(operation)
+        raise cancellation
+    except TeamHubHostControlFailure as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=team_hub_host_control_error_detail(exc),
+        ) from exc
+
+
+@app.post("/api/admin/team-hub/host/disable")
+async def team_hub_host_disable_endpoint(
+    body: TeamHubHostEnableRequest,
+    request: Request,
+) -> dict[str, Any]:
+    require_native_admin_control(request)
+    operation = asyncio.create_task(disable_team_hub_host(body))
+    try:
+        return await asyncio.shield(operation)
+    except asyncio.CancelledError as cancellation:
+        await join_task_despite_caller_cancellation(operation)
+        raise cancellation
+    except TeamHubHostControlFailure as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=team_hub_host_control_error_detail(exc),
+        ) from exc
 
 
 def require_team_hub_bootstrap_control(

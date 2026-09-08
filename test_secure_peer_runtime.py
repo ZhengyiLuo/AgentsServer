@@ -412,6 +412,7 @@ class SecurePeerRuntimeTests(unittest.TestCase):
                     "id": target_id,
                     "server_identity": "sonic_server_identity",
                     "display_name": "Sonic",
+                    "recipient_display_name": "Network owner",
                     "status": "active",
                     "is_host": True,
                     "owned_by_caller": False,
@@ -432,7 +433,7 @@ class SecurePeerRuntimeTests(unittest.TestCase):
                 "team_id": "team_1",
                 "recipient_kind": "server",
                 "target_id": target_id,
-                "display_name_snapshot": "Sonic",
+                "display_name_snapshot": "Network owner",
             }
             try:
                 with mock.patch.object(
@@ -448,7 +449,7 @@ class SecurePeerRuntimeTests(unittest.TestCase):
                         runtime.resolve_team_references([
                             {
                                 **reference,
-                                "display_name_snapshot": "Visible local alias",
+                                "display_name_snapshot": "Sonic",
                             }
                         ])
                 self.assertEqual(stale.exception.code, "team_reference_invalid")
@@ -517,6 +518,7 @@ class SecurePeerRuntimeTests(unittest.TestCase):
                     {
                         "id": "node_host_12345678",
                         "display_name": "Sonic",
+                        "recipient_display_name": "Network owner",
                         "status": "active",
                         "owned_by_caller": False,
                         "server_identity": "host_identity",
@@ -567,7 +569,7 @@ class SecurePeerRuntimeTests(unittest.TestCase):
             ],
             [
                 ("server", "node_remote_12345678", "Remote", None),
-                ("server", "node_host_12345678", "Sonic", None),
+                ("server", "node_host_12345678", "Network owner", None),
             ],
         )
         self.assertNotIn(
@@ -3202,6 +3204,123 @@ class SecurePeerRuntimeTests(unittest.TestCase):
             self.assertNotIn(connection_id, runtime._remote_routes_cache)
             self.assertNotIn(connection_id, runtime._remote_routes_refreshed_at)
             self.assertIsNone(runtime._client_error)
+            runtime.shutdown()
+
+    def test_proxy_overlaps_get_io_but_keeps_mutations_fenced(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            active = self.outgoing_pairing(123)
+            connection_id = active["connection_id"]
+            two_reads_entered = threading.Event()
+            release_reads = threading.Event()
+            counter_guard = threading.Lock()
+            entered_reads = 0
+            errors: list[BaseException] = []
+
+            def read_proxy(*_args, **_kwargs):
+                nonlocal entered_reads
+                with counter_guard:
+                    entered_reads += 1
+                    if entered_reads == 2:
+                        two_reads_entered.set()
+                if not release_reads.wait(5):
+                    raise TimeoutError("concurrent runtime reads were not released")
+                return ProxyResponse(
+                    200,
+                    (("content-type", "application/json"),),
+                    b"{}",
+                )
+
+            def capture(operation) -> None:
+                try:
+                    operation()
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with (
+                mock.patch.object(
+                    runtime.client, "list_connections", return_value=[active]
+                ),
+                mock.patch.object(
+                    runtime.client, "proxy", side_effect=read_proxy
+                ),
+            ):
+                readers = [
+                    threading.Thread(
+                        target=lambda: capture(
+                            lambda: runtime.proxy(
+                                connection_id,
+                                "GET",
+                                "/v1/teams",
+                                query="",
+                                headers=None,
+                                body=None,
+                            )
+                        )
+                    )
+                    for _index in range(2)
+                ]
+                for reader in readers:
+                    reader.start()
+                try:
+                    self.assertTrue(
+                        two_reads_entered.wait(2),
+                        "runtime serialized independent Team Network reads",
+                    )
+                finally:
+                    release_reads.set()
+                for reader in readers:
+                    reader.join(5)
+                    self.assertFalse(reader.is_alive())
+            self.assertEqual(errors, [])
+
+            mutation_entered = threading.Event()
+            release_mutation = threading.Event()
+
+            def mutation_proxy(*_args, **_kwargs):
+                mutation_entered.set()
+                if not release_mutation.wait(5):
+                    raise TimeoutError("runtime mutation was not released")
+                return ProxyResponse(
+                    200,
+                    (("content-type", "application/json"),),
+                    b"{}",
+                )
+
+            with (
+                mock.patch.object(
+                    runtime.client, "list_connections", return_value=[active]
+                ),
+                mock.patch.object(
+                    runtime.client, "proxy", side_effect=mutation_proxy
+                ),
+            ):
+                writer = threading.Thread(
+                    target=lambda: capture(
+                        lambda: runtime.proxy(
+                            connection_id,
+                            "POST",
+                            "/v1/teams/team-1/network/bulletin",
+                            query="",
+                            headers={"content-type": "application/json"},
+                            body=b'{"body":"notice","idempotency_key":"notice-123"}',
+                        )
+                    )
+                )
+                writer.start()
+                self.assertTrue(mutation_entered.wait(2))
+                try:
+                    self.assertFalse(runtime._outbound_guard.acquire(timeout=0.1))
+                finally:
+                    release_mutation.set()
+                writer.join(5)
+                self.assertFalse(writer.is_alive())
+            self.assertEqual(errors, [])
             runtime.shutdown()
 
     def test_proxy_never_retires_transient_or_other_unauthorized_errors(self) -> None:

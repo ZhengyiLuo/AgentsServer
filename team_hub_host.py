@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from fastapi import Request
@@ -306,7 +306,298 @@ class ManagedTeamHubHost:
         with self._guard:
             return self._store
 
-    def initialize(self) -> None:
+    def enable_live_host(
+        self,
+        *,
+        transport: str,
+        hub_url: str | None,
+        routes: dict[str, str | None],
+        allowed_hosts: set[str],
+        managed_host_display_name: str,
+        reactivation_hub_id: str | None = None,
+        reactivation_operation_id: str | None = None,
+        reactivation_snapshot: Path | None = None,
+        commit_configuration: Callable[[], Any] | None = None,
+    ) -> dict[str, Any]:
+        """Activate this process as its own managed Hub host without restart.
+
+        The caller owns durable configuration.  This method changes only the
+        in-process boundary, and publishes the new mode atomically with a
+        successfully initialized delegate.  A failed initialization restores
+        the exact disabled runtime projection so health never claims that an
+        unusable host was enabled.
+        """
+
+        if transport not in {
+            TEAM_HUB_TRANSPORT_LOOPBACK,
+            TEAM_HUB_TRANSPORT_TAILSCALE_SERVE,
+            TEAM_HUB_TRANSPORT_DIRECT_IP,
+        }:
+            raise ValueError("Team Hub transport is invalid")
+        if routes.get(transport) != hub_url:
+            raise ValueError("Team Hub routes do not contain the primary transport")
+        reactivation_values = (
+            reactivation_hub_id,
+            reactivation_operation_id,
+            reactivation_snapshot,
+        )
+        if any(value is not None for value in reactivation_values) and not all(
+            value is not None for value in reactivation_values
+        ):
+            raise ValueError("Team Hub reactivation authority is incomplete")
+
+        with self._guard:
+            if self.designated_host:
+                self.rename_live_host(managed_host_display_name)
+                capability = self.capability()
+                if capability.get("available") is not True:
+                    raise RuntimeError("the designated Team Hub host is unavailable")
+                return capability
+            if (
+                self._delegate is not None
+                or self._store is not None
+                or self._runtime_lease_fd is not None
+            ):
+                raise RuntimeError("the disabled Team Hub runtime is not clean")
+
+            previous = {
+                "mode": self.mode,
+                "transport": self.transport,
+                "hub_url": self.hub_url,
+                "routes": dict(self.routes),
+                "allowed_hosts": set(self.allowed_hosts),
+                "config_error": self.config_error,
+                "managed_host_display_name": self.managed_host_display_name,
+                "reactivation_hub_id": self.reactivation_hub_id,
+                "reactivation_operation_id": self.reactivation_operation_id,
+                "reactivation_snapshot": self.reactivation_snapshot,
+            }
+            self.mode = TEAM_HUB_MODE_HOST
+            self.transport = transport
+            self.hub_url = hub_url
+            self.routes = dict(routes)
+            self.allowed_hosts = set(allowed_hosts)
+            self.managed_host_display_name = str(managed_host_display_name)
+            self.reactivation_hub_id = reactivation_hub_id
+            self.reactivation_operation_id = reactivation_operation_id
+            self.reactivation_snapshot = reactivation_snapshot
+            self.config_error = None
+            self._startup_failed = False
+            self._startup_failure_reason = None
+
+            self.initialize(hold_admission=True, hold_peer_attachment=True)
+            available = self._store is not None
+            failure_reason = self._startup_failure_reason
+            if not available:
+                self.mode = str(previous["mode"])
+                self.transport = str(previous["transport"])
+                self.hub_url = previous["hub_url"]
+                self.routes = dict(previous["routes"])
+                self.allowed_hosts = set(previous["allowed_hosts"])
+                self.config_error = previous["config_error"]
+                self.managed_host_display_name = str(
+                    previous["managed_host_display_name"]
+                )
+                self.reactivation_hub_id = previous["reactivation_hub_id"]
+                self.reactivation_operation_id = previous[
+                    "reactivation_operation_id"
+                ]
+                self.reactivation_snapshot = previous["reactivation_snapshot"]
+                self._delegate = None
+                self._store = None
+                self._accepting = False
+                self._startup_failed = False
+                self._startup_failure_reason = None
+                raise RuntimeError(
+                    failure_reason or "Team Hub host activation failed"
+                )
+
+            try:
+                if commit_configuration is not None:
+                    commit_configuration()
+                if reactivation_hub_id is not None:
+                    assert reactivation_operation_id is not None
+                    assert reactivation_snapshot is not None
+                    if not self.clear_maintenance_sync(
+                        "host-reactivation",
+                        reactivation_operation_id,
+                        reactivation_snapshot,
+                    ):
+                        raise RuntimeError(
+                            "Team Hub reactivation fence disappeared before commit"
+                        )
+                    self._finalize_committed_fenced_start()
+                elif self._store is not None:
+                    self._attach_host_store(self._store)
+            except BaseException:
+                lease = self._runtime_lease_fd
+                self._runtime_lease_fd = None
+                self.mode = str(previous["mode"])
+                self.transport = str(previous["transport"])
+                self.hub_url = previous["hub_url"]
+                self.routes = dict(previous["routes"])
+                self.allowed_hosts = set(previous["allowed_hosts"])
+                self.config_error = previous["config_error"]
+                self.managed_host_display_name = str(
+                    previous["managed_host_display_name"]
+                )
+                self.reactivation_hub_id = previous["reactivation_hub_id"]
+                self.reactivation_operation_id = previous[
+                    "reactivation_operation_id"
+                ]
+                self.reactivation_snapshot = previous["reactivation_snapshot"]
+                self._delegate = None
+                self._store = None
+                self._accepting = False
+                self._startup_failed = False
+                self._startup_failure_reason = None
+                HubStore.release_managed_runtime_lease(lease)
+                raise
+            self._accepting = True
+            return self.capability()
+
+    def rename_live_host(self, display_name: str) -> None:
+        """Rename the active managed node without changing host identity."""
+
+        label = str(display_name)
+        with self._guard:
+            store = self._store
+            previous = self.managed_host_display_name
+            if store is None:
+                if self.designated_host:
+                    raise RuntimeError("the designated Team Hub host is unavailable")
+                self.managed_host_display_name = label
+                return
+            try:
+                store.rename_managed_host(label)
+            except BaseException:
+                self.managed_host_display_name = previous
+                raise
+            self.managed_host_display_name = label
+
+    async def disable_live_host(self) -> dict[str, Any]:
+        """Drain and demote this live host without stopping AgentsServer."""
+
+        with self._guard:
+            if not self.designated_host:
+                return self.capability()
+            store = self._store
+        if store is None:
+            with self._guard:
+                lease = self._runtime_lease_fd
+                self._runtime_lease_fd = None
+                self._delegate = None
+                self._accepting = False
+                self._startup_failed = False
+                self._startup_failure_reason = None
+                self.mode = TEAM_HUB_MODE_DISABLED
+            HubStore.release_managed_runtime_lease(lease)
+            return self.capability()
+
+        drain_task = asyncio.create_task(self._close_and_drain())
+        try:
+            await asyncio.shield(drain_task)
+        except asyncio.CancelledError as cancellation:
+            try:
+                await _join_task_despite_caller_cancellation(drain_task)
+            except BaseException:
+                await self.reopen_admission()
+                raise
+            # Draining alone is not the demotion commit point. If the caller
+            # goes away before peer detachment, restore the still-live Host's
+            # admission boundary instead of leaving it unavailable forever.
+            await self.reopen_admission()
+            raise cancellation
+        except BaseException:
+            await self.reopen_admission()
+            raise
+
+        if self.secure_peer_manager is not None:
+            detach_task = asyncio.create_task(
+                asyncio.to_thread(
+                    self.secure_peer_manager.detach_host_hub,
+                    hub_store=store,
+                )
+            )
+            try:
+                await asyncio.shield(detach_task)
+            except asyncio.CancelledError as cancellation:
+                try:
+                    await _join_task_despite_caller_cancellation(detach_task)
+                except BaseException:
+                    # A failed detach has not published the local demotion.
+                    # Restore admission on the still-owned Host, failing
+                    # closed if its peer surface cannot reopen.
+                    await self.reopen_admission()
+                    raise
+                # Detachment is the commit boundary. Finish the local state
+                # transition before propagating cancellation to the caller.
+                cancellation_to_raise: asyncio.CancelledError | None = cancellation
+            except BaseException:
+                await self.reopen_admission()
+                raise
+            else:
+                cancellation_to_raise = None
+        else:
+            cancellation_to_raise = None
+
+        with self._guard:
+            if self._store is not store:
+                raise RuntimeError("Team Hub host ownership changed during demotion")
+            lease = self._runtime_lease_fd
+            self._runtime_lease_fd = None
+            self._delegate = None
+            self._store = None
+            self._accepting = False
+            self._startup_failed = False
+            self._startup_failure_reason = None
+            self.mode = TEAM_HUB_MODE_DISABLED
+        HubStore.release_managed_runtime_lease(lease)
+        result = self.capability()
+        if cancellation_to_raise is not None:
+            raise cancellation_to_raise
+        return result
+
+    def _attach_host_store(self, store: HubStore) -> None:
+        if self.secure_peer_manager is None:
+            return
+        try:
+            self.secure_peer_manager.attach_host_hub(
+                hub_id=store.hub_id,
+                hub_data_dir=self.data_dir,
+                hub_store=store,
+            )
+        except Exception as exc:
+            self.logger.error(
+                "secure peer host attachment failed error_type=%s error_code=%s",
+                type(exc).__name__,
+                getattr(exc, "code", "secure_peer_host_recovery_failed"),
+            )
+            error_code = str(
+                getattr(exc, "code", "secure_peer_host_recovery_failed")
+            )
+            self.secure_peer_manager.mark_host_unavailable(
+                (
+                    "An existing secure peer connection could not be "
+                    "reconciled safely."
+                    if error_code == "peer_identity_conflict"
+                    else "The secure peer host could not finish recovery."
+                ),
+                error_code=error_code,
+                action=(
+                    "Review or remove the conflicting logical server "
+                    "connection, then retry host recovery."
+                    if error_code == "peer_identity_conflict"
+                    else "Retry after the Team Hub database is available."
+                ),
+            )
+
+    def initialize(
+        self,
+        *,
+        hold_admission: bool = False,
+        hold_peer_attachment: bool = False,
+    ) -> None:
         if not self.designated_host:
             if self.config_error:
                 self.logger.error("Team Hub is disabled: %s", self.config_error)
@@ -372,43 +663,15 @@ class ManagedTeamHubHost:
             self._runtime_lease_fd = lease
             self._delegate = application
             self._store = application.state.store
-            self._accepting = True
+            self._accepting = not hold_admission
             self._startup_failed = False
             self._startup_failure_reason = None
         if (
             self.secure_peer_manager is not None
             and not application.state.store.maintenance_fenced_start
+            and not hold_peer_attachment
         ):
-            try:
-                self.secure_peer_manager.attach_host_hub(
-                    hub_id=application.state.store.hub_id,
-                    hub_data_dir=self.data_dir,
-                    hub_store=application.state.store,
-                )
-            except Exception as exc:
-                self.logger.error(
-                    "secure peer host attachment failed error_type=%s error_code=%s",
-                    type(exc).__name__,
-                    getattr(exc, "code", "secure_peer_host_recovery_failed"),
-                )
-                error_code = str(
-                    getattr(exc, "code", "secure_peer_host_recovery_failed")
-                )
-                self.secure_peer_manager.mark_host_unavailable(
-                    (
-                        "An existing secure peer connection could not be "
-                        "reconciled safely."
-                        if error_code == "peer_identity_conflict"
-                        else "The secure peer host could not finish recovery."
-                    ),
-                    error_code=error_code,
-                    action=(
-                        "Review or remove the conflicting logical server "
-                        "connection, then retry host recovery."
-                        if error_code == "peer_identity_conflict"
-                        else "Retry after the Team Hub database is available."
-                    ),
-                )
+            self._attach_host_store(application.state.store)
 
     def _finalize_committed_fenced_start(self) -> None:
         """Attach peer hosting after the installer consumes the exact fence.

@@ -878,8 +878,8 @@ class HubStore:
         finally:
             os.close(descriptor)
 
-    def _read_managed_binding_without_source_mutation(self) -> str | None:
-        """Read the main DB plus any live WAL through a private stable copy."""
+    def _read_managed_state_without_source_mutation(self) -> dict[str, Any]:
+        """Read binding and empty-state proof from a private stable copy."""
 
         wal_path = self.database_path.with_name(self.database_path.name + "-wal")
         for _attempt in range(3):
@@ -914,21 +914,49 @@ class HubStore:
                         continue
                     connection = sqlite3.connect(str(copied), isolation_level=None)
                     try:
+                        table_names = {
+                            str(row[0])
+                            for row in connection.execute(
+                                "SELECT name FROM sqlite_master WHERE type='table'"
+                            ).fetchall()
+                        }
                         table = connection.execute(
                             """
                             SELECT 1 FROM sqlite_master
                             WHERE type = 'table' AND name = 'managed_host_bindings'
                             """
                         ).fetchone()
-                        if table is None:
-                            return None
-                        binding = connection.execute(
-                            """
-                            SELECT server_identity
-                            FROM managed_host_bindings WHERE singleton = 1
-                            """
-                        ).fetchone()
-                        return str(binding[0]) if binding is not None else None
+                        binding = (
+                            connection.execute(
+                                """
+                                SELECT server_identity
+                                FROM managed_host_bindings WHERE singleton = 1
+                                """
+                            ).fetchone()
+                            if table is not None
+                            else None
+                        )
+                        identity_tables = {
+                            "principals",
+                            "teams",
+                            "memberships",
+                            "device_sessions",
+                        }
+                        globally_empty = identity_tables.issubset(table_names) and all(
+                            int(
+                                connection.execute(
+                                    f"SELECT count(*) FROM {name}"
+                                ).fetchone()[0]
+                            )
+                            == 0
+                            for name in identity_tables
+                        )
+                        return {
+                            "server_identity": (
+                                str(binding[0]) if binding is not None else None
+                            ),
+                            "globally_empty": globally_empty,
+                        }
                     finally:
                         connection.close()
                 except RuntimeError:
@@ -938,6 +966,11 @@ class HubStore:
                         "Team Hub host-binding preflight could not verify the database"
                     ) from exc
         raise RuntimeError("Team Hub host-binding preflight could not obtain a stable snapshot")
+
+    def _read_managed_binding_without_source_mutation(self) -> str | None:
+        return self._read_managed_state_without_source_mutation()[
+            "server_identity"
+        ]
 
     @classmethod
     def managed_host_binding_without_source_mutation(
@@ -952,6 +985,20 @@ class HubStore:
         probe.data_dir = root
         probe.database_path = root / "team-hub.sqlite3"
         return probe._read_managed_binding_without_source_mutation()
+
+    @classmethod
+    def managed_host_state_without_source_mutation(
+        cls,
+        data_dir: Path,
+    ) -> dict[str, Any]:
+        """Read a preserved Hub's binding and global emptiness proof."""
+
+        root = Path(os.path.abspath(os.path.expanduser(os.fspath(data_dir))))
+        cls._validate_private_directory_without_mutation(root)
+        probe = object.__new__(cls)
+        probe.data_dir = root
+        probe.database_path = root / "team-hub.sqlite3"
+        return probe._read_managed_state_without_source_mutation()
 
     @staticmethod
     def _sha256_private_regular_file(
@@ -5977,6 +6024,34 @@ class HubStore:
             raise HubError("peer_unavailable", "Secure peer is unavailable", 404)
         return "service_secure_peer_" + parsed.hex
 
+    def rename_managed_host(self, display_name: str) -> None:
+        """Rename this exact managed server node and its principal atomically."""
+
+        if self.managed_host_identity is None:
+            raise RuntimeError("managed server identity is unavailable")
+        label = _bounded_text(display_name, "display_name", 1, 160)
+        timestamp = _now()
+        previous = self.managed_host_display_name
+        self.managed_host_display_name = label
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                row = connection.execute(
+                    "SELECT team_id FROM nodes WHERE server_identity=?",
+                    (self.managed_host_identity,),
+                ).fetchone()
+                if row is not None:
+                    self._ensure_managed_host_node(
+                        connection,
+                        str(row["team_id"]),
+                        timestamp,
+                    )
+        except BaseException:
+            self.managed_host_display_name = previous
+            raise
+        finally:
+            connection.close()
+
     def _ensure_managed_host_node(
         self,
         connection: sqlite3.Connection,
@@ -9109,6 +9184,19 @@ class HubStore:
             ).fetchone()
             if team is None:
                 raise HubError("not_found", "Resource not found", 404)
+            owner = connection.execute(
+                """
+                SELECT p.display_name
+                FROM memberships AS m
+                JOIN principals AS p ON p.id=m.principal_id
+                WHERE m.team_id=? AND m.role='owner' AND m.status='active'
+                  AND p.kind='human' AND p.status='active'
+                """,
+                (team_id,),
+            ).fetchone()
+            if owner is None:
+                raise RuntimeError("Team Network owner is unavailable")
+            host_recipient_display_name = str(owner["display_name"])
             owned_node_id: str | None = None
             if claims.auth_kind in NETWORK_AUTOMATION_AUTH_KINDS:
                 owned_node_id = str(
@@ -9189,6 +9277,12 @@ class HubStore:
                     "id": row["id"],
                     "server_identity": row["server_identity"],
                     "display_name": row["display_name"],
+                    "recipient_display_name": (
+                        host_recipient_display_name
+                        if self.managed_host_identity is not None
+                        and row["server_identity"] == self.managed_host_identity
+                        else row["display_name"]
+                    ),
                     "status": row["status"],
                     "is_host": bool(
                         self.managed_host_identity is not None
@@ -9326,16 +9420,33 @@ class HubStore:
             ).fetchone()
             if row is None:
                 raise HubError("not_found", "Resource not found", 404)
+            is_host = bool(
+                self.managed_host_identity is not None
+                and row["server_identity"] == self.managed_host_identity
+            )
+            recipient_display_name = str(row["display_name"])
+            if is_host:
+                owner = connection.execute(
+                    """
+                    SELECT p.display_name
+                    FROM memberships AS m
+                    JOIN principals AS p ON p.id=m.principal_id
+                    WHERE m.team_id=? AND m.role='owner' AND m.status='active'
+                      AND p.kind='human' AND p.status='active'
+                    """,
+                    (team_id,),
+                ).fetchone()
+                if owner is None:
+                    raise RuntimeError("Team Network owner is unavailable")
+                recipient_display_name = str(owner["display_name"])
             result = {
                 "server": {
                     "id": str(row["id"]),
                     "server_identity": str(row["server_identity"]),
                     "display_name": str(row["display_name"]),
+                    "recipient_display_name": recipient_display_name,
                     "status": str(row["status"]),
-                    "is_host": bool(
-                        self.managed_host_identity is not None
-                        and row["server_identity"] == self.managed_host_identity
-                    ),
+                    "is_host": is_host,
                     "owned_by_caller": row["id"] == owned_node_id,
                 }
             }

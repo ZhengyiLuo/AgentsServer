@@ -408,6 +408,7 @@ sys.exit(10)
             projection = migrated.get_network(claims, team_id)
             host = next(server for server in projection["servers"] if server["is_host"])
             self.assertEqual(host["display_name"], "Sonic")
+            self.assertEqual(host["recipient_display_name"], "Owner")
             self.assertEqual(
                 migrated.get_network_server(claims, team_id, host["id"])["server"],
                 host,

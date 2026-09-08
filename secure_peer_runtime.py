@@ -202,6 +202,7 @@ class SecurePeerRuntime:
         # pending before retirement (so retirement returns 409) or observes
         # the retired route and cannot be created.
         self._outbound_guard = threading.RLock()
+        self._host_role_active = False
         self._peer_admission = threading.Condition(threading.RLock())
         self._peer_accepting = False
         self._peer_in_flight = 0
@@ -276,6 +277,68 @@ class SecurePeerRuntime:
                     "secure peer state quarantined error_type=%s",
                     type(exc).__name__,
                 )
+
+    def set_display_name(self, display_name: str) -> str:
+        """Update this live server label without changing its stable identity."""
+
+        label = str(display_name)
+        if not label or len(label.encode("utf-8")) > 160:
+            raise ValueError("server display name is invalid")
+        with self._guard:
+            self.display_name = label
+            client = self.client
+            if isinstance(client, SecurePeerClient):
+                client.display_name = label
+        return label
+
+    def pause_member_for_host(self) -> dict[str, Any] | None:
+        """Pause the active remote membership without deleting queued work."""
+
+        with self._outbound_guard:
+            if not isinstance(self.client, SecurePeerClient):
+                if self._initialization_error is not None:
+                    raise RuntimeError(self._initialization_error)
+                return None
+            try:
+                paused = self.client.pause_active_connection_for_host()
+            except BaseException:
+                # SQLite commit can report an ambiguous storage error after
+                # installing the exact pause marker. The operation is
+                # idempotent, so one replay classifies committed vs uncommitted
+                # state before the caller decides whether rollback is needed.
+                paused = self.client.pause_active_connection_for_host()
+            self._host_role_active = True
+            return paused
+
+    def resume_member_after_host(self) -> dict[str, Any] | None:
+        """Restore the exact membership that local Host mode paused."""
+
+        with self._outbound_guard:
+            # Keep every connection-changing path fenced until the durable
+            # pause marker has either been consumed successfully or repaired.
+            # In particular, startup must not permit a second membership when
+            # an interrupted Host -> Member transition left the saved row in
+            # place.
+            self._host_role_active = True
+            if not isinstance(self.client, SecurePeerClient):
+                if self._initialization_error is not None:
+                    raise RuntimeError(self._initialization_error)
+                self._host_role_active = False
+                return None
+            try:
+                restored = self.client.restore_host_paused_connection()
+            except BaseException:
+                # A committed restore consumes its marker; replay then returns
+                # None. An uncommitted restore safely retries the same fenced
+                # connection transition.
+                restored = self.client.restore_host_paused_connection()
+            self._host_role_active = False
+            if restored is not None:
+                self._client_failure_counts.pop(
+                    str(restored.get("connection_id") or ""),
+                    None,
+                )
+            return restored
 
     def _default_config(self) -> dict[str, Any]:
         return {
@@ -568,6 +631,36 @@ class SecurePeerRuntime:
                 self._peer_admission.notify_all()
             self._pending_host_attachment = None
 
+    def detach_host_hub(self, *, hub_store: HubStore) -> None:
+        """Retire only this server's host role while preserving client state."""
+
+        # Delivery claims and host removal share this guard, so no background
+        # claim can retain an authoritative host adapter after demotion.
+        with self._outbound_guard:
+            self.close_host_admission()
+            with self._guard:
+                pending_store = (
+                    self._pending_host_attachment[2]
+                    if self._pending_host_attachment is not None
+                    else None
+                )
+                if (
+                    self._hub_store is not None
+                    and self._hub_store is not hub_store
+                ) or (pending_store is not None and pending_store is not hub_store):
+                    raise RuntimeError("secure peer host ownership changed")
+                gateway = self._gateway
+                if gateway is not None:
+                    gateway.stop()
+                self._gateway = None
+                self._hub_store = None
+                self._host_store = None
+                self._adapter = None
+                self._pending_host_attachment = None
+                self._host_error = None
+                self._host_error_code = None
+                self._host_action = None
+
     def retry_host_attachment(self) -> bool:
         """Retry the exact designated Hub attachment after a transient failure."""
 
@@ -755,6 +848,12 @@ class SecurePeerRuntime:
         expected_hub_id: str,
     ) -> dict[str, Any]:
         with self._outbound_guard:
+            if self._host_role_active:
+                raise SecurePeerError(
+                    "host_role_active",
+                    "This server cannot activate a Member connection while it is the Team Network host",
+                    409,
+                )
             connection = self._outgoing_for_pairing(pairing_id)
             if (
                 connection.get("connection_id") != expected_connection_id
@@ -801,6 +900,12 @@ class SecurePeerRuntime:
         expected_hub_id: str,
     ) -> dict[str, Any]:
         with self._outbound_guard:
+            if self._host_role_active:
+                raise SecurePeerError(
+                    "host_role_active",
+                    "This server cannot change its saved Member connection while it is the Team Network host",
+                    409,
+                )
             self._require_connection_delivery_quiescent(connection_id)
             self.client.deactivate_connection(
                 connection_id,
@@ -819,6 +924,12 @@ class SecurePeerRuntime:
         expected_certificate_fingerprint: str,
     ) -> dict[str, Any]:
         with self._outbound_guard:
+            if self._host_role_active:
+                raise SecurePeerError(
+                    "host_role_active",
+                    "This server cannot forget its saved Member connection while it is the Team Network host",
+                    409,
+                )
             self._require_connection_delivery_quiescent(connection_id)
             connection = next(
                 (
@@ -1898,6 +2009,19 @@ class SecurePeerRuntime:
         return status.get("status") == "revoked"
 
     def maintenance_once(self) -> dict[str, Any]:
+        """Serialize client maintenance with live Host/Member transitions."""
+
+        with self._outbound_guard:
+            if self._host_role_active:
+                return {
+                    "active": False,
+                    "renewed": False,
+                    "healthy": False,
+                    "host_role_active": True,
+                }
+            return self._maintenance_once_unlocked()
+
+    def _maintenance_once_unlocked(self) -> dict[str, Any]:
         """Reconcile host leases and heartbeat the active peer independently."""
 
         if self._initialization_error is not None:
@@ -3321,72 +3445,122 @@ class SecurePeerRuntime:
             query=query,
             body=body,
         )
-        with self._outbound_guard:
-            active = next(
-                (
-                    item
-                    for item in self.client.list_connections()
-                    if item.get("active")
-                ),
-                None,
+        # GETs carry no durable outbound intent.  Snapshot the exact active
+        # connection under the retirement fence, then let independent reads
+        # use the peer transport concurrently.  Connection-changing and write
+        # paths retain the guard through their complete remote operation.
+        if str(method).upper() == "GET" and reply_parent_path is None:
+            with self._outbound_guard:
+                active = self._require_active_proxy_connection(connection_id)
+            return self._proxy_with_active_connection(
+                active,
+                connection_id,
+                method,
+                path,
+                query=query,
+                headers=headers,
+                body=body,
+                reply_parent_path=None,
             )
-            if active is None or active.get("connection_id") != connection_id:
-                raise SecurePeerError(
-                    "connection_unavailable",
-                    "Secure peer connection is unavailable",
-                    404,
-                )
-            try:
-                if reply_parent_path is not None:
-                    parent_response = self.client.proxy(
-                        connection_id,
-                        "GET",
-                        reply_parent_path,
-                        query="",
-                        headers={"accept": "application/json"},
-                        body=None,
-                    )
-                    parent = self._decoded_proxy_json(
-                        parent_response,
-                        preserve_not_found=True,
-                    )
-                    item = parent.get("item")
-                    sender = item.get("from") if isinstance(item, Mapping) else None
-                    recipient = item.get("to") if isinstance(item, Mapping) else None
-                    allowed_participant_kinds = {"server", "human"}
-                    if (
-                        not isinstance(sender, Mapping)
-                        or not isinstance(recipient, Mapping)
-                        or sender.get("kind") not in allowed_participant_kinds
-                        or recipient.get("kind") not in allowed_participant_kinds
-                    ):
-                        raise SecurePeerError(
-                            "invalid_request",
-                            "Agent-addressed peer replies are retired",
-                            422,
-                        )
-                return self.client.proxy(
+        with self._outbound_guard:
+            active = self._require_active_proxy_connection(connection_id)
+            return self._proxy_with_active_connection(
+                active,
+                connection_id,
+                method,
+                path,
+                query=query,
+                headers=headers,
+                body=body,
+                reply_parent_path=reply_parent_path,
+            )
+
+    def _require_active_proxy_connection(
+        self,
+        connection_id: str,
+    ) -> Mapping[str, Any]:
+        active = next(
+            (
+                item
+                for item in self.client.list_connections()
+                if item.get("active")
+            ),
+            None,
+        )
+        if active is None or active.get("connection_id") != connection_id:
+            raise SecurePeerError(
+                "connection_unavailable",
+                "Secure peer connection is unavailable",
+                404,
+            )
+        return active
+
+    def _proxy_with_active_connection(
+        self,
+        active: Mapping[str, Any],
+        connection_id: str,
+        method: str,
+        path: str,
+        *,
+        query: str,
+        headers: Mapping[str, str] | None,
+        body: bytes | None,
+        reply_parent_path: str | None,
+    ):
+        try:
+            if reply_parent_path is not None:
+                parent_response = self.client.proxy(
                     connection_id,
-                    method,
-                    path,
-                    query=query,
-                    headers=headers,
-                    body=body,
+                    "GET",
+                    reply_parent_path,
+                    query="",
+                    headers={"accept": "application/json"},
+                    body=None,
                 )
-            except SecurePeerError as exc:
+                parent = self._decoded_proxy_json(
+                    parent_response,
+                    preserve_not_found=True,
+                )
+                item = parent.get("item")
+                sender = item.get("from") if isinstance(item, Mapping) else None
+                recipient = item.get("to") if isinstance(item, Mapping) else None
+                allowed_participant_kinds = {"server", "human"}
                 if (
-                    self._is_unconfirmed_peer_revocation(exc)
-                    and self._remote_revocation_confirmed(connection_id) is True
+                    not isinstance(sender, Mapping)
+                    or not isinstance(recipient, Mapping)
+                    or sender.get("kind") not in allowed_participant_kinds
+                    or recipient.get("kind") not in allowed_participant_kinds
                 ):
-                    try:
-                        self._retire_remote_revoked_active_connection(active, {})
-                    except Exception as retire_error:
-                        if self.logger is not None:
-                            self.logger.warning(
-                                "secure peer local revocation retirement deferred error_type=%s",
-                                type(retire_error).__name__,
-                            )
-                raise
+                    raise SecurePeerError(
+                        "invalid_request",
+                        "Agent-addressed peer replies are retired",
+                        422,
+                    )
+            return self.client.proxy(
+                connection_id,
+                method,
+                path,
+                query=query,
+                headers=headers,
+                body=body,
+            )
+        except SecurePeerError as exc:
+            if self._is_unconfirmed_peer_revocation(exc):
+                # A read may have released the ordinary outbound fence.  Take
+                # it again across the pinned confirmation and durable local
+                # retirement so certificate renewal/role switching cannot
+                # cross this terminal trust transition.
+                with self._outbound_guard:
+                    if self._remote_revocation_confirmed(connection_id) is True:
+                        try:
+                            self._retire_remote_revoked_active_connection(active, {})
+                        except Exception as retire_error:
+                            if self.logger is not None:
+                                self.logger.warning(
+                                    "secure peer local revocation retirement deferred error_type=%s",
+                                    type(retire_error).__name__,
+                                )
+            raise
 
     @staticmethod
     def _enforce_inbox_only_outbound_proxy(
@@ -3537,7 +3711,11 @@ class SecurePeerRuntime:
                 **dict(realm),
                 "destination_kind": "server",
                 "destination_id": server_id,
-                "display_name": str(server.get("display_name") or "Server")[:160],
+                "display_name": str(
+                    server.get("recipient_display_name")
+                    or server.get("display_name")
+                    or "Server"
+                )[:160],
                 "backend": None,
                 "network_display_name": network_display_name,
             })
@@ -5835,7 +6013,11 @@ class SecurePeerRuntime:
                 target = network_server(team_id, target_id)
                 if (
                     target is None
-                    or str(target.get("display_name") or "") != display_name
+                    or str(
+                        target.get("recipient_display_name")
+                        or target.get("display_name")
+                        or ""
+                    ) != display_name
                 ):
                     raise SecurePeerError(
                         "team_reference_invalid",

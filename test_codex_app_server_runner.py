@@ -506,6 +506,27 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         )
         return stack, events, finished, exec_fallback
 
+    async def wait_for_native_provider_ready(
+        self,
+        runner: asyncio.Task[None],
+        *,
+        timeout: float = 2.0,
+    ) -> None:
+        """Wait for mocked native startup without depending on loop turns."""
+
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            active = agent_server.ACTIVE.get("chat-native") or {}
+            if active.get("provider_turn_ready"):
+                return
+            if runner.done():
+                await runner
+                self.fail("native provider runner exited before becoming ready")
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                self.fail("native provider turn never became ready")
+            await asyncio.sleep(0)
+
     async def assert_unpin_failure_still_drains_successor(
         self,
         unpin_error: BaseException,
@@ -2677,13 +2698,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                     allow_resume_rollover=False,
                 )
             )
-            for _ in range(100):
-                active = agent_server.ACTIVE.get("chat-native") or {}
-                if active.get("provider_turn_ready"):
-                    break
-                await asyncio.sleep(0)
-            else:
-                self.fail("Codex app-server turn never became ready")
+            await self.wait_for_native_provider_ready(runner)
 
             agent_server.register_session_task(
                 agent_server.SESSION_TURN_TASKS,
@@ -3033,13 +3048,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                     allow_exec_fallback=True,
                 )
             )
-            for _ in range(100):
-                active = agent_server.ACTIVE.get("chat-native") or {}
-                if active.get("provider_turn_ready"):
-                    break
-                await asyncio.sleep(0)
-            else:
-                self.fail("native provider turn never became ready")
+            await self.wait_for_native_provider_ready(runner)
 
             run_now = await asyncio.wait_for(
                 agent_server.run_queued_turn_now(
@@ -3199,12 +3208,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                 allow_exec_fallback=True,
                 allow_resume_rollover=False,
             ))
-            for _ in range(100):
-                if (agent_server.ACTIVE.get("chat-native") or {}).get(
-                    "provider_turn_ready"
-                ):
-                    break
-                await asyncio.sleep(0)
+            await self.wait_for_native_provider_ready(runner)
             first = await asyncio.wait_for(
                 agent_server.run_queued_turn_now(
                     "chat-native",
@@ -3527,12 +3531,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                     allow_resume_rollover=False,
                 )
             )
-            for _ in range(100):
-                if (
-                    agent_server.ACTIVE.get("chat-native") or {}
-                ).get("provider_turn_ready"):
-                    break
-                await asyncio.sleep(0)
+            await self.wait_for_native_provider_ready(runner)
             force_send = asyncio.create_task(
                 agent_server.run_queued_turn_now(
                     "chat-native",
@@ -3693,12 +3692,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                     allow_resume_rollover=False,
                 )
             )
-            for _ in range(100):
-                if (
-                    agent_server.ACTIVE.get("chat-native") or {}
-                ).get("provider_turn_ready"):
-                    break
-                await asyncio.sleep(0)
+            await self.wait_for_native_provider_ready(runner)
             await asyncio.sleep(0.1)
             run_now = await agent_server.run_queued_turn_now(
                 "chat-native",
@@ -4241,12 +4235,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                     allow_resume_rollover=True,
                 )
             )
-            for _ in range(100):
-                if (
-                    agent_server.ACTIVE.get("chat-native") or {}
-                ).get("provider_turn_ready"):
-                    break
-                await asyncio.sleep(0)
+            await self.wait_for_native_provider_ready(runner)
             force_send = asyncio.create_task(
                 agent_server.run_queued_turn_now(
                     "chat-native",
@@ -4298,12 +4287,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                 allow_exec_fallback=True,
                 allow_resume_rollover=False,
             ))
-            for _ in range(100):
-                if (agent_server.ACTIVE.get("chat-native") or {}).get(
-                    "provider_turn_ready"
-                ):
-                    break
-                await asyncio.sleep(0)
+            await self.wait_for_native_provider_ready(runner)
             force_send = asyncio.create_task(agent_server.run_queued_turn_now(
                 "chat-native",
                 "queued-cancel-boundary",
@@ -4348,12 +4332,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                     allow_resume_rollover=False,
                 )
             )
-            for _ in range(100):
-                if (
-                    agent_server.ACTIVE.get("chat-native") or {}
-                ).get("provider_turn_ready"):
-                    break
-                await asyncio.sleep(0)
+            await self.wait_for_native_provider_ready(runner)
             force_send = asyncio.create_task(
                 agent_server.run_queued_turn_now(
                     "chat-native",
@@ -4435,14 +4414,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                     allow_resume_rollover=True,
                 )
             )
-            for _ in range(100):
-                if (
-                    agent_server.ACTIVE.get("chat-native") or {}
-                ).get("provider_turn_ready"):
-                    break
-                await asyncio.sleep(0)
-            else:
-                self.fail("native provider turn never became ready")
+            await self.wait_for_native_provider_ready(runner)
 
             force_send = asyncio.create_task(
                 agent_server.run_queued_turn_now(
@@ -4547,14 +4519,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                 allow_exec_fallback=True,
                 allow_resume_rollover=False,
             ))
-            for _ in range(100):
-                if (agent_server.ACTIVE.get("chat-native") or {}).get(
-                    "provider_turn_ready"
-                ):
-                    break
-                await asyncio.sleep(0)
-            else:
-                self.fail("native provider turn never became ready")
+            await self.wait_for_native_provider_ready(runner)
 
             force_send = asyncio.create_task(agent_server.run_queued_turn_now(
                 "chat-native",
@@ -4627,12 +4592,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                 allow_exec_fallback=True,
                 allow_resume_rollover=False,
             ))
-            for _ in range(100):
-                if (agent_server.ACTIVE.get("chat-native") or {}).get(
-                    "provider_turn_ready"
-                ):
-                    break
-                await asyncio.sleep(0)
+            await self.wait_for_native_provider_ready(runner)
             force_send = asyncio.create_task(agent_server.run_queued_turn_now(
                 "chat-native",
                 "queued-cancel-commit",
@@ -4699,12 +4659,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                 allow_exec_fallback=True,
                 allow_resume_rollover=False,
             ))
-            for _ in range(100):
-                if (agent_server.ACTIVE.get("chat-native") or {}).get(
-                    "provider_turn_ready"
-                ):
-                    break
-                await asyncio.sleep(0)
+            await self.wait_for_native_provider_ready(runner)
             force_send = asyncio.create_task(agent_server.run_queued_turn_now(
                 "chat-native",
                 "queued-cancel-before-promotion",
@@ -4795,14 +4750,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                     allow_resume_rollover=False,
                 )
             )
-            for _ in range(100):
-                if (
-                    agent_server.ACTIVE.get("chat-native") or {}
-                ).get("provider_turn_ready"):
-                    break
-                await asyncio.sleep(0)
-            else:
-                self.fail("native provider turn never became ready")
+            await self.wait_for_native_provider_ready(runner)
 
             force_send = asyncio.create_task(
                 agent_server.run_queued_turn_now(
@@ -5806,12 +5754,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                     allow_resume_rollover=True,
                 )
             )
-            for _ in range(100):
-                if (
-                    agent_server.ACTIVE.get("chat-native") or {}
-                ).get("provider_turn_ready"):
-                    break
-                await asyncio.sleep(0)
+            await self.wait_for_native_provider_ready(runner)
             run_now = await agent_server.run_queued_turn_now(
                 "chat-native",
                 "queued-steer-rollover",

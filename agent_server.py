@@ -38317,6 +38317,41 @@ async def cancel_cross_chat_exchange(exchange_id: str) -> dict[str, Any]:
     return cancelled
 
 
+async def cancel_cross_chat_exchanges_for_stopped_source_run(
+    run_id: str,
+) -> int:
+    """Cancel every still-live exchange authorized by an explicit Stop.
+
+    Capability revocation by itself only closes the provider helper. Accepted
+    asks are normally allowed to outlive a *completed* source turn so a busy
+    recipient can answer asynchronously. An explicit Stop is different: it
+    is the user's cancellation boundary, so no registered/queued delivery may
+    be promoted later and any exact running recipient must be interrupted.
+
+    The authorization run is immutable in the exchange ledger. Re-reading it
+    here also covers the narrow acceptance-before-live-waiter window, where a
+    waiter-based cleanup would miss an already durable request.
+    """
+
+    run_id = str(run_id or "").strip()
+    if not run_id:
+        return 0
+    cancelled = 0
+    for exchange in await CROSS_CHAT.exchanges_for_authorization_run(run_id):
+        if str(exchange.get("status") or "") not in {
+            "waiting_request",
+            "active",
+        }:
+            continue
+        result = await cancel_cross_chat_exchange(str(exchange.get("id") or ""))
+        if (
+            str(result.get("status") or "") == "cancelled"
+            and str(result.get("error_code") or "") == "cancelled_by_user"
+        ):
+            cancelled += 1
+    return cancelled
+
+
 async def terminalize_cross_chat_exchanges_for_session(
     session_id: str,
     *,
@@ -41957,6 +41992,20 @@ async def finalize_cross_chat_exchange_run(event: dict[str, Any]) -> None:
         return
 
     if not run_id:
+        return
+    if (
+        (
+            str(event.get("type") or "") == "turn_stopped"
+            or event.get("stopped") is True
+        )
+        and event.get("native_steer") is not True
+        and not str(event.get("superseded_by_run_id") or "").strip()
+    ):
+        # This is the recovery/alternate-terminal boundary for an explicit
+        # Stop. The normal Stop endpoint performs the same idempotent ledger
+        # cancellation before interrupting the provider so a queued target
+        # cannot promote during teardown.
+        await cancel_cross_chat_exchanges_for_stopped_source_run(run_id)
         return
     # A request/reply @ mention reserves a visible placeholder before provider
     # launch. If the source turn ends without invoking `ask`, close it visibly.
@@ -81218,9 +81267,18 @@ async def stop_turn(
         await pause_queued_turns_after_explicit_stop(session_id)
     if not deferred and stopping_run_id:
         # ACTIVE.stop_requested / STOPPED_RUNS already closes provider helper
-        # authority synchronously. Remove the capability record before any
-        # provider interrupt or subagent teardown, but outside the broad
-        # lifecycle-lock admission edge.
+        # authority synchronously. Close every exchange authorized by this
+        # exact source run before revoking its helper or interrupting the
+        # provider. A queued delivery therefore cannot promote in the Stop
+        # teardown window. Targeted cross-chat cancellation passes
+        # pause_queued_turns_on_stop=False and must not recursively cancel
+        # unrelated requests authored by the recipient run.
+        if pause_queued_turns_on_stop:
+            await cancel_cross_chat_exchanges_for_stopped_source_run(
+                stopping_run_id
+            )
+        # Remove the capability record outside the broad lifecycle-lock
+        # admission edge.
         await revoke_cross_chat_capability(stopping_run_id)
     root_thread_id = str(
         (active or {}).get("provider_thread_id")

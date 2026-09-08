@@ -4901,6 +4901,127 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(bool(exchange["live_response_lease"]))
         self.assertFalse(waiter["future"].done())
 
+    async def test_explicit_stop_cancels_queued_exchange_before_capability_revoke(
+        self,
+    ) -> None:
+        source_run_id = "run_stopped_before_target_promotion"
+        exchange, leg = await self.create_exchange(
+            "exchange_stopped_before_target_promotion",
+            source_run_id=source_run_id,
+        )
+        leg = await agent_server.CROSS_CHAT.update_exchange_leg(
+            leg["id"],
+            expected={"registered"},
+            status="queued",
+            queued_id="queued_stopped_before_target_promotion",
+            queue_position=1,
+        )
+        self.assertIsNotNone(leg)
+        agent_server.QUEUED_TURNS["target"] = deque([{
+            "queued_id": "queued_stopped_before_target_promotion",
+            "purpose": "cross_chat_handoff_delivery",
+            "source_session_id": "source",
+            "target_session_id": "target",
+            "cross_chat_exchange_id": exchange["id"],
+            "cross_chat_exchange_leg_id": leg["id"],
+        }])
+        agent_server.BUSY_SESSIONS.add("source")
+        agent_server.CURRENT_TURNS["source"] = {"run_id": source_run_id}
+        revoke_observed_after_cancel = False
+
+        async def observe_revoke(run_id: str) -> None:
+            nonlocal revoke_observed_after_cancel
+            self.assertEqual(run_id, source_run_id)
+            self.assertNotIn("target", agent_server.QUEUED_TURNS)
+            durable = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
+            self.assertEqual(durable["status"], "cancelled")
+            revoke_observed_after_cancel = True
+
+        with (
+            patch.object(agent_server, "ACTIVE", {}),
+            patch.object(agent_server, "STOP_REQUESTS", set()),
+            patch.object(agent_server, "STOPPED_RUNS", set()),
+            patch.object(agent_server, "STOP_CONFIRM_TIMEOUT_SECONDS", 0),
+            patch.object(agent_server, "append_durable_event", AsyncMock()),
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_leg_terminal_lifecycle",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_terminal_lifecycle",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "revoke_cross_chat_capability",
+                AsyncMock(side_effect=observe_revoke),
+            ),
+            patch.object(
+                agent_server,
+                "cancel_codex_interactions",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "cancel_claude_interactions",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "release_turn_slot",
+                AsyncMock(return_value=True),
+            ),
+        ):
+            stopped = await agent_server.stop_turn(
+                "source",
+                emit_event=False,
+                schedule_queue=False,
+                cascade_codex_subagents=False,
+                cascade_claude_subagents=False,
+                hard_terminalize_on_timeout=False,
+            )
+
+        self.assertTrue(stopped["stopped"])
+        self.assertTrue(revoke_observed_after_cancel)
+        durable_leg = await agent_server.CROSS_CHAT.get_exchange_leg(leg["id"])
+        self.assertEqual(durable_leg["status"], "cancelled")
+        self.assertEqual(durable_leg["error_code"], "cancelled_by_user")
+
+    async def test_stopped_terminal_repairs_exchange_cancel_if_stop_path_was_lost(
+        self,
+    ) -> None:
+        source_run_id = "run_stopped_terminal_repair"
+        exchange, leg = await self.create_exchange(
+            "exchange_stopped_terminal_repair",
+            source_run_id=source_run_id,
+        )
+        with (
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_leg_terminal_lifecycle",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_terminal_lifecycle",
+                AsyncMock(),
+            ),
+        ):
+            await agent_server.finalize_cross_chat_exchange_run({
+                "type": "turn_stopped",
+                "run_id": source_run_id,
+                "result_text": "",
+                "exit_code": 130,
+            })
+
+        durable = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
+        durable_leg = await agent_server.CROSS_CHAT.get_exchange_leg(leg["id"])
+        self.assertEqual(durable["status"], "cancelled")
+        self.assertEqual(durable["error_code"], "cancelled_by_user")
+        self.assertEqual(durable_leg["status"], "cancelled")
+
     async def test_exchange_late_terminal_after_user_cancel_never_wakes_or_replies(self) -> None:
         exchange, leg = await self.create_exchange("exchange_cancel_late_failure")
         await agent_server.CROSS_CHAT.update_exchange_leg(

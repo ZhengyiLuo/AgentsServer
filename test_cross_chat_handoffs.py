@@ -8139,6 +8139,10 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
                     message="target queue row never bound its exchange leg",
                 )
                 self.assertEqual(request_leg["status"], "queued")
+                await wait_until(
+                    lambda: queued_request.get("_durable") is True,
+                    message="target queue row never crossed its durable event boundary",
+                )
                 self.assertTrue(queued_request["_durable"])
                 await wait_until(
                     lambda: any(
@@ -8221,6 +8225,10 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
                     message="source queue row never bound its reply leg",
                 )
                 self.assertEqual(reply_leg["status"], "queued")
+                await wait_until(
+                    lambda: queued_reply.get("_durable") is True,
+                    message="source queue row never crossed its durable event boundary",
+                )
                 self.assertTrue(queued_reply["_durable"])
                 self.assertEqual(reply_leg["body"], (
                     "SuperSONIC completed the requested handoff."

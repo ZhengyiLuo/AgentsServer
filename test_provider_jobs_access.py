@@ -87,6 +87,10 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
                 else None
             ),
             provider_route_snapshot=provider_route_snapshot,
+            # This helper models a normal user-origin chat turn. Internal
+            # delivery capabilities deliberately retain the production
+            # default (False) and cannot convert routes into scheduled jobs.
+            reciprocal_mint_allowed=bool(provider_route_snapshot),
         )
         payload = json.loads(authority_path.read_text(encoding="utf-8"))
         token = payload["provider_capability"]

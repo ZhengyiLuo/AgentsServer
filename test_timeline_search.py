@@ -222,6 +222,83 @@ class TimelineSearchForkTests(unittest.TestCase):
             [],
         )
 
+    def test_version_migration_rebuild_excludes_imported_claude_task_notification(self) -> None:
+        task_notification = (
+            "<task-notification>\n"
+            "<task-id>workflow-42</task-id>\n"
+            "<status>stopped</status>\n"
+            "<summary>internal control needle</summary>\n"
+            "</task-notification>"
+        )
+        path = agent_server.events_path(self.session_id)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(self.event(
+                7,
+                "turn_started",
+                run_id="import_legacy_task",
+                backend=agent_server.BACKEND_CLAUDE,
+                imported=True,
+                prompt=task_notification,
+            ), separators=(",", ":")) + "\n")
+            stream.write(json.dumps(self.event(
+                8,
+                "assistant_text",
+                run_id="normal-run",
+                backend=agent_server.BACKEND_CLAUDE,
+                text="visible migration needle",
+            ), separators=(",", ":")) + "\n")
+
+        connection = agent_server.history_search_connection()
+        connection.execute(
+            "INSERT INTO history_search(text, session_id, event_id, seq, ts, role) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                task_notification,
+                self.session_id,
+                "legacy-task-notification",
+                7,
+                None,
+                "user",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO history_search_state(session_id, inode, offset, mtime_ns) "
+            "VALUES (?, ?, ?, ?)",
+            (self.session_id, 1, path.stat().st_size, 1),
+        )
+        connection.execute(
+            "UPDATE history_search_meta SET value = '4' WHERE key = 'index_version'"
+        )
+        connection.commit()
+        connection.close()
+
+        migrated = agent_server.history_search_connection()
+        try:
+            agent_server.sync_history_search_index(
+                migrated,
+                {self.session_id},
+                {self.session_id},
+            )
+        finally:
+            migrated.close()
+
+        self.assertEqual(
+            agent_server.search_timeline_index(self.session_id, "control needle")[
+                "results"
+            ],
+            [],
+        )
+        self.assertEqual(
+            [
+                result["seq"]
+                for result in agent_server.search_timeline_index(
+                    self.session_id,
+                    "migration needle",
+                )["results"]
+            ],
+            [8],
+        )
+
     def test_initializing_fork_is_not_eligible_for_history_indexing(self) -> None:
         staged_id = "staged-fork"
         staged_path = agent_server.events_path(staged_id)

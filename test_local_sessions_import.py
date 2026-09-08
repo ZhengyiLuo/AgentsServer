@@ -538,6 +538,15 @@ class BulkImportSessionsEndpointTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LocalTranscriptSafetyTests(unittest.TestCase):
+    TASK_NOTIFICATION = (
+        "<task-notification>\n"
+        "<task-id>workflow-42</task-id>\n"
+        "<tool-use-id>tool-42</tool-use-id>\n"
+        "<status>stopped</status>\n"
+        "<summary>Resume the provider workflow.</summary>\n"
+        "</task-notification>"
+    )
+
     def test_direct_path_must_be_contained_and_not_a_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -574,6 +583,65 @@ class LocalTranscriptSafetyTests(unittest.TestCase):
             "message-6",
             "message-7",
         ])
+
+    def test_claude_parser_omits_sdk_task_notification_origin(self) -> None:
+        events = [
+            {
+                "type": "user",
+                "origin": {"kind": "task-notification"},
+                "promptSource": "sdk",
+                "queueSkipAttachments": True,
+                "message": {
+                    "role": "user",
+                    "content": self.TASK_NOTIFICATION,
+                },
+            },
+            {
+                # Content alone is not authority to hide a real user turn.
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": self.TASK_NOTIFICATION,
+                },
+            },
+            {
+                "type": "assistant",
+                "message": {"content": "Finished normally."},
+            },
+        ]
+
+        self.assertEqual(
+            agent_server.parse_claude_history_events(events, None),
+            [
+                {"kind": "user", "text": self.TASK_NOTIFICATION},
+                {"kind": "assistant", "text": "Finished normally."},
+            ],
+        )
+
+    def test_legacy_imported_task_notification_is_hidden_from_clients(self) -> None:
+        imported = {
+            "type": "turn_started",
+            "backend": agent_server.BACKEND_CLAUDE,
+            "run_id": "import_legacy",
+            "imported": True,
+            "prompt": self.TASK_NOTIFICATION,
+        }
+
+        self.assertFalse(agent_server.is_client_visible_event(imported))
+        self.assertIsNone(agent_server.history_search_event_record(imported))
+        self.assertTrue(agent_server.is_client_visible_event({
+            **imported,
+            "run_id": "run_human",
+            "imported": False,
+        }))
+        self.assertTrue(agent_server.is_client_visible_event({
+            **imported,
+            "prompt": f"Please explain this:\n{self.TASK_NOTIFICATION}",
+        }))
+        self.assertTrue(agent_server.is_client_visible_event({
+            **imported,
+            "backend": agent_server.BACKEND_CODEX,
+        }))
 
 
 class StagedHistoryBatchTests(unittest.IsolatedAsyncioTestCase):

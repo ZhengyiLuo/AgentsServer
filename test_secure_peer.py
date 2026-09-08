@@ -2819,6 +2819,153 @@ def _free_port(host: str) -> int:
         listener.close()
 
 
+class SecurePeerTeamAuthorityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.runtime = SecurePeerRuntime(
+            Path(self.temporary.name) / "runtime",
+            server_identity="team-authority-server-12345678",
+            server_instance_id="team-authority-instance-12345678",
+            display_name="Team authority test",
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_host_role_enable_disable_rotates_team_authority_even_after_aba(self) -> None:
+        member_generation = self.runtime.team_authority_generation()
+
+        self.runtime.pause_member_for_host()
+        host_generation = self.runtime.team_authority_generation()
+
+        self.runtime.resume_member_after_host()
+        restored_member_generation = self.runtime.team_authority_generation()
+
+        self.assertEqual(
+            len({member_generation, host_generation, restored_member_generation}),
+            3,
+        )
+        for stale_generation in (member_generation, host_generation):
+            with self.assertRaises(SecurePeerError) as raised:
+                self.runtime.team_authorized_read(
+                    stale_generation,
+                    lambda: "must not run",
+                )
+            self.assertEqual(raised.exception.code, "team_authority_changed")
+        self.assertEqual(
+            self.runtime.team_authorized_read(
+                restored_member_generation,
+                lambda: "current realm",
+            ),
+            "current realm",
+        )
+
+    def test_team_read_crossing_host_enable_discards_the_stale_result(self) -> None:
+        generation = self.runtime.team_authority_generation()
+        read_started = threading.Event()
+        release_read = threading.Event()
+        results: list[str] = []
+        errors: list[BaseException] = []
+
+        def read_old_realm() -> str:
+            read_started.set()
+            self.assertTrue(release_read.wait(2))
+            return "old realm data"
+
+        worker = threading.Thread(
+            target=lambda: self._capture_thread_result(
+                results,
+                errors,
+                lambda: self.runtime.team_authorized_read(
+                    generation,
+                    read_old_realm,
+                ),
+            )
+        )
+        worker.start()
+        self.assertTrue(read_started.wait(2))
+        self.runtime.pause_member_for_host()
+        release_read.set()
+        worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(results, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], SecurePeerError)
+        self.assertEqual(errors[0].code, "team_authority_changed")
+
+    def test_team_write_linearizes_before_host_enable_and_disable(self) -> None:
+        for transition in (
+            self.runtime.pause_member_for_host,
+            self.runtime.resume_member_after_host,
+        ):
+            with self.subTest(transition=transition.__name__):
+                generation = self.runtime.team_authority_generation()
+                write_started = threading.Event()
+                release_write = threading.Event()
+                transition_started = threading.Event()
+                transition_done = threading.Event()
+                order: list[str] = []
+                errors: list[BaseException] = []
+
+                def commit() -> str:
+                    order.append("write_started")
+                    write_started.set()
+                    self.assertTrue(release_write.wait(2))
+                    order.append("write_committed")
+                    return "committed"
+
+                writer = threading.Thread(
+                    target=lambda: self._capture_thread_result(
+                        [],
+                        errors,
+                        lambda: self.runtime.team_authorized_write(
+                            generation,
+                            commit,
+                        ),
+                    )
+                )
+
+                def switch_role() -> None:
+                    try:
+                        transition_started.set()
+                        transition()
+                        order.append("role_switched")
+                    except BaseException as exc:
+                        errors.append(exc)
+                    finally:
+                        transition_done.set()
+
+                switcher = threading.Thread(target=switch_role)
+                writer.start()
+                self.assertTrue(write_started.wait(2))
+                switcher.start()
+                self.assertTrue(transition_started.wait(2))
+                self.assertFalse(transition_done.wait(0.1))
+                release_write.set()
+                writer.join(2)
+                switcher.join(2)
+
+                self.assertFalse(writer.is_alive())
+                self.assertFalse(switcher.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(
+                    order,
+                    ["write_started", "write_committed", "role_switched"],
+                )
+                self.assertNotEqual(
+                    self.runtime.team_authority_generation(),
+                    generation,
+                )
+
+    @staticmethod
+    def _capture_thread_result(results, errors, operation) -> None:
+        try:
+            results.append(operation())
+        except BaseException as exc:
+            errors.append(exc)
+
+
 class SecurePeerLiveTLSTests(unittest.TestCase):
     def setUp(self) -> None:
         self.host_ip = _nonloopback_ipv4()

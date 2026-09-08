@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import suppress
 from datetime import datetime, timezone
 import hashlib
+import hmac
 import json
 import mimetypes
 import os
@@ -202,6 +203,12 @@ class SecurePeerRuntime:
         # pending before retirement (so retirement returns 409) or observes
         # the retired route and cannot be created.
         self._outbound_guard = threading.RLock()
+        # Provider Team grants are bound to both the exact visible realms and
+        # this process-local role generation.  Realm identity catches peer,
+        # Hub, team, certificate, and scope changes; rotating the generation
+        # on Host <-> Member transitions closes an ABA where a long-running
+        # provider could otherwise regain an old grant after both transitions.
+        self._team_authority_epoch = uuid.uuid4().hex
         self._host_role_active = False
         self._peer_admission = threading.Condition(threading.RLock())
         self._peer_accepting = False
@@ -298,6 +305,8 @@ class SecurePeerRuntime:
             if not isinstance(self.client, SecurePeerClient):
                 if self._initialization_error is not None:
                     raise RuntimeError(self._initialization_error)
+                self._team_authority_epoch = uuid.uuid4().hex
+                self._host_role_active = True
                 return None
             try:
                 paused = self.client.pause_active_connection_for_host()
@@ -307,6 +316,7 @@ class SecurePeerRuntime:
                 # idempotent, so one replay classifies committed vs uncommitted
                 # state before the caller decides whether rollback is needed.
                 paused = self.client.pause_active_connection_for_host()
+            self._team_authority_epoch = uuid.uuid4().hex
             self._host_role_active = True
             return paused
 
@@ -323,6 +333,7 @@ class SecurePeerRuntime:
             if not isinstance(self.client, SecurePeerClient):
                 if self._initialization_error is not None:
                     raise RuntimeError(self._initialization_error)
+                self._team_authority_epoch = uuid.uuid4().hex
                 self._host_role_active = False
                 return None
             try:
@@ -332,6 +343,7 @@ class SecurePeerRuntime:
                 # None. An uncommitted restore safely retries the same fenced
                 # connection transition.
                 restored = self.client.restore_host_paused_connection()
+            self._team_authority_epoch = uuid.uuid4().hex
             self._host_role_active = False
             if restored is not None:
                 self._client_failure_counts.pop(
@@ -453,6 +465,22 @@ class SecurePeerRuntime:
         return self.client.actionable_pairing_count()
 
     def attach_host_hub(
+        self,
+        *,
+        hub_id: str,
+        hub_data_dir: Path,
+        hub_store: HubStore | None = None,
+    ) -> None:
+        """Attach a Host realm under the Team authority transition fence."""
+
+        with self._outbound_guard:
+            self._attach_host_hub_locked(
+                hub_id=hub_id,
+                hub_data_dir=hub_data_dir,
+                hub_store=hub_store,
+            )
+
+    def _attach_host_hub_locked(
         self,
         *,
         hub_id: str,
@@ -5809,6 +5837,108 @@ class SecurePeerRuntime:
                 "can_write": "teamspace.write" in set(active.get("scopes") or []),
             })
         return realms
+
+    @staticmethod
+    def _team_authority_digest(
+        epoch: str,
+        realms: list[dict[str, Any]],
+    ) -> str:
+        ordered_realms = sorted(realms, key=lambda item: canonical_json(item))
+        return hashlib.sha256(canonical_json({
+            "epoch": epoch,
+            "realms": ordered_realms,
+        })).hexdigest()
+
+    def _team_authority_generation_locked(self) -> str:
+        """Return a private fingerprint for the exact current Team authority."""
+
+        return self._team_authority_digest(
+            self._team_authority_epoch,
+            self.team_realms(),
+        )
+
+    def team_authority_generation(self) -> str:
+        """Snapshot the current Team realm generation for a provider grant."""
+
+        with self._outbound_guard:
+            return self._team_authority_generation_locked()
+
+    def team_authority_matches(self, expected_generation: str) -> bool:
+        """Cheap live intersection that does not queue behind an active write.
+
+        Provider writes hold ``_outbound_guard`` across remote commit.  This
+        optimistic snapshot lets a duplicate request join that write's replay
+        reservation instead of waiting until a failed leader has completed.
+        The effect/read wrappers remain the authoritative linearization fence.
+        """
+
+        if not expected_generation:
+            return False
+        epoch_before = self._team_authority_epoch
+        realms = self.team_realms()
+        epoch_after = self._team_authority_epoch
+        return epoch_before == epoch_after and hmac.compare_digest(
+            expected_generation,
+            self._team_authority_digest(epoch_before, realms),
+        )
+
+    def _require_team_authority_generation_locked(
+        self,
+        expected_generation: str,
+    ) -> None:
+        if not expected_generation or not hmac.compare_digest(
+            expected_generation,
+            self._team_authority_generation_locked(),
+        ):
+            raise SecurePeerError(
+                "team_authority_changed",
+                "Team Network authority changed; start a new turn",
+                409,
+            )
+
+    def team_authorized_read(
+        self,
+        expected_generation: str,
+        operation: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Run a Team read only while its provider realm remains unchanged.
+
+        The network read intentionally runs outside ``_outbound_guard`` so
+        independent provider reads remain parallel.  The second check drops
+        any result obtained across a Host/Member or peer authority change.
+        """
+
+        with self._outbound_guard:
+            self._require_team_authority_generation_locked(expected_generation)
+        try:
+            result = operation(*args, **kwargs)
+        except Exception:
+            # Prefer the authority-transition error when the operation raced
+            # a realm change; details from the replacement realm must not be
+            # returned through the old grant.
+            with self._outbound_guard:
+                self._require_team_authority_generation_locked(
+                    expected_generation
+                )
+            raise
+        with self._outbound_guard:
+            self._require_team_authority_generation_locked(expected_generation)
+        return result
+
+    def team_authorized_write(
+        self,
+        expected_generation: str,
+        operation: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Linearize a provider Team side effect with realm transitions."""
+
+        with self._outbound_guard:
+            self._require_team_authority_generation_locked(expected_generation)
+            return operation(*args, **kwargs)
 
     def team_realm(self, team_id: str | None = None) -> dict[str, Any]:
         realms = self.team_realms()

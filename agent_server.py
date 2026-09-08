@@ -703,6 +703,12 @@ PROVIDER_TEAM_ATTACHMENT_LIMIT = 16
 PROVIDER_TEAM_BODY_MAX_BYTES = 49_152
 PROVIDER_TEAM_ROUTE_ID_RE = re.compile(r"^team_[0-9a-f]{32}$")
 PROVIDER_TEAM_LIST_LIMIT = 100
+PROVIDER_TEAM_ACTIONS = frozenset({
+    "team_mail",
+    "team_read",
+    "team_send",
+    "team_skill_publish",
+})
 CROSS_CHAT_HANDOFF_BODY_MAX_CHARS = 100_000
 CROSS_CHAT_SOURCE_USER_INSTRUCTION_MAX_CHARS = 100_000
 # Admitted direct messages are durable effects. Retry transient same-process
@@ -18415,10 +18421,25 @@ async def issue_cross_chat_capability(
         list(team_references or []),
         chat_references=references,
     )
+    team_authority_generation = ""
+    if AGENT_TOKEN and (
+        validated_team_references or team_mail_enabled or team_read_enabled
+    ):
+        try:
+            team_authority_generation = await asyncio.to_thread(
+                SECURE_PEER_RUNTIME.team_authority_generation
+            )
+        except (HubError, SecurePeerError, OSError, ValueError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="Team Network authority is unavailable",
+            ) from exc
     resolved_team_references: list[dict[str, Any]] = []
     if validated_team_references and AGENT_TOKEN:
         try:
             resolved_team_references = await asyncio.to_thread(
+                SECURE_PEER_RUNTIME.team_authorized_read,
+                team_authority_generation,
                 SECURE_PEER_RUNTIME.resolve_team_references,
                 team_reference_dicts(validated_team_references),
             )
@@ -18504,6 +18525,8 @@ async def issue_cross_chat_capability(
         effective_actions.discard("team_skill_publish")
     if not team_read_enabled or not AGENT_TOKEN:
         effective_actions.discard("team_read")
+    if not effective_actions.intersection(PROVIDER_TEAM_ACTIONS):
+        team_authority_generation = ""
     token = secrets.token_urlsafe(48)
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     expires_at = time.time() + CROSS_CHAT_CAPABILITY_TTL_SECONDS
@@ -18592,6 +18615,9 @@ async def issue_cross_chat_capability(
                 else None
             ),
             "team_mail_route_error": None,
+            # Private, process-local binding for every Team action. A role,
+            # peer, Hub, certificate, team, or scope change invalidates it.
+            "team_authority_generation": team_authority_generation,
             "team_mail_consumed": {},
             "team_mail_send_count": 0,
             "team_routes": team_routes,
@@ -40269,6 +40295,58 @@ def expire_provider_route_authority(capability: dict[str, Any]) -> None:
     capability["team_mail_consumed"] = {}
 
 
+def expire_provider_team_authority(capability: dict[str, Any]) -> None:
+    """Fail closed every Team grant after its issued realm changes."""
+
+    actions = capability.get("actions")
+    if isinstance(actions, set):
+        actions.difference_update(PROVIDER_TEAM_ACTIONS)
+    capability["team_authority_generation"] = None
+    capability["team_routes"] = {}
+    capability["team_routes_used"] = {}
+    capability["team_send_consumed"] = {}
+    capability["team_send_count"] = 0
+    capability["team_mail_routes"] = {}
+    capability["team_mail_command"] = None
+    capability["team_mail_route_error"] = None
+    capability["team_mail_profile_generation"] = None
+    capability["team_mail_consumed"] = {}
+    capability["team_mail_send_count"] = 0
+
+
+async def require_provider_team_authority(
+    token_hash: str,
+    capability: dict[str, Any],
+) -> str:
+    """Intersect an issued Team grant with the live runtime realm."""
+
+    expected_generation = str(
+        capability.get("team_authority_generation") or ""
+    )
+    generation_matches = False
+    if re.fullmatch(r"[0-9a-f]{64}", expected_generation):
+        try:
+            generation_matches = SECURE_PEER_RUNTIME.team_authority_matches(
+                expected_generation
+            )
+        except (HubError, SecurePeerError, OSError, ValueError):
+            generation_matches = False
+    if generation_matches:
+        return expected_generation
+    async with CROSS_CHAT_CAPABILITY_LOCK:
+        live = CROSS_CHAT_CAPABILITIES.get(token_hash)
+        if (
+            live is not None
+            and str(live.get("team_authority_generation") or "")
+            == expected_generation
+        ):
+            expire_provider_team_authority(live)
+    raise HTTPException(
+        status_code=409,
+        detail="Team Network authority changed; start a new turn",
+    )
+
+
 def provider_capability_has_ambient_native_routes(
     capability: dict[str, Any],
 ) -> bool:
@@ -40303,6 +40381,7 @@ async def authorize_provider_action(
     if not token:
         raise HTTPException(status_code=403, detail="provider capability is required")
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    authorized: dict[str, Any]
     async with CROSS_CHAT_CAPABILITY_LOCK:
         capability = CROSS_CHAT_CAPABILITIES.get(token_hash)
         if not capability:
@@ -40336,7 +40415,10 @@ async def authorize_provider_action(
             raise HTTPException(status_code=403, detail="provider capability is no longer attached to a live turn")
         if action not in capability.get("actions", set()):
             raise HTTPException(status_code=403, detail="provider action was not authorized")
-        return dict(capability)
+        authorized = dict(capability)
+    if action in PROVIDER_TEAM_ACTIONS:
+        await require_provider_team_authority(token_hash, authorized)
+    return authorized
 
 
 async def authorize_provider_jobs_operation(
@@ -78432,12 +78514,16 @@ async def provider_team_mail_routes(
     str,
     dict[str, dict[str, Any]],
     str,
+    str,
     dict[str, str] | None,
 ]:
     """Lazily freeze one exact opaque destination snapshot for this run."""
 
     token_hash, source_session_id, capability = (
         await provider_team_mail_capability(request)
+    )
+    team_authority_generation = str(
+        capability.get("team_authority_generation") or ""
     )
     issued = capability.get("team_mail_routes")
     if isinstance(issued, dict):
@@ -78465,6 +78551,7 @@ async def provider_team_mail_routes(
                 )
             },
             str(capability.get("team_mail_profile_generation") or ""),
+            team_authority_generation,
             (
                 dict(strict_command)
                 if isinstance(strict_command, dict)
@@ -78473,7 +78560,9 @@ async def provider_team_mail_routes(
         )
     try:
         profiles = await asyncio.to_thread(
-            SECURE_PEER_RUNTIME.agent_mail_route_profiles
+            SECURE_PEER_RUNTIME.team_authorized_read,
+            team_authority_generation,
+            SECURE_PEER_RUNTIME.agent_mail_route_profiles,
         )
     except (HubError, SecurePeerError, OSError, ValueError) as exc:
         logger.info(
@@ -78506,6 +78595,14 @@ async def provider_team_mail_routes(
         current = CROSS_CHAT_CAPABILITIES.get(token_hash)
         if current is None:
             raise HTTPException(status_code=403, detail="provider capability is invalid")
+        if (
+            str(current.get("team_authority_generation") or "")
+            != team_authority_generation
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Team Network authority changed; start a new turn",
+            )
         existing = current.get("team_mail_routes")
         if existing is None:
             command = current.get("team_mail_command")
@@ -78570,6 +78667,7 @@ async def provider_team_mail_routes(
         source_session_id,
         routes,
         profile_generation,
+        team_authority_generation,
         dict(strict_command) if isinstance(strict_command, dict) else None,
     )
 
@@ -78600,6 +78698,7 @@ async def list_provider_team_mail_routes(request: Request) -> dict[str, Any]:
         _source_session_id,
         routes,
         _profile_generation,
+        _team_authority_generation,
         _strict_command,
     ) = await provider_team_mail_routes(request)
     return {
@@ -78652,6 +78751,7 @@ async def send_provider_team_mail(
         source_session_id,
         routes,
         profile_generation,
+        team_authority_generation,
         strict_command_snapshot,
     ) = await provider_team_mail_routes(request)
     profile = routes.get(route_id)
@@ -78822,6 +78922,8 @@ async def send_provider_team_mail(
     ).hexdigest()
     try:
         await asyncio.to_thread(
+            SECURE_PEER_RUNTIME.team_authorized_write,
+            team_authority_generation,
             SECURE_PEER_RUNTIME.send_agent_mail,
             profile,
             kind=req.kind,
@@ -79043,12 +79145,15 @@ async def provider_team_local_attachments(
     result: dict[str, Any],
     container_key: str,
     team_id: str | None,
+    team_authority_generation: str,
 ) -> None:
     container = result.get(container_key)
     attachments = container.get("attachments") if isinstance(container, dict) else None
     if not isinstance(attachments, list) or not attachments:
         return
     container["attachments"] = await asyncio.to_thread(
+        SECURE_PEER_RUNTIME.team_authorized_write,
+        team_authority_generation,
         SECURE_PEER_RUNTIME.team_attachment_local_paths,
         [item for item in attachments if isinstance(item, dict)],
         team_id=team_id,
@@ -79065,11 +79170,18 @@ async def list_provider_team_messages(
     limit: int = 20,
     team: str | None = None,
 ) -> dict[str, Any]:
-    await provider_team_capability(request, "team_read")
+    _token_hash, _source_session_id, capability = await provider_team_capability(
+        request, "team_read"
+    )
+    team_authority_generation = str(
+        capability.get("team_authority_generation") or ""
+    )
     if box not in {"inbox", "feed", "sent"}:
         raise HTTPException(status_code=422, detail="box must be inbox, feed, or sent")
     try:
         result = await asyncio.to_thread(
+            SECURE_PEER_RUNTIME.team_authorized_read,
+            team_authority_generation,
             SECURE_PEER_RUNTIME.team_list_messages,
             box=box,
             team_id=team or None,
@@ -79091,13 +79203,27 @@ async def get_provider_team_message(
     download: bool = False,
     team: str | None = None,
 ) -> dict[str, Any]:
-    await provider_team_capability(request, "team_read")
+    _token_hash, _source_session_id, capability = await provider_team_capability(
+        request, "team_read"
+    )
+    team_authority_generation = str(
+        capability.get("team_authority_generation") or ""
+    )
     try:
         result = await asyncio.to_thread(
-            SECURE_PEER_RUNTIME.team_get_message, message_id, team_id=team or None
+            SECURE_PEER_RUNTIME.team_authorized_read,
+            team_authority_generation,
+            SECURE_PEER_RUNTIME.team_get_message,
+            message_id,
+            team_id=team or None,
         )
         if download:
-            await provider_team_local_attachments(result, "message", result.get("team_id"))
+            await provider_team_local_attachments(
+                result,
+                "message",
+                result.get("team_id"),
+                team_authority_generation,
+            )
     except (HubError, SecurePeerError, OSError, ValueError) as exc:
         raise provider_team_error(exc) from exc
     result["notice"] = TEAM_CONTENT_NOTICE
@@ -79110,9 +79236,16 @@ async def list_provider_team_skills(
     include_archived: bool = False,
     team: str | None = None,
 ) -> dict[str, Any]:
-    await provider_team_capability(request, "team_read")
+    _token_hash, _source_session_id, capability = await provider_team_capability(
+        request, "team_read"
+    )
+    team_authority_generation = str(
+        capability.get("team_authority_generation") or ""
+    )
     try:
         result = await asyncio.to_thread(
+            SECURE_PEER_RUNTIME.team_authorized_read,
+            team_authority_generation,
             SECURE_PEER_RUNTIME.team_list_skills,
             include_archived=bool(include_archived),
             team_id=team or None,
@@ -79131,12 +79264,19 @@ async def get_provider_team_skill(
     download: bool = False,
     team: str | None = None,
 ) -> dict[str, Any]:
-    await provider_team_capability(request, "team_read")
+    _token_hash, _source_session_id, capability = await provider_team_capability(
+        request, "team_read"
+    )
+    team_authority_generation = str(
+        capability.get("team_authority_generation") or ""
+    )
     clean_slug = str(slug or "").strip().lower()
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", clean_slug):
         raise HTTPException(status_code=422, detail="skill slug is invalid")
     try:
         result = await asyncio.to_thread(
+            SECURE_PEER_RUNTIME.team_authorized_read,
+            team_authority_generation,
             SECURE_PEER_RUNTIME.team_get_skill,
             clean_slug,
             version=version,
@@ -79144,7 +79284,10 @@ async def get_provider_team_skill(
         )
         if download:
             await provider_team_local_attachments(
-                result, "version" if version is not None else "skill", result.get("team_id")
+                result,
+                "version" if version is not None else "skill",
+                result.get("team_id"),
+                team_authority_generation,
             )
     except (HubError, SecurePeerError, OSError, ValueError) as exc:
         raise provider_team_error(exc) from exc
@@ -79191,6 +79334,9 @@ async def send_provider_team_message(
     attachment_paths = provider_team_attachment_paths(list(req.attachments))
     token_hash, source_session_id, capability = await provider_team_capability(
         request, "team_send"
+    )
+    team_authority_generation = str(
+        capability.get("team_authority_generation") or ""
     )
     reference = (capability.get("team_routes") or {}).get(route_id)
     if not isinstance(reference, dict):
@@ -79293,6 +79439,8 @@ async def send_provider_team_message(
     ).hexdigest()
     try:
         result = await asyncio.to_thread(
+            SECURE_PEER_RUNTIME.team_authorized_write,
+            team_authority_generation,
             SECURE_PEER_RUNTIME.team_send_message,
             reference,
             payload=req.model_dump(),

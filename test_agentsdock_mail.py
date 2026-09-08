@@ -347,6 +347,32 @@ class ProviderTeamMailTests(unittest.IsolatedAsyncioTestCase):
             await agent_server.list_provider_team_mail_routes(self.request())
         self.assertEqual(raised.exception.status_code, 403)
 
+    async def test_lazy_routes_cannot_resolve_after_a_team_realm_switch(self) -> None:
+        capability = agent_server.CROSS_CHAT_CAPABILITIES[self.token_hash]
+        self.assertRegex(
+            capability["team_authority_generation"],
+            r"^[0-9a-f]{64}$",
+        )
+        with (
+            patch.object(
+                agent_server.SECURE_PEER_RUNTIME,
+                "_team_authority_epoch",
+                "provider-mail-realm-switch-test",
+            ),
+            patch.object(
+                agent_server.SECURE_PEER_RUNTIME,
+                "agent_mail_route_profiles",
+                return_value=[self.profile()],
+            ) as snapshot,
+        ):
+            with self.assertRaises(HTTPException) as changed:
+                await agent_server.list_provider_team_mail_routes(self.request())
+
+        self.assertEqual(changed.exception.status_code, 409)
+        snapshot.assert_not_called()
+        self.assertNotIn("team_mail", capability["actions"])
+        self.assertEqual(capability["team_mail_routes"], {})
+
     async def test_routes_filter_legacy_agent_profiles_and_project_server_only(self) -> None:
         server = self.profile()
         agent = {
@@ -652,6 +678,7 @@ class ProviderTeamMailTests(unittest.IsolatedAsyncioTestCase):
             {route_id: forged},
             snapshot[3],
             snapshot[4],
+            snapshot[5],
         )
         with (
             patch.object(

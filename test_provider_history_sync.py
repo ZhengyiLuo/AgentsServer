@@ -1068,6 +1068,60 @@ class DurableHistoryCursorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(continued_again)
         self.assertEqual(next_cursor["source_offset"], transcript.stat().st_size)
 
+    def test_claude_cursor_consumes_task_notification_without_importing_it(self) -> None:
+        transcript = Path(self.tempdir.name) / "claude-task-notification.jsonl"
+        transcript.write_text(
+            provider_line(agent_server.BACKEND_CLAUDE, "user", "before"),
+            encoding="utf-8",
+        )
+        sess = {
+            "id": "claude-task-notification",
+            "backend": agent_server.BACKEND_CLAUDE,
+            "claude_session_id": "claude-task-notification-thread",
+        }
+        task_notification = {
+            "type": "user",
+            "origin": {"kind": "task-notification"},
+            "promptSource": "sdk",
+            "queueSkipAttachments": True,
+            "message": {
+                "role": "user",
+                "content": (
+                    "<task-notification>\n"
+                    "<task-id>workflow-42</task-id>\n"
+                    "<status>completed</status>\n"
+                    "<summary>Internal completion.</summary>\n"
+                    "</task-notification>"
+                ),
+            },
+        }
+        with patch.object(
+            agent_server,
+            "provider_history_path",
+            return_value=transcript,
+        ):
+            _path, first, cursor, continued = (
+                agent_server.load_provider_history_with_cursor(sess, None, None)
+            )
+            with transcript.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(task_notification, separators=(",", ":")) + "\n")
+                stream.write(
+                    provider_line(
+                        agent_server.BACKEND_CLAUDE,
+                        "assistant",
+                        "visible follow-up",
+                    )
+                )
+            _path, second, next_cursor, continued_again = (
+                agent_server.load_provider_history_with_cursor(sess, None, cursor)
+            )
+
+        self.assertEqual(first, [user("before")])
+        self.assertFalse(continued)
+        self.assertEqual(second, [assistant("visible follow-up")])
+        self.assertTrue(continued_again)
+        self.assertEqual(next_cursor["source_offset"], transcript.stat().st_size)
+
     def test_raw_checkpoint_reader_recovers_field_hidden_from_clients(self) -> None:
         transcript = Path(self.tempdir.name) / "raw-checkpoint-provider.jsonl"
         transcript.write_text(

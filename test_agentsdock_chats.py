@@ -564,7 +564,7 @@ class AgentsDockChatsCLITests(unittest.TestCase):
         self.assertEqual(get.call_args.kwargs["timeout"], 30)
         self.assertTrue(get.call_args.kwargs["live_slice"])
 
-    def test_live_wait_transport_loss_returns_same_resumable_lease(self) -> None:
+    def test_live_wait_transport_loss_returns_distinct_resumable_error(self) -> None:
         exchange_id = "exchange_" + "1" * 32
         inbound_leg_id = "leg_" + "2" * 32
         lease_id = "lease_" + "3" * 32
@@ -584,15 +584,105 @@ class AgentsDockChatsCLITests(unittest.TestCase):
             )
 
         self.assertEqual(result, {
-            "ok": True,
+            "ok": False,
             "exchange_id": exchange_id,
             "inbound_leg_id": inbound_leg_id,
-            "pending": True,
             "live_response_lease_id": lease_id,
+            "transport_error": True,
+            "retryable": True,
+            "message": (
+                "AgentsServer did not confirm the live-response state because "
+                "the transport was interrupted. Retry the existing wait "
+                f"exactly with --exchange {exchange_id} "
+                f"--inbound-leg {inbound_leg_id} --lease {lease_id}; "
+                "do not resend the ask or change its wording."
+            ),
         })
+        self.assertNotIn("pending", result)
         get.assert_called_once()
         self.assertEqual(get.call_args.kwargs["timeout"], 30)
         self.assertTrue(get.call_args.kwargs["live_slice"])
+
+    def test_cli_transport_receipt_prints_exact_lease_and_exits_nonzero(self) -> None:
+        exchange_id = "exchange_" + "4" * 32
+        inbound_leg_id = "leg_" + "5" * 32
+        lease_id = "lease_" + "6" * 32
+        stdout = io.StringIO()
+        with (
+            patch.object(agentsdock_chats, "authority", return_value="capability"),
+            patch.object(
+                agentsdock_chats,
+                "get_json",
+                side_effect=agentsdock_chats.LiveWaitRetryable(
+                    "response socket closed",
+                ),
+            ),
+            patch.object(agentsdock_chats.sys, "stdout", stdout),
+        ):
+            exit_code = agentsdock_chats.main([
+                "--authority-file",
+                "authority.json",
+                "wait",
+                "--exchange",
+                exchange_id,
+                "--inbound-leg",
+                inbound_leg_id,
+                "--lease",
+                lease_id,
+            ])
+
+        receipt = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 2)
+        self.assertFalse(receipt["ok"])
+        self.assertTrue(receipt["transport_error"])
+        self.assertTrue(receipt["retryable"])
+        self.assertNotIn("pending", receipt)
+        self.assertEqual(receipt["exchange_id"], exchange_id)
+        self.assertEqual(receipt["inbound_leg_id"], inbound_leg_id)
+        self.assertEqual(receipt["live_response_lease_id"], lease_id)
+        self.assertIn(
+            f"--exchange {exchange_id} --inbound-leg {inbound_leg_id} "
+            f"--lease {lease_id}",
+            receipt["message"],
+        )
+        self.assertIn("do not resend the ask", receipt["message"])
+
+    def test_same_lease_retry_recovers_an_already_delivered_answer(self) -> None:
+        exchange_id = "exchange_" + "7" * 32
+        inbound_leg_id = "leg_" + "8" * 32
+        lease_id = "lease_" + "9" * 32
+        answer_leg_id = "leg_" + "a" * 32
+        args = argparse.Namespace(
+            authority_file="authority.json",
+            exchange=exchange_id,
+            inbound_leg=inbound_leg_id,
+            lease=lease_id,
+            timeout_seconds=20,
+        )
+        answer = {
+            "ok": True,
+            "exchange_id": exchange_id,
+            "inbound_leg_id": answer_leg_id,
+            "body": "The reply was already committed.",
+            "request_response": False,
+        }
+        get = Mock(side_effect=[
+            agentsdock_chats.LiveWaitRetryable("disconnect cleanup stalled"),
+            answer,
+        ])
+        with (
+            patch.object(agentsdock_chats, "authority", return_value="capability"),
+            patch.object(agentsdock_chats, "get_json", get),
+        ):
+            transport_receipt = agentsdock_chats.wait(args)
+            recovered = agentsdock_chats.wait(args)
+
+        self.assertTrue(transport_receipt["transport_error"])
+        self.assertNotIn("pending", transport_receipt)
+        self.assertEqual(recovered, answer)
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(get.call_args_list[0].args[0], get.call_args_list[1].args[0])
+        self.assertIn(f"lease_id={lease_id}", get.call_args_list[0].args[0])
 
     def test_wait_rejects_noncanonical_resume_identifiers_before_http(self) -> None:
         args = argparse.Namespace(

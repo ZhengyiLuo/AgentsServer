@@ -21,11 +21,12 @@ from typing import Any
 # The legacy ``response_timeout_seconds`` wire field is now only a requested
 # heartbeat interval.  There is deliberately no client response-deadline
 # constant.  A provider tool call observes at most one bounded slice, then
-# returns a resumable pending receipt.  The provider immediately invokes
-# ``wait`` with that exact receipt until the server lease reaches terminal
-# state.  Keeping every network observation at 30 seconds or less bounds the
-# whole idempotent command safely below provider shell caps, instead of turning
-# any provider-specific Bash limit into a cross-chat response deadline.
+# returns either the server's explicit pending receipt or an honest retryable
+# transport receipt.  The provider immediately invokes ``wait`` with those
+# exact opaque IDs until the server lease reaches terminal state.  Keeping
+# every network observation at 30 seconds or less bounds the whole idempotent
+# command safely below provider shell caps, instead of turning any
+# provider-specific Bash limit into a cross-chat response deadline.
 LIVE_RESPONSE_HEARTBEAT_SECONDS = 20
 LIVE_RESPONSE_MAX_HEARTBEAT_SECONDS = 20
 LIVE_RESPONSE_SOCKET_GRACE_SECONDS = 10
@@ -525,15 +526,26 @@ def await_live_response(
             live_slice=True,
         )
     except LiveWaitRetryable:
-        # A provider command must end promptly even if a proxy or local server
-        # is between restarts.  The exact lease is side-effect-free to replay,
-        # so surface the same pending contract and let the next foreground
-        # ``wait`` invocation reconnect it.
-        result = {
-            "ok": True,
+        # A transport failure says nothing about durable server state.  In
+        # particular, the response may already be committed while the HTTP
+        # handler is still disconnecting.  Never relabel that ambiguity as a
+        # genuine server-owned pending exchange.  Return the same exact lease
+        # as a distinct retry receipt; replaying its GET is side-effect free
+        # and can recover a committed answer without resending the ask.
+        return {
+            "ok": False,
             "exchange_id": exchange_id,
             "inbound_leg_id": inbound_leg_id,
-            "pending": True,
+            "live_response_lease_id": lease_id,
+            "transport_error": True,
+            "retryable": True,
+            "message": (
+                "AgentsServer did not confirm the live-response state because "
+                "the transport was interrupted. Retry the existing wait "
+                f"exactly with --exchange {exchange_id} "
+                f"--inbound-leg {inbound_leg_id} --lease {lease_id}; "
+                "do not resend the ask or change its wording."
+            ),
         }
     valid_answer = (
         set(result) == answer_keys
@@ -1031,8 +1043,13 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["AGENTSDOCK_PROVIDER_AUTHORITY_FILE"] = str(
             selected_authority
         )
-        print(json.dumps(args.handler(args), ensure_ascii=False))
-        return 0
+        result = args.handler(args)
+        print(json.dumps(result, ensure_ascii=False))
+        # A retryable live-response transport failure is structured so the
+        # caller retains its exact lease, but it is not a successful pending
+        # observation.  Exit nonzero after printing the receipt so automation
+        # cannot silently treat network ambiguity as server-owned waiting.
+        return 2 if result.get("transport_error") is True else 0
     except ChatsCLIError as exc:
         print(f"agentsdock-chats: {exc}", file=sys.stderr)
         return 2

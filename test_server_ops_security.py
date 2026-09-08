@@ -48,6 +48,41 @@ def http_request(
     return agent_server.Request(scope, receive=receive)
 
 
+class FakeProviderStream:
+    def __init__(self, payload: bytes):
+        self.payload = payload
+
+    async def read(self, _size: int) -> bytes:
+        payload, self.payload = self.payload, b""
+        return payload
+
+
+class FakeProviderStdin:
+    def __init__(self):
+        self.payload = b""
+        self.closed = False
+
+    def write(self, payload: bytes) -> None:
+        self.payload += payload
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeProviderProcess:
+    def __init__(self, *, stdout: bytes, stderr: bytes, returncode: int):
+        self.stdout = FakeProviderStream(stdout)
+        self.stderr = FakeProviderStream(stderr)
+        self.stdin = FakeProviderStdin()
+        self.returncode = returncode
+
+    async def wait(self) -> int:
+        return self.returncode
+
+
 class ServerOpsSecurityTests(unittest.IsolatedAsyncioTestCase):
     async def test_user_authored_authority_lookalike_is_never_stripped(self):
         lookalike = (
@@ -273,6 +308,105 @@ class ServerOpsSecurityTests(unittest.IsolatedAsyncioTestCase):
                     provider_turn_id="turn-live",
                 )
             self.assertEqual(executor.await_count, 2)
+
+    async def test_provider_tool_preserves_structured_chat_transport_error(self):
+        exchange_id = "exchange_" + "1" * 32
+        inbound_leg_id = "leg_" + "2" * 32
+        lease_id = "lease_" + "3" * 32
+        receipt = {
+            "ok": False,
+            "exchange_id": exchange_id,
+            "inbound_leg_id": inbound_leg_id,
+            "live_response_lease_id": lease_id,
+            "transport_error": True,
+            "retryable": True,
+            "message": "Retry the existing wait with the same lease.",
+        }
+        value = {
+            "helper": "chats",
+            "arguments": [
+                "wait",
+                "--exchange",
+                exchange_id,
+                "--inbound-leg",
+                inbound_leg_id,
+                "--lease",
+                lease_id,
+            ],
+        }
+        for backend, owner_kwargs in (
+            (
+                agent_server.BACKEND_CODEX,
+                {
+                    "provider_thread_id": "thread-live",
+                    "provider_turn_id": "turn-live",
+                },
+            ),
+            (
+                agent_server.BACKEND_CLAUDE,
+                {"claude_owner_token": "owner-live"},
+            ),
+        ):
+            with self.subTest(backend=backend):
+                process = FakeProviderProcess(
+                    stdout=(json.dumps(receipt) + "\n").encode(),
+                    stderr=b"incidental runtime warning\n",
+                    returncode=2,
+                )
+                with patch.object(
+                    agent_server,
+                    "provider_tool_capability_snapshot",
+                    AsyncMock(return_value=(Path("/private/authority"), {})),
+                ), patch.object(
+                    agent_server,
+                    "agent_runner_env",
+                    return_value={},
+                ), patch.object(
+                    agent_server.asyncio,
+                    "create_subprocess_exec",
+                    AsyncMock(return_value=process),
+                ):
+                    text, is_error = await agent_server.execute_provider_tool(
+                        "chat-live",
+                        "run_live",
+                        value,
+                        backend=backend,
+                        **owner_kwargs,
+                    )
+
+                self.assertTrue(is_error)
+                self.assertEqual(json.loads(text), receipt)
+
+    async def test_provider_tool_generic_failure_keeps_stderr_precedence(self):
+        process = FakeProviderProcess(
+            stdout=b"partial non-JSON output\n",
+            stderr=b"specific helper failure\n",
+            returncode=2,
+        )
+        with patch.object(
+            agent_server,
+            "provider_tool_capability_snapshot",
+            AsyncMock(return_value=(Path("/private/authority"), {})),
+        ), patch.object(
+            agent_server,
+            "agent_runner_env",
+            return_value={},
+        ), patch.object(
+            agent_server.asyncio,
+            "create_subprocess_exec",
+            AsyncMock(return_value=process),
+        ):
+            text, is_error = await agent_server.execute_provider_tool(
+                "chat-live",
+                "run_live",
+                {"helper": "chats", "arguments": ["list"]},
+                backend=agent_server.BACKEND_CODEX,
+                provider_thread_id="thread-live",
+                provider_turn_id="turn-live",
+            )
+
+        self.assertTrue(is_error)
+        self.assertEqual(text, "specific helper failure")
 
     async def test_provider_generated_context_and_tool_inputs_are_bounded(self):
         exact_user_text = "User-authored text must remain byte-for-byte exact."

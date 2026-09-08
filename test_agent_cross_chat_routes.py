@@ -306,6 +306,11 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(
                 agent_server,
+                "provider_authority_runtime_env",
+                AsyncMock(return_value={}),
+            ),
+            patch.object(
+                agent_server,
                 "append_durable_event",
                 side_effect=capture_event,
             ),
@@ -3699,6 +3704,11 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
                 agent_server,
                 "issue_cross_chat_capability",
                 side_effect=capture_issue,
+            ),
+            patch.object(
+                agent_server,
+                "provider_authority_runtime_env",
+                AsyncMock(return_value={}),
             ),
             patch.object(
                 agent_server,

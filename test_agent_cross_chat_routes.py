@@ -31,6 +31,7 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             "active": agent_server.ACTIVE,
             "busy": set(agent_server.BUSY_SESSIONS),
             "agent_token": agent_server.AGENT_TOKEN,
+            "queue_lock": agent_server.QUEUE_LOCK,
             "lifecycle_locks": agent_server.SESSION_LIFECYCLE_LOCKS,
             "event_cache": agent_server.CROSS_CHAT_EVENT_TYPE_CACHE,
             "deleting": set(agent_server.DELETING_SESSIONS),
@@ -68,6 +69,7 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         agent_server.DELETING_SESSIONS.clear()
         agent_server.DELETED_SESSION_TOMBSTONES.clear()
         agent_server.CROSS_CHAT_CAPABILITIES.clear()
+        agent_server.QUEUE_LOCK = asyncio.Lock()
 
     async def asyncTearDown(self) -> None:
         agent_server.CROSS_CHAT_CAPABILITIES.clear()
@@ -81,6 +83,7 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         agent_server.BUSY_SESSIONS.clear()
         agent_server.BUSY_SESSIONS.update(self.original["busy"])
         agent_server.AGENT_TOKEN = self.original["agent_token"]
+        agent_server.QUEUE_LOCK = self.original["queue_lock"]
         agent_server.SESSION_LIFECYCLE_LOCKS = self.original["lifecycle_locks"]
         agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = self.original["event_cache"]
         agent_server.DELETING_SESSIONS.clear()
@@ -184,6 +187,7 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         routes: list[dict],
         *,
         source_user_instruction: str = "",
+        reciprocal_mint_allowed: bool = False,
     ) -> tuple[str, Request]:
         agent_server.CURRENT_TURNS["source"] = {"run_id": run_id}
         authority = await agent_server.issue_cross_chat_capability(
@@ -193,10 +197,141 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             source_user_instruction=source_user_instruction,
             actions={"agent_cross_chat_routes", "jobs"},
             provider_route_snapshot=routes,
+            reciprocal_mint_allowed=reciprocal_mint_allowed,
         )
         self.assertIsNotNone(authority)
         token = json.loads(authority.read_text())["provider_capability"]
         return token, self.provider_request(token)
+
+    async def configured_delivery(
+        self,
+        suffix: str,
+        *,
+        actions: list[str] | None = None,
+        reciprocal: bool = True,
+    ) -> tuple[dict, dict, agent_server.TurnRequest]:
+        nibble = suffix[-1].lower()
+        exchange_id = "exchange_" + nibble * 32
+        leg_id = "leg_" + nibble * 32
+        route_id = "route_" + nibble * 32
+        frozen_actions = list(actions or ["instruction", "request_reply"])
+        exchange, leg, created = (
+            await agent_server.CROSS_CHAT.create_route_exchange_request(
+                exchange_id=exchange_id,
+                leg_id=leg_id,
+                requester_session_id="source",
+                authorization_source_run_id=f"run_source_{nibble}",
+                responder_session_id="target",
+                body=f"delivery {nibble}",
+                idempotency_key=f"delivery-key-{nibble}",
+                max_legs=2,
+                expires_at="2099-01-01T00:00:00Z",
+                authorization_route_id=route_id,
+                reciprocal_route_effect_id=(exchange_id if reciprocal else ""),
+                reciprocal_route_actions=(frozen_actions if reciprocal else []),
+            )
+        )
+        self.assertTrue(created)
+        leg = await agent_server.CROSS_CHAT.update_exchange_leg(
+            leg_id,
+            expected={"registered"},
+            status="submitting",
+        )
+        self.assertIsNotNone(leg)
+        request = agent_server.TurnRequest(
+            prompt=f"delivery {nibble}",
+            display_prompt="Agent-authored same-server request",
+            purpose=agent_server.LOCAL_CROSS_CHAT_DELIVERY_PURPOSE,
+            source_session_id="source",
+            target_session_id="target",
+            cross_chat_exchange_id=exchange_id,
+            cross_chat_exchange_leg_id=leg_id,
+            client_capabilities=(
+                agent_server.cross_chat_delivery_client_capabilities(
+                    agent_server.STORE.sessions["target"]
+                )
+            ),
+        )
+        return exchange, leg, request
+
+    async def capture_start_admission(
+        self,
+        session_id: str,
+        request: agent_server.TurnRequest,
+    ) -> tuple[dict[str, object], list[tuple[str, dict]]]:
+        """Run admission through its durable event, stopping before launch."""
+
+        issued: dict[str, object] = {}
+        events: list[tuple[str, dict]] = []
+
+        async def capture_issue(*_args, **kwargs):
+            issued.update(kwargs)
+            return self.root / "captured-authority.json"
+
+        async def capture_event(
+            _session_id: str,
+            event_type: str,
+            payload: dict,
+        ) -> dict:
+            events.append((event_type, dict(payload)))
+            return {"type": event_type, **payload}
+
+        with (
+            self.native_transports(),
+            patch.object(agent_server.STORE, "save", AsyncMock()),
+            patch.object(
+                agent_server,
+                "turn_start_blocker",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(
+                agent_server,
+                "ensure_runtime_available",
+                AsyncMock(return_value={}),
+            ),
+            patch.object(
+                agent_server,
+                "codex_manifest_path",
+                return_value=self.root / "manifest.json",
+            ),
+            patch.object(
+                agent_server,
+                "build_turn_provider_prompt",
+                return_value=request.prompt,
+            ),
+            patch.object(
+                agent_server,
+                "issue_cross_chat_capability",
+                side_effect=capture_issue,
+            ),
+            patch.object(
+                agent_server,
+                "append_durable_event",
+                side_effect=capture_event,
+            ),
+            patch.object(
+                agent_server,
+                "append_event",
+                side_effect=capture_event,
+            ),
+            patch.object(
+                agent_server,
+                "scrub_tmux_global_secret_environment",
+                side_effect=RuntimeError("stop before provider launch"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "stop before provider launch",
+            ):
+                await agent_server._start_turn_locked(
+                    session_id,
+                    request,
+                    queue_if_busy=False,
+                    provider_context_mode="chat",
+                    admission_backend="codex",
+                )
+        return issued, events
 
     def test_route_normalization_is_fail_closed_and_defaults_empty(self) -> None:
         valid = self.route("a")
@@ -253,9 +388,16 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         agent_server.STORE.sessions["source"]["provider_cross_chat_routes"] = [
             route
         ]
+        request = agent_server.TurnRequest(
+            prompt="@Target hello",
+            chat_references=[self.grant_reference()],
+            client_capabilities=[
+                agent_server.AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY
+            ],
+        )
         with self.native_transports():
             snapshot = agent_server.initial_provider_cross_chat_route_snapshot(
-                "source", agent_server.TurnRequest(prompt="hello"), "chat"
+                "source", request, "chat"
             )
             authority_snapshot = (
                 agent_server.provider_cross_chat_route_snapshot_for_authority(
@@ -744,7 +886,11 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             action="instruction",
         )
         with self.native_transports():
-            _token, request = await self.issue("run_job_route", [route])
+            _token, request = await self.issue(
+                "run_job_route",
+                [route],
+                reciprocal_mint_allowed=True,
+            )
             capability, reservations = (
                 await agent_server.reserve_provider_job_route_conversions(
                     request,
@@ -782,6 +928,7 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             _token, legacy_request = await self.issue(
                 "run_legacy_job_route",
                 [legacy_reference_route],
+                reciprocal_mint_allowed=True,
             )
             with self.assertRaisesRegex(HTTPException, "durable source-chat"):
                 await agent_server.reserve_provider_job_route_conversions(
@@ -1143,9 +1290,16 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         agent_server.STORE.sessions["source"]["provider_cross_chat_routes"] = [
             route
         ]
+        route_request = agent_server.TurnRequest(
+            prompt="@Target hello",
+            chat_references=[self.grant_reference()],
+            client_capabilities=[
+                agent_server.AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY
+            ],
+        )
         with self.native_transports():
             snapshot = agent_server.initial_provider_cross_chat_route_snapshot(
-                "source", agent_server.TurnRequest(prompt="hello"), "chat"
+                "source", route_request, "chat"
             )
             self.assertEqual(len(snapshot), 1)
             token, request = await self.issue("run_ambient_list", snapshot)
@@ -1487,7 +1641,8 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
                 snapshot = agent_server.initial_provider_cross_chat_route_snapshot(
                     "source",
                     agent_server.TurnRequest(
-                        prompt="ordinary user turn",
+                        prompt="@Target ordinary user turn",
+                        chat_references=[self.grant_reference()],
                         client_capabilities=[
                             agent_server.AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY
                         ],
@@ -2683,7 +2838,8 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("keeps this turn waiting", source_copy)
         self.assertIn("until the destination answers", source_copy)
         self.assertIn("explicitly stopped", source_copy)
-        self.assertIn("Neither action grants durable access", source_copy)
+        self.assertIn("grants that recipient one durable route back", source_copy)
+        self.assertIn("never propagate another grant", source_copy)
         self.assertNotIn("respond --exchange EXCHANGE_ID", source_copy)
         await agent_server.CROSS_CHAT.update_exchange_leg(
             legs[0]["id"],
@@ -3341,6 +3497,910 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([result["accepted"] for result in results], [True, True])
         self.assertTrue(token_a)
 
+    async def test_ordinary_turn_without_explicit_route_has_no_route_harness(
+        self,
+    ) -> None:
+        route = self.route("a")
+        agent_server.STORE.sessions["source"][
+            "provider_cross_chat_routes"
+        ] = [route]
+        user_text = "Continue the local analysis without contacting another chat."
+
+        issued, events = await self.capture_start_admission(
+            "source",
+            agent_server.TurnRequest(prompt=user_text),
+        )
+
+        self.assertEqual(issued["provider_route_snapshot"], [])
+        self.assertTrue({
+            "agent_cross_chat_routes",
+            "cross_chat_instruction",
+            "cross_chat_request_reply",
+        }.isdisjoint(set(issued["actions"])))
+        self.assertEqual(issued["source_user_instruction"], user_text)
+        started = next(
+            payload for event_type, payload in events
+            if event_type == "turn_started"
+        )
+        self.assertEqual(started["prompt"], user_text)
+        visible = json.dumps(started, sort_keys=True)
+        self.assertNotIn("captured-authority.json", visible)
+        self.assertNotIn("authority-file=", visible)
+        self.assertNotIn("[AgentsDock provider authority]", visible)
+
+    async def test_explicit_route_exposes_only_its_exact_target(self) -> None:
+        agent_server.STORE.sessions["other"] = {
+            "id": "other",
+            "title": "Other",
+            "folder": "/other-private",
+            "backend": "codex",
+            "provider_cross_chat_routes": [],
+        }
+        route_to_other = self.route(
+            "c",
+            alias="other",
+            target="other",
+        )
+        agent_server.STORE.sessions["source"][
+            "provider_cross_chat_routes"
+        ] = [route_to_other]
+        request = agent_server.TurnRequest(
+            prompt="@Target inspect the migration",
+            chat_references=[self.grant_reference()],
+            client_capabilities=[
+                agent_server.AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY
+            ],
+        )
+
+        issued, _events = await self.capture_start_admission("source", request)
+
+        snapshots = list(issued["provider_route_snapshot"])
+        self.assertEqual(
+            [route["target_session_id"] for route in snapshots],
+            ["target"],
+        )
+        self.assertIn("agent_cross_chat_routes", issued["actions"])
+        self.assertNotIn("other", {
+            route["target_session_id"] for route in snapshots
+        })
+        # The unrelated configured route remains durable policy; it is simply
+        # not ambient authority in this turn.
+        self.assertEqual(
+            {
+                route["target_session_id"]
+                for route in agent_server.provider_cross_chat_routes(
+                    agent_server.STORE.sessions["source"]
+                )
+            },
+            {"target", "other"},
+        )
+
+    def test_recovered_ordinary_queue_drops_legacy_ambient_snapshot(self) -> None:
+        route = self.route("a")
+        agent_server.STORE.sessions["source"][
+            "provider_cross_chat_routes"
+        ] = [route]
+
+        recovered = agent_server.queued_turn_from_event(
+            {
+                "type": "turn_queued",
+                "queued_id": "queued_no_reference",
+                "prompt": "local work only",
+                "request_prompt": "local work only",
+                "purpose": None,
+                "chat_references": [],
+                # Simulate a durable row written by the old ambient policy.
+                "provider_cross_chat_route_snapshot": [route],
+            },
+            agent_server.STORE.sessions["source"],
+            1,
+        )
+        self.assertEqual(recovered["provider_cross_chat_route_snapshot"], [])
+
+    async def test_queue_edit_removing_route_reference_clears_snapshot(
+        self,
+    ) -> None:
+        route = self.route("a")
+        agent_server.STORE.sessions["source"][
+            "provider_cross_chat_routes"
+        ] = [route]
+        item = {
+            "queued_id": "queued_remove_route",
+            "prompt": "@Target inspect this",
+            "file_ids": [],
+            "chat_references": [
+                agent_server.chat_reference_dict(self.grant_reference())
+            ],
+            "team_references": [],
+            "cross_chat_obligation_ids": [],
+            "cross_chat_exchange_ids": [],
+            "client_capabilities": [
+                agent_server.AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY
+            ],
+            "provider_cross_chat_route_snapshot": [route],
+        }
+        agent_server.QUEUED_TURNS = {"source": deque([item])}
+        append = AsyncMock(return_value={"type": "turn_queue_updated"})
+        with (
+            self.native_transports(),
+            patch.object(
+                agent_server,
+                "managed_server_update_blocker",
+                return_value=None,
+            ),
+            patch.object(agent_server, "append_durable_event", append),
+        ):
+            updated = await agent_server.update_queued_turn(
+                "source",
+                "queued_remove_route",
+                agent_server.UpdateQueuedTurnRequest(
+                    prompt="Continue locally",
+                    chat_references=[],
+                ),
+            )
+        self.assertEqual(
+            updated["item"]["provider_cross_chat_route_snapshot"],
+            [],
+        )
+        self.assertEqual(
+            append.await_args.args[2]["provider_cross_chat_route_snapshot"],
+            [],
+        )
+
+    async def test_configured_delivery_immediately_grants_exact_reverse_route(
+        self,
+    ) -> None:
+        exchange, _leg, request = await self.configured_delivery(
+            "c",
+            actions=["instruction"],
+        )
+        issued: dict[str, object] = {}
+        durable_events: list[tuple[str, dict]] = []
+
+        async def capture_issue(*_args, **kwargs):
+            issued.update(kwargs)
+            return self.root / "captured-authority.json"
+
+        async def capture_durable(
+            _session_id: str,
+            event_type: str,
+            payload: dict,
+        ) -> dict:
+            durable_events.append((event_type, dict(payload)))
+            return {"type": event_type, **payload}
+
+        with (
+            self.native_transports(),
+            patch.object(agent_server.STORE, "save", AsyncMock()),
+            patch.object(
+                agent_server,
+                "turn_start_blocker",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(
+                agent_server,
+                "ensure_runtime_available",
+                AsyncMock(return_value={}),
+            ),
+            patch.object(
+                agent_server,
+                "codex_manifest_path",
+                return_value=self.root / "manifest.json",
+            ),
+            patch.object(
+                agent_server,
+                "build_turn_provider_prompt",
+                return_value="delivery prompt",
+            ),
+            patch.object(
+                agent_server,
+                "issue_cross_chat_capability",
+                side_effect=capture_issue,
+            ),
+            patch.object(
+                agent_server,
+                "append_durable_event",
+                side_effect=capture_durable,
+            ),
+            patch.object(agent_server, "append_event", AsyncMock()),
+            patch.object(
+                agent_server,
+                "scrub_tmux_global_secret_environment",
+                side_effect=RuntimeError("stop before provider launch"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "stop before provider launch",
+            ):
+                await agent_server._start_turn_locked(
+                    "target",
+                    request,
+                    queue_if_busy=False,
+                    provider_context_mode="chat",
+                    admission_backend="codex",
+                )
+
+        routes = agent_server.provider_cross_chat_routes(
+            agent_server.STORE.sessions["target"]
+        )
+        self.assertEqual(len(routes), 1)
+        reverse = routes[0]
+        self.assertEqual(reverse["target_session_id"], "source")
+        self.assertEqual(reverse["actions"], ["instruction"])
+        self.assertEqual(
+            reverse["reciprocal_origin_effect_id"],
+            exchange["id"],
+        )
+        self.assertIn("agent_cross_chat_routes", issued["actions"])
+        self.assertFalse(issued["reciprocal_mint_allowed"])
+        self.assertEqual(issued["provider_route_snapshot"], [reverse])
+        started = next(
+            payload
+            for event_type, payload in durable_events
+            if event_type == "turn_started"
+        )
+        self.assertEqual(
+            started["provider_cross_chat_reciprocal_effect_id"],
+            exchange["id"],
+        )
+        self.assertEqual(
+            started["provider_cross_chat_reciprocal_route_id"],
+            reverse["route_id"],
+        )
+        self.assertEqual(
+            started["provider_cross_chat_reciprocal_actions"],
+            ["instruction"],
+        )
+        settled = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
+        self.assertEqual(settled["reciprocal_route_state"], "applied")
+        self.assertEqual(settled["reciprocal_route_id"], reverse["route_id"])
+
+    async def test_busy_configured_delivery_queues_reverse_route_snapshot(
+        self,
+    ) -> None:
+        exchange, _leg, request = await self.configured_delivery(
+            "d",
+            actions=["instruction", "request_reply"],
+        )
+        durable_events: list[tuple[str, dict]] = []
+
+        async def capture_durable(
+            _session_id: str,
+            event_type: str,
+            payload: dict,
+        ) -> dict:
+            durable_events.append((event_type, dict(payload)))
+            return {"type": event_type, **payload}
+
+        agent_server.BUSY_SESSIONS.add("target")
+        try:
+            with (
+                self.native_transports(),
+                patch.object(agent_server.STORE, "save", AsyncMock()),
+                patch.object(
+                    agent_server,
+                    "managed_server_update_blocker",
+                    return_value=None,
+                ),
+                patch.object(
+                    agent_server,
+                    "append_durable_event",
+                    side_effect=capture_durable,
+                ),
+            ):
+                accepted = await agent_server._start_turn_locked(
+                    "target",
+                    request,
+                    queue_if_busy=True,
+                    provider_context_mode="chat",
+                    admission_backend="codex",
+                )
+        finally:
+            agent_server.BUSY_SESSIONS.discard("target")
+
+        self.assertTrue(accepted["queued"])
+        queued = agent_server.QUEUED_TURNS["target"][0]
+        self.assertEqual(queued["queued_id"], accepted["queued_id"])
+        self.assertEqual(len(queued["provider_cross_chat_route_snapshot"]), 1)
+        reverse = queued["provider_cross_chat_route_snapshot"][0]
+        self.assertEqual(reverse["target_session_id"], "source")
+        self.assertEqual(
+            reverse["actions"],
+            ["instruction", "request_reply"],
+        )
+        queued_event = next(
+            payload
+            for event_type, payload in durable_events
+            if event_type == "turn_queued"
+        )
+        self.assertEqual(
+            queued_event["provider_cross_chat_route_snapshot"],
+            [reverse],
+        )
+        self.assertEqual(
+            queued_event["provider_cross_chat_reciprocal_effect_id"],
+            exchange["id"],
+        )
+        recovered = agent_server.queued_turn_from_event(
+            queued_event,
+            agent_server.STORE.sessions["target"],
+            1,
+        )
+        self.assertEqual(
+            recovered["provider_cross_chat_route_snapshot"],
+            [reverse],
+        )
+        settled = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
+        self.assertEqual(settled["reciprocal_route_state"], "applied")
+        self.assertEqual(settled["reciprocal_route_id"], reverse["route_id"])
+
+    async def test_existing_reverse_route_is_never_widened_by_reciprocity(
+        self,
+    ) -> None:
+        existing = self.route(
+            "e",
+            alias="existing_reverse",
+            target="source",
+            actions=["request_reply"],
+        )
+        agent_server.STORE.sessions["target"][
+            "provider_cross_chat_routes"
+        ] = [existing]
+        exchange, leg, request = await self.configured_delivery(
+            "e",
+            actions=["instruction"],
+        )
+        grant = await agent_server.configured_route_reciprocal_grant_for_delivery(
+            "target",
+            request,
+            delivery_record=leg,
+            delivery_exchange=exchange,
+        )
+        mutation = await (
+            agent_server.persist_durable_provider_cross_chat_reference_grants(
+                "target",
+                [],
+                admission_id="grant_admission_" + "e" * 32,
+                event_type="turn_queued",
+                server_derived_grants=[grant],
+            )
+        )
+        self.assertFalse(mutation["committed"])
+        snapshot = agent_server.provider_cross_chat_route_snapshot_to_target(
+            mutation["routes"],
+            "source",
+            route_id=mutation["reciprocal_effects"][0]["route_id"],
+            allowed_actions=grant["actions"],
+        )
+        self.assertEqual(snapshot, [])
+        await agent_server.settle_provider_cross_chat_reciprocal_effect(
+            grant,
+            mutation,
+        )
+        self.assertEqual(
+            agent_server.provider_cross_chat_routes(
+                agent_server.STORE.sessions["target"]
+            ),
+            [existing],
+        )
+        settled = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
+        self.assertEqual(settled["reciprocal_route_state"], "applied")
+        self.assertEqual(settled["reciprocal_route_id"], existing["route_id"])
+
+    async def test_restart_settles_accepted_existing_route_then_delete_wins_replay(
+        self,
+    ) -> None:
+        existing = self.route(
+            "a",
+            alias="existing_reverse",
+            target="source",
+            actions=["instruction"],
+        )
+        agent_server.STORE.sessions["target"][
+            "provider_cross_chat_routes"
+        ] = [existing]
+        exchange, leg, request = await self.configured_delivery(
+            "a",
+            actions=["instruction"],
+        )
+        grant = await agent_server.configured_route_reciprocal_grant_for_delivery(
+            "target",
+            request,
+            delivery_record=leg,
+            delivery_exchange=exchange,
+        )
+        mutation = await (
+            agent_server.persist_durable_provider_cross_chat_reference_grants(
+                "target",
+                [],
+                admission_id="grant_admission_" + "a" * 32,
+                event_type="turn_queued",
+                server_derived_grants=[grant],
+            )
+        )
+        self.assertFalse(mutation["committed"])
+        event = {
+            "type": "turn_queued",
+            "purpose": agent_server.LOCAL_CROSS_CHAT_DELIVERY_PURPOSE,
+            "cross_chat_exchange_id": exchange["id"],
+            "cross_chat_exchange_leg_id": leg["id"],
+            "source_session_id": "source",
+            "target_session_id": "target",
+            **agent_server.provider_cross_chat_reciprocal_admission_fields(
+                grant,
+                mutation,
+            ),
+        }
+        event_path = self.root / "target-events.jsonl"
+        event_path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+
+        with patch.object(
+            agent_server,
+            "events_path",
+            return_value=event_path,
+        ):
+            await agent_server.reconcile_pending_cross_chat_reciprocal_effects()
+        settled = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
+        self.assertEqual(settled["reciprocal_route_state"], "applied")
+        self.assertEqual(settled["reciprocal_route_id"], existing["route_id"])
+
+        # The settled effect is a permanent tombstone. Deleting the reverse
+        # route later must not let delivery replay recreate it.
+        agent_server.STORE.sessions["target"][
+            "provider_cross_chat_routes"
+        ] = []
+        replay_grant = (
+            await agent_server.configured_route_reciprocal_grant_for_delivery(
+                "target",
+                request,
+                delivery_record=leg,
+                delivery_exchange=settled,
+            )
+        )
+        self.assertEqual(replay_grant["state"], "applied")
+        self.assertEqual(
+            agent_server.provider_cross_chat_route_snapshot_to_target(
+                agent_server.provider_cross_chat_routes(
+                    agent_server.STORE.sessions["target"]
+                ),
+                "source",
+                route_id=replay_grant["route_id"],
+                allowed_actions=replay_grant["actions"],
+            ),
+            [],
+        )
+        with patch.object(
+            agent_server,
+            "events_path",
+            return_value=event_path,
+        ):
+            await agent_server.reconcile_pending_cross_chat_reciprocal_effects()
+        self.assertEqual(
+            agent_server.provider_cross_chat_routes(
+                agent_server.STORE.sessions["target"]
+            ),
+            [],
+        )
+
+    async def test_restart_recovers_new_staged_route_from_exact_event(
+        self,
+    ) -> None:
+        exchange, leg, request = await self.configured_delivery(
+            "b",
+            actions=["instruction"],
+        )
+        grant = await agent_server.configured_route_reciprocal_grant_for_delivery(
+            "target",
+            request,
+            delivery_record=leg,
+            delivery_exchange=exchange,
+        )
+        with patch.object(agent_server.STORE, "save", AsyncMock()):
+            mutation = await (
+                agent_server.persist_durable_provider_cross_chat_reference_grants(
+                    "target",
+                    [],
+                    admission_id="grant_admission_" + "b" * 32,
+                    event_type="turn_queued",
+                    server_derived_grants=[grant],
+                )
+            )
+        self.assertTrue(mutation["committed"])
+        self.assertIn(
+            agent_server.PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY,
+            agent_server.STORE.sessions["target"],
+        )
+        event = {
+            "type": "turn_queued",
+            "purpose": agent_server.LOCAL_CROSS_CHAT_DELIVERY_PURPOSE,
+            "cross_chat_exchange_id": exchange["id"],
+            "cross_chat_exchange_leg_id": leg["id"],
+            "source_session_id": "source",
+            "target_session_id": "target",
+            "provider_cross_chat_grant_admission_id": mutation[
+                "admission_id"
+            ],
+            **agent_server.provider_cross_chat_reciprocal_admission_fields(
+                grant,
+                mutation,
+            ),
+        }
+        event_path = self.root / "restart-target-events.jsonl"
+        event_path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+        sessions_path = self.root / "restart-sessions.json"
+        sessions_path.write_text(
+            json.dumps(agent_server.STORE.sessions),
+            encoding="utf-8",
+        )
+
+        restarted_store = agent_server.SessionStore()
+        with (
+            patch.object(agent_server, "STORE", restarted_store),
+            patch.object(agent_server, "SESSIONS_FILE", sessions_path),
+            patch.object(agent_server, "events_path", return_value=event_path),
+            patch.object(agent_server, "ensure_dirs"),
+            patch.object(restarted_store, "save", AsyncMock()),
+        ):
+            # STORE.load must retain the raw staged route but keep it hidden
+            # until the now-initialized SQLite ledger proves the exact event.
+            await restarted_store.load()
+            loaded_target = restarted_store.sessions["target"]
+            self.assertIn(
+                agent_server.PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY,
+                loaded_target,
+            )
+            self.assertEqual(
+                agent_server.provider_cross_chat_routes(loaded_target),
+                [],
+            )
+            self.assertEqual(
+                len(agent_server.stored_provider_cross_chat_routes(loaded_target)),
+                1,
+            )
+
+            await agent_server.reconcile_pending_cross_chat_reciprocal_effects()
+            loaded_target = restarted_store.sessions["target"]
+            self.assertNotIn(
+                agent_server.PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY,
+                loaded_target,
+            )
+            recovered_routes = agent_server.provider_cross_chat_routes(
+                loaded_target
+            )
+            self.assertEqual(len(recovered_routes), 1)
+            self.assertEqual(
+                recovered_routes[0]["target_session_id"],
+                "source",
+            )
+            settled = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
+            self.assertEqual(settled["reciprocal_route_state"], "applied")
+
+            # A later user deletion still wins over replay of the accepted
+            # event: SQLite's applied state is a tombstone, not a create log.
+            loaded_target["provider_cross_chat_routes"] = []
+            await agent_server.reconcile_pending_cross_chat_reciprocal_effects()
+            self.assertEqual(
+                agent_server.provider_cross_chat_routes(loaded_target),
+                [],
+            )
+
+    async def test_queue_cancel_race_has_one_owner_and_no_unaccepted_grant(
+        self,
+    ) -> None:
+        # Cancellation that commits before the queue-owner CAS makes enqueue
+        # fail and rolls the staged reverse grant back completely.
+        exchange, leg, request = await self.configured_delivery("1")
+        grant = await agent_server.configured_route_reciprocal_grant_for_delivery(
+            "target",
+            request,
+            delivery_record=leg,
+            delivery_exchange=exchange,
+        )
+        await agent_server.CROSS_CHAT.cancel_exchange(exchange["id"])
+        with (
+            patch.object(agent_server, "QUEUE_LOCK", asyncio.Lock()),
+            patch.object(agent_server.STORE, "save", AsyncMock()),
+            patch.object(
+                agent_server,
+                "managed_server_update_blocker",
+                return_value=None,
+            ),
+            patch.object(
+                agent_server,
+                "append_durable_event",
+                AsyncMock(),
+            ) as append,
+        ):
+            with self.assertRaises(HTTPException) as rejected:
+                await agent_server.enqueue_turn(
+                    "target",
+                    request,
+                    agent_server.STORE.sessions["target"],
+                    provider_route_snapshot=[],
+                    reciprocal_route_grant=grant,
+                )
+        self.assertEqual(rejected.exception.status_code, 410)
+        append.assert_not_awaited()
+        self.assertNotIn("target", agent_server.QUEUED_TURNS)
+        self.assertEqual(
+            agent_server.provider_cross_chat_routes(
+                agent_server.STORE.sessions["target"]
+            ),
+            [],
+        )
+
+        # If queue admission owns QUEUE_LOCK first, cancellation cannot split
+        # the ledger CAS from its fsynced acceptance event. It observes and
+        # removes a fully accepted queue item; that accepted message's exact
+        # reciprocal route remains valid.
+        exchange, leg, request = await self.configured_delivery("2")
+        grant = await agent_server.configured_route_reciprocal_grant_for_delivery(
+            "target",
+            request,
+            delivery_record=leg,
+            delivery_exchange=exchange,
+        )
+        event_entered = asyncio.Event()
+        release_event = asyncio.Event()
+
+        async def gated_append(
+            _session_id: str,
+            event_type: str,
+            payload: dict,
+        ) -> dict:
+            if event_type == "turn_queued":
+                event_entered.set()
+                await release_event.wait()
+            return {"type": event_type, **payload}
+
+        agent_server.BUSY_SESSIONS.add("target")
+        try:
+            with (
+                patch.object(agent_server.STORE, "save", AsyncMock()),
+                patch.object(
+                    agent_server,
+                    "managed_server_update_blocker",
+                    return_value=None,
+                ),
+                patch.object(
+                    agent_server,
+                    "append_durable_event",
+                    side_effect=gated_append,
+                ),
+                patch.object(
+                    agent_server,
+                    "append_cross_chat_exchange_leg_terminal_lifecycle",
+                    AsyncMock(),
+                ),
+                patch.object(
+                    agent_server,
+                    "append_cross_chat_exchange_terminal_lifecycle",
+                    AsyncMock(),
+                ),
+            ):
+                enqueue_task = asyncio.create_task(
+                    agent_server.enqueue_turn(
+                        "target",
+                        request,
+                        agent_server.STORE.sessions["target"],
+                        provider_route_snapshot=[],
+                        reciprocal_route_grant=grant,
+                    )
+                )
+                await asyncio.wait_for(event_entered.wait(), timeout=1)
+                cancel_task = asyncio.create_task(
+                    agent_server.cancel_cross_chat_exchange(exchange["id"])
+                )
+                await asyncio.sleep(0)
+                self.assertFalse(cancel_task.done())
+                release_event.set()
+                accepted = await asyncio.wait_for(enqueue_task, timeout=1)
+                cancelled = await asyncio.wait_for(cancel_task, timeout=1)
+        finally:
+            agent_server.BUSY_SESSIONS.discard("target")
+        self.assertTrue(accepted["queued"])
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertNotIn("target", agent_server.QUEUED_TURNS)
+        accepted_routes = agent_server.provider_cross_chat_routes(
+            agent_server.STORE.sessions["target"]
+        )
+        self.assertEqual(len(accepted_routes), 1)
+        self.assertEqual(accepted_routes[0]["target_session_id"], "source")
+        self.assertNotIn(
+            agent_server.PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY,
+            agent_server.STORE.sessions["target"],
+        )
+
+    async def test_queue_expiry_race_cannot_split_bind_from_acceptance(
+        self,
+    ) -> None:
+        exchange, leg, request = await self.configured_delivery("3")
+        grant = await agent_server.configured_route_reciprocal_grant_for_delivery(
+            "target",
+            request,
+            delivery_record=leg,
+            delivery_exchange=exchange,
+        )
+        connection = sqlite3.connect(agent_server.CROSS_CHAT.path)
+        with connection:
+            connection.execute(
+                "UPDATE cross_chat_exchanges SET expires_at=? WHERE id=?",
+                ("2000-01-01T00:00:00Z", exchange["id"]),
+            )
+        connection.close()
+
+        event_entered = asyncio.Event()
+        release_event = asyncio.Event()
+        durable_types: list[str] = []
+
+        async def gated_append(
+            _session_id: str,
+            event_type: str,
+            payload: dict,
+        ) -> dict:
+            if event_type == "turn_queued":
+                event_entered.set()
+                await release_event.wait()
+            durable_types.append(event_type)
+            return {"type": event_type, **payload}
+
+        with (
+            patch.object(agent_server, "QUEUE_LOCK", asyncio.Lock()),
+            patch.object(agent_server.STORE, "save", AsyncMock()),
+            patch.object(
+                agent_server,
+                "managed_server_update_blocker",
+                return_value=None,
+            ),
+            patch.object(
+                agent_server,
+                "append_durable_event",
+                side_effect=gated_append,
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_leg_terminal_lifecycle",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_terminal_lifecycle",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "maybe_deliver_cross_chat_exchange_failure_status",
+                AsyncMock(),
+            ),
+        ):
+            enqueue_task = asyncio.create_task(
+                agent_server.enqueue_turn(
+                    "target",
+                    request,
+                    agent_server.STORE.sessions["target"],
+                    provider_route_snapshot=[],
+                    reciprocal_route_grant=grant,
+                )
+            )
+            await asyncio.wait_for(event_entered.wait(), timeout=1)
+            expiry_task = asyncio.create_task(
+                agent_server.reconcile_cross_chat_exchanges()
+            )
+            await asyncio.sleep(0)
+            self.assertFalse(expiry_task.done())
+            bound = await agent_server.CROSS_CHAT.get_exchange_leg(leg["id"])
+            self.assertEqual(bound["status"], "queued")
+            release_event.set()
+            accepted = await asyncio.wait_for(enqueue_task, timeout=1)
+            await asyncio.wait_for(expiry_task, timeout=1)
+
+        self.assertTrue(accepted["queued"])
+        self.assertEqual(durable_types[0], "turn_queued")
+        expired = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
+        self.assertEqual(expired["status"], "expired")
+        self.assertNotIn("target", agent_server.QUEUED_TURNS)
+        # The route belongs to the already accepted message. Expiry may close
+        # its queued owner only after that acceptance boundary, never before.
+        routes = agent_server.provider_cross_chat_routes(
+            agent_server.STORE.sessions["target"]
+        )
+        self.assertEqual(len(routes), 1)
+        self.assertEqual(routes[0]["target_session_id"], "source")
+
+    async def test_reciprocity_is_one_generation_and_noninitial_legs_mint_none(
+        self,
+    ) -> None:
+        exchange, leg, request = await self.configured_delivery("f")
+        grant = await agent_server.configured_route_reciprocal_grant_for_delivery(
+            "target",
+            request,
+            delivery_record=leg,
+            delivery_exchange=exchange,
+        )
+        mutation = await (
+            agent_server.persist_durable_provider_cross_chat_reference_grants(
+                "target",
+                [],
+                admission_id="grant_admission_" + "f" * 32,
+                event_type="turn_started",
+                server_derived_grants=[grant],
+            )
+        )
+        await agent_server.settle_provider_cross_chat_reciprocal_effect(
+            grant,
+            mutation,
+        )
+        await agent_server.commit_durable_provider_cross_chat_reference_grants(
+            "target",
+            mutation,
+        )
+        reverse = agent_server.provider_cross_chat_routes(
+            agent_server.STORE.sessions["target"]
+        )[0]
+
+        agent_server.CURRENT_TURNS["target"] = {
+            "run_id": "run_internal_delivery",
+            "purpose": agent_server.LOCAL_CROSS_CHAT_DELIVERY_PURPOSE,
+        }
+        authority = await agent_server.issue_cross_chat_capability(
+            "target",
+            "run_internal_delivery",
+            [],
+            actions={"agent_cross_chat_routes"},
+            provider_route_snapshot=[reverse],
+            reciprocal_mint_allowed=False,
+        )
+        token = json.loads(authority.read_text())["provider_capability"]
+        internal_request = self.provider_request(token, method="POST")
+        internal_request.scope["headers"] = [
+            (
+                b"x-agentsdock-provider-capability",
+                token.encode(),
+            )
+        ]
+        reservation, replay = await agent_server.reserve_provider_route_handoff(
+            internal_request,
+            source_session_id="target",
+            route_id=reverse["route_id"],
+            action="instruction",
+            body="reply without minting another route",
+            idempotency_key="one-generation-only",
+        )
+        self.assertFalse(replay)
+        self.assertEqual(reservation["reciprocal_route_effect_id"], "")
+        self.assertEqual(reservation["reciprocal_route_actions"], [])
+
+        reply_leg = {
+            **leg,
+            "id": "leg_" + "1" * 32,
+            "ordinal": 2,
+            "kind": "reply",
+            "source_session_id": "target",
+            "target_session_id": "source",
+        }
+        reply_request = request.model_copy(update={
+            "source_session_id": "target",
+            "target_session_id": "source",
+            "cross_chat_exchange_leg_id": reply_leg["id"],
+        })
+        self.assertIsNone(
+            await agent_server.configured_route_reciprocal_grant_for_delivery(
+                "source",
+                reply_request,
+                delivery_record=reply_leg,
+                delivery_exchange=exchange,
+            )
+        )
+        self.assertIsNone(
+            await agent_server.configured_route_reciprocal_grant_for_delivery(
+                "target",
+                request.model_copy(update={"cross_chat_exchange_status": True}),
+                delivery_record=leg,
+                delivery_exchange=exchange,
+            )
+        )
+
     async def test_queue_snapshot_can_only_narrow_and_survives_recovery(self) -> None:
         route = self.route("a")
         item = {
@@ -3404,9 +4464,9 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             agent_server.STORE.sessions["source"],
             1,
         )
-        self.assertEqual(recovered["provider_cross_chat_route_snapshot"], [route])
+        self.assertEqual(recovered["provider_cross_chat_route_snapshot"], [])
 
-    async def test_queue_capability_edit_does_not_revoke_durable_snapshot(
+    async def test_queue_capability_edit_does_not_restore_unhinted_snapshot(
         self,
     ) -> None:
         route = self.route("a")
@@ -3445,12 +4505,7 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             updated["item"]["provider_cross_chat_route_snapshot"],
             snapshot,
         )
-        self.assertIsNotNone(
-            agent_server.live_provider_cross_chat_route(
-                "source",
-                snapshot[0],
-            )
-        )
+        self.assertEqual(snapshot, [])
         recovered = agent_server.queued_turn_from_event(
             {
                 "queued_id": "queued_durable_recovered",
@@ -3567,9 +4622,20 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         route = self.route("a")
         agent_server.STORE.sessions["source"]["provider_cross_chat_routes"] = [route]
         normal = agent_server.TurnRequest(prompt="hello")
+        explicit = agent_server.TurnRequest(
+            prompt="@Target hello",
+            chat_references=[self.grant_reference()],
+            client_capabilities=[
+                agent_server.AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY
+            ],
+        )
         with self.native_transports():
             snapshot = agent_server.initial_provider_cross_chat_route_snapshot(
                 "source", normal, "chat"
+            )
+            self.assertEqual(snapshot, [])
+            snapshot = agent_server.initial_provider_cross_chat_route_snapshot(
+                "source", explicit, "chat"
             )
             self.assertEqual(len(snapshot), 1)
             self.assertEqual(snapshot[0]["target_session_id"], "target")
@@ -3625,7 +4691,7 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
                 agent_server.initial_provider_cross_chat_route_snapshot(
                     "source", legacy, "chat"
                 ),
-                [route],
+                [],
             )
 
     async def test_old_cross_chat_database_migrates_origin_columns(self) -> None:

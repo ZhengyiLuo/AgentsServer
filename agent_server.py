@@ -1052,6 +1052,11 @@ MANAGED_UPDATE_PROVIDER_QUIESCE_TIMEOUT_SECONDS = max(
     1.0,
     float(agentsdock_setting("MANAGED_UPDATE_PROVIDER_QUIESCE_TIMEOUT_SECONDS", "8")),
 )
+# Provider shutdown first gives lingering turn/interaction owners their own
+# bounded cleanup window, then retires the underlying SDK/app-server
+# transports.  The managed-update deadline must leave room for both phases;
+# otherwise the outer 8s default always cancels a legitimate 15s inner drain.
+MANAGED_UPDATE_PROVIDER_TEARDOWN_MARGIN_SECONDS = 10.0
 MANAGED_UPDATE_CGROUP_SETTLE_TIMEOUT_SECONDS = max(
     0.1,
     float(agentsdock_setting("MANAGED_UPDATE_CGROUP_SETTLE_TIMEOUT_SECONDS", "3")),
@@ -12145,6 +12150,8 @@ RUN_NOW_COMPLETED_RESULTS: OrderedDict[
 RUN_METADATA: dict[str, dict[str, Any]] = {}
 CODEX_APP_SERVER_MANAGER: CodexAppServerManager | None = None
 CODEX_APP_SERVER_MANAGER_LOCK = asyncio.Lock()
+CODEX_APP_SERVER_MANAGER_EPOCH = 0
+CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH: int | None = None
 CLAUDE_SDK_MANAGER: ClaudeSDKSupervisorManager | None = None
 CLAUDE_SDK_MANAGER_LOCK = asyncio.Lock()
 CODEX_GOALS_CONFIG_LOCK = asyncio.Lock()
@@ -47095,17 +47102,32 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
         )
 
 
+def ensure_provider_manager_factory_admission(*, codex: bool = False) -> None:
+    """Reject even read-route lazy starts while provider teardown owns state."""
+
+    blocker = managed_server_update_admission_blocker()
+    if blocker or (codex and CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH is not None):
+        raise HTTPException(
+            status_code=503,
+            detail=blocker or "AgentsServer is finishing Codex provider cleanup",
+        )
+
+
 async def codex_app_server_manager() -> CodexAppServerManager:
     """Return the one lazy, multiplexed Codex app-server for this server."""
     global CODEX_APP_SERVER_MANAGER
+    global CODEX_APP_SERVER_MANAGER_EPOCH
+    ensure_provider_manager_factory_admission(codex=True)
     # Goal enablement is a process launch flag. Manager lookup therefore takes
     # the same barrier as configuration replacement, including the fast path;
     # no caller can retain/create the old generation halfway through a toggle.
     async with CODEX_GOALS_CONFIG_LOCK:
+        ensure_provider_manager_factory_admission(codex=True)
         manager = CODEX_APP_SERVER_MANAGER
         if manager is not None:
             return manager
         async with CODEX_APP_SERVER_MANAGER_LOCK:
+            ensure_provider_manager_factory_admission(codex=True)
             manager = CODEX_APP_SERVER_MANAGER
             if manager is None:
                 manager = CodexAppServerManager(
@@ -47138,6 +47160,7 @@ async def codex_app_server_manager() -> CodexAppServerManager:
                 )
                 manager.add_notification_handler(project_codex_notification)
                 manager.add_notification_handler(cache_codex_approval_item)
+                CODEX_APP_SERVER_MANAGER_EPOCH += 1
                 CODEX_APP_SERVER_MANAGER = manager
             return manager
 
@@ -47146,10 +47169,12 @@ async def claude_sdk_manager() -> ClaudeSDKSupervisorManager:
     """Return the bounded registry of independent per-chat Claude clients."""
 
     global CLAUDE_SDK_MANAGER
+    ensure_provider_manager_factory_admission()
     manager = CLAUDE_SDK_MANAGER
     if manager is not None:
         return manager
     async with CLAUDE_SDK_MANAGER_LOCK:
+        ensure_provider_manager_factory_admission()
         manager = CLAUDE_SDK_MANAGER
         if manager is None:
             manager = ClaudeSDKSupervisorManager(
@@ -47597,11 +47622,16 @@ async def interrupt_claude_sdk_run_bounded(
 
 async def close_codex_app_server_manager() -> None:
     global CODEX_APP_SERVER_MANAGER
+    global CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH
     await cancel_codex_interactions(resolution="server_closed")
     await cancel_codex_native_actions()
     async with CODEX_APP_SERVER_MANAGER_LOCK:
+        if CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH is not None:
+            raise RuntimeError("Codex provider cleanup is already in progress")
         manager = CODEX_APP_SERVER_MANAGER
+        cleanup_epoch = CODEX_APP_SERVER_MANAGER_EPOCH
         CODEX_APP_SERVER_MANAGER = None
+        CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH = cleanup_epoch
     async with CODEX_APP_SERVER_THREAD_LRU_LOCK:
         for event in CODEX_APP_SERVER_EVICTING_THREADS.values():
             event.set()
@@ -47649,6 +47679,9 @@ async def close_codex_app_server_manager() -> None:
     CODEX_PERMISSION_PROFILES_CACHE.clear()
     CODEX_QUARANTINED_GOAL_THREADS.clear()
     await reset_codex_ephemeral_runtime_metadata()
+    async with CODEX_APP_SERVER_MANAGER_LOCK:
+        if CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH == cleanup_epoch:
+            CODEX_APP_SERVER_MANAGER_CLEANUP_EPOCH = None
 
 
 def codex_control_http_error(exc: Exception) -> HTTPException:
@@ -60509,6 +60542,11 @@ SERVER_UPDATE_PRIVATE_PER_RUN_STATUS_FIELDS = (
     "_force_restart_requested_at",
 )
 SERVER_UPDATE_OPERATION_LOCK = asyncio.Lock()
+MANAGED_UPDATE_PROVIDER_QUIESCE_STRAGGLERS: dict[
+    str,
+    asyncio.Task[Any],
+] = {}
+MANAGED_UPDATE_PROVIDER_FENCE_RELEASE_TASKS: set[asyncio.Task[Any]] = set()
 SERVER_UPDATE_START_GRACE_SECONDS = 45.0
 SERVER_RESTART_PHASES = {"idle", "accepted", "signaling", "complete", "failed"}
 SERVER_RESTART_ACTIVE_PHASES = {"accepted", "signaling"}
@@ -60661,7 +60699,10 @@ def managed_server_update_blocks_work(
     """Return whether this process is draining for a managed replacement."""
 
     current = status if status is not None else read_server_update_status()
-    return str(current.get("phase") or "") in SERVER_UPDATE_ACTIVE_PHASES
+    return (
+        str(current.get("phase") or "") in SERVER_UPDATE_ACTIVE_PHASES
+        or managed_update_provider_quiesce_in_progress()
+    )
 
 
 def managed_server_update_is_pending(
@@ -63046,6 +63087,213 @@ def managed_update_provider_quiesce_timeout_detail() -> dict[str, Any]:
     }
 
 
+def managed_update_provider_quiesce_failure_detail() -> dict[str, Any]:
+    return {
+        "code": "provider_quiesce_failed",
+        "message": "AgentsServer could not safely finish provider cleanup.",
+        "action": "Restart AgentsServer from the host, then retry the update.",
+        "retryable": True,
+    }
+
+
+def restore_pending_server_update_after_provider_quiesce_timeout(
+    *,
+    expected_update_id: str,
+    reservation: dict[str, Any],
+    public_error: dict[str, Any],
+) -> dict[str, Any] | None:
+    """CAS a failed idle-update launch back to its exact reservation."""
+
+    if public_error.get("error_code") != "provider_quiesce_timeout":
+        return None
+    schedule_id = str(reservation.get("schedule_id") or "").strip()
+    target = str(reservation.get("target_version") or "").strip()
+    if not schedule_id or not target or not expected_update_id:
+        return None
+
+    with server_update_status_lock(SERVER_UPDATE_STATUS_FILE):
+        current = read_server_update_status()
+        if (
+            str(current.get("phase") or "") != "starting"
+            or str(current.get("update_id") or "") != expected_update_id
+            or str(current.get("schedule_id") or "") != schedule_id
+        ):
+            # Another exact owner changed the journal while failure cleanup
+            # was settling.  Its row wins; never overwrite it with this retry.
+            return current
+
+        # The admission snapshot already proved ordinary work idle.  Do not
+        # revive stale counts from the earlier reservation; the only known
+        # blocker now is this provider teardown attempt.
+        counts = server_update_blocker_counts(
+            [],
+            0,
+            ["provider cleanup"],
+            0,
+        )
+        track: Literal["stable", "beta"] = (
+            "beta" if reservation.get("track") == "beta" else "stable"
+        )
+        return _write_fresh_server_update_status_unlocked(
+            schedule_id=schedule_id,
+            phase=SERVER_UPDATE_PENDING_PHASE,
+            track=track,
+            current_track=server_release_track(SERVER_VERSION),
+            channel_switch=(track != server_release_track(SERVER_VERSION)),
+            target_version=target,
+            latest_version=target,
+            update_available=True,
+            when_idle=True,
+            cancelable=reservation.get("cancelable") is True,
+            pending_at=reservation.get("pending_at"),
+            blocker_counts=counts,
+            _force_restart_request_id=reservation.get(
+                "_force_restart_request_id"
+            ),
+            _force_restart_requested_at=reservation.get(
+                "_force_restart_requested_at"
+            ),
+            message=(
+                f"AgentsServer {target} remains scheduled while idle provider "
+                "cleanup finishes; the update will retry automatically."
+            ),
+            error_code="provider_quiesce_timeout",
+            error_action=public_error.get("error_action"),
+            retryable=True,
+            checked_at=reservation.get("checked_at"),
+        )
+
+
+def managed_update_provider_quiesce_timeout_seconds() -> float:
+    """Cover the nested task drain plus bounded provider transport teardown."""
+
+    return max(
+        MANAGED_UPDATE_PROVIDER_QUIESCE_TIMEOUT_SECONDS,
+        CODEX_SESSION_CLEANUP_TIMEOUT_SECONDS
+        + MANAGED_UPDATE_PROVIDER_TEARDOWN_MARGIN_SECONDS,
+    )
+
+
+def managed_update_provider_quiesce_in_progress() -> bool:
+    """Return whether an old provider close still lacks successful proof."""
+
+    return bool(MANAGED_UPDATE_PROVIDER_QUIESCE_STRAGGLERS)
+
+
+def managed_update_provider_quiesce_failed() -> bool:
+    """Return whether retained teardown proof completed unsuccessfully."""
+
+    for task in MANAGED_UPDATE_PROVIDER_QUIESCE_STRAGGLERS.values():
+        if task.cancelled():
+            return True
+        if task.done() and task.exception() is not None:
+            return True
+    return False
+
+
+def ensure_managed_update_provider_quiesce_failure_status(
+    status: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep the restart-required teardown failure visible in update status."""
+
+    changes: dict[str, Any] = {
+        "message": (
+            "AgentsServer could not safely finish provider cleanup; managed "
+            "updates remain fenced."
+        ),
+        "error_code": "provider_quiesce_failed",
+        "error_action": managed_update_provider_quiesce_failure_detail()["action"],
+        "retryable": True,
+    }
+    if managed_server_update_is_pending(status):
+        changes["blocker_counts"] = server_update_blocker_counts(
+            [],
+            0,
+            ["provider cleanup failed"],
+            0,
+        )
+    return write_server_update_status(**changes)
+
+
+async def reopen_after_managed_update_provider_quiesce() -> None:
+    """Release the temporary hard fence after every old close task settles."""
+
+    async with SERVER_UPDATE_OPERATION_LOCK:
+        # Keep the authoritative read and terminal-registry decision in the
+        # same order as start/status/cancel.  A pending waiter cannot switch
+        # to ``starting`` between this read and the registry lock acquisition.
+        status = read_server_update_status()
+        reopened = await TERMINAL_ATTACHMENTS.reopen_if_update_inactive(status)
+        if reopened:
+            schedule_rebuilt_queued_turns()
+
+
+async def record_managed_update_provider_quiesce_failure(name: str) -> None:
+    """Expose a failed retained close while keeping its hard fence installed."""
+
+    async with SERVER_UPDATE_OPERATION_LOCK:
+        current = read_server_update_status()
+        if str(current.get("phase") or "") not in {
+            SERVER_UPDATE_PENDING_PHASE,
+            "available",
+        }:
+            return
+        ensure_managed_update_provider_quiesce_failure_status(current)
+
+
+def track_managed_update_provider_fence_task(
+    awaitable: Any,
+    *,
+    name: str,
+) -> None:
+    task = asyncio.create_task(awaitable, name=name)
+    MANAGED_UPDATE_PROVIDER_FENCE_RELEASE_TASKS.add(task)
+
+    def settled(completed: asyncio.Task[Any]) -> None:
+        MANAGED_UPDATE_PROVIDER_FENCE_RELEASE_TASKS.discard(completed)
+        with suppress(BaseException):
+            completed.result()
+
+    task.add_done_callback(settled)
+
+
+def retain_managed_update_provider_quiesce_straggler(
+    name: str,
+    task: asyncio.Task[Any],
+) -> None:
+    """Fence replacement providers until a cancellation-hostile close ends."""
+
+    MANAGED_UPDATE_PROVIDER_QUIESCE_STRAGGLERS[name] = task
+
+    def settled(completed: asyncio.Task[Any]) -> None:
+        try:
+            completed.result()
+        except BaseException as exc:
+            logger.error(
+                "managed update provider cleanup failed manager=%s error_type=%s",
+                name,
+                type(exc).__name__,
+            )
+            track_managed_update_provider_fence_task(
+                record_managed_update_provider_quiesce_failure(name),
+                name="managed-update-provider-fence-failure",
+            )
+            return
+        if MANAGED_UPDATE_PROVIDER_QUIESCE_STRAGGLERS.get(name) is completed:
+            MANAGED_UPDATE_PROVIDER_QUIESCE_STRAGGLERS.pop(name, None)
+        if (
+            MANAGED_UPDATE_PROVIDER_QUIESCE_STRAGGLERS
+            or SERVER_SHUTTING_DOWN
+        ):
+            return
+        track_managed_update_provider_fence_task(
+            reopen_after_managed_update_provider_quiesce(),
+            name="managed-update-provider-fence-release",
+        )
+
+    task.add_done_callback(settled)
+
+
 def ensure_managed_update_service_cgroup_clear(
     *,
     service_cgroup: str | None = None,
@@ -63092,31 +63340,63 @@ async def wait_for_managed_update_service_cgroup_clear(
 async def close_managed_update_provider_managers() -> None:
     """Bound provider retirement so a bad supervisor cannot pin the drain."""
 
+    timeout_seconds = managed_update_provider_quiesce_timeout_seconds()
     tasks = {
-        asyncio.create_task(close_claude_sdk_manager()),
-        asyncio.create_task(close_codex_app_server_manager()),
+        "claude-sdk": asyncio.create_task(
+            close_claude_sdk_manager(),
+            name="managed-update-close-claude-sdk",
+        ),
+        "codex-app-server": asyncio.create_task(
+            close_codex_app_server_manager(),
+            name="managed-update-close-codex-app-server",
+        ),
     }
     _done, pending = await asyncio.wait(
-        tasks,
-        timeout=MANAGED_UPDATE_PROVIDER_QUIESCE_TIMEOUT_SECONDS,
+        set(tasks.values()),
+        timeout=timeout_seconds,
     )
-    if pending:
-        for task in pending:
-            task.cancel()
-        await asyncio.wait(
-            pending,
-            timeout=min(1.0, MANAGED_UPDATE_PROVIDER_QUIESCE_TIMEOUT_SECONDS),
+    failed_names: list[str] = []
+    for name, task in tasks.items():
+        if task in pending:
+            continue
+        try:
+            task.result()
+        except BaseException:
+            failed_names.append(name)
+            retain_managed_update_provider_quiesce_straggler(name, task)
+    if failed_names:
+        for name, task in tasks.items():
+            if task in pending:
+                retain_managed_update_provider_quiesce_straggler(name, task)
+        logger.error(
+            "managed update provider quiesce failed managers=%s "
+            "still_running=%s",
+            ",".join(failed_names),
+            ",".join(
+                name for name, task in tasks.items() if task in pending
+            ) or "none",
         )
-        for task in tasks:
-            if task.done():
-                with suppress(BaseException):
-                    task.result()
+        raise HTTPException(
+            status_code=502,
+            detail=managed_update_provider_quiesce_failure_detail(),
+        )
+    if pending:
+        pending_names = [
+            name for name, task in tasks.items() if task in pending
+        ]
+        for name, task in tasks.items():
+            if task in pending:
+                retain_managed_update_provider_quiesce_straggler(name, task)
+        logger.error(
+            "managed update provider quiesce timed out after %.1fs "
+            "pending_managers=%s",
+            timeout_seconds,
+            ",".join(pending_names),
+        )
         raise HTTPException(
             status_code=504,
             detail=managed_update_provider_quiesce_timeout_detail(),
         )
-    for task in tasks:
-        task.result()
 
 
 async def quiesce_managed_update_service_cgroup(
@@ -67756,6 +68036,9 @@ async def server_update_status(
             expected_server_instance_id,
         )
         status = read_server_update_status()
+        if managed_update_provider_quiesce_failed():
+            status = ensure_managed_update_provider_quiesce_failure_status(status)
+            return public_server_update_status(status)
         phase = str(status.get("phase") or "")
         if phase in SERVER_UPDATE_ACTIVE_PHASES:
             updater_active = await asyncio.to_thread(server_update_is_active, status)
@@ -67804,6 +68087,9 @@ async def check_server_update(
                 detail="AgentsServer is restarting",
             )
         status = read_server_update_status()
+        if managed_update_provider_quiesce_failed():
+            status = ensure_managed_update_provider_quiesce_failure_status(status)
+            return public_server_update_status(status)
         if managed_server_update_is_pending(status):
             return public_server_update_status(status)
         if str(status.get("phase") or "") in SERVER_UPDATE_ACTIVE_PHASES:
@@ -67892,6 +68178,12 @@ async def _start_server_update(
                 detail="AgentsServer is restarting",
             )
         status = read_server_update_status()
+        if managed_update_provider_quiesce_failed():
+            ensure_managed_update_provider_quiesce_failure_status(status)
+            raise HTTPException(
+                status_code=503,
+                detail=managed_update_provider_quiesce_failure_detail(),
+            )
         if str(status.get("phase") or "") in SERVER_UPDATE_ACTIVE_PHASES:
             updater_active = await asyncio.to_thread(server_update_is_active, status)
             if (
@@ -67918,12 +68210,27 @@ async def _start_server_update(
             if managed_server_update_is_pending(status)
             else ""
         )
+        pending_reservation = (
+            dict(status) if pending_schedule_id else None
+        )
         if (
             expected_schedule_id is not None
             and pending_schedule_id != expected_schedule_id
         ):
             # A stale waiter lost its durable compare-and-swap ownership.
             return status
+        if managed_update_provider_quiesce_in_progress():
+            if pending_schedule_id:
+                return status
+            raise HTTPException(
+                status_code=409,
+                detail=server_update_error_detail(
+                    "server_update_in_progress",
+                    "AgentsServer is still finishing the previous provider cleanup.",
+                    action="Wait briefly, then retry the managed update.",
+                    retryable=True,
+                ),
+            )
         track: Literal["stable", "beta"] = body.track or status["track"]
         requested = str(body.version or status.get("latest_version") or "").strip()
         if not requested:
@@ -68398,7 +68705,21 @@ async def _start_server_update(
                 logger.error("Team Hub update fence clear failed after runner launch failure")
             try:
                 if not fence_clear_failed:
-                    if public_error.get("retryable") is True:
+                    restored_pending = None
+                    if (
+                        public_error.get("retryable") is True
+                        and pending_reservation is not None
+                    ):
+                        restored_pending = (
+                            restore_pending_server_update_after_provider_quiesce_timeout(
+                                expected_update_id=update_id,
+                                reservation=pending_reservation,
+                                public_error=public_error,
+                            )
+                        )
+                    if restored_pending is not None:
+                        pass
+                    elif public_error.get("retryable") is True:
                         write_fresh_server_update_status(
                             phase="available",
                             track=track,
@@ -68530,6 +68851,12 @@ async def cancel_server_update(
             body.expected_server_instance_id,
         )
         status = read_server_update_status()
+        if managed_update_provider_quiesce_failed():
+            ensure_managed_update_provider_quiesce_failure_status(status)
+            raise HTTPException(
+                status_code=503,
+                detail=managed_update_provider_quiesce_failure_detail(),
+            )
         actual_schedule_id = str(status.get("schedule_id") or "").strip()
         if actual_schedule_id != body.schedule_id:
             raise HTTPException(
@@ -68684,15 +69011,27 @@ async def advance_pending_server_update_once() -> dict[str, Any]:
 def pending_server_update_exception_is_transient(exc: BaseException) -> bool:
     """Return true only for a process transition that will resolve itself."""
 
-    if not isinstance(exc, HTTPException) or exc.status_code != 409:
+    if not isinstance(exc, HTTPException):
         return False
     detail = exc.detail
     if isinstance(detail, dict):
         code = str(detail.get("code") or "").strip()
+        if (
+            code == "provider_quiesce_timeout"
+            and detail.get("retryable") is True
+        ):
+            # The exact idle reservation was restored before admission
+            # reopened.  Keep its jobs parked and let the durable waiter retry
+            # after the bounded provider cleanup window.
+            return True
+        if exc.status_code != 409:
+            return False
         return code in {
             "server_restart_in_progress",
             "server_update_in_progress",
         }
+    if exc.status_code != 409:
+        return False
     return str(detail or "").strip() in {
         "AgentsServer is restarting",
         "a server update is already running",

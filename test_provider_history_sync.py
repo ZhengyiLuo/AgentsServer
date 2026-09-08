@@ -131,6 +131,11 @@ def fake_history_timeline_scan(events: list[dict]):
                 key = agent_server.history_dedup_key(
                     "assistant", event.get("text")
                 )
+            elif tail and event_type in {"turn_finished", "job_summary"}:
+                result_text = event.get("result_text")
+                if not isinstance(result_text, str) or not result_text.strip():
+                    continue
+                key = agent_server.history_dedup_key("assistant", result_text)
             else:
                 continue
             has_messages = True
@@ -723,6 +728,52 @@ class UnsyncedHistoryItemsTests(unittest.TestCase):
             ),
             [],
         )
+
+    def test_compacted_scheduled_result_anchors_first_sync(self) -> None:
+        events = [
+            {"type": "turn_started", "prompt": "older human question"},
+            {"type": "assistant_text", "text": "older human answer"},
+            {
+                "type": "turn_started",
+                "purpose": "scheduled_job",
+                "job_id": "job-monitor",
+                "prompt": "monitor the fleet\n\n[legacy generated runtime suffix]",
+            },
+            {
+                "type": "turn_finished",
+                "purpose": "scheduled_job",
+                "job_id": "job-monitor",
+                "result_text": "fleet is healthy",
+            },
+        ]
+        transcript = [
+            user("older human question"),
+            assistant("older human answer"),
+            user("monitor the fleet"),
+            assistant("fleet is healthy"),
+        ]
+
+        self.assertEqual(self.select(events, transcript), [])
+
+    def test_job_summary_result_anchors_first_sync_after_compaction(self) -> None:
+        events = [
+            {"type": "turn_started", "prompt": "older human question"},
+            {"type": "assistant_text", "text": "older human answer"},
+            {
+                "type": "job_summary",
+                "purpose": "scheduled_job",
+                "job_id": "job-monitor",
+                "result_text": "latest compacted monitor report",
+            },
+        ]
+        transcript = [
+            user("older human question"),
+            assistant("older human answer"),
+            user("monitor the fleet"),
+            assistant("latest compacted monitor report"),
+        ]
+
+        self.assertEqual(self.select(events, transcript), [])
 
     def test_cursor_keeps_external_prefix_before_timeline_owned_suffix(self) -> None:
         events = [

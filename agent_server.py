@@ -44733,6 +44733,19 @@ def history_timeline_message_keys(
                 key = history_dedup_key("user", event.get("prompt"))
             elif event_type == "assistant_text":
                 key = history_dedup_key("assistant", event.get("text"))
+            elif tail and event_type in {"turn_finished", "job_summary"}:
+                # A compacted scheduled run can retain only its canonical
+                # result event.  The provider transcript still contains that
+                # same assistant message, so ignoring the result leaves the
+                # first history sync anchored to an older ordinary turn and
+                # re-imports every intervening cron run as raw chat output.
+                # Final results are used only for the conservative first-sync
+                # tail anchor; cursor reconciliation keeps its one-credit-per-
+                # provider-message contract unchanged.
+                result_text = event.get("result_text")
+                if not isinstance(result_text, str) or not result_text.strip():
+                    continue
+                key = history_dedup_key("assistant", result_text)
             else:
                 continue
             timeline_has_messages = True

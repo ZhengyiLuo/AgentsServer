@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 from collections import OrderedDict, deque
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -7729,6 +7730,638 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             "cross_chat_exchange_leg_failed",
             [call.args[2] for call in leg_lifecycle.await_args_list],
         )
+
+    async def test_real_queue_round_trip_survives_source_turnover_and_only_cancel_stops_target(
+        self,
+    ) -> None:
+        """Exercise the Newton -> SuperSONIC incident through real queue owners.
+
+        This deliberately does not stub ``start_turn_durably``, ``enqueue_turn``,
+        ``start_next_queued_turn``, ``_start_turn_locked``, or either exchange
+        submission/finalization path.  Only the external provider coroutine is
+        replaced: it binds the same ACTIVE owner a Claude SDK run would bind,
+        waits for a deterministic answer/interrupt, then enters the ordinary
+        owned terminal pipeline.
+        """
+
+        event_root = self.root / "round-trip-events"
+        provider_answers = {
+            "source": asyncio.Queue(),
+            "target": asyncio.Queue(),
+        }
+        provider_starts = {
+            "source": asyncio.Queue(),
+            "target": asyncio.Queue(),
+        }
+        provider_handles: list[dict[str, object]] = []
+
+        def test_events_path(session_id: str) -> Path:
+            return event_root / session_id / "events.jsonl"
+
+        def ensure_test_dirs(session_id: str | None = None) -> None:
+            event_root.mkdir(parents=True, exist_ok=True)
+            if session_id:
+                test_events_path(session_id).parent.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+        async def wait_until(predicate, *, message: str) -> None:
+            deadline = asyncio.get_running_loop().time() + 3
+            while not predicate():
+                if asyncio.get_running_loop().time() >= deadline:
+                    self.fail(message)
+                await asyncio.sleep(0.005)
+
+        async def wait_for_leg_status(
+            leg_id: str,
+            status: str,
+            *,
+            message: str,
+        ) -> dict:
+            deadline = asyncio.get_running_loop().time() + 3
+            while True:
+                leg = await agent_server.CROSS_CHAT.get_exchange_leg(leg_id)
+                if leg is not None and leg.get("status") == status:
+                    return leg
+                if asyncio.get_running_loop().time() >= deadline:
+                    self.fail(message)
+                await asyncio.sleep(0.005)
+
+        async def wait_for_exchange_status(
+            exchange_id: str,
+            status: str,
+            *,
+            message: str,
+        ) -> dict:
+            deadline = asyncio.get_running_loop().time() + 3
+            while True:
+                exchange = await agent_server.CROSS_CHAT.get_exchange(
+                    exchange_id
+                )
+                if exchange is not None and exchange.get("status") == status:
+                    return exchange
+                if asyncio.get_running_loop().time() >= deadline:
+                    self.fail(message)
+                await asyncio.sleep(0.005)
+
+        class FakeClaudeRun:
+            def __init__(self) -> None:
+                self.interrupted = asyncio.Event()
+                self.interrupt_calls = 0
+
+            async def interrupt(self) -> bool:
+                self.interrupt_calls += 1
+                self.interrupted.set()
+                return True
+
+        async def fake_claude_provider(
+            session_id: str,
+            run_id: str,
+            _prompt: str,
+            _session: dict,
+            _manifest_path: Path,
+            **_kwargs,
+        ) -> None:
+            handle = FakeClaudeRun()
+            active = {
+                "run_id": run_id,
+                "backend": agent_server.BACKEND_CLAUDE,
+                "transport": agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+                "provider_turn_ready": True,
+                "provider_session_id": f"fake-provider-{run_id}",
+                "claude_sdk_run": handle,
+                "claude_permissions_open": True,
+                "owner_task": asyncio.current_task(),
+            }
+            bound, stop_requested = await agent_server.bind_active_turn(
+                session_id,
+                run_id,
+                active,
+            )
+            self.assertTrue(bound)
+            self.assertFalse(stop_requested)
+            provider_handles.append({
+                "session_id": session_id,
+                "run_id": run_id,
+                "handle": handle,
+            })
+            await provider_starts[session_id].put((run_id, handle))
+
+            answer_task = asyncio.create_task(
+                provider_answers[session_id].get()
+            )
+            interrupt_task = asyncio.create_task(handle.interrupted.wait())
+            done, pending = await asyncio.wait(
+                {answer_task, interrupt_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            stopped = interrupt_task in done and bool(interrupt_task.result())
+            result_text = "" if stopped else str(answer_task.result())
+            if result_text:
+                await agent_server.append_event(
+                    session_id,
+                    "assistant_text",
+                    {
+                        "run_id": run_id,
+                        "text": result_text,
+                        **agent_server.run_event_metadata(run_id),
+                    },
+                )
+            await agent_server.finalize_owned_turn_finished(
+                session_id,
+                run_id,
+                stopped=stopped,
+                payload={
+                    "run_id": run_id,
+                    "backend": agent_server.BACKEND_CLAUDE,
+                    "transport": agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+                    "exit_code": 130 if stopped else 0,
+                    "result_text": result_text,
+                    "stopped": stopped,
+                    **agent_server.run_event_metadata(run_id),
+                },
+            )
+
+        async def issue_ask(
+            source_run_id: str,
+            idempotency_key: str,
+        ) -> tuple[str, str, asyncio.Task[dict]]:
+            agent_server.CURRENT_TURNS["source"] = {
+                "run_id": source_run_id,
+            }
+            reference = agent_server.ChatReference(
+                session_id="target",
+                display_title_snapshot="Target",
+                source_text_start=0,
+                source_text_end=7,
+                action="request_reply",
+            )
+            exchange_ids = await agent_server.register_request_reply_exchanges(
+                "source",
+                source_run_id,
+                [reference],
+                source_user_instruction="Ask Target to investigate.",
+            )
+            authority_path = await agent_server.issue_cross_chat_capability(
+                "source",
+                source_run_id,
+                [reference],
+                source_user_instruction="Ask Target to investigate.",
+                actions={"cross_chat_request_reply"},
+                exchange_request_grants={"target": exchange_ids[0]},
+            )
+            self.assertIsNotNone(authority_path)
+            assert authority_path is not None
+            token = json.loads(authority_path.read_text())[
+                "provider_capability"
+            ]
+            route_handle = self.direct_grant_handle(
+                authority_path,
+                action="request_reply",
+            )
+            http_request = Request({
+                "type": "http",
+                "headers": [
+                    (
+                        b"x-agentsdock-provider-capability",
+                        token.encode(),
+                    ),
+                ],
+                "client": ("127.0.0.1", 1234),
+            })
+            task = asyncio.create_task(
+                agent_server.submit_authorized_cross_chat_handoff(
+                    agent_server.CrossChatHandoffRequest(
+                        target_session_id=route_handle,
+                        action="request_reply",
+                        body="Investigate the queue handoff and report back.",
+                        idempotency_key=idempotency_key,
+                        wait_for_response=True,
+                    ),
+                    http_request,
+                )
+            )
+            return exchange_ids[0], token, task
+
+        async def begin_live_wait(
+            token: str,
+            receipt: dict,
+        ) -> asyncio.Task[dict]:
+            exchange, waiter = (
+                await agent_server.authorized_cross_chat_live_waiter(
+                    token,
+                    exchange_id=receipt["exchange_id"],
+                    inbound_leg_id=receipt["inbound_leg_id"],
+                    lease_id=receipt["live_response_lease_id"],
+                )
+            )
+            task = asyncio.create_task(
+                agent_server.await_cross_chat_live_waiter(
+                    exchange,
+                    waiter,
+                    timeout_seconds=10,
+                )
+            )
+            await wait_until(
+                lambda: bool(waiter.get("observers")),
+                message="provider helper never attached its live observer",
+            )
+            return task
+
+        def events_for(session_id: str) -> list[dict]:
+            path = test_events_path(session_id)
+            if not path.exists():
+                return []
+            return [
+                json.loads(line)
+                for line in path.read_text().splitlines()
+                if line.strip()
+            ]
+
+        pending_tasks: set[asyncio.Task] = set()
+        with ExitStack() as patch_stack:
+            for name, value in (
+                ("ACTIVE", {}),
+                ("BUSY_SESSIONS", set()),
+                ("CURRENT_TURNS", {}),
+                ("QUEUED_TURNS", {}),
+                ("RUN_NOW_TURNS", {}),
+                ("QUEUE_START_TASKS", {}),
+                ("RUN_METADATA", {}),
+                ("SESSION_TURN_TASKS", {}),
+                ("EVENT_SEQ_CACHE", {}),
+                ("EVENT_SEQ_REPAIR_LOCKS", {}),
+                ("EVENT_DELIVERY_LOCKS", {}),
+                ("HISTORY_SEARCH_DIRTY", set()),
+            ):
+                patch_stack.enter_context(
+                    patch.object(agent_server, name, value)
+                )
+            patch_stack.enter_context(patch.object(
+                agent_server,
+                "events_path",
+                side_effect=test_events_path,
+            ))
+            patch_stack.enter_context(patch.object(
+                agent_server,
+                "ensure_dirs",
+                side_effect=ensure_test_dirs,
+            ))
+            patch_stack.enter_context(patch.object(
+                agent_server.STORE,
+                "save",
+                new_callable=AsyncMock,
+            ))
+            patch_stack.enter_context(patch.object(
+                agent_server,
+                "ensure_runtime_available",
+                AsyncMock(return_value={
+                    "backend": agent_server.BACKEND_CLAUDE,
+                    "status": "ready",
+                }),
+            ))
+            patch_stack.enter_context(patch.object(
+                agent_server,
+                "turn_start_blocker",
+                AsyncMock(return_value=None),
+            ))
+            patch_stack.enter_context(patch.object(
+                agent_server,
+                "managed_server_update_blocker",
+                return_value=None,
+            ))
+            patch_stack.enter_context(patch.object(
+                agent_server,
+                "managed_server_update_admission_blocker",
+                return_value=None,
+            ))
+            patch_stack.enter_context(patch.object(
+                agent_server,
+                "scrub_tmux_global_secret_environment",
+                return_value=None,
+            ))
+            patch_stack.enter_context(patch.object(
+                agent_server,
+                "CLAUDE_TRANSPORT",
+                agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+            ))
+            patch_stack.enter_context(patch.object(
+                agent_server,
+                "claude_sdk_dependency_available",
+                return_value=True,
+            ))
+            patch_stack.enter_context(patch.object(
+                agent_server,
+                "run_claude",
+                side_effect=fake_claude_provider,
+            ))
+            patch_stack.enter_context(patch.object(
+                agent_server.HUB,
+                "broadcast",
+                new_callable=AsyncMock,
+            ))
+            patch_stack.enter_context(patch.object(
+                agent_server,
+                "cancel_codex_interactions",
+                new_callable=AsyncMock,
+            ))
+            patch_stack.enter_context(patch.object(
+                agent_server,
+                "cancel_claude_interactions",
+                new_callable=AsyncMock,
+            ))
+            patch_stack.enter_context(patch.object(
+                agent_server,
+                "stop_idle_claude_background_subagents_bounded",
+                AsyncMock(return_value={
+                    "fence_committed": True,
+                    "descendants": 0,
+                    "requested": [],
+                    "interrupted": [],
+                    "pending": [],
+                    "errors": [],
+                }),
+            ))
+            patch_stack.enter_context(patch.object(
+                agent_server,
+                "STOP_CONFIRM_TIMEOUT_SECONDS",
+                0.25,
+            ))
+            try:
+                # Use one deterministic fake provider boundary for both
+                # disposable chats; all server routing/queue state remains
+                # production code.
+                agent_server.STORE.sessions["source"]["backend"] = (
+                    agent_server.BACKEND_CLAUDE
+                )
+                agent_server.STORE.sessions["target"]["backend"] = (
+                    agent_server.BACKEND_CLAUDE
+                )
+                # SuperSONIC is occupied, so the authenticated Newton Ask must
+                # cross the actual durable target-queue admission boundary.
+                target_predecessor = "run_target_predecessor"
+                agent_server.BUSY_SESSIONS.add("target")
+                agent_server.CURRENT_TURNS["target"] = {
+                    "run_id": target_predecessor,
+                }
+                source_run = "run_newton_ask"
+                exchange_id, source_token, ask_task = await issue_ask(
+                    source_run,
+                    "real-queue-source-turnover",
+                )
+                pending_tasks.add(ask_task)
+                await wait_until(
+                    lambda: bool(agent_server.QUEUED_TURNS.get("target")),
+                    message="target delivery never reached the durable queue",
+                )
+                queued_request = agent_server.QUEUED_TURNS["target"][0]
+                request_leg_id = str(
+                    queued_request["cross_chat_exchange_leg_id"]
+                )
+                request_leg = await wait_for_leg_status(
+                    request_leg_id,
+                    "queued",
+                    message="target queue row never bound its exchange leg",
+                )
+                self.assertEqual(request_leg["status"], "queued")
+                self.assertTrue(queued_request["_durable"])
+                await wait_until(
+                    lambda: any(
+                        key[0] == exchange_id
+                        for key in agent_server.CROSS_CHAT_LIVE_RESPONSE_WAITERS
+                    ),
+                    message="live Ask waiter was not attached",
+                )
+                ask_receipt = await asyncio.wait_for(ask_task, timeout=1)
+                pending_tasks.discard(ask_task)
+                self.assertIn("live_response_lease_id", ask_receipt)
+                live_wait = await begin_live_wait(
+                    source_token,
+                    ask_receipt,
+                )
+                pending_tasks.add(live_wait)
+
+                # A new Newton turn replaces the old source owner. The actual
+                # terminal hook revokes its capability and must only detach the
+                # HTTP waiter; the accepted SuperSONIC queue row remains owned.
+                source_successor = "run_newton_successor"
+                agent_server.BUSY_SESSIONS.add("source")
+                agent_server.CURRENT_TURNS["source"] = {
+                    "run_id": source_successor,
+                }
+                await agent_server.finalize_cross_chat_terminal({
+                    "type": "turn_finished",
+                    "run_id": source_run,
+                    "result_text": "Newton moved on to another user turn.",
+                    "exit_code": 0,
+                })
+                receipt = await asyncio.wait_for(live_wait, timeout=1)
+                pending_tasks.discard(live_wait)
+                self.assertTrue(receipt.get("deferred"), receipt)
+                self.assertEqual(receipt["delivery"], "asynchronous")
+                self.assertEqual(
+                    agent_server.QUEUED_TURNS["target"][0]["queued_id"],
+                    queued_request["queued_id"],
+                )
+
+                # Release only the predecessor and promote through the real
+                # queue-to-_start_turn_locked-to-provider path.
+                self.assertTrue(await agent_server.release_turn_slot(
+                    "target",
+                    expected_run_id=target_predecessor,
+                ))
+                target_promotion = asyncio.create_task(
+                    agent_server.start_next_queued_turn("target")
+                )
+                pending_tasks.add(target_promotion)
+                await asyncio.wait_for(target_promotion, timeout=1)
+                pending_tasks.discard(target_promotion)
+                await asyncio.sleep(0)
+                target_run_id, target_handle = await asyncio.wait_for(
+                    provider_starts["target"].get(),
+                    timeout=1,
+                )
+                self.assertEqual(target_handle.interrupt_calls, 0)
+                self.assertEqual(
+                    agent_server.CURRENT_TURNS["target"]["run_id"],
+                    target_run_id,
+                )
+                await provider_answers["target"].put(
+                    "SuperSONIC completed the requested handoff."
+                )
+
+                # Target terminalization creates the automatic return leg and
+                # real start_turn_durably queues it behind Newton's successor.
+                await wait_until(
+                    lambda: bool(agent_server.QUEUED_TURNS.get("source")),
+                    message="automatic reply never reached Newton's queue",
+                )
+                queued_reply = agent_server.QUEUED_TURNS["source"][0]
+                reply_leg_id = str(
+                    queued_reply["cross_chat_exchange_leg_id"]
+                )
+                reply_leg = await wait_for_leg_status(
+                    reply_leg_id,
+                    "queued",
+                    message="source queue row never bound its reply leg",
+                )
+                self.assertEqual(reply_leg["status"], "queued")
+                self.assertTrue(queued_reply["_durable"])
+                self.assertEqual(reply_leg["body"], (
+                    "SuperSONIC completed the requested handoff."
+                ))
+
+                # Deliver the persisted reply through the same queue promoter.
+                self.assertTrue(await agent_server.release_turn_slot(
+                    "source",
+                    expected_run_id=source_successor,
+                ))
+                source_promotion = asyncio.create_task(
+                    agent_server.start_next_queued_turn("source")
+                )
+                pending_tasks.add(source_promotion)
+                await asyncio.wait_for(source_promotion, timeout=1)
+                pending_tasks.discard(source_promotion)
+                await asyncio.sleep(0)
+                source_reply_run, source_reply_handle = await asyncio.wait_for(
+                    provider_starts["source"].get(),
+                    timeout=1,
+                )
+                self.assertEqual(source_reply_handle.interrupt_calls, 0)
+                await provider_answers["source"].put(
+                    "Newton received the returned answer."
+                )
+                exchange = await wait_for_exchange_status(
+                    exchange_id,
+                    "completed",
+                    message="round-trip exchange never completed",
+                )
+                legs = await agent_server.CROSS_CHAT.exchange_legs(exchange_id)
+                self.assertEqual(exchange["status"], "completed")
+                self.assertEqual(
+                    [leg["status"] for leg in legs],
+                    ["delivered", "delivered"],
+                )
+                self.assertEqual(
+                    [leg["target_session_id"] for leg in legs],
+                    ["target", "source"],
+                )
+
+                target_events = events_for("target")
+                source_events = events_for("source")
+                self.assertTrue(any(
+                    event["type"] == "turn_queued"
+                    and event.get("queued_id") == queued_request["queued_id"]
+                    for event in target_events
+                ))
+                self.assertTrue(any(
+                    event["type"] == "turn_started"
+                    and event.get("queued_id") == queued_request["queued_id"]
+                    for event in target_events
+                ))
+                self.assertTrue(any(
+                    event["type"] == "turn_queued"
+                    and event.get("queued_id") == queued_reply["queued_id"]
+                    for event in source_events
+                ))
+                self.assertTrue(any(
+                    event["type"] == "turn_started"
+                    and event.get("queued_id") == queued_reply["queued_id"]
+                    for event in source_events
+                ))
+
+                # A second live Ask starts immediately. Source turnover again
+                # leaves it running; only explicit exchange Cancel interrupts
+                # the exact fake provider owner through production stop_turn.
+                cancel_source_run = "run_newton_cancel_case"
+                (
+                    cancel_exchange_id,
+                    cancel_source_token,
+                    cancel_ask,
+                ) = await issue_ask(
+                    cancel_source_run,
+                    "real-running-explicit-cancel",
+                )
+                pending_tasks.add(cancel_ask)
+                cancel_target_run, cancel_handle = await asyncio.wait_for(
+                    provider_starts["target"].get(),
+                    timeout=1,
+                )
+                cancel_post_receipt = await asyncio.wait_for(
+                    cancel_ask,
+                    timeout=1,
+                )
+                pending_tasks.discard(cancel_ask)
+                cancel_live_wait = await begin_live_wait(
+                    cancel_source_token,
+                    cancel_post_receipt,
+                )
+                pending_tasks.add(cancel_live_wait)
+                await agent_server.finalize_cross_chat_terminal({
+                    "type": "turn_finished",
+                    "run_id": cancel_source_run,
+                    "result_text": "Newton moved on again.",
+                    "exit_code": 0,
+                })
+                cancel_receipt = await asyncio.wait_for(
+                    cancel_live_wait,
+                    timeout=1,
+                )
+                pending_tasks.discard(cancel_live_wait)
+                self.assertTrue(cancel_receipt["deferred"])
+                self.assertEqual(cancel_handle.interrupt_calls, 0)
+                self.assertEqual(
+                    agent_server.CURRENT_TURNS["target"]["run_id"],
+                    cancel_target_run,
+                )
+
+                cancelled = await agent_server.cancel_cross_chat_exchange(
+                    cancel_exchange_id
+                )
+                self.assertEqual(cancelled["status"], "cancelled")
+                self.assertEqual(cancel_handle.interrupt_calls, 1)
+                await wait_until(
+                    lambda: "target" not in agent_server.BUSY_SESSIONS,
+                    message="explicit Cancel did not stop the target owner",
+                )
+                cancel_legs = await agent_server.CROSS_CHAT.exchange_legs(
+                    cancel_exchange_id
+                )
+                self.assertEqual(len(cancel_legs), 1)
+                self.assertEqual(cancel_legs[0]["status"], "failed")
+
+                self.assertEqual(
+                    [
+                        entry["handle"].interrupt_calls
+                        for entry in provider_handles
+                    ],
+                    [0, 0, 1],
+                )
+                self.assertNotIn("target", agent_server.QUEUED_TURNS)
+                self.assertNotIn("source", agent_server.QUEUED_TURNS)
+            finally:
+                for task in pending_tasks:
+                    if not task.done():
+                        task.cancel()
+                if pending_tasks:
+                    await asyncio.gather(
+                        *pending_tasks,
+                        return_exceptions=True,
+                    )
+                for session_id, tasks in list(
+                    agent_server.SESSION_TURN_TASKS.items()
+                ):
+                    for task in tuple(tasks):
+                        if not task.done():
+                            task.cancel()
+                    if tasks:
+                        await asyncio.gather(*tuple(tasks), return_exceptions=True)
+                    agent_server.SESSION_TURN_TASKS.pop(session_id, None)
 
     async def test_targeted_stop_run_guard_cannot_stop_a_promoted_successor(self) -> None:
         active_successor = {

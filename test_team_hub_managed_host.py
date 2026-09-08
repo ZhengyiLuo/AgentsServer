@@ -502,6 +502,35 @@ sys.exit(10)
             self.assertIsNone(session["principal"]["email"])
             self.assertEqual(session["teams"][0]["role"], "automation")
 
+            invitation = store.issue_invite(
+                claims,
+                team_id,
+                "new-person@example.com",
+                "member",
+                15 * 60,
+            )
+            self.assertEqual(
+                invitation["invitation"]["invitee_email"],
+                "new-person@example.com",
+            )
+            joined = store.redeem_invite(
+                invitation["token"],
+                "new-person@example.com",
+                "New person",
+                "New person Mac",
+            )
+            self.assertEqual(joined["teams"][0]["role"], "member")
+            self.assertEqual(joined["teams"][0]["status"], "active")
+            with self.assertRaises(HubError) as local_mail_invite:
+                store.issue_invite(
+                    local_mail_claims,
+                    team_id,
+                    "forbidden@example.com",
+                    "member",
+                    15 * 60,
+                )
+            self.assertEqual(local_mail_invite.exception.code, "forbidden")
+
             network = store.get_network(claims, team_id)
             host = next(server for server in network["servers"] if server["is_host"])
             self.assertTrue(host["owned_by_caller"])

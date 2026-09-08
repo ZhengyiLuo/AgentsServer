@@ -38,6 +38,8 @@ from .auth import (
     AuthenticationError,
     AuthorizationError,
     INVITATION_MAX_TTL_SECONDS,
+    MANAGED_SERVER_PRINCIPAL_ID,
+    MANAGED_SERVER_SERVICE_IDENTIFIER,
     _bounded_text,
     _canonical_ed25519_public_key,
     _email,
@@ -49,6 +51,7 @@ from .auth import (
     _write_transaction,
     bootstrap_personal_team,
     issue_invitation,
+    issue_managed_host_invitation,
     issue_node_enrollment,
     redeem_invitation,
 )
@@ -136,8 +139,6 @@ TEAM_ATTACHMENT_MEDIA_TYPE_RE = re.compile(
 TEAM_ATTACHMENT_ID_RE = re.compile(r"^tatt_[0-9a-f]{32}$")
 TEAM_ATTACHMENT_STORAGE_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
 LOCAL_CONTROL_PRINCIPAL_ID = "service_local_control"
-MANAGED_SERVER_PRINCIPAL_ID = "service_managed_server"
-MANAGED_SERVER_SERVICE_IDENTIFIER = "agentsdock.team-hub.managed-server"
 NETWORK_AUTOMATION_AUTH_KINDS = frozenset(
     {"secure_peer", "local_agent_mail", "managed_server"}
 )
@@ -7904,15 +7905,30 @@ class HubStore:
         try:
             with _write_transaction(connection):
                 self._require_session(connection, claims, timestamp)
-                issued = issue_invitation(
-                    connection,
-                    team_id,
-                    claims.principal_id,
-                    role,
-                    invitee_email=invitee_email,
-                    ttl_seconds=ttl_seconds,
-                    now=timestamp,
-                )
+                if claims.auth_kind == "managed_server":
+                    if claims.team_id != team_id:
+                        raise AuthorizationError(
+                            "managed host operator is bound to another team"
+                        )
+                    issued = issue_managed_host_invitation(
+                        connection,
+                        team_id,
+                        claims.principal_id,
+                        role,
+                        invitee_email=invitee_email,
+                        ttl_seconds=ttl_seconds,
+                        now=timestamp,
+                    )
+                else:
+                    issued = issue_invitation(
+                        connection,
+                        team_id,
+                        claims.principal_id,
+                        role,
+                        invitee_email=invitee_email,
+                        ttl_seconds=ttl_seconds,
+                        now=timestamp,
+                    )
                 normalized = _email(invitee_email)
                 self._audit(
                     connection,

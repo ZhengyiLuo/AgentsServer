@@ -698,6 +698,28 @@ class TeamHubParentIntegrationTests(unittest.TestCase):
                     )
 
                     team_id = first.json()["teams"][0]["id"]
+                    invitation = client.post(
+                        f"/api/team-hub-server/v1/teams/{team_id}/invitations",
+                        headers=headers,
+                        json={
+                            "invitee_email": "host-invited@example.com",
+                            "role": "member",
+                        },
+                    )
+                    self.assertEqual(invitation.status_code, 200, invitation.text)
+                    self.assertNotIn("host-invited@example.com", invitation.json()["token"])
+                    joined = client.post(
+                        "/api/team-hub/v1/invitations/redeem",
+                        json={
+                            "token": invitation.json()["token"],
+                            "email": "host-invited@example.com",
+                            "display_name": "Host invited person",
+                            "device_label": "Invited Mac",
+                        },
+                    )
+                    self.assertEqual(joined.status_code, 200, joined.text)
+                    self.assertEqual(joined.json()["teams"][0]["role"], "member")
+
                     message = client.post(
                         f"/api/team-hub-server/v1/teams/{team_id}/network/messages",
                         headers=headers,

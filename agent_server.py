@@ -67774,6 +67774,7 @@ TEAM_HUB_SERVER_SESSION_ROUTE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("GET", re.compile(r"^/v1/teams$")),
     ("GET", re.compile(r"^/v1/teams/[^/]+$")),
     ("GET", re.compile(r"^/v1/teams/[^/]+/(?:members|nodes|channels)$")),
+    ("POST", re.compile(r"^/v1/teams/[^/]+/invitations$")),
     ("GET", re.compile(r"^/v1/channels/[^/]+/messages$")),
     ("POST", re.compile(r"^/v1/channels/[^/]+/messages$")),
     ("GET", re.compile(r"^/v1/teams/[^/]+/network$")),

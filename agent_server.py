@@ -17459,23 +17459,19 @@ async def _revoke_cross_chat_capability(run_id: str) -> None:
                 error="live cross-chat response capability was revoked",
             )
             if failed is not None and active_leg is not None:
-                # Refresh after the terminal CAS: a simultaneous admission may
-                # have bound its exact queue id after our earlier snapshot but
-                # before the failure won.  Once failed, no later claim can add
-                # a queue owner, so this removes the complete winning set.
                 failed_leg = (
                     await CROSS_CHAT.get_exchange_leg(
                         str(active_leg.get("id") or "")
                     )
                 ) or active_leg
-                if failed_leg.get("queued_id"):
-                    await remove_cross_chat_exchange_leg_queue_owner(
-                        failed_leg,
-                        reason=(
-                            "Removed queued cross-chat delivery because its "
-                            "live source run was stopped."
-                        ),
-                    )
+                await close_cross_chat_exchange_target_owner(
+                    exchange_id,
+                    failed_leg,
+                    queued_reason=(
+                        "Removed queued cross-chat delivery because its "
+                        "live source run was stopped."
+                    ),
+                )
                 await maybe_deliver_cross_chat_exchange_failure_status(
                     failed,
                     failed_session_id=str(failed_leg.get("target_session_id") or ""),
@@ -35891,6 +35887,100 @@ async def fail_cross_chat_exchange(
     return result
 
 
+async def stop_exact_cross_chat_exchange_target_run(
+    exchange_id: str,
+    leg: dict[str, Any],
+) -> bool:
+    """Stop only the provider run that owns one exact exchange delivery.
+
+    Exchange cancellation and target-turn completion race independently. A
+    target chat can therefore finish this delivery and promote an unrelated
+    user turn before cancellation cleanup reaches the provider. Match the
+    immutable run, exchange, and leg identities before asking the reusable
+    Stop path to interrupt anything; ``expected_run_id`` repeats the run CAS
+    inside Stop so the check cannot kill a successor.
+    """
+
+    target_session_id = str(leg.get("target_session_id") or "")
+    target_run_id = str(leg.get("target_run_id") or "")
+    leg_id = str(leg.get("id") or "")
+    if not target_session_id or not target_run_id or not leg_id:
+        return False
+
+    async with ACTIVE_LOCK:
+        active = ACTIVE.get(target_session_id) or {}
+        current = CURRENT_TURNS.get(target_session_id) or {}
+        metadata = RUN_METADATA.get(target_run_id) or {}
+        active_run_id = str(active.get("run_id") or "")
+        current_run_id = str(current.get("run_id") or "")
+        if (
+            target_run_id not in {active_run_id, current_run_id}
+            or any(
+                owner_id not in {"", target_run_id}
+                for owner_id in (active_run_id, current_run_id)
+            )
+        ):
+            return False
+
+        owners = [
+            owner
+            for owner in (current, active, metadata)
+            if isinstance(owner, dict)
+        ]
+        owner_exchange_ids = {
+            str(owner.get(key) or "")
+            for owner in owners
+            for key in ("cross_chat_exchange_id", "exchange_id")
+            if str(owner.get(key) or "")
+        }
+        owner_leg_ids = {
+            str(owner.get(key) or "")
+            for owner in owners
+            for key in ("cross_chat_exchange_leg_id", "exchange_leg_id")
+            if str(owner.get(key) or "")
+        }
+        if exchange_id not in owner_exchange_ids or leg_id not in owner_leg_ids:
+            return False
+
+    result = await stop_turn(
+        target_session_id,
+        expected_run_id=target_run_id,
+        # Cancelling one delivery must not pause unrelated queued work in the
+        # recipient chat. Normal completion may promote it after this exact
+        # provider owner has stopped.
+        pause_queued_turns_on_stop=False,
+    )
+    return bool(result.get("stopped") or result.get("pending"))
+
+
+async def close_cross_chat_exchange_target_owner(
+    exchange_id: str,
+    leg: dict[str, Any] | None,
+    *,
+    queued_reason: str,
+) -> None:
+    """Remove or stop the exact target owner after terminal ledger commit."""
+
+    if leg is None:
+        return
+    leg_id = str(leg.get("id") or "")
+    if not leg_id:
+        return
+
+    # Re-read after the exchange CAS. A queued promotion can win between an
+    # earlier snapshot and terminalization, and its target run id is the only
+    # safe identity with which to interrupt the provider.
+    current = await CROSS_CHAT.get_exchange_leg(leg_id) or leg
+    if current.get("queued_id"):
+        await remove_cross_chat_exchange_leg_queue_owner(
+            current,
+            reason=queued_reason,
+        )
+        current = await CROSS_CHAT.get_exchange_leg(leg_id) or current
+    if current.get("target_run_id"):
+        await stop_exact_cross_chat_exchange_target_run(exchange_id, current)
+
+
 async def cancel_cross_chat_exchange(exchange_id: str) -> dict[str, Any]:
     # Always take the exchange lock: a waiting request can atomically become a
     # live lease after any unlocked snapshot but before cancellation commits.
@@ -35906,46 +35996,11 @@ async def cancel_cross_chat_exchange(exchange_id: str) -> dict[str, Any]:
         # A completion or another terminal transition won the durable CAS.
         # Do not publish cancellation lifecycle/status output for that winner.
         return cancelled
-    if (
-        active_leg is not None
-        and str(active_leg.get("status") or "") == "cancelled"
-        and active_leg.get("queued_id")
-    ):
-        target_session_id = str(active_leg.get("target_session_id") or "")
-        queued_id = str(active_leg.get("queued_id") or "")
-        async with QUEUE_LOCK:
-            queue = QUEUED_TURNS.get(target_session_id)
-            if queue:
-                original = list(queue)
-                index = next((
-                    idx for idx, item in enumerate(original)
-                    if str(item.get("queued_id") or "") == queued_id
-                    and str(item.get("cross_chat_exchange_leg_id") or "") == str(active_leg.get("id") or "")
-                ), None)
-                if index is not None:
-                    remaining = original[:index] + original[index + 1:]
-                    if remaining:
-                        QUEUED_TURNS[target_session_id] = deque(remaining)
-                    else:
-                        QUEUED_TURNS.pop(target_session_id, None)
-                    try:
-                        await append_durable_event(target_session_id, "turn_unqueued", {
-                            "queued_id": queued_id,
-                            "purpose": "cross_chat_handoff_delivery",
-                            "cross_chat_exchange_id": exchange_id,
-                            "cross_chat_exchange_leg_id": active_leg.get("id"),
-                            "exchange_id": exchange_id,
-                            "exchange_leg_id": active_leg.get("id"),
-                            "source_session_id": active_leg.get("source_session_id"),
-                            "target_session_id": target_session_id,
-                            "message": "Cancelled queued cross-chat exchange delivery.",
-                        })
-                    except BaseException:
-                        # Authorization is already durably closed. Preserve the
-                        # row only long enough for the scheduler to discard it
-                        # fail-closed; never reopen the exchange.
-                        QUEUED_TURNS[target_session_id] = deque(original)
-                        raise
+    await close_cross_chat_exchange_target_owner(
+        exchange_id,
+        active_leg,
+        queued_reason="Cancelled queued cross-chat exchange delivery.",
+    )
     if active_leg is not None and str(active_leg.get("status") or "") == "cancelled":
         await append_cross_chat_exchange_leg_terminal_lifecycle(
             cancelled,
@@ -75292,6 +75347,7 @@ async def settle_idle_codex_goal_for_stop(
 async def stop_turn(
     session_id: str,
     *,
+    expected_run_id: str | None = None,
     emit_event: bool = True,
     schedule_queue: bool = True,
     require_provider_turn_ready: bool = False,
@@ -75315,6 +75371,28 @@ async def stop_turn(
     async with ACTIVE_LOCK:
         active = ACTIVE.get(session_id)
         busy = session_id in BUSY_SESSIONS
+        current_turn = CURRENT_TURNS.get(session_id) or {}
+        expected_run_id = str(expected_run_id or "").strip() or None
+        if expected_run_id is not None:
+            active_run_id = str((active or {}).get("run_id") or "")
+            current_run_id = str(current_turn.get("run_id") or "")
+            if (
+                not busy
+                or expected_run_id not in {active_run_id, current_run_id}
+                or any(
+                    owner_id not in {"", expected_run_id}
+                    for owner_id in (active_run_id, current_run_id)
+                )
+            ):
+                if _admission_ready is not None:
+                    _admission_ready.set()
+                return {
+                    "ok": True,
+                    "stopped": False,
+                    "pending": False,
+                    "superseded": True,
+                    "message": "The requested run no longer owns this chat.",
+                }
         if active:
             if require_provider_turn_ready and (
                 not active.get("provider_turn_ready")
@@ -75363,11 +75441,16 @@ async def stop_turn(
             if require_provider_turn_ready:
                 deferred = True
             else:
-                STOP_REQUESTS.add(session_id)
                 stopping_run_id = str(
-                    (CURRENT_TURNS.get(session_id) or {}).get("run_id") or ""
+                    current_turn.get("run_id") or ""
                 ) or None
-        current_turn = CURRENT_TURNS.get(session_id) or {}
+                if expected_run_id is not None and stopping_run_id:
+                    # A targeted cancellation is run-scoped. A session-wide
+                    # startup marker could otherwise stop a successor if the
+                    # expected launch loses its slot before binding ACTIVE.
+                    STOPPED_RUNS.add(stopping_run_id)
+                else:
+                    STOP_REQUESTS.add(session_id)
         # Identity of the reservation this Stop observed. A Stop that outlives
         # its deadline runs detached; it must never act on a successor turn
         # admitted after the fence was released.
@@ -75586,6 +75669,7 @@ async def stop_turn(
                     # false terminal event.
                     return await stop_turn(
                         session_id,
+                        expected_run_id=expected_run_id,
                         emit_event=emit_event,
                         schedule_queue=schedule_queue,
                         require_provider_turn_ready=require_provider_turn_ready,

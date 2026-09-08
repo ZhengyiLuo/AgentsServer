@@ -7529,6 +7529,227 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             "queued_live_revoke_queue_race",
         )
 
+    async def test_capability_revocation_stops_exact_running_codex_and_claude_target(self) -> None:
+        for backend in (agent_server.BACKEND_CODEX, agent_server.BACKEND_CLAUDE):
+            with self.subTest(backend=backend):
+                exchange_id = f"exchange_live_revoke_running_{backend}"
+                source_run_id = f"run_live_revoke_source_{backend}"
+                target_run_id = f"run_live_revoke_target_{backend}"
+                source_token = await self.issue_live_waiter_owner(
+                    "source",
+                    source_run_id,
+                )
+                await agent_server.CROSS_CHAT.create_exchange_obligation(
+                    exchange_id=exchange_id,
+                    requester_session_id="source",
+                    authorization_source_run_id=source_run_id,
+                    responder_session_id="target",
+                    max_legs=6,
+                    expires_at="2099-01-01T00:00:00Z",
+                )
+                exchange, inbound, _created = (
+                    await agent_server.CROSS_CHAT.create_initial_exchange_leg(
+                        exchange_id=exchange_id,
+                        source_session_id="source",
+                        source_run_id=source_run_id,
+                        target_session_id="target",
+                        body="Cancel the live target",
+                        idempotency_key=f"live-running-revoke-{backend}",
+                        live_response_lease=True,
+                    )
+                )
+                async with agent_server.cross_chat_live_lease_lock(exchange_id):
+                    await agent_server.register_cross_chat_live_waiter_locked(
+                        exchange,
+                        inbound,
+                        owner_session_id="source",
+                        owner_run_id=source_run_id,
+                        capability_token=source_token,
+                    )
+                inbound = await agent_server.CROSS_CHAT.update_exchange_leg(
+                    inbound["id"],
+                    expected={"registered"},
+                    status="running",
+                    target_run_id=target_run_id,
+                )
+                self.assertIsNotNone(inbound)
+                agent_server.STORE.sessions["target"]["backend"] = backend
+                agent_server.CURRENT_TURNS["target"] = {
+                    "run_id": target_run_id,
+                    "purpose": "cross_chat_handoff_delivery",
+                    "cross_chat_exchange_id": exchange_id,
+                    "cross_chat_exchange_leg_id": inbound["id"],
+                }
+                stop = AsyncMock(return_value={
+                    "ok": True,
+                    "stopped": True,
+                    "pending": False,
+                })
+                with (
+                    patch.object(agent_server, "ACTIVE", {}),
+                    patch.object(agent_server, "stop_turn", stop),
+                    patch.object(agent_server, "append_cross_chat_exchange_leg_terminal_lifecycle", AsyncMock()),
+                    patch.object(agent_server, "append_cross_chat_exchange_terminal_lifecycle", AsyncMock()),
+                    patch.object(agent_server, "maybe_deliver_cross_chat_exchange_failure_status", AsyncMock()),
+                ):
+                    await agent_server.revoke_cross_chat_capability(source_run_id)
+                stop.assert_awaited_once_with(
+                    "target",
+                    expected_run_id=target_run_id,
+                    pause_queued_turns_on_stop=False,
+                )
+                durable = await agent_server.CROSS_CHAT.get_exchange(exchange_id)
+                self.assertEqual(durable["status"], "failed")
+                agent_server.CURRENT_TURNS.pop("target", None)
+
+    async def test_targeted_stop_run_guard_cannot_stop_a_promoted_successor(self) -> None:
+        active_successor = {
+            "run_id": "run_user_successor",
+            "purpose": None,
+            "cross_chat_exchange_id": None,
+            "cross_chat_exchange_leg_id": None,
+        }
+        current_successor = dict(active_successor)
+        with (
+            patch.object(agent_server, "ACTIVE", {"target": active_successor}),
+            patch.object(agent_server, "CURRENT_TURNS", {"target": current_successor}),
+        ):
+            agent_server.BUSY_SESSIONS.add("target")
+            try:
+                result = await agent_server.stop_turn(
+                    "target",
+                    expected_run_id="run_cancelled_delivery",
+                    pause_queued_turns_on_stop=False,
+                )
+            finally:
+                agent_server.BUSY_SESSIONS.discard("target")
+        self.assertFalse(result["stopped"])
+        self.assertTrue(result["superseded"])
+        self.assertNotIn("stop_requested", active_successor)
+        self.assertNotIn("stop_requested", current_successor)
+
+    async def test_exact_exchange_target_stop_interrupts_codex_and_claude_owner(self) -> None:
+        for backend, transport in (
+            (
+                agent_server.BACKEND_CODEX,
+                agent_server.CODEX_TRANSPORT_APP_SERVER,
+            ),
+            (
+                agent_server.BACKEND_CLAUDE,
+                agent_server.CLAUDE_TRANSPORT_AGENT_SDK,
+            ),
+        ):
+            with self.subTest(backend=backend):
+                run_id = f"run_exact_interrupt_{backend}"
+                exchange_id = f"exchange_exact_interrupt_{backend}"
+                leg_id = f"leg_exact_interrupt_{backend}"
+                provider = Mock()
+                provider.interrupt = AsyncMock(return_value=True)
+                active = {
+                    "run_id": run_id,
+                    "backend": backend,
+                    "transport": transport,
+                    "provider_turn_ready": True,
+                    "provider_session_id": f"provider_{backend}",
+                    "cross_chat_exchange_id": exchange_id,
+                    "cross_chat_exchange_leg_id": leg_id,
+                }
+                if backend == agent_server.BACKEND_CODEX:
+                    provider.turn_id = f"turn_{backend}"
+                    active["codex_app_server_turn"] = provider
+                else:
+                    active["claude_sdk_run"] = provider
+                    active["claude_permissions_open"] = True
+                current = {
+                    "run_id": run_id,
+                    "purpose": "cross_chat_handoff_delivery",
+                    "cross_chat_exchange_id": exchange_id,
+                    "cross_chat_exchange_leg_id": leg_id,
+                }
+                agent_server.STORE.sessions["target"]["backend"] = backend
+                with (
+                    patch.object(agent_server, "ACTIVE", {"target": active}),
+                    patch.object(agent_server, "CURRENT_TURNS", {"target": current}),
+                    patch.object(agent_server, "RUN_METADATA", {run_id: dict(current)}),
+                    patch.object(agent_server, "BUSY_SESSIONS", {"target"}),
+                    patch.object(agent_server, "STOPPED_RUNS", set()),
+                    patch.object(agent_server, "STOP_REQUESTS", set()),
+                    patch.object(agent_server, "revoke_cross_chat_capability", AsyncMock()),
+                    patch.object(agent_server, "cancel_codex_interactions", AsyncMock()),
+                    patch.object(agent_server, "cancel_claude_interactions", AsyncMock()),
+                    patch.object(
+                        agent_server,
+                        "pause_active_codex_goal_for_stop",
+                        AsyncMock(return_value=(True, False, None)),
+                    ),
+                    patch.object(
+                        agent_server,
+                        "stop_idle_claude_background_subagents_bounded",
+                        AsyncMock(return_value={
+                            "fence_committed": True,
+                            "descendants": 0,
+                            "requested": [],
+                            "interrupted": [],
+                            "pending": [],
+                            "errors": [],
+                        }),
+                    ),
+                    patch.object(agent_server, "append_event", AsyncMock()),
+                    patch.object(agent_server, "schedule_next_queued_turn"),
+                    patch.object(agent_server, "STOP_CONFIRM_TIMEOUT_SECONDS", 0.01),
+                ):
+                    stopped = await agent_server.stop_exact_cross_chat_exchange_target_run(
+                        exchange_id,
+                        {
+                            "id": leg_id,
+                            "target_session_id": "target",
+                            "target_run_id": run_id,
+                        },
+                    )
+                self.assertTrue(stopped)
+                provider.interrupt.assert_awaited_once()
+
+    async def test_cancel_during_queue_promotion_never_stops_the_successor(self) -> None:
+        exchange, inbound = await self.create_exchange(
+            "exchange_cancel_promotion_successor"
+        )
+        queued_id = "queued_cancel_promotion"
+        inbound = await agent_server.CROSS_CHAT.update_exchange_leg(
+            inbound["id"],
+            expected={"registered"},
+            status="queued",
+            queued_id=queued_id,
+            queue_position=1,
+        )
+        self.assertIsNotNone(inbound)
+        inbound = await agent_server.CROSS_CHAT.update_exchange_leg(
+            inbound["id"],
+            expected={"queued"},
+            status="running",
+            target_run_id="run_cancelled_delivery",
+        )
+        self.assertIsNotNone(inbound)
+        successor = {
+            "run_id": "run_user_successor",
+            "purpose": None,
+        }
+        stop = AsyncMock(return_value={
+            "ok": True,
+            "stopped": True,
+            "pending": False,
+        })
+        with (
+            patch.object(agent_server, "ACTIVE", {"target": dict(successor)}),
+            patch.object(agent_server, "CURRENT_TURNS", {"target": dict(successor)}),
+            patch.object(agent_server, "stop_turn", stop),
+            patch.object(agent_server, "append_cross_chat_exchange_terminal_lifecycle", AsyncMock()),
+        ):
+            cancelled = await agent_server.cancel_cross_chat_exchange(
+                exchange["id"]
+            )
+        self.assertEqual(cancelled["status"], "cancelled")
+        stop.assert_not_awaited()
+
     async def test_secure_peer_ask_rejects_live_wait_before_outbound_side_effect(self) -> None:
         token = "secure-live-wait-token"
         token_hash = agent_server.hashlib.sha256(token.encode()).hexdigest()

@@ -27525,11 +27525,6 @@ def is_client_visible_event(event: dict[str, Any]) -> bool:
 
     if str(event.get("type") or "") == "_event_sequence_checkpoint":
         return False
-    if is_legacy_imported_claude_task_notification(event):
-        # Older releases imported Claude's SDK-generated workflow wake-up as
-        # a human turn. Keep the durable row for sequence/cursor continuity,
-        # but never expose it through HTTP, catch-up, websocket, or search.
-        return False
     cross_chat_owner = any(
         str(event.get(key) or "").strip()
         for key in (

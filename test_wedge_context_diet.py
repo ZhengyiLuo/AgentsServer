@@ -165,7 +165,7 @@ class CompactProviderAuthorityBlockTests(unittest.TestCase):
         )
 
         self.assertIn("team_mail=prebound", block)
-        self.assertIn("team-send mentions=the whole team", block)
+        self.assertIn("team-send mentions=the shared Bulletin", block)
         self.assertNotIn("SONIC", block)
         self.assertNotIn("hello", block)
 

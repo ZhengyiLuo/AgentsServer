@@ -79233,6 +79233,7 @@ async def record_team_message_sent_event(
     run_id: str,
     receipt: dict[str, Any],
     *,
+    team_id: str,
     recipients: list[dict[str, str]],
     title: str | None,
     destination: str | None = None,
@@ -79245,6 +79246,7 @@ async def record_team_message_sent_event(
 
     payload = {
         "run_id": run_id,
+        "team_id": team_id,
         "message_id": receipt.get("message_id"),
         "kind": receipt.get("kind"),
         "title": title,
@@ -79711,6 +79713,7 @@ async def send_provider_team_message(
         source_session_id,
         source_run_id,
         receipt,
+        team_id=str(reference["team_id"]),
         recipients=[
             {
                 "kind": str(item.get("kind") or ""),

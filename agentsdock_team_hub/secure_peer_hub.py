@@ -926,6 +926,7 @@ class SecurePeerHubAdapter:
                             "since",
                             "after_sequence",
                             "limit",
+                            "include_revision",
                         },
                     )
                     result = self.store.list_team_messages(

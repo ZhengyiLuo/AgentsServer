@@ -12,6 +12,7 @@ from agentsdock_team_hub.secure_peer import (
     MAX_RESPONSE_BODY_BYTES,
     PeerAuthorization,
     ProxyRequest,
+    sanitize_proxy_request,
 )
 from agentsdock_team_hub.secure_peer_hub import SecurePeerHubAdapter
 from agentsdock_team_hub.store import (
@@ -121,7 +122,17 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
         revision = self.request("POST", f"{base}/messages/{message_id}/revisions", body={
             "body": "Updated broadcast", "expected_version": 1, "idempotency_key": "peer-revise-broadcast"})
         self.assertEqual(revision.status, 200, revision.body)
-        history = self.request("GET", f"{base}/messages/{message_id}/revisions", query="version=1")
+        # Exercise both transport validation and Hub forwarding, as member UI
+        # requests pass through both before reaching the store.
+        listing = self.adapter.forward(sanitize_proxy_request(self.peer, "GET", f"{base}/messages",
+            "box=feed&limit=25&include_revision=1", (), b""))
+        self.assertEqual(listing.status, 200, listing.body)
+        self.assertEqual(json.loads(listing.body)["messages"][0]["revision"]["version"], 2)
+        inbox = self.adapter.forward(sanitize_proxy_request(self.peer, "GET", f"{base}/messages",
+            f"box=inbox&limit=25&address_kind=server&address_id={node['id']}&include_revision=1", (), b""))
+        self.assertEqual(inbox.status, 200, inbox.body)
+        history = self.adapter.forward(sanitize_proxy_request(self.peer, "GET",
+            f"{base}/messages/{message_id}/revisions", "version=1", (), b""))
         self.assertEqual(history.status, 200, history.body)
         self.assertEqual(json.loads(history.body)["versions"][0]["body"], "Original broadcast")
 

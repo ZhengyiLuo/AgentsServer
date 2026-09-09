@@ -4849,6 +4849,7 @@ def sanitize_proxy_request(
                     "since",
                     "after_sequence",
                     "limit",
+                    "include_revision",
                 }
             elif (
                 len(pieces) == 2
@@ -4865,6 +4866,8 @@ def sanitize_proxy_request(
                 and normalized_method in {"GET", "POST"}
             ):
                 route_allowed = True
+                allow_query = normalized_method == "GET"
+                allowed_query_keys = {"version"}
             elif pieces == ["deletions"] and normalized_method == "GET":
                 route_allowed = True
                 allow_query = True
@@ -4942,12 +4945,14 @@ def sanitize_proxy_request(
         ):
             raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         values = dict(pairs)
-        for key in ("limit", "before_sequence", "after_sequence"):
+        for key in ("limit", "before_sequence", "after_sequence", "version"):
             if key in values and (
                 not values[key].isdigit() or str(int(values[key])) != values[key]
             ):
                 raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         if "limit" in values and not 1 <= int(values["limit"]) <= 100:
+            raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
+        if "version" in values and not 1 <= int(values["version"]) <= 200:
             raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         if "cursor" in values:
             if re.fullmatch(r"v1\.[A-Za-z0-9_-]{38,500}", values["cursor"]) is None:

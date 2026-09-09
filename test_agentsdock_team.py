@@ -973,6 +973,7 @@ class ProviderTeamEndpointTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(receipt["duplicate"])
             self.assertEqual(send.call_args.kwargs["attachment_paths"], [str(attachment.resolve())])
             recorded.assert_awaited_once()
+            self.assertEqual(recorded.call_args.kwargs["team_id"], "team_alpha_0001")
 
             replay = await agent_server.send_provider_team_message(
                 routes["SONIC"]["route_id"],

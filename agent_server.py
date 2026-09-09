@@ -77928,6 +77928,69 @@ def completed_fork_events(
     return prefix[:completed_length]
 
 
+def claude_imported_fork_boundary(
+    parent: dict[str, Any],
+    provider_id: str,
+    events: list[dict[str, Any]],
+) -> str:
+    """Recover native completion from an import's durable transcript checkpoint.
+
+    Import terminals are bookkeeping, not provider turns. Their saved byte
+    prefix must end at an explicit native completion before it can be forked.
+    Later source appends are allowed; none are read into this snapshot.
+    """
+    run_id = str(events[-1].get("run_id") or "")
+    batch = [event for event in events if str(event.get("run_id") or "") == run_id]
+    marker = next((event for event in batch if event.get("type") == "history_imported"), {})
+    checkpoint = marker.get("_history_sync_checkpoint")
+    if not isinstance(checkpoint, dict) or checkpoint.get("caught_up") is not True:
+        raise ValueError("imported history has no complete native checkpoint")
+    cursor = normalized_history_sync_cursor({**parent, "_history_sync_cursor": checkpoint.get("cursor")})
+    if cursor is None or cursor["backend"] != BACKEND_CLAUDE or cursor["provider_session_id"] != provider_id:
+        raise ValueError("imported history checkpoint belongs to a different provider")
+    path = contained_jsonl_path(Path(cursor["source_path"]), CLAUDE_PROJECTS_ROOT)
+    if path is None:
+        raise ValueError("imported history checkpoint transcript is unavailable")
+    remaining = int(cursor["source_offset"])
+    digest = hashlib.sha256()
+    last_message: dict[str, Any] = {}
+    with path.open("rb") as stream:
+        for _line in range(MAX_LOCAL_TRANSCRIPT_SCAN_LINES):
+            if not remaining:
+                break
+            raw = stream.readline(min(MAX_LOCAL_TRANSCRIPT_LINE_BYTES + 1, remaining))
+            if not raw or not raw.endswith(b"\n") or len(raw) > MAX_LOCAL_TRANSCRIPT_LINE_BYTES:
+                raise ValueError("imported history checkpoint has an incomplete transcript record")
+            remaining -= len(raw)
+            digest.update(raw)
+            if not raw.strip():
+                continue
+            record = json.loads(raw)
+            if isinstance(record, dict) and record.get("type") in {"user", "assistant"} and not record.get("isSidechain"):
+                last_message = record
+    if remaining or not hmac.compare_digest(digest.hexdigest(), cursor["source_digest"]):
+        raise ValueError("imported history checkpoint no longer matches its native prefix")
+    message = last_message.get("message")
+    cutoff = str(last_message.get("uuid") or "")
+    native_time = parse_job_timestamp(str(last_message.get("timestamp") or ""))
+    imported_time = parse_job_timestamp(str(events[-1].get("ts") or ""))
+    if (
+        last_message.get("type") != "assistant" or not cutoff
+        or not isinstance(message, dict) or message.get("stop_reason") != "end_turn"
+        or native_time is None or imported_time is None or native_time > imported_time
+    ):
+        raise ValueError("imported history does not end at a completed native assistant turn")
+    visible = [event for event in batch if event.get("type") in {"turn_started", "assistant_text"}]
+    native_item = claude_history_event_item(last_message, expected_session_id=str(parent.get("id") or ""))
+    if (
+        not visible or visible[-1].get("type") != "assistant_text"
+        or native_item is None
+        or native_item.get("text") != str(visible[-1].get("text") or "")
+    ):
+        raise ValueError("imported visible history does not match the native completed boundary")
+    return cutoff
+
+
 def claude_completed_fork_boundary(
     parent: dict[str, Any],
     provider_id: str,
@@ -77939,6 +78002,8 @@ def claude_completed_fork_boundary(
     before the durable terminal timestamp; never take the transcript's tail.
     """
     terminal = events[-1]
+    if terminal.get("imported") is True:
+        return claude_imported_fork_boundary(parent, provider_id, events)
     run_id = str(terminal.get("run_id") or "")
     completed_provider = str(terminal.get("provider_session_id") or "")
     if completed_provider and completed_provider != provider_id:

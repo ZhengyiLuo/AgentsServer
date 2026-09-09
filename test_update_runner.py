@@ -7,7 +7,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,6 +18,21 @@ import update_runner
 
 
 class UpdateRunnerTests(unittest.TestCase):
+    @staticmethod
+    def idle_health():
+        return {
+            "ok": True,
+            "server_identity": "server-test-identity",
+            "active_count": 0,
+            "queued": {},
+            "update_blocking_queued_count": 0,
+            "update_service_cgroup": {
+                "safe": True,
+                "unknown_descendant_count": 0,
+                "inspection": "verified",
+            },
+        }
+
     @staticmethod
     def secure_peer_capability(*, state_available: bool = True):
         return {
@@ -412,7 +427,8 @@ class UpdateRunnerTests(unittest.TestCase):
                 heartbeat_seconds=0.02,
             )
 
-            self.assertEqual(log_path.read_text().splitlines(), ["started", "finished"])
+            self.assertEqual(log_path.read_text().splitlines()[-2:], ["started", "finished"])
+            self.assertIn("AgentsServer update manual to 1.2.3 at", log_path.read_text())
             self.assertEqual(os.stat(log_path).st_mode & 0o777, 0o600)
             status = json.loads(status_path.read_text())
             self.assertEqual(status["phase"], "installing")
@@ -436,6 +452,69 @@ class UpdateRunnerTests(unittest.TestCase):
                     timeout_seconds=2,
                     heartbeat_seconds=0.02,
                 )
+
+    def test_installer_retry_preserves_previous_attempt_without_reusing_its_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            status_path = root / "server-update.json"
+            log_path = root / "server-update.log"
+            attempts = [
+                ("first-attempt", "print('first diagnostic', flush=True); raise SystemExit(7)", 7),
+                ("second-attempt", "print('second attempt succeeded', flush=True)", 0),
+                ("silent-attempt", "raise SystemExit(9)", 9),
+            ]
+            for update_id, script, code in attempts:
+                update_runner.update_status(status_path, phase="installing", update_id=update_id)
+                kwargs = dict(
+                    cwd=root,
+                    status_path=status_path,
+                    log_path=log_path,
+                    version="1.2.4",
+                    expected_update_id=update_id,
+                    timeout_seconds=2,
+                    heartbeat_seconds=0.02,
+                )
+                if code:
+                    with self.assertRaises(RuntimeError) as raised:
+                        update_runner.run_installer([sys.executable, "-c", script], **kwargs)
+                    if code == 9:
+                        self.assertIn("no output; inspect server-update.log", str(raised.exception))
+                        self.assertNotIn("first diagnostic", str(raised.exception))
+                        self.assertNotIn("second attempt succeeded", str(raised.exception))
+                else:
+                    update_runner.run_installer([sys.executable, "-c", script], **kwargs)
+            history = log_path.read_text()
+            self.assertIn("first diagnostic", history)
+            self.assertIn("second attempt succeeded", history)
+            for update_id, _script, _code in attempts:
+                self.assertIn(f"AgentsServer update {update_id} to 1.2.4 at", history)
+
+    def test_installer_bounds_retained_history_and_completed_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            log_path = root / "server-update.log"
+            log_path.write_text("old record\n" * update_runner.INSTALLER_LOG_MAX_BYTES + "previous diagnostic\n")
+            update_runner.run_installer(
+                [sys.executable, "-c", "print('current diagnostic', flush=True)"],
+                cwd=root,
+                status_path=root / "server-update.json",
+                log_path=log_path,
+                version="1.2.4",
+                timeout_seconds=2,
+            )
+            self.assertLessEqual(log_path.stat().st_size, update_runner.INSTALLER_LOG_MAX_BYTES)
+            self.assertIn("previous diagnostic", log_path.read_text())
+            self.assertIn("current diagnostic", log_path.read_text())
+            update_runner.run_installer(
+                [sys.executable, "-c", f"print('x' * {update_runner.INSTALLER_LOG_MAX_BYTES}); print('latest diagnostic')"],
+                cwd=root,
+                status_path=root / "server-update.json",
+                log_path=log_path,
+                version="1.2.4",
+                timeout_seconds=2,
+            )
+            self.assertLessEqual(log_path.stat().st_size, update_runner.INSTALLER_LOG_MAX_BYTES)
+            self.assertIn("latest diagnostic", log_path.read_text())
 
     def test_installer_failure_redacts_setup_and_bearer_secrets_from_status_tail(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -640,7 +719,7 @@ class UpdateRunnerTests(unittest.TestCase):
         self.assertFalse(update_runner.release_transition_allowed("1.3.0", "1.4.0-beta.1", "stable"))
         self.assertFalse(update_runner.release_transition_allowed("1.2.3", "1.2.3", "stable"))
 
-    def test_successful_update_records_default_stable_track(self):
+    def test_successful_update_waits_for_startup_and_records_default_stable_track(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             archive_buffer = io.BytesIO()
@@ -681,7 +760,11 @@ class UpdateRunnerTests(unittest.TestCase):
             with patch.object(update_runner, "check_release", return_value=manifest), \
                  patch.object(update_runner, "download_bytes", return_value=archive_bytes), \
                  patch.object(update_runner, "update_status", side_effect=record_status), \
-                 patch.object(update_runner, "assert_server_idle") as idle_check, \
+                 patch.object(update_runner.urllib.request, "urlopen", side_effect=[
+                     URLError(ConnectionRefusedError("native listener is not ready")),
+                     io.BytesIO(json.dumps(self.idle_health()).encode()),
+                 ]) as health_request, \
+                 patch.object(update_runner.time, "sleep") as sleep, \
                  patch.object(update_runner, "assert_post_update_identity") as identity_check, \
                  patch.object(update_runner, "run_installer") as install:
                 update_runner.run_update(args)
@@ -699,11 +782,8 @@ class UpdateRunnerTests(unittest.TestCase):
         self.assertIsNone(statuses[-1]["error_code"])
         self.assertIsNone(statuses[-1]["error_action"])
         self.assertIsNone(statuses[-1]["retryable"])
-        idle_check.assert_called_once_with(
-            7850,
-            token="",
-            require_verified_service_cgroup=True,
-        )
+        self.assertEqual(health_request.call_count, 2)
+        sleep.assert_called_once_with(1.0)
         install.assert_called_once()
         install_command = install.call_args.args[0]
         self.assertNotIn("--managed-update-id", install_command)
@@ -1120,6 +1200,8 @@ class UpdateRunnerTests(unittest.TestCase):
             7850,
             token="",
             require_verified_service_cgroup=False,
+            expected_server_identity="server-test-identity",
+            timeout=update_runner.SERVER_IDLE_CHECK_TIMEOUT_SECONDS,
         )
         self.assertTrue(legacy_installer_completed)
         identity_check.assert_called_once()
@@ -1139,6 +1221,132 @@ class UpdateRunnerTests(unittest.TestCase):
                 "2 active agent runs and 3 queued turns",
             ):
                 update_runner.assert_server_idle(7850, token="one-time-token")
+
+    def test_startup_readiness_does_not_retry_failed_safety_checks(self):
+        cases = [
+            ({"server_identity": "another-server"}, "stable identity changed"),
+            ({"ok": False}, "not healthy"),
+            ({"active_count": 1}, "1 active agent run"),
+            ({"update_blocking_queued_count": 2}, "2 queued turns"),
+            ({"active_count": True}, "invalid active count"),
+            ({"update_service_cgroup": {"safe": False, "unknown_descendant_count": 1}}, "nonempty service cgroup"),
+            ({"update_service_cgroup": {"safe": True, "unknown_descendant_count": 0}}, "verified systemd"),
+            (b"not JSON", "invalid JSON"),
+            (URLError(PermissionError("permission denied")), "permission denied"),
+            *( (HTTPError("http://127.0.0.1:7850/api/health", code, "Rejected", {}, None), str(code))
+               for code in (401, 403, 404, 500) ),
+        ]
+        for response, message in cases:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as temporary:
+                status_path = Path(temporary) / "server-update.json"
+                update_runner.update_status(status_path, phase="verifying", update_id="update-readiness")
+                if isinstance(response, dict):
+                    response = io.BytesIO(json.dumps({**self.idle_health(), **response}).encode())
+                elif isinstance(response, bytes):
+                    response = io.BytesIO(response)
+                with patch.object(update_runner.urllib.request, "urlopen", side_effect=[
+                    URLError(ConnectionRefusedError("starting")), response,
+                ]) as probe, patch.object(update_runner.time, "sleep") as sleep:
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        update_runner.wait_for_server_idle(
+                            7850,
+                            status_path=status_path,
+                            expected_update_id="update-readiness",
+                            expected_server_identity="server-test-identity",
+                            require_verified_service_cgroup=True,
+                        )
+                self.assertEqual(probe.call_count, 2)
+                sleep.assert_called_once_with(1.0)
+
+    def test_startup_readiness_timeout_bounds_probes_and_waits(self):
+        clock = [0.0]
+        with tempfile.TemporaryDirectory() as temporary:
+            status_path = Path(temporary) / "server-update.json"
+            update_runner.update_status(status_path, phase="verifying", update_id="update-readiness")
+            with patch.object(update_runner.urllib.request, "urlopen", side_effect=URLError(
+                ConnectionRefusedError("starting")
+            )) as probe, patch.object(update_runner.time, "monotonic", side_effect=lambda: clock[0]), \
+                 patch.object(update_runner.time, "sleep", side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay)):
+                with self.assertRaisesRegex(RuntimeError, "readiness timed out after 2.5 seconds"):
+                    update_runner.wait_for_server_idle(
+                        7850,
+                        status_path=status_path,
+                        expected_update_id="update-readiness",
+                        expected_server_identity="server-test-identity",
+                        timeout_seconds=2.5,
+                    )
+            status = json.loads(status_path.read_text())
+        self.assertEqual(clock[0], 2.5)
+        self.assertEqual([call.kwargs["timeout"] for call in probe.call_args_list], [2.5, 1.5, 0.5])
+        self.assertEqual(status["phase"], "verifying")
+        self.assertTrue(status["heartbeat_at"])
+
+    def test_startup_readiness_retries_service_unavailable_and_transport_timeouts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            status_path = Path(temporary) / "server-update.json"
+            update_runner.update_status(status_path, phase="verifying", update_id="update-readiness")
+            with patch.object(update_runner.urllib.request, "urlopen", side_effect=[
+                HTTPError("http://127.0.0.1:7850/api/health", 503, "Starting", {}, None),
+                URLError(TimeoutError("starting")),
+                ConnectionResetError("starting"),
+                io.BytesIO(json.dumps(self.idle_health()).encode()),
+            ]) as probe, patch.object(update_runner.time, "sleep") as sleep:
+                update_runner.wait_for_server_idle(
+                    7850,
+                    status_path=status_path,
+                    expected_update_id="update-readiness",
+                    expected_server_identity="server-test-identity",
+                    token="one-time-token",
+                )
+        self.assertEqual(probe.call_count, 4)
+        self.assertEqual(sleep.call_count, 3)
+        for call in probe.call_args_list:
+            self.assertEqual(call.args[0].get_header("Authorization"), "Bearer one-time-token")
+
+    def test_startup_readiness_stops_when_ownership_changes_during_probe_or_wait(self):
+        for during in ("probe", "wait"):
+            for replacement in ({"update_id": "new-update"}, {"phase": "failed"}):
+                with self.subTest(during=during, replacement=replacement), tempfile.TemporaryDirectory() as temporary:
+                    status_path = Path(temporary) / "server-update.json"
+                    update_runner.update_status(status_path, phase="verifying", update_id="update-readiness")
+                    changed = {}
+
+                    def replace_owner(*_args):
+                        changed.update(update_runner.update_status(status_path, **replacement))
+
+                    def probe_response(*_args, **_kwargs):
+                        if during == "wait":
+                            raise URLError(ConnectionRefusedError("starting"))
+                        replace_owner()
+                        return io.BytesIO(json.dumps(self.idle_health()).encode())
+
+                    with patch.object(update_runner.urllib.request, "urlopen", side_effect=probe_response) as probe, \
+                         patch.object(update_runner.time, "sleep", side_effect=replace_owner):
+                        with self.assertRaises(update_runner.UpdateOwnershipLostError):
+                            update_runner.wait_for_server_idle(
+                                7850,
+                                status_path=status_path,
+                                expected_update_id="update-readiness",
+                                expected_server_identity="server-test-identity",
+                            )
+                    self.assertEqual(probe.call_count, 1)
+                    self.assertEqual(json.loads(status_path.read_text()), changed)
+
+    def test_startup_readiness_does_not_swallow_cancellation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            status_path = Path(temporary) / "server-update.json"
+            update_runner.update_status(status_path, phase="verifying", update_id="update-readiness")
+            with patch.object(update_runner.urllib.request, "urlopen", side_effect=URLError(
+                ConnectionRefusedError("starting")
+            )) as probe, patch.object(update_runner.time, "sleep", side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    update_runner.wait_for_server_idle(
+                        7850,
+                        status_path=status_path,
+                        expected_update_id="update-readiness",
+                        expected_server_identity="server-test-identity",
+                    )
+            self.assertEqual(probe.call_count, 1)
 
     def test_pre_restart_idle_check_ignores_server_declared_durable_queue(self):
         payload = json.dumps({

@@ -18,7 +18,7 @@ import tarfile
 import tempfile
 import time
 import urllib.request
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from pathlib import Path
 from typing import Any, Callable
 
@@ -33,6 +33,8 @@ RELEASES_PAGE_URL = f"https://github.com/{RELEASE_REPOSITORY}/releases"
 MAX_METADATA_BYTES = 1_000_000
 MAX_ARCHIVE_BYTES = 200 * 1024 * 1024
 SERVER_IDLE_CHECK_TIMEOUT_SECONDS = 10.0
+SERVER_STARTUP_READINESS_TIMEOUT_SECONDS = 45.0
+SERVER_STARTUP_READINESS_POLL_SECONDS = 1.0
 VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$")
 # The standalone installer allows dependency synchronization to run for up to
 # 1,200 seconds. Keep this enclosing budget comfortably above that so the
@@ -49,6 +51,7 @@ INSTALLER_TERMINATION_POLL_SECONDS = 10.0
 INSTALLER_LOG_TAIL_BYTES = 64 * 1024
 INSTALLER_LOG_TAIL_LINES = 12
 INSTALLER_ERROR_MAX_CHARS = 4_000
+INSTALLER_LOG_MAX_BYTES = 1024 * 1024
 INSTALLER_ENVIRONMENT_SELECTORS = (
     "AGENTSDOCK_AGENT_TOKEN",
     "AGENTSDOCK_EXPECTED_SERVICE_CGROUP",
@@ -173,14 +176,33 @@ def update_status(
         return _update_status_unlocked(path, current, **changes)
 
 
-def installer_log_tail(log_path: Path) -> str:
+def trim_installer_log(log_path: Path, limit: int = INSTALLER_LOG_MAX_BYTES) -> None:
+    """Retain bounded history between attempts, while no installer is writing."""
+    try:
+        with log_path.open("r+b") as log:
+            log.seek(0, os.SEEK_END)
+            if log.tell() <= limit:
+                return
+            log.seek(-limit, os.SEEK_END)
+            tail = log.read(limit)
+            # Do not retain an unclassifiable partial secret line.
+            tail = tail.partition(b"\n")[2]
+            log.seek(0)
+            log.write(tail)
+            log.truncate()
+    except FileNotFoundError:
+        pass
+
+
+def installer_log_tail(log_path: Path, *, start_offset: int = 0) -> str:
     """Read a bounded diagnostic tail without loading a large install log."""
     try:
         with log_path.open("rb") as stream:
             stream.seek(0, os.SEEK_END)
             size = stream.tell()
-            truncated = size > INSTALLER_LOG_TAIL_BYTES
-            stream.seek(max(0, size - INSTALLER_LOG_TAIL_BYTES))
+            start = max(start_offset, size - INSTALLER_LOG_TAIL_BYTES)
+            truncated = start > start_offset
+            stream.seek(start)
             content = stream.read(INSTALLER_LOG_TAIL_BYTES)
     except OSError:
         return ""
@@ -273,7 +295,18 @@ def run_installer(
     on_started: Callable[[], None] | None = None,
 ) -> None:
     """Run the installer with live logging and a durable status heartbeat."""
+    if expected_update_id is not None:
+        update_status(
+            status_path,
+            expected_update_id=expected_update_id,
+            heartbeat_at=utc_now(),
+        )
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    header = (
+        f"\n--- AgentsServer update {expected_update_id or 'manual'} "
+        f"to {version} at {utc_now()} ---\n"
+    ).encode()
+    trim_installer_log(log_path, INSTALLER_LOG_MAX_BYTES - len(header))
     started = time.monotonic()
     deadline = started + timeout_seconds
     environment = installer_environment()
@@ -281,8 +314,11 @@ def run_installer(
         environment["AGENTSDOCK_MANAGED_UPDATE_ID"] = managed_update_id
     if expected_service_cgroup is not None:
         environment["AGENTSDOCK_EXPECTED_SERVICE_CGROUP"] = expected_service_cgroup
-    with log_path.open("wb") as log:
+    with log_path.open("ab") as log:
         os.chmod(log_path, 0o600)
+        log.write(header)
+        log.flush()
+        attempt_start = log.tell()
         process = subprocess.Popen(
             command,
             cwd=cwd,
@@ -312,7 +348,8 @@ def run_installer(
 
                 terminate_installer(process, on_wait=report_protected_recovery)
                 log.flush()
-                tail = installer_log_tail(log_path)
+                tail = installer_log_tail(log_path, start_offset=attempt_start)
+                trim_installer_log(log_path)
                 detail = f": {tail}" if tail else ""
                 raise RuntimeError(
                     f"installer timed out after {timeout_seconds:g} seconds{detail}"
@@ -333,11 +370,14 @@ def run_installer(
                     )
                 except UpdateOwnershipLostError:
                     terminate_installer(process)
+                    log.flush()
+                    trim_installer_log(log_path)
                     raise
         log.flush()
 
+    tail = installer_log_tail(log_path, start_offset=attempt_start) if returncode else ""
+    trim_installer_log(log_path)
     if returncode != 0:
-        tail = installer_log_tail(log_path)
         raise RuntimeError(
             f"installer failed ({returncode}): {tail or 'no output; inspect server-update.log'}"
         )
@@ -391,10 +431,16 @@ def server_work_snapshot(
     timeout: float = SERVER_IDLE_CHECK_TIMEOUT_SECONDS,
     require_cgroup_safe: bool = False,
     require_verified_service_cgroup: bool = False,
+    expected_server_identity: str | None = None,
 ) -> tuple[int, int]:
     """Read the live workload immediately before invoking the installer."""
 
     health = server_health_snapshot(port, token=token, timeout=timeout)
+    if (
+        expected_server_identity is not None
+        and health.get("server_identity") != expected_server_identity
+    ):
+        raise RuntimeError("AgentsServer stable identity changed before restart")
 
     active = health.get("active")
     raw_active_count = health.get("active_count")
@@ -600,6 +646,8 @@ def assert_server_idle(
     *,
     token: str | None = None,
     require_verified_service_cgroup: bool = False,
+    expected_server_identity: str | None = None,
+    timeout: float = SERVER_IDLE_CHECK_TIMEOUT_SECONDS,
 ) -> None:
     """Fail closed if work appeared after the update was accepted."""
 
@@ -609,6 +657,8 @@ def assert_server_idle(
             token=token,
             require_cgroup_safe=True,
             require_verified_service_cgroup=require_verified_service_cgroup,
+            expected_server_identity=expected_server_identity,
+            timeout=timeout,
         )
     except Exception as exc:
         raise RuntimeError(
@@ -629,6 +679,77 @@ def assert_server_idle(
             + " and ".join(parts)
             + "; retry the update after work finishes"
         )
+
+
+def transient_server_readiness_error(error: BaseException | None) -> bool:
+    """Recognize unavailable transport, never failed authentication or proof."""
+    if isinstance(error, HTTPError):
+        return error.code == 503
+    if isinstance(error, URLError):
+        error = error.reason
+    return isinstance(error, (
+        ConnectionRefusedError,
+        ConnectionResetError,
+        ConnectionAbortedError,
+        TimeoutError,
+    ))
+
+
+def wait_for_server_idle(
+    port: int,
+    *,
+    status_path: Path,
+    expected_update_id: str,
+    expected_server_identity: str,
+    token: str | None = None,
+    require_verified_service_cgroup: bool = False,
+    timeout_seconds: float = SERVER_STARTUP_READINESS_TIMEOUT_SECONDS,
+) -> None:
+    """Allow a forced-update startup to finish opening its native listener.
+
+    The replacement process advances its reserved update during lifespan,
+    before HTTP startup completes. Keep the exact update alive while transport
+    becomes ready, but never retry a response that fails the idle/safety proof.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    last_error: RuntimeError | None = None
+    while True:
+        # This CAS also stops a cancelled/finalized or superseded updater.
+        update_status(
+            status_path,
+            expected_update_id=expected_update_id,
+            heartbeat_at=utc_now(),
+            message="Waiting for AgentsServer startup before checking installation safety.",
+        )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"AgentsServer startup readiness timed out after {timeout_seconds:g} seconds"
+            ) from last_error
+        try:
+            assert_server_idle(
+                port,
+                token=token,
+                require_verified_service_cgroup=require_verified_service_cgroup,
+                expected_server_identity=expected_server_identity,
+                timeout=min(SERVER_IDLE_CHECK_TIMEOUT_SECONDS, remaining),
+            )
+        except RuntimeError as exc:
+            if not transient_server_readiness_error(exc.__cause__):
+                raise
+            last_error = exc
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(SERVER_STARTUP_READINESS_POLL_SECONDS, remaining))
+        else:
+            # Ownership can change while the health request is in flight.
+            update_status(
+                status_path,
+                expected_update_id=expected_update_id,
+                heartbeat_at=utc_now(),
+                message="AgentsServer startup, identity, and idle checks passed.",
+            )
+            return
 
 
 def consume_auth_token_file(path: str | None) -> str:
@@ -1250,8 +1371,11 @@ def run_update(args: argparse.Namespace) -> None:
                     expected_team_hub_direct_ip_url or "",
                 ]
             )
-        assert_server_idle(
+        wait_for_server_idle(
             args.port,
+            status_path=status_path,
+            expected_update_id=update_id,
+            expected_server_identity=expected_server_identity,
             token=auth_token,
             require_verified_service_cgroup=expected_service_cgroup is not None,
         )

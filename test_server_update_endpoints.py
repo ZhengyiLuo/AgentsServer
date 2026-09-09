@@ -1868,7 +1868,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(status["update_available"])
         self.assertIn("No signed AgentsServer release", status["message"])
 
-    async def test_fresh_check_clears_every_prior_run_field(self):
+    async def test_fresh_check_archives_completed_attempt_and_clears_run_fields(self):
         with tempfile.TemporaryDirectory() as temporary, \
              patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
              patch.object(
@@ -1883,14 +1883,11 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                  new=AsyncMock(return_value={"version": "1.1.0"}),
              ):
             agent_server.write_server_update_status(
-                phase="failed",
+                phase="complete",
                 update_id="old-update",
                 target_version="0.9.0",
                 heartbeat_at="old-heartbeat",
                 elapsed_seconds=91,
-                error_code="old_error",
-                error_action="Old action.",
-                retryable=True,
                 team_hub_id="old-hub",
             )
             status = await agent_server.check_server_update()
@@ -1898,6 +1895,90 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["phase"], "available")
         for field in agent_server.SERVER_UPDATE_PER_RUN_STATUS_FIELDS:
             self.assertIsNone(status[field], field)
+        self.assertEqual(status["attempt_history"][0]["update_id"], "old-update")
+        self.assertNotIn("team_hub_id", status["attempt_history"][0])
+
+    async def test_check_keeps_failed_attempt_visible_until_explicit_retry(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+             patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", Path(temporary) / "status.json"), \
+             patch.object(agent_server, "server_update_is_active", return_value=False), \
+             patch.object(agent_server, "signed_release_manifest", new=AsyncMock(return_value={"version": "1.2.0"})):
+            agent_server.write_server_update_status(
+                phase="failed", update_id="first-attempt", target_version="1.1.0",
+                message="Native listener was not ready.", error_code="readiness_failed",
+                error_action="Retry the update.", finished_at="2026-09-09T18:05:00Z",
+            )
+            for _ in range(2):
+                status = await agent_server.check_server_update()
+                self.assertEqual(status["phase"], "failed")
+                self.assertEqual(status["update_id"], "first-attempt")
+                self.assertEqual(status["message"], "Native listener was not ready.")
+                self.assertEqual(status["error_code"], "readiness_failed")
+                self.assertEqual(status["latest_version"], "1.2.0")
+                self.assertTrue(status["update_available"])
+            retry = agent_server.write_fresh_server_update_status(
+                phase="starting", update_id="second-attempt", target_version="1.2.0",
+                message="Starting update.",
+            )
+            self.assertIsNone(retry["error_code"])
+            self.assertEqual(len(retry["attempt_history"]), 1)
+            self.assertEqual(retry["attempt_history"][0]["update_id"], "first-attempt")
+            self.assertEqual(retry["attempt_history"][0]["message"], "Native listener was not ready.")
+
+    async def test_unpublished_release_check_does_not_erase_previous_failure(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+             patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", Path(temporary) / "status.json"), \
+             patch.object(agent_server, "server_update_is_active", return_value=False), \
+             patch.object(agent_server, "signed_release_manifest", new=AsyncMock(side_effect=HTTPException(status_code=404, detail="Not published"))):
+            agent_server.write_server_update_status(
+                phase="failed", update_id="first-attempt", target_version="1.1.0",
+                message="Original failure.",
+            )
+            status = await agent_server.check_server_update()
+            self.assertEqual(status["phase"], "failed")
+            self.assertEqual(status["message"], "Original failure.")
+            self.assertEqual(status["update_id"], "first-attempt")
+            self.assertFalse(status["update_available"])
+
+    def test_update_attempt_receipts_are_bounded_and_exclude_private_fields(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", Path(temporary) / "status.json"):
+            for index in range(12):
+                agent_server.write_fresh_server_update_status(
+                    phase="failed", update_id=f"attempt-{index}",
+                    message="x" * 3000, error_code="failed",
+                    _force_restart_request_id="private-marker",
+                    auth_token="never-copy-this",
+                )
+            status = agent_server.write_fresh_server_update_status(phase="starting", update_id="last")
+            history = status["attempt_history"]
+            self.assertEqual(len(history), 8)
+            self.assertEqual(history[0]["update_id"], "attempt-4")
+            self.assertEqual(history[-1]["update_id"], "attempt-11")
+            for receipt in history:
+                self.assertEqual(len(receipt["message"]), 2000)
+                self.assertNotIn("_force_restart_request_id", receipt)
+                self.assertNotIn("auth_token", receipt)
+
+    def test_retryable_launch_failure_archives_original_attempt_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", Path(temporary) / "status.json"):
+            agent_server.write_fresh_server_update_status(
+                phase="starting", update_id="first-attempt", target_version="1.2.0",
+                started_at="2026-09-09T18:04:00Z", message="Starting update.",
+            )
+            status = agent_server.write_fresh_server_update_status(
+                phase="available", error_code="launch_failed", message="Could not launch.",
+                error_action="Retry.", update_available=True, latest_version="1.2.0",
+            )
+            receipt = status["attempt_history"][0]
+            self.assertEqual(receipt["phase"], "failed")
+            self.assertEqual(receipt["target_version"], "1.2.0")
+            self.assertEqual(receipt["started_at"], "2026-09-09T18:04:00Z")
+            self.assertEqual(receipt["message"], "Could not launch.")
+            self.assertEqual(receipt["update_id"], "first-attempt")
 
     async def test_status_keeps_a_just_started_update_active_while_tmux_appears(self):
         with tempfile.TemporaryDirectory() as temporary, \

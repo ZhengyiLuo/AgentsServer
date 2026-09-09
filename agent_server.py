@@ -49626,6 +49626,27 @@ async def project_codex_notification(notification: dict[str, Any]) -> None:
             )
             # Never project an ownerless provider continuation as chat work.
             return
+        # Goal activation can publish a native turn before its RPC returns.
+        # Bind that turn to the explicit resume reservation immediately so
+        # Stop and failed-RPC cleanup can interrupt it before the consumer runs.
+        async with ACTIVE_LOCK:
+            active = ACTIVE.get(session_id)
+            if (
+                active
+                and active.get("codex_native_operation_kind") == "goal_resume"
+                and str(active.get("provider_thread_id") or "") == thread_id
+            ):
+                turn_value = params.get("turn")
+                turn_id = str(
+                    params.get("turnId")
+                    or (turn_value.get("id") if isinstance(turn_value, dict) else "")
+                    or ""
+                )
+                if turn_id:
+                    if active.get("provider_turn_id") != turn_id:
+                        active["native_interrupt_sent"] = False
+                    active["provider_turn_id"] = turn_id
+                    active["provider_turn_ready"] = True
     if not session_id:
         return
 
@@ -51166,6 +51187,7 @@ async def consume_codex_native_turn(
     subscription: Any,
     *,
     turn_id: str | None = None,
+    interrupted_before_start: bool = False,
 ) -> None:
     """Project a native control turn and own its reserved chat slot."""
     assistant_deltas: dict[str, list[str]] = {}
@@ -51173,14 +51195,77 @@ async def consume_codex_native_turn(
     terminal_status = "completed"
     terminal_error: str | None = None
     schedule_queue = True
+    goal_resume = operation == "goal_resume"
+    goal_turn_running = bool(turn_id)
+    goal_clock_started: float | None = None
+    goal_clock_used = 0.0
+    goal_clock_identity = ""
+    seen_goal_turn_ids: set[str] = set()
+    goal_activity_deadline = time.monotonic() + max(
+        CODEX_APP_SERVER_LIFECYCLE_TIMEOUT_SECONDS, IDLE_KILL_SECONDS,
+    )
     try:
+        if interrupted_before_start:
+            raise asyncio.CancelledError
         while True:
-            notification = await subscription.next_notification(
-                timeout=max(
-                    CODEX_APP_SERVER_LIFECYCLE_TIMEOUT_SECONDS,
-                    IDLE_KILL_SECONDS,
+            if goal_resume:
+                latest = STORE.sessions.get(session_id) or {}
+                goal = latest.get("codex_goal")
+                goal_status = str(goal.get("status") or "") if isinstance(goal, dict) else ""
+                async with ACTIVE_LOCK:
+                    active = ACTIVE.get(session_id)
+                    stopped = bool(active and active.get("stop_requested"))
+                remaining = codex_goal_time_budget_remaining(latest)
+                used = goal.get("timeUsedSeconds") if isinstance(goal, dict) else 0
+                used = float(used) if isinstance(used, (int, float)) and not isinstance(used, bool) else 0.0
+                identity = str(goal.get("id") or goal.get("objective") or "") if isinstance(goal, dict) else ""
+                now = time.monotonic()
+                if not goal_turn_running or goal_status != "active":
+                    goal_clock_started = None
+                elif goal_clock_started is None or identity != goal_clock_identity:
+                    goal_clock_started = now
+                    goal_clock_used = used
+                    goal_clock_identity = identity
+                if remaining is not None and goal_clock_started is not None:
+                    projected_used = max(used, goal_clock_used + now - goal_clock_started)
+                    limit = float(latest["codex_goal_time_budget_seconds"])
+                    if remaining == 0 or projected_used >= limit:
+                        async with session_lifecycle_lock(session_id):
+                            current = STORE.sessions.get(session_id) or {}
+                            current_goal = current.get("codex_goal") or {}
+                            if (
+                                current.get("codex_goal_time_budget_seconds") == limit
+                                and str(current_goal.get("id") or current_goal.get("objective") or "") == identity
+                                and current_goal.get("status") == "active"
+                            ):
+                                await apply_codex_goal_time_budget_limit(
+                                    session_id, operation_id, manager, thread_id,
+                                    None, limit,
+                                )
+                                await stop_codex_goal_resume(
+                                    session_id, manager, thread_id, reservation_id,
+                                )
+                try:
+                    notification = await subscription.next_notification(timeout=0.5)
+                except asyncio.TimeoutError:
+                    # Drain already queued output before using control state:
+                    # projection may have persisted complete ahead of us.
+                    if not goal_turn_running and (goal_status != "active" or stopped):
+                        terminal_status = "interrupted" if stopped else "completed"
+                        break
+                    if time.monotonic() >= goal_activity_deadline:
+                        raise
+                    continue
+                goal_activity_deadline = time.monotonic() + max(
+                    CODEX_APP_SERVER_LIFECYCLE_TIMEOUT_SECONDS, IDLE_KILL_SECONDS,
                 )
-            )
+            else:
+                notification = await subscription.next_notification(
+                    timeout=max(
+                        CODEX_APP_SERVER_LIFECYCLE_TIMEOUT_SECONDS,
+                        IDLE_KILL_SECONDS,
+                    )
+                )
             method = str(notification.get("method") or "")
             params = (
                 notification.get("params")
@@ -51196,10 +51281,19 @@ async def consume_codex_native_turn(
                 )
                 or ""
             )
+            if goal_resume and method == "turn/started" and notification_turn_id:
+                if notification_turn_id in seen_goal_turn_ids:
+                    continue
+                seen_goal_turn_ids.add(notification_turn_id)
+                turn_id = notification_turn_id
+                goal_turn_running = True
+                assistant_deltas.clear()
+                reasoning_deltas.clear()
             if turn_id and notification_turn_id and notification_turn_id != turn_id:
                 continue
             if method == "turn/started":
                 interrupt_after_start = False
+                interrupt_turn_id = notification_turn_id
                 if notification_turn_id and not turn_id:
                     turn_id = notification_turn_id
                 if notification_turn_id:
@@ -51209,8 +51303,17 @@ async def consume_codex_native_turn(
                             active
                             and str(active.get("run_id") or "") == operation_id
                         ):
-                            active["provider_turn_id"] = notification_turn_id
-                            active["provider_turn_ready"] = True
+                            # The goal projector binds the latest native turn
+                            # before RPC completion. A backlogged consumer must
+                            # not replace that id with an earlier goal turn.
+                            if not goal_resume:
+                                active["provider_turn_id"] = notification_turn_id
+                                active["provider_turn_ready"] = True
+                            else:
+                                interrupt_turn_id = str(
+                                    active.get("provider_turn_id")
+                                    or notification_turn_id
+                                )
                             if (
                                 active.get("stop_requested")
                                 and not active.get("native_interrupt_sent")
@@ -51223,7 +51326,7 @@ async def consume_codex_native_turn(
                             "turn/interrupt",
                             {
                                 "threadId": thread_id,
-                                "turnId": notification_turn_id,
+                                "turnId": interrupt_turn_id,
                             },
                         )
                     except Exception as exc:
@@ -51362,6 +51465,17 @@ async def consume_codex_native_turn(
                 terminal_status = str(completed_turn.get("status") or "failed")
                 if completed_turn.get("error"):
                     terminal_error = concise_error_message(completed_turn["error"])
+                if goal_resume:
+                    goal_turn_running = False
+                    goal_clock_started = None
+                    # Keep the thread-wide subscription and exact local owner
+                    # across native goal turns; no synthetic user turn is sent.
+                    await manager.wait_for_notification_handler(
+                        project_codex_notification, thread_id,
+                    )
+                    if terminal_status == "completed" and not terminal_error:
+                        turn_id = None
+                        continue
                 break
     except (asyncio.TimeoutError, CodexAppServerSubscriptionClosed) as exc:
         terminal_status = "failed"
@@ -51374,6 +51488,10 @@ async def consume_codex_native_turn(
         terminal_status = "failed"
         terminal_error = concise_error_message(exc)
     finally:
+        if goal_resume and terminal_status != "completed":
+            await stop_codex_goal_resume(
+                session_id, manager, thread_id, reservation_id,
+            )
         subscription.close()
         terminal_claimed = False
         try:
@@ -51441,6 +51559,8 @@ async def consume_codex_native_turn(
                 terminal_event_type = (
                     "codex_compaction_completed"
                     if operation == "compaction"
+                    else "turn_finished"
+                    if goal_resume
                     else f"codex_{operation}_finished"
                 )
                 operation_label = {
@@ -51461,6 +51581,7 @@ async def consume_codex_native_turn(
                         "operation_id": operation_id,
                         "turn_id": turn_id,
                         "status": terminal_status,
+                        **({"backend": BACKEND_CODEX, "purpose": "codex_goal_resume"} if goal_resume else {}),
                         "error": terminal_error,
                         "message": terminal_message,
                         **compaction_usage,
@@ -63958,6 +64079,12 @@ async def _start_turn_locked(
 SERVER_UPDATE_ACTIVE_PHASES = {"starting", "checking", "downloading", "verifying", "installing", "restarting"}
 SERVER_UPDATE_PENDING_PHASE = "pending"
 SERVER_UPDATE_PENDING_POLL_SECONDS = 1.0
+SERVER_UPDATE_ATTEMPT_HISTORY_LIMIT = 8
+SERVER_UPDATE_ATTEMPT_FIELDS = (
+    "update_id", "schedule_id", "phase", "current_version", "target_version",
+    "installed_version", "message", "error_code", "error_action",
+    "started_at", "finished_at", "updated_at",
+)
 SERVER_UPDATE_PER_RUN_STATUS_FIELDS = (
     "schedule_id",
     "update_id",
@@ -65864,6 +65991,43 @@ def public_server_update_status(status: dict[str, Any]) -> dict[str, Any]:
 
 def _write_server_update_status_unlocked(**changes: Any) -> dict[str, Any]:
     value = read_server_update_status()
+    # A check/retry must not erase the only receipt for a failed detached
+    # runner. Keep a small, scalar-only history in the existing status file;
+    # never copy credentials, process arguments, or private restart markers.
+    previous_id = value.get("update_id") or value.get("schedule_id")
+    next_id = changes.get("update_id", value.get("update_id")) or changes.get(
+        "schedule_id", value.get("schedule_id"),
+    )
+    if previous_id and previous_id != next_id and (
+        value.get("phase") in {"failed", "complete"}
+        or changes.get("error_code")
+    ):
+        receipt = dict(value)
+        if value.get("phase") not in {"failed", "complete"}:
+            # Fresh availability rows deliberately clear the old run fields.
+            # Archive the failed run's target/timestamps, not those nulls.
+            receipt.update({
+                key: changes[key]
+                for key in ("message", "error_code", "error_action", "finished_at")
+                if isinstance(changes.get(key), str)
+            })
+            receipt["phase"] = "failed"
+            receipt["updated_at"] = update_utc_now()
+        raw_history = value.get("attempt_history")
+        history = raw_history[-SERVER_UPDATE_ATTEMPT_HISTORY_LIMIT:] if isinstance(raw_history, list) else []
+        history = [
+            item for item in history if isinstance(item, dict)
+            and (item.get("update_id") or item.get("schedule_id")) != previous_id
+        ]
+        history.append(receipt)
+        value["attempt_history"] = [
+            {
+                key: item[key][:2000 if key in {"message", "error_action"} else 160]
+                for key in SERVER_UPDATE_ATTEMPT_FIELDS
+                if isinstance(item.get(key), str)
+            }
+            for item in history[-SERVER_UPDATE_ATTEMPT_HISTORY_LIMIT:]
+        ]
     value.update(changes)
     value["updated_at"] = update_utc_now()
     atomic_update_json(SERVER_UPDATE_STATUS_FILE, value)
@@ -73317,11 +73481,19 @@ async def check_server_update(
             if body is not None and body.track is not None
             else status["track"]
         )
+        keep_failure = status.get("phase") == "failed" or bool(status.get("error_code"))
         try:
             manifest = await signed_release_manifest(track)
         except HTTPException as exc:
             if exc.status_code != 404:
                 raise
+            if keep_failure:
+                return public_server_update_status(write_server_update_status(
+                    track=track,
+                    latest_version=None,
+                    update_available=False,
+                    checked_at=update_utc_now(),
+                ))
             return public_server_update_status(
                 write_fresh_server_update_status(
                     phase="unavailable",
@@ -73347,6 +73519,18 @@ async def check_server_update(
             message = f"AgentsServer {latest} is available."
         else:
             message = f"AgentsServer {SERVER_VERSION} is current on {track}."
+        if keep_failure:
+            # Refresh availability, not the outcome of the last attempt.
+            # The existing error stays visible until an explicit new start;
+            # that start archives its receipt before clearing per-run fields.
+            return public_server_update_status(write_server_update_status(
+                track=track,
+                current_track=current_track,
+                latest_version=latest,
+                update_available=update_available,
+                channel_switch=channel_switch,
+                checked_at=update_utc_now(),
+            ))
         return public_server_update_status(
             write_fresh_server_update_status(
                 phase="available" if update_available else "current",
@@ -76768,6 +76952,129 @@ async def put_codex_goal(
         return await _put_codex_goal_locked(session_id, req)
 
 
+def validate_codex_goal_resume_budget(
+    session: dict[str, Any], req: CodexGoalRequest,
+) -> None:
+    if req.status != "active":
+        return
+    goal = session.get("codex_goal")
+    if not isinstance(goal, dict):
+        return
+    fields = request_fields_set(req)
+    if "objective" in fields and str(req.objective or "").strip() != str(goal.get("objective") or "").strip():
+        return
+    candidate = dict(session)
+    if "time_budget_seconds" in fields:
+        previous = candidate.get("codex_goal_time_budget_seconds")
+        candidate["codex_goal_time_budget_seconds"] = req.time_budget_seconds
+        if (
+            req.time_budget_seconds is None
+            or not isinstance(previous, (int, float))
+            or isinstance(previous, bool)
+            or req.time_budget_seconds > previous
+        ):
+            candidate["codex_goal_time_budget_exhausted"] = False
+    if codex_goal_time_budget_is_exhausted(candidate):
+        raise HTTPException(
+            status_code=409,
+            detail="The goal's time budget is exhausted. Increase or clear the time limit before resuming.",
+        )
+
+
+async def stop_codex_goal_resume(
+    session_id: str,
+    manager: CodexAppServerManager,
+    thread_id: str,
+    reservation_id: str,
+) -> None:
+    """Fence a failed/cancelled goal activation before releasing its owner."""
+    async with ACTIVE_LOCK:
+        active = ACTIVE.get(session_id)
+        if (
+            not active
+            or active.get("codex_native_operation_kind") != "goal_resume"
+            or str(active.get("codex_control_reservation_id") or "") != reservation_id
+            or str(active.get("provider_thread_id") or "") != thread_id
+        ):
+            return
+        active["stop_requested"] = True
+        active_snapshot = dict(active)
+    try:
+        paused, _changed, error = await pause_active_codex_goal_for_stop(
+            session_id, active_snapshot,
+        )
+    except Exception as exc:
+        paused = False
+        error = f"Could not persist the paused goal: {concise_error_message(exc)}"
+    if not paused:
+        try:
+            await quarantine_codex_goal_thread(
+                session_id, thread_id,
+                reason=error or "Could not pause a failed goal resume",
+            )
+        except Exception as exc:
+            logger.warning("failed to quarantine goal resume session=%s thread=%s: %s", session_id, thread_id, concise_error_message(exc))
+    # The projector binds early turn/started notifications to this exact
+    # reservation even when goal/set fails after accepting the mutation.
+    async with ACTIVE_LOCK:
+        active = ACTIVE.get(session_id)
+        turn_id = str(active.get("provider_turn_id") or "") if active else ""
+        owned = bool(active and str(active.get("codex_control_reservation_id") or "") == reservation_id)
+        needs_interrupt = bool(owned and turn_id and not active.get("native_interrupt_sent"))
+        if needs_interrupt:
+            active["native_interrupt_sent"] = True
+    if needs_interrupt:
+        try:
+            await manager.request(
+                "turn/interrupt", {"threadId": thread_id, "turnId": turn_id},
+                timeout=CODEX_GOAL_CONTROL_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            async with ACTIVE_LOCK:
+                active = ACTIVE.get(session_id)
+                if active and str(active.get("codex_control_reservation_id") or "") == reservation_id:
+                    active["native_interrupt_sent"] = False
+            try:
+                await quarantine_codex_goal_thread(
+                    session_id, thread_id,
+                    reason=f"Could not interrupt a failed goal resume: {concise_error_message(exc)}",
+                )
+            except Exception as quarantine_error:
+                logger.warning("failed to quarantine interrupted goal session=%s thread=%s: %s", session_id, thread_id, concise_error_message(quarantine_error))
+
+
+def start_codex_goal_resume_consumer(
+    session_id: str, operation_id: str, manager: CodexAppServerManager,
+    thread_id: str, reservation_id: str, subscription: Any,
+) -> asyncio.Task[None]:
+    entered = False
+
+    async def consume() -> None:
+        nonlocal entered
+        entered = True
+        await consume_codex_native_turn(
+            session_id, operation_id, "goal_resume", manager,
+            thread_id, reservation_id, subscription,
+        )
+
+    task = asyncio.create_task(consume())
+    register_codex_native_action(session_id, operation_id, task)
+
+    def reconcile_unstarted_cancel(completed: asyncio.Task[None]) -> None:
+        if not entered and completed.cancelled():
+            # Cancelling a task before its first step does not execute its
+            # finally block. Keep cleanup tracked under the same operation.
+            cleanup = asyncio.create_task(consume_codex_native_turn(
+                session_id, operation_id, "goal_resume", manager,
+                thread_id, reservation_id, subscription,
+                interrupted_before_start=True,
+            ))
+            register_codex_native_action(session_id, operation_id, cleanup)
+
+    task.add_done_callback(reconcile_unstarted_cancel)
+    return task
+
+
 async def _put_codex_goal_locked(
     session_id: str,
     req: CodexGoalRequest,
@@ -76783,10 +77090,21 @@ async def _put_codex_goal_locked(
     fields_set = request_fields_set(req)
     if not fields_set:
         raise HTTPException(status_code=400, detail="provide at least one goal field")
-    manager, thread_id, _session = await acquire_codex_control_thread(
+    if req.status == "active":
+        if (STORE.sessions.get(session_id) or {}).get("archived"):
+            raise HTTPException(status_code=409, detail="archived chats cannot resume goals")
+        await wait_for_queue_recovery_admission()
+    manager, thread_id, control_session = await acquire_codex_control_thread(
         session_id,
+        reserve_session=req.status == "active",
         allow_active_goal_mutation=True,
     )
+    reservation_id = str(control_session.get("_codex_control_reservation_id") or "")
+    subscription = None
+    operation_id = ""
+    consumer_owns_reservation = False
+    goal_activation_attempted = False
+    resume_started_published = False
     try:
         native_fields = fields_set & {"objective", "status", "token_budget"}
         stored_session = STORE.sessions.get(session_id, {})
@@ -76798,6 +77116,44 @@ async def _put_codex_goal_locked(
         time_budget_exhausted = bool(
             stored_session.get("codex_goal_time_budget_exhausted")
         )
+        validate_codex_goal_resume_budget(stored_session, req)
+        if reservation_id:
+            async with QUEUE_LOCK:
+                promotion = QUEUE_START_TASKS.get(session_id)
+                prior_queue = bool(
+                    QUEUED_TURNS.get(session_id)
+                    or RUN_NOW_TURNS.get(session_id)
+                    or session_id in STEERING_SESSIONS
+                    or (promotion is not None and not promotion.done())
+                )
+            if prior_queue:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This chat has queued work. Run or remove it before resuming the goal.",
+                )
+            blocker = await turn_start_blocker(ignore_session_id=session_id)
+            if blocker:
+                raise HTTPException(status_code=503, detail=f"agent launch deferred: {blocker}")
+            operation_id = f"codexgoal_{uuid.uuid4().hex[:16]}"
+            subscription = manager.subscribe_thread(thread_id)
+            async with ACTIVE_LOCK:
+                active = ACTIVE.get(session_id)
+                if not active or str(active.get("codex_control_reservation_id") or "") != reservation_id:
+                    raise HTTPException(status_code=409, detail="The goal resume reservation changed; retry.")
+                active["run_id"] = operation_id
+                active["codex_native_operation_kind"] = "goal_resume"
+                current_turn = CURRENT_TURNS.get(session_id)
+                if current_turn is not None:
+                    current_turn["run_id"] = operation_id
+                    current_turn["purpose"] = "codex_goal_resume"
+            await append_event(session_id, "turn_started", {
+                "run_id": operation_id,
+                "backend": BACKEND_CODEX,
+                "purpose": "codex_goal_resume",
+                "thread_id": thread_id,
+                "message": "Resuming the persistent Codex goal.",
+            })
+            resume_started_published = True
         if native_fields:
             kwargs: dict[str, Any] = {}
             if "objective" in fields_set:
@@ -76808,6 +77164,7 @@ async def _put_codex_goal_locked(
                 kwargs["status"] = req.status
             if "token_budget" in fields_set:
                 kwargs["token_budget"] = req.token_budget
+            goal_activation_attempted = bool(reservation_id)
             goal = await asyncio.wait_for(
                 manager.set_thread_goal(thread_id, **kwargs),
                 timeout=CODEX_GOAL_CONTROL_TIMEOUT_SECONDS,
@@ -76850,6 +77207,25 @@ async def _put_codex_goal_locked(
         async with STORE._lock:
             current = STORE.sessions.get(session_id)
             if current:
+                # Native goal notifications may finish or pause this goal
+                # before goal/set returns its earlier active snapshot. UI
+                # controls are serialized by the lifecycle lock, so a replaced
+                # goal object here is newer provider-authoritative state.
+                latest_goal = current.get("codex_goal")
+                if latest_goal is not previous_goal:
+                    goal = latest_goal
+                    if goal is None:
+                        time_budget_seconds = None
+                        time_budget_exhausted = False
+                    elif isinstance(goal, dict):
+                        latest_used = goal.get("timeUsedSeconds")
+                        if (
+                            time_budget_seconds is not None
+                            and isinstance(latest_used, (int, float))
+                            and not isinstance(latest_used, bool)
+                            and latest_used >= time_budget_seconds
+                        ):
+                            time_budget_exhausted = True
                 current["codex_goal"] = goal
                 current["codex_goal_time_budget_seconds"] = time_budget_seconds
                 current["codex_goal_time_budget_exhausted"] = (
@@ -76867,6 +77243,16 @@ async def _put_codex_goal_locked(
                     "time_budget_owner": "AgentsDock",
                 },
             )
+        if reservation_id and subscription is not None:
+            task = start_codex_goal_resume_consumer(
+                session_id, operation_id, manager,
+                thread_id, reservation_id, subscription,
+            )
+            consumer_owns_reservation = True
+            async with ACTIVE_LOCK:
+                active = ACTIVE.get(session_id)
+                if active and str(active.get("codex_control_reservation_id") or "") == reservation_id:
+                    active["owner_task"] = task
         return {
             "goal": goal,
             "time_budget_seconds": time_budget_seconds,
@@ -76882,7 +77268,28 @@ async def _put_codex_goal_locked(
             raise
         raise codex_control_http_error(exc) from exc
     finally:
-        await release_codex_control_thread(session_id, manager, thread_id)
+        if not consumer_owns_reservation:
+            try:
+                if goal_activation_attempted:
+                    await stop_codex_goal_resume(
+                        session_id, manager, thread_id, reservation_id,
+                    )
+            finally:
+                if subscription is not None:
+                    subscription.close()
+                await release_codex_control_thread(
+                    session_id, manager, thread_id,
+                    reserved_session=bool(reservation_id),
+                    reservation_id=reservation_id,
+                )
+                if resume_started_published:
+                    await append_event(session_id, "turn_finished", {
+                        "run_id": operation_id,
+                        "backend": BACKEND_CODEX,
+                        "purpose": "codex_goal_resume",
+                        "status": "failed",
+                        "message": "The goal could not be resumed.",
+                    })
 
 
 @app.delete("/api/sessions/{session_id}/codex/goal")

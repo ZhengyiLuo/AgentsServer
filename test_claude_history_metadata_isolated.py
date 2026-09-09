@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from collections import deque
+from datetime import datetime
 import hashlib
 import hmac
 import json
@@ -11,6 +12,7 @@ from pathlib import Path
 import re
 import unittest
 from unittest.mock import Mock
+from claude_history_provenance import ClaudeInterruptionTracker
 
 
 SOURCE = Path(__file__).with_name("agent_server.py")
@@ -20,6 +22,7 @@ FUNCTIONS = {
     "text_from_content",
     "message_text",
     "normalized_history_item",
+    "normalized_history_provider_origin",
     "add_history_item",
     "normalized_history_import_limit",
     "claude_history_event_is_task_notification",
@@ -62,6 +65,8 @@ def load_projection() -> dict:
     module = ast.fix_missing_locations(ast.Module(body=[annotations, *selected], type_ignores=[]))
     namespace = {
         "re": re,
+        "datetime": datetime,
+        "ClaudeInterruptionTracker": ClaudeInterruptionTracker,
         "json": json,
         "hashlib": hashlib,
         "hmac": hmac,

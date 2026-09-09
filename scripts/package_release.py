@@ -30,6 +30,7 @@ FILES = (
     "cursor_agent_client.py",
     "cursor_process_guard.py",
     "claude_history_repair.py",
+    "claude_history_provenance.py",
     "public_chat_shares.py",
     "public_chat_transcript.py",
     "public_chat_share_routes.py",

@@ -12,7 +12,7 @@ import unittest
 
 ROOT = Path(__file__).parent
 NEW_MODULES = {
-    "claude_history_repair.py", "public_chat_shares.py",
+    "claude_history_repair.py", "claude_history_provenance.py", "public_chat_shares.py",
     "public_chat_transcript.py", "public_chat_share_routes.py",
 }
 NEW_MIGRATION = "migrations/0017_skill_announcement_deletions.sql"

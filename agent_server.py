@@ -128,7 +128,8 @@ from agentsdock_team_hub.store import (
 )
 from agentsdock_team_hub.secure_peer import SecurePeerError
 from secure_peer_runtime import SECURE_PEER_HEARTBEAT_SECONDS, SecurePeerRuntime
-from claude_history_repair import ClaudeMetadataRepairCache
+from claude_history_repair import ClaudeMetadataRepairCache, enrich_interruption_origins
+from claude_history_provenance import ClaudeInterruptionTracker, normalize_claude_interruption_context
 from public_chat_share_routes import create_public_chat_share_router, redact_public_share_path
 from public_chat_transcript import (
     PublicTranscriptError,
@@ -15939,6 +15940,14 @@ def is_agent_visible_event(event_type: str, event: dict[str, Any]) -> bool:
 
 
 def should_bump_session_updated_at(event_type: str, event: dict[str, Any]) -> bool:
+    if (
+        event.get("metadata_only") is True
+        and event.get("imported") is True
+        and event.get("backend") == BACKEND_CLAUDE
+        and str(event.get("run_id") or "").startswith("import_")
+        and event_type in {"history_imported", "turn_finished"}
+    ) or event_type == "provider_interruption":
+        return False
     if event_type.startswith("cross_chat_"):
         return True
     if is_agent_visible_event(event_type, event):
@@ -30014,6 +30023,9 @@ def project_legacy_imported_provider_event(
     provider-origin metadata.
     """
 
+    interruption = CLAUDE_METADATA_REPAIR_CACHE.project_event(session_id, event)
+    if interruption is not None:
+        return interruption
     if (
         str(event.get("type") or "") != "turn_started"
         or event.get("imported") is not True
@@ -42626,23 +42638,79 @@ def message_text(message: Any, *, compact: bool = True) -> str:
     return text_from_content(message, compact=compact)
 
 
-def normalized_history_item(kind: str, text: str) -> dict[str, str] | None:
+def normalized_history_provider_origin(value: Any) -> dict[str, str] | None:
+    """Keep only validated Claude identifiers and the original aware timestamp.
+
+    This metadata is descriptive, never authority or a message-matching key.
+    Validate fields independently so one malformed timestamp cannot erase a
+    valid source identity, and never copy transcript paths or context fields.
+    """
+    if not isinstance(value, dict) or value.get("provider") != "claude":
+        return None
+    origin = {"provider": "claude"}
+    for field in ("event_id", "session_id", "parent_event_id", "prompt_id"):
+        candidate = value.get(field)
+        if isinstance(candidate, str) and re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            candidate,
+        ):
+            origin[field] = candidate
+    timestamp = value.get("timestamp")
+    if isinstance(timestamp, str) and re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)",
+        timestamp,
+    ):
+        try:
+            parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if parsed.utcoffset() is not None:
+                origin["timestamp"] = timestamp
+        except ValueError:
+            pass
+    if value.get("kind") == "interruption":
+        if not all(field in origin for field in ("event_id", "session_id", "timestamp")):
+            return None
+        origin["kind"] = "interruption"
+        cause = value.get("cause")
+        origin["cause"] = cause if cause in ("steer", "stop", "unknown") else "unknown"
+    return origin if len(origin) > 1 else None
+
+
+def normalized_history_item(
+    kind: str,
+    text: str,
+    *,
+    provider_origin: Any = None,
+) -> dict[str, Any] | None:
+    origin = normalized_history_provider_origin(provider_origin)
+    if kind == "interruption" and (origin is None or origin.get("kind") != "interruption"):
+        return None
     text = compact_import_text(text)
     if not text or (kind == "user" and is_import_boilerplate(text)):
         return None
-    return {"kind": kind, "text": text}
+    item: dict[str, Any] = {"kind": kind, "text": text}
+    if origin is not None:
+        item["provider_origin"] = origin
+    return item
 
 
-def add_history_item(items: Any, kind: str, text: str) -> None:
-    item = normalized_history_item(kind, text)
+def add_history_item(
+    items: Any,
+    kind: str,
+    text: str,
+    *,
+    provider_origin: Any = None,
+) -> None:
+    item = normalized_history_item(kind, text, provider_origin=provider_origin)
     if item is None:
         return
-    if (
-        items
-        and items[-1]["kind"] == item["kind"]
-        and items[-1]["text"].strip() == item["text"].strip()
-    ):
-        return
+    if items and items[-1]["kind"] == item["kind"]:
+        if item["kind"] == "interruption":
+            previous_origin = normalized_history_provider_origin(items[-1].get("provider_origin"))
+            origin = item["provider_origin"]
+            if previous_origin is not None and all(previous_origin.get(field) == origin.get(field) for field in ("event_id", "session_id")):
+                return
+        elif items[-1]["text"].strip() == item["text"].strip():
+            return
     items.append(item)
 
 
@@ -42720,7 +42788,7 @@ def bounded_jsonl_paths(root: Path) -> Iterator[Path]:
                     continue
 
 
-def bounded_jsonl_events(path: Path) -> Iterator[dict[str, Any]]:
+def bounded_jsonl_events(path: Path, *, preserve_invalid: bool = False) -> Iterator[dict[str, Any] | None]:
     """Parse a transcript with hard byte, line-size, and line-count bounds."""
 
     size = path.stat().st_size
@@ -42744,9 +42812,13 @@ def bounded_jsonl_events(path: Path) -> Iterator[dict[str, Any]]:
             try:
                 event = json.loads(raw_line)
             except (json.JSONDecodeError, UnicodeDecodeError):
+                if preserve_invalid:
+                    yield None
                 continue
             if isinstance(event, dict):
                 yield event
+            elif preserve_invalid:
+                yield None
         if stream.read(1):
             raise ValueError(
                 f"transcript exceeds the {MAX_LOCAL_TRANSCRIPT_SCAN_LINES}-line import limit"
@@ -42817,14 +42889,15 @@ def bounded_jsonl_events_range(
     end: int,
     *,
     expected_stat: dict[str, int],
-) -> Iterator[dict[str, Any]]:
+    preserve_invalid: bool = False,
+) -> Iterator[dict[str, Any] | None]:
     for event, _record_end in bounded_jsonl_records_range(
         path,
         start,
         end,
         expected_stat=expected_stat,
     ):
-        if event is not None:
+        if event is not None or preserve_invalid:
             yield event
 
 
@@ -43473,8 +43546,16 @@ def claude_history_event_item(
     event: dict[str, Any],
     *,
     expected_session_id: str | None = None,
-) -> dict[str, str] | None:
+) -> dict[str, Any] | None:
     event_type = event.get("type")
+    provider_origin = {
+        "provider": "claude",
+        "event_id": event.get("uuid"),
+        "session_id": event.get("sessionId"),
+        "timestamp": event.get("timestamp"),
+        "parent_event_id": event.get("parentUuid"),
+        "prompt_id": event.get("promptId"),
+    }
     if event_type == "user":
         if event.get("isMeta") is True:
             # Claude marks generated skill/command context as metadata even
@@ -43494,11 +43575,13 @@ def claude_history_event_item(
                 expected_session_id=expected_session_id,
                 provider_history=True,
             ),
+            provider_origin=provider_origin,
         )
     if event_type == "assistant":
         return normalized_history_item(
             "assistant",
             message_text(event.get("message")),
+            provider_origin=provider_origin,
         )
     return None
 
@@ -43514,24 +43597,39 @@ def append_claude_history_event(
         expected_session_id=expected_session_id,
     )
     if item is not None:
-        add_history_item(items, item["kind"], item["text"])
+        add_history_item(
+            items, item["kind"], item["text"],
+            provider_origin=item.get("provider_origin"),
+        )
 
 
 def parse_claude_history_events(
-    events: Iterable[dict[str, Any]],
+    events: Iterable[dict[str, Any] | None],
     limit: int | None,
     *,
     expected_session_id: str | None = None,
-) -> list[dict[str, str]]:
-    items: deque[dict[str, str]] = deque(
+    interruption_context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    items: deque[dict[str, Any]] = deque(
         maxlen=normalized_history_import_limit(limit)
     )
+    tracker = ClaudeInterruptionTracker()
     for event in events:
-        append_claude_history_event(
-            items,
-            event,
-            expected_session_id=expected_session_id,
-        )
+        if not isinstance(event, dict):
+            tracker = ClaudeInterruptionTracker()
+            continue
+        origin = tracker.consume(event)
+        if origin is not None:
+            add_history_item(items, "interruption", message_text(event.get("message")), provider_origin=origin)
+        else:
+            append_claude_history_event(
+                items,
+                event,
+                expected_session_id=expected_session_id,
+            )
+    if interruption_context is not None:
+        interruption_context.clear()
+        interruption_context.update(tracker.export_context())
     return list(items)
 
 
@@ -43542,7 +43640,7 @@ def parse_claude_history(
     expected_session_id: str | None = None,
 ) -> list[dict[str, str]]:
     return parse_claude_history_events(
-        bounded_jsonl_events(path),
+        bounded_jsonl_events(path, preserve_invalid=True),
         limit,
         expected_session_id=expected_session_id,
     )
@@ -44316,9 +44414,14 @@ def provider_history(sess: dict[str, Any], limit: int | None) -> tuple[Path | No
     return None, []
 
 
-def history_item_cursor_digest(item: dict[str, str]) -> str:
+def history_item_cursor_digest(item: dict[str, Any]) -> str:
+    identity = [str(item.get("kind") or ""), str(item.get("text") or "").strip()]
+    if item.get("kind") == "interruption":
+        origin = normalized_history_provider_origin(item.get("provider_origin"))
+        if origin is not None and origin.get("kind") == "interruption":
+            identity = ["interruption", origin["session_id"], origin["event_id"]]
     encoded = json.dumps(
-        [str(item.get("kind") or ""), str(item.get("text") or "").strip()],
+        identity,
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -44386,7 +44489,7 @@ def normalized_history_sync_cursor(
         < int(raw["timeline_seq"])
     ):
         return None
-    return {
+    cursor = {
         "version": HISTORY_SYNC_CURSOR_VERSION,
         "backend": backend,
         "provider_session_id": provider_id,
@@ -44408,6 +44511,13 @@ def normalized_history_sync_cursor(
         "timeline_pending_active": timeline_pending_active,
         "checkpoint_seq": int(raw.get("checkpoint_seq", raw["timeline_seq"])),
     }
+    # Distinguish a pre-feature cursor from an initialized conservative empty
+    # context. The former receives one bounded seed; the latter never rescans.
+    if backend == BACKEND_CLAUDE and "claude_interruption_context" in raw:
+        cursor["claude_interruption_context"] = normalize_claude_interruption_context(
+            raw["claude_interruption_context"], provider_session_id=provider_id,
+        )
+    return cursor
 
 
 def history_sync_checkpoint(
@@ -44663,6 +44773,57 @@ def provider_history_prefix_digest(
     return digest.hexdigest()
 
 
+def seed_claude_interruption_context(
+    path: Path,
+    end: int,
+    *,
+    expected_stat: dict[str, int],
+    provider_session_id: str,
+) -> dict[str, Any]:
+    """Seed one legacy cursor from at most 2 MiB ending at its consumed offset."""
+    if end < 0 or end > int(expected_stat["st_size"]):
+        raise ValueError("transcript interruption seed range is invalid")
+    if end == 0:
+        return {"version": 1}
+    start = max(0, end - 2 * 1024 * 1024)
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("transcript interruption seed is not a regular file")
+        if any(int(getattr(before, field)) != int(expected_stat[field]) for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns")):
+            raise ValueError("transcript changed before interruption seed")
+        stream.seek(start)
+        region = stream.read(end - start)
+        if len(region) != end - start:
+            raise ValueError("transcript was truncated during interruption seed")
+        after = os.fstat(stream.fileno())
+        if any(int(getattr(after, field)) != int(expected_stat[field]) for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns")):
+            raise ValueError("transcript changed during interruption seed")
+    if start:
+        # A leading partial record cannot establish lineage. Discarding an
+        # exactly aligned first record too is conservative and keeps reads bounded.
+        _partial, _separator, region = region.partition(b"\n")
+    if region and not region.endswith(b"\n"):
+        raise ValueError("transcript interruption seed does not end on a complete line")
+    tracker = ClaudeInterruptionTracker()
+    for index, line in enumerate(region.splitlines()):
+        if index >= MAX_LOCAL_TRANSCRIPT_SCAN_LINES:
+            return {"version": 1}
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except (ValueError, UnicodeDecodeError):
+            tracker = ClaudeInterruptionTracker()
+            continue
+        if isinstance(event, dict):
+            tracker.consume(event)
+        else:
+            tracker = ClaudeInterruptionTracker()
+    return normalize_claude_interruption_context(tracker.export_context(), provider_session_id=provider_session_id)
+
+
 def parse_provider_history_delta(
     path: Path,
     backend: str,
@@ -44673,14 +44834,16 @@ def parse_provider_history_delta(
     expected_stat: dict[str, int],
     previous_last_item_digest: str,
     expected_session_id: str | None = None,
-) -> tuple[list[dict[str, str]], int, str, bool]:
+    interruption_context: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], int, str, bool]:
     """Consume the front of an append-only delta without skipping messages."""
 
     maximum = normalized_history_import_limit(limit)
-    items: list[dict[str, str]] = []
+    items: list[dict[str, Any]] = []
     cursor_offset = start
     last_item_digest = previous_last_item_digest
     blocked_on_unseen_message = False
+    tracker = ClaudeInterruptionTracker(interruption_context) if backend == BACKEND_CLAUDE else None
     for event, record_end in bounded_jsonl_records_range(
         path,
         start,
@@ -44692,11 +44855,16 @@ def parse_provider_history_delta(
             # runs, but never advance across an unconsumed provider message.
             continue
         item = None
+        prior_context = tracker.export_context() if tracker is not None else None
+        if tracker is not None and event is None:
+            tracker = ClaudeInterruptionTracker()
+        origin = tracker.consume(event) if tracker is not None else None
         if event is not None:
             if backend == BACKEND_CLAUDE:
-                item = claude_history_event_item(
-                    event,
-                    expected_session_id=expected_session_id,
+                item = normalized_history_item(
+                    "interruption", message_text(event.get("message")), provider_origin=origin,
+                ) if origin is not None else claude_history_event_item(
+                    event, expected_session_id=expected_session_id,
                 )
             elif backend == BACKEND_CODEX:
                 item = codex_history_event_item(
@@ -44717,10 +44885,15 @@ def parse_provider_history_delta(
             continue
         if len(items) >= maximum:
             blocked_on_unseen_message = True
+            if tracker is not None:
+                tracker = ClaudeInterruptionTracker(prior_context)
             continue
         items.append(item)
         last_item_digest = item_digest
         cursor_offset = record_end
+    if tracker is not None and interruption_context is not None:
+        interruption_context.clear()
+        interruption_context.update(tracker.export_context())
     return items, cursor_offset, last_item_digest, blocked_on_unseen_message
 
 
@@ -44745,6 +44918,13 @@ def load_provider_history_with_cursor(
         )
     start = int(previous["source_offset"]) if continued and previous else 0
     end = int(snapshot["source_offset"])
+    interruption_context: dict[str, Any] = {"version": 1}
+    if backend == BACKEND_CLAUDE and continued and previous:
+        interruption_context = (
+            normalize_claude_interruption_context(previous["claude_interruption_context"], provider_session_id=provider_id)
+            if "claude_interruption_context" in previous
+            else seed_claude_interruption_context(path, start, expected_stat=snapshot["expected_stat"], provider_session_id=provider_id)
+        )
     if continued and previous:
         (
             items,
@@ -44761,6 +44941,8 @@ def load_provider_history_with_cursor(
             previous_last_item_digest=str(
                 previous.get("last_item_digest") or ""
             ),
+            expected_session_id=str(sess.get("id") or "") or None,
+            interruption_context=interruption_context,
         )
         caught_up = not delta_overflow and cursor_offset == end
     else:
@@ -44769,11 +44951,12 @@ def load_provider_history_with_cursor(
             0,
             end,
             expected_stat=snapshot["expected_stat"],
+            preserve_invalid=backend == BACKEND_CLAUDE,
         )
         if backend == BACKEND_CLAUDE:
-            items = parse_claude_history_events(events, limit)
+            items = parse_claude_history_events(events, limit, expected_session_id=str(sess.get("id") or "") or None, interruption_context=interruption_context)
         elif backend == BACKEND_CODEX:
-            items = parse_codex_history_events(events, limit)
+            items = parse_codex_history_events(events, limit, expected_session_id=str(sess.get("id") or "") or None)
         else:
             return None, [], None, False
         cursor_offset = end
@@ -44790,6 +44973,28 @@ def load_provider_history_with_cursor(
             expected_stat=snapshot["expected_stat"],
         )
     )
+    interruptions = [item for item in items if item.get("kind") == "interruption"] if backend == BACKEND_CLAUDE else []
+    if interruptions:
+        # This loader already runs in the import worker. Native-control proof
+        # is bounded and only read for newly parsed lifecycle records, never
+        # for ordinary refreshes or per-event client projection.
+        try:
+            enriched = enrich_interruption_origins(
+                events_path(str(sess["id"])), provider_id,
+                [item["provider_origin"] for item in interruptions],
+                session_id=str(sess["id"]),
+            )
+        except Exception:
+            enriched = []
+        if isinstance(enriched, list) and len(enriched) == len(interruptions):
+            for item, candidate in zip(interruptions, enriched):
+                origin = normalized_history_provider_origin(candidate)
+                original = item["provider_origin"]
+                if origin is not None and origin.get("kind") == "interruption" and all(
+                    origin.get(field) == original.get(field)
+                    for field in ("event_id", "session_id", "timestamp")
+                ):
+                    item["provider_origin"] = {**original, "cause": origin["cause"]}
     cursor = {
         "version": HISTORY_SYNC_CURSOR_VERSION,
         "backend": backend,
@@ -44822,6 +45027,8 @@ def load_provider_history_with_cursor(
         # continuity; the next pass revalidates the prefix digest.
         "source_caught_up": bool(caught_up),
     }
+    if backend == BACKEND_CLAUDE:
+        cursor["claude_interruption_context"] = normalize_claude_interruption_context(interruption_context, provider_session_id=provider_id)
     return path, items, cursor, continued
 
 
@@ -45457,13 +45664,18 @@ def schedule_provider_history_sync(sess: dict[str, Any]) -> None:
 async def append_imported_history(
     sess: dict[str, Any],
     source_path: Path,
-    items: list[dict[str, str]],
+    items: list[dict[str, Any]],
     *,
     sync_checkpoint: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     session_id = str(sess["id"])
     provider_id = str(session_provider_id(sess) or "")
     backend = str(sess.get("backend") or DEFAULT_BACKEND).lower()
+    metadata_only = bool(items) and all(item.get("kind") == "interruption" for item in items)
+    items = [item for item in items if item.get("kind") != "interruption" or (
+        backend == BACKEND_CLAUDE
+        and (normalized_history_provider_origin(item.get("provider_origin")) or {}).get("kind") == "interruption"
+    )]
     run_id = f"import_{uuid.uuid4().hex[:12]}"
     message = f"Imported {len(items)} rough messages from {backend} history."
     history_event = {
@@ -45472,6 +45684,7 @@ async def append_imported_history(
         "provider_session_id": provider_id,
         "source_path": str(source_path),
         "message": message,
+        **({"metadata_only": True, "imported": True} if metadata_only else {}),
     }
     if sync_checkpoint is not None:
         history_event["_history_sync_checkpoint"] = sync_checkpoint
@@ -45480,6 +45693,10 @@ async def append_imported_history(
         history_event,
     )]
     for item in items:
+        origin = normalized_history_provider_origin(item.get("provider_origin")) if backend == BACKEND_CLAUDE else None
+        provenance: dict[str, Any] = {"provider_origin": origin} if origin is not None else {}
+        if origin is not None and "timestamp" in origin:
+            provenance["ts"] = origin["timestamp"]
         if item["kind"] == "user":
             imported_events.append(("turn_started", {
                 "run_id": run_id,
@@ -45487,6 +45704,7 @@ async def append_imported_history(
                 "prompt": item["text"],
                 "imported": True,
                 "provider_history_sanitized": True,
+                **provenance,
             }))
         elif item["kind"] == "assistant":
             imported_events.append(("assistant_text", {
@@ -45494,8 +45712,16 @@ async def append_imported_history(
                 "backend": backend,
                 "text": item["text"],
                 "imported": True,
+                **provenance,
             }))
-    imported_events.append(imported_history_terminal_event(run_id, backend))
+        elif item["kind"] == "interruption":
+            imported_events.append(("provider_interruption", {
+                "run_id": run_id,
+                "backend": backend,
+                "imported": True,
+                **provenance,
+            }))
+    imported_events.append(imported_history_terminal_event(run_id, backend, metadata_only=metadata_only))
     committed = await append_durable_event_batch(session_id, imported_events)
     if len(committed) != len(imported_events):
         raise RuntimeError("history event batch was not fully persisted")
@@ -45507,7 +45733,12 @@ async def append_imported_history(
     }
 
 
-def imported_history_terminal_event(run_id: str, backend: str) -> tuple[str, dict[str, Any]]:
+def imported_history_terminal_event(
+    run_id: str,
+    backend: str,
+    *,
+    metadata_only: bool = False,
+) -> tuple[str, dict[str, Any]]:
     """Close an import run so no client can mistake replayed history for a live turn."""
 
     return ("turn_finished", {
@@ -45516,19 +45747,25 @@ def imported_history_terminal_event(run_id: str, backend: str) -> tuple[str, dic
         "imported": True,
         "result_text": "",
         "message": "Imported history replay finished.",
+        **({"metadata_only": True} if metadata_only else {}),
     })
 
 
 async def append_staged_imported_history(
     sess: dict[str, Any],
     source_path: Path,
-    items: list[dict[str, str]],
+    items: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Append one hidden import as an fsynced, rollback-capable batch."""
 
     session_id = str(sess["id"])
     provider_id = str(session_provider_id(sess) or "")
     backend = str(sess.get("backend") or DEFAULT_BACKEND).lower()
+    metadata_only = bool(items) and all(item.get("kind") == "interruption" for item in items)
+    items = [item for item in items if item.get("kind") != "interruption" or (
+        backend == BACKEND_CLAUDE
+        and (normalized_history_provider_origin(item.get("provider_origin")) or {}).get("kind") == "interruption"
+    )]
     run_id = f"import_{uuid.uuid4().hex[:12]}"
     message = f"Imported {len(items)} rough messages from {backend} history."
     imported_events: list[tuple[str, dict[str, Any]]] = [("history_imported", {
@@ -45537,8 +45774,13 @@ async def append_staged_imported_history(
         "provider_session_id": provider_id,
         "source_path": str(source_path),
         "message": message,
+        **({"metadata_only": True, "imported": True} if metadata_only else {}),
     })]
     for item in items:
+        origin = normalized_history_provider_origin(item.get("provider_origin")) if backend == BACKEND_CLAUDE else None
+        provenance: dict[str, Any] = {"provider_origin": origin} if origin is not None else {}
+        if origin is not None and "timestamp" in origin:
+            provenance["ts"] = origin["timestamp"]
         if item["kind"] == "user":
             imported_events.append(("turn_started", {
                 "run_id": run_id,
@@ -45546,6 +45788,7 @@ async def append_staged_imported_history(
                 "prompt": item["text"],
                 "imported": True,
                 "provider_history_sanitized": True,
+                **provenance,
             }))
         elif item["kind"] == "assistant":
             imported_events.append(("assistant_text", {
@@ -45553,8 +45796,16 @@ async def append_staged_imported_history(
                 "backend": backend,
                 "text": item["text"],
                 "imported": True,
+                **provenance,
             }))
-    imported_events.append(imported_history_terminal_event(run_id, backend))
+        elif item["kind"] == "interruption":
+            imported_events.append(("provider_interruption", {
+                "run_id": run_id,
+                "backend": backend,
+                "imported": True,
+                **provenance,
+            }))
+    imported_events.append(imported_history_terminal_event(run_id, backend, metadata_only=metadata_only))
     written = await append_imported_events(session_id, imported_events)
     if written != len(imported_events):
         raise RuntimeError("history event batch was not fully persisted")

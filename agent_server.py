@@ -69653,6 +69653,11 @@ async def bootstrap_requested_team_network(body: TeamHubHostEnableRequest) -> No
             action="Retry after the host is available.", retryable=True,
         )
     try:
+        if (await asyncio.to_thread(store.health))["bootstrapped"]:
+            # The Create/Host action also reactivates a preserved network.
+            # Verify this host's existing binding without changing its team.
+            await asyncio.to_thread(store.managed_server_claims)
+            return
         await asyncio.to_thread(store.bootstrap_managed_network, body.network_name)
     except HubError as exc:
         raise TeamHubHostControlFailure(

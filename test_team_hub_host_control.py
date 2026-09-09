@@ -273,7 +273,7 @@ class TeamHubHostControlTests(unittest.IsolatedAsyncioTestCase):
                     _request("Studio")
                 )
                 second = await agent_server.enable_team_hub_host(
-                    _request("Studio Two")
+                    _request("Studio Two", network_name="Studio Two")
                 )
 
                 self.assertEqual(first["operation"], "create")
@@ -281,6 +281,10 @@ class TeamHubHostControlTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(second["operation"], "reactivate")
                 self.assertEqual(runtime.store.hub_id, hub_id)
                 self.assertEqual(runtime.store.managed_server_claims().team_id, original_team)
+                self.assertEqual(
+                    runtime.store.get_team(runtime.store.managed_server_claims(), original_team)["team"]["display_name"],
+                    "Research",
+                )
                 self.assertEqual(second["server_name"], "Studio Two")
                 self.assertFalse(second["reconnect_required"])
                 self.assertFalse((data_dir / "maintenance-fence.json").exists())

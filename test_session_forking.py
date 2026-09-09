@@ -487,6 +487,7 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
                     "session_id": None,
                     "claude_session_id": None,
                     "fork_from": resolved,
+                    "fork_resume_session_at": "completed-message-uuid",
                 }
                 print_cmd = agent_server.build_claude_cmd(
                     child["id"],
@@ -525,8 +526,10 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
             provider_id,
         )
         self.assertIn("--fork-session", print_cmd)
+        self.assertEqual(print_cmd[print_cmd.index("--resume-session-at") + 1], "completed-message-uuid")
         self.assertEqual(captured_options["resume"], provider_id)
         self.assertIs(captured_options["fork_session"], True)
+        self.assertEqual(captured_options["extra_args"]["resume-session-at"], "completed-message-uuid")
 
     async def test_claude_fork_missing_transcript_is_rejected_before_child_creation(
         self,
@@ -2230,13 +2233,13 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("fresh provider session", history_event["message"])
 
-    async def test_active_parent_is_rejected_before_provider_fork(self) -> None:
+    async def test_unsupported_active_parent_is_rejected_before_provider_fork(self) -> None:
         parent_id = "busy-parent"
         parent = {
             "id": parent_id,
             "title": "Busy",
             "cwd": "/tmp",
-            "backend": agent_server.BACKEND_CODEX,
+            "backend": agent_server.BACKEND_CURSOR,
             "codex_thread_id": "thread-parent",
         }
         with patch.object(agent_server.STORE, "sessions", {parent_id: parent}), patch.object(

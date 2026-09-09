@@ -10204,6 +10204,7 @@ class SessionStore:
                 )
             if backend == BACKEND_CLAUDE and sess.get("fork_from") and provider_id != sess.get("fork_from"):
                 sess["fork_from"] = None
+                sess.pop("fork_resume_session_at", None)
             sess["updated_at"] = now_iso()
             await self.save()
         if usage_signal is not None and not defer_runtime_broadcast:
@@ -44197,6 +44198,7 @@ def standalone_provider_session(sess: dict[str, Any]) -> dict[str, Any]:
     isolated.pop("cursor_instruction_hash", None)
     isolated.pop("cursor_instruction_version", None)
     isolated["fork_from"] = None
+    isolated.pop("fork_resume_session_at", None)
     isolated["memory_seed"] = None
     isolated["memory_seed_used"] = False
     isolated["codex_goal"] = None
@@ -46003,10 +46005,15 @@ def fork_event_file_ids(event: dict[str, Any]) -> list[str]:
     return merged_file_ids(file_ids)
 
 
-async def copy_fork_history(parent_id: str, child_id: str) -> int:
+async def copy_fork_history(
+    parent_id: str,
+    child_id: str,
+    *,
+    source_events: list[dict[str, Any]] | None = None,
+) -> int:
     # Fork history copy is an internal clone operation, not an API page. Do not
     # route it through read_events(), which clamps responses for UI pagination.
-    stored_parent_events = await asyncio.to_thread(
+    stored_parent_events = source_events if source_events is not None else await asyncio.to_thread(
         lambda: list(iter_session_events(parent_id))
     )
     parent_events = [
@@ -53792,6 +53799,8 @@ def build_claude_cmd(
     no_session_persistence: bool = False,
     disable_provider_subagents: bool = False,
 ) -> list[str]:
+    if sess.get("fork_resume_session_at") and not (provider_id and sess.get("fork_from")):
+        raise ValueError("The completed Claude fork snapshot is unavailable; refusing an empty resume.")
     system_prompt = session_system_prompt(
         session_id,
         sess,
@@ -53822,6 +53831,8 @@ def build_claude_cmd(
         if sess.get("fork_from"):
             cmd.append("--fork-session")
             cmd.extend(["--name", f"Fork: {sess.get('title') or sess['id']}"])
+            if sess.get("fork_resume_session_at"):
+                cmd.extend(["--resume-session-at", str(sess["fork_resume_session_at"])])
     return cmd
 
 
@@ -53903,6 +53914,8 @@ def build_claude_sdk_options(
     cli_path = claude_sdk_cli_path(env)
     system_prompt = session_system_prompt(session_id, sess, manifest_path)
     provider_id = resolve_claude_resume_provider(sess, cwd)[0]
+    if sess.get("fork_resume_session_at") and not (provider_id and sess.get("fork_from")):
+        raise ValueError("The completed Claude fork snapshot is unavailable; refusing an empty resume.")
     permission_owner = {"token": ""}
     provider_tool_owner = {"ownership_token": "", "run_id": ""}
     provider_tool_slots = asyncio.Semaphore(
@@ -53999,6 +54012,8 @@ def build_claude_sdk_options(
     }
     if provider_id and sess.get("fork_from"):
         extra_args["name"] = f"Fork: {sess.get('title') or sess['id']}"
+        if sess.get("fork_resume_session_at"):
+            extra_args["resume-session-at"] = str(sess["fork_resume_session_at"])
     options = create_claude_agent_options(
         system_prompt={
             "type": "preset",
@@ -54457,7 +54472,12 @@ class CodexForkCleanupError(CodexAppServerProtocolError):
         )
 
 
-async def fork_codex_thread(source_thread_id: str, sess: dict[str, Any]) -> str:
+async def fork_codex_thread(
+    source_thread_id: str,
+    sess: dict[str, Any],
+    *,
+    last_turn_id: str | None = None,
+) -> str:
     cwd = existing_cwd(str(sess.get("cwd") or DEFAULT_CWD))
     manager = await codex_app_server_manager()
     params = {
@@ -54469,7 +54489,10 @@ async def fork_codex_thread(source_thread_id: str, sess: dict[str, Any]) -> str:
         "deferGoalContinuation": True,
     }
     try:
-        forked_id = await manager.fork_thread(source_thread_id, params)
+        forked_id = await manager.fork_thread(
+            source_thread_id, params,
+            **({"last_turn_id": last_turn_id} if last_turn_id else {}),
+        )
     except BaseException as fork_exc:
         # app-server can report a late-created child after thread/fork itself
         # timed out or was cancelled.  If deleting that child also failed, the
@@ -54575,6 +54598,19 @@ async def fork_codex_thread(source_thread_id: str, sess: dict[str, Any]) -> str:
                 request_sent=True,
                 safe_to_retry=False,
             )
+        if last_turn_id:
+            turns = await manager.list_turns(
+                forked_id, limit=1, items_view="summary", sort_direction="desc",
+            )
+            if (
+                not turns
+                or str(turns[0].get("id") or "") != last_turn_id
+                or str(turns[0].get("status") or "") != "completed"
+            ):
+                raise CodexAppServerProtocolError(
+                    "thread/fork completed-turn boundary could not be verified",
+                    request_sent=True, safe_to_retry=False,
+                )
         await touch_codex_app_server_thread(manager, forked_id)
         return forked_id
     except BaseException:
@@ -56595,6 +56631,7 @@ async def project_claude_sdk_message(
                         "text": text,
                         "phase": "commentary",
                         "backend": BACKEND_CLAUDE,
+                        "provider_message_id": claude_sdk_field(message, "uuid"),
                         **run_event_metadata(run_id),
                     })
             elif block_type in {"ThinkingBlock", "thinking"}:
@@ -71043,6 +71080,11 @@ async def health() -> dict[str, Any]:
                 "max_batch_items": MAX_BULK_IMPORT_ITEMS,
                 "max_list_items": MAX_LOCAL_SESSION_LIST_ITEMS,
             },
+            "session_fork_completed_prefix_v1": {
+                "available": True,
+                "version": 1,
+                "supported_backends": [BACKEND_CLAUDE, BACKEND_CODEX],
+            },
             "secure_peer_v1": {
                 "available": bool(AGENT_TOKEN),
                 "state_available": SECURE_PEER_RUNTIME.state_available(),
@@ -77859,6 +77901,109 @@ async def delete_session(session_id: str) -> dict[str, Any]:
             raise
 
 
+def completed_fork_events(
+    events: list[dict[str, Any]],
+    *,
+    active_run_id: str,
+    through_sequence: int | None,
+) -> list[dict[str, Any]]:
+    """Freeze the visible completed prefix, never a partially observed turn."""
+    prefix: list[dict[str, Any]] = []
+    completed_length = 0
+    for event in events:
+        if through_sequence is not None and int(event.get("seq") or 0) > through_sequence:
+            break
+        if active_run_id and str(event.get("run_id") or "") == active_run_id:
+            break
+        prefix.append(event)
+        if (
+            event.get("type") == "turn_finished"
+            and (event.get("exit_code") == 0 or event.get("imported") is True)
+            and not event.get("stopped")
+            and not event.get("is_error")
+            and event.get("purpose") not in FORK_INTERNAL_PURPOSES
+        ):
+            completed_length = len(prefix)
+    return prefix[:completed_length]
+
+
+def claude_completed_fork_boundary(
+    parent: dict[str, Any],
+    provider_id: str,
+    events: list[dict[str, Any]],
+) -> str:
+    """Resolve the completed reply's exact UUID in the read-only transcript.
+
+    Legacy SDK events lack UUIDs. Accept an exact, unique final-response match
+    before the durable terminal timestamp; never take the transcript's tail.
+    """
+    terminal = events[-1]
+    run_id = str(terminal.get("run_id") or "")
+    completed_provider = str(terminal.get("provider_session_id") or "")
+    if completed_provider and completed_provider != provider_id:
+        raise HTTPException(status_code=409, detail="The completed Claude turn belongs to a different provider session; the running chat was left unchanged.")
+    final_text = clean_assistant_text(str(terminal.get("result_text") or ""))
+    final_projection = next((
+        event for event in reversed(events[:-1])
+        if str(event.get("run_id") or "") == run_id
+        and (event.get("type") == "assistant_text" or (
+            event.get("type") == "reasoning_summary" and event.get("phase") == "commentary"
+        ))
+        and str(event.get("text") or "").strip()
+    ), {})
+    projected_text = clean_assistant_text(str(final_projection.get("text") or ""))
+    # A terminal result can be a concatenation of assistant messages. Only its
+    # final projected message can identify the inclusive native cutoff.
+    expected_text = projected_text if projected_text and final_text.endswith(projected_text) else final_text
+    recorded_uuid = str(final_projection.get("provider_message_id") or "") if expected_text == projected_text else ""
+    cutoff_time = parse_job_timestamp(str(terminal.get("ts") or ""))
+    started = next((
+        event for event in reversed(events[:-1])
+        if event.get("type") == "turn_started" and str(event.get("run_id") or "") == run_id
+    ), {})
+    start_time = parse_job_timestamp(str(started.get("ts") or ""))
+    cwd = str(parent.get("cwd") or "")
+    expected_path = claude_resume_file_for_cwd(provider_id, cwd)
+    paths = [expected_path] if expected_path.is_file() else [
+        path for path in claude_history_candidates(provider_id)
+        if claude_transcript_matches_cwd(path, cwd)
+    ]
+    matches: set[str] = set()
+    for path in paths:
+        for record in bounded_jsonl_events(path):
+            if record.get("type") != "assistant" or record.get("isSidechain"):
+                continue
+            record_uuid = str(record.get("uuid") or "")
+            if not record_uuid or (recorded_uuid and record_uuid != recorded_uuid):
+                continue
+            record_time = parse_job_timestamp(str(record.get("timestamp") or ""))
+            if cutoff_time is None or record_time is None or record_time > cutoff_time:
+                continue
+            if not recorded_uuid and (start_time is None or record_time < start_time):
+                continue
+            message = record.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            # A pending tool call is not a completed assistant reply boundary.
+            if not isinstance(content, list) or any(
+                isinstance(block, dict) and block.get("type") in {"tool_use", "server_tool_use"}
+                for block in content
+            ):
+                continue
+            text_blocks = [
+                clean_assistant_text(str(block.get("text") or ""))
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            ]
+            if expected_text and expected_text in ["\n\n".join(text_blocks).strip(), *text_blocks[-1:]]:
+                matches.add(record_uuid)
+    if len(matches) != 1:
+        raise HTTPException(status_code=409, detail=(
+            "The last completed Claude turn could not be matched to an exact provider "
+            "snapshot. The running chat was left unchanged; retry after it finishes."
+        ))
+    return next(iter(matches))
+
+
 @app.post("/api/sessions/{session_id}/fork")
 async def fork_session(session_id: str, req: ForkSessionRequest) -> dict[str, Any]:
     cleanup_state: dict[str, str | None] = {}
@@ -77866,17 +78011,27 @@ async def fork_session(session_id: str, req: ForkSessionRequest) -> dict[str, An
         try:
             ensure_session_not_deleting(session_id)
             async with ACTIVE_LOCK:
-                if session_id in BUSY_SESSIONS or ACTIVE.get(session_id):
-                    raise HTTPException(
-                        status_code=409,
-                        detail="wait for or stop the active turn before forking this chat",
-                    )
+                active = ACTIVE.get(session_id) or {}
+                running = session_id in BUSY_SESSIONS or bool(active)
+                active_run_id = str(active.get("run_id") or "")
+                latest_sequence = (STORE.sessions.get(session_id) or {}).get("latest_event_seq")
+            snapshot = None
+            if running:
+                parent = STORE.sessions.get(session_id) or {}
+                if parent.get("backend", DEFAULT_BACKEND) not in {BACKEND_CLAUDE, BACKEND_CODEX}:
+                    raise HTTPException(status_code=409, detail="This backend cannot fork a running chat safely; wait for its turn to finish.")
+                snapshot = completed_fork_events(
+                    await asyncio.to_thread(lambda: list(iter_session_events(session_id))),
+                    active_run_id=active_run_id,
+                    through_sequence=latest_sequence if isinstance(latest_sequence, int) else None,
+                )
             # Holding the lifecycle lock prevents a new turn or deletion from
             # crossing the provider snapshot and local-history snapshot.
             return await _fork_session_locked(
                 session_id,
                 req,
                 cleanup_state=cleanup_state,
+                **({"completed_snapshot": snapshot} if snapshot is not None else {}),
             )
         except BaseException:
             await cleanup_aborted_session_fork(cleanup_state)
@@ -77888,6 +78043,7 @@ async def _fork_session_locked(
     req: ForkSessionRequest,
     *,
     cleanup_state: dict[str, str | None] | None = None,
+    completed_snapshot: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if cleanup_state is None:
         cleanup_state = {}
@@ -77898,20 +78054,44 @@ async def _fork_session_locked(
     fork_cwd = validated_fork_cwd(parent)
     parent["cwd"] = fork_cwd
     parent_backend = (parent.get("backend") or DEFAULT_BACKEND).lower()
+    live_snapshot = completed_snapshot is not None
+    empty_snapshot = live_snapshot and not completed_snapshot
     parent_codex_thread_id = parent.get("codex_thread_id") or (
         parent.get("session_id") if parent_backend == BACKEND_CODEX else None
     )
     parent_claude_session_id = (
         validated_claude_fork_provider_id(parent, session_id, fork_cwd)
-        if parent_backend == BACKEND_CLAUDE
+        if parent_backend == BACKEND_CLAUDE and not empty_snapshot
         else None
     )
+    # A not-yet-started Claude child still resumes its ancestor at this exact
+    # cutoff. Forking that child again must not lose the inherited boundary.
+    claude_cutoff = parent.get("fork_resume_session_at") if parent.get("fork_from") and not empty_snapshot else None
+    codex_cutoff = None
+    if live_snapshot and not empty_snapshot:
+        terminal = completed_snapshot[-1]
+        if parent_backend == BACKEND_CLAUDE and not parent_claude_session_id:
+            raise HTTPException(status_code=409, detail="The completed Claude turn has no resumable provider snapshot. The running chat was left unchanged.")
+        if parent_backend == BACKEND_CLAUDE and parent_claude_session_id:
+            try:
+                claude_cutoff = await asyncio.to_thread(
+                    claude_completed_fork_boundary, parent, parent_claude_session_id, completed_snapshot,
+                )
+            except (OSError, ValueError) as exc:
+                raise HTTPException(status_code=409, detail="The completed Claude transcript snapshot is unavailable. The running chat was left unchanged.") from exc
+        elif parent_backend == BACKEND_CODEX:
+            codex_cutoff = str(terminal.get("provider_turn_id") or "")
+            if not parent_codex_thread_id or not codex_cutoff or str(terminal.get("provider_thread_id") or "") != str(parent_codex_thread_id):
+                raise HTTPException(status_code=409, detail="The last completed Codex turn has no verifiable native snapshot. The running chat was left unchanged; retry after it finishes.")
     forked_codex_thread_id: str | None = None
     codex_fork_error: str | None = None
 
-    if parent_backend == BACKEND_CODEX and parent_codex_thread_id:
+    if parent_backend == BACKEND_CODEX and parent_codex_thread_id and not empty_snapshot:
         try:
-            forked_codex_thread_id = await fork_codex_thread(str(parent_codex_thread_id), parent)
+            forked_codex_thread_id = await fork_codex_thread(
+                str(parent_codex_thread_id), parent,
+                **({"last_turn_id": codex_cutoff} if codex_cutoff else {}),
+            )
             cleanup_state["provider_thread_id"] = forked_codex_thread_id
             logger.info(
                 "forked codex thread parent_session=%s source_thread=%s forked_thread=%s",
@@ -77926,6 +78106,8 @@ async def _fork_session_locked(
             cleanup_state["provider_thread_id"] = e.thread_id
             raise
         except Exception as e:
+            if live_snapshot:
+                raise HTTPException(status_code=409, detail="The native completed-turn fork could not be verified. The running chat was left unchanged.") from e
             logger.warning(
                 "codex fork failed parent_session=%s source_thread=%s: %s",
                 session_id,
@@ -77933,7 +78115,7 @@ async def _fork_session_locked(
                 e,
             )
             codex_fork_error = str(e)
-    elif parent_backend == BACKEND_CODEX:
+    elif parent_backend == BACKEND_CODEX and not empty_snapshot:
         # A goal-reconciliation rollover can deliberately detach an unsafe
         # provider thread. A UI fork must still inherit bounded conversational
         # memory; silently creating an empty Codex thread makes the fork look
@@ -78054,6 +78236,8 @@ async def _fork_session_locked(
                 forked_codex_thread_id,
             )
             cleanup_state["provider_thread_id"] = None
+            if live_snapshot:
+                raise HTTPException(status_code=409, detail="The completed-turn fork could not be bound safely. The running chat was left unchanged.") from exc
             codex_fork_error = str(exc)
             forked_codex_thread_id = None
     ordered_sessions = await STORE.reorder(child["id"], target_id=session_id, placement="after")
@@ -78090,6 +78274,8 @@ async def _fork_session_locked(
             await STORE.save()
     if parent_claude_session_id:
         child["fork_from"] = parent_claude_session_id
+        if claude_cutoff:
+            child["fork_resume_session_at"] = claude_cutoff
         async with STORE._lock:
             STORE.sessions[child["id"]] = child
             await STORE.save()
@@ -78097,7 +78283,10 @@ async def _fork_session_locked(
     # rows inside copy_fork_history. Any exception escaping that function is a
     # transactional clone failure, so fail closed and let the outer wrapper
     # remove both the local child and its provider fork.
-    copied = await copy_fork_history(session_id, child["id"])
+    copied = await copy_fork_history(
+        session_id, child["id"],
+        **({"source_events": completed_snapshot} if live_snapshot else {}),
+    )
     history_copy_error: str | None = None
     if forked_codex_thread_id:
         await append_event(

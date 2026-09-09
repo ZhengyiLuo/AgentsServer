@@ -168,6 +168,38 @@ class TeamMessagesServiceTests(unittest.TestCase):
 
     # -- feed ---------------------------------------------------------------
 
+    def test_inbox_removal_is_scoped_to_recipient_and_keeps_shared_content(self) -> None:
+        created = self.send(self.owner, [
+            {"kind": "human", "id": self.member["principal"]["id"]},
+            {"kind": "human", "id": self.guest["principal"]["id"]},
+        ])
+        member_id = self.member["principal"]["id"]
+        path = f"{self.base}/messages/{created['id']}/dismissals"
+        body = {"address_kind": "human", "address_id": member_id, "idempotency_key": _key()}
+        self.post(self.guest, path, body, expected=403)
+        removed = self.post(self.member, path, body)
+        self.assertEqual(self.post(self.member, path, body), removed)
+        self.assertTrue(removed["dismissed"])
+        inbox = f"{self.base}/messages?box=inbox&address_kind=human&address_id="
+        self.assertEqual(self.get(self.member, inbox + member_id)["messages"], [])
+        self.assertEqual(self.get(self.member, inbox + member_id + "&unread=true")["messages"], [])
+        self.assertEqual(len(self.get(self.guest, inbox + self.guest["principal"]["id"])["messages"]), 1)
+        self.assertEqual(len(self.get(self.owner, f"{self.base}/messages?box=sent")["messages"]), 1)
+        self.assertEqual(self.get(self.member, f"{self.base}/messages/{created['id']}")["message"]["body"], created["body"])
+
+    def test_bulletin_history_returns_one_preserved_body_and_save_replay(self) -> None:
+        created = self.send(self.owner, [{"kind": "all"}], body="Original version")
+        path = f"{self.base}/messages/{created['id']}/revisions"
+        payload = {"body": "Updated version", "expected_version": 1, "idempotency_key": _key()}
+        revised = self.post(self.owner, path, payload)
+        self.assertEqual(self.post(self.owner, path, payload), revised)
+        history = self.get(self.member, path)
+        self.assertEqual([row["version"] for row in history["versions"]], [2, 1])
+        self.assertNotIn("body", history["versions"][0])
+        original = self.get(self.member, path + "?version=1")
+        self.assertEqual(len(original["versions"]), 1)
+        self.assertEqual(original["versions"][0]["body"], "Original version")
+
     def test_feed_post_is_visible_to_all_and_guest_is_read_only(self) -> None:
         created = self.send(self.owner, [{"kind": "all"}], body="Hello **team**")
         self.assertEqual(created["kind"], "message")

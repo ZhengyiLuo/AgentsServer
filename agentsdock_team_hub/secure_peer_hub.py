@@ -456,15 +456,32 @@ class SecurePeerHubAdapter:
     def _team_receipt_body(cls, request: ProxyRequest) -> dict[str, Any]:
         value = cls._object_body(
             request,
-            allowed={"state", "idempotency_key"},
+            allowed={"state", "idempotency_key", "address_kind", "address_id"},
             required={"state", "idempotency_key"},
         )
         if value.get("state") not in {"delivered", "read"}:
             raise HubError("invalid_request", "Request body is invalid", 422)
+        if ("address_kind" in value) != ("address_id" in value):
+            raise HubError("invalid_request", "Receipt mailbox requires kind and id", 422)
+        if "address_kind" in value and value["address_kind"] not in {"human", "server"}:
+            raise HubError("invalid_request", "Receipt mailbox is invalid", 422)
         return {
             "state": value["state"],
             "idempotency_key": cls._identifier(value["idempotency_key"], minimum=8),
+            **({"address_kind": value["address_kind"], "address_id": cls._identifier(value["address_id"], minimum=8)}
+               if "address_kind" in value else {}),
         }
+
+    @classmethod
+    def _team_dismissal_body(cls, request: ProxyRequest) -> dict[str, Any]:
+        value = cls._object_body(request,
+            allowed={"address_kind", "address_id", "idempotency_key"},
+            required={"address_kind", "address_id", "idempotency_key"})
+        if value["address_kind"] not in {"human", "server"}:
+            raise HubError("invalid_request", "Mailbox is invalid", 422)
+        return {"address_kind": value["address_kind"],
+            "address_id": cls._identifier(value["address_id"], minimum=8),
+            "idempotency_key": cls._identifier(value["idempotency_key"], minimum=8)}
 
     @classmethod
     def _team_message_revision_body(cls, request: ProxyRequest) -> dict[str, Any]:
@@ -529,12 +546,14 @@ class SecurePeerHubAdapter:
         ):
             raise HubError("invalid_request", "Query is invalid", 422)
         values = dict(pairs)
-        for key in ("after_sequence", "limit"):
+        for key in ("after_sequence", "limit", "version"):
             if key in values and (
                 not values[key].isdigit() or str(int(values[key])) != values[key]
             ):
                 raise HubError("invalid_request", "Query is invalid", 422)
         if "limit" in values and not 1 <= int(values["limit"]) <= 100:
+            raise HubError("invalid_request", "Query is invalid", 422)
+        if "version" in values and not 1 <= int(values["version"]) <= 200:
             raise HubError("invalid_request", "Query is invalid", 422)
         if "cursor" in values:
             if re.fullmatch(r"v1\.[A-Za-z0-9_-]{38,500}", values["cursor"]) is None:
@@ -936,8 +955,10 @@ class SecurePeerHubAdapter:
                     and pieces[1:3] == [_NETWORK_CHILD, "messages"]
                     and pieces[4] == "revisions"
                 ):
+                    values = self._team_query(request, allowed={"version"})
                     result = self.store.list_team_message_revisions(
-                        claims, team_id, self._resource_id(pieces[3])
+                        claims, team_id, self._resource_id(pieces[3]),
+                        version=int(values["version"]) if "version" in values else None,
                     )
                 elif len(pieces) == 4 and pieces[1:3] == [_NETWORK_CHILD, "attachments"]:
                     result = self.store.get_team_attachment(
@@ -978,7 +999,13 @@ class SecurePeerHubAdapter:
                 remainder = path[len(_TEAM_PREFIX) :]
                 pieces = remainder.split("/")
                 team_id = pieces[0]
-                if len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "agents"]:
+                if len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "server-profile"]:
+                    self._query(request, allowed=set())
+                    body = self._object_body(request, allowed={"display_name"}, required={"display_name"})
+                    result = self.store.rename_network_server(
+                        claims, team_id, self._identifier(body["display_name"], maximum=160)
+                    )
+                elif len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "agents"]:
                     result = self.store.register_network_agent(
                         claims, team_id, self._network_agent_body(request)
                     )
@@ -1076,6 +1103,14 @@ class SecurePeerHubAdapter:
                         team_id,
                         self._resource_id(pieces[3]),
                         self._team_message_revision_body(request),
+                    )
+                elif (
+                    len(pieces) == 5
+                    and pieces[1:3] == [_NETWORK_CHILD, "messages"]
+                    and pieces[4] == "dismissals"
+                ):
+                    result = self.store.dismiss_team_message(
+                        claims, team_id, self._resource_id(pieces[3]), self._team_dismissal_body(request)
                     )
                 elif len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "attachments"]:
                     result = self.store.declare_team_attachment(

@@ -8207,6 +8207,7 @@ class TeamHubHostEnableRequest(BaseModel):
     expected_server_instance_id: str = Field(min_length=8, max_length=240)
     confirmed: Literal[True]
     server_name: str = Field(min_length=1, max_length=160)
+    network_name: str | None = Field(default=None, min_length=1, max_length=160)
 
     @field_validator("request_id", mode="before")
     @classmethod
@@ -8228,9 +8229,11 @@ class TeamHubHostEnableRequest(BaseModel):
             raise ValueError("confirmed must be the JSON boolean true")
         return value
 
-    @field_validator("server_name", mode="before")
+    @field_validator("server_name", "network_name", mode="before")
     @classmethod
     def require_canonical_server_name(cls, value: Any) -> Any:
+        if value is None:
+            return None
         if not isinstance(value, str):
             raise ValueError(SERVER_DISPLAY_NAME_ERROR)
         try:
@@ -67957,6 +67960,9 @@ TEAM_HUB_SERVER_SESSION_ROUTE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("GET", re.compile(r"^/v1/teams/[^/]+/network/messages/[^/]+$")),
     ("DELETE", re.compile(r"^/v1/teams/[^/]+/network/messages/[^/]+$")),
     ("POST", re.compile(r"^/v1/teams/[^/]+/network/messages/[^/]+/receipts$")),
+    ("POST", re.compile(r"^/v1/teams/[^/]+/network/messages/[^/]+/dismissals$")),
+    ("GET", re.compile(r"^/v1/teams/[^/]+/network/messages/[^/]+/revisions$")),
+    ("POST", re.compile(r"^/v1/teams/[^/]+/network/messages/[^/]+/revisions$")),
     ("POST", re.compile(r"^/v1/teams/[^/]+/network/attachments$")),
     ("GET", re.compile(r"^/v1/teams/[^/]+/network/attachments/[^/]+$")),
     ("PUT", re.compile(r"^/v1/teams/[^/]+/network/attachments/[^/]+/content$")),
@@ -69186,6 +69192,7 @@ def team_hub_host_control_capability() -> dict[str, Any]:
         "enabled": enabled,
         "can_enable": authenticated and not enabled,
         "can_disable": authenticated and enabled,
+        "server_bootstrap": authenticated,
         "required": False,
         "version": 1,
         "status_path": "/api/admin/team-hub/host",
@@ -69636,6 +69643,24 @@ async def reconcile_pending_team_hub_host_control() -> None:
         )
 
 
+async def bootstrap_requested_team_network(body: TeamHubHostEnableRequest) -> None:
+    if body.network_name is None:
+        return
+    store = TEAM_HUB_RUNTIME.store
+    if not TEAM_HUB_RUNTIME.designated_host or store is None:
+        raise TeamHubHostControlFailure(
+            "team_hub_bootstrap_unavailable", "The Team Network host is unavailable.",
+            action="Retry after the host is available.", retryable=True,
+        )
+    try:
+        await asyncio.to_thread(store.bootstrap_managed_network, body.network_name)
+    except HubError as exc:
+        raise TeamHubHostControlFailure(
+            exc.code, exc.message, status_code=exc.status_code,
+            action="Refresh Team Network before trying again.",
+        ) from exc
+
+
 async def enable_team_hub_host(
     body: TeamHubHostEnableRequest,
 ) -> dict[str, Any]:
@@ -69650,6 +69675,7 @@ async def enable_team_hub_host(
             and TEAM_HUB_RUNTIME.designated_host
             and AGENTSDOCK_SERVER_DISPLAY_NAME == body.server_name
         ):
+            await bootstrap_requested_team_network(body)
             return public_team_hub_host_control_status(prior)
         if TEAM_HUB_RUNTIME.designated_host:
             previous_name = AGENTSDOCK_SERVER_DISPLAY_NAME
@@ -69708,6 +69734,7 @@ async def enable_team_hub_host(
                 body.server_name,
                 configuration,
             )
+            await bootstrap_requested_team_network(body)
             completed = write_team_hub_host_control_status(
                 phase="complete",
                 request_id=request_id,
@@ -69777,6 +69804,7 @@ async def enable_team_hub_host(
         else:
             cancellation_to_raise = None
         publish_team_hub_runtime_globals("host", body.server_name, configuration)
+        await bootstrap_requested_team_network(body)
         completed = write_team_hub_host_control_status(
             phase="complete",
             request_id=request_id,
@@ -69797,6 +69825,11 @@ async def enable_team_hub_host(
 async def disable_team_hub_host(
     body: TeamHubHostEnableRequest,
 ) -> dict[str, Any]:
+    if body.network_name is not None:
+        raise TeamHubHostControlFailure(
+            "invalid_request", "Only a host can create a Team Network.",
+            status_code=422, action="Select Host to create a network.",
+        )
     request_id = str(body.request_id)
     async with TEAM_HUB_HOST_CONTROL_LOCK:
         require_team_hub_host_control_target(body)
@@ -69823,6 +69856,8 @@ async def disable_team_hub_host(
                 SECURE_PEER_RUNTIME.set_display_name(body.server_name)
                 TEAM_HUB_RUNTIME.managed_host_display_name = body.server_name
                 SECURE_PEER_RUNTIME.resume_member_after_host()
+                if previous_name != body.server_name:
+                    await asyncio.to_thread(SECURE_PEER_RUNTIME.publish_display_name, body.server_name)
             except Exception as exc:
                 rollback_errors: list[BaseException] = []
                 if config_snapshot is not None:
@@ -70892,6 +70927,7 @@ async def health() -> dict[str, Any]:
         "api_contract_version": API_CONTRACT_VERSION,
         "server_identity": server_identity(),
         "server_instance_id": SERVER_INSTANCE_ID,
+        "server_name": AGENTSDOCK_SERVER_DISPLAY_NAME,
         "state_dir": str(STATE_DIR),
         "default_backend": DEFAULT_BACKEND,
         "default_cwd": existing_cwd(DEFAULT_CWD),

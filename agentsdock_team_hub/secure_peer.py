@@ -4782,6 +4782,8 @@ def sanitize_proxy_request(
                 and normalized_method == "GET"
             ):
                 route_allowed = True
+            elif pieces == ["server-profile"] and normalized_method == "POST":
+                route_allowed = True
             elif pieces == ["agents"] and normalized_method == "POST":
                 route_allowed = True
             elif pieces == ["bulletin"] and normalized_method in {"GET", "POST"}:

@@ -97,6 +97,49 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
             )
         )
 
+    def test_team_message_mailbox_removal_and_revision_history_over_peer_route(self) -> None:
+        base = f"/v1/teams/{self.team_id}/network"
+        directory = json.loads(self.request("GET", base).body)
+        node = next(row for row in directory["servers"] if row["server_identity"] == self.peer.peer_server_identity)
+        message = self.store.create_team_message(self.owner, self.team_id, {
+            "kind": "message", "body": "Incoming mail", "recipients": [{"kind": "server", "id": node["id"]}],
+            "idempotency_key": "peer-incoming-mail",
+        })["message"]
+        addressed = {"address_kind": "server", "address_id": node["id"]}
+        receipt = self.request("POST", f"{base}/messages/{message['id']}/receipts",
+            body={**addressed, "state": "read", "idempotency_key": "peer-read-mail"})
+        self.assertEqual(receipt.status, 200, receipt.body)
+        removed = self.request("POST", f"{base}/messages/{message['id']}/dismissals",
+            body={**addressed, "idempotency_key": "peer-dismiss-mail"})
+        self.assertEqual(removed.status, 200, removed.body)
+        inbox = self.request("GET", f"{base}/messages", query=f"box=inbox&address_kind=server&address_id={node['id']}")
+        self.assertEqual(json.loads(inbox.body)["messages"], [])
+        broadcast = self.request("POST", f"{base}/messages", body={
+            "kind": "message", "body": "Original broadcast", "recipients": [{"kind": "all"}],
+            "idempotency_key": "peer-broadcast-history"})
+        message_id = json.loads(broadcast.body)["message"]["id"]
+        revision = self.request("POST", f"{base}/messages/{message_id}/revisions", body={
+            "body": "Updated broadcast", "expected_version": 1, "idempotency_key": "peer-revise-broadcast"})
+        self.assertEqual(revision.status, 200, revision.body)
+        history = self.request("GET", f"{base}/messages/{message_id}/revisions", query="version=1")
+        self.assertEqual(history.status, 200, history.body)
+        self.assertEqual(json.loads(history.body)["versions"][0]["body"], "Original broadcast")
+
+    def test_server_rename_changes_only_directory_name_and_survives_reprovision(self) -> None:
+        path = f"/v1/teams/{self.team_id}/network/server-profile"
+        renamed = self.request("POST", path, body={"display_name": "Renamed server"})
+        self.assertEqual(renamed.status, 200, renamed.body)
+        value = json.loads(renamed.body)["server"]
+        self.assertEqual(value["server_identity"], self.peer.peer_server_identity)
+        self.adapter.provision_peer({"peer_id": self.peer_id, "peer_server_identity": self.peer.peer_server_identity,
+                                     "team_id": self.team_id}, display_name=self.peer.peer_display_name)
+        result = json.loads(self.request("GET", f"/v1/teams/{self.team_id}/network").body)
+        self.assertEqual(next(server for server in result["servers"] if server["id"] == value["id"])["display_name"], "Renamed server")
+        denied = self.request("POST", path, body={"display_name": "Other", "server_id": "someone-else"})
+        self.assertEqual(denied.status, 422)
+        denied = self.request("POST", "/v1/teams/other-team/network/server-profile", body={"display_name": "Other"})
+        self.assertEqual(denied.status, 403)
+
     def test_peer_session_and_team_are_service_scoped(self) -> None:
         session = self.request("GET", "/v1/peer-session")
         self.assertEqual(session.status, 200)

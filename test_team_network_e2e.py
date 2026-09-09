@@ -475,7 +475,7 @@ class TeamNetworkE2EAcceptanceTests(unittest.TestCase):
         self.assertEqual(host_servers[HOST_SERVER_IDENTITY]["display_name"], "Sonic")
         self.assertEqual(
             host_servers[HOST_SERVER_IDENTITY]["recipient_display_name"],
-            "Network owner",
+            "Sonic",
         )
         self.assertEqual(
             host_servers[MEMBER_SERVER_IDENTITY]["recipient_display_name"],

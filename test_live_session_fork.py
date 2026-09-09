@@ -1,4 +1,7 @@
 import asyncio
+import hashlib
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -110,3 +113,40 @@ class CompletedPrefixForkTests(unittest.IsolatedAsyncioTestCase):
     def test_claude_missing_deferred_snapshot_never_launches_fresh(self):
         with self.assertRaisesRegex(ValueError, "refusing an empty resume"):
             server.build_claude_cmd("child", {"fork_from": "parent", "fork_resume_session_at": "uuid"}, Path("manifest"))
+
+    def test_imported_checkpoint_proves_exact_completed_tail_despite_later_live_append(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "provider.jsonl"
+            parent = {"id": "parent", "backend": "claude", "claude_session_id": "provider", "cwd": str(root)}
+            native = {
+                "type": "assistant", "uuid": "completed-uuid", "timestamp": "2026-09-08T10:00:40Z",
+                "message": {"stop_reason": "end_turn", "content": [{"type": "text", "text": "Completed answer"}]},
+            }
+            for invalid in (None, "partial", "later-user", "changed-prefix"):
+                with self.subTest(invalid=invalid):
+                    record = {**native, "message": {**native["message"], "stop_reason": None}} if invalid == "partial" else native
+                    prefix = (json.dumps(record) + "\n").encode()
+                    if invalid == "later-user":
+                        prefix += (json.dumps({"type": "user", "message": {"content": "New incomplete turn"}}) + "\n").encode()
+                    path.write_bytes(prefix + b'{"type":"user","message":{"content":"LIVE: must not copy"}}\n')
+                    stat = path.stat()
+                    cursor = {
+                        "version": server.HISTORY_SYNC_CURSOR_VERSION, "backend": "claude", "provider_session_id": "provider",
+                        "source_path": str(path), "source_dev": stat.st_dev, "source_ino": stat.st_ino,
+                        "source_size": len(prefix), "source_offset": len(prefix), "source_mtime_ns": stat.st_mtime_ns,
+                        "source_digest": "0" * 64 if invalid == "changed-prefix" else hashlib.sha256(prefix).hexdigest(),
+                        "last_item_digest": "", "timeline_seq": 3,
+                    }
+                    events = [
+                        {"seq": 1, "type": "history_imported", "run_id": "import", "_history_sync_checkpoint": {"caught_up": True, "cursor": cursor}},
+                        {"seq": 2, "type": "assistant_text", "run_id": "import", "imported": True, "text": "Completed answer"},
+                        {"seq": 3, "type": "turn_finished", "run_id": "import", "imported": True, "result_text": "", "ts": "2026-09-08T10:42:00Z"},
+                    ]
+                    with patch.object(server, "CLAUDE_PROJECTS_ROOT", root):
+                        if invalid:
+                            with self.assertRaises(ValueError):
+                                server.claude_completed_fork_boundary(parent, "provider", events)
+                        else:
+                            self.assertEqual(server.claude_completed_fork_boundary(parent, "provider", events), "completed-uuid")
+                    self.assertEqual(events[-1]["seq"], 3)

@@ -1546,6 +1546,16 @@ exit 0
                 f"agents-server-{version}/agentsdock_team_hub/migrations/0013_team_message_revisions.sql",
                 members,
             )
+            for migration in (
+                "0014_managed_network_owner.sql",
+                "0015_team_message_inbox_dismissals.sql",
+                "0016_team_message_all_servers.sql",
+            ):
+                self.assertIn(f"migrations/{migration}", installer_source)
+                self.assertIn(
+                    f"agents-server-{version}/agentsdock_team_hub/migrations/{migration}",
+                    members,
+                )
             self.assertFalse(
                 any("__pycache__" in name or name.endswith((".pyc", ".pyo")) for name in members)
             )

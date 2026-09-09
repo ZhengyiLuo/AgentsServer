@@ -32557,7 +32557,10 @@ def collect_semantic_timeline_events(
                 # The event already updated logical-turn routing above. Its
                 # provider-only prompt is not part of the semantic response.
                 continue
-            if event_type == "turn_stopped":
+            if event_type == "turn_stopped" or (
+                event_type == "turn_finished"
+                and event.get("stopped") is True
+            ):
                 stopped_turn_keys.add(key)
             if not event_files_belong_to_session(event, session_id):
                 continue

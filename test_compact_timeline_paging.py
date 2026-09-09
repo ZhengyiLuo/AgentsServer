@@ -2231,6 +2231,102 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
             "run-a",
         )
 
+    def test_stopped_finish_native_steer_preserves_completed_commentary_in_semantic_page(
+        self,
+    ) -> None:
+        self.write_events([
+            self.event(1, "turn_started", run_id="run-a", prompt="Initial request"),
+            self.event(2, "reasoning_summary", run_id="run-a", text="Private reasoning"),
+            self.event(
+                3,
+                "reasoning_summary",
+                run_id="run-a",
+                item_id="commentary-1",
+                phase="commentary",
+                text="Completed commentary 1.",
+            ),
+            self.event(4, "tool_started", run_id="run-a", tool={"name": "exec"}),
+            self.event(
+                5,
+                "reasoning_summary",
+                run_id="run-a",
+                item_id="commentary-2",
+                phase="commentary",
+                text="Completed commentary 2.",
+            ),
+            self.event(6, "tool_finished", run_id="run-a", tool={"name": "exec"}),
+            self.event(
+                7,
+                "reasoning_summary",
+                run_id="run-a",
+                item_id="commentary-3",
+                phase="commentary",
+                text="Completed commentary 3.",
+            ),
+            self.event(
+                8,
+                "reasoning_summary",
+                run_id="run-a",
+                item_id="commentary-4",
+                phase="commentary",
+                text="Completed commentary 4.",
+            ),
+            self.event(
+                9,
+                "turn_finished",
+                run_id="run-a",
+                result_text="",
+                stopped=True,
+            ),
+            self.event(
+                10,
+                "turn_started",
+                run_id="run-b",
+                native_steer=True,
+                steer_interrupted_run_id="run-a",
+                prompt="Steered request",
+            ),
+        ])
+
+        page = agent_server.read_semantic_timeline_page(
+            self.session_id,
+            limit=2,
+            tail=True,
+        )
+
+        commentary = [
+            event
+            for event in page["events"]
+            if event["type"] == "reasoning_summary"
+            and event.get("phase") == "commentary"
+        ]
+        self.assertEqual(
+            [event["item_id"] for event in commentary],
+            [
+                "commentary-1",
+                "commentary-2",
+                "commentary-3",
+                "commentary-4",
+            ],
+        )
+        stopped_finish = next(
+            event
+            for event in page["events"]
+            if event["type"] == "turn_finished"
+            and event.get("run_id") == "run-a"
+        )
+        self.assertIs(stopped_finish.get("stopped"), True)
+        self.assertEqual(stopped_finish.get("result_text"), "")
+        self.assertEqual(
+            next(
+                event
+                for event in page["events"]
+                if event["type"] == "turn_started"
+                and event.get("run_id") == "run-b"
+            )["steer_interrupted_run_id"],
+            "run-a",
+        )
+
     def test_active_turn_preserves_completed_commentary_after_compaction(
         self,
     ) -> None:

@@ -73810,11 +73810,25 @@ async def server_update_status(
     expected_server_identity: str | None = None,
     expected_server_instance_id: str | None = None,
 ) -> dict[str, Any]:
-    async with SERVER_UPDATE_OPERATION_LOCK:
+    require_server_update_target(
+        expected_server_identity,
+        expected_server_instance_id,
+    )
+    if SERVER_UPDATE_OPERATION_LOCK.locked():
+        # Release checks may await slow network metadata while owning the
+        # operation lock. The atomically replaced durable receipt is safe to
+        # read without it; all reconciliation and mutations stay locked below.
+        return public_server_update_status(read_server_update_status())
+    async with bounded_lock(
+        SERVER_UPDATE_OPERATION_LOCK,
+        SERVER_RESTART_STATUS_LOCK_TIMEOUT_SECONDS,
+    ) as operation_lock_held:
         require_server_update_target(
             expected_server_identity,
             expected_server_instance_id,
         )
+        if not operation_lock_held:
+            return public_server_update_status(read_server_update_status())
         status = read_server_update_status()
         if managed_update_provider_quiesce_failed():
             status = ensure_managed_update_provider_quiesce_failure_status(status)

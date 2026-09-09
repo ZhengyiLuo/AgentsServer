@@ -80,7 +80,17 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Scheduled jobs", instructions)
         self.assertNotIn("Current jobs for this chat", instructions)
         self.assertIn(str(agent_server.codex_manifest_path("chat-1")), instructions)
-        self.assertIn("current turn's provider-authority block", instructions)
+        self.assertIn("run-bound AgentsDock provider tool", instructions)
+        self.assertIn(
+            f"Use only `{agent_server.CLAUDE_PROVIDER_MCP_TOOL_NAME}`",
+            instructions,
+        )
+        self.assertIn(
+            "A user-configured MCP server named `agentsdock` is unrelated",
+            instructions,
+        )
+        self.assertNotIn("Use the `agentsdock` provider tool", instructions)
+        self.assertNotIn("provider-authority block", instructions)
         self.assertNotIn("--chat-id chat-1", instructions)
         self.assertIn(agent_server.terminal_session_name("chat-1"), instructions)
         self.assertIn("immediately retry the still-safe requested operation", instructions)
@@ -120,8 +130,8 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
                     session,
                 )
 
-        # v9 also migrates resumed threads onto resumable live-wait policy.
-        self.assertEqual(agent_server.CODEX_THREAD_POLICY_VERSION, "9")
+        # v10 migrates resumed threads onto the out-of-band provider tool.
+        self.assertEqual(agent_server.CODEX_THREAD_POLICY_VERSION, "10")
         self.assertNotEqual(current_hash, previous_hash)
 
     def test_claude_policy_has_the_same_retry_and_context_hygiene_rules(self) -> None:
@@ -136,7 +146,8 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
             instructions,
         )
         self.assertIn("cannot durably deliver a later chat update", instructions)
-        self.assertIn("Jobs `--authority-file` command below", instructions)
+        self.assertIn("Jobs helper through the provider tool", instructions)
+        self.assertNotIn("--authority-file", instructions)
         # Context diet: the static addendum is appended once; the core policy
         # keeps its line budget.
         core = instructions.split(agent_server.PROVIDER_THREAD_INSTRUCTION_ADDENDUM.strip())[0]
@@ -313,7 +324,8 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(manager.resume_calls), 1)
         policy = manager.resume_calls[0][1]["developerInstructions"]
         self.assertIn("sessions/chat-child/manifests/current.json", policy)
-        self.assertIn("current turn's provider-authority block", policy)
+        self.assertIn("run-bound AgentsDock provider tool", policy)
+        self.assertNotIn("provider-authority block", policy)
         self.assertNotIn("--chat-id chat-child", policy)
         self.assertIn("zd_chat_child", policy)
         self.assertTrue(manager.resume_calls[0][1]["excludeTurns"])

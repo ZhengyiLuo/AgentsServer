@@ -45,6 +45,68 @@ def provider_line(backend: str, kind: str, text: str) -> str:
     return json.dumps(record, separators=(",", ":")) + "\n"
 
 
+SANITIZER_CHAT_ID = "sess_history_sanitizer"
+SANITIZER_RUN_ID = "run_0123456789abcdef"
+SANITIZER_NONCE = "0123456789abcdef0123456789abcdef"
+
+
+def task_notification_text(summary: str = "Background work completed") -> str:
+    return (
+        "<task-notification>\n"
+        "<task-id>task_123</task-id>\n"
+        "<tool-use-id>toolu_task_123</tool-use-id>\n"
+        "<status>completed</status>\n"
+        f"<summary>{summary}</summary>\n"
+        "</task-notification>"
+    )
+
+
+def task_notification_event(
+    *,
+    origin: dict | None = None,
+    prompt_source: str = "sdk",
+    queue_skip_attachments: bool = True,
+    content: str | None = None,
+) -> dict:
+    event = {
+        "type": "user",
+        "isSidechain": False,
+        "userType": "external",
+        "promptSource": prompt_source,
+        "queueSkipAttachments": queue_skip_attachments,
+        "message": {
+            "role": "user",
+            "content": content or task_notification_text(),
+        },
+    }
+    if origin is not None:
+        event["origin"] = origin
+    return event
+
+
+def legacy_provider_authority_block(*, compact: bool = True, chat_id: str = SANITIZER_CHAT_ID) -> str:
+    return agent_server.cross_chat_provider_authority_block(
+        [],
+        agent_server.cross_chat_authority_path(
+            SANITIZER_RUN_ID,
+            SANITIZER_NONCE,
+        ),
+        chat_id,
+        {"publish"},
+        "blocked",
+        compact=compact,
+    )
+
+
+def legacy_final_result_handoff() -> str:
+    return (
+        "\n\n[AgentsDock final-result handoff]\n"
+        "Your successful non-empty final answer will be delivered once to the explicitly referenced chat. "
+        "Do not send it manually.\n"
+        "[End AgentsDock final-result handoff]\n"
+    )
+
+
 def fake_history_timeline_scan(events: list[dict]):
     """Mirror the message-only scanner for tests with an in-memory timeline."""
 
@@ -69,6 +131,19 @@ def fake_history_timeline_scan(events: list[dict]):
                 key = agent_server.history_dedup_key(
                     "assistant", event.get("text")
                 )
+            elif (
+                event_type == "reasoning_summary"
+                and event.get("phase") == "commentary"
+                and event.get("backend") == agent_server.BACKEND_CLAUDE
+            ):
+                key = agent_server.history_dedup_key(
+                    "assistant", event.get("text")
+                )
+            elif tail and event_type in {"turn_finished", "job_summary"}:
+                result_text = event.get("result_text")
+                if not isinstance(result_text, str) or not result_text.strip():
+                    continue
+                key = agent_server.history_dedup_key("assistant", result_text)
             else:
                 continue
             has_messages = True
@@ -85,6 +160,468 @@ def fake_history_timeline_scan(events: list[dict]):
         return selected, has_messages, front_window_truncated
 
     return scan
+
+
+class ProviderTranscriptSanitizerTests(unittest.TestCase):
+    def test_structured_task_notification_is_not_imported(self) -> None:
+        generated = task_notification_event(
+            origin={"kind": "task-notification"},
+        )
+        self.assertTrue(
+            agent_server.claude_history_event_is_task_notification(generated)
+        )
+        self.assertIsNone(agent_server.claude_history_event_item(generated))
+
+    def test_human_task_notification_lookalike_is_preserved(self) -> None:
+        human = task_notification_event(
+            origin={"kind": "human"},
+            prompt_source="typed",
+            queue_skip_attachments=False,
+        )
+        self.assertFalse(
+            agent_server.claude_history_event_is_task_notification(human)
+        )
+        self.assertEqual(
+            agent_server.claude_history_event_item(human),
+            user(task_notification_text()),
+        )
+
+    def test_legacy_task_notification_fallback_requires_full_fingerprint(self) -> None:
+        legacy = task_notification_event()
+        self.assertNotIn("origin", legacy)
+        self.assertTrue(
+            agent_server.claude_history_event_is_task_notification(legacy)
+        )
+        for patch_values in (
+            {"queueSkipAttachments": False},
+            {"promptSource": "typed"},
+            {
+                "message": {
+                    "role": "user",
+                    "content": task_notification_text() + "\nHuman suffix",
+                }
+            },
+        ):
+            with self.subTest(patch=patch_values):
+                lookalike = {**legacy, **patch_values}
+                self.assertFalse(
+                    agent_server.claude_history_event_is_task_notification(
+                        lookalike
+                    )
+                )
+                self.assertIsNotNone(
+                    agent_server.claude_history_event_item(lookalike)
+                )
+
+    def test_legacy_task_notification_accepts_observed_nested_output_variant(self) -> None:
+        content = (
+            "<task-notification>\n"
+            "<task-id>task12345</task-id>\n"
+            "<tool-use-id>toolu_0123456789abcdefghijklm</tool-use-id>\n"
+            "<output-file>/tmp/task-output/result.json</output-file>\n"
+            "<status>completed</status>\n"
+            "<summary><result>done</result>\n"
+            "<diagnostics><usage>42</usage><agent_count>2</agent_count>"
+            "</diagnostics></summary>\n"
+            "</task-notification>"
+        )
+        legacy = task_notification_event(content=content)
+
+        self.assertTrue(
+            agent_server.claude_history_event_is_task_notification(legacy)
+        )
+        self.assertIsNone(agent_server.claude_history_event_item(legacy))
+
+        missing_provider_tool_id = dict(legacy)
+        missing_provider_tool_id["message"] = {
+            **legacy["message"],
+            "content": content.replace(
+                "<tool-use-id>toolu_0123456789abcdefghijklm</tool-use-id>\n",
+                "",
+            ),
+        }
+        self.assertFalse(
+            agent_server.claude_history_event_is_task_notification(
+                missing_provider_tool_id
+            )
+        )
+
+    def test_claude_preview_skips_generated_task_notification(self) -> None:
+        human = {
+            "type": "user",
+            "origin": {"kind": "human"},
+            "message": {"role": "user", "content": "Actual user prompt"},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            transcript = Path(temporary) / "claude.jsonl"
+            transcript.write_text(
+                json.dumps(task_notification_event(
+                    origin={"kind": "task-notification"},
+                ))
+                + "\n"
+                + json.dumps(human)
+                + "\n",
+                encoding="utf-8",
+            )
+            preview = agent_server.claude_transcript_preview(transcript)
+        self.assertEqual(preview, "Actual user prompt")
+
+    def test_delta_parser_skips_task_notification_and_advances_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            transcript = Path(temporary) / "claude.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            session = {
+                "id": SANITIZER_CHAT_ID,
+                "backend": agent_server.BACKEND_CLAUDE,
+                "claude_session_id": "provider-history-sanitizer",
+            }
+            with patch.object(
+                agent_server,
+                "provider_history_path",
+                return_value=transcript,
+            ):
+                _path, _items, cursor, _continued = (
+                    agent_server.load_provider_history_with_cursor(
+                        session,
+                        None,
+                        None,
+                    )
+                )
+                with transcript.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(task_notification_event(
+                        origin={"kind": "task-notification"},
+                    )) + "\n")
+                    stream.write(json.dumps({
+                        "type": "user",
+                        "origin": {"kind": "human"},
+                        "message": {"role": "user", "content": "New user text"},
+                    }) + "\n")
+                _path, items, next_cursor, continued = (
+                    agent_server.load_provider_history_with_cursor(
+                        session,
+                        None,
+                        cursor,
+                    )
+                )
+                transcript_size = transcript.stat().st_size
+
+        self.assertTrue(continued)
+        self.assertEqual(items, [user("New user text")])
+        self.assertEqual(next_cursor["source_offset"], transcript_size)
+
+    def test_compact_authority_suffix_is_removed_for_all_provider_shapes(self) -> None:
+        prompt = "Keep only this user text."
+        decorated = (
+            prompt
+            + legacy_provider_authority_block(compact=True)
+            + legacy_final_result_handoff()
+        )
+        events = (
+            {
+                "type": "user",
+                "message": {"content": decorated},
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": decorated},
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": decorated}],
+                },
+            },
+        )
+        parsed = [
+            agent_server.claude_history_event_item(
+                events[0],
+                expected_session_id=SANITIZER_CHAT_ID,
+            ),
+            agent_server.codex_history_event_item(
+                events[1],
+                expected_session_id=SANITIZER_CHAT_ID,
+            ),
+            agent_server.codex_history_event_item(
+                events[2],
+                expected_session_id=SANITIZER_CHAT_ID,
+            ),
+        ]
+        self.assertEqual(parsed, [user(prompt), user(prompt), user(prompt)])
+
+        nested = (
+            prompt
+            + legacy_provider_authority_block(compact=True)
+            + legacy_provider_authority_block(compact=True)
+        )
+        self.assertEqual(
+            agent_server.strip_agentsdock_generated_user_text(
+                nested,
+                expected_session_id=SANITIZER_CHAT_ID,
+            ),
+            prompt,
+        )
+
+    def test_authority_is_removed_before_long_provider_text_is_compacted(self) -> None:
+        prompt = "x" * (agent_server.MAX_IMPORTED_TEXT_CHARS + 500)
+        decorated = prompt + legacy_provider_authority_block(compact=True)
+        expected = agent_server.normalized_history_item("user", prompt)
+        claude = agent_server.claude_history_event_item(
+            {
+                "type": "user",
+                "message": {"content": decorated},
+            },
+            expected_session_id=SANITIZER_CHAT_ID,
+        )
+        codex = agent_server.codex_history_event_item(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": decorated}],
+                },
+            },
+            expected_session_id=SANITIZER_CHAT_ID,
+        )
+        self.assertEqual(claude, expected)
+        self.assertEqual(codex, expected)
+        self.assertNotIn(
+            agent_server.LEGACY_PROVIDER_AUTHORITY_HEADER,
+            str(claude["text"] if claude else ""),
+        )
+
+    def test_verbose_authority_and_preceding_attachment_wrapper_are_removed(self) -> None:
+        prompt = "Inspect the attachment."
+        provider_prompt = (
+            prompt
+            + "\n\n[Attached files]\n"
+            + "- /tmp/reference.png (reference.png, image/png)\n"
+            + "Use these local paths directly when needed.\n"
+        )
+        decorated = provider_prompt + legacy_provider_authority_block(compact=False)
+        self.assertEqual(
+            agent_server.strip_agentsdock_generated_user_text(
+                decorated,
+                expected_session_id=SANITIZER_CHAT_ID,
+            ),
+            prompt,
+        )
+
+    def test_authority_only_prompt_and_inline_verbose_footer_are_removed(self) -> None:
+        authority_only = legacy_provider_authority_block(compact=True).strip()
+        self.assertEqual(
+            agent_server.strip_agentsdock_generated_user_text(
+                authority_only,
+                expected_session_id=SANITIZER_CHAT_ID,
+            ),
+            "",
+        )
+
+        prompt = "Keep the real prompt."
+        inline_verbose = legacy_provider_authority_block(
+            compact=False
+        ).replace(
+            "\n[End AgentsDock provider authority]",
+            " [End AgentsDock provider authority]",
+        )
+        self.assertEqual(
+            agent_server.strip_agentsdock_generated_user_text(
+                prompt + inline_verbose,
+                expected_session_id=SANITIZER_CHAT_ID,
+            ),
+            prompt,
+        )
+
+    def test_timeline_projection_uses_the_current_imported_session_boundary(self) -> None:
+        prompt = "Migrated same-session prompt"
+        event = {
+            "session_id": SANITIZER_CHAT_ID,
+            "type": "turn_started",
+            "run_id": "import_0123456789ab",
+            "backend": agent_server.BACKEND_CLAUDE,
+            "imported": True,
+            "prompt": prompt + legacy_provider_authority_block(compact=True),
+        }
+        projected = agent_server.project_legacy_imported_provider_event(
+            event,
+            SANITIZER_CHAT_ID,
+        )
+        wrong_session = agent_server.project_legacy_imported_provider_event(
+            event,
+            "sess_history_other",
+        )
+        self.assertEqual(projected["prompt"], prompt)
+        self.assertIs(wrong_session, event)
+
+        migrated = dict(event)
+        migrated["provider_history_sanitized"] = True
+        migrated["prompt"] = (
+            prompt
+            + legacy_provider_authority_block(
+                compact=True,
+                chat_id="sess_previous_agentsdock_chat",
+            )
+        ).replace(
+            str(agent_server.CROSS_CHAT_AUTHORITY_ROOT),
+            "/home/migrated-user/.agentsdock/cross_chat_authority",
+        )
+        migrated_projection = (
+            agent_server.project_legacy_imported_provider_event(
+                migrated,
+                SANITIZER_CHAT_ID,
+            )
+        )
+        self.assertEqual(migrated_projection["prompt"], prompt)
+        self.assertEqual(
+            agent_server.claude_history_event_item({
+                "type": "user",
+                "message": {"content": migrated["prompt"]},
+            }),
+            user(prompt),
+        )
+
+    def test_authority_lookalikes_and_nonterminal_blocks_are_preserved(self) -> None:
+        exact = "User-owned evidence" + legacy_provider_authority_block(compact=True)
+        wrong_root = exact.replace(
+            str(agent_server.CROSS_CHAT_AUTHORITY_ROOT),
+            "/tmp/not-agentsdock-authority",
+        )
+        wrong_chat = "User-owned evidence" + legacy_provider_authority_block(
+            compact=True,
+            chat_id="sess_different_chat",
+        )
+        nonterminal = exact + "Human suffix"
+        marker_only = (
+            "User-owned evidence\n\n[AgentsDock provider authority]\n"
+            "ordinary quoted text\n[End AgentsDock provider authority]\n"
+        )
+        for lookalike in (wrong_root, wrong_chat, nonterminal, marker_only):
+            with self.subTest(lookalike=lookalike[:40]):
+                self.assertEqual(
+                    agent_server.strip_agentsdock_generated_user_text(
+                        lookalike,
+                        expected_session_id=SANITIZER_CHAT_ID,
+                    ),
+                    lookalike,
+                )
+
+        portable_migration = exact.replace(
+            str(agent_server.CROSS_CHAT_AUTHORITY_ROOT),
+            "/home/migrated-user/.agentsdock/cross_chat_authority",
+        )
+        self.assertEqual(
+            agent_server.strip_legacy_agentsdock_provider_authority_suffix(
+                portable_migration,
+                expected_session_id=SANITIZER_CHAT_ID,
+            ),
+            portable_migration,
+        )
+        self.assertEqual(
+            agent_server.strip_agentsdock_generated_user_text(
+                portable_migration,
+                expected_session_id=SANITIZER_CHAT_ID,
+            ),
+            "User-owned evidence",
+        )
+
+    def test_portable_authority_path_accepts_both_platforms_and_rejects_malformed(self) -> None:
+        filename = f"{SANITIZER_RUN_ID}-{SANITIZER_NONCE}.json"
+        portable_paths = (
+            f"/home/migrated/.agentsdock/cross_chat_authority/{filename}",
+            f"C:\\Users\\migrated\\.agentsdock\\cross_chat_authority\\{filename}",
+            f"C:/Users/migrated/.agentsdock/cross_chat_authority/{filename}",
+        )
+        for authority_path in portable_paths:
+            with self.subTest(authority_path=authority_path):
+                self.assertEqual(
+                    agent_server.legacy_provider_authority_run_id(
+                        authority_path,
+                        allow_portable_root=True,
+                    ),
+                    SANITIZER_RUN_ID,
+                )
+
+        current_path = str(agent_server.cross_chat_authority_path(
+            SANITIZER_RUN_ID,
+            SANITIZER_NONCE,
+        ))
+        windows_block = legacy_provider_authority_block(compact=True).replace(
+            agent_server.shlex.quote(current_path),
+            agent_server.shlex.quote(portable_paths[1]),
+        )
+        self.assertEqual(
+            agent_server.strip_agentsdock_generated_user_text(
+                "Portable user prompt" + windows_block,
+                expected_session_id=SANITIZER_CHAT_ID,
+            ),
+            "Portable user prompt",
+        )
+
+        malformed = (
+            f"relative/.agentsdock/cross_chat_authority/{filename}",
+            f"/home/migrated/.agentsdock/not_authority/{filename}",
+            f"C:\\Users\\migrated\\.agentsdock\\crosscross_chat_authority\\{filename}",
+            f"C:\\Users\\migrated\\.agentsdock\\cross_chat_authority\\..\\{filename}",
+            f"C:\\Users\\migrated\\.agentsdock\\cross_chat_authority\\run_bad-short.json",
+            f"/home/migrated\n/.agentsdock/cross_chat_authority/{filename}",
+        )
+        for authority_path in malformed:
+            with self.subTest(authority_path=authority_path):
+                self.assertIsNone(
+                    agent_server.legacy_provider_authority_run_id(
+                        authority_path,
+                        allow_portable_root=True,
+                    )
+                )
+
+    def test_duplicate_pruner_never_collapses_hidden_import_boundaries(self) -> None:
+        hidden_boundary = {
+            "type": "turn_started",
+            "run_id": "import_hidden_boundary",
+            "imported": True,
+            "prompt": "",
+            agent_server.TIMELINE_IMPORTED_PROMPT_HIDDEN_FIELD: True,
+        }
+        ordinary_empty_prompt = {
+            "type": "turn_started",
+            "run_id": "import_ordinary_empty",
+            "imported": True,
+            "prompt": "",
+        }
+
+        self.assertIsNone(
+            agent_server._prune_history_message_key(hidden_boundary)
+        )
+        self.assertIsNotNone(
+            agent_server._prune_history_message_key(ordinary_empty_prompt)
+        )
+
+    def test_sanitized_authority_prompt_matches_native_timeline(self) -> None:
+        prompt = "Asked from AgentsDock"
+        items = agent_server.parse_claude_history_events(
+            [{
+                "type": "user",
+                "message": {
+                    "content": prompt + legacy_provider_authority_block(compact=True),
+                },
+            }],
+            None,
+            expected_session_id=SANITIZER_CHAT_ID,
+        )
+        events = [{"type": "turn_started", "prompt": prompt}]
+        with patch.object(
+            agent_server,
+            "history_timeline_message_keys",
+            side_effect=fake_history_timeline_scan(events),
+        ):
+            fresh = agent_server.unsynced_history_items(
+                SANITIZER_CHAT_ID,
+                items,
+                timeline_through_seq=1,
+            )
+        self.assertEqual(fresh, [])
 
 
 class UnsyncedHistoryItemsTests(unittest.TestCase):
@@ -199,6 +736,109 @@ class UnsyncedHistoryItemsTests(unittest.TestCase):
             ),
             [],
         )
+
+    def test_claude_commentary_is_an_owned_provider_message(self) -> None:
+        events = [
+            {
+                "seq": 11,
+                "type": "turn_started",
+                "backend": agent_server.BACKEND_CLAUDE,
+                "prompt": "asked from AgentsDock",
+            },
+            {
+                "seq": 12,
+                "type": "reasoning_summary",
+                "backend": agent_server.BACKEND_CLAUDE,
+                "phase": "commentary",
+                "text": "checking before the tool",
+            },
+        ]
+        with patch.object(
+            agent_server,
+            "history_timeline_message_keys",
+            side_effect=fake_history_timeline_scan(events),
+        ):
+            fresh, consumed_seq = agent_server.reconcile_cursor_history_items(
+                "chat-x",
+                [
+                    user("asked from AgentsDock"),
+                    assistant("checking before the tool"),
+                ],
+                timeline_after_seq=10,
+                timeline_through_seq=12,
+            )
+
+        self.assertEqual(fresh, [])
+        self.assertEqual(consumed_seq, 12)
+
+    def test_non_claude_commentary_is_not_a_provider_message_credit(self) -> None:
+        events = [{
+            "seq": 11,
+            "type": "reasoning_summary",
+            "backend": agent_server.BACKEND_CODEX,
+            "phase": "commentary",
+            "text": "Codex progress",
+        }]
+        with patch.object(
+            agent_server,
+            "history_timeline_message_keys",
+            side_effect=fake_history_timeline_scan(events),
+        ):
+            fresh, consumed_seq = agent_server.reconcile_cursor_history_items(
+                "chat-x",
+                [assistant("Codex progress")],
+                timeline_after_seq=10,
+                timeline_through_seq=11,
+            )
+
+        self.assertEqual(fresh, [assistant("Codex progress")])
+        self.assertEqual(consumed_seq, 11)
+
+    def test_compacted_scheduled_result_anchors_first_sync(self) -> None:
+        events = [
+            {"type": "turn_started", "prompt": "older human question"},
+            {"type": "assistant_text", "text": "older human answer"},
+            {
+                "type": "turn_started",
+                "purpose": "scheduled_job",
+                "job_id": "job-monitor",
+                "prompt": "monitor the fleet\n\n[legacy generated runtime suffix]",
+            },
+            {
+                "type": "turn_finished",
+                "purpose": "scheduled_job",
+                "job_id": "job-monitor",
+                "result_text": "fleet is healthy",
+            },
+        ]
+        transcript = [
+            user("older human question"),
+            assistant("older human answer"),
+            user("monitor the fleet"),
+            assistant("fleet is healthy"),
+        ]
+
+        self.assertEqual(self.select(events, transcript), [])
+
+    def test_job_summary_result_anchors_first_sync_after_compaction(self) -> None:
+        events = [
+            {"type": "turn_started", "prompt": "older human question"},
+            {"type": "assistant_text", "text": "older human answer"},
+            {
+                "type": "job_summary",
+                "purpose": "scheduled_job",
+                "job_id": "job-monitor",
+                "result_text": "latest compacted monitor report",
+            },
+        ]
+        transcript = [
+            user("older human question"),
+            assistant("older human answer"),
+            user("monitor the fleet"),
+            assistant("latest compacted monitor report"),
+        ]
+
+        self.assertEqual(self.select(events, transcript), [])
 
     def test_cursor_keeps_external_prefix_before_timeline_owned_suffix(self) -> None:
         events = [

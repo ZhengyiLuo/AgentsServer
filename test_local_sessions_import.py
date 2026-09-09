@@ -621,13 +621,18 @@ class LocalTranscriptSafetyTests(unittest.TestCase):
     def test_legacy_imported_task_notification_is_hidden_from_clients(self) -> None:
         imported = {
             "type": "turn_started",
+            "session_id": "chat-legacy",
             "backend": agent_server.BACKEND_CLAUDE,
             "run_id": "import_legacy",
             "imported": True,
             "prompt": self.TASK_NOTIFICATION,
         }
 
-        self.assertFalse(agent_server.is_client_visible_event(imported))
+        # Keep the empty turn boundary so pagination and the following answer
+        # retain their semantic owner; the provider-only text itself is
+        # removed at the shared client projection boundary.
+        self.assertTrue(agent_server.is_client_visible_event(imported))
+        self.assertEqual(agent_server.client_safe_event(imported)["prompt"], "")
         self.assertIsNone(agent_server.history_search_event_record(imported))
         self.assertTrue(agent_server.is_client_visible_event({
             **imported,
@@ -677,6 +682,7 @@ class StagedHistoryBatchTests(unittest.IsolatedAsyncioTestCase):
             [event_type for event_type, _payload in event_specs],
             ["history_imported", "turn_started", "assistant_text", "turn_finished"],
         )
+        self.assertTrue(event_specs[1][1]["provider_history_sanitized"])
         self.assertTrue(event_specs[-1][1]["imported"])
 
     async def test_staged_history_rejects_an_incomplete_batch_write(self) -> None:

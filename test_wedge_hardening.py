@@ -257,6 +257,11 @@ class ExplicitStopDeadlineTests(unittest.IsolatedAsyncioTestCase):
                  "managed_server_update_blocker",
                  return_value=None,
              ), \
+             patch.object(
+                 agent_server,
+                 "managed_server_update_scheduled_job_blocker",
+                 return_value=None,
+             ), \
              self.assertLogs(agent_server.logger, level="ERROR") as logs:
             result = await asyncio.wait_for(
                 agent_server.stop_turn_endpoint("chat"),
@@ -806,6 +811,7 @@ class ImportedHistoryLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 sess, Path("/tmp/rollout.jsonl"), [{"kind": "user", "text": "hello"}],
             )
         self.assertEqual([kind for kind, _ in appended], ["history_imported", "turn_started", "turn_finished"])
+        self.assertTrue(appended[1][1]["provider_history_sanitized"])
         self.assertTrue(appended[-1][1]["imported"])
         self.assertEqual(appended[-1][1]["run_id"], appended[1][1]["run_id"])
 

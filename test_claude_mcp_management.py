@@ -10,6 +10,15 @@ from claude_sdk_client import ClaudeSDKControlTimeout
 RAW_MCP_STATUS = {
     "mcpServers": [
         {
+            "name": agent_server.CLAUDE_PROVIDER_MCP_SERVER_NAME,
+            "status": "failed",
+        },
+        {
+            "name": "agentsdock",
+            "status": "connected",
+            "scope": "user",
+        },
+        {
             "name": "dayone",
             "status": "failed",
             "error": "Bearer top-secret-token at https://private.example/path?key=secret",
@@ -157,6 +166,8 @@ class ClaudeMCPManagementTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(response["reason"])
         self.assertIsNone(response["action"])
         servers = {item["name"]: item for item in response["servers"]}
+        self.assertNotIn(agent_server.CLAUDE_PROVIDER_MCP_SERVER_NAME, servers)
+        self.assertIn("agentsdock", servers)
         self.assertEqual(
             servers["dayone"]["error"],
             "Claude could not connect to this MCP server.",
@@ -445,6 +456,25 @@ class ClaudeMCPManagementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 400)
         self.assertFalse(manager.mutate_calls)
 
+    async def test_internal_provider_mcp_cannot_be_managed_from_public_api(self) -> None:
+        manager = FakeMCPManager()
+        request = agent_server.ClaudeMCPControlRequest(
+            version=1,
+            action="disable",
+            server_name=agent_server.CLAUDE_PROVIDER_MCP_SERVER_NAME,
+            expected_generation="generation",
+        )
+
+        with self.assertRaises(agent_server.HTTPException) as raised:
+            await self.call_with_patches(manager, request)
+
+        self.assertEqual(raised.exception.status_code, 404)
+        self.assertEqual(
+            raised.exception.detail["code"],
+            "claude_mcp_server_not_found",
+        )
+        self.assertFalse(manager.mutate_calls)
+
     async def test_mutation_unavailable_wrong_backend_and_invalid_shape_fail_closed(self) -> None:
         request = agent_server.ClaudeMCPControlRequest(
             version=1,
@@ -539,7 +569,7 @@ class ClaudeMCPManagementTests(unittest.IsolatedAsyncioTestCase):
         capability = health["capabilities"]["claude_controls"]
         self.assertEqual(capability["version"], 3)
         self.assertTrue(capability["features"]["mcp_management"])
-        self.assertEqual(health["api_contract_version"], 27)
+        self.assertEqual(health["api_contract_version"], 28)
         local_import = health["capabilities"]["local_session_import_v1"]
         self.assertTrue(local_import["available"])
         self.assertEqual(local_import["version"], 1)

@@ -98,6 +98,54 @@ class AgentsDockMailCLITests(unittest.TestCase):
                     authority_file=self.authority(0o644),
                 ))
 
+    def test_authority_uses_matching_provider_environment_without_flag(self) -> None:
+        authority_file = self.authority()
+        with patch.dict("os.environ", {
+            "AGENTSDOCK_PROVIDER_AUTHORITY_FILE": authority_file,
+            "AGENTSDOCK_CHAT_ID": "source",
+        }, clear=True):
+            self.assertEqual(
+                agentsdock_mail._provider_authority(None),
+                ("provider-secret", "source"),
+            )
+
+    def test_authority_rejects_explicit_override_and_chat_mismatch(self) -> None:
+        ambient = self.authority()
+        other = self.root / "other-authority.json"
+        other.write_text(json.dumps({
+            "provider_capability": "provider-other",
+            "source_session_id": "source",
+        }))
+        other.chmod(0o600)
+        with patch.dict("os.environ", {
+            "AGENTSDOCK_PROVIDER_AUTHORITY_FILE": ambient,
+            "AGENTSDOCK_CHAT_ID": "source",
+        }, clear=True):
+            with self.assertRaisesRegex(
+                agentsdock_mail.MailCLIError,
+                "conflicts with the live provider authority",
+            ):
+                agentsdock_mail._provider_authority(str(other))
+        with patch.dict("os.environ", {
+            "AGENTSDOCK_PROVIDER_AUTHORITY_FILE": ambient,
+            "AGENTSDOCK_CHAT_ID": "other-source",
+        }, clear=True):
+            with self.assertRaisesRegex(
+                agentsdock_mail.MailCLIError,
+                "does not match the authority file",
+            ):
+                agentsdock_mail._provider_authority(None)
+
+    def test_oversized_provider_authority_environment_fails_closed(self) -> None:
+        with patch.dict("os.environ", {
+            "AGENTSDOCK_PROVIDER_AUTHORITY_FILE": "x" * 4097,
+        }, clear=True):
+            with self.assertRaisesRegex(
+                agentsdock_mail.MailCLIError,
+                "exceeds the provider runtime limit",
+            ):
+                agentsdock_mail._provider_authority(None)
+
     def test_send_uses_opaque_route_and_strict_receipt(self) -> None:
         route_id = "mail_" + "a" * 32
         calls = []
@@ -298,6 +346,32 @@ class ProviderTeamMailTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as raised:
             await agent_server.list_provider_team_mail_routes(self.request())
         self.assertEqual(raised.exception.status_code, 403)
+
+    async def test_lazy_routes_cannot_resolve_after_a_team_realm_switch(self) -> None:
+        capability = agent_server.CROSS_CHAT_CAPABILITIES[self.token_hash]
+        self.assertRegex(
+            capability["team_authority_generation"],
+            r"^[0-9a-f]{64}$",
+        )
+        with (
+            patch.object(
+                agent_server.SECURE_PEER_RUNTIME,
+                "_team_authority_epoch",
+                "provider-mail-realm-switch-test",
+            ),
+            patch.object(
+                agent_server.SECURE_PEER_RUNTIME,
+                "agent_mail_route_profiles",
+                return_value=[self.profile()],
+            ) as snapshot,
+        ):
+            with self.assertRaises(HTTPException) as changed:
+                await agent_server.list_provider_team_mail_routes(self.request())
+
+        self.assertEqual(changed.exception.status_code, 409)
+        snapshot.assert_not_called()
+        self.assertNotIn("team_mail", capability["actions"])
+        self.assertEqual(capability["team_mail_routes"], {})
 
     async def test_routes_filter_legacy_agent_profiles_and_project_server_only(self) -> None:
         server = self.profile()
@@ -604,6 +678,7 @@ class ProviderTeamMailTests(unittest.IsolatedAsyncioTestCase):
             {route_id: forged},
             snapshot[3],
             snapshot[4],
+            snapshot[5],
         )
         with (
             patch.object(
@@ -995,7 +1070,7 @@ class ProviderTeamMailTests(unittest.IsolatedAsyncioTestCase):
     async def test_health_advertises_explicit_bounded_mail_contract(self) -> None:
         with patch.object(agent_server, "AGENT_TOKEN", "configured"):
             health = await agent_server.health()
-        self.assertEqual(health["api_contract_version"], 27)
+        self.assertEqual(health["api_contract_version"], 28)
         self.assertEqual(health["capabilities"]["cursor_backend"]["version"], 2)
         capability = health["capabilities"]["agent_team_mail_v1"]
         self.assertTrue(capability["available"])
@@ -1025,12 +1100,14 @@ class ProviderTeamMailTests(unittest.IsolatedAsyncioTestCase):
             "provider_cross_chat_route_snapshot": [],
             "secure_peer_route_snapshots": [],
         }
-        _prompt, denied_path = await agent_server.issue_native_steer_provider_authority(
-            "source",
-            "run_native_denied",
-            {**base, "prompt": "/mail stale queued prompt"},
-            "ordinary new prompt",
-            "nonce-denied",
+        _prompt, denied_path, _runtime_env = (
+            await agent_server.issue_native_steer_provider_authority(
+                "source",
+                "run_native_denied",
+                {**base, "prompt": "/mail stale queued prompt"},
+                "ordinary new prompt",
+                "nonce-denied",
+            )
         )
         denied_payload = json.loads(denied_path.read_text())
         denied_hash = agent_server.hashlib.sha256(
@@ -1041,7 +1118,7 @@ class ProviderTeamMailTests(unittest.IsolatedAsyncioTestCase):
             agent_server.CROSS_CHAT_CAPABILITIES[denied_hash]["actions"],
         )
 
-        provider_prompt, allowed_path = (
+        provider_prompt, allowed_path, allowed_runtime_env = (
             await agent_server.issue_native_steer_provider_authority(
                 "source",
                 "run_native_allowed",
@@ -1059,6 +1136,10 @@ class ProviderTeamMailTests(unittest.IsolatedAsyncioTestCase):
             agent_server.CROSS_CHAT_CAPABILITIES[allowed_hash]["actions"],
         )
         self.assertEqual(
+            allowed_runtime_env["AGENTSDOCK_PROVIDER_AUTHORITY_FILE"],
+            str(allowed_path),
+        )
+        self.assertEqual(
             agent_server.CROSS_CHAT_CAPABILITIES[allowed_hash][
                 "team_mail_command"
             ],
@@ -1070,10 +1151,9 @@ class ProviderTeamMailTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("MBA", allowed_path.read_text())
         self.assertNotIn("exact body", allowed_path.read_text())
-        # The per-turn block is compact: it names the pre-bound mail grant,
-        # while the usage rules live once in the thread-level instructions.
-        self.assertIn("team_mail=prebound", provider_prompt)
-        self.assertIn("/mail server MBA exact body", provider_prompt)
+        # Server control data is out-of-band; the steering user message is exact.
+        self.assertEqual(provider_prompt, "/mail server MBA exact body")
+        self.assertNotIn("[AgentsDock provider authority]", provider_prompt)
         self.assertIn(
             "pre-bound",
             agent_server.PROVIDER_AUTHORITY_USAGE_INSTRUCTIONS,

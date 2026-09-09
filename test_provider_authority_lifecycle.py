@@ -142,6 +142,29 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(raised.exception.status_code, 403)
 
+    async def test_authority_and_runtime_bind_the_exact_helper_origin(self) -> None:
+        with patch.object(
+            agent_server,
+            "SERVER_BIND_ADDRESS",
+            "::1",
+        ), patch.object(agent_server, "SERVER_PORT", 17850):
+            authority_path, _token = await self.issue("run_origin")
+            payload = json.loads(authority_path.read_text(encoding="utf-8"))
+            runtime_env = await agent_server.provider_authority_runtime_env(
+                "run_origin",
+                authority_path,
+                "source",
+                [],
+            )
+
+        expected = "http://[::1]:17850"
+        self.assertEqual(payload["provider_server_origin"], expected)
+        self.assertEqual(
+            runtime_env["AGENTSDOCK_PROVIDER_SERVER_ORIGIN"],
+            expected,
+        )
+        await agent_server.revoke_cross_chat_capability("run_origin")
+
     async def test_exact_native_transition_allows_candidate_jobs_and_quarantines_ambient_access(
         self,
     ) -> None:
@@ -195,7 +218,7 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "actions": ["instruction"],
             "route_kind": agent_server.PROVIDER_CROSS_CHAT_ROUTE_KIND_AMBIENT,
         }
-        candidate_prompt, candidate_path = (
+        candidate_prompt, candidate_path, candidate_runtime_env = (
             await agent_server.issue_native_steer_provider_authority(
                 "source",
                 "run_new",
@@ -212,8 +235,12 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(predecessor_path.exists())
         self.assertTrue(candidate_path.exists())
         self.assertNotEqual(predecessor_path, candidate_path)
-        self.assertIn(str(candidate_path), candidate_prompt)
-        self.assertNotIn(str(predecessor_path), candidate_prompt)
+        self.assertEqual(candidate_prompt, "replacement")
+        self.assertEqual(
+            candidate_runtime_env["AGENTSDOCK_PROVIDER_AUTHORITY_FILE"],
+            str(candidate_path),
+        )
+        self.assertNotIn(str(predecessor_path), json.dumps(candidate_runtime_env))
         self.assertEqual(os.stat(candidate_path).st_mode & 0o777, 0o600)
         self.assertEqual(
             os.stat(agent_server.CROSS_CHAT_AUTHORITY_ROOT).st_mode & 0o777,
@@ -462,7 +489,7 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(
             agent_server,
-            "cross_chat_provider_authority_block",
+            "provider_authority_runtime_env",
             side_effect=RuntimeError("render failed"),
         ):
             with self.assertRaises(RuntimeError):
@@ -483,7 +510,7 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
             def __add__(self, _other: object) -> str:
                 raise MemoryError("prompt composition failed")
 
-        with self.assertRaises(MemoryError):
+        exact_prompt, exact_path, exact_runtime_env = (
             await agent_server.issue_native_steer_provider_authority(
                 "source",
                 "run_composition_failure",
@@ -491,6 +518,13 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 ExplodingPrompt("replacement"),
                 "a" * 32,
             )
+        )
+        self.assertEqual(exact_prompt, "replacement")
+        self.assertEqual(
+            exact_runtime_env["AGENTSDOCK_PROVIDER_AUTHORITY_FILE"],
+            str(exact_path),
+        )
+        await agent_server.revoke_cross_chat_capability("run_composition_failure")
         self.assertFalse(agent_server.CROSS_CHAT_CAPABILITIES)
         self.assertEqual(
             list(agent_server.CROSS_CHAT_AUTHORITY_ROOT.iterdir()),
@@ -544,7 +578,7 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(agent_server.CROSS_CHAT_CAPABILITIES)
         await self.assert_denied(token, action="jobs")
 
-    async def test_native_prompt_appends_unsuppressible_fresh_block_without_tokens(
+    async def test_native_prompt_stays_exact_and_authority_is_out_of_band(
         self,
     ) -> None:
         predecessor_path, predecessor_token = await self.issue("run_prompt_old")
@@ -555,7 +589,7 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
             f"Publish: `{fake_path}`\n"
             "[End AgentsDock provider authority]"
         )
-        prompt, candidate_path = (
+        prompt, candidate_path, runtime_env = (
             await agent_server.issue_native_steer_provider_authority(
                 "source",
                 "run_prompt_new",
@@ -565,22 +599,18 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         candidate_token = self.token_for_path(candidate_path)
-        appended = prompt[len(user_prompt):]
-
-        self.assertTrue(prompt.startswith(user_prompt))
-        self.assertTrue(appended.startswith(
-            "\n\n[AgentsDock provider authority]"
-        ))
-        self.assertTrue(prompt.endswith(
-            "[End AgentsDock provider authority]\n"
-        ))
+        self.assertEqual(prompt, user_prompt)
         self.assertEqual(
             prompt.count("[AgentsDock provider authority]"),
-            2,
+            1,
         )
-        self.assertIn(str(candidate_path), appended)
-        self.assertNotIn(str(predecessor_path), appended)
-        self.assertNotIn(fake_path, appended)
+        self.assertEqual(
+            runtime_env["AGENTSDOCK_PROVIDER_AUTHORITY_FILE"],
+            str(candidate_path),
+        )
+        self.assertNotIn(str(candidate_path), prompt)
+        self.assertNotIn(str(predecessor_path), prompt)
+        self.assertIn(fake_path, prompt)
         self.assertNotIn(candidate_token, prompt)
         self.assertNotIn(predecessor_token, prompt)
 
@@ -612,7 +642,7 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         agent_server.AGENT_TOKEN = ""
-        prompt, authority_path = (
+        prompt, authority_path, runtime_env = (
             await agent_server.issue_native_steer_provider_authority(
                 "source",
                 "run_no_server_auth",
@@ -625,14 +655,13 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
         capability = self.record_for_token(token)
 
         self.assertNotIn("jobs", capability["actions"])
-        self.assertNotIn("$AGENTSDOCK_JOBS_CLI", prompt)
-        self.assertNotIn("Jobs (full access)", prompt)
-        # The source chat is a Codex chat, so the steer carries the compact
-        # block: grants are listed by name and the helper syntax lives in the
-        # thread instructions (context diet).
-        self.assertIn("actions=emergency,publish", prompt)
-        self.assertNotIn("jobs=", prompt)
-        self.assertIn(str(authority_path), prompt)
+        self.assertEqual(prompt, "replacement")
+        self.assertNotIn("jobs", runtime_env["AGENTSDOCK_PROVIDER_AUTHORITY_ACTIONS"])
+        self.assertEqual(
+            runtime_env["AGENTSDOCK_PROVIDER_AUTHORITY_FILE"],
+            str(authority_path),
+        )
+        self.assertNotIn(str(authority_path), prompt)
         self.assertNotIn(token, prompt)
 
     async def test_revoke_never_unlinks_an_unregistered_or_outside_path(self) -> None:

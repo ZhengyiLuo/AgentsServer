@@ -7,6 +7,8 @@ from typing import Any
 
 from claude_sdk_client import (
     CLAUDE_NON_DURABLE_SCHEDULER_TOOLS,
+    CLAUDE_PROVIDER_MCP_SERVER_NAME,
+    CLAUDE_PROVIDER_MCP_TOOL_NAME,
     CLAUDE_SDK_LITERAL_MESSAGE_PREFIX,
     CLAUDE_SDK_MCP_STATUS_SCAN_LIMIT,
     CLAUDE_SDK_MCP_STATUS_TRUNCATED_KEY,
@@ -24,6 +26,7 @@ from claude_sdk_client import (
     claude_nondurable_scheduler_reason,
     claude_untracked_background_reason,
     reject_nondurable_scheduler_hook,
+    reject_subagent_provider_tool_hook,
     reject_untracked_background_hook,
 )
 
@@ -1991,6 +1994,16 @@ class ClaudeSDKMCPControlTests(unittest.IsolatedAsyncioTestCase):
                 options={},
                 configuration_key="profile-a",
             )
+            factory.clients[0].mcp_servers.extend([
+                {
+                    "name": CLAUDE_PROVIDER_MCP_SERVER_NAME,
+                    "status": "failed",
+                },
+                {
+                    "name": "agentsdock",
+                    "status": "failed",
+                },
+            ])
             updated, _generation = await manager.mutate_mcp_server(
                 "mcp-chat",
                 action="reconnect_all",
@@ -2005,7 +2018,12 @@ class ClaudeSDKMCPControlTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(reconnects, [
                 ("reconnect_mcp_server", "dayone"),
                 ("reconnect_mcp_server", "login"),
+                ("reconnect_mcp_server", "agentsdock"),
             ])
+            self.assertNotIn(
+                ("reconnect_mcp_server", CLAUDE_PROVIDER_MCP_SERVER_NAME),
+                reconnects,
+            )
             statuses = {
                 item["name"]: item["status"]
                 for item in updated["mcpServers"]
@@ -2360,6 +2378,31 @@ class ClaudeSDKLoopOwnershipTests(unittest.TestCase):
 
 
 class ClaudeSDKBackgroundTrackingHookTests(unittest.IsolatedAsyncioTestCase):
+    async def test_provider_tool_hook_allows_root_and_denies_subagent(self) -> None:
+        root = await reject_subagent_provider_tool_hook(
+            {
+                "tool_name": CLAUDE_PROVIDER_MCP_TOOL_NAME,
+                "tool_input": {},
+            },
+            "tool-root",
+            {"signal": None},
+        )
+        self.assertEqual(root, {})
+
+        child = await reject_subagent_provider_tool_hook(
+            {
+                "tool_name": CLAUDE_PROVIDER_MCP_TOOL_NAME,
+                "tool_input": {},
+                "agent_id": "child-1",
+                "agent_type": "general-purpose",
+            },
+            "tool-child",
+            {"signal": None},
+        )
+        output = child["hookSpecificOutput"]
+        self.assertEqual(output["permissionDecision"], "deny")
+        self.assertIn("top-level live turn", output["permissionDecisionReason"])
+
     def test_rejects_common_untracked_shell_detachment(self) -> None:
         for command in (
             "nohup python sweep.py > sweep.log 2>&1 &",
@@ -2435,7 +2478,7 @@ class ClaudeSDKBackgroundTrackingHookTests(unittest.IsolatedAsyncioTestCase):
                 reason = claude_nondurable_scheduler_reason(tool_name)
                 self.assertIsNotNone(reason)
                 self.assertIn(tool_name, str(reason))
-                self.assertIn("AgentsDock Jobs CLI", str(reason))
+                self.assertIn("AgentsDock provider tool", str(reason))
                 self.assertIn("explicitly requested", str(reason))
         for tool_name in (
             "CronList",
@@ -2461,7 +2504,11 @@ class ClaudeSDKBackgroundTrackingHookTests(unittest.IsolatedAsyncioTestCase):
                 output = result["hookSpecificOutput"]
                 self.assertEqual(output["hookEventName"], "PreToolUse")
                 self.assertEqual(output["permissionDecision"], "deny")
-                self.assertIn("provider-authority block", output["permissionDecisionReason"])
+                self.assertIn("AgentsDock provider tool", output["permissionDecisionReason"])
+                self.assertNotIn(
+                    "provider-authority block",
+                    output["permissionDecisionReason"],
+                )
         for tool_name in ("CronList", "CronDelete", "MonitorStatus", "monitor"):
             with self.subTest(tool_name=tool_name):
                 self.assertEqual(
@@ -2487,13 +2534,14 @@ class ClaudeSDKBackgroundTrackingHookTests(unittest.IsolatedAsyncioTestCase):
         matchers = hooks["PreToolUse"]
         self.assertEqual(
             [matcher.matcher for matcher in matchers],
-            ["Bash", *CLAUDE_NON_DURABLE_SCHEDULER_TOOLS],
+            [CLAUDE_PROVIDER_MCP_TOOL_NAME, "Bash", *CLAUDE_NON_DURABLE_SCHEDULER_TOOLS],
         )
         self.assertTrue(all(matcher.timeout == 5.0 for matcher in matchers))
-        self.assertEqual(matchers[0].hooks, [reject_untracked_background_hook])
+        self.assertEqual(matchers[0].hooks, [reject_subagent_provider_tool_hook])
+        self.assertEqual(matchers[1].hooks, [reject_untracked_background_hook])
         self.assertTrue(all(
             matcher.hooks == [reject_nondurable_scheduler_hook]
-            for matcher in matchers[1:]
+            for matcher in matchers[2:]
         ))
 
 

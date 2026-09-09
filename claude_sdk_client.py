@@ -51,6 +51,17 @@ CLAUDE_NON_DURABLE_SCHEDULER_TOOLS = (
     "Monitor",
     "ScheduleWakeup",
 )
+# Deliberately collision-resistant: a user's ordinary MCP named
+# ``agentsdock`` must remain visible and manageable. This reserved transport
+# is installed by AgentsServer and is never part of the public MCP profile.
+CLAUDE_PROVIDER_MCP_SERVER_NAME = "_agentsdock_internal_provider_9f3a2c71"
+CLAUDE_PROVIDER_MCP_TOOL_NAME = (
+    f"mcp__{CLAUDE_PROVIDER_MCP_SERVER_NAME}__run"
+)
+_CLAUDE_PROVIDER_MCP_SUBAGENT_REASON = (
+    "AgentsDock provider actions belong to the exact top-level live turn; "
+    "Claude subagents cannot use that authority."
+)
 
 
 def claude_sdk_transport_prompt(prompt: str) -> str:
@@ -306,6 +317,37 @@ def create_claude_agent_options(**kwargs: Any) -> Any:
     return ClaudeAgentOptions(**kwargs)
 
 
+def create_claude_sdk_mcp_server(
+    *,
+    name: str,
+    version: str,
+    tool_name: str,
+    description: str,
+    input_schema: dict[str, Any],
+    handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]],
+) -> Any:
+    """Construct one in-process SDK MCP server behind the optional import."""
+
+    try:
+        from claude_agent_sdk import SdkMcpTool, create_sdk_mcp_server
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise ClaudeSDKUnavailable(
+            "claude-agent-sdk is not installed; use the claude -p fallback"
+        ) from exc
+    return create_sdk_mcp_server(
+        name=name,
+        version=version,
+        tools=[
+            SdkMcpTool(
+                name=tool_name,
+                description=description,
+                input_schema=input_schema,
+                handler=handler,
+            )
+        ],
+    )
+
+
 @dataclass
 class ClaudeSDKHookMatcher:
     """Structural HookMatcher accepted by every supported Agent SDK build."""
@@ -328,8 +370,8 @@ _UNTRACKED_BACKGROUND_REASON = (
 _NON_DURABLE_SCHEDULER_REASON = (
     "Claude's {tool_name} is not an AgentsDock durable job and cannot be relied on "
     "to survive this turn or deliver a later chat update. If the user explicitly "
-    "requested scheduling, use only the AgentsDock Jobs CLI with the exact authority "
-    "command in the current turn's provider-authority block. Otherwise keep required "
+    "requested scheduling, use only the run-bound AgentsDock provider tool's Jobs "
+    "helper. Otherwise keep required "
     "work in the foreground or use a tracked Agent/workflow."
 )
 
@@ -585,11 +627,37 @@ async def reject_nondurable_scheduler_hook(
     }
 
 
+async def reject_subagent_provider_tool_hook(
+    hook_input: dict[str, Any],
+    _tool_use_id: str | None,
+    _context: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep the root turn's server authority out of Claude subagents."""
+
+    if (
+        hook_input.get("tool_name") != CLAUDE_PROVIDER_MCP_TOOL_NAME
+        or not str(hook_input.get("agent_id") or "").strip()
+    ):
+        return {}
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": _CLAUDE_PROVIDER_MCP_SUBAGENT_REASON,
+        }
+    }
+
+
 def claude_background_tracking_hooks() -> dict[str, list[ClaudeSDKHookMatcher]]:
     """Return SDK hooks for shell detachment and non-durable schedulers."""
 
     return {
         "PreToolUse": [
+            ClaudeSDKHookMatcher(
+                matcher=CLAUDE_PROVIDER_MCP_TOOL_NAME,
+                hooks=[reject_subagent_provider_tool_hook],
+                timeout=5.0,
+            ),
             ClaudeSDKHookMatcher(
                 matcher="Bash",
                 hooks=[reject_untracked_background_hook],
@@ -618,6 +686,22 @@ def bind_permission_owner(options: Any, ownership_token: str) -> None:
     binder = getattr(callback, "_agentsdock_bind_owner", None)
     if callable(binder):
         binder(ownership_token)
+
+
+def bind_provider_tool_owner(
+    options: Any,
+    ownership_token: str,
+    run_id: str,
+) -> None:
+    """Bind an in-process provider tool to one exact live SDK query."""
+
+    binder = (
+        options.get("_agentsdock_bind_provider_tool_owner")
+        if isinstance(options, dict)
+        else getattr(options, "_agentsdock_bind_provider_tool_owner", None)
+    )
+    if callable(binder):
+        binder(str(ownership_token), str(run_id))
 
 
 _RUN_END = object()
@@ -1287,6 +1371,7 @@ class ClaudeSDKSupervisor:
 
     async def _disconnect_current_client(self) -> None:
         self._cancel_ack_timeout()
+        bind_provider_tool_owner(self.options, "", "")
         client = self._client
         receiver = self._receiver_task
         self._client = None
@@ -1301,6 +1386,7 @@ class ClaudeSDKSupervisor:
         self._cancel_ack_timeout()
         active = self._active_run
         self._active_run = None
+        bind_provider_tool_owner(self.options, "", "")
         self._inflight_tasks.clear()
         if active is not None:
             active._fail(error)
@@ -1410,6 +1496,7 @@ class ClaudeSDKSupervisor:
                 await command.on_supervisor_ready(self.ownership_token)
             except BaseException as exc:
                 self._active_run = None
+                bind_provider_tool_owner(self.options, "", "")
                 handle._fail(
                     exc
                     if isinstance(exc, Exception)
@@ -1420,6 +1507,14 @@ class ClaudeSDKSupervisor:
                 if not command.response.done():
                     command.response.set_exception(exc)
                 return
+        # The in-process AgentsDock MCP callback is part of this exact
+        # supervisor generation. Bind it only after the ACTIVE admission hook,
+        # at the final actor-serialized boundary before query delivery.
+        bind_provider_tool_owner(
+            self.options,
+            self.ownership_token,
+            command.run_id,
+        )
         try:
             if self._closed:
                 raise ClaudeSDKSupervisorClosed(
@@ -1442,6 +1537,7 @@ class ClaudeSDKSupervisor:
                 )
         except ClaudeSDKSupervisorClosed as exc:
             self._active_run = None
+            bind_provider_tool_owner(self.options, "", "")
             handle._fail(exc)
             if not command.response.done():
                 command.response.set_exception(exc)
@@ -1452,6 +1548,7 @@ class ClaudeSDKSupervisor:
                 f"Claude SDK query delivery is uncertain for chat {self.chat_id}: {exc}"
             )
             self._active_run = None
+            bind_provider_tool_owner(self.options, "", "")
             handle._fail(error)
             if not command.response.done():
                 command.response.set_exception(error)
@@ -1669,7 +1766,7 @@ class ClaudeSDKSupervisor:
         by_name: dict[str, dict[str, Any]] = {}
         for item in servers:
             name = canonical_claude_mcp_identifier(item.get("name"), 512)
-            if name is not None:
+            if name is not None and name != CLAUDE_PROVIDER_MCP_SERVER_NAME:
                 by_name.setdefault(name, item)
         if action == "reconnect_all":
             reconnect = getattr(client, "reconnect_mcp_server", None)
@@ -1817,6 +1914,7 @@ class ClaudeSDKSupervisor:
             self._cancel_ack_timeout()
             active._finish(command.message)
             self._active_run = None
+            bind_provider_tool_owner(self.options, "", "")
             self._inflight_tasks.clear()
             if had_inflight_tasks and forced_run_end:
                 # An interrupted/error response can strand provider-side task

@@ -21,17 +21,20 @@ from typing import Any
 # The legacy ``response_timeout_seconds`` wire field is now only a requested
 # heartbeat interval.  There is deliberately no client response-deadline
 # constant.  A provider tool call observes at most one bounded slice, then
-# returns a resumable pending receipt.  The provider immediately invokes
-# ``wait`` with that exact receipt until the server lease reaches terminal
-# state.  Keeping every network observation at 30 seconds or less bounds the
-# whole idempotent command safely below provider shell caps, instead of turning
-# any provider-specific Bash limit into a cross-chat response deadline.
+# returns either the server's explicit pending receipt or an honest retryable
+# transport receipt.  The provider immediately invokes ``wait`` with those
+# exact opaque IDs until the server lease reaches terminal state.  Keeping
+# every network observation at 30 seconds or less bounds the whole idempotent
+# command safely below provider shell caps, instead of turning any
+# provider-specific Bash limit into a cross-chat response deadline.
 LIVE_RESPONSE_HEARTBEAT_SECONDS = 20
 LIVE_RESPONSE_MAX_HEARTBEAT_SECONDS = 20
 LIVE_RESPONSE_SOCKET_GRACE_SECONDS = 10
 LIVE_RESPONSE_POST_SOCKET_SECONDS = 10
 IDEMPOTENT_POST_RETRY_DELAYS_SECONDS = (0.1, 0.5)
 IDEMPOTENT_GET_RETRY_DELAYS_SECONDS = (0.1, 0.5)
+PROVIDER_RUNTIME_VALUE_MAX_BYTES = 4096
+PROVIDER_RUNTIME_HANDLE_MAX_COUNT = 64
 
 
 class ChatsCLIError(RuntimeError):
@@ -57,18 +60,122 @@ def host_is_loopback(host: str) -> bool:
     return address.is_loopback
 
 
+def _canonical_http_origin(value: str, label: str) -> tuple[str, bool]:
+    raw = value.strip()
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        port = parsed.port or 80
+    except ValueError as exc:
+        raise ChatsCLIError(f"{label} must be an HTTP origin") from exc
+    if (
+        parsed.scheme.lower() != "http"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ChatsCLIError(f"{label} must be an HTTP origin")
+    host = parsed.hostname.lower()
+    try:
+        address = ipaddress.ip_address(host)
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+            address = address.ipv4_mapped
+        host = address.compressed
+        loopback = address.is_loopback
+        url_host = f"[{host}]" if isinstance(address, ipaddress.IPv6Address) else host
+    except ValueError:
+        loopback = host == "localhost"
+        url_host = host
+    return f"http://{url_host}:{port}", loopback
+
+
+def _authority_server_origin(path: str | None) -> str:
+    authority_path = _authority_path(path)
+    try:
+        if authority_path.stat().st_mode & 0o077:
+            raise ChatsCLIError("authority file permissions are unsafe")
+        payload = json.loads(authority_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ChatsCLIError(f"could not read authority file: {exc}") from exc
+    return _bounded_identity_value(
+        payload.get("provider_server_origin"),
+        "authority provider_server_origin",
+    )
+
+
 def environment() -> str:
-    server_url = os.environ.get("AGENTSDOCK_SERVER_URL", "").strip().rstrip("/")
-    if not server_url:
+    raw_server_url = os.environ.get("AGENTSDOCK_SERVER_URL", "").strip()
+    if not raw_server_url:
         raise ChatsCLIError("missing AgentsDock agent environment")
-    parsed = urllib.parse.urlsplit(server_url)
-    if parsed.scheme != "http" or not parsed.hostname or not host_is_loopback(parsed.hostname):
-        raise ChatsCLIError("AGENTSDOCK_SERVER_URL must be a loopback HTTP URL")
-    return server_url
+    server_origin, loopback = _canonical_http_origin(
+        raw_server_url,
+        "AGENTSDOCK_SERVER_URL",
+    )
+    runtime_origin = _bounded_runtime_value(
+        "AGENTSDOCK_PROVIDER_SERVER_ORIGIN"
+    )
+    if runtime_origin:
+        canonical_runtime, _runtime_loopback = _canonical_http_origin(
+            runtime_origin,
+            "AGENTSDOCK_PROVIDER_SERVER_ORIGIN",
+        )
+        if canonical_runtime != server_origin:
+            raise ChatsCLIError(
+                "AGENTSDOCK_SERVER_URL conflicts with the live provider origin"
+            )
+    if loopback:
+        return raw_server_url.rstrip("/")
+    authority_origin = _authority_server_origin(None)
+    if not authority_origin:
+        raise ChatsCLIError(
+            "non-loopback AGENTSDOCK_SERVER_URL must match the authority origin"
+        )
+    canonical_authority, _authority_loopback = _canonical_http_origin(
+        authority_origin,
+        "authority provider_server_origin",
+    )
+    if canonical_authority != server_origin:
+        raise ChatsCLIError(
+            "non-loopback AGENTSDOCK_SERVER_URL must match the authority origin"
+        )
+    return server_origin
 
 
-def authority(path: str) -> str:
-    authority_path = Path(path).expanduser()
+def _bounded_identity_value(value: str | None, label: str) -> str:
+    clean = str(value or "").strip()
+    try:
+        encoded_size = len(clean.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ChatsCLIError(f"{label} is not valid UTF-8") from exc
+    if encoded_size > PROVIDER_RUNTIME_VALUE_MAX_BYTES:
+        raise ChatsCLIError(f"{label} exceeds the provider runtime limit")
+    return clean
+
+
+def _bounded_runtime_value(name: str) -> str:
+    return _bounded_identity_value(os.environ.get(name), name)
+
+
+def _authority_path(path: str | None) -> Path:
+    explicit = _bounded_identity_value(path, "--authority-file")
+    ambient = _bounded_runtime_value("AGENTSDOCK_PROVIDER_AUTHORITY_FILE")
+    if explicit and ambient:
+        explicit_key = os.path.abspath(os.path.expanduser(explicit))
+        ambient_key = os.path.abspath(os.path.expanduser(ambient))
+        if explicit_key != ambient_key:
+            raise ChatsCLIError(
+                "--authority-file conflicts with the live provider authority"
+            )
+    selected = explicit or ambient
+    if not selected:
+        raise ChatsCLIError("--authority-file is required")
+    return Path(selected).expanduser()
+
+
+def authority(path: str | None) -> str:
+    authority_path = _authority_path(path)
     try:
         mode = authority_path.stat().st_mode & 0o777
         if mode & 0o077:
@@ -77,9 +184,73 @@ def authority(path: str) -> str:
     except (OSError, json.JSONDecodeError) as exc:
         raise ChatsCLIError(f"could not read authority file: {exc}") from exc
     token = str(payload.get("provider_capability") or payload.get("capability") or "")
-    if not token:
+    source_session_id = str(payload.get("source_session_id") or "").strip()
+    if not token or not source_session_id:
         raise ChatsCLIError("authority file is invalid")
+    environment_chat_id = _bounded_runtime_value("AGENTSDOCK_CHAT_ID")
+    if environment_chat_id and environment_chat_id != source_session_id:
+        raise ChatsCLIError(
+            "AGENTSDOCK_CHAT_ID does not match the authority file"
+        )
     return token
+
+
+def positive_target_index(value: str) -> int:
+    if len(value) > 2 or re.fullmatch(r"[1-9][0-9]*", value) is None:
+        raise argparse.ArgumentTypeError("--target-index must be a positive integer")
+    index = int(value)
+    if index > PROVIDER_RUNTIME_HANDLE_MAX_COUNT:
+        raise argparse.ArgumentTypeError(
+            f"--target-index must be at most {PROVIDER_RUNTIME_HANDLE_MAX_COUNT}"
+        )
+    return index
+
+
+def provider_handle(index: int, action: str) -> tuple[str, bool]:
+    count_text = _bounded_runtime_value("AGENTSDOCK_CROSS_CHAT_HANDLE_COUNT")
+    if re.fullmatch(r"0|[1-9][0-9]*", count_text) is None:
+        raise ChatsCLIError("the live @Chat handle count is unavailable")
+    count = int(count_text)
+    if count > PROVIDER_RUNTIME_HANDLE_MAX_COUNT or index > count:
+        raise ChatsCLIError("the requested @Chat handle is unavailable")
+    prefix = f"AGENTSDOCK_CROSS_CHAT_HANDLE_{index}"
+    handle = _bounded_runtime_value(prefix)
+    granted_action = _bounded_runtime_value(f"{prefix}_ACTION")
+    async_text = _bounded_runtime_value(f"{prefix}_ASYNC")
+    expected_action = "instruction" if action == "instruction" else "request_reply"
+    if not handle or granted_action != expected_action or async_text not in {"0", "1"}:
+        raise ChatsCLIError("the requested @Chat handle is unavailable")
+    if action == "instruction" and async_text != "0":
+        raise ChatsCLIError("the requested @Chat handle is malformed")
+    return handle, async_text == "1"
+
+
+def respond_current(args: argparse.Namespace) -> dict[str, Any]:
+    exchange_id = _bounded_runtime_value(
+        "AGENTSDOCK_CROSS_CHAT_RESPONSE_EXCHANGE_ID"
+    )
+    inbound_leg_id = _bounded_runtime_value(
+        "AGENTSDOCK_CROSS_CHAT_RESPONSE_INBOUND_LEG_ID"
+    )
+    followup = _bounded_runtime_value(
+        "AGENTSDOCK_CROSS_CHAT_RESPONSE_FOLLOWUP"
+    ) or "none"
+    if (
+        re.fullmatch(r"exchange_[0-9a-f]{32}", exchange_id) is None
+        or re.fullmatch(r"leg_[0-9a-f]{32}", inbound_leg_id) is None
+        or followup not in {"none", "allowed", "allowed-async"}
+    ):
+        raise ChatsCLIError("the current inbound reply grant is unavailable")
+    request_response = bool(args.request_response)
+    if request_response and followup == "none":
+        raise ChatsCLIError("the current inbound reply has no follow-up grant")
+    values = vars(args).copy()
+    values.update({
+        "exchange": exchange_id,
+        "inbound_leg": inbound_leg_id,
+        "async_response": request_response and followup == "allowed-async",
+    })
+    return respond(argparse.Namespace(**values))
 
 
 def provider_headers(capability: str) -> dict[str, str]:
@@ -355,15 +526,26 @@ def await_live_response(
             live_slice=True,
         )
     except LiveWaitRetryable:
-        # A provider command must end promptly even if a proxy or local server
-        # is between restarts.  The exact lease is side-effect-free to replay,
-        # so surface the same pending contract and let the next foreground
-        # ``wait`` invocation reconnect it.
-        result = {
-            "ok": True,
+        # A transport failure says nothing about durable server state.  In
+        # particular, the response may already be committed while the HTTP
+        # handler is still disconnecting.  Never relabel that ambiguity as a
+        # genuine server-owned pending exchange.  Return the same exact lease
+        # as a distinct retry receipt; replaying its GET is side-effect free
+        # and can recover a committed answer without resending the ask.
+        return {
+            "ok": False,
             "exchange_id": exchange_id,
             "inbound_leg_id": inbound_leg_id,
-            "pending": True,
+            "live_response_lease_id": lease_id,
+            "transport_error": True,
+            "retryable": True,
+            "message": (
+                "AgentsServer did not confirm the live-response state because "
+                "the transport was interrupted. Retry the existing wait "
+                f"exactly with --exchange {exchange_id} "
+                f"--inbound-leg {inbound_leg_id} --lease {lease_id}; "
+                "do not resend the ask or change its wording."
+            ),
         }
     valid_answer = (
         set(result) == answer_keys
@@ -426,8 +608,19 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
         raise ChatsCLIError("--message must not be empty")
     route = str(getattr(args, "route", None) or "")
     target = str(getattr(args, "target", None) or "")
-    if bool(route) == bool(target):
-        raise ChatsCLIError("provide exactly one of --route or --target")
+    target_index = getattr(args, "target_index", None)
+    if sum((bool(route), bool(target), target_index is not None)) != 1:
+        raise ChatsCLIError(
+            "provide exactly one of --route, --target, or --target-index"
+        )
+    if target_index is not None:
+        if bool(getattr(args, "async_response", False)):
+            raise ChatsCLIError(
+                "--async-response is selected by the live @Chat grant"
+            )
+        target, grant_is_async = provider_handle(int(target_index), action)
+        if action == "request_reply":
+            args.async_response = grant_is_async
     destination = route if route else target
     live_wait = (
         action == "request_reply"
@@ -705,29 +898,44 @@ def respond(args: argparse.Namespace) -> dict[str, Any]:
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
-        description="Contact an eligible chat on this AgentsDock server."
+        description="Contact an eligible chat on this AgentsDock server.",
+        allow_abbrev=False,
     )
-    root.add_argument("--authority-file", required=True)
+    root.add_argument(
+        "--authority-file",
+        help=(
+            "mode-0600 per-run authority file; defaults to the live provider "
+            "environment"
+        ),
+    )
     commands = root.add_subparsers(dest="command", required=True)
     list_command = commands.add_parser(
         "list",
         help="list eligible same-server chats for this live run",
+        allow_abbrev=False,
     )
     list_command.set_defaults(handler=list_routes)
-    command = commands.add_parser("send", help="send one authorized instruction")
+    command = commands.add_parser(
+        "send",
+        help="send one authorized instruction",
+        allow_abbrev=False,
+    )
     send_destination = command.add_mutually_exclusive_group(required=True)
     send_destination.add_argument("--route")
     send_destination.add_argument("--target")
+    send_destination.add_argument("--target-index", type=positive_target_index)
     command.add_argument("--message", required=True)
     command.add_argument("--idempotency-key")
     command.set_defaults(handler=send)
     ask_command = commands.add_parser(
         "ask",
         help="ask a same-server agent and wait until it answers or is stopped",
+        allow_abbrev=False,
     )
     ask_destination = ask_command.add_mutually_exclusive_group(required=True)
     ask_destination.add_argument("--route")
     ask_destination.add_argument("--target")
+    ask_destination.add_argument("--target-index", type=positive_target_index)
     ask_command.add_argument("--message", required=True)
     ask_command.add_argument("--idempotency-key")
     ask_command.add_argument(
@@ -749,7 +957,11 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     ask_command.set_defaults(handler=ask)
-    response_command = commands.add_parser("respond", help="respond to the exact inbound exchange leg")
+    response_command = commands.add_parser(
+        "respond",
+        help="respond to the exact inbound exchange leg",
+        allow_abbrev=False,
+    )
     response_command.add_argument("--exchange", required=True)
     response_command.add_argument("--inbound-leg", required=True)
     response_command.add_argument("--message", required=True)
@@ -774,12 +986,35 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     response_command.set_defaults(handler=respond)
+    current_response_command = commands.add_parser(
+        "respond-current",
+        help="respond using this run's current inbound reply grant",
+        allow_abbrev=False,
+    )
+    current_response_command.add_argument("--message", required=True)
+    current_response_command.add_argument(
+        "--request-response",
+        action="store_true",
+    )
+    current_response_command.add_argument("--idempotency-key")
+    current_response_command.add_argument(
+        "--timeout-seconds",
+        type=int,
+        choices=range(1, 3601),
+        default=LIVE_RESPONSE_HEARTBEAT_SECONDS,
+        help=(
+            "deprecated compatibility value; live same-server waits have no "
+            "response deadline"
+        ),
+    )
+    current_response_command.set_defaults(handler=respond_current)
     wait_command = commands.add_parser(
         "wait",
         help=(
             "observe one bounded foreground slice of a pending same-server "
             "request"
         ),
+        allow_abbrev=False,
     )
     wait_command.add_argument("--exchange", required=True)
     wait_command.add_argument("--inbound-leg", required=True)
@@ -799,13 +1034,32 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    previous_authority_file = os.environ.get(
+        "AGENTSDOCK_PROVIDER_AUTHORITY_FILE"
+    )
     try:
         args = parser().parse_args(argv)
-        print(json.dumps(args.handler(args), ensure_ascii=False))
-        return 0
+        selected_authority = _authority_path(args.authority_file)
+        os.environ["AGENTSDOCK_PROVIDER_AUTHORITY_FILE"] = str(
+            selected_authority
+        )
+        result = args.handler(args)
+        print(json.dumps(result, ensure_ascii=False))
+        # A retryable live-response transport failure is structured so the
+        # caller retains its exact lease, but it is not a successful pending
+        # observation.  Exit nonzero after printing the receipt so automation
+        # cannot silently treat network ambiguity as server-owned waiting.
+        return 2 if result.get("transport_error") is True else 0
     except ChatsCLIError as exc:
         print(f"agentsdock-chats: {exc}", file=sys.stderr)
         return 2
+    finally:
+        if previous_authority_file is None:
+            os.environ.pop("AGENTSDOCK_PROVIDER_AUTHORITY_FILE", None)
+        else:
+            os.environ[
+                "AGENTSDOCK_PROVIDER_AUTHORITY_FILE"
+            ] = previous_authority_file
 
 
 if __name__ == "__main__":

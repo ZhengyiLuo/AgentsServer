@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import agentsdock_jobs
 
@@ -285,6 +285,90 @@ class AgentsDockJobsCLITests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertEqual(calls, [("GET", "/api/agent/sessions/sess%2Fchat/jobs", None)])
+
+    def test_explicit_authority_cannot_override_live_provider_environment(self) -> None:
+        other = Path(self.temporary.name) / "other-authority.json"
+        other.write_text(json.dumps({
+            "provider_capability": "other-token",
+            "source_session_id": "sess/chat",
+        }))
+        other.chmod(0o600)
+        environment = self.environment()
+        request = Mock()
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(agentsdock_jobs, "api_request", request),
+            redirect_stderr(io.StringIO()) as error,
+        ):
+            result = agentsdock_jobs.main([
+                "--authority-file", str(other), "list",
+            ])
+            self.assertEqual(
+                os.environ["AGENTSDOCK_PROVIDER_AUTHORITY_FILE"],
+                str(self.authority_path),
+            )
+
+        self.assertEqual(result, 1)
+        self.assertIn("conflicts with the live provider authority", error.getvalue())
+        request.assert_not_called()
+
+    def test_explicit_chat_cannot_mask_conflicting_provider_environment(self) -> None:
+        environment = self.environment()
+        environment["AGENTSDOCK_CHAT_ID"] = "sess/other"
+        request = Mock()
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(agentsdock_jobs, "api_request", request),
+            redirect_stderr(io.StringIO()) as error,
+        ):
+            result = agentsdock_jobs.main([
+                "--chat-id", "sess/chat", "list",
+            ])
+
+        self.assertEqual(result, 1)
+        self.assertIn("conflicts with AGENTSDOCK_CHAT_ID", error.getvalue())
+        request.assert_not_called()
+
+    def test_oversized_provider_authority_environment_fails_closed(self) -> None:
+        environment = self.environment()
+        environment["AGENTSDOCK_PROVIDER_AUTHORITY_FILE"] = "x" * 4097
+        request = Mock()
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(agentsdock_jobs, "api_request", request),
+            redirect_stderr(io.StringIO()) as error,
+        ):
+            result = agentsdock_jobs.main(["list"])
+
+        self.assertEqual(result, 1)
+        self.assertIn("exceeds the provider runtime limit", error.getvalue())
+        request.assert_not_called()
+
+    def test_non_loopback_origin_requires_matching_authority_and_runtime(self) -> None:
+        self.authority_path.write_text(json.dumps({
+            "provider_capability": "provider-token",
+            "source_session_id": "sess/chat",
+            "provider_server_origin": "http://192.0.2.10:17850",
+        }))
+        environment = self.environment()
+        environment.update({
+            "AGENTSDOCK_SERVER_URL": "http://192.0.2.10:17850/",
+            "AGENTSDOCK_PROVIDER_SERVER_ORIGIN": "http://192.0.2.10:17850",
+        })
+        with patch.dict(os.environ, environment, clear=True):
+            self.assertEqual(
+                agentsdock_jobs.required_environment()[0],
+                "http://192.0.2.10:17850",
+            )
+        environment["AGENTSDOCK_PROVIDER_SERVER_ORIGIN"] = (
+            "http://192.0.2.11:17850"
+        )
+        with patch.dict(os.environ, environment, clear=True):
+            with self.assertRaisesRegex(
+                agentsdock_jobs.JobsCLIError,
+                "conflicts with the live provider origin",
+            ):
+                agentsdock_jobs.required_environment()
 
     def test_global_chat_id_rejects_empty_values(self) -> None:
         parser = agentsdock_jobs.build_parser()

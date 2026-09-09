@@ -1,4 +1,7 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import agent_server
@@ -76,6 +79,87 @@ class DigestQueuePersistenceTests(unittest.TestCase):
             pack["source_pack"],
         )
 
+    def test_source_pack_never_embeds_legacy_provider_only_prompts(self) -> None:
+        session_id = "legacy-handoff-source"
+        source = {
+            "id": session_id,
+            "title": "Legacy source",
+            "backend": agent_server.BACKEND_CLAUDE,
+            "cwd": "/tmp/source",
+        }
+        authority = agent_server.cross_chat_provider_authority_block(
+            [],
+            agent_server.cross_chat_authority_path(
+                "run_handoff_projection",
+                "abcdef0123456789abcdef0123456789",
+            ),
+            session_id,
+            {"publish"},
+            "blocked",
+            compact=True,
+        )
+        notice = (
+            "<task-notification>\n"
+            "<task-id>task_pack1</task-id>\n"
+            "<tool-use-id>toolu_pack_projection_123</tool-use-id>\n"
+            "<status>completed</status>\n"
+            "<summary>Private provider completion</summary>\n"
+            "</task-notification>"
+        )
+        events = [
+            {
+                "seq": 1,
+                "session_id": session_id,
+                "type": "turn_started",
+                "run_id": "import_handoff_projection",
+                "backend": agent_server.BACKEND_CLAUDE,
+                "imported": True,
+                "prompt": "Keep this user request" + authority,
+            },
+            {
+                "seq": 2,
+                "session_id": session_id,
+                "type": "turn_started",
+                "run_id": "import_handoff_projection",
+                "backend": agent_server.BACKEND_CLAUDE,
+                "imported": True,
+                "prompt": notice,
+            },
+            {
+                "seq": 3,
+                "session_id": session_id,
+                "type": "assistant_text",
+                "run_id": "import_handoff_projection",
+                "text": "Retained assistant answer",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            event_file = Path(temporary) / "events.jsonl"
+            event_file.write_text(
+                "".join(json.dumps(event) + "\n" for event in events),
+                encoding="utf-8",
+            )
+            with patch.object(
+                agent_server.STORE,
+                "sessions",
+                {session_id: source},
+            ), patch.object(
+                agent_server,
+                "events_path",
+                return_value=event_file,
+            ), patch.object(
+                agent_server,
+                "list_session_file_records",
+                return_value=[],
+            ):
+                pack = agent_server.build_handoff_source_pack(session_id)
+
+        source_pack = pack["source_pack"]
+        self.assertIn("Keep this user request", source_pack)
+        self.assertIn("Retained assistant answer", source_pack)
+        self.assertNotIn("AgentsDock provider authority", source_pack)
+        self.assertNotIn("Private provider completion", source_pack)
+
 
 class DigestSummarizerBackendTests(unittest.IsolatedAsyncioTestCase):
     async def test_cursor_cannot_be_mislabeled_as_digest_summarizer(self) -> None:
@@ -146,6 +230,89 @@ class ForkHistoryDigestTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(all(payload["forked"] is True for _event_type, payload in imported))
         self.assertEqual(imported[-1][1]["result_text"], "")
+
+    async def test_fork_copy_projects_legacy_prompts_but_keeps_turn_boundaries(self) -> None:
+        parent_id = "legacy-fork-parent"
+        authority = agent_server.cross_chat_provider_authority_block(
+            [],
+            agent_server.cross_chat_authority_path(
+                "run_fork_projection",
+                "1234567890abcdef1234567890abcdef",
+            ),
+            parent_id,
+            {"publish"},
+            "blocked",
+            compact=True,
+        )
+        notice = (
+            "<task-notification>\n"
+            "<task-id>task_fork1</task-id>\n"
+            "<tool-use-id>toolu_fork_projection_123</tool-use-id>\n"
+            "<status>completed</status>\n"
+            "<summary>Private fork notification</summary>\n"
+            "</task-notification>"
+        )
+        common = {
+            "session_id": parent_id,
+            "run_id": "import_fork_projection",
+            "backend": agent_server.BACKEND_CLAUDE,
+            "imported": True,
+        }
+        events = [
+            {
+                **common,
+                "seq": 1,
+                "type": "turn_started",
+                "prompt": "Retained fork request" + authority,
+            },
+            {
+                **common,
+                "seq": 2,
+                "type": "assistant_text",
+                "text": "First fork answer",
+            },
+            {
+                **common,
+                "seq": 3,
+                "type": "turn_started",
+                "prompt": notice,
+            },
+            {
+                **common,
+                "seq": 4,
+                "type": "assistant_text",
+                "text": "Answer after empty fork boundary",
+            },
+            {
+                **common,
+                "seq": 5,
+                "type": "turn_finished",
+                "result_text": "Answer after empty fork boundary",
+            },
+        ]
+        with patch.object(
+            agent_server,
+            "iter_session_events",
+            return_value=iter(events),
+        ), patch.object(
+            agent_server,
+            "append_imported_events",
+            new_callable=AsyncMock,
+            side_effect=lambda _session_id, imported: len(imported),
+        ) as append_imported:
+            copied = await agent_server.copy_fork_history(parent_id, "fork-child")
+
+        imported = append_imported.await_args.args[1]
+        self.assertEqual(copied, 5)
+        self.assertEqual(imported[0][1]["prompt"], "Retained fork request")
+        self.assertEqual(imported[2][0], "turn_started")
+        self.assertEqual(imported[2][1]["prompt"], "")
+        self.assertTrue(
+            imported[2][1][agent_server.TIMELINE_IMPORTED_PROMPT_HIDDEN_FIELD]
+        )
+        self.assertEqual(imported[3][1]["text"], "Answer after empty fork boundary")
+        self.assertNotIn("AgentsDock provider authority", json.dumps(imported))
+        self.assertNotIn("Private fork notification", json.dumps(imported))
 
 
 class DigestDeliveryTests(unittest.IsolatedAsyncioTestCase):

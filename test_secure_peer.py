@@ -46,6 +46,7 @@ from agentsdock_team_hub.secure_peer import (
     sas_words,
 )
 from agentsdock_team_hub.security import canonical_json
+from secure_peer_runtime import SecurePeerRuntime
 
 
 def _uuid() -> str:
@@ -1027,6 +1028,7 @@ class SecurePeerStoreTests(unittest.TestCase):
             mock.patch.object(
                 client,
                 "_require_active_connection_locked",
+                return_value=None,
             ),
             mock.patch.object(
                 client,
@@ -1062,6 +1064,7 @@ class SecurePeerStoreTests(unittest.TestCase):
                 mock.patch.object(
                     client,
                     "_require_active_connection_locked",
+                    return_value=None,
                 ),
                 mock.patch.object(
                     client,
@@ -1073,6 +1076,102 @@ class SecurePeerStoreTests(unittest.TestCase):
                     client.proxy(connection_id, "GET", "/v1/teams"),
                     response,
                 )
+
+    def test_client_proxy_overlaps_read_io_but_keeps_mutations_fenced(self) -> None:
+        client = SecurePeerClient(
+            self.root / "concurrent-proxy-client",
+            "proxy-peer-001",
+            "Proxy peer",
+            clock=self.clock,
+        )
+        connection_id = _uuid()
+        row = {"host_ip": "192.0.2.20", "port": 7851}
+        two_reads_entered = threading.Event()
+        release_reads = threading.Event()
+        call_guard = threading.Lock()
+        entered_reads = 0
+        errors: list[BaseException] = []
+
+        def read_request(*_args, **_kwargs):
+            nonlocal entered_reads
+            with call_guard:
+                entered_reads += 1
+                if entered_reads == 2:
+                    two_reads_entered.set()
+            if not release_reads.wait(5):
+                raise TimeoutError("concurrent proxy reads were not released")
+            return 200, [("content-type", "application/json")], b"{}", b"leaf"
+
+        with (
+            mock.patch.object(
+                client, "_require_active_connection_locked", return_value=row
+            ),
+            mock.patch.object(client, "_pinned_context", return_value=object()),
+            mock.patch.object(client, "_request", side_effect=read_request),
+        ):
+            readers = [
+                threading.Thread(
+                    target=lambda: self._capture_thread_error(
+                        errors,
+                        lambda: client.proxy(
+                            connection_id,
+                            "GET",
+                            "/v1/teams",
+                        ),
+                    )
+                )
+                for _index in range(2)
+            ]
+            for reader in readers:
+                reader.start()
+            try:
+                self.assertTrue(
+                    two_reads_entered.wait(2),
+                    "read-only peer requests were serialized during remote I/O",
+                )
+            finally:
+                release_reads.set()
+            for reader in readers:
+                reader.join(5)
+                self.assertFalse(reader.is_alive())
+        self.assertEqual(errors, [])
+
+        mutation_entered = threading.Event()
+        release_mutation = threading.Event()
+
+        def mutation_request(*_args, **_kwargs):
+            mutation_entered.set()
+            if not release_mutation.wait(5):
+                raise TimeoutError("proxy mutation was not released")
+            return 200, [("content-type", "application/json")], b"{}", b"leaf"
+
+        with (
+            mock.patch.object(
+                client, "_require_active_connection_locked", return_value=row
+            ),
+            mock.patch.object(client, "_pinned_context", return_value=object()),
+            mock.patch.object(client, "_request", side_effect=mutation_request),
+        ):
+            writer = threading.Thread(
+                target=lambda: self._capture_thread_error(
+                    errors,
+                    lambda: client.proxy(
+                        connection_id,
+                        "POST",
+                        "/v1/teams/team-1/network/messages",
+                        body=b"{}",
+                    ),
+                )
+            )
+            writer.start()
+            self.assertTrue(mutation_entered.wait(2))
+            try:
+                self.assertFalse(client._route_guard.acquire(timeout=0.1))
+            finally:
+                release_mutation.set()
+            writer.join(5)
+            self.assertFalse(writer.is_alive())
+        self.assertEqual(errors, [])
 
     def test_pairing_capacity_is_transactional_and_prunes_old_terminal_rows(self) -> None:
         _key, request = self.request()
@@ -2720,6 +2819,153 @@ def _free_port(host: str) -> int:
         listener.close()
 
 
+class SecurePeerTeamAuthorityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.runtime = SecurePeerRuntime(
+            Path(self.temporary.name) / "runtime",
+            server_identity="team-authority-server-12345678",
+            server_instance_id="team-authority-instance-12345678",
+            display_name="Team authority test",
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_host_role_enable_disable_rotates_team_authority_even_after_aba(self) -> None:
+        member_generation = self.runtime.team_authority_generation()
+
+        self.runtime.pause_member_for_host()
+        host_generation = self.runtime.team_authority_generation()
+
+        self.runtime.resume_member_after_host()
+        restored_member_generation = self.runtime.team_authority_generation()
+
+        self.assertEqual(
+            len({member_generation, host_generation, restored_member_generation}),
+            3,
+        )
+        for stale_generation in (member_generation, host_generation):
+            with self.assertRaises(SecurePeerError) as raised:
+                self.runtime.team_authorized_read(
+                    stale_generation,
+                    lambda: "must not run",
+                )
+            self.assertEqual(raised.exception.code, "team_authority_changed")
+        self.assertEqual(
+            self.runtime.team_authorized_read(
+                restored_member_generation,
+                lambda: "current realm",
+            ),
+            "current realm",
+        )
+
+    def test_team_read_crossing_host_enable_discards_the_stale_result(self) -> None:
+        generation = self.runtime.team_authority_generation()
+        read_started = threading.Event()
+        release_read = threading.Event()
+        results: list[str] = []
+        errors: list[BaseException] = []
+
+        def read_old_realm() -> str:
+            read_started.set()
+            self.assertTrue(release_read.wait(2))
+            return "old realm data"
+
+        worker = threading.Thread(
+            target=lambda: self._capture_thread_result(
+                results,
+                errors,
+                lambda: self.runtime.team_authorized_read(
+                    generation,
+                    read_old_realm,
+                ),
+            )
+        )
+        worker.start()
+        self.assertTrue(read_started.wait(2))
+        self.runtime.pause_member_for_host()
+        release_read.set()
+        worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(results, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], SecurePeerError)
+        self.assertEqual(errors[0].code, "team_authority_changed")
+
+    def test_team_write_linearizes_before_host_enable_and_disable(self) -> None:
+        for transition in (
+            self.runtime.pause_member_for_host,
+            self.runtime.resume_member_after_host,
+        ):
+            with self.subTest(transition=transition.__name__):
+                generation = self.runtime.team_authority_generation()
+                write_started = threading.Event()
+                release_write = threading.Event()
+                transition_started = threading.Event()
+                transition_done = threading.Event()
+                order: list[str] = []
+                errors: list[BaseException] = []
+
+                def commit() -> str:
+                    order.append("write_started")
+                    write_started.set()
+                    self.assertTrue(release_write.wait(2))
+                    order.append("write_committed")
+                    return "committed"
+
+                writer = threading.Thread(
+                    target=lambda: self._capture_thread_result(
+                        [],
+                        errors,
+                        lambda: self.runtime.team_authorized_write(
+                            generation,
+                            commit,
+                        ),
+                    )
+                )
+
+                def switch_role() -> None:
+                    try:
+                        transition_started.set()
+                        transition()
+                        order.append("role_switched")
+                    except BaseException as exc:
+                        errors.append(exc)
+                    finally:
+                        transition_done.set()
+
+                switcher = threading.Thread(target=switch_role)
+                writer.start()
+                self.assertTrue(write_started.wait(2))
+                switcher.start()
+                self.assertTrue(transition_started.wait(2))
+                self.assertFalse(transition_done.wait(0.1))
+                release_write.set()
+                writer.join(2)
+                switcher.join(2)
+
+                self.assertFalse(writer.is_alive())
+                self.assertFalse(switcher.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(
+                    order,
+                    ["write_started", "write_committed", "role_switched"],
+                )
+                self.assertNotEqual(
+                    self.runtime.team_authority_generation(),
+                    generation,
+                )
+
+    @staticmethod
+    def _capture_thread_result(results, errors, operation) -> None:
+        try:
+            results.append(operation())
+        except BaseException as exc:
+            errors.append(exc)
+
+
 class SecurePeerLiveTLSTests(unittest.TestCase):
     def setUp(self) -> None:
         self.host_ip = _nonloopback_ipv4()
@@ -2769,6 +3015,88 @@ class SecurePeerLiveTLSTests(unittest.TestCase):
             idempotency_key=_uuid(),
         )
         return self.client.poll_pairing(connection["connection_id"])
+
+    def test_host_role_pause_fences_mutation_and_revalidates_member_on_resume(self) -> None:
+        approved = self.pair_and_approve()
+        connection_id = approved["connection_id"]
+        active = self.client.set_active_connection(
+            connection_id,
+            expected_current=None,
+        )
+        runtime = SecurePeerRuntime(
+            Path(self.temporary.name) / "runtime",
+            server_identity=self.client.server_identity,
+            server_instance_id="instance-host-pause-12345678",
+            display_name="Live peer",
+        )
+        runtime.client = self.client
+
+        paused = runtime.pause_member_for_host()
+        self.assertEqual(paused["connection_id"], connection_id)
+        self.assertFalse(self.client.get_connection(connection_id)["active"])
+        for operation in (
+            lambda: runtime.deactivate_connection(
+                connection_id,
+                expected_host_server_identity=active["host_server_identity"],
+                expected_hub_id=active["hub_id"],
+            ),
+            lambda: runtime.forget_connection(
+                connection_id,
+                expected_host_server_identity=active["host_server_identity"],
+                expected_hub_id=active["hub_id"],
+                expected_certificate_fingerprint=active[
+                    "certificate_fingerprint"
+                ],
+            ),
+        ):
+            with self.assertRaises(SecurePeerError) as raised:
+                operation()
+            self.assertEqual(raised.exception.code, "host_role_active")
+
+        restored = runtime.resume_member_after_host()
+        self.assertEqual(restored["connection_id"], connection_id)
+        self.assertTrue(restored["active"])
+        self.assertEqual(restored["status"], "connected")
+        self.assertGreaterEqual(
+            restored["last_validated_at"],
+            int(paused["last_validated_at"] or 0),
+        )
+
+    def test_host_role_resume_keeps_member_paused_when_health_fails(self) -> None:
+        approved = self.pair_and_approve()
+        connection_id = approved["connection_id"]
+        self.client.set_active_connection(connection_id, expected_current=None)
+        runtime = SecurePeerRuntime(
+            Path(self.temporary.name) / "runtime-health-failure",
+            server_identity=self.client.server_identity,
+            server_instance_id="instance-host-pause-failure-12345678",
+            display_name="Live peer",
+        )
+        runtime.client = self.client
+        runtime.pause_member_for_host()
+
+        with mock.patch.object(
+            self.client,
+            "_request",
+            side_effect=SecurePeerError(
+                "peer_unavailable",
+                "peer is offline",
+                503,
+            ),
+        ), self.assertRaises(SecurePeerError):
+            runtime.resume_member_after_host()
+
+        paused = self.client.get_connection(connection_id)
+        self.assertFalse(paused["active"])
+        self.assertEqual(paused["status"], "deactivated")
+        with self.assertRaises(SecurePeerError) as blocked:
+            runtime.activate_pairing(
+                approved["pairing_id"],
+                expected_connection_id=connection_id,
+                expected_host_server_identity=approved["host_server_identity"],
+                expected_hub_id=approved["hub_id"],
+            )
+        self.assertEqual(blocked.exception.code, "host_role_active")
 
     def test_outgoing_pending_pairing_expires_offline_and_retires_authority(
         self,

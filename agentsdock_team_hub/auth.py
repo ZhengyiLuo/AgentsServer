@@ -19,6 +19,8 @@ from typing import Iterator
 INVITATION_MAX_TTL_SECONDS = 24 * 60 * 60
 NODE_ENROLLMENT_MAX_TTL_SECONDS = 15 * 60
 MIN_TTL_SECONDS = 30
+MANAGED_SERVER_PRINCIPAL_ID = "service_managed_server"
+MANAGED_SERVER_SERVICE_IDENTIFIER = "agentsdock.team-hub.managed-server"
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 IDENTITY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{7,239}$")
 
@@ -328,6 +330,44 @@ def record_legacy_server_binding(
         return binding_id
 
 
+def _insert_invitation(
+    connection: sqlite3.Connection,
+    team_id: str,
+    issued_by_principal_id: str,
+    role: str,
+    *,
+    invitee_email: str,
+    ttl_seconds: int = 15 * 60,
+    now: int | None = None,
+) -> IssuedSecret:
+    if role not in ("admin", "member", "guest"):
+        raise ValueError("invitation role must be admin, member, or guest")
+    email_normalized = _email(invitee_email)
+    timestamp = _timestamp(now)
+    expires_at = timestamp + _ttl(ttl_seconds, INVITATION_MAX_TTL_SECONDS)
+    token, token_hash = _new_secret()
+    invitation_id = _id("invite")
+    connection.execute(
+        """
+        INSERT INTO invitations(
+            id, team_id, token_hash, invitee_email_normalized, role,
+            issued_by_principal_id, expires_at, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            invitation_id,
+            team_id,
+            token_hash,
+            email_normalized,
+            role,
+            issued_by_principal_id,
+            expires_at,
+            timestamp,
+        ),
+    )
+    return IssuedSecret(invitation_id, token, expires_at)
+
+
 def issue_invitation(
     connection: sqlite3.Connection,
     team_id: str,
@@ -340,36 +380,67 @@ def issue_invitation(
 ) -> IssuedSecret:
     """Issue a one-time, short-lived invitation as an owner or admin."""
 
-    if role not in ("admin", "member", "guest"):
-        raise ValueError("invitation role must be admin, member, or guest")
-    email_normalized = _email(invitee_email)
-    timestamp = _timestamp(now)
-    expires_at = timestamp + _ttl(ttl_seconds, INVITATION_MAX_TTL_SECONDS)
-    token, token_hash = _new_secret()
-    invitation_id = _id("invite")
     with _write_transaction(connection):
         _require_team_role(
             connection, team_id, issued_by_principal_id, ("owner", "admin")
         )
-        connection.execute(
+        return _insert_invitation(
+            connection,
+            team_id,
+            issued_by_principal_id,
+            role,
+            invitee_email=invitee_email,
+            ttl_seconds=ttl_seconds,
+            now=now,
+        )
+
+
+def issue_managed_host_invitation(
+    connection: sqlite3.Connection,
+    team_id: str,
+    issued_by_principal_id: str,
+    role: str,
+    *,
+    invitee_email: str,
+    ttl_seconds: int = 15 * 60,
+    now: int | None = None,
+) -> IssuedSecret:
+    """Issue an invitation as this Hub's exact active managed host actor."""
+
+    with _write_transaction(connection):
+        if issued_by_principal_id != MANAGED_SERVER_PRINCIPAL_ID:
+            raise AuthorizationError("principal is not the managed host operator")
+        authorized = connection.execute(
             """
-            INSERT INTO invitations(
-                id, team_id, token_hash, invitee_email_normalized, role,
-                issued_by_principal_id, expires_at, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            SELECT 1
+            FROM principals AS p
+            JOIN service_accounts AS s ON s.principal_id=p.id
+            JOIN memberships AS m ON m.principal_id=p.id AND m.team_id=?
+            JOIN nodes AS n ON n.team_id=m.team_id
+            JOIN managed_host_bindings AS managed
+              ON managed.singleton=1 AND managed.server_identity=n.server_identity
+            WHERE p.id=? AND p.kind='service' AND p.scope_team_id IS NULL
+              AND p.status='active' AND s.service_identifier=?
+              AND m.role='automation' AND m.status='active'
+              AND n.status='active'
             """,
             (
-                invitation_id,
                 team_id,
-                token_hash,
-                email_normalized,
-                role,
-                issued_by_principal_id,
-                expires_at,
-                timestamp,
+                MANAGED_SERVER_PRINCIPAL_ID,
+                MANAGED_SERVER_SERVICE_IDENTIFIER,
             ),
+        ).fetchone()
+        if authorized is None:
+            raise AuthorizationError("managed host operator is unavailable")
+        return _insert_invitation(
+            connection,
+            team_id,
+            issued_by_principal_id,
+            role,
+            invitee_email=invitee_email,
+            ttl_seconds=ttl_seconds,
+            now=now,
         )
-    return IssuedSecret(invitation_id, token, expires_at)
 
 
 def redeem_invitation(
@@ -394,13 +465,36 @@ def redeem_invitation(
               ON issuer.team_id = i.team_id
              AND issuer.principal_id = i.issued_by_principal_id
              AND issuer.status = 'active'
-             AND issuer.role IN ('owner', 'admin')
             JOIN principals AS issuer_principal
               ON issuer_principal.id = issuer.principal_id
              AND issuer_principal.status = 'active'
-            WHERE i.token_hash = ?
+            LEFT JOIN service_accounts AS issuer_service
+              ON issuer_service.principal_id = issuer_principal.id
+            WHERE i.token_hash = ? AND (
+                issuer.role IN ('owner', 'admin')
+                OR (
+                    issuer.role = 'automation'
+                    AND issuer_principal.id = ?
+                    AND issuer_principal.kind = 'service'
+                    AND issuer_principal.scope_team_id IS NULL
+                    AND issuer_service.service_identifier = ?
+                    AND EXISTS (
+                        SELECT 1
+                        FROM nodes AS managed_node
+                        JOIN managed_host_bindings AS managed
+                          ON managed.singleton=1
+                         AND managed.server_identity=managed_node.server_identity
+                        WHERE managed_node.team_id=i.team_id
+                          AND managed_node.status='active'
+                    )
+                )
+            )
             """,
-            (token_hash,),
+            (
+                token_hash,
+                MANAGED_SERVER_PRINCIPAL_ID,
+                MANAGED_SERVER_SERVICE_IDENTIFIER,
+            ),
         ).fetchone()
         if invitation is None or not hmac.compare_digest(invitation["token_hash"], token_hash):
             raise AuthenticationError("credential is invalid or unavailable")

@@ -25,6 +25,7 @@ from typing import Any
 
 BODY_MAX_BYTES = 49_152
 ATTACHMENT_MAX_COUNT = 16
+PROVIDER_RUNTIME_VALUE_MAX_BYTES = 4096
 
 
 class TeamCLIError(RuntimeError):
@@ -36,34 +37,122 @@ class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _loopback_server_url() -> str:
-    server_url = os.environ.get("AGENTSDOCK_SERVER_URL", "").strip().rstrip("/")
-    if not server_url:
-        raise TeamCLIError("missing AgentsDock agent environment")
-    parsed = urllib.parse.urlsplit(server_url)
-    if parsed.scheme != "http" or not parsed.hostname:
-        raise TeamCLIError("AGENTSDOCK_SERVER_URL must be a loopback HTTP URL")
+def _canonical_http_origin(value: str, label: str) -> tuple[str, bool]:
+    raw = value.strip()
     try:
-        address = ipaddress.ip_address(parsed.hostname)
+        parsed = urllib.parse.urlsplit(raw)
+        port = parsed.port or 80
+    except ValueError as exc:
+        raise TeamCLIError(f"{label} must be an HTTP origin") from exc
+    if (
+        parsed.scheme.lower() != "http"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise TeamCLIError(f"{label} must be an HTTP origin")
+    host = parsed.hostname.lower()
+    try:
+        address = ipaddress.ip_address(host)
         if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
             address = address.ipv4_mapped
         loopback = address.is_loopback
+        host = address.compressed
+        url_host = f"[{host}]" if isinstance(address, ipaddress.IPv6Address) else host
     except ValueError:
-        loopback = parsed.hostname.lower() == "localhost"
-    if not loopback:
-        raise TeamCLIError("refusing to send provider authority to a non-loopback server")
-    return server_url
+        loopback = host == "localhost"
+        url_host = host
+    return f"http://{url_host}:{port}", loopback
+
+
+def _authority_server_origin(authority_file: str | None) -> str:
+    path = _selected_authority_path(authority_file)
+    try:
+        if path.stat().st_mode & 0o077:
+            raise TeamCLIError("authority file permissions are unsafe")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise TeamCLIError(f"could not read authority file: {exc}") from exc
+    return _bounded_identity_value(
+        payload.get("provider_server_origin"),
+        "authority provider_server_origin",
+    )
+
+
+def _loopback_server_url() -> str:
+    raw_server_url = os.environ.get("AGENTSDOCK_SERVER_URL", "").strip()
+    if not raw_server_url:
+        raise TeamCLIError("missing AgentsDock agent environment")
+    server_origin, loopback = _canonical_http_origin(
+        raw_server_url,
+        "AGENTSDOCK_SERVER_URL",
+    )
+    runtime_origin = _bounded_identity_value(
+        os.environ.get("AGENTSDOCK_PROVIDER_SERVER_ORIGIN"),
+        "AGENTSDOCK_PROVIDER_SERVER_ORIGIN",
+    )
+    if runtime_origin:
+        canonical_runtime, _runtime_loopback = _canonical_http_origin(
+            runtime_origin,
+            "AGENTSDOCK_PROVIDER_SERVER_ORIGIN",
+        )
+        if canonical_runtime != server_origin:
+            raise TeamCLIError(
+                "AGENTSDOCK_SERVER_URL conflicts with the live provider origin"
+            )
+    if loopback:
+        return raw_server_url.rstrip("/")
+    authority_origin = _authority_server_origin(None)
+    if not authority_origin:
+        raise TeamCLIError(
+            "non-loopback AGENTSDOCK_SERVER_URL must match the authority origin"
+        )
+    canonical_authority, _authority_loopback = _canonical_http_origin(
+        authority_origin,
+        "authority provider_server_origin",
+    )
+    if canonical_authority != server_origin:
+        raise TeamCLIError(
+            "non-loopback AGENTSDOCK_SERVER_URL must match the authority origin"
+        )
+    return server_origin
+
+
+def _bounded_identity_value(value: str | None, label: str) -> str:
+    clean = str(value or "").strip()
+    try:
+        size = len(clean.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise TeamCLIError(f"{label} is not valid UTF-8") from exc
+    if size > PROVIDER_RUNTIME_VALUE_MAX_BYTES:
+        raise TeamCLIError(f"{label} exceeds the provider runtime limit")
+    return clean
+
+
+def _selected_authority_path(authority_file: str | None) -> Path:
+    explicit = _bounded_identity_value(authority_file, "--authority-file")
+    ambient = _bounded_identity_value(
+        os.environ.get("AGENTSDOCK_PROVIDER_AUTHORITY_FILE"),
+        "AGENTSDOCK_PROVIDER_AUTHORITY_FILE",
+    )
+    if explicit and ambient:
+        explicit_key = os.path.abspath(os.path.expanduser(explicit))
+        ambient_key = os.path.abspath(os.path.expanduser(ambient))
+        if explicit_key != ambient_key:
+            raise TeamCLIError(
+                "--authority-file conflicts with the live provider authority"
+            )
+    selected = explicit or ambient
+    if not selected:
+        raise TeamCLIError("--authority-file is required")
+    return Path(selected).expanduser()
 
 
 def _provider_authority(authority_file: str | None) -> tuple[str, str]:
-    raw_path = str(
-        authority_file
-        or os.environ.get("AGENTSDOCK_PROVIDER_AUTHORITY_FILE")
-        or ""
-    ).strip()
-    if not raw_path:
-        raise TeamCLIError("--authority-file is required")
-    path = Path(raw_path).expanduser()
+    path = _selected_authority_path(authority_file)
     try:
         if path.stat().st_mode & 0o077:
             raise TeamCLIError("authority file permissions are unsafe")
@@ -74,6 +163,14 @@ def _provider_authority(authority_file: str | None) -> tuple[str, str]:
     source_session_id = str(payload.get("source_session_id") or "").strip()
     if not capability or not source_session_id:
         raise TeamCLIError("authority file is invalid")
+    environment_chat_id = _bounded_identity_value(
+        os.environ.get("AGENTSDOCK_CHAT_ID"),
+        "AGENTSDOCK_CHAT_ID",
+    )
+    if environment_chat_id and environment_chat_id != source_session_id:
+        raise TeamCLIError(
+            "AGENTSDOCK_CHAT_ID does not match the authority file"
+        )
     return capability, source_session_id
 
 
@@ -337,6 +434,7 @@ def send(args: argparse.Namespace) -> dict[str, Any]:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
         description="Read Team Network mail and skills, and send to @@-mentioned recipients.",
+        allow_abbrev=False,
     )
     root.add_argument(
         "--authority-file",
@@ -345,7 +443,7 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", required=True)
 
     def listing(name: str, help_text: str):
-        command = commands.add_parser(name, help=help_text)
+        command = commands.add_parser(name, help=help_text, allow_abbrev=False)
         command.add_argument("--limit", type=int, default=20)
         command.add_argument("--after", type=int, default=None, help="sequence cursor")
         command.add_argument("--team", default=None, help="team id when this server is in several teams")
@@ -365,32 +463,47 @@ def parser() -> argparse.ArgumentParser:
     sent_command = listing("sent", "messages this server sent")
     sent_command.set_defaults(handler=sent)
 
-    read_command = commands.add_parser("read", help="read one message with its attachments")
+    read_command = commands.add_parser(
+        "read", help="read one message with its attachments", allow_abbrev=False
+    )
     read_command.add_argument("message_id")
     read_command.add_argument("--download", action="store_true", help="fetch attachments into the local team cache and print their paths")
     read_command.add_argument("--team", default=None)
     read_command.set_defaults(handler=read)
 
-    skills_command = commands.add_parser("skills", help="list the team Skills library")
+    skills_command = commands.add_parser(
+        "skills", help="list the team Skills library", allow_abbrev=False
+    )
     skills_command.add_argument("--include-archived", action="store_true")
     skills_command.add_argument("--team", default=None)
     skills_command.set_defaults(handler=skills)
 
-    skill_command = commands.add_parser("skill", help="skill operations")
+    skill_command = commands.add_parser(
+        "skill", help="skill operations", allow_abbrev=False
+    )
     skill_sub = skill_command.add_subparsers(dest="skill_command", required=True)
-    skill_get_command = skill_sub.add_parser("get", help="read one skill (latest version by default)")
+    skill_get_command = skill_sub.add_parser(
+        "get",
+        help="read one skill (latest version by default)",
+        allow_abbrev=False,
+    )
     skill_get_command.add_argument("slug")
     skill_get_command.add_argument("--version", type=int, default=None)
     skill_get_command.add_argument("--download", action="store_true")
     skill_get_command.add_argument("--team", default=None)
     skill_get_command.set_defaults(handler=skill_get)
 
-    routes_command = commands.add_parser("routes", help="list this run's @@ recipient routes")
+    routes_command = commands.add_parser(
+        "routes",
+        help="list this run's @@ recipient routes",
+        allow_abbrev=False,
+    )
     routes_command.set_defaults(handler=routes)
 
     send_command = commands.add_parser(
         "send",
         help="send one message to a route; the Markdown body is read from stdin",
+        allow_abbrev=False,
     )
     send_command.add_argument("--route", required=True)
     send_command.add_argument("--kind", choices=("message", "skill"), default="message")
@@ -407,14 +520,28 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    previous_authority_file = os.environ.get(
+        "AGENTSDOCK_PROVIDER_AUTHORITY_FILE"
+    )
     try:
         args = parser().parse_args(argv)
+        selected_authority = _selected_authority_path(args.authority_file)
+        os.environ["AGENTSDOCK_PROVIDER_AUTHORITY_FILE"] = str(
+            selected_authority
+        )
         result = args.handler(args)
         print(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False))
         return 0
     except TeamCLIError as exc:
         print(f"agentsdock-team: {exc}", file=sys.stderr)
         return 2
+    finally:
+        if previous_authority_file is None:
+            os.environ.pop("AGENTSDOCK_PROVIDER_AUTHORITY_FILE", None)
+        else:
+            os.environ[
+                "AGENTSDOCK_PROVIDER_AUTHORITY_FILE"
+            ] = previous_authority_file
 
 
 if __name__ == "__main__":

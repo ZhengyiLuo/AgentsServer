@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import Any
 
 
+PROVIDER_RUNTIME_VALUE_MAX_BYTES = 4096
+
+
 class JobsCLIError(RuntimeError):
     """A safe, user-facing CLI failure."""
 
@@ -33,6 +36,37 @@ def host_is_loopback(host: str) -> bool:
     if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
         address = address.ipv4_mapped
     return address.is_loopback
+
+
+def canonical_http_origin(value: str, label: str) -> tuple[str, bool]:
+    raw = value.strip()
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        port = parsed.port or 80
+    except ValueError as exc:
+        raise JobsCLIError(f"{label} must be an HTTP origin") from exc
+    if (
+        parsed.scheme.lower() != "http"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise JobsCLIError(f"{label} must be an HTTP origin")
+    host = parsed.hostname.lower()
+    try:
+        address = ipaddress.ip_address(host)
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+            address = address.ipv4_mapped
+        host = address.compressed
+        loopback = address.is_loopback
+        url_host = f"[{host}]" if isinstance(address, ipaddress.IPv6Address) else host
+    except ValueError:
+        loopback = host == "localhost"
+        url_host = host
+    return f"http://{url_host}:{port}", loopback
 
 
 def nonempty_chat_id(value: str) -> str:
@@ -59,11 +93,38 @@ def chat_route_selection(value: str) -> dict[str, str]:
     return {"route_id": route_id, "action": selected_action}
 
 
-def provider_authority() -> tuple[str, str]:
-    raw_path = os.environ.get("AGENTSDOCK_PROVIDER_AUTHORITY_FILE", "").strip()
-    if not raw_path:
+def bounded_identity_value(value: str | None, label: str) -> str:
+    clean = str(value or "").strip()
+    try:
+        size = len(clean.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise JobsCLIError(f"{label} is not valid UTF-8") from exc
+    if size > PROVIDER_RUNTIME_VALUE_MAX_BYTES:
+        raise JobsCLIError(f"{label} exceeds the provider runtime limit")
+    return clean
+
+
+def selected_authority_path(authority_file: str | None = None) -> Path:
+    explicit = bounded_identity_value(authority_file, "--authority-file")
+    ambient = bounded_identity_value(
+        os.environ.get("AGENTSDOCK_PROVIDER_AUTHORITY_FILE"),
+        "AGENTSDOCK_PROVIDER_AUTHORITY_FILE",
+    )
+    if explicit and ambient:
+        explicit_key = os.path.abspath(os.path.expanduser(explicit))
+        ambient_key = os.path.abspath(os.path.expanduser(ambient))
+        if explicit_key != ambient_key:
+            raise JobsCLIError(
+                "--authority-file conflicts with the live provider authority"
+            )
+    selected = explicit or ambient
+    if not selected:
         raise JobsCLIError("--authority-file is required")
-    path = Path(raw_path).expanduser()
+    return Path(selected).expanduser()
+
+
+def provider_authority(authority_file: str | None = None) -> tuple[str, str]:
+    path = selected_authority_path(authority_file)
     try:
         if path.stat().st_mode & 0o077:
             raise JobsCLIError("authority file permissions are unsafe")
@@ -77,25 +138,68 @@ def provider_authority() -> tuple[str, str]:
     return capability, source_session_id
 
 
+def authority_server_origin(authority_file: str | None = None) -> str:
+    path = selected_authority_path(authority_file)
+    try:
+        if path.stat().st_mode & 0o077:
+            raise JobsCLIError("authority file permissions are unsafe")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise JobsCLIError(f"could not read authority file: {exc}") from exc
+    return bounded_identity_value(
+        payload.get("provider_server_origin"),
+        "authority provider_server_origin",
+    )
+
+
+def validated_server_url(authority_origin: str) -> str:
+    raw_server_url = os.environ.get("AGENTSDOCK_SERVER_URL", "").strip()
+    if not raw_server_url:
+        raise JobsCLIError("missing agent environment: AGENTSDOCK_SERVER_URL")
+    server_origin, loopback = canonical_http_origin(
+        raw_server_url,
+        "AGENTSDOCK_SERVER_URL",
+    )
+    runtime_origin = bounded_identity_value(
+        os.environ.get("AGENTSDOCK_PROVIDER_SERVER_ORIGIN"),
+        "AGENTSDOCK_PROVIDER_SERVER_ORIGIN",
+    )
+    if runtime_origin:
+        canonical_runtime, _runtime_loopback = canonical_http_origin(
+            runtime_origin,
+            "AGENTSDOCK_PROVIDER_SERVER_ORIGIN",
+        )
+        if canonical_runtime != server_origin:
+            raise JobsCLIError(
+                "AGENTSDOCK_SERVER_URL conflicts with the live provider origin"
+            )
+    if loopback:
+        return raw_server_url.rstrip("/")
+    if not authority_origin:
+        raise JobsCLIError(
+            "non-loopback AGENTSDOCK_SERVER_URL must match the authority origin"
+        )
+    canonical_authority, _authority_loopback = canonical_http_origin(
+        authority_origin,
+        "authority provider_server_origin",
+    )
+    if canonical_authority != server_origin:
+        raise JobsCLIError(
+            "non-loopback AGENTSDOCK_SERVER_URL must match the authority origin"
+        )
+    return server_origin
+
+
 def required_environment() -> tuple[str, str, str]:
-    server_url = os.environ.get("AGENTSDOCK_SERVER_URL", "").strip().rstrip("/")
-    explicit_chat_id = os.environ.get("AGENTSDOCK_CHAT_ID", "").strip()
+    explicit_chat_id = bounded_identity_value(
+        os.environ.get("AGENTSDOCK_CHAT_ID"),
+        "AGENTSDOCK_CHAT_ID",
+    )
     token, authority_chat_id = provider_authority()
+    server_url = validated_server_url(authority_server_origin())
     if explicit_chat_id and explicit_chat_id != authority_chat_id:
         raise JobsCLIError("--chat-id does not match the authority file")
     chat_id = explicit_chat_id or authority_chat_id
-    missing = [
-        name
-        for name, value in (
-            ("AGENTSDOCK_SERVER_URL", server_url),
-        )
-        if value is None or not value
-    ]
-    if missing:
-        raise JobsCLIError(f"missing agent environment: {', '.join(missing)}")
-    parsed = urllib.parse.urlsplit(server_url)
-    if parsed.scheme != "http" or not parsed.hostname or not host_is_loopback(parsed.hostname):
-        raise JobsCLIError("AGENTSDOCK_SERVER_URL must be a loopback HTTP URL")
     return server_url, chat_id, token
 
 
@@ -357,6 +461,7 @@ def command_delete(args: argparse.Namespace) -> Any:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Manage scheduled jobs for the current AgentsDock chat.",
+        allow_abbrev=False,
     )
     parser.add_argument(
         "--authority-file",
@@ -369,20 +474,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    list_parser = subparsers.add_parser("list", help="list jobs in the active chat")
+    list_parser = subparsers.add_parser(
+        "list", help="list jobs in the active chat", allow_abbrev=False
+    )
     list_parser.set_defaults(handler=command_list)
 
-    get_parser = subparsers.add_parser("get", help="get one job in the active chat")
+    get_parser = subparsers.add_parser(
+        "get", help="get one job in the active chat", allow_abbrev=False
+    )
     get_parser.add_argument("job_id")
     get_parser.set_defaults(handler=command_get)
 
-    runs_parser = subparsers.add_parser("runs", help="show recent run status for one job")
+    runs_parser = subparsers.add_parser(
+        "runs", help="show recent run status for one job", allow_abbrev=False
+    )
     runs_parser.add_argument("job_id")
     runs_parser.add_argument("--before-seq", type=int)
     runs_parser.add_argument("--limit", type=int, default=20)
     runs_parser.set_defaults(handler=command_runs)
 
-    create_parser = subparsers.add_parser("create", help="create a job in the active chat")
+    create_parser = subparsers.add_parser(
+        "create", help="create a job in the active chat", allow_abbrev=False
+    )
     create_parser.add_argument("--title", required=True)
     create_parser.add_argument("--prompt", required=True)
     create_schedule = create_parser.add_mutually_exclusive_group()
@@ -413,7 +526,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     create_parser.set_defaults(handler=command_create)
 
-    update_parser = subparsers.add_parser("update", help="update a job owned by the active chat")
+    update_parser = subparsers.add_parser(
+        "update", help="update a job owned by the active chat", allow_abbrev=False
+    )
     update_parser.add_argument("job_id")
     update_parser.add_argument("--title")
     update_parser.add_argument("--prompt")
@@ -461,7 +576,9 @@ def build_parser() -> argparse.ArgumentParser:
         clear_chat_routes=False,
     )
 
-    delete_parser = subparsers.add_parser("delete", help="delete a job owned by the active chat")
+    delete_parser = subparsers.add_parser(
+        "delete", help="delete a job owned by the active chat", allow_abbrev=False
+    )
     delete_parser.add_argument("job_id")
     delete_parser.set_defaults(handler=command_delete)
     return parser
@@ -470,23 +587,51 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.authority_file:
-        os.environ["AGENTSDOCK_PROVIDER_AUTHORITY_FILE"] = args.authority_file
+    previous_authority_file = os.environ.get(
+        "AGENTSDOCK_PROVIDER_AUTHORITY_FILE"
+    )
     previous_chat_id = os.environ.get("AGENTSDOCK_CHAT_ID")
-    if args.chat_id is not None:
-        os.environ["AGENTSDOCK_CHAT_ID"] = args.chat_id
     try:
         try:
+            authority_path = selected_authority_path(args.authority_file)
+            _token, authority_chat_id = provider_authority(args.authority_file)
+            explicit_chat_id = bounded_identity_value(args.chat_id, "--chat-id")
+            environment_chat_id = bounded_identity_value(
+                previous_chat_id,
+                "AGENTSDOCK_CHAT_ID",
+            )
+            if (
+                explicit_chat_id
+                and environment_chat_id
+                and explicit_chat_id != environment_chat_id
+            ):
+                raise JobsCLIError(
+                    "--chat-id conflicts with AGENTSDOCK_CHAT_ID"
+                )
+            for candidate in (explicit_chat_id, environment_chat_id):
+                if candidate and candidate != authority_chat_id:
+                    raise JobsCLIError(
+                        "--chat-id does not match the authority file"
+                    )
+            os.environ["AGENTSDOCK_PROVIDER_AUTHORITY_FILE"] = str(
+                authority_path
+            )
+            os.environ["AGENTSDOCK_CHAT_ID"] = authority_chat_id
             result = args.handler(args)
         except JobsCLIError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
     finally:
-        if args.chat_id is not None:
-            if previous_chat_id is None:
-                os.environ.pop("AGENTSDOCK_CHAT_ID", None)
-            else:
-                os.environ["AGENTSDOCK_CHAT_ID"] = previous_chat_id
+        if previous_authority_file is None:
+            os.environ.pop("AGENTSDOCK_PROVIDER_AUTHORITY_FILE", None)
+        else:
+            os.environ[
+                "AGENTSDOCK_PROVIDER_AUTHORITY_FILE"
+            ] = previous_authority_file
+        if previous_chat_id is None:
+            os.environ.pop("AGENTSDOCK_CHAT_ID", None)
+        else:
+            os.environ["AGENTSDOCK_CHAT_ID"] = previous_chat_id
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 

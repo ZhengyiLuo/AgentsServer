@@ -958,6 +958,90 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         runtime_success.assert_called_once_with(agent_server.BACKEND_CLAUDE)
         runtime_failure.assert_not_called()
 
+    async def test_sdk_text_streams_as_commentary_and_result_is_only_final(
+        self,
+    ) -> None:
+        append_event, append_finished, runtime_success, runtime_failure = (
+            await self._run_sdk_terminal_case([
+                {
+                    "type": "AssistantMessage",
+                    "content": [{
+                        "type": "text",
+                        "text": "Checking the repository now.",
+                    }],
+                    "session_id": "provider",
+                },
+                {
+                    "type": "result",
+                    "result": "The repository is ready.",
+                    "session_id": "provider",
+                    "terminal_reason": "end_turn",
+                },
+            ])
+        )
+
+        projected = [
+            (call.args[1], call.args[2])
+            for call in append_event.await_args_list
+        ]
+        self.assertFalse(any(
+            event_type == "assistant_text"
+            for event_type, _payload in projected
+        ))
+        self.assertEqual(
+            [
+                payload
+                for event_type, payload in projected
+                if event_type == "reasoning_summary"
+            ],
+            [{
+                "run_id": "run-claude",
+                "text": "Checking the repository now.",
+                "phase": "commentary",
+                "backend": agent_server.BACKEND_CLAUDE,
+            }],
+        )
+        terminal = append_finished.await_args.args[1]
+        self.assertEqual(terminal["result_text"], "The repository is ready.")
+        self.assertFalse(terminal["stopped"])
+        runtime_success.assert_called_once_with(agent_server.BACKEND_CLAUDE)
+        runtime_failure.assert_not_called()
+
+    async def test_aborted_sdk_result_does_not_promote_commentary_to_final(
+        self,
+    ) -> None:
+        append_event, append_finished, runtime_success, runtime_failure = (
+            await self._run_sdk_terminal_case([
+                {
+                    "type": "AssistantMessage",
+                    "content": [{
+                        "type": "text",
+                        "text": "Partial work before cancellation.",
+                    }],
+                    "session_id": "provider",
+                },
+                {
+                    "type": "result",
+                    "result": "",
+                    "session_id": "provider",
+                    "terminal_reason": "aborted_streaming",
+                },
+            ])
+        )
+
+        self.assertTrue(any(
+            call.args[1] == "reasoning_summary"
+            and call.args[2].get("phase") == "commentary"
+            and call.args[2].get("text")
+            == "Partial work before cancellation."
+            for call in append_event.await_args_list
+        ))
+        terminal = append_finished.await_args.args[1]
+        self.assertTrue(terminal["stopped"])
+        self.assertEqual(terminal["result_text"], "")
+        runtime_success.assert_not_called()
+        runtime_failure.assert_not_called()
+
     async def test_sdk_iterator_end_before_terminal_never_waits_forever(self) -> None:
         handle = PrematurelyEndedClaudeRun()
 
@@ -1997,6 +2081,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             {
                 "replay-user-messages": None,
                 "allow-dangerously-skip-permissions": None,
+                "system-prompt-snapshot": "off",
             },
         )
 
@@ -2096,11 +2181,25 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(captured_options["permission_mode"], "plan")
-        self.assertEqual(agent_server.CLAUDE_SDK_CONFIGURATION_VERSION, 8)
+        self.assertEqual(agent_server.CLAUDE_SDK_CONFIGURATION_VERSION, 9)
         self.assertEqual(
             captured_options["disallowed_tools"],
             ["CronCreate", "Monitor", "ScheduleWakeup"],
         )
+        self.assertEqual(
+            captured_options["allowed_tools"],
+            [agent_server.CLAUDE_PROVIDER_MCP_TOOL_NAME],
+        )
+        system_prompt = captured_options["system_prompt"]["append"]
+        self.assertIn(
+            f"Use only `{agent_server.CLAUDE_PROVIDER_MCP_TOOL_NAME}`",
+            system_prompt,
+        )
+        self.assertIn(
+            "A user-configured MCP server named `agentsdock` is unrelated",
+            system_prompt,
+        )
+        self.assertNotIn("Use the `agentsdock` provider tool", system_prompt)
         self.assertEqual(
             captured_options["thinking"],
             {"type": "adaptive", "display": "summarized"},
@@ -2110,12 +2209,19 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             {
                 "replay-user-messages": None,
                 "allow-dangerously-skip-permissions": None,
+                "system-prompt-snapshot": "off",
             },
         )
         hooks = captured_options["hooks"]
         self.assertEqual(
             [matcher.matcher for matcher in hooks["PreToolUse"]],
-            ["Bash", "CronCreate", "Monitor", "ScheduleWakeup"],
+            [
+                agent_server.CLAUDE_PROVIDER_MCP_TOOL_NAME,
+                "Bash",
+                "CronCreate",
+                "Monitor",
+                "ScheduleWakeup",
+            ],
         )
         self.assertEqual(result, {"behavior": "allow"})
         permission.assert_awaited_once_with(
@@ -2125,6 +2231,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             {"tool_use_id": "exit-plan"},
             owner_token="",
         )
+
         default_key = agent_server.claude_sdk_configuration_key(
             {**session, "claude_permission_mode": "default"},
             self.cwd,
@@ -2162,6 +2269,126 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(config_key, previous_version_key)
         self.assertNotEqual(config_key, previous_tools_key)
 
+    async def test_provider_tool_repeats_live_reads_but_replays_identical_mutations(self) -> None:
+        captured_mcp: dict[str, object] = {}
+
+        def make_options(**kwargs: object) -> dict[str, object]:
+            return kwargs
+
+        def make_mcp(**kwargs: object) -> dict[str, object]:
+            captured_mcp.update(kwargs)
+            return {"type": "sdk", "name": "agentsdock"}
+
+        with patch.object(
+            agent_server,
+            "claude_sdk_cli_path",
+            return_value="/usr/bin/claude",
+        ), patch.object(
+            agent_server,
+            "resolve_claude_resume_provider",
+            return_value=(None, None),
+        ), patch.object(
+            agent_server,
+            "create_claude_agent_options",
+            side_effect=make_options,
+        ), patch.object(
+            agent_server,
+            "create_claude_sdk_mcp_server",
+            side_effect=make_mcp,
+        ):
+            options, _config_key, _ = agent_server.build_claude_sdk_options(
+                "chat-claude",
+                self.session,
+                self.cwd,
+                Path(self.cwd) / ".manifest.json",
+            )
+
+        options["_agentsdock_bind_provider_tool_owner"]("owner", "run-claude")
+        handler = captured_mcp["handler"]
+        executor = AsyncMock(
+            side_effect=[
+                ("read-1", False),
+                ("read-2", False),
+                ("mutation", False),
+            ]
+        )
+        with patch.object(
+            agent_server,
+            "PROVIDER_TOOL_REPLAY",
+            agent_server.OrderedDict(),
+        ), patch.object(
+            agent_server,
+            "PROVIDER_TOOL_REPLAY_TOMBSTONES",
+            agent_server.OrderedDict(),
+        ), patch.object(
+            agent_server,
+            "PROVIDER_TOOL_REPLAY_LOCK",
+            asyncio.Lock(),
+        ), patch.object(
+            agent_server,
+            "provider_tool_capability_snapshot",
+            AsyncMock(return_value=(Path("/private/authority"), {})),
+        ), patch.object(
+            agent_server,
+            "execute_provider_tool",
+            executor,
+        ):
+            first_read = await handler({"helper": "jobs", "arguments": ["list"]})
+            second_read = await handler({"helper": "jobs", "arguments": ["list"]})
+            mutation = {
+                "helper": "team",
+                "arguments": ["send", "--route", "route-1"],
+                "stdin": "same body",
+            }
+            first_mutation = await handler(mutation)
+            second_mutation = await handler(mutation)
+
+        self.assertEqual(first_read["content"][0]["text"], "read-1")
+        self.assertEqual(second_read["content"][0]["text"], "read-2")
+        self.assertEqual(first_mutation, second_mutation)
+        self.assertEqual(first_mutation["content"][0]["text"], "mutation")
+        self.assertEqual(executor.await_count, 3)
+
+        entered = 0
+        both_entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def gated_executor(*_args: object, **_kwargs: object):
+            nonlocal entered
+            entered += 1
+            if entered == agent_server.PROVIDER_TOOL_MAX_CONCURRENT_PER_CLAUDE_CHAT:
+                both_entered.set()
+            await release.wait()
+            return "fresh", False
+
+        with patch.object(
+            agent_server,
+            "execute_provider_tool",
+            AsyncMock(side_effect=gated_executor),
+        ):
+            running = [
+                asyncio.create_task(handler({
+                    "helper": "jobs",
+                    "arguments": ["list"],
+                }))
+                for _ in range(
+                    agent_server.PROVIDER_TOOL_MAX_CONCURRENT_PER_CLAUDE_CHAT
+                )
+            ]
+            await asyncio.wait_for(both_entered.wait(), 1)
+            rejected = await handler({
+                "helper": "jobs",
+                "arguments": ["list"],
+            })
+            release.set()
+            await asyncio.gather(*running)
+
+        self.assertTrue(rejected["is_error"])
+        self.assertIn(
+            "too many AgentsDock provider actions",
+            rejected["content"][0]["text"],
+        )
+
     async def test_nondurable_scheduler_permission_never_creates_interaction(self) -> None:
         append_event = AsyncMock(return_value={})
         update_metadata = AsyncMock()
@@ -2184,8 +2411,8 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertIsInstance(result, FakePermissionResultDeny)
                     self.assertFalse(getattr(result, "interrupt", True))
-                    self.assertIn("AgentsDock Jobs CLI", result.message)
-                    self.assertIn("provider-authority block", result.message)
+                    self.assertIn("AgentsDock provider tool", result.message)
+                    self.assertNotIn("provider-authority block", result.message)
 
         self.assertFalse(agent_server.CLAUDE_PENDING_INTERACTIONS)
         append_event.assert_not_awaited()
@@ -3751,11 +3978,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
                 )
             self.assertEqual(stale.exception.status_code, 403)
             self.assertFalse(predecessor_path.exists())
-            self.assertTrue(
-                str(manager.start_calls[1][1]).startswith(
-                    "Steered prompt\n\n[AgentsDock provider authority]"
-                )
-            )
+            self.assertEqual(manager.start_calls[1][1], "Steered prompt")
             await second.messages.put(second_terminal)
             await asyncio.wait_for(runner, 0.5)
 

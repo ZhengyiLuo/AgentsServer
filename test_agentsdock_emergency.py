@@ -218,6 +218,57 @@ class EmergencyCLITests(unittest.TestCase):
                     request_id="request.mode.0001",
                 )
 
+    def test_identity_uses_matching_provider_environment_without_flags(self) -> None:
+        authority_file = self.authority_file("sess/demo")
+        environment = self.environment("sess/demo")
+        environment["AGENTSDOCK_PROVIDER_AUTHORITY_FILE"] = authority_file
+        with patch.dict("os.environ", environment, clear=True):
+            server_url, chat_id, token = agentsdock_emergency.required_environment(
+                None,
+                None,
+            )
+
+        self.assertEqual(server_url, "http://127.0.0.1:7850")
+        self.assertEqual(chat_id, "sess/demo")
+        self.assertEqual(token, "provider-secret")
+
+    def test_explicit_identity_cannot_override_provider_environment(self) -> None:
+        ambient_authority = self.authority_file("sess/demo")
+        explicit_authority = self.authority_file("sess/demo")
+        environment = self.environment("sess/demo")
+        environment["AGENTSDOCK_PROVIDER_AUTHORITY_FILE"] = ambient_authority
+        with patch.dict("os.environ", environment, clear=True):
+            with self.assertRaisesRegex(
+                agentsdock_emergency.EmergencyCLIError,
+                "conflicts with the live provider authority",
+            ):
+                agentsdock_emergency.required_environment(
+                    explicit_authority,
+                    "sess/demo",
+                )
+
+        environment = self.environment("sess/other")
+        environment["AGENTSDOCK_PROVIDER_AUTHORITY_FILE"] = ambient_authority
+        with patch.dict("os.environ", environment, clear=True):
+            with self.assertRaisesRegex(
+                agentsdock_emergency.EmergencyCLIError,
+                "conflicts with AGENTSDOCK_CHAT_ID",
+            ):
+                agentsdock_emergency.required_environment(
+                    None,
+                    "sess/demo",
+                )
+
+    def test_oversized_provider_identity_environment_fails_closed(self) -> None:
+        environment = self.environment("sess/demo")
+        environment["AGENTSDOCK_PROVIDER_AUTHORITY_FILE"] = "x" * 4097
+        with patch.dict("os.environ", environment, clear=True):
+            with self.assertRaisesRegex(
+                agentsdock_emergency.EmergencyCLIError,
+                "exceeds the provider runtime limit",
+            ):
+                agentsdock_emergency.required_environment(None, None)
+
     def test_invalid_receipt_is_rejected_after_bounded_retry(self) -> None:
         requests = []
 

@@ -7904,6 +7904,244 @@ class SecurePeerClient:
 
     activate_after_health = set_active_connection
 
+    @staticmethod
+    def _host_role_pause_record(raw: Any) -> dict[str, Any]:
+        try:
+            paused = json.loads(str(raw))
+        except (TypeError, ValueError) as exc:
+            raise SecurePeerError(
+                "host_role_pause_invalid",
+                "Paused Team Network member state is invalid",
+                409,
+            ) from exc
+        expected_keys = {
+            "format",
+            "connection_id",
+            "host_server_identity",
+            "hub_id",
+            "status",
+            "updated_at",
+            "last_validated_at",
+        }
+        if (
+            not isinstance(paused, dict)
+            or set(paused) != expected_keys
+            or paused.get("format") != 1
+            or paused.get("status") not in {"approved", "connected"}
+            or isinstance(paused.get("updated_at"), bool)
+            or not isinstance(paused.get("updated_at"), int)
+            or (
+                paused.get("last_validated_at") is not None
+                and (
+                    isinstance(paused.get("last_validated_at"), bool)
+                    or not isinstance(paused.get("last_validated_at"), int)
+                )
+            )
+        ):
+            raise SecurePeerError(
+                "host_role_pause_invalid",
+                "Paused Team Network member state is invalid",
+                409,
+            )
+        paused["connection_id"] = _uuid(
+            paused.get("connection_id"), "connection_id"
+        )
+        paused["host_server_identity"] = _identifier(
+            paused.get("host_server_identity"), "host server identity"
+        )
+        paused["hub_id"] = _identifier(paused.get("hub_id"), "hub id")
+        return paused
+
+    def pause_active_connection_for_host(self) -> dict[str, Any] | None:
+        """Durably pause Member routing while preserving its exact outbox."""
+
+        with self._route_guard:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                paused_row = connection.execute(
+                    "SELECT value FROM client_meta WHERE key='host_role_pause'"
+                ).fetchone()
+                if paused_row is not None:
+                    paused = self._host_role_pause_record(paused_row["value"])
+                    row = connection.execute(
+                        """
+                        SELECT host_server_identity,hub_id,status
+                        FROM client_connections WHERE connection_id=?
+                        """,
+                        (paused["connection_id"],),
+                    ).fetchone()
+                    if (
+                        self._active_id(connection) is not None
+                        or row is None
+                        or str(row["host_server_identity"])
+                        != paused["host_server_identity"]
+                        or str(row["hub_id"]) != paused["hub_id"]
+                        or row["status"] != "deactivated"
+                    ):
+                        raise SecurePeerError(
+                            "host_role_pause_changed",
+                            "Paused Team Network membership changed",
+                            409,
+                        )
+                    connection.execute("COMMIT")
+                    return paused
+                active = self._active_id(connection)
+                if active is None:
+                    connection.execute("COMMIT")
+                    return None
+                row = connection.execute(
+                    """
+                    SELECT connection_id,host_server_identity,hub_id,status,
+                           updated_at,last_validated_at
+                    FROM client_connections WHERE connection_id=?
+                    """,
+                    (active,),
+                ).fetchone()
+                if row is None or row["status"] not in {"approved", "connected"}:
+                    raise SecurePeerError(
+                        "active_connection_changed",
+                        "Active Team Network membership changed",
+                        409,
+                    )
+                paused = {
+                    "format": 1,
+                    "connection_id": str(row["connection_id"]),
+                    "host_server_identity": str(row["host_server_identity"]),
+                    "hub_id": str(row["hub_id"]),
+                    "status": str(row["status"]),
+                    "updated_at": int(row["updated_at"]),
+                    "last_validated_at": (
+                        int(row["last_validated_at"])
+                        if row["last_validated_at"] is not None
+                        else None
+                    ),
+                }
+                timestamp = self._timestamp()
+                connection.execute(
+                    "UPDATE client_meta SET value=NULL WHERE key='active_connection_id' AND value=?",
+                    (active,),
+                )
+                connection.execute(
+                    "UPDATE client_connections SET status='deactivated',updated_at=? WHERE connection_id=?",
+                    (timestamp, active),
+                )
+                connection.execute(
+                    "INSERT INTO client_meta(key,value) VALUES ('host_role_pause',?)",
+                    (
+                        json.dumps(
+                            paused,
+                            ensure_ascii=True,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ),
+                    ),
+                )
+                connection.execute("COMMIT")
+                return paused
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            finally:
+                connection.close()
+
+    def restore_host_paused_connection(self) -> dict[str, Any] | None:
+        """Restore a paused Member only after pinned remote revalidation."""
+
+        with self._route_guard:
+            # Read the exact durable marker before doing network I/O. The
+            # route guard prevents another in-process connection mutation,
+            # while leaving the SQLite transaction closed during the pinned
+            # health check.
+            connection = self._connect()
+            try:
+                paused_row = connection.execute(
+                    "SELECT value FROM client_meta WHERE key='host_role_pause'"
+                ).fetchone()
+                if paused_row is None:
+                    return None
+                paused = self._host_role_pause_record(paused_row["value"])
+                connection_id = paused["connection_id"]
+                host_identity = paused["host_server_identity"]
+                hub_id = paused["hub_id"]
+            finally:
+                connection.close()
+
+            # Local possession of an old certificate is not enough to restore
+            # trust after time spent hosting. Revalidate the pinned peer,
+            # certificate and Hub identity before publishing it as active.
+            self._peer_health_locked(connection_id)
+            validated_at = self._timestamp()
+
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                current_pause = connection.execute(
+                    "SELECT value FROM client_meta WHERE key='host_role_pause'"
+                ).fetchone()
+                if (
+                    current_pause is None
+                    or self._host_role_pause_record(current_pause["value"])
+                    != paused
+                ):
+                    raise SecurePeerError(
+                        "host_role_pause_changed",
+                        "Paused Team Network membership changed",
+                        409,
+                    )
+                if self._active_id(connection) is not None:
+                    raise SecurePeerError(
+                        "active_connection_changed",
+                        "Active Team Network membership changed",
+                        409,
+                    )
+                row = connection.execute(
+                    """
+                    SELECT host_server_identity,hub_id,status
+                    FROM client_connections WHERE connection_id=?
+                    """,
+                    (connection_id,),
+                ).fetchone()
+                if (
+                    row is None
+                    or str(row["host_server_identity"]) != host_identity
+                    or str(row["hub_id"]) != hub_id
+                    or row["status"] != "deactivated"
+                ):
+                    raise SecurePeerError(
+                        "host_role_pause_changed",
+                        "Paused Team Network membership changed",
+                        409,
+                    )
+                connection.execute(
+                    "UPDATE client_meta SET value=? WHERE key='active_connection_id'",
+                    (connection_id,),
+                )
+                connection.execute(
+                    """
+                    UPDATE client_connections
+                    SET status='connected',updated_at=?,last_validated_at=?
+                    WHERE connection_id=?
+                    """,
+                    (
+                        validated_at,
+                        validated_at,
+                        connection_id,
+                    ),
+                )
+                connection.execute(
+                    "DELETE FROM client_meta WHERE key='host_role_pause'"
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            finally:
+                connection.close()
+        return self.get_connection(connection_id)
+
     def deactivate_connection(
         self,
         connection_id: str,
@@ -8352,34 +8590,63 @@ class SecurePeerClient:
         headers: Mapping[str, str] | None = None,
         body: Mapping[str, Any] | bytes | None = None,
     ) -> ProxyResponse:
+        normalized_method = str(method).upper()
+        prepared: tuple[str, int, ssl.SSLContext] | None = None
         with self._route_guard:
-            self._require_active_connection_locked(
+            row = self._require_active_connection_locked(
                 connection_id,
                 relay_required=False,
             )
+            # Load and validate the exact pinned CA/client credential while
+            # connection retirement is fenced.  Read-only Teamspace requests
+            # may then perform their remote round trip concurrently.  This is
+            # the same authority-snapshot boundary used by attachment reads:
+            # a request admitted before retirement may finish, while every
+            # later request must validate the new durable state.  Mutations
+            # deliberately retain the route guard for the complete request.
+            if row is not None:
+                prepared = (
+                    str(row["host_ip"]),
+                    int(row["port"]),
+                    self._pinned_context(row, mutual_tls=True),
+                )
+            if normalized_method not in {"GET", "HEAD"}:
+                response = self._proxy_locked(
+                    connection_id,
+                    normalized_method,
+                    hub_path,
+                    query=query,
+                    headers=headers,
+                    body=body,
+                    prepared=prepared,
+                )
+            else:
+                response = None
+        if response is None:
             response = self._proxy_locked(
                 connection_id,
-                method,
+                normalized_method,
                 hub_path,
                 query=query,
                 headers=headers,
                 body=body,
+                prepared=prepared,
             )
-            # Proxy errors normally remain byte-for-byte upstream responses.
-            # A pinned host's structured terminal revocation is the one
-            # exception: surface it as a typed error so the runtime can retire
-            # this exact credential before returning the same failure locally.
-            if response.status == 401:
-                try:
-                    self._decode_json_response(
-                        response.status,
-                        list(response.headers),
-                        response.body,
-                    )
-                except SecurePeerError as exc:
-                    if exc.code == "peer_revoked" and exc.status_code == 401:
-                        raise
-            return response
+        # Proxy errors normally remain byte-for-byte upstream responses.  A
+        # pinned host's structured terminal revocation is the one exception:
+        # surface it as a typed error so the runtime can retire this exact
+        # credential before returning the same failure locally.
+        if response.status == 401:
+            try:
+                self._decode_json_response(
+                    response.status,
+                    list(response.headers),
+                    response.body,
+                )
+            except SecurePeerError as exc:
+                if exc.code == "peer_revoked" and exc.status_code == 401:
+                    raise
+        return response
 
     def _proxy_locked(
         self,
@@ -8390,14 +8657,27 @@ class SecurePeerClient:
         query: str = "",
         headers: Mapping[str, str] | None = None,
         body: Mapping[str, Any] | bytes | None = None,
+        prepared: tuple[str, int, ssl.SSLContext] | None = None,
     ) -> ProxyResponse:
         if not hub_path.startswith("/v1/"):
             raise ValueError("Hub path must begin with /v1/")
-        row = self._connection_row(connection_id)
+        if prepared is None:
+            row = self._connection_row(connection_id)
+            prepared = (
+                str(row["host_ip"]),
+                int(row["port"]),
+                self._pinned_context(row, mutual_tls=True),
+            )
+        host, port, context = prepared
         suffix = "?" + query if query else ""
         status, response_headers, raw, _leaf = self._request(
-            row["host_ip"], int(row["port"]), method.upper(), "/v1/hub" + hub_path + suffix,
-            body=body, headers=headers, context=self._pinned_context(row, mutual_tls=True)
+            host,
+            port,
+            method.upper(),
+            "/v1/hub" + hub_path + suffix,
+            body=body,
+            headers=headers,
+            context=context,
         )
         return sanitize_proxy_response(
             ProxyResponse(status, tuple(response_headers), raw)

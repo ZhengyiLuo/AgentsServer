@@ -961,6 +961,13 @@ lease after every pending receipt. Those slices stay below provider shell-tool
 caps; they never convert the exchange into a later source-chat turn or impose a
 semantic response deadline.
 
+`pending=true` is returned only when the server confirms it is still waiting.
+A lost connection instead produces an `ok=false`, `transport_error=true`,
+`retryable=true` receipt with the same exchange, inbound leg, and lease; the
+CLI prints that receipt and exits nonzero. Retry that exact `wait`, never the
+original Ask: the answer may already be saved. Completed-answer delivery does
+not wait indefinitely for disconnect-watcher cleanup.
+
 Active agent messaging is strictly same-server: Studio chats can address only
 Studio chats, and Sonic chats can address only Sonic chats. Communication
 between servers uses passive Team Network Inbox messages (`server`, `human`,

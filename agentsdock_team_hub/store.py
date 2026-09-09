@@ -13153,7 +13153,11 @@ class HubStore:
         message_id: str,
         request: dict[str, Any],
     ) -> dict[str, Any]:
-        """Soft-delete one ordinary Team Message without mutating its source."""
+        """Hide a Team Message announcement without mutating its source.
+
+        A skill version's poster may remove its announcement. Library versions
+        and archive state are independent and remain intact.
+        """
 
         timestamp = _now()
         idempotency_key = self._team_idempotency_key(request)
@@ -13186,7 +13190,14 @@ class HubStore:
                 ).fetchone()
                 if row is None:
                     raise HubError("not_found", "Resource not found", 404)
-                if (
+                if row["kind"] == "skill":
+                    if not self._team_message_author_matches(
+                        connection, claims, team_id, row
+                    ):
+                        raise HubError(
+                            "forbidden", "Only the poster can delete this announcement", 403
+                        )
+                elif (
                     not self._network_source_author_matches(
                         connection,
                         claims,
@@ -13201,12 +13212,6 @@ class HubStore:
                     and membership["role"] not in {"owner", "admin"}
                 ):
                     raise HubError("forbidden", "Operation is not permitted", 403)
-                if row["kind"] != "message":
-                    raise HubError(
-                        "skill_archive_required",
-                        "Archive this skill in the Skills library instead",
-                        409,
-                    )
                 existing = connection.execute(
                     """
                     SELECT id FROM network_content_deletions
@@ -13335,7 +13340,7 @@ class HubStore:
                 d.resource_kind='message' AND EXISTS (
                     SELECT 1 FROM team_messages AS m
                     WHERE m.team_id=d.team_id AND m.id=d.resource_id
-                      AND m.kind='message'
+                      AND m.kind IN ('message', 'skill')
                       AND (
                         {' OR '.join(sender_visibility)}
                         OR EXISTS (

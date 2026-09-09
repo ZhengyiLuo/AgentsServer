@@ -69329,9 +69329,26 @@ def team_hub_host_control_error_detail(
     return detail
 
 
+def scoped_team_hub_host_control_status_path() -> Path:
+    """Reject partially redirected runtimes before touching another state's journal."""
+
+    state_root = TEAM_HUB_DATA_DIR.parent.resolve()
+    journal = TEAM_HUB_HOST_CONTROL_STATUS_FILE.resolve()
+    if (
+        state_root == Path(state_root.anchor)
+        or journal == state_root
+        or not journal.is_relative_to(state_root)
+    ):
+        raise RuntimeError(
+            "Team Hub control journal must remain inside the active server state directory"
+        )
+    return journal
+
+
 def read_team_hub_host_control_status() -> dict[str, Any]:
+    journal = scoped_team_hub_host_control_status_path()
     try:
-        value = json.loads(TEAM_HUB_HOST_CONTROL_STATUS_FILE.read_text())
+        value = json.loads(journal.read_text())
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         value = {}
     if not isinstance(value, dict):
@@ -69342,11 +69359,12 @@ def read_team_hub_host_control_status() -> dict[str, Any]:
 
 
 def write_team_hub_host_control_status(**changes: Any) -> dict[str, Any]:
+    journal = scoped_team_hub_host_control_status_path()
     current = read_team_hub_host_control_status()
     current.update(changes)
     current["_source_instance_id"] = SERVER_INSTANCE_ID
     current["updated_at"] = update_utc_now()
-    atomic_update_json(TEAM_HUB_HOST_CONTROL_STATUS_FILE, current)
+    atomic_update_json(journal, current)
     return current
 
 
@@ -69530,6 +69548,7 @@ def team_hub_reactivation_control_consumed() -> bool:
 def activate_team_hub_host_sync(
     server_name: str,
 ) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    scoped_team_hub_host_control_status_path()
     try:
         with team_hub_activation_lease():
             return _activate_team_hub_host_sync(server_name)

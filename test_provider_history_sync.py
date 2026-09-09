@@ -131,6 +131,14 @@ def fake_history_timeline_scan(events: list[dict]):
                 key = agent_server.history_dedup_key(
                     "assistant", event.get("text")
                 )
+            elif (
+                event_type == "reasoning_summary"
+                and event.get("phase") == "commentary"
+                and event.get("backend") == agent_server.BACKEND_CLAUDE
+            ):
+                key = agent_server.history_dedup_key(
+                    "assistant", event.get("text")
+                )
             elif tail and event_type in {"turn_finished", "job_summary"}:
                 result_text = event.get("result_text")
                 if not isinstance(result_text, str) or not result_text.strip():
@@ -728,6 +736,63 @@ class UnsyncedHistoryItemsTests(unittest.TestCase):
             ),
             [],
         )
+
+    def test_claude_commentary_is_an_owned_provider_message(self) -> None:
+        events = [
+            {
+                "seq": 11,
+                "type": "turn_started",
+                "backend": agent_server.BACKEND_CLAUDE,
+                "prompt": "asked from AgentsDock",
+            },
+            {
+                "seq": 12,
+                "type": "reasoning_summary",
+                "backend": agent_server.BACKEND_CLAUDE,
+                "phase": "commentary",
+                "text": "checking before the tool",
+            },
+        ]
+        with patch.object(
+            agent_server,
+            "history_timeline_message_keys",
+            side_effect=fake_history_timeline_scan(events),
+        ):
+            fresh, consumed_seq = agent_server.reconcile_cursor_history_items(
+                "chat-x",
+                [
+                    user("asked from AgentsDock"),
+                    assistant("checking before the tool"),
+                ],
+                timeline_after_seq=10,
+                timeline_through_seq=12,
+            )
+
+        self.assertEqual(fresh, [])
+        self.assertEqual(consumed_seq, 12)
+
+    def test_non_claude_commentary_is_not_a_provider_message_credit(self) -> None:
+        events = [{
+            "seq": 11,
+            "type": "reasoning_summary",
+            "backend": agent_server.BACKEND_CODEX,
+            "phase": "commentary",
+            "text": "Codex progress",
+        }]
+        with patch.object(
+            agent_server,
+            "history_timeline_message_keys",
+            side_effect=fake_history_timeline_scan(events),
+        ):
+            fresh, consumed_seq = agent_server.reconcile_cursor_history_items(
+                "chat-x",
+                [assistant("Codex progress")],
+                timeline_after_seq=10,
+                timeline_through_seq=11,
+            )
+
+        self.assertEqual(fresh, [assistant("Codex progress")])
+        self.assertEqual(consumed_seq, 11)
 
     def test_compacted_scheduled_result_anchors_first_sync(self) -> None:
         events = [

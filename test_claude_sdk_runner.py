@@ -958,6 +958,90 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         runtime_success.assert_called_once_with(agent_server.BACKEND_CLAUDE)
         runtime_failure.assert_not_called()
 
+    async def test_sdk_text_streams_as_commentary_and_result_is_only_final(
+        self,
+    ) -> None:
+        append_event, append_finished, runtime_success, runtime_failure = (
+            await self._run_sdk_terminal_case([
+                {
+                    "type": "AssistantMessage",
+                    "content": [{
+                        "type": "text",
+                        "text": "Checking the repository now.",
+                    }],
+                    "session_id": "provider",
+                },
+                {
+                    "type": "result",
+                    "result": "The repository is ready.",
+                    "session_id": "provider",
+                    "terminal_reason": "end_turn",
+                },
+            ])
+        )
+
+        projected = [
+            (call.args[1], call.args[2])
+            for call in append_event.await_args_list
+        ]
+        self.assertFalse(any(
+            event_type == "assistant_text"
+            for event_type, _payload in projected
+        ))
+        self.assertEqual(
+            [
+                payload
+                for event_type, payload in projected
+                if event_type == "reasoning_summary"
+            ],
+            [{
+                "run_id": "run-claude",
+                "text": "Checking the repository now.",
+                "phase": "commentary",
+                "backend": agent_server.BACKEND_CLAUDE,
+            }],
+        )
+        terminal = append_finished.await_args.args[1]
+        self.assertEqual(terminal["result_text"], "The repository is ready.")
+        self.assertFalse(terminal["stopped"])
+        runtime_success.assert_called_once_with(agent_server.BACKEND_CLAUDE)
+        runtime_failure.assert_not_called()
+
+    async def test_aborted_sdk_result_does_not_promote_commentary_to_final(
+        self,
+    ) -> None:
+        append_event, append_finished, runtime_success, runtime_failure = (
+            await self._run_sdk_terminal_case([
+                {
+                    "type": "AssistantMessage",
+                    "content": [{
+                        "type": "text",
+                        "text": "Partial work before cancellation.",
+                    }],
+                    "session_id": "provider",
+                },
+                {
+                    "type": "result",
+                    "result": "",
+                    "session_id": "provider",
+                    "terminal_reason": "aborted_streaming",
+                },
+            ])
+        )
+
+        self.assertTrue(any(
+            call.args[1] == "reasoning_summary"
+            and call.args[2].get("phase") == "commentary"
+            and call.args[2].get("text")
+            == "Partial work before cancellation."
+            for call in append_event.await_args_list
+        ))
+        terminal = append_finished.await_args.args[1]
+        self.assertTrue(terminal["stopped"])
+        self.assertEqual(terminal["result_text"], "")
+        runtime_success.assert_not_called()
+        runtime_failure.assert_not_called()
+
     async def test_sdk_iterator_end_before_terminal_never_waits_forever(self) -> None:
         handle = PrematurelyEndedClaudeRun()
 

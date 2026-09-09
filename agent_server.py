@@ -44842,6 +44842,18 @@ def history_timeline_message_keys(
                 key = history_dedup_key("user", event.get("prompt"))
             elif event_type == "assistant_text":
                 key = history_dedup_key("assistant", event.get("text"))
+            elif (
+                event_type == "reasoning_summary"
+                and event.get("phase") == "commentary"
+                and event.get("backend") == BACKEND_CLAUDE
+            ):
+                # Claude's SDK emits every public text block before its
+                # terminal ResultMessage. Those blocks are live commentary,
+                # but they still correspond one-for-one with assistant
+                # records in Claude's provider transcript. Count them as
+                # ownership credits so the next history sync cannot import
+                # this chat's own progress back as duplicate messages.
+                key = history_dedup_key("assistant", event.get("text"))
             elif tail and event_type in {"turn_finished", "job_summary"}:
                 # A compacted scheduled run can retain only its canonical
                 # result event.  The provider transcript still contains that
@@ -56053,7 +56065,6 @@ async def run_claude_print(
         proc.stdin.close()
 
     final_text = ""
-    text_parts: list[str] = []
     provider_id: str | None = None
     current_tools: dict[str, dict[str, Any]] = {}
     had_tool_activity = False
@@ -56062,6 +56073,7 @@ async def run_claude_print(
     idle_killed = False
     stream_error: str | None = None
     result_error: str | None = None
+    terminal_result_received = False
     seen_artifacts: set[str] = set()
     manifest_watch_task = asyncio.create_task(watch_manifest_artifacts(session_id, run_id, manifest_path, seen_artifacts))
 
@@ -56115,8 +56127,13 @@ async def run_claude_print(
                     if btype == "text" and block.get("text"):
                         text = clean_assistant_text(block["text"])
                         if text:
-                            text_parts.append(text)
-                            await append_event(session_id, "assistant_text", {"run_id": run_id, "text": text, **run_event_metadata(run_id)})
+                            await append_event(session_id, "reasoning_summary", {
+                                "run_id": run_id,
+                                "text": text,
+                                "phase": "commentary",
+                                "backend": BACKEND_CLAUDE,
+                                **run_event_metadata(run_id),
+                            })
                     elif btype == "thinking" and block.get("thinking"):
                         await append_event(session_id, "reasoning_summary", {"run_id": run_id, "text": block["thinking"]})
                     elif btype in ("tool_use", "server_tool_use"):
@@ -56140,6 +56157,7 @@ async def run_claude_print(
                             "is_error": block.get("is_error") is True,
                         })
             elif etype == "result":
+                terminal_result_received = True
                 if run_id in STOPPED_RUNS and is_expected_claude_interruption_result(event):
                     continue
                 result_error = claude_result_error(event)
@@ -56164,15 +56182,18 @@ async def run_claude_print(
     if proc.stderr:
         stderr = (await proc.stderr.read()).decode("utf-8", "replace").strip()
     stopped = run_id in STOPPED_RUNS
-    result_text = clean_assistant_text(
-        final_text or "\n\n".join(text_parts).strip()
-    )
+    if not stopped and not terminal_result_received and not stream_error:
+        stream_error = (
+            "Claude print stream ended before a terminal result became "
+            "available."
+        )
+    result_text = clean_assistant_text(final_text)
     empty_result_error = claude_empty_turn_failure_message(
         prompt=prompt,
         result_text=result_text,
         had_tool_activity=had_tool_activity,
         stopped=stopped,
-        terminal_result_received=True,
+        terminal_result_received=terminal_result_received,
         existing_error=bool(
             result_error
             or stream_error
@@ -56228,7 +56249,12 @@ async def run_claude_print(
         "transport": CLAUDE_TRANSPORT_PRINT,
         "exit_code": (
             1
-            if empty_result_error and proc.returncode in (0, None)
+            if (
+                empty_result_error
+                or stream_error
+                or result_error
+                or idle_killed
+            ) and proc.returncode in (0, None)
             else proc.returncode
         ),
         "result_text": result_text,
@@ -56544,9 +56570,11 @@ async def project_claude_sdk_message(
                 )
                 if text:
                     text_parts.append(text)
-                    await append_event(session_id, "assistant_text", {
+                    await append_event(session_id, "reasoning_summary", {
                         "run_id": run_id,
                         "text": text,
+                        "phase": "commentary",
+                        "backend": BACKEND_CLAUDE,
                         **run_event_metadata(run_id),
                     })
             elif block_type in {"ThinkingBlock", "thinking"}:
@@ -57615,7 +57643,6 @@ async def run_claude_sdk(
             previous_paths = set(changed_paths)
             previous_artifacts = set(seen_artifacts)
             previous_result_details = dict(result_details or {})
-            previous_text_parts = list(text_parts)
             previous_prompt = current_prompt
             try:
                 await finish_outputs(
@@ -57971,7 +57998,6 @@ async def run_claude_sdk(
             else:
                 previous_result_text = clean_assistant_text(
                     str(previous_result_details.get("result_text") or "")
-                    or "\n\n".join(previous_text_parts).strip()
                 )
                 previous_projection_error = (
                     previous_run_id in projection_error_run_ids
@@ -58245,7 +58271,6 @@ async def run_claude_sdk(
         )
         result_text = clean_assistant_text(
             str((result_details or {}).get("result_text") or "")
-            or "\n\n".join(text_parts).strip()
         )
         result_error = str((result_details or {}).get("error") or "")
         projection_error = current_run_id in projection_error_run_ids

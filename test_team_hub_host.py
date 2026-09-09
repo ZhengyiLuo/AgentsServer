@@ -1751,7 +1751,7 @@ class VendoredTeamHubParityTests(unittest.TestCase):
         vendored = server_root / "agentsdock_team_hub"
         expected = {
             "__init__.py": "154fbe20574096cff3a5012d8720d51e024c5f077cc1044c3ea6cd5ad6f96861",
-            "auth.py": "8f3ff2c2bf12845041acdb5f3f489cef4a9d827feca4de6b3925e4456be98f3d",
+            "auth.py": "d939fd30bdd93cf53183de5b5ff21be43d2a7a2cc9d2ce6dc00a49c888db41db",
             "cli.py": "c5827f30d90420d2e362389530154255ca6039c1c524edec29a5d219b96328d3",
             "database.py": "c7a9bb1e132e6eba5d20de358e3c83b43d36a893d324643a944ae54a802cfcab",
             "migrations/0001_identity_auth.sql": "f55a62bf6dec527e1f71df91975deaf371e2af8b6e457b9d5577437e914dc186",
@@ -1772,7 +1772,7 @@ class VendoredTeamHubParityTests(unittest.TestCase):
             "secure_peer.py": "b4c1e6c7d705b70881cdb8c4b92768bdcce35ce2ef1d7f15975580a3da63376d",
             "secure_peer_hub.py": "259636fd314e5bd1e0325092170f97c7d862f826e348f4c0ec52db1a79ad6c5e",
             "service.py": "0bdc37c091d10c7c34ed4ffd4ddecbd06b9368b317bac449361a867935a0aad1",
-            "store.py": "da56c8f7f803acc02541f84387eb4d5579efbbc497608b52c1bfca5c0c548818",
+            "store.py": "bee4843175e25ea5f4a0696346e24f9a8c4a9e94490e776bda65ddd63cd66408",
         }
         entries = list(vendored.rglob("*"))
         for path in entries:

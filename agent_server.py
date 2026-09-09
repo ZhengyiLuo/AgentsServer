@@ -38393,6 +38393,14 @@ async def cancel_cross_chat_exchanges_for_stopped_source_run(
     waiter-based cleanup would miss an already durable request.
     """
 
+    # ASGI lifespan initializes the durable ledger before production requests
+    # are admitted.  A few embedding and unit-test callers intentionally run
+    # the stop state machine without lifespan; before initialization there
+    # cannot be an accepted v2 exchange to cancel.  Do not catch query errors
+    # after this boundary: an initialized-but-broken ledger must still fail
+    # loudly instead of weakening the Stop cancellation guarantee.
+    if not bool(getattr(CROSS_CHAT, "_initialized", False)):
+        return 0
     run_id = str(run_id or "").strip()
     if not run_id:
         return 0

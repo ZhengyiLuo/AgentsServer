@@ -56631,7 +56631,8 @@ async def project_claude_sdk_message(
                         "text": text,
                         "phase": "commentary",
                         "backend": BACKEND_CLAUDE,
-                        "provider_message_id": claude_sdk_field(message, "uuid"),
+                        **({"provider_message_id": message_uuid}
+                           if (message_uuid := claude_sdk_field(message, "uuid")) else {}),
                         **run_event_metadata(run_id),
                     })
             elif block_type in {"ThinkingBlock", "thinking"}:

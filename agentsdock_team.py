@@ -6,6 +6,9 @@ every ordinary turn.  ``routes`` and ``send`` exist only when the user
 mentioned Team Network recipients with ``@@`` on this turn; the server freezes
 those recipients into opaque per-run routes.  Message bodies arrive on stdin so
 they never appear in process arguments.
+
+The Bulletin route posts only to the shared board. The all_servers route sends
+Team Network mail to each current server inbox, not to an email/SMTP address.
 """
 
 from __future__ import annotations

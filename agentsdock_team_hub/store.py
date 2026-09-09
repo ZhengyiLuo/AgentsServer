@@ -93,6 +93,7 @@ MAX_NETWORK_PAGE_RESPONSE_BYTES = 1_900_000
 # JSON request limit; attachment bytes never travel through JSON or SQLite.
 MAX_TEAM_MESSAGE_BODY_BYTES = 49_152
 MAX_TEAM_MESSAGE_RECIPIENTS = 16
+MAX_TEAM_MESSAGE_SERVER_RECIPIENTS = 1024
 MAX_TEAM_MESSAGE_ATTACHMENTS = 16
 MAX_TEAM_MESSAGE_ATTACHMENT_BYTES = 2 * 1024 * 1024 * 1024
 MAX_TEAM_MESSAGE_TITLE_CHARS = 160
@@ -3212,6 +3213,7 @@ class HubStore:
                     # Sibling object: clients that parse team_network_v1 with
                     # an exact key list keep working unchanged.
                     "team_messages_v1": self.team_messages_capability(),
+                    "team_all_servers_alias_v1": self.team_all_servers_capability(),
                 },
             }
         finally:
@@ -11679,6 +11681,16 @@ class HubStore:
             },
         }
 
+    @staticmethod
+    def team_all_servers_capability() -> dict[str, Any]:
+        return {
+            "available": True,
+            "version": 1,
+            "mention": "@@all",
+            "recipient_kind": "all_servers",
+            "max_recipients_per_message": MAX_TEAM_MESSAGE_SERVER_RECIPIENTS,
+        }
+
     # -- validation helpers -------------------------------------------------
 
     @staticmethod
@@ -12109,6 +12121,8 @@ class HubStore:
             "provenance": self._team_provenance_public(row["provenance_json"]),
             "created_at": _iso8601(row["created_at"]),
         }
+        if row["destination"] == "all_servers":
+            item["destination"] = "all_servers"
         if include_revision:
             item["revision"] = {
                 "version": int(row["message_version"]),
@@ -12259,18 +12273,23 @@ class HubStore:
             raise HubError("invalid_request", "Message recipients are invalid", 422)
         requested: list[tuple[str, str | None]] = []
         for entry in raw_recipients:
-            if not isinstance(entry, dict) or entry.get("kind") not in {"server", "human", "all"}:
+            if not isinstance(entry, dict) or entry.get("kind") not in {"server", "human", "all", "all_servers"}:
                 raise HubError("invalid_request", "Message recipients are invalid", 422)
             recipient_kind = str(entry["kind"])
             recipient_id = entry.get("id")
-            if recipient_kind == "all":
-                if recipient_id not in (None, "all"):
+            if recipient_kind in {"all", "all_servers"}:
+                if recipient_id not in (None, recipient_kind):
                     raise HubError("invalid_request", "Message recipients are invalid", 422)
                 recipient_id = None
             elif not isinstance(recipient_id, str) or not 1 <= len(recipient_id) <= 240:
                 raise HubError("invalid_request", "Message recipients are invalid", 422)
             if (recipient_kind, recipient_id) not in requested:
                 requested.append((recipient_kind, recipient_id))
+        all_servers = ("all_servers", None) in requested
+        if all_servers and (kind != "message" or requested != [("all_servers", None)]):
+            raise HubError(
+                "invalid_request", "All-server mail must be a message with only the all_servers recipient", 422
+            )
         raw_attachments = request.get("attachment_ids") or []
         if (
             not isinstance(raw_attachments, list)
@@ -12348,6 +12367,43 @@ class HubStore:
                 sender_kind, sender_node_id = self._team_sender(connection, claims, team_id)
                 resolved: list[tuple[str, str | None, str | None]] = []
                 for recipient_kind, recipient_id in requested:
+                    if recipient_kind == "all_servers":
+                        # Freeze the current server mailboxes in this transaction.
+                        # Presence is not trust: offline members still receive mail;
+                        # retired secure-peer bindings do not. Match the roster's
+                        # exact active-binding rule, including legacy/host nodes.
+                        server_rows = connection.execute(
+                            """
+                            SELECT n.id FROM nodes AS n
+                            WHERE n.team_id=? AND n.status<>'revoked'
+                              AND (
+                                n.server_identity=?
+                                OR NOT EXISTS (
+                                    SELECT 1 FROM network_peer_bindings AS history
+                                    WHERE history.team_id=n.team_id AND history.node_id=n.id
+                                )
+                                OR EXISTS (
+                                    SELECT 1 FROM network_peer_bindings AS live
+                                    JOIN principals AS p ON p.id=live.service_principal_id
+                                    JOIN service_accounts AS s ON s.principal_id=p.id
+                                    JOIN memberships AS m ON m.team_id=live.team_id AND m.principal_id=p.id
+                                    WHERE live.team_id=n.team_id AND live.node_id=n.id
+                                      AND live.peer_server_identity=n.server_identity
+                                      AND live.status='active' AND p.kind='service' AND p.status='active'
+                                      AND s.service_identifier='agentsdock.secure-peer.' || live.peer_id
+                                      AND m.role='automation' AND m.status='active'
+                                )
+                              )
+                            ORDER BY n.id LIMIT ?
+                            """,
+                            (team_id, self.managed_host_identity, MAX_TEAM_MESSAGE_SERVER_RECIPIENTS + 1),
+                        ).fetchall()
+                        if not server_rows:
+                            raise HubError("recipient_unavailable", "No Team Network server inboxes are available", 404)
+                        if len(server_rows) > MAX_TEAM_MESSAGE_SERVER_RECIPIENTS:
+                            raise HubError("recipient_limit", "Team Network server inbox limit exceeded", 413)
+                        resolved.extend(("server", str(row["id"]), None) for row in server_rows)
+                        continue
                     if recipient_kind == "all":
                         resolved.append(("all", None, None))
                         continue
@@ -12528,8 +12584,8 @@ class HubStore:
                         id,team_id,kind,title,body_format,body,body_sha256,
                         sender_kind,sender_principal_id,sender_node_id,provenance_json,
                         in_reply_to_message_id,skill_id,skill_version,
-                        attachment_count,attachment_bytes,idempotency_key,created_at
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        attachment_count,attachment_bytes,idempotency_key,created_at,destination
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         message_id,
@@ -12554,6 +12610,7 @@ class HubStore:
                             )
                         ).digest(),
                         timestamp,
+                        "all_servers" if all_servers else None,
                     ),
                 )
                 for recipient_kind, node_id, principal_id in resolved:
@@ -12613,6 +12670,8 @@ class HubStore:
                 response = {
                     "message": self._team_message_public(connection, row, include_body=True)
                 }
+                if len(canonical_json(response)) > MAX_NETWORK_PAGE_RESPONSE_BYTES:
+                    raise HubError("recipient_limit", "Message recipient response exceeds the size limit", 413)
                 self._idempotency_store(
                     connection,
                     team_id,
@@ -12783,6 +12842,13 @@ class HubStore:
                 ),
                 "has_more": len(rows) > limit,
             }
+            # Expanded all-server mail can make an ordinary page larger than
+            # the peer transport. Preserve the cursor, returning a shorter
+            # complete page instead of omitting any recipients or messages.
+            while len(messages) > 1 and len(canonical_json(response)) > MAX_NETWORK_PAGE_RESPONSE_BYTES:
+                messages.pop()
+                response["next_after_sequence"] = messages[-1]["sequence"]
+                response["has_more"] = True
             if len(canonical_json(response)) > MAX_NETWORK_PAGE_RESPONSE_BYTES:
                 raise HubError(
                     "invalid_request", "Message page exceeds the response limit; lower limit", 422

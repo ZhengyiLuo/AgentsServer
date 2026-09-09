@@ -22,6 +22,50 @@ from secure_peer_runtime import SecurePeerRuntime
 
 
 class SecurePeerRuntimeTests(unittest.TestCase):
+    def test_all_server_inbox_broadcast_stays_distinct_from_bulletin(self) -> None:
+        runtime = object.__new__(SecurePeerRuntime)
+        realm = {"realm": "secure_peer", "team_id": "team-test", "can_write": True}
+        broadcast = {
+            "kind": "recipient", "team_id": "team-test", "recipient_kind": "all_servers",
+            "target_id": "all_servers", "display_name_snapshot": "all",
+        }
+        runtime.team_realms = mock.Mock(return_value=[realm])
+        runtime._team_hub_post = mock.Mock(return_value={"ok": True})
+        runtime._team_upload_attachment = mock.Mock()
+        self.assertEqual(runtime.resolve_team_references([broadcast]), [broadcast])
+        for changed in ({"target_id": "all"}, {"display_name_snapshot": "bulletin"}):
+            with self.subTest(changed=changed), self.assertRaises(SecurePeerError):
+                runtime.resolve_team_references([{**broadcast, **changed}])
+        for recipient_kind, label in (("all_servers", "all"), ("all", "all"), ("all", "bulletin")):
+            reference = {
+                **broadcast, "recipient_kind": recipient_kind,
+                "target_id": recipient_kind, "display_name_snapshot": label,
+            }
+            self.assertEqual(runtime.resolve_team_references([reference]), [reference])
+            runtime.team_send_message(
+                reference, payload={"body": "Hello"}, attachment_paths=[],
+                idempotency_key="broadcast-test", provenance={},
+            )
+            body = runtime._team_hub_post.call_args.args[2]
+            self.assertEqual(body["recipients"], [{"kind": recipient_kind}])
+            self.assertIsNone(runtime._enforce_inbox_only_outbound_proxy(
+                "POST", "/v1/teams/team-test/network/messages", query="", body=body,
+            ))
+        runtime._team_hub_post.reset_mock()
+        for payload in ({"kind": "skill", "body": "Skill"}, {"body": "Skill", "skill": {"slug": "deploy"}}):
+            with self.subTest(payload=payload), self.assertRaises(SecurePeerError):
+                runtime.team_send_message(
+                    broadcast, payload=payload, attachment_paths=["must-not-upload"],
+                    idempotency_key="broadcast-test", provenance={},
+                )
+        runtime._team_hub_post.assert_not_called()
+        runtime._team_upload_attachment.assert_not_called()
+        with self.assertRaises(SecurePeerError):
+            runtime._enforce_inbox_only_outbound_proxy(
+                "POST", "/v1/teams/team-test/network/messages", query="",
+                body={"kind": "message", "recipients": [{"kind": "all_servers"}, {"kind": "server", "id": "node-test"}]},
+            )
+
     def test_team_deletion_wrappers_cover_host_remote_and_read_only_realms(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             runtime = SecurePeerRuntime(

@@ -267,7 +267,7 @@ class NetworkReceiptRequest(StrictModel):
 
 
 class TeamRecipientRequest(StrictModel):
-    kind: Literal["server", "human", "all"]
+    kind: Literal["server", "human", "all", "all_servers"]
     id: str | None = Field(default=None, min_length=1, max_length=240)
 
 

@@ -6330,7 +6330,7 @@ class TeamReference(BaseModel):
     model_config = {"extra": "forbid"}
 
     kind: Literal["recipient", "skill"]
-    recipient_kind: Literal["server", "human", "all"] | None = None
+    recipient_kind: Literal["server", "human", "all", "all_servers"] | None = None
     team_id: str = Field(min_length=1, max_length=240)
     target_id: str = Field(min_length=1, max_length=240)
     display_name_snapshot: str = Field(min_length=1, max_length=160)
@@ -6343,6 +6343,10 @@ class TeamReference(BaseModel):
         if self.kind == "recipient":
             if self.recipient_kind is None:
                 raise ValueError("recipient references require recipient_kind")
+            if self.recipient_kind == "all_servers" and (
+                self.target_id != "all_servers" or self.display_name_snapshot != "all"
+            ):
+                raise ValueError("all-server mail references use target_id 'all_servers' and visible token '@@all'")
             if self.recipient_kind == "all" and self.target_id != "all":
                 raise ValueError("team-wide recipients use target_id 'all'")
             if (
@@ -19804,8 +19808,10 @@ def compact_provider_authority_block(
     if "team_send" in actions:
         mentioned = ", ".join(
             (
-                "the whole team"
+                "the shared Bulletin"
                 if reference.kind == "recipient" and reference.recipient_kind == "all"
+                else "every team server inbox"
+                if reference.kind == "recipient" and reference.recipient_kind == "all_servers"
                 else ("a skill" if reference.kind == "skill" else f"a {reference.recipient_kind}")
             )
             for reference in (team_references or [])
@@ -20019,19 +20025,22 @@ def cross_chat_provider_authority_block(
     if "team_send" in actions:
         mentioned = ", ".join(
             (
-                "the whole team"
+                "the shared Bulletin"
                 if reference.kind == "recipient" and reference.recipient_kind == "all"
+                else "every team server inbox"
+                if reference.kind == "recipient" and reference.recipient_kind == "all_servers"
                 else ("a skill" if reference.kind == "skill" else f"a {reference.recipient_kind}")
             )
             for reference in (team_references or [])
         ) or "recipients"
         helper_lines.extend((
             f"- The user mentioned Team Network recipients with @@ ({mentioned}). Compose the message yourself in Markdown, attach only files the user asked for, and send once per route.",
+            "- @@bulletin posts only to the shared Bulletin. @@all sends Team Network mail to every current server inbox, including offline members; each server reads/removes its own delivery. This is not email/SMTP. Use each frozen route's recipient_kind: all means Bulletin (including old saved aliases), all_servers means all-server inbox mail. Never substitute one for the other.",
             f"- Recipient routes for this turn: `{team_command} routes`",
             f"- Send a message (Markdown body on stdin, never argv): `{team_command} send --route ROUTE_ID --kind message [--attach /abs/path]...`",
             *(
                 (
-                    f"- Publish a skill: `{team_command} send --route ROUTE_ID --kind skill --skill-slug SLUG --title T [--attach /abs/path]...`. Use this only for @@bulletin (legacy @@all) or a mentioned skill; when updating an existing skill pass `--expected-version` from `skill get`. Skill bodies should be complete, runnable instructions.",
+                    f"- Publish a skill: `{team_command} send --route ROUTE_ID --kind skill --skill-slug SLUG --title T [--attach /abs/path]...`. Use this only for a Bulletin route or a mentioned skill, never an all_servers mail route; when updating an existing skill pass `--expected-version` from `skill get`. Skill bodies should be complete, runnable instructions.",
                 )
                 if "team_skill_publish" in actions
                 else ()
@@ -46964,7 +46973,7 @@ def provider_public_job(job: dict[str, Any]) -> dict[str, Any]:
             "display_name_snapshot": safe_display_name,
             "kind": str(kind or "recipient"),
         }
-        if recipient_kind in {"server", "human", "all"}:
+        if recipient_kind in {"server", "human", "all", "all_servers"}:
             summary["recipient_kind"] = str(recipient_kind)
         team_targets.append(summary)
     out["team_target_count"] = len(team_references)
@@ -71019,6 +71028,12 @@ async def health() -> dict[str, Any]:
                 "mention": "@@bulletin",
                 "legacy_mention": "@@all",
             },
+            "team_all_servers_alias_v1": {
+                **HubStore.team_all_servers_capability(),
+                "available": bool(
+                    AGENT_TOKEN and (SERVER_ROOT / "agentsdock_team.py").is_file()
+                ),
+            },
             "local_session_import_v1": {
                 "available": True,
                 "required": False,
@@ -79220,6 +79235,7 @@ async def record_team_message_sent_event(
     *,
     recipients: list[dict[str, str]],
     title: str | None,
+    destination: str | None = None,
 ) -> None:
     """Append a compact ``team_message_sent`` card to the source chat.
 
@@ -79237,6 +79253,8 @@ async def record_team_message_sent_event(
         "skill_slug": receipt.get("skill_slug"),
         "skill_version": receipt.get("skill_version"),
     }
+    if destination == "all_servers":
+        payload["destination"] = "all_servers"
     try:
         await append_durable_event(session_id, "team_message_sent", payload)
     except Exception:  # pragma: no cover - the send already committed on the Hub.
@@ -79252,10 +79270,14 @@ def provider_team_route_projection(route_id: str, reference: dict[str, Any]) -> 
     recipient_kind = (
         str(reference.get("recipient_kind") or "") if kind == "recipient" else None
     )
-    fallback = "Team" if recipient_kind == "all" else "Team Network recipient"
+    fallback = (
+        "Bulletin" if recipient_kind == "all"
+        else "All server inboxes" if recipient_kind == "all_servers"
+        else "Team Network recipient"
+    )
     display_name = (
         fallback
-        if recipient_kind == "all"
+        if recipient_kind in {"all", "all_servers"}
         else reference.get("display_name_snapshot") or fallback
     )
     return {
@@ -79698,6 +79720,7 @@ async def send_provider_team_message(
             if isinstance(item, dict)
         ],
         title=message.get("title"),
+        destination=message.get("destination"),
     )
     logger.info(
         "team message send accepted source_session=%s source_run=%s route=%s kind=%s attachments=%d",

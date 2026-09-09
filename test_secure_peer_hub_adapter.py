@@ -125,6 +125,19 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
         self.assertEqual(history.status, 200, history.body)
         self.assertEqual(json.loads(history.body)["versions"][0]["body"], "Original broadcast")
 
+    def test_all_servers_peer_send_is_inbox_mail_not_bulletin(self) -> None:
+        path = f"/v1/teams/{self.team_id}/network/messages"
+        response = self.request("POST", path, body={
+            "kind": "message", "body": "Every server inbox", "recipients": [{"kind": "all_servers"}],
+            "idempotency_key": "peer-all-servers-mail"})
+        self.assertEqual(response.status, 200, response.body)
+        message = json.loads(response.body)["message"]
+        self.assertEqual(message["destination"], "all_servers")
+        self.assertTrue(all(row["kind"] == "server" for row in message["recipients"]))
+        self.assertEqual(json.loads(self.request("GET", path, query="box=feed").body)["messages"], [])
+        inbox = json.loads(self.request("GET", path, query="box=inbox").body)["messages"]
+        self.assertEqual([row["id"] for row in inbox], [message["id"]])
+
     def test_server_rename_changes_only_directory_name_and_survives_reprovision(self) -> None:
         path = f"/v1/teams/{self.team_id}/network/server-profile"
         renamed = self.request("POST", path, body={"display_name": "Renamed server"})

@@ -3751,9 +3751,15 @@ class SecurePeerRuntime:
                 or not recipients
                 or any(
                     not isinstance(recipient, Mapping)
-                    or recipient.get("kind") not in {"server", "human", "all"}
+                    or recipient.get("kind") not in {"server", "human", "all", "all_servers"}
                     for recipient in recipients
                 )
+            ):
+                invalid()
+            if any(recipient.get("kind") == "all_servers" for recipient in recipients) and (
+                recipients != [{"kind": "all_servers"}]
+                or value.get("kind") != "message"
+                or value.get("skill") is not None
             ):
                 invalid()
         return reply_parent
@@ -6192,6 +6198,13 @@ class SecurePeerRuntime:
                         409,
                     )
                 reference["authorized_skill_slug"] = slug
+            elif reference.get("recipient_kind") == "all_servers":
+                if target_id != "all_servers" or display_name != "all":
+                    raise SecurePeerError(
+                        "team_reference_invalid",
+                        "Server inbox broadcasts must use @@all",
+                        409,
+                    )
             elif reference.get("recipient_kind") == "all":
                 if target_id != "all" or display_name not in {"all", "bulletin"}:
                     raise SecurePeerError(
@@ -6522,6 +6535,16 @@ class SecurePeerRuntime:
             )
         team_path = f"/v1/teams/{quote(realm['team_id'], safe='')}/network"
         kind = str(payload.get("kind") or "message")
+        if (
+            (kind == "skill" or payload.get("skill") is not None)
+            and reference.get("kind") != "skill"
+            and reference.get("recipient_kind") != "all"
+        ):
+            raise SecurePeerError(
+                "team_reference_invalid",
+                "Skills can only be published to Bulletin or a mentioned Team skill",
+                409,
+            )
         if reference.get("kind") == "skill" and kind != "skill":
             raise SecurePeerError(
                 "team_reference_invalid",
@@ -6544,6 +6567,8 @@ class SecurePeerRuntime:
             recipients = [{"kind": "all"}]
         elif reference.get("recipient_kind") == "all":
             recipients = [{"kind": "all"}]
+        elif reference.get("recipient_kind") == "all_servers":
+            recipients = [{"kind": "all_servers"}]
         else:
             recipients = [
                 {"kind": str(reference.get("recipient_kind")), "id": str(reference.get("target_id"))}

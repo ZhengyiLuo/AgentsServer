@@ -127,6 +127,13 @@ from agentsdock_team_hub.store import (
 )
 from agentsdock_team_hub.secure_peer import SecurePeerError
 from secure_peer_runtime import SECURE_PEER_HEARTBEAT_SECONDS, SecurePeerRuntime
+from claude_history_repair import ClaudeMetadataRepairCache
+from public_chat_share_routes import create_public_chat_share_router, redact_public_share_path
+from public_chat_transcript import (
+    PublicTranscriptError,
+    make_public_event_projector,
+    read_public_transcript,
+)
 
 try:
     import tomllib
@@ -6524,6 +6531,7 @@ class UpdateQueuedTurnRequest(BaseModel):
 
 class MoveQueuedTurnRequest(BaseModel):
     direction: str
+    expected_adjacent_queued_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class RunQueuedTurnNowRequest(BaseModel):
@@ -21202,18 +21210,25 @@ async def move_queued_turn(session_id: str, queued_id: str, req: MoveQueuedTurnR
             items = list(original_items)
             idx = next((i for i, item in enumerate(items) if item.get("queued_id") == queued_id), None)
             if idx is not None:
-                if items[idx].get("purpose") in CROSS_CHAT_DELIVERY_PURPOSES:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="cross-chat delivery queue order is immutable",
-                    )
                 new_idx = idx - 1 if direction == "up" else idx + 1
                 new_idx = max(0, min(len(items) - 1, new_idx))
+                expected_adjacent = req.expected_adjacent_queued_id
+                adjacent_id = items[new_idx].get("queued_id") if new_idx != idx else None
+                if expected_adjacent is not None and adjacent_id != expected_adjacent:
+                    raise HTTPException(status_code=409, detail="Queue changed; refresh before moving this message")
                 if new_idx != idx:
-                    if items[new_idx].get("purpose") in CROSS_CHAT_DELIVERY_PURPOSES:
+                    reject_promoted_queue_mutation(session_id, str(adjacent_id or ""))
+                    # An explicit, identity-bound user reorder can change FIFO
+                    # priority, but never a delivery's content, grant or status.
+                    # Legacy clients keep the old fence until they opt into the
+                    # advertised exact-reorder contract.
+                    if expected_adjacent is None and any(
+                        item.get("purpose") in CROSS_CHAT_DELIVERY_PURPOSES | {"scheduled_job"}
+                        for item in (items[idx], items[new_idx])
+                    ):
                         raise HTTPException(
                             status_code=409,
-                            detail="cross-chat delivery queue order is immutable",
+                            detail="Update the app to arrange queued deliveries safely",
                         )
                     items[idx], items[new_idx] = items[new_idx], items[idx]
                     QUEUED_TURNS[session_id] = deque(items)
@@ -29949,6 +29964,41 @@ def timeline_index_event_is_hidden(event: dict[str, Any]) -> bool:
 
 
 TIMELINE_IMPORTED_PROMPT_HIDDEN_FIELD = "_agentsdock_imported_prompt_hidden"
+CLAUDE_METADATA_REPAIR_CACHE = ClaudeMetadataRepairCache()
+
+
+def prepare_claude_history_metadata_repair(session_id: str) -> None:
+    """Prove old metadata only for a requested chat, never during event egress.
+
+    This bounded read is called once at history-read/cache-build boundaries.
+    Neither the projector nor public snapshot creation discovers provider logs.
+    """
+    session = STORE.sessions.get(session_id)
+    if (
+        not isinstance(session, dict)
+        or str(session.get("backend") or "").lower() != BACKEND_CLAUDE
+        or session.get("_deleting") is True
+    ):
+        CLAUDE_METADATA_REPAIR_CACHE.forget(session_id)
+        return
+    provider_id = provider_session_identifier(session_provider_id(session))
+    if not provider_id:
+        CLAUDE_METADATA_REPAIR_CACHE.forget(session_id)
+        return
+
+    def normalize_legacy_user(source_event: dict[str, Any]) -> str | None:
+        # Reproduce the old import normalization without its lost isMeta flag.
+        # Every real user record is normalized too, so quoted identical text
+        # makes the proof ambiguous and remains visible.
+        legacy = dict(source_event)
+        legacy.pop("isMeta", None)
+        item = claude_history_event_item(legacy, expected_session_id=session_id)
+        return item["text"] if item and item.get("kind") == "user" else None
+
+    CLAUDE_METADATA_REPAIR_CACHE.prepare(
+        session_id, provider_id, events_path(session_id), CLAUDE_PROJECTS_ROOT,
+        normalize_legacy_user,
+    )
 
 
 def project_legacy_imported_provider_event(
@@ -29976,6 +30026,11 @@ def project_legacy_imported_provider_event(
         or not isinstance(event.get("prompt"), str)
     ):
         return event
+    if CLAUDE_METADATA_REPAIR_CACHE.is_hidden(session_id, event):
+        projected = dict(event)
+        projected["prompt"] = ""
+        projected[TIMELINE_IMPORTED_PROMPT_HIDDEN_FIELD] = True
+        return projected
     prompt = str(event["prompt"])
     generated_task_notification = bool(
         event.get("provider_history_sanitized") is not True
@@ -30371,6 +30426,8 @@ def build_timeline_index(session_id: str) -> dict[str, Any]:
 
 
 def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
+    prepare_claude_history_metadata_repair(session_id)
+    claude_metadata_signature = CLAUDE_METADATA_REPAIR_CACHE.signature(session_id)
     path = events_path(session_id)
     if not path.exists():
         with TIMELINE_INDEX_CACHE_LOCK:
@@ -30420,6 +30477,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
     if (
         cached
         and cached.get("projection_version") == TIMELINE_INDEX_PROJECTION_VERSION
+        and cached.get("claude_metadata_signature") == claude_metadata_signature
         and cached.get("signature") == signature
         and int(cached.get("offset") or 0) >= stat.st_size
     ):
@@ -30428,6 +30486,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
     can_append = bool(
         cached and
         cached.get("projection_version") == TIMELINE_INDEX_PROJECTION_VERSION and
+        cached.get("claude_metadata_signature") == claude_metadata_signature and
         cached.get("inode") == stat.st_ino and
         cached.get("codex_scope_signature") == codex_scope_signature and
         "internal_status_run_ids" in cached and
@@ -31592,6 +31651,7 @@ def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
     )
     cache_entry = {
         "projection_version": TIMELINE_INDEX_PROJECTION_VERSION,
+        "claude_metadata_signature": claude_metadata_signature,
         "signature": final_signature,
         "codex_scope_signature": codex_scope_signature,
         "payload": payload,
@@ -35619,6 +35679,7 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
             "live_wait_timeout_async_fallback": False,
             "live_wait_restart_async_fallback": True,
             "exact_queued_delivery_skip": True,
+            "exact_queued_delivery_reorder": True,
             "secure_peer_fifo_barriers": False,
             "secure_peer_agent_relay": False,
             "cross_server_delivery": "team_network_inbox_only",
@@ -43414,6 +43475,11 @@ def claude_history_event_item(
 ) -> dict[str, str] | None:
     event_type = event.get("type")
     if event_type == "user":
+        if event.get("isMeta") is True:
+            # Claude marks generated skill/command context as metadata even
+            # though it occupies a user-role transcript row. Preserve genuine
+            # user quotations: the structured flag, never the text, decides.
+            return None
         if is_claude_task_notification_history_event(event):
             # Claude records its workflow wake-up as a user-role transcript
             # item so the model can consume it. It is provider control state,
@@ -68788,6 +68854,10 @@ async def require_agent_token(request: Request, call_next):
         or request.url.path.startswith("/api/admin/team-hub/host/")
     )
     codex_goals_admin_route = request.url.path == "/api/admin/codex/goals"
+    public_chat_shares_admin_route = (
+        request.url.path == "/api/admin/chat-shares"
+        or request.url.path.startswith("/api/admin/chat-shares/")
+    )
     secure_peer_admin_route = (
         request.url.path == "/api/admin/secure-peers/v1"
         or request.url.path.startswith("/api/admin/secure-peers/v1/")
@@ -68819,6 +68889,7 @@ async def require_agent_token(request: Request, call_next):
         or server_update_admin_route
         or team_hub_host_admin_route
         or codex_goals_admin_route
+        or public_chat_shares_admin_route
         or codex_provider_mcp_route
     ):
         return JSONResponse({"detail": "forbidden"}, status_code=403)
@@ -68904,6 +68975,7 @@ async def require_agent_token(request: Request, call_next):
         server_update_admin_route
         or team_hub_host_admin_route
         or codex_goals_admin_route
+        or public_chat_shares_admin_route
     ):
         if privileged_native_browser_request_forbidden(request):
             return JSONResponse({"detail": "forbidden"}, status_code=403)
@@ -72405,6 +72477,56 @@ def require_native_admin_control(request: Request) -> None:
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
+def public_chat_share_session_exists(session_id: str) -> bool:
+    if not isinstance(session_id, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id) is None:
+        return False
+    session = STORE.sessions.get(session_id)
+    return bool(
+        isinstance(session, dict) and session.get("id") == session_id
+        and session_id not in DELETING_SESSIONS
+        and session_id not in DELETED_SESSION_TOMBSTONES
+        and not session.get("_history_import_initializing")
+        and not session.get("_fork_initializing")
+    )
+
+
+def load_public_chat_share_transcript(session_id: str, through_bytes: int | None) -> dict[str, Any]:
+    """Read a validated, bounded durable snapshot; never discover provider logs."""
+    if not public_chat_share_session_exists(session_id):
+        raise PublicTranscriptError("Chat is unavailable")
+    try:
+        sessions_root = STATE_DIR / "sessions"
+        selected = session_dir(session_id)
+        if (
+            sessions_root.is_symlink() or selected.is_symlink()
+            or selected.resolve(strict=True).parent != sessions_root.resolve(strict=True)
+        ):
+            raise PublicTranscriptError("Chat history is unavailable")
+    except OSError as exc:
+        raise PublicTranscriptError("Chat history is unavailable") from exc
+    projector = make_public_event_projector(
+        session_id,
+        event_is_visible=is_client_visible_event,
+        event_files_belong=event_files_belong_to_session,
+        project_provider_event=project_provider_history_event_for_egress,
+        strip_user_context=strip_agentsdock_generated_user_text,
+        fork_internal_purposes=FORK_INTERNAL_PURPOSES,
+    )
+    snapshot = read_public_transcript(events_path(session_id), projector, through_bytes=through_bytes)
+    if not public_chat_share_session_exists(session_id):
+        raise PublicTranscriptError("Chat is unavailable")
+    return snapshot
+
+
+app.include_router(create_public_chat_share_router(
+    storage_root=STATE_DIR / "public-chat-shares",
+    authorize=require_native_admin_control,
+    session_exists=public_chat_share_session_exists,
+    load_transcript=load_public_chat_share_transcript,
+    public_base_url=lambda: agentsdock_setting("PUBLIC_CHAT_BASE_URL", ""),
+))
+
+
 @app.get("/api/admin/codex/goals")
 async def get_codex_goals_admin_endpoint(request: Request) -> dict[str, Any]:
     require_native_admin_control(request)
@@ -75140,6 +75262,8 @@ async def get_session(
     normalized_page_mode = str(page_mode or "").strip().lower()
     if normalized_page_mode not in {"", "semantic"}:
         raise HTTPException(status_code=400, detail="page_mode must be semantic")
+    if normalized_page_mode != "semantic":
+        await asyncio.to_thread(prepare_claude_history_metadata_repair, session_id)
     page_tail = tail and after <= 0
     semantic_page: dict[str, Any] | None = None
     if normalized_page_mode == "semantic":
@@ -83529,6 +83653,7 @@ async def session_events(
         # sequence-bound catch-up; the old single 500-row read silently skipped
         # the rest of a long offline gap.
         catchup_visible = visible is True
+        await asyncio.to_thread(prepare_claude_history_metadata_repair, session_id)
         boundary = await asyncio.to_thread(
             last_event_seq_from_file,
             events_path(session_id),
@@ -84527,12 +84652,12 @@ def is_polling_access_log_request(method: Any, path: Any, status: Any) -> bool:
 
 
 def redact_access_log_token(value: Any) -> str:
-    """Remove bearer query values before any access-log handler sees them."""
+    """Remove query and public-share bearer values before access-log handlers."""
 
-    return ACCESS_LOG_TOKEN_QUERY_RE.sub(
+    return redact_public_share_path(ACCESS_LOG_TOKEN_QUERY_RE.sub(
         lambda match: f"{match.group('prefix')}<redacted>",
         str(value or ""),
-    )
+    ))
 
 
 class PollingAccessLogFilter(logging.Filter):

@@ -131,6 +131,32 @@ _REVIEW_TARGET_TYPES = frozenset(
 )
 
 
+CODEX_AUTH_FILE_NAME = "auth.json"
+
+
+def codex_auth_file_path(env: dict[str, str]) -> str:
+    """Resolve ``$CODEX_HOME/auth.json`` for the environment a child inherits."""
+
+    home = str(env.get("CODEX_HOME") or "").strip()
+    if not home:
+        home = os.path.join("~", ".codex")
+    return os.path.join(os.path.expanduser(home), CODEX_AUTH_FILE_NAME)
+
+
+def codex_auth_signature(path: str) -> tuple[int, int] | None:
+    """Return a cheap change signature for the credential file.
+
+    ``None`` means the file is absent or unreadable, which is never treated as
+    a change: an unreadable file cannot prove that newer credentials exist.
+    """
+
+    try:
+        stat_result = os.stat(path)
+    except OSError:
+        return None
+    return (stat_result.st_mtime_ns, stat_result.st_size)
+
+
 class _OmittedType:
     """Sentinel that distinguishes an omitted optional field from JSON null."""
 
@@ -543,6 +569,11 @@ class CodexAppServerClient:
         self._initialized = False
         self._initialize_result: dict[str, Any] | None = None
         self._generation = 0
+        # Codex reads its rotating OAuth credentials once per process, so the
+        # file a live child was launched against is the only thing that can
+        # tell us whether a later sign-in superseded what it holds.
+        self._auth_file: str | None = None
+        self._auth_signature: tuple[int, int] | None = None
 
     @property
     def ready(self) -> bool:
@@ -600,6 +631,13 @@ class CodexAppServerClient:
             ):
                 await self._discard_process()
             self._closing = False
+            env = self.env_factory()
+            auth_file = codex_auth_file_path(env)
+            # Sample before the spawn, never after.  A sign-in that lands
+            # during startup then merely looks newer than the process, which
+            # costs one redundant retire; sampling afterwards could record
+            # credentials the child never read and strand the user on them.
+            auth_signature = codex_auth_signature(auth_file)
             try:
                 proc = await self._process_factory(
                     self.codex_bin,
@@ -611,7 +649,7 @@ class CodexAppServerClient:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     cwd=self.cwd,
-                    env=self.env_factory(),
+                    env=env,
                     limit=self.process_stream_limit,
                     start_new_session=True,
                 )
@@ -634,6 +672,8 @@ class CodexAppServerClient:
                 else None
             )
             self._proc = proc
+            self._auth_file = auth_file
+            self._auth_signature = auth_signature
             if (
                 self._on_process_started is not None
                 and isinstance(raw_pid, int)
@@ -687,6 +727,31 @@ class CodexAppServerClient:
                 return False
             await self._discard_process()
             return True
+
+    async def retire_replaced_credentials(self) -> bool:
+        """Retire an idle process that is holding superseded credentials.
+
+        Codex loads ``auth.json`` once per process.  After an out-of-band
+        sign-in the live process keeps refreshing the credentials it already
+        holds and fails every turn with an authentication error asking the
+        user to sign in again - which no amount of signing in can fix, because
+        nothing tells the running child to re-read the file.  Retiring the
+        generation makes the next lazy ``start`` pick up the new credentials,
+        so the sign-in the user already completed simply takes effect.
+
+        Only an idle process is retired.  The shared app-server multiplexes
+        every Codex thread, so discarding it while turns are in flight would
+        kill work that may still be running fine on a valid in-memory token.
+        """
+
+        if not self.ready or self._auth_file is None:
+            return False
+        if self._turns_by_thread:
+            return False
+        current = codex_auth_signature(self._auth_file)
+        if current is None or current == self._auth_signature:
+            return False
+        return await self.retire_generation(self._generation)
 
     async def __aenter__(self) -> "CodexAppServerClient":
         await self.start()
@@ -2406,6 +2471,9 @@ class CodexAppServerManager:
 
     async def retire_generation(self, expected_generation: int) -> bool:
         return await self.client.retire_generation(expected_generation)
+
+    async def retire_replaced_credentials(self) -> bool:
+        return await self.client.retire_replaced_credentials()
 
     async def __aenter__(self) -> "CodexAppServerManager":
         await self.start()

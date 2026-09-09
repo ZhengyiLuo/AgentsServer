@@ -1,13 +1,17 @@
 import asyncio
 import json
+import os
 import signal
+import tempfile
 import time
 import unittest
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
 from codex_app_server import (
+    codex_auth_file_path,
     CodexAppServerClient,
     CodexAppServerDisconnected,
     CodexAppServerManager,
@@ -2228,6 +2232,161 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
             factory.process.messages[-1]["method"],
             "thread/compact/start",
         )
+
+
+class CodexCredentialRetirementTests(unittest.IsolatedAsyncioTestCase):
+    """Codex loads auth.json once per process; a later sign-in must land."""
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.codex_home = Path(directory.name)
+        self.auth_file = self.codex_home / "auth.json"
+
+    def write_credentials(self, token: str) -> None:
+        self.auth_file.write_text(json.dumps({"tokens": {"access": token}}))
+
+    def make_client(self, factory: FakeProcessFactory) -> CodexAppServerClient:
+        return CodexAppServerClient(
+            "codex",
+            cwd="/tmp",
+            env_factory=lambda: {
+                "PATH": "/usr/bin",
+                "CODEX_HOME": str(self.codex_home),
+            },
+            process_factory=factory,
+            request_timeout=1,
+        )
+
+    def test_auth_file_path_follows_codex_home(self) -> None:
+        self.assertEqual(
+            codex_auth_file_path({"CODEX_HOME": str(self.codex_home)}),
+            str(self.auth_file),
+        )
+        self.assertEqual(
+            codex_auth_file_path({}),
+            os.path.join(os.path.expanduser("~"), ".codex", "auth.json"),
+        )
+        # An empty value must fall back rather than resolve against the cwd.
+        self.assertEqual(
+            codex_auth_file_path({"CODEX_HOME": "   "}),
+            os.path.join(os.path.expanduser("~"), ".codex", "auth.json"),
+        )
+
+    async def test_signing_in_again_retires_the_stale_process(self) -> None:
+        self.write_credentials("revoked-token")
+        factory = FakeProcessFactory()
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+        await client.start()
+        generation = client.generation
+
+        # The user signs in again out of band, exactly as `codex login` does.
+        self.write_credentials("freshly-issued-token-after-sign-in")
+
+        self.assertTrue(await client.retire_replaced_credentials())
+        self.assertFalse(client.ready)
+
+        # The lazy restart is what actually reads the new credentials, so the
+        # user never has to sign in a second time.
+        await client.start()
+        self.assertTrue(client.ready)
+        self.assertGreater(client.generation, generation)
+        self.assertEqual(len(factory.calls), 2)
+
+        # The replacement is current, so nothing retires it again.
+        self.assertFalse(await client.retire_replaced_credentials())
+        self.assertTrue(client.ready)
+
+    async def test_unchanged_credentials_keep_the_live_process(self) -> None:
+        self.write_credentials("still-valid-token")
+        factory = FakeProcessFactory()
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+        await client.start()
+
+        self.assertFalse(await client.retire_replaced_credentials())
+        self.assertTrue(client.ready)
+        self.assertEqual(len(factory.calls), 1)
+
+    async def test_first_sign_in_retires_a_process_started_without_credentials(
+        self,
+    ) -> None:
+        factory = FakeProcessFactory()
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+        await client.start()
+        self.assertFalse(self.auth_file.exists())
+
+        self.write_credentials("first-ever-token")
+
+        self.assertTrue(await client.retire_replaced_credentials())
+        self.assertFalse(client.ready)
+
+    async def test_unreadable_credentials_are_never_treated_as_a_change(
+        self,
+    ) -> None:
+        self.write_credentials("token")
+        factory = FakeProcessFactory()
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+        await client.start()
+
+        # A vanished file proves nothing about newer credentials existing, and
+        # must never cost the user a working process.
+        self.auth_file.unlink()
+
+        self.assertFalse(await client.retire_replaced_credentials())
+        self.assertTrue(client.ready)
+
+    async def test_in_flight_turns_are_never_killed_by_a_sign_in(self) -> None:
+        self.write_credentials("token")
+        factory = FakeProcessFactory()
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+        await client.start()
+
+        # The app-server is shared by every Codex thread, so a turn that is
+        # still running on a valid in-memory token must survive the sign-in.
+        client._turns_by_thread["thr_busy"] = object()
+        self.write_credentials("token-from-a-later-sign-in")
+
+        self.assertFalse(await client.retire_replaced_credentials())
+        self.assertTrue(client.ready)
+
+        client._turns_by_thread.clear()
+        self.assertTrue(await client.retire_replaced_credentials())
+        self.assertFalse(client.ready)
+
+    async def test_a_process_that_never_started_is_not_retired(self) -> None:
+        self.write_credentials("token")
+        factory = FakeProcessFactory()
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+
+        self.assertFalse(await client.retire_replaced_credentials())
+        self.assertEqual(len(factory.calls), 0)
+
+    async def test_manager_delegates_credential_retirement(self) -> None:
+        self.write_credentials("revoked")
+        factory = FakeProcessFactory()
+        manager = CodexAppServerManager(
+            "codex",
+            cwd="/tmp",
+            env_factory=lambda: {
+                "PATH": "/usr/bin",
+                "CODEX_HOME": str(self.codex_home),
+            },
+            process_factory=factory,
+            request_timeout=1,
+        )
+        self.addAsyncCleanup(manager.close)
+        await manager.start()
+
+        self.write_credentials("re-issued-after-sign-in")
+
+        self.assertTrue(await manager.retire_replaced_credentials())
+        self.assertFalse(manager.ready)
 
 
 if __name__ == "__main__":

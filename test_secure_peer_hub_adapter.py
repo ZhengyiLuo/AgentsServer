@@ -12,6 +12,7 @@ from agentsdock_team_hub.secure_peer import (
     MAX_RESPONSE_BODY_BYTES,
     PeerAuthorization,
     ProxyRequest,
+    sanitize_proxy_request,
 )
 from agentsdock_team_hub.secure_peer_hub import SecurePeerHubAdapter
 from agentsdock_team_hub.store import (
@@ -96,6 +97,80 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
                 self.peer,
             )
         )
+
+    def test_team_message_mailbox_removal_and_revision_history_over_peer_route(self) -> None:
+        base = f"/v1/teams/{self.team_id}/network"
+        directory = json.loads(self.request("GET", base).body)
+        node = next(row for row in directory["servers"] if row["server_identity"] == self.peer.peer_server_identity)
+        message = self.store.create_team_message(self.owner, self.team_id, {
+            "kind": "message", "body": "Incoming mail", "recipients": [{"kind": "server", "id": node["id"]}],
+            "idempotency_key": "peer-incoming-mail",
+        })["message"]
+        addressed = {"address_kind": "server", "address_id": node["id"]}
+        receipt = self.request("POST", f"{base}/messages/{message['id']}/receipts",
+            body={**addressed, "state": "read", "idempotency_key": "peer-read-mail"})
+        self.assertEqual(receipt.status, 200, receipt.body)
+        dismissal_path = f"{base}/messages/{message['id']}/dismissals"
+        denied = self.adapter.forward(sanitize_proxy_request(self.peer, "POST", dismissal_path, "",
+            (("content-type", "application/json"),), json.dumps({"address_kind": "server",
+                "address_id": "node_someone_else", "idempotency_key": "peer-denied-dismiss"}).encode()))
+        self.assertEqual(denied.status, 403, denied.body)
+        removed = self.adapter.forward(sanitize_proxy_request(self.peer, "POST", dismissal_path, "",
+            (("content-type", "application/json"),),
+            json.dumps({**addressed, "idempotency_key": "peer-dismiss-mail"}).encode()))
+        self.assertEqual(removed.status, 200, removed.body)
+        inbox = self.request("GET", f"{base}/messages", query=f"box=inbox&address_kind=server&address_id={node['id']}")
+        self.assertEqual(json.loads(inbox.body)["messages"], [])
+        broadcast = self.request("POST", f"{base}/messages", body={
+            "kind": "message", "body": "Original broadcast", "recipients": [{"kind": "all"}],
+            "idempotency_key": "peer-broadcast-history"})
+        message_id = json.loads(broadcast.body)["message"]["id"]
+        revision = self.adapter.forward(sanitize_proxy_request(self.peer, "POST",
+            f"{base}/messages/{message_id}/revisions", "", (("content-type", "application/json"),),
+            json.dumps({"body": "Updated broadcast", "expected_version": 1,
+                "idempotency_key": "peer-revise-broadcast"}).encode()))
+        self.assertEqual(revision.status, 200, revision.body)
+        # Exercise both transport validation and Hub forwarding, as member UI
+        # requests pass through both before reaching the store.
+        listing = self.adapter.forward(sanitize_proxy_request(self.peer, "GET", f"{base}/messages",
+            "box=feed&limit=25&include_revision=1", (), b""))
+        self.assertEqual(listing.status, 200, listing.body)
+        self.assertEqual(json.loads(listing.body)["messages"][0]["revision"]["version"], 2)
+        inbox = self.adapter.forward(sanitize_proxy_request(self.peer, "GET", f"{base}/messages",
+            f"box=inbox&limit=25&address_kind=server&address_id={node['id']}&include_revision=1", (), b""))
+        self.assertEqual(inbox.status, 200, inbox.body)
+        history = self.adapter.forward(sanitize_proxy_request(self.peer, "GET",
+            f"{base}/messages/{message_id}/revisions", "version=1", (), b""))
+        self.assertEqual(history.status, 200, history.body)
+        self.assertEqual(json.loads(history.body)["versions"][0]["body"], "Original broadcast")
+
+    def test_all_servers_peer_send_is_inbox_mail_not_bulletin(self) -> None:
+        path = f"/v1/teams/{self.team_id}/network/messages"
+        response = self.request("POST", path, body={
+            "kind": "message", "body": "Every server inbox", "recipients": [{"kind": "all_servers"}],
+            "idempotency_key": "peer-all-servers-mail"})
+        self.assertEqual(response.status, 200, response.body)
+        message = json.loads(response.body)["message"]
+        self.assertEqual(message["destination"], "all_servers")
+        self.assertTrue(all(row["kind"] == "server" for row in message["recipients"]))
+        self.assertEqual(json.loads(self.request("GET", path, query="box=feed").body)["messages"], [])
+        inbox = json.loads(self.request("GET", path, query="box=inbox").body)["messages"]
+        self.assertEqual([row["id"] for row in inbox], [message["id"]])
+
+    def test_server_rename_changes_only_directory_name_and_survives_reprovision(self) -> None:
+        path = f"/v1/teams/{self.team_id}/network/server-profile"
+        renamed = self.request("POST", path, body={"display_name": "Renamed server"})
+        self.assertEqual(renamed.status, 200, renamed.body)
+        value = json.loads(renamed.body)["server"]
+        self.assertEqual(value["server_identity"], self.peer.peer_server_identity)
+        self.adapter.provision_peer({"peer_id": self.peer_id, "peer_server_identity": self.peer.peer_server_identity,
+                                     "team_id": self.team_id}, display_name=self.peer.peer_display_name)
+        result = json.loads(self.request("GET", f"/v1/teams/{self.team_id}/network").body)
+        self.assertEqual(next(server for server in result["servers"] if server["id"] == value["id"])["display_name"], "Renamed server")
+        denied = self.request("POST", path, body={"display_name": "Other", "server_id": "someone-else"})
+        self.assertEqual(denied.status, 422)
+        denied = self.request("POST", "/v1/teams/other-team/network/server-profile", body={"display_name": "Other"})
+        self.assertEqual(denied.status, 403)
 
     def test_peer_session_and_team_are_service_scoped(self) -> None:
         session = self.request("GET", "/v1/peer-session")

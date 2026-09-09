@@ -36,14 +36,18 @@ class _PeerRuntime:
     def resume_member_after_host(self):
         return None
 
+    def publish_display_name(self, display_name):
+        return None
 
-def _request(name: str, *, request_id: str | None = None):
+
+def _request(name: str, *, request_id: str | None = None, network_name: str | None = None):
     return agent_server.TeamHubHostEnableRequest(
         request_id=request_id or str(uuid.uuid4()),
         expected_server_identity="server-control-test-12345678",
         expected_server_instance_id="instance-control-test-12345678",
         confirmed=True,
         server_name=name,
+        network_name=network_name,
     )
 
 
@@ -262,19 +266,25 @@ class TeamHubHostControlTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(agent_server, "read_server_update_status", return_value={}),
                 patch.dict(os.environ, {}, clear=False),
             ):
-                first = await agent_server.enable_team_hub_host(_request("Studio"))
+                first = await agent_server.enable_team_hub_host(_request("Studio", network_name="Research"))
                 hub_id = runtime.store.hub_id
+                original_team = runtime.store.managed_server_claims().team_id
                 disabled = await agent_server.disable_team_hub_host(
                     _request("Studio")
                 )
                 second = await agent_server.enable_team_hub_host(
-                    _request("Studio Two")
+                    _request("Studio Two", network_name="Studio Two")
                 )
 
                 self.assertEqual(first["operation"], "create")
                 self.assertEqual(disabled["operation"], "disable")
                 self.assertEqual(second["operation"], "reactivate")
                 self.assertEqual(runtime.store.hub_id, hub_id)
+                self.assertEqual(runtime.store.managed_server_claims().team_id, original_team)
+                self.assertEqual(
+                    runtime.store.get_team(runtime.store.managed_server_claims(), original_team)["team"]["display_name"],
+                    "Research",
+                )
                 self.assertEqual(second["server_name"], "Studio Two")
                 self.assertFalse(second["reconnect_required"])
                 self.assertFalse((data_dir / "maintenance-fence.json").exists())

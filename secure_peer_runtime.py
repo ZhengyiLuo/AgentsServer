@@ -298,6 +298,57 @@ class SecurePeerRuntime:
                 client.display_name = label
         return label
 
+    def publish_display_name(self, display_name: str) -> None:
+        """Publish an explicit Member rename through its exact active pairing."""
+
+        label = str(display_name)
+        if not label or len(label.encode("utf-8")) > 160:
+            raise ValueError("server display name is invalid")
+        with self._outbound_guard:
+            if self._host_role_active:
+                return
+            active = next(
+                (item for item in self.client.list_connections() if item.get("active")),
+                None,
+            )
+            if active is None:
+                return
+            if "teamspace.write" not in set(active.get("scopes") or []):
+                raise SecurePeerError(
+                    "forbidden", "This server's Team Network connection is read-only", 403
+                )
+            team_id = str(active.get("team_id") or "")
+            if not team_id:
+                raise SecurePeerError(
+                    "connection_unavailable", "The paired Team Network is unavailable", 409
+                )
+            response = self.proxy(
+                str(active["connection_id"]),
+                "POST",
+                f"/v1/teams/{quote(team_id, safe='')}/network/server-profile",
+                query="",
+                headers={"accept": "application/json", "content-type": "application/json"},
+                body=json.dumps({"display_name": label}, ensure_ascii=False).encode("utf-8"),
+            )
+            if int(response.status) != 200:
+                raise SecurePeerError(
+                    "server_profile_unavailable",
+                    "The Team Network host did not accept this server's name update",
+                    int(response.status),
+                )
+            try:
+                result = json.loads(response.body)
+                server = result.get("server") if isinstance(result, dict) else None
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                server = None
+            if not isinstance(server, dict) or (
+                server.get("server_identity") != self.server_identity
+                or server.get("display_name") != label
+            ):
+                raise SecurePeerError(
+                    "remote_invalid", "The host returned a mismatched server name update", 502
+                )
+
     def pause_member_for_host(self) -> dict[str, Any] | None:
         """Pause the active remote membership without deleting queued work."""
 
@@ -918,6 +969,13 @@ class SecurePeerRuntime:
                 expected_current=active_id or None,
             )
             self._client_failure_counts.pop(expected_connection_id, None)
+            try:
+                self.publish_display_name(self.display_name)
+            except SecurePeerError as exc:
+                # Older hosts and read-only pairings can still connect. A
+                # supported rename must otherwise acknowledge the exact node.
+                if exc.status_code not in {403, 404}:
+                    raise
         return self.status()
 
     def deactivate_connection(
@@ -2040,13 +2098,6 @@ class SecurePeerRuntime:
         """Serialize client maintenance with live Host/Member transitions."""
 
         with self._outbound_guard:
-            if self._host_role_active:
-                return {
-                    "active": False,
-                    "renewed": False,
-                    "healthy": False,
-                    "host_role_active": True,
-                }
             return self._maintenance_once_unlocked()
 
     def _maintenance_once_unlocked(self) -> dict[str, Any]:
@@ -2123,6 +2174,16 @@ class SecurePeerRuntime:
                         "secure peer lease expiry deferred error_type=%s",
                         type(exc).__name__,
                     )
+        # Host mode pauses outgoing Member work, not the shared upkeep above.
+        # The listener still needs certificate rotation, lease expiry, and
+        # recovery even when no local Member connection is active.
+        if self._host_role_active:
+            return {
+                "active": False,
+                "renewed": False,
+                "healthy": False,
+                "host_role_active": True,
+            }
         try:
             # Persist outgoing pending deadlines even when no operator is
             # viewing or polling Team Network. This is also the periodic
@@ -3690,9 +3751,15 @@ class SecurePeerRuntime:
                 or not recipients
                 or any(
                     not isinstance(recipient, Mapping)
-                    or recipient.get("kind") not in {"server", "human", "all"}
+                    or recipient.get("kind") not in {"server", "human", "all", "all_servers"}
                     for recipient in recipients
                 )
+            ):
+                invalid()
+            if any(recipient.get("kind") == "all_servers" for recipient in recipients) and (
+                recipients != [{"kind": "all_servers"}]
+                or value.get("kind") != "message"
+                or value.get("skill") is not None
             ):
                 invalid()
         return reply_parent
@@ -6131,6 +6198,13 @@ class SecurePeerRuntime:
                         409,
                     )
                 reference["authorized_skill_slug"] = slug
+            elif reference.get("recipient_kind") == "all_servers":
+                if target_id != "all_servers" or display_name != "all":
+                    raise SecurePeerError(
+                        "team_reference_invalid",
+                        "Server inbox broadcasts must use @@all",
+                        409,
+                    )
             elif reference.get("recipient_kind") == "all":
                 if target_id != "all" or display_name not in {"all", "bulletin"}:
                     raise SecurePeerError(
@@ -6461,6 +6535,16 @@ class SecurePeerRuntime:
             )
         team_path = f"/v1/teams/{quote(realm['team_id'], safe='')}/network"
         kind = str(payload.get("kind") or "message")
+        if (
+            (kind == "skill" or payload.get("skill") is not None)
+            and reference.get("kind") != "skill"
+            and reference.get("recipient_kind") != "all"
+        ):
+            raise SecurePeerError(
+                "team_reference_invalid",
+                "Skills can only be published to Bulletin or a mentioned Team skill",
+                409,
+            )
         if reference.get("kind") == "skill" and kind != "skill":
             raise SecurePeerError(
                 "team_reference_invalid",
@@ -6483,6 +6567,8 @@ class SecurePeerRuntime:
             recipients = [{"kind": "all"}]
         elif reference.get("recipient_kind") == "all":
             recipients = [{"kind": "all"}]
+        elif reference.get("recipient_kind") == "all_servers":
+            recipients = [{"kind": "all_servers"}]
         else:
             recipients = [
                 {"kind": str(reference.get("recipient_kind")), "id": str(reference.get("target_id"))}

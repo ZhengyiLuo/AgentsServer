@@ -19,6 +19,7 @@ import sqlite3
 import stat
 import tempfile
 import time
+import unicodedata
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -92,6 +93,7 @@ MAX_NETWORK_PAGE_RESPONSE_BYTES = 1_900_000
 # JSON request limit; attachment bytes never travel through JSON or SQLite.
 MAX_TEAM_MESSAGE_BODY_BYTES = 49_152
 MAX_TEAM_MESSAGE_RECIPIENTS = 16
+MAX_TEAM_MESSAGE_SERVER_RECIPIENTS = 1024
 MAX_TEAM_MESSAGE_ATTACHMENTS = 16
 MAX_TEAM_MESSAGE_ATTACHMENT_BYTES = 2 * 1024 * 1024 * 1024
 MAX_TEAM_MESSAGE_TITLE_CHARS = 160
@@ -3211,6 +3213,7 @@ class HubStore:
                     # Sibling object: clients that parse team_network_v1 with
                     # an exact key list keep working unchanged.
                     "team_messages_v1": self.team_messages_capability(),
+                    "team_all_servers_alias_v1": self.team_all_servers_capability(),
                 },
             }
         finally:
@@ -6047,6 +6050,10 @@ class HubStore:
                         str(row["team_id"]),
                         timestamp,
                     )
+                    connection.execute(
+                        "UPDATE principals SET display_name=?,updated_at=? WHERE id='service_managed_network_owner'",
+                        (label, timestamp),
+                    )
         except BaseException:
             self.managed_host_display_name = previous
             raise
@@ -6286,23 +6293,8 @@ class HubStore:
                             409,
                         )
                     node_id = str(node["id"])
-                    if node["display_name"] != label:
-                        connection.execute(
-                            """
-                            UPDATE nodes
-                            SET display_name=?
-                            WHERE id=?
-                            """,
-                            (label, node_id),
-                        )
-                        connection.execute(
-                            """
-                            UPDATE principals SET display_name=?,updated_at=?
-                            WHERE id=?
-                            """,
-                            (label, timestamp, node["principal_id"]),
-                        )
-                        changed = True
+                    # Pairing labels are immutable trust history. A live node
+                    # may have been explicitly renamed since approval.
                 binding = connection.execute(
                     """
                     SELECT peer_id,node_id,service_principal_id,
@@ -6798,6 +6790,76 @@ class HubStore:
             "refresh_expires_at": _iso8601(refresh_expires_at),
             **self._session_public(connection, session),
         }
+
+    def bootstrap_managed_network(self, network_name: str) -> None:
+        """Create one shared network under the authenticated parent operator.
+
+        This is process-local only: public Hub credentials and secure peers
+        cannot invoke it. No human identity or login credential is created.
+        """
+        name = _bounded_text(network_name, "network_name", 1, 160)
+        timestamp = _now()
+        owner_id = "service_managed_network_owner"
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                binding = connection.execute(
+                    "SELECT server_identity,hub_id FROM managed_host_bindings WHERE singleton=1"
+                ).fetchone()
+                if (
+                    self.managed_host_identity is None
+                    or binding is None
+                    or binding["server_identity"] != self.managed_host_identity
+                    or binding["hub_id"] != self.hub_id
+                ):
+                    raise HubError("bootstrap_unavailable", "Managed host creation is unavailable", 403)
+                teams = connection.execute(
+                    "SELECT id,kind,display_name,created_by_principal_id FROM teams"
+                ).fetchall()
+                if teams:
+                    if (
+                        len(teams) == 1
+                        and teams[0]["kind"] == "shared"
+                        and teams[0]["created_by_principal_id"] == owner_id
+                        and teams[0]["display_name"] == name
+                    ):
+                        self._validate_owner_invariants(connection)
+                        return
+                    raise HubError("network_already_exists", "This server already hosts a Team Network", 409)
+                if not self._globally_empty(connection):
+                    raise HubError("bootstrap_unavailable", "Existing Hub state requires recovery", 409)
+                team_id = _id("team")
+                connection.execute(
+                    "INSERT INTO principals(id,kind,display_name,created_at,updated_at) VALUES (?,'service',?,?,?)",
+                    (owner_id, self.managed_host_display_name, timestamp, timestamp),
+                )
+                connection.execute(
+                    "INSERT INTO service_accounts(principal_id,service_identifier,created_at) VALUES (?,?,?)",
+                    (owner_id, "agentsdock.team-hub.managed-network-owner", timestamp),
+                )
+                connection.execute(
+                    """INSERT INTO teams(id,kind,slug,display_name,created_by_principal_id,created_at,updated_at)
+                       VALUES (?,'shared',?,?,?,?,?)""",
+                    (team_id, f"network-{team_id[-24:]}", name, owner_id, timestamp, timestamp),
+                )
+                connection.execute(
+                    """INSERT INTO memberships(id,team_id,principal_id,role,status,created_at,updated_at)
+                       VALUES (?,?,?,'owner','active',?,?)""",
+                    (_id("membership"), team_id, owner_id, timestamp, timestamp),
+                )
+                self._ensure_managed_host_node(connection, team_id, timestamp)
+                self._local_control_principal(connection, team_id, timestamp)
+                self._managed_server_principal(connection, team_id, timestamp)
+                self._ensure_network_board(connection, team_id, owner_id, timestamp)
+                connection.execute(
+                    "UPDATE bootstrap_claims SET revoked_at=? WHERE consumed_at IS NULL AND revoked_at IS NULL",
+                    (timestamp,),
+                )
+                self._audit(connection, team_id, owner_id, "team.bootstrap", "team", team_id,
+                            "succeeded", {"authentication": "managed_server"}, timestamp)
+                self._validate_owner_invariants(connection)
+        finally:
+            connection.close()
 
     def bootstrap(
         self,
@@ -9165,6 +9227,27 @@ class HubStore:
             "status": row["status"],
         }
 
+    def rename_network_server(self, claims: AccessClaims, team_id: str, display_name: str) -> dict[str, Any]:
+        """Let an authenticated paired server rename only its own directory node."""
+        label = _bounded_text(display_name, "display_name", 1, 160)
+        if label != display_name or len(label.encode("utf-8")) > 160 or any(unicodedata.category(character) == "Cc" for character in label):
+            raise HubError("invalid_request", "Server name is invalid", 422)
+        timestamp = _now()
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                self._require_network_scope(connection, claims, team_id, write=True)
+                node = self._bound_network_node(connection, claims, team_id)
+                if node["display_name"] != label:
+                    connection.execute("UPDATE nodes SET display_name=? WHERE id=?", (label, node["node_id"]))
+                    connection.execute("UPDATE principals SET display_name=?,updated_at=? WHERE id=?",
+                                       (label, timestamp, node["principal_id"]))
+                    self._audit(connection, team_id, claims.principal_id, "network.server.rename", "node",
+                                node["node_id"], "succeeded", {}, timestamp)
+                return {"server": {"id": node["node_id"], "server_identity": node["server_identity"], "display_name": label}}
+        finally:
+            connection.close()
+
     def get_network(
         self,
         claims: AccessClaims,
@@ -9200,19 +9283,6 @@ class HubStore:
             ).fetchone()
             if team is None:
                 raise HubError("not_found", "Resource not found", 404)
-            owner = connection.execute(
-                """
-                SELECT p.display_name
-                FROM memberships AS m
-                JOIN principals AS p ON p.id=m.principal_id
-                WHERE m.team_id=? AND m.role='owner' AND m.status='active'
-                  AND p.kind='human' AND p.status='active'
-                """,
-                (team_id,),
-            ).fetchone()
-            if owner is None:
-                raise RuntimeError("Team Network owner is unavailable")
-            host_recipient_display_name = str(owner["display_name"])
             owned_node_id: str | None = None
             if claims.auth_kind in NETWORK_AUTOMATION_AUTH_KINDS:
                 owned_node_id = str(
@@ -9293,12 +9363,7 @@ class HubStore:
                     "id": row["id"],
                     "server_identity": row["server_identity"],
                     "display_name": row["display_name"],
-                    "recipient_display_name": (
-                        host_recipient_display_name
-                        if self.managed_host_identity is not None
-                        and row["server_identity"] == self.managed_host_identity
-                        else row["display_name"]
-                    ),
+                    "recipient_display_name": row["display_name"],
                     "status": row["status"],
                     "is_host": bool(
                         self.managed_host_identity is not None
@@ -9440,27 +9505,12 @@ class HubStore:
                 self.managed_host_identity is not None
                 and row["server_identity"] == self.managed_host_identity
             )
-            recipient_display_name = str(row["display_name"])
-            if is_host:
-                owner = connection.execute(
-                    """
-                    SELECT p.display_name
-                    FROM memberships AS m
-                    JOIN principals AS p ON p.id=m.principal_id
-                    WHERE m.team_id=? AND m.role='owner' AND m.status='active'
-                      AND p.kind='human' AND p.status='active'
-                    """,
-                    (team_id,),
-                ).fetchone()
-                if owner is None:
-                    raise RuntimeError("Team Network owner is unavailable")
-                recipient_display_name = str(owner["display_name"])
             result = {
                 "server": {
                     "id": str(row["id"]),
                     "server_identity": str(row["server_identity"]),
                     "display_name": str(row["display_name"]),
-                    "recipient_display_name": recipient_display_name,
+                    "recipient_display_name": str(row["display_name"]),
                     "status": str(row["status"]),
                     "is_host": is_host,
                     "owned_by_caller": row["id"] == owned_node_id,
@@ -11631,6 +11681,16 @@ class HubStore:
             },
         }
 
+    @staticmethod
+    def team_all_servers_capability() -> dict[str, Any]:
+        return {
+            "available": True,
+            "version": 1,
+            "mention": "@@all",
+            "recipient_kind": "all_servers",
+            "max_recipients_per_message": MAX_TEAM_MESSAGE_SERVER_RECIPIENTS,
+        }
+
     # -- validation helpers -------------------------------------------------
 
     @staticmethod
@@ -12061,6 +12121,8 @@ class HubStore:
             "provenance": self._team_provenance_public(row["provenance_json"]),
             "created_at": _iso8601(row["created_at"]),
         }
+        if row["destination"] == "all_servers":
+            item["destination"] = "all_servers"
         if include_revision:
             item["revision"] = {
                 "version": int(row["message_version"]),
@@ -12211,18 +12273,23 @@ class HubStore:
             raise HubError("invalid_request", "Message recipients are invalid", 422)
         requested: list[tuple[str, str | None]] = []
         for entry in raw_recipients:
-            if not isinstance(entry, dict) or entry.get("kind") not in {"server", "human", "all"}:
+            if not isinstance(entry, dict) or entry.get("kind") not in {"server", "human", "all", "all_servers"}:
                 raise HubError("invalid_request", "Message recipients are invalid", 422)
             recipient_kind = str(entry["kind"])
             recipient_id = entry.get("id")
-            if recipient_kind == "all":
-                if recipient_id not in (None, "all"):
+            if recipient_kind in {"all", "all_servers"}:
+                if recipient_id not in (None, recipient_kind):
                     raise HubError("invalid_request", "Message recipients are invalid", 422)
                 recipient_id = None
             elif not isinstance(recipient_id, str) or not 1 <= len(recipient_id) <= 240:
                 raise HubError("invalid_request", "Message recipients are invalid", 422)
             if (recipient_kind, recipient_id) not in requested:
                 requested.append((recipient_kind, recipient_id))
+        all_servers = ("all_servers", None) in requested
+        if all_servers and (kind != "message" or requested != [("all_servers", None)]):
+            raise HubError(
+                "invalid_request", "All-server mail must be a message with only the all_servers recipient", 422
+            )
         raw_attachments = request.get("attachment_ids") or []
         if (
             not isinstance(raw_attachments, list)
@@ -12300,6 +12367,43 @@ class HubStore:
                 sender_kind, sender_node_id = self._team_sender(connection, claims, team_id)
                 resolved: list[tuple[str, str | None, str | None]] = []
                 for recipient_kind, recipient_id in requested:
+                    if recipient_kind == "all_servers":
+                        # Freeze the current server mailboxes in this transaction.
+                        # Presence is not trust: offline members still receive mail;
+                        # retired secure-peer bindings do not. Match the roster's
+                        # exact active-binding rule, including legacy/host nodes.
+                        server_rows = connection.execute(
+                            """
+                            SELECT n.id FROM nodes AS n
+                            WHERE n.team_id=? AND n.status<>'revoked'
+                              AND (
+                                n.server_identity=?
+                                OR NOT EXISTS (
+                                    SELECT 1 FROM network_peer_bindings AS history
+                                    WHERE history.team_id=n.team_id AND history.node_id=n.id
+                                )
+                                OR EXISTS (
+                                    SELECT 1 FROM network_peer_bindings AS live
+                                    JOIN principals AS p ON p.id=live.service_principal_id
+                                    JOIN service_accounts AS s ON s.principal_id=p.id
+                                    JOIN memberships AS m ON m.team_id=live.team_id AND m.principal_id=p.id
+                                    WHERE live.team_id=n.team_id AND live.node_id=n.id
+                                      AND live.peer_server_identity=n.server_identity
+                                      AND live.status='active' AND p.kind='service' AND p.status='active'
+                                      AND s.service_identifier='agentsdock.secure-peer.' || live.peer_id
+                                      AND m.role='automation' AND m.status='active'
+                                )
+                              )
+                            ORDER BY n.id LIMIT ?
+                            """,
+                            (team_id, self.managed_host_identity, MAX_TEAM_MESSAGE_SERVER_RECIPIENTS + 1),
+                        ).fetchall()
+                        if not server_rows:
+                            raise HubError("recipient_unavailable", "No Team Network server inboxes are available", 404)
+                        if len(server_rows) > MAX_TEAM_MESSAGE_SERVER_RECIPIENTS:
+                            raise HubError("recipient_limit", "Team Network server inbox limit exceeded", 413)
+                        resolved.extend(("server", str(row["id"]), None) for row in server_rows)
+                        continue
                     if recipient_kind == "all":
                         resolved.append(("all", None, None))
                         continue
@@ -12480,8 +12584,8 @@ class HubStore:
                         id,team_id,kind,title,body_format,body,body_sha256,
                         sender_kind,sender_principal_id,sender_node_id,provenance_json,
                         in_reply_to_message_id,skill_id,skill_version,
-                        attachment_count,attachment_bytes,idempotency_key,created_at
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        attachment_count,attachment_bytes,idempotency_key,created_at,destination
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         message_id,
@@ -12506,6 +12610,7 @@ class HubStore:
                             )
                         ).digest(),
                         timestamp,
+                        "all_servers" if all_servers else None,
                     ),
                 )
                 for recipient_kind, node_id, principal_id in resolved:
@@ -12565,6 +12670,8 @@ class HubStore:
                 response = {
                     "message": self._team_message_public(connection, row, include_body=True)
                 }
+                if len(canonical_json(response)) > MAX_NETWORK_PAGE_RESPONSE_BYTES:
+                    raise HubError("recipient_limit", "Message recipient response exceeds the size limit", 413)
                 self._idempotency_store(
                     connection,
                     team_id,
@@ -12682,6 +12789,7 @@ class HubStore:
                     f" AND r.recipient_kind=? AND r.{column}=?"
                 )
                 params = [address_kind, address_id, *params]
+                where.append("r.dismissed_at IS NULL")
                 if unread:
                     where.append("r.state<>'read'")
             else:
@@ -12734,6 +12842,13 @@ class HubStore:
                 ),
                 "has_more": len(rows) > limit,
             }
+            # Expanded all-server mail can make an ordinary page larger than
+            # the peer transport. Preserve the cursor, returning a shorter
+            # complete page instead of omitting any recipients or messages.
+            while len(messages) > 1 and len(canonical_json(response)) > MAX_NETWORK_PAGE_RESPONSE_BYTES:
+                messages.pop()
+                response["next_after_sequence"] = messages[-1]["sequence"]
+                response["has_more"] = True
             if len(canonical_json(response)) > MAX_NETWORK_PAGE_RESPONSE_BYTES:
                 raise HubError(
                     "invalid_request", "Message page exceeds the response limit; lower limit", 422
@@ -12802,9 +12917,12 @@ class HubStore:
         claims: AccessClaims,
         team_id: str,
         message_id: str,
+        *,
+        version: int | None = None,
     ) -> dict[str, Any]:
         """Return immutable revision summaries for one visible Team Message."""
-
+        if version is not None and (type(version) is not int or not 1 <= version <= 200):
+            raise HubError("invalid_request", "Message version is invalid", 422)
         connection = self.connect()
         try:
             connection.execute("BEGIN")
@@ -12839,8 +12957,9 @@ class HubStore:
             response = {
                 "message_id": message_id,
                 "versions": [
-                    self._team_message_revision_public(item, include_body=False)
+                    self._team_message_revision_public(item, include_body=version is not None)
                     for item in revision_rows
+                    if version is None or int(item["revision_version"]) == version
                 ],
             }
             connection.execute("COMMIT")
@@ -13282,6 +13401,43 @@ class HubStore:
         finally:
             connection.close()
 
+    def dismiss_team_message(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        message_id: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Remove a message from one owned inbox without changing other copies."""
+        timestamp = _now()
+        address = (request.get("address_kind"), request.get("address_id"))
+        key = self._team_idempotency_key(request)
+        fingerprint = canonical_fingerprint({"message_id": message_id, "address": address})
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                membership = self._require_network_scope(connection, claims, team_id, write=False)
+                owned = self._team_owned_addresses(connection, claims, team_id, str(membership["role"]))
+                if address not in owned:
+                    raise HubError("forbidden", "This mailbox is not owned by the caller", 403)
+                cached = self._idempotency_lookup(connection, team_id, claims.principal_id,
+                    "team.message.dismiss", key, fingerprint)
+                if cached is not None:
+                    return cached
+                recipient = next((row for row in self._team_message_recipients(connection, team_id, message_id)
+                    if (row["recipient_kind"], row["recipient_node_id"] or row["recipient_principal_id"]) == address), None)
+                if recipient is None:
+                    raise HubError("not_found", "Message is not in this mailbox", 404)
+                connection.execute("UPDATE team_message_recipients SET dismissed_at=COALESCE(dismissed_at,?) WHERE id=?",
+                    (timestamp, recipient["id"]))
+                response = {"dismissed": True, "message_id": message_id,
+                    "address": {"kind": address[0], "id": address[1]}}
+                self._idempotency_store(connection, team_id, claims.principal_id,
+                    "team.message.dismiss", key, fingerprint, "team_message_recipient", recipient["id"], response, timestamp)
+                return response
+        finally:
+            connection.close()
+
     def record_team_message_receipt(
         self,
         claims: AccessClaims,
@@ -13293,9 +13449,13 @@ class HubStore:
         state = request.get("state")
         if state not in {"delivered", "read"}:
             raise HubError("invalid_request", "Receipt state is invalid", 422)
+        address = (request.get("address_kind"), request.get("address_id"))
+        if (address[0] is None) != (address[1] is None):
+            raise HubError("invalid_request", "Receipt mailbox requires kind and id", 422)
         idempotency_key = self._team_idempotency_key(request)
         fingerprint = canonical_fingerprint(
-            {"team_id": team_id, "message_id": message_id, "state": state}
+            {"team_id": team_id, "message_id": message_id, "state": state,
+             **({"address": address} if address[0] is not None else {})}
         )
         connection = self.connect()
         try:
@@ -13331,6 +13491,10 @@ class HubStore:
                         str(recipient["recipient_node_id"] or recipient["recipient_principal_id"]),
                     )
                     in owned
+                    and (address[0] is None or (
+                        recipient["recipient_kind"],
+                        recipient["recipient_node_id"] or recipient["recipient_principal_id"],
+                    ) == address)
                 ]
                 if not rows:
                     raise HubError("forbidden", "This message is not addressed to the caller", 403)

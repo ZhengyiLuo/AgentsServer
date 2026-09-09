@@ -6330,7 +6330,7 @@ class TeamReference(BaseModel):
     model_config = {"extra": "forbid"}
 
     kind: Literal["recipient", "skill"]
-    recipient_kind: Literal["server", "human", "all"] | None = None
+    recipient_kind: Literal["server", "human", "all", "all_servers"] | None = None
     team_id: str = Field(min_length=1, max_length=240)
     target_id: str = Field(min_length=1, max_length=240)
     display_name_snapshot: str = Field(min_length=1, max_length=160)
@@ -6343,6 +6343,10 @@ class TeamReference(BaseModel):
         if self.kind == "recipient":
             if self.recipient_kind is None:
                 raise ValueError("recipient references require recipient_kind")
+            if self.recipient_kind == "all_servers" and (
+                self.target_id != "all_servers" or self.display_name_snapshot != "all"
+            ):
+                raise ValueError("all-server mail references use target_id 'all_servers' and visible token '@@all'")
             if self.recipient_kind == "all" and self.target_id != "all":
                 raise ValueError("team-wide recipients use target_id 'all'")
             if (
@@ -8207,6 +8211,7 @@ class TeamHubHostEnableRequest(BaseModel):
     expected_server_instance_id: str = Field(min_length=8, max_length=240)
     confirmed: Literal[True]
     server_name: str = Field(min_length=1, max_length=160)
+    network_name: str | None = Field(default=None, min_length=1, max_length=160)
 
     @field_validator("request_id", mode="before")
     @classmethod
@@ -8228,9 +8233,11 @@ class TeamHubHostEnableRequest(BaseModel):
             raise ValueError("confirmed must be the JSON boolean true")
         return value
 
-    @field_validator("server_name", mode="before")
+    @field_validator("server_name", "network_name", mode="before")
     @classmethod
     def require_canonical_server_name(cls, value: Any) -> Any:
+        if value is None:
+            return None
         if not isinstance(value, str):
             raise ValueError(SERVER_DISPLAY_NAME_ERROR)
         try:
@@ -19801,8 +19808,10 @@ def compact_provider_authority_block(
     if "team_send" in actions:
         mentioned = ", ".join(
             (
-                "the whole team"
+                "the shared Bulletin"
                 if reference.kind == "recipient" and reference.recipient_kind == "all"
+                else "every team server inbox"
+                if reference.kind == "recipient" and reference.recipient_kind == "all_servers"
                 else ("a skill" if reference.kind == "skill" else f"a {reference.recipient_kind}")
             )
             for reference in (team_references or [])
@@ -20016,19 +20025,22 @@ def cross_chat_provider_authority_block(
     if "team_send" in actions:
         mentioned = ", ".join(
             (
-                "the whole team"
+                "the shared Bulletin"
                 if reference.kind == "recipient" and reference.recipient_kind == "all"
+                else "every team server inbox"
+                if reference.kind == "recipient" and reference.recipient_kind == "all_servers"
                 else ("a skill" if reference.kind == "skill" else f"a {reference.recipient_kind}")
             )
             for reference in (team_references or [])
         ) or "recipients"
         helper_lines.extend((
             f"- The user mentioned Team Network recipients with @@ ({mentioned}). Compose the message yourself in Markdown, attach only files the user asked for, and send once per route.",
+            "- @@bulletin posts only to the shared Bulletin. @@all sends Team Network mail to every current server inbox, including offline members; each server reads/removes its own delivery. This is not email/SMTP. Use each frozen route's recipient_kind: all means Bulletin (including old saved aliases), all_servers means all-server inbox mail. Never substitute one for the other.",
             f"- Recipient routes for this turn: `{team_command} routes`",
             f"- Send a message (Markdown body on stdin, never argv): `{team_command} send --route ROUTE_ID --kind message [--attach /abs/path]...`",
             *(
                 (
-                    f"- Publish a skill: `{team_command} send --route ROUTE_ID --kind skill --skill-slug SLUG --title T [--attach /abs/path]...`. Use this only for @@bulletin (legacy @@all) or a mentioned skill; when updating an existing skill pass `--expected-version` from `skill get`. Skill bodies should be complete, runnable instructions.",
+                    f"- Publish a skill: `{team_command} send --route ROUTE_ID --kind skill --skill-slug SLUG --title T [--attach /abs/path]...`. Use this only for a Bulletin route or a mentioned skill, never an all_servers mail route; when updating an existing skill pass `--expected-version` from `skill get`. Skill bodies should be complete, runnable instructions.",
                 )
                 if "team_skill_publish" in actions
                 else ()
@@ -46961,7 +46973,7 @@ def provider_public_job(job: dict[str, Any]) -> dict[str, Any]:
             "display_name_snapshot": safe_display_name,
             "kind": str(kind or "recipient"),
         }
-        if recipient_kind in {"server", "human", "all"}:
+        if recipient_kind in {"server", "human", "all", "all_servers"}:
             summary["recipient_kind"] = str(recipient_kind)
         team_targets.append(summary)
     out["team_target_count"] = len(team_references)
@@ -67957,6 +67969,9 @@ TEAM_HUB_SERVER_SESSION_ROUTE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("GET", re.compile(r"^/v1/teams/[^/]+/network/messages/[^/]+$")),
     ("DELETE", re.compile(r"^/v1/teams/[^/]+/network/messages/[^/]+$")),
     ("POST", re.compile(r"^/v1/teams/[^/]+/network/messages/[^/]+/receipts$")),
+    ("POST", re.compile(r"^/v1/teams/[^/]+/network/messages/[^/]+/dismissals$")),
+    ("GET", re.compile(r"^/v1/teams/[^/]+/network/messages/[^/]+/revisions$")),
+    ("POST", re.compile(r"^/v1/teams/[^/]+/network/messages/[^/]+/revisions$")),
     ("POST", re.compile(r"^/v1/teams/[^/]+/network/attachments$")),
     ("GET", re.compile(r"^/v1/teams/[^/]+/network/attachments/[^/]+$")),
     ("PUT", re.compile(r"^/v1/teams/[^/]+/network/attachments/[^/]+/content$")),
@@ -69186,6 +69201,7 @@ def team_hub_host_control_capability() -> dict[str, Any]:
         "enabled": enabled,
         "can_enable": authenticated and not enabled,
         "can_disable": authenticated and enabled,
+        "server_bootstrap": authenticated,
         "required": False,
         "version": 1,
         "status_path": "/api/admin/team-hub/host",
@@ -69636,6 +69652,29 @@ async def reconcile_pending_team_hub_host_control() -> None:
         )
 
 
+async def bootstrap_requested_team_network(body: TeamHubHostEnableRequest) -> None:
+    if body.network_name is None:
+        return
+    store = TEAM_HUB_RUNTIME.store
+    if not TEAM_HUB_RUNTIME.designated_host or store is None:
+        raise TeamHubHostControlFailure(
+            "team_hub_bootstrap_unavailable", "The Team Network host is unavailable.",
+            action="Retry after the host is available.", retryable=True,
+        )
+    try:
+        if (await asyncio.to_thread(store.health))["bootstrapped"]:
+            # The Create/Host action also reactivates a preserved network.
+            # Verify this host's existing binding without changing its team.
+            await asyncio.to_thread(store.managed_server_claims)
+            return
+        await asyncio.to_thread(store.bootstrap_managed_network, body.network_name)
+    except HubError as exc:
+        raise TeamHubHostControlFailure(
+            exc.code, exc.message, status_code=exc.status_code,
+            action="Refresh Team Network before trying again.",
+        ) from exc
+
+
 async def enable_team_hub_host(
     body: TeamHubHostEnableRequest,
 ) -> dict[str, Any]:
@@ -69650,6 +69689,7 @@ async def enable_team_hub_host(
             and TEAM_HUB_RUNTIME.designated_host
             and AGENTSDOCK_SERVER_DISPLAY_NAME == body.server_name
         ):
+            await bootstrap_requested_team_network(body)
             return public_team_hub_host_control_status(prior)
         if TEAM_HUB_RUNTIME.designated_host:
             previous_name = AGENTSDOCK_SERVER_DISPLAY_NAME
@@ -69708,6 +69748,7 @@ async def enable_team_hub_host(
                 body.server_name,
                 configuration,
             )
+            await bootstrap_requested_team_network(body)
             completed = write_team_hub_host_control_status(
                 phase="complete",
                 request_id=request_id,
@@ -69777,6 +69818,7 @@ async def enable_team_hub_host(
         else:
             cancellation_to_raise = None
         publish_team_hub_runtime_globals("host", body.server_name, configuration)
+        await bootstrap_requested_team_network(body)
         completed = write_team_hub_host_control_status(
             phase="complete",
             request_id=request_id,
@@ -69797,6 +69839,11 @@ async def enable_team_hub_host(
 async def disable_team_hub_host(
     body: TeamHubHostEnableRequest,
 ) -> dict[str, Any]:
+    if body.network_name is not None:
+        raise TeamHubHostControlFailure(
+            "invalid_request", "Only a host can create a Team Network.",
+            status_code=422, action="Select Host to create a network.",
+        )
     request_id = str(body.request_id)
     async with TEAM_HUB_HOST_CONTROL_LOCK:
         require_team_hub_host_control_target(body)
@@ -69823,6 +69870,8 @@ async def disable_team_hub_host(
                 SECURE_PEER_RUNTIME.set_display_name(body.server_name)
                 TEAM_HUB_RUNTIME.managed_host_display_name = body.server_name
                 SECURE_PEER_RUNTIME.resume_member_after_host()
+                if previous_name != body.server_name:
+                    await asyncio.to_thread(SECURE_PEER_RUNTIME.publish_display_name, body.server_name)
             except Exception as exc:
                 rollback_errors: list[BaseException] = []
                 if config_snapshot is not None:
@@ -70892,6 +70941,7 @@ async def health() -> dict[str, Any]:
         "api_contract_version": API_CONTRACT_VERSION,
         "server_identity": server_identity(),
         "server_instance_id": SERVER_INSTANCE_ID,
+        "server_name": AGENTSDOCK_SERVER_DISPLAY_NAME,
         "state_dir": str(STATE_DIR),
         "default_backend": DEFAULT_BACKEND,
         "default_cwd": existing_cwd(DEFAULT_CWD),
@@ -70977,6 +71027,12 @@ async def health() -> dict[str, Any]:
                 "version": 1,
                 "mention": "@@bulletin",
                 "legacy_mention": "@@all",
+            },
+            "team_all_servers_alias_v1": {
+                **HubStore.team_all_servers_capability(),
+                "available": bool(
+                    AGENT_TOKEN and (SERVER_ROOT / "agentsdock_team.py").is_file()
+                ),
             },
             "local_session_import_v1": {
                 "available": True,
@@ -79177,8 +79233,10 @@ async def record_team_message_sent_event(
     run_id: str,
     receipt: dict[str, Any],
     *,
+    team_id: str,
     recipients: list[dict[str, str]],
     title: str | None,
+    destination: str | None = None,
 ) -> None:
     """Append a compact ``team_message_sent`` card to the source chat.
 
@@ -79188,6 +79246,7 @@ async def record_team_message_sent_event(
 
     payload = {
         "run_id": run_id,
+        "team_id": team_id,
         "message_id": receipt.get("message_id"),
         "kind": receipt.get("kind"),
         "title": title,
@@ -79196,6 +79255,8 @@ async def record_team_message_sent_event(
         "skill_slug": receipt.get("skill_slug"),
         "skill_version": receipt.get("skill_version"),
     }
+    if destination == "all_servers":
+        payload["destination"] = "all_servers"
     try:
         await append_durable_event(session_id, "team_message_sent", payload)
     except Exception:  # pragma: no cover - the send already committed on the Hub.
@@ -79211,10 +79272,14 @@ def provider_team_route_projection(route_id: str, reference: dict[str, Any]) -> 
     recipient_kind = (
         str(reference.get("recipient_kind") or "") if kind == "recipient" else None
     )
-    fallback = "Team" if recipient_kind == "all" else "Team Network recipient"
+    fallback = (
+        "Bulletin" if recipient_kind == "all"
+        else "All server inboxes" if recipient_kind == "all_servers"
+        else "Team Network recipient"
+    )
     display_name = (
         fallback
-        if recipient_kind == "all"
+        if recipient_kind in {"all", "all_servers"}
         else reference.get("display_name_snapshot") or fallback
     )
     return {
@@ -79648,6 +79713,7 @@ async def send_provider_team_message(
         source_session_id,
         source_run_id,
         receipt,
+        team_id=str(reference["team_id"]),
         recipients=[
             {
                 "kind": str(item.get("kind") or ""),
@@ -79657,6 +79723,7 @@ async def send_provider_team_message(
             if isinstance(item, dict)
         ],
         title=message.get("title"),
+        destination=message.get("destination"),
     )
     logger.info(
         "team message send accepted source_session=%s source_run=%s route=%s kind=%s attachments=%d",

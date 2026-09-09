@@ -267,7 +267,7 @@ class NetworkReceiptRequest(StrictModel):
 
 
 class TeamRecipientRequest(StrictModel):
-    kind: Literal["server", "human", "all"]
+    kind: Literal["server", "human", "all", "all_servers"]
     id: str | None = Field(default=None, min_length=1, max_length=240)
 
 
@@ -316,6 +316,14 @@ class TeamMessageRevisionRequest(StrictModel):
 
 class TeamReceiptRequest(StrictModel):
     state: Literal["delivered", "read"]
+    idempotency_key: str = Field(min_length=8, max_length=240)
+    address_kind: Literal["server", "human"] | None = None
+    address_id: str | None = Field(default=None, min_length=8, max_length=240)
+
+
+class TeamMessageDismissalRequest(StrictModel):
+    address_kind: Literal["server", "human"]
+    address_id: str = Field(min_length=8, max_length=240)
     idempotency_key: str = Field(min_length=8, max_length=240)
 
 
@@ -1506,8 +1514,18 @@ def create_app(
         team_id: str,
         message_id: str,
         claims: Auth,
+        version: Annotated[int | None, Query(ge=1, le=200)] = None,
     ) -> dict[str, Any]:
-        return store.list_team_message_revisions(claims, team_id, message_id)
+        return store.list_team_message_revisions(claims, team_id, message_id, version=version)
+
+    @app.post("/v1/teams/{team_id}/network/messages/{message_id}/dismissals")
+    def dismiss_team_message(
+        team_id: str,
+        message_id: str,
+        body: TeamMessageDismissalRequest,
+        claims: Auth,
+    ) -> dict[str, Any]:
+        return store.dismiss_team_message(claims, team_id, message_id, body.model_dump())
 
     @app.post("/v1/teams/{team_id}/network/messages/{message_id}/revisions")
     def revise_team_message(

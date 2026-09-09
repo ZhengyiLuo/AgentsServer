@@ -22,6 +22,50 @@ from secure_peer_runtime import SecurePeerRuntime
 
 
 class SecurePeerRuntimeTests(unittest.TestCase):
+    def test_all_server_inbox_broadcast_stays_distinct_from_bulletin(self) -> None:
+        runtime = object.__new__(SecurePeerRuntime)
+        realm = {"realm": "secure_peer", "team_id": "team-test", "can_write": True}
+        broadcast = {
+            "kind": "recipient", "team_id": "team-test", "recipient_kind": "all_servers",
+            "target_id": "all_servers", "display_name_snapshot": "all",
+        }
+        runtime.team_realms = mock.Mock(return_value=[realm])
+        runtime._team_hub_post = mock.Mock(return_value={"ok": True})
+        runtime._team_upload_attachment = mock.Mock()
+        self.assertEqual(runtime.resolve_team_references([broadcast]), [broadcast])
+        for changed in ({"target_id": "all"}, {"display_name_snapshot": "bulletin"}):
+            with self.subTest(changed=changed), self.assertRaises(SecurePeerError):
+                runtime.resolve_team_references([{**broadcast, **changed}])
+        for recipient_kind, label in (("all_servers", "all"), ("all", "all"), ("all", "bulletin")):
+            reference = {
+                **broadcast, "recipient_kind": recipient_kind,
+                "target_id": recipient_kind, "display_name_snapshot": label,
+            }
+            self.assertEqual(runtime.resolve_team_references([reference]), [reference])
+            runtime.team_send_message(
+                reference, payload={"body": "Hello"}, attachment_paths=[],
+                idempotency_key="broadcast-test", provenance={},
+            )
+            body = runtime._team_hub_post.call_args.args[2]
+            self.assertEqual(body["recipients"], [{"kind": recipient_kind}])
+            self.assertIsNone(runtime._enforce_inbox_only_outbound_proxy(
+                "POST", "/v1/teams/team-test/network/messages", query="", body=body,
+            ))
+        runtime._team_hub_post.reset_mock()
+        for payload in ({"kind": "skill", "body": "Skill"}, {"body": "Skill", "skill": {"slug": "deploy"}}):
+            with self.subTest(payload=payload), self.assertRaises(SecurePeerError):
+                runtime.team_send_message(
+                    broadcast, payload=payload, attachment_paths=["must-not-upload"],
+                    idempotency_key="broadcast-test", provenance={},
+                )
+        runtime._team_hub_post.assert_not_called()
+        runtime._team_upload_attachment.assert_not_called()
+        with self.assertRaises(SecurePeerError):
+            runtime._enforce_inbox_only_outbound_proxy(
+                "POST", "/v1/teams/team-test/network/messages", query="",
+                body={"kind": "message", "recipients": [{"kind": "all_servers"}, {"kind": "server", "id": "node-test"}]},
+            )
+
     def test_team_deletion_wrappers_cover_host_remote_and_read_only_realms(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             runtime = SecurePeerRuntime(
@@ -1407,6 +1451,126 @@ class SecurePeerRuntimeTests(unittest.TestCase):
                 recover.assert_called_once_with(limit=2)
                 self.assertFalse(result["active"])
                 logger.warning.assert_called_once()
+            finally:
+                runtime._gateway = None
+                runtime.shutdown()
+
+    def test_member_rename_uses_active_pairing_and_validates_its_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            active = {
+                **self.outgoing_pairing(123),
+                "team_id": "team-test",
+                "scopes": ["teamspace.read", "teamspace.write"],
+            }
+            receipt = {"server": {"server_identity": runtime.server_identity, "display_name": "Renamed server"}}
+            try:
+                with (
+                    mock.patch.object(runtime.client, "list_connections", return_value=[active]),
+                    mock.patch.object(runtime.client, "proxy", return_value=ProxyResponse(
+                        200, (), json.dumps(receipt).encode(),
+                    )) as proxy,
+                ):
+                    runtime.publish_display_name("Renamed server")
+                    self.assertEqual(proxy.call_args.args, (
+                        active["connection_id"], "POST", "/v1/teams/team-test/network/server-profile",
+                    ))
+                    self.assertEqual(json.loads(proxy.call_args.kwargs["body"]), {"display_name": "Renamed server"})
+                    receipt["server"]["server_identity"] = "some_other_server"
+                    proxy.return_value = ProxyResponse(200, (), json.dumps(receipt).encode())
+                    with self.assertRaises(SecurePeerError) as mismatch:
+                        runtime.publish_display_name("Renamed server")
+                    self.assertEqual(mismatch.exception.code, "remote_invalid")
+                    proxy.reset_mock()
+                    active["active"] = False
+                    runtime.publish_display_name("Renamed server")
+                    active["active"] = True
+                    runtime._host_role_active = True
+                    runtime.publish_display_name("Renamed server")
+                    proxy.assert_not_called()
+            finally:
+                runtime.shutdown()
+
+    def test_activation_publishes_name_but_accepts_hosts_without_rename_support(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Renamed server",
+            )
+            active = {**self.outgoing_pairing(123), "hub_id": "hub-test"}
+            try:
+                with (
+                    mock.patch.object(runtime, "_outgoing_for_pairing", return_value=active),
+                    mock.patch.object(runtime.client, "list_connections", return_value=[active]),
+                    mock.patch.object(runtime.client, "set_active_connection"),
+                    mock.patch.object(runtime, "status", return_value={"ok": True}),
+                    mock.patch.object(runtime, "publish_display_name") as publish,
+                ):
+                    for status_code in (None, 403, 404, 503):
+                        with self.subTest(status_code=status_code):
+                            publish.side_effect = None if status_code is None else SecurePeerError(
+                                "server_profile_unavailable", "Name update unavailable", status_code,
+                            )
+                            values = {
+                                "expected_connection_id": active["connection_id"],
+                                "expected_host_server_identity": active["host_server_identity"],
+                                "expected_hub_id": active["hub_id"],
+                            }
+                            if status_code == 503:
+                                with self.assertRaises(SecurePeerError):
+                                    runtime.activate_pairing(active["pairing_id"], **values)
+                            else:
+                                self.assertEqual(runtime.activate_pairing(active["pairing_id"], **values), {"ok": True})
+                            publish.assert_called_with("Renamed server")
+            finally:
+                runtime.shutdown()
+
+    def test_host_maintenance_keeps_upkeep_running_without_member_work(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            runtime.pause_member_for_host()
+            peer_id = str(uuid.uuid4())
+            host_store = mock.Mock()
+            host_store.list_peers.return_value = [{
+                "peer_id": peer_id,
+                "team_id": "team-test",
+                "peer_server_identity": "peer-test",
+                "status": "revoked",
+            }]
+            gateway = mock.Mock()
+            adapter = mock.Mock()
+            adapter.active_binding_peer_ids.return_value = {peer_id}
+            runtime._host_store = host_store
+            runtime._adapter = adapter
+            runtime._gateway = gateway
+            try:
+                with (
+                    mock.patch.object(runtime, "retry_host_attachment") as retry,
+                    mock.patch.object(runtime.client, "expire_pending_pairings") as expire,
+                    mock.patch.object(runtime.client, "recover_pairing_attempts") as recover,
+                    mock.patch.object(runtime.client, "peer_health") as heartbeat,
+                ):
+                    result = runtime.maintenance_once()
+                retry.assert_called_once_with()
+                gateway.refresh_listener_identity.assert_called_once_with()
+                adapter.revoke_peer.assert_called_once_with(peer_id=peer_id, team_id="team-test")
+                adapter.expire_peer_leases.assert_called_once()
+                expire.assert_not_called()
+                recover.assert_not_called()
+                heartbeat.assert_not_called()
+                self.assertTrue(result["host_role_active"])
             finally:
                 runtime._gateway = None
                 runtime.shutdown()

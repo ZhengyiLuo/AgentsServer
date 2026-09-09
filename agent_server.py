@@ -87,6 +87,7 @@ from claude_sdk_client import (
     ClaudeSDKMCPServerNotFound,
     ClaudeSDKQueryError,
     ClaudeSDKRunActive,
+    ClaudeSDKSupervisorClosed,
     ClaudeSDKSupervisorManager,
     ClaudeSDKUnavailable,
     canonical_claude_mcp_identifier,
@@ -57277,6 +57278,7 @@ async def run_claude_sdk(
     first_activity_task: asyncio.Task[bool] | None = None
     provider_ready_tasks: set[asyncio.Task[bool]] = set()
     outputs_finished_run_ids: set[str] = set()
+    shutdown_interrupted_run_ids: set[str] = set()
     logical_started_monotonic = time.monotonic()
     last_activity_monotonic = logical_started_monotonic
     deadline_clock_checked_monotonic = logical_started_monotonic
@@ -57291,6 +57293,27 @@ async def run_claude_sdk(
             seen_artifacts,
         )
     )
+
+    def record_sdk_stream_exception(exc: Exception) -> bool:
+        nonlocal stream_error
+        # Latch the cause at failure time. A later shutdown must not relabel
+        # an earlier provider/projection fault, and an unexpected closed
+        # supervisor must remain an error. This never retries the prompt.
+        shutdown_interrupted = bool(
+            SERVER_SHUTTING_DOWN
+            and isinstance(exc, ClaudeSDKSupervisorClosed)
+            and not (
+                stream_error
+                or (result_details or {}).get("error")
+                or (result_details or {}).get("is_error")
+                or current_run_id in projection_error_run_ids
+            )
+        )
+        if shutdown_interrupted:
+            STOPPED_RUNS.add(current_run_id)
+            shutdown_interrupted_run_ids.add(current_run_id)
+        stream_error = stream_error or concise_error_message(exc)
+        return shutdown_interrupted
 
     def watch_provider_readiness(
         logical_run_id: str,
@@ -57716,7 +57739,7 @@ async def run_claude_sdk(
                 message_task = None
                 if bool(getattr(exc, "delivery_uncertain", False)):
                     retire_supervisor = True
-                stream_error = concise_error_message(exc)
+                record_sdk_stream_exception(exc)
                 result_details = None
             else:
                 message_task = None
@@ -58339,13 +58362,14 @@ async def run_claude_sdk(
         retire_supervisor = True
         STOPPED_RUNS.add(current_run_id)
     except Exception as exc:
-        stream_error = concise_error_message(exc)
+        shutdown_interrupted = record_sdk_stream_exception(exc)
         retire_supervisor = True
-        logger.exception(
-            "Claude SDK run failed session=%s run=%s",
-            session_id,
-            current_run_id,
-        )
+        if not shutdown_interrupted:
+            logger.exception(
+                "Claude SDK run failed session=%s run=%s",
+                session_id,
+                current_run_id,
+            )
 
     async def cleanup_live_sdk_state() -> None:
         nonlocal retire_supervisor, stream_error
@@ -58469,7 +58493,7 @@ async def run_claude_sdk(
             session_id,
             resolution=(
                 "turn_stopped"
-                if cancelled_error is not None
+                if cancelled_error is not None or current_run_id in shutdown_interrupted_run_ids
                 else "turn_finished"
             ),
             expected_run_id=current_run_id,
@@ -58614,6 +58638,7 @@ async def run_claude_sdk(
                     ),
                     "result_text": result_text,
                     "stopped": stopped,
+                    **({"reason": "server_shutdown"} if current_run_id in shutdown_interrupted_run_ids else {}),
                     **({"delivery_unknown": True} if delivery_unknown else {}),
                     **run_event_metadata(current_run_id),
                 })

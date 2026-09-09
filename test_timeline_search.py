@@ -226,10 +226,16 @@ class TimelineSearchForkTests(unittest.TestCase):
         task_notification = (
             "<task-notification>\n"
             "<task-id>workflow-42</task-id>\n"
+            "<tool-use-id>toolu_workflow_42</tool-use-id>\n"
             "<status>stopped</status>\n"
             "<summary>internal control needle</summary>\n"
             "</task-notification>"
         )
+        # Migration must use the same complete provider fingerprint as every
+        # other history projection. An incomplete lookalike can be user text.
+        partial_notice = task_notification.replace(
+            "<tool-use-id>toolu_workflow_42</tool-use-id>\n", ""
+        ).replace("internal control needle", "partialpastedneedle")
         path = agent_server.events_path(self.session_id)
         with path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(self.event(
@@ -246,6 +252,14 @@ class TimelineSearchForkTests(unittest.TestCase):
                 run_id="normal-run",
                 backend=agent_server.BACKEND_CLAUDE,
                 text="visible migration needle",
+            ), separators=(",", ":")) + "\n")
+            stream.write(json.dumps(self.event(
+                9,
+                "turn_started",
+                run_id="import_legacy_lookalike",
+                backend=agent_server.BACKEND_CLAUDE,
+                imported=True,
+                prompt=partial_notice,
             ), separators=(",", ":")) + "\n")
 
         connection = agent_server.history_search_connection()
@@ -297,6 +311,15 @@ class TimelineSearchForkTests(unittest.TestCase):
                 )["results"]
             ],
             [8],
+        )
+        self.assertEqual(
+            [
+                result["seq"]
+                for result in agent_server.search_timeline_index(
+                    self.session_id, "partialpastedneedle",
+                )["results"]
+            ],
+            [9],
         )
 
     def test_initializing_fork_is_not_eligible_for_history_indexing(self) -> None:

@@ -4989,6 +4989,43 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(durable_leg["status"], "cancelled")
         self.assertEqual(durable_leg["error_code"], "cancelled_by_user")
 
+    async def test_stop_exchange_cleanup_is_noop_before_ledger_initialization(
+        self,
+    ) -> None:
+        uninitialized = agent_server.CrossChatStore(
+            self.root / "uninitialized-cross-chat.sqlite3"
+        )
+        with patch.object(agent_server, "CROSS_CHAT", uninitialized):
+            cancelled = (
+                await agent_server.cancel_cross_chat_exchanges_for_stopped_source_run(
+                    "run_without_lifespan"
+                )
+            )
+
+        self.assertEqual(cancelled, 0)
+        self.assertFalse(uninitialized.path.exists())
+
+    async def test_stop_exchange_cleanup_propagates_initialized_ledger_failure(
+        self,
+    ) -> None:
+        query = AsyncMock(
+            side_effect=agent_server.sqlite3.OperationalError("ledger unavailable")
+        )
+        with patch.object(
+            agent_server.CROSS_CHAT,
+            "exchanges_for_authorization_run",
+            query,
+        ):
+            with self.assertRaisesRegex(
+                agent_server.sqlite3.OperationalError,
+                "ledger unavailable",
+            ):
+                await agent_server.cancel_cross_chat_exchanges_for_stopped_source_run(
+                    "run_initialized_ledger_failure"
+                )
+
+        query.assert_awaited_once_with("run_initialized_ledger_failure")
+
     async def test_stopped_terminal_repairs_exchange_cancel_if_stop_path_was_lost(
         self,
     ) -> None:

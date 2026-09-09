@@ -4875,7 +4875,7 @@ def sanitize_proxy_request(
             elif (
                 len(pieces) == 3
                 and pieces[0] == "messages"
-                and pieces[2] == "receipts"
+                and pieces[2] in {"receipts", "dismissals"}
                 and normalized_method == "POST"
             ):
                 route_allowed = True

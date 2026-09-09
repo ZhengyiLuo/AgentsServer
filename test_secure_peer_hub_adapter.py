@@ -110,8 +110,14 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
         receipt = self.request("POST", f"{base}/messages/{message['id']}/receipts",
             body={**addressed, "state": "read", "idempotency_key": "peer-read-mail"})
         self.assertEqual(receipt.status, 200, receipt.body)
-        removed = self.request("POST", f"{base}/messages/{message['id']}/dismissals",
-            body={**addressed, "idempotency_key": "peer-dismiss-mail"})
+        dismissal_path = f"{base}/messages/{message['id']}/dismissals"
+        denied = self.adapter.forward(sanitize_proxy_request(self.peer, "POST", dismissal_path, "",
+            (("content-type", "application/json"),), json.dumps({"address_kind": "server",
+                "address_id": "node_someone_else", "idempotency_key": "peer-denied-dismiss"}).encode()))
+        self.assertEqual(denied.status, 403, denied.body)
+        removed = self.adapter.forward(sanitize_proxy_request(self.peer, "POST", dismissal_path, "",
+            (("content-type", "application/json"),),
+            json.dumps({**addressed, "idempotency_key": "peer-dismiss-mail"}).encode()))
         self.assertEqual(removed.status, 200, removed.body)
         inbox = self.request("GET", f"{base}/messages", query=f"box=inbox&address_kind=server&address_id={node['id']}")
         self.assertEqual(json.loads(inbox.body)["messages"], [])
@@ -119,8 +125,10 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
             "kind": "message", "body": "Original broadcast", "recipients": [{"kind": "all"}],
             "idempotency_key": "peer-broadcast-history"})
         message_id = json.loads(broadcast.body)["message"]["id"]
-        revision = self.request("POST", f"{base}/messages/{message_id}/revisions", body={
-            "body": "Updated broadcast", "expected_version": 1, "idempotency_key": "peer-revise-broadcast"})
+        revision = self.adapter.forward(sanitize_proxy_request(self.peer, "POST",
+            f"{base}/messages/{message_id}/revisions", "", (("content-type", "application/json"),),
+            json.dumps({"body": "Updated broadcast", "expected_version": 1,
+                "idempotency_key": "peer-revise-broadcast"}).encode()))
         self.assertEqual(revision.status, 200, revision.body)
         # Exercise both transport validation and Hub forwarding, as member UI
         # requests pass through both before reaching the store.

@@ -19785,7 +19785,7 @@ async def execute_provider_tool(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(SERVER_ROOT),
-            env=agent_runner_env(session_id),
+            env=agent_runner_env(session_id, runtime_env),
             limit=PROVIDER_TOOL_MAX_OUTPUT_BYTES + 1,
             start_new_session=True,
         )

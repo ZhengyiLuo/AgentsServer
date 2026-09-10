@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 from agentsdock_team_hub.service import create_app
 from agentsdock_team_hub.store import (
     HubError,
+    HubStore,
     MAX_TEAM_MESSAGE_BODY_BYTES,
     TEAM_ATTACHMENT_CHUNK_BYTES,
 )
@@ -348,20 +349,20 @@ class TeamMessagesServiceTests(unittest.TestCase):
         feed = self.get(self.owner, f"{self.base}/messages?box=feed")
         self.assertEqual(len(feed["messages"]), 1)
 
-    def test_plain_message_rejects_title_and_legacy_title_is_sanitized(self) -> None:
-        rejected = self.post(
+    def test_plain_message_subject_is_opt_in_and_legacy_title_is_sanitized(self) -> None:
+        titled = self.post(
             self.owner,
             f"{self.base}/messages",
             {
                 "kind": "message",
-                "title": "Unexpected",
+                "title": "New subject",
                 "body": "plain",
                 "recipients": [{"kind": "all"}],
                 "idempotency_key": _key(),
             },
-            expected=422,
         )
-        self.assertEqual(rejected["error"]["code"], "invalid_request")
+        self.assertEqual(titled["message"]["title"], "New subject")
+        self.assertIsNone(self.get(self.owner, f"{self.base}/messages/{titled['message']['id']}")["message"]["title"])
 
         sent = self.send(self.owner, [{"kind": "all"}], body="legacy")
         store = self.app.state.store
@@ -382,6 +383,8 @@ class TeamMessagesServiceTests(unittest.TestCase):
             self.owner, f"{self.base}/messages/{sent['id']}"
         )["message"]
         self.assertIsNone(detail["title"])
+        opted_in = self.get(self.owner, f"{self.base}/messages/{sent['id']}?include_mail_subject=true")["message"]
+        self.assertIsNone(opted_in["title"])
         feed = self.get(self.owner, f"{self.base}/messages?box=feed")
         self.assertIsNone(feed["messages"][0]["title"])
 
@@ -1070,58 +1073,147 @@ class TeamMessagesServiceTests(unittest.TestCase):
             connection.close()
         self.assertEqual(blob.read_bytes(), payload)
 
-    def test_skill_message_delete_requires_library_archive(self) -> None:
-        skill_message = self.skill_post(
-            self.owner,
-            "delete-via-archive",
-            "Delete via archive",
-            "# Keep immutable versions",
+    def test_skill_announcement_delete_is_poster_only_and_preserves_library(self) -> None:
+        payload = b"keep the historical attachment bytes"
+        attachment = self.upload(self.member, payload)
+        first = self.post(self.member, f"{self.base}/messages", {
+            "kind": "skill",
+            "title": "Retained runbook",
+            "body": "# Original runbook",
+            "recipients": [{"kind": "all"}],
+            "skill": {"slug": "retained-runbook"},
+            "attachment_ids": [attachment["id"]],
+            "idempotency_key": _key(),
+        })["message"]
+        second = self.skill_post(
+            self.owner, "retained-runbook", "Retained runbook", "# Updated runbook",
+            expected_version=1,
         )["message"]
-        rejected = self.delete(
-            self.owner,
-            f"{self.base}/messages/{skill_message['id']}",
-            {"idempotency_key": _key()},
-            expected=409,
+        skill_id = first["skill"]["id"]
+        skill_path = f"{self.base}/skills/{skill_id}"
+        self.post(self.member, skill_path + "/pin", {"pinned": True, "idempotency_key": _key()})
+        tables = (
+            "team_messages", "team_message_recipients", "team_attachments",
+            "team_skill_versions", "team_skills",
         )
-        self.assertEqual(rejected["error"]["code"], "skill_archive_required")
-        self.assertIn("Archive", rejected["error"]["message"])
-        self.assertIn("Skills library", rejected["error"]["message"])
+
+        def source_snapshot() -> dict:
+            connection = self.app.state.store.connect()
+            try:
+                return {
+                    table: [dict(row) for row in connection.execute(
+                        f"SELECT * FROM {table} WHERE team_id=? ORDER BY id", (self.team_id,)
+                    )]
+                    for table in tables
+                }
+            finally:
+                connection.close()
+
+        before = source_snapshot()
+        admin = self.invite_and_redeem(self.owner, "skill-admin@example.com", "admin")
+        other = self.invite_and_redeem(self.owner, "skill-other@example.com", "member")
+        path = f"{self.base}/messages/{first['id']}"
+        for nonposter in (self.owner, admin, other):
+            self.delete(nonposter, path, {"idempotency_key": _key()}, expected=403)
+        body = {"idempotency_key": _key()}
+        expected = {"deleted": True, "message_id": first["id"]}
+        for request in (body, body, {"idempotency_key": _key()}):
+            self.assertEqual(self.delete(self.member, path, request), expected)
+        for bundle in (self.owner, self.member, self.guest):
+            feed = self.get(bundle, f"{self.base}/messages?box=feed")["messages"]
+            self.assertEqual([item["id"] for item in feed], [second["id"]])
+            self.get(bundle, path, expected=404)
+            journal = self.get(bundle, f"{self.base}/deletions?limit=1")
+            self.assertEqual(
+                [(item["kind"], item["id"]) for item in journal["deletions"]],
+                [("message", first["id"])],
+            )
+        self.assertEqual(self.get(self.member, f"{self.base}/messages?box=sent")["messages"], [])
+        self.post(self.member, f"{self.base}/messages", {
+            "kind": "message", "body": "unavailable reply",
+            "recipients": [{"kind": "all"}], "in_reply_to_message_id": first["id"],
+            "idempotency_key": _key(),
+        }, expected=422)
+        self.get(self.member, path + "/revisions", expected=404)
+
+        # Bulletin removal adds no new attachment or library authorization.
+        attachment_path = f"{self.base}/attachments/{attachment['id']}"
+        self.get(self.member, attachment_path, expected=404)
+        for method, extra_headers in (("GET", {}), ("HEAD", {}), ("GET", {"Range": "bytes=0-3"})):
+            response = self.client.request(
+                method, attachment_path + "/content",
+                headers={**self.auth(self.member), **extra_headers},
+            )
+            self.assertEqual(response.status_code, 404, response.text)
+        blob = self.data_dir / "attachments" / attachment["sha256"][:2] / attachment["sha256"]
+        self.assertEqual(blob.read_bytes(), payload)
+
+        # A later version has its own poster; deleting either announcement
+        # does not archive the shared library entry or rewrite any version.
+        latest_path = f"{self.base}/messages/{second['id']}"
+        self.delete(self.member, latest_path, {"idempotency_key": _key()}, expected=403)
+        self.delete(self.owner, latest_path, {"idempotency_key": _key()})
+        self.assertEqual(source_snapshot(), before)
+        self.assertEqual(self.get(self.guest, f"{self.base}/messages?box=feed")["messages"], [])
+        current = self.get(self.guest, skill_path)["skill"]
+        self.assertEqual(current["body"], "# Updated runbook")
+        self.assertEqual(current["version"], 2)
+        self.assertEqual(current["versions_count"], 2)
+        self.assertTrue(current["pinned"])
+        self.assertFalse(current["archived"])
+        original = self.get(self.guest, skill_path + "/versions/1")["version"]
+        self.assertEqual(original["body"], "# Original runbook")
+        self.assertEqual(original["attachments"][0]["id"], attachment["id"])
         connection = self.app.state.store.connect()
         try:
-            self.assertEqual(
-                connection.execute(
-                    "SELECT COUNT(*) FROM network_content_deletions WHERE resource_id=?",
-                    (skill_message["id"],),
-                ).fetchone()[0],
-                0,
-            )
-            with self.assertRaisesRegex(
-                sqlite3.IntegrityError,
-                "team message deletion source is unavailable",
+            for query in (
+                "SELECT COUNT(*) FROM network_content_deletions WHERE resource_id=?",
+                "SELECT COUNT(*) FROM audit_events WHERE action='team.message.delete' AND resource_id=?",
+                "SELECT COUNT(*) FROM outbox_events WHERE event_type='team.message.deleted' AND aggregate_id=?",
             ):
-                connection.execute(
-                    "INSERT INTO network_content_deletions("
-                    "id,team_id,resource_kind,resource_id,"
-                    "deleted_by_principal_id,deleted_at"
-                    ") VALUES (?,?,?,?,?,?)",
-                    (
-                        "deletion_skill_insert_must_fail",
-                        self.team_id,
-                        "message",
-                        skill_message["id"],
-                        self.owner["principal"]["id"],
-                        int(time.time()),
-                    ),
-                )
-            connection.rollback()
+                self.assertEqual(connection.execute(query, (first["id"],)).fetchone()[0], 1)
         finally:
             connection.close()
+        third = self.skill_post(
+            self.member, "retained-runbook", "Retained runbook", "# Next runbook",
+            expected_version=2,
+        )["message"]
+        self.assertEqual(third["skill"]["version"], 3)
+
+    def test_skill_announcement_delete_matches_stable_server_poster(self) -> None:
+        store = HubStore(self.data_dir / "managed", managed_host_identity="server-skill-poster-12345678")
+        owner = store.bootstrap(
+            store.bootstrap_proof_path.read_text().strip(),
+            "managed-owner@example.com", "Managed owner", "Managed device",
+        )
+        team_id = owner["teams"][0]["id"]
+        agent = store.local_agent_mail_claims(team_id)
+        desktop = store.managed_server_claims()
+        self.assertNotEqual(agent.principal_id, desktop.principal_id)
+        message = store.create_team_message(agent, team_id, {
+            "kind": "skill", "title": "Server runbook", "body": "# Server runbook",
+            "recipients": [{"kind": "all"}], "skill": {"slug": "server-runbook"},
+            "idempotency_key": _key(),
+        })["message"]
+        self.assertEqual(message["sender"]["kind"], "server")
+        peer_id = str(uuid.uuid4())
+        peer_identity = "server-other-poster-12345678"
+        store.ensure_secure_peer_service(
+            peer_id=peer_id, peer_server_identity=peer_identity, team_id=team_id,
+            display_name="Other server",
+        )
+        other = store.secure_peer_claims(
+            peer_id=peer_id, peer_server_identity=peer_identity, team_id=team_id,
+            scopes=frozenset({"teamspace.read", "teamspace.write"}),
+            expires_at=int(time.time()) + 60,
+        )
+        for nonposter in (store.verify_access(owner["access_token"]), other):
+            with self.assertRaises(HubError) as denied:
+                store.delete_team_message(nonposter, team_id, message["id"], {"idempotency_key": _key()})
+            self.assertEqual(denied.exception.status_code, 403)
         self.assertEqual(
-            self.get(
-                self.owner,
-                f"{self.base}/messages/{skill_message['id']}",
-            )["message"]["id"],
-            skill_message["id"],
+            store.delete_team_message(desktop, team_id, message["id"], {"idempotency_key": _key()}),
+            {"deleted": True, "message_id": message["id"]},
         )
 
     def test_bulletin_delete_is_global_additive_and_blocks_new_replies(self) -> None:

@@ -153,6 +153,49 @@ def _open_secure_database_file(target: Path) -> int:
         raise
 
 
+def _has_current_wal_migrations(connection: sqlite3.Connection) -> bool:
+    """Verify an existing WAL schema without contending for its writer lock.
+
+    Every new connection checks the complete bounded ledger and user_version
+    in one read snapshot. No path/inode cache can bypass checksum checks after
+    another connection changes the ledger or a database is replaced. Anything
+    other than the exact current chain still uses the serialized migration
+    path, including its existing error reporting for invalid/newer schemas.
+    """
+
+    connection.execute("BEGIN")
+    try:
+        if str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower() != "wal":
+            return False
+        if connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'schema_migrations'"
+        ).fetchone() is None:
+            return False
+        applied = [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT version, name, sha256 FROM schema_migrations "
+                "ORDER BY version LIMIT ?",
+                (len(MIGRATIONS) + 1,),
+            )
+        ]
+        user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        return user_version == LATEST_SCHEMA_VERSION and applied == [
+            (migration.version, migration.name, migration.sha256)
+            for migration in MIGRATIONS
+        ]
+    except sqlite3.OperationalError as exc:
+        # Another first opener may be changing the journal mode. Let the
+        # existing initialization lock and bounded retry handle that race.
+        if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+            return False
+        raise
+    finally:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+
+
 def open_database(path: str | os.PathLike[str] = ":memory:") -> sqlite3.Connection:
     """Open a hardened SQLite connection and apply every embedded migration."""
 
@@ -176,7 +219,7 @@ def open_database(path: str | os.PathLike[str] = ":memory:") -> sqlite3.Connecti
         _configure(connection)
         if database == ":memory:":
             apply_migrations(connection)
-        else:
+        elif not _has_current_wal_migrations(connection):
             with _initialization_lock(os.path.realpath(database)):
                 _retry_locked(lambda: connection.execute("PRAGMA journal_mode = WAL"))
                 _retry_locked(lambda: apply_migrations(connection))

@@ -295,6 +295,17 @@ class TeamMessageRequest(StrictModel):
     provenance: dict[str, str | None] | None = None
     idempotency_key: str = Field(min_length=8, max_length=240)
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_mail_subject(cls, value: Any) -> Any:
+        if isinstance(value, dict) and value.get("kind") == "message" and value.get("title") is not None:
+            try:
+                subject = HubStore._team_mail_subject(value["title"])
+            except HubError as exc:
+                raise ValueError(exc.message) from exc
+            return {**value, "title": subject}
+        return value
+
     @field_validator("provenance")
     @classmethod
     def validate_provenance_keys(
@@ -324,6 +335,14 @@ class TeamReceiptRequest(StrictModel):
 class TeamMessageDismissalRequest(StrictModel):
     address_kind: Literal["server", "human"]
     address_id: str = Field(min_length=8, max_length=240)
+    idempotency_key: str = Field(min_length=8, max_length=240)
+
+
+class TeamMailboxStateRequest(StrictModel):
+    address_kind: Literal["server"]
+    address_id: str = Field(min_length=8, max_length=240)
+    unread: bool = Field(strict=True)
+    expected_version: int = Field(strict=True, ge=0, lt=9_007_199_254_740_991)
     idempotency_key: str = Field(min_length=8, max_length=240)
 
 
@@ -1455,6 +1474,8 @@ def create_app(
         ] = 0,
         limit: Annotated[int, Query(ge=1, le=MAX_NETWORK_PAGE_ITEMS)] = 50,
         include_revision: Annotated[bool, Query()] = False,
+        include_mail_subject: Annotated[bool, Query()] = False,
+        include_mailbox_state: Annotated[bool, Query()] = False,
     ) -> dict[str, Any]:
         return store.list_team_messages(
             claims,
@@ -1469,6 +1490,8 @@ def create_app(
             after_sequence=after_sequence,
             limit=limit,
             include_revision=include_revision,
+            include_mail_subject=include_mail_subject,
+            include_mailbox_state=include_mailbox_state,
         )
 
     @app.get("/v1/teams/{team_id}/network/deletions")
@@ -1501,12 +1524,16 @@ def create_app(
         message_id: str,
         claims: Auth,
         include_revision: Annotated[bool, Query()] = False,
+        include_mail_subject: Annotated[bool, Query()] = False,
+        include_mailbox_state: Annotated[bool, Query()] = False,
     ) -> dict[str, Any]:
         return store.get_team_message(
             claims,
             team_id,
             message_id,
             include_revision=include_revision,
+            include_mail_subject=include_mail_subject,
+            include_mailbox_state=include_mailbox_state,
         )
 
     @app.get("/v1/teams/{team_id}/network/messages/{message_id}/revisions")
@@ -1517,6 +1544,12 @@ def create_app(
         version: Annotated[int | None, Query(ge=1, le=200)] = None,
     ) -> dict[str, Any]:
         return store.list_team_message_revisions(claims, team_id, message_id, version=version)
+
+    @app.post("/v1/teams/{team_id}/network/messages/{message_id}/mailbox-state")
+    def team_message_mailbox_state(
+        team_id: str, message_id: str, body: TeamMailboxStateRequest, claims: Auth,
+    ) -> dict[str, Any]:
+        return store.set_team_message_mailbox_state(claims, team_id, message_id, body.model_dump())
 
     @app.post("/v1/teams/{team_id}/network/messages/{message_id}/dismissals")
     def dismiss_team_message(
@@ -1533,12 +1566,14 @@ def create_app(
         message_id: str,
         body: TeamMessageRevisionRequest,
         claims: Auth,
+        include_mail_subject: Annotated[bool, Query()] = False,
     ) -> dict[str, Any]:
         return store.revise_team_message(
             claims,
             team_id,
             message_id,
             body.model_dump(),
+            include_mail_subject=include_mail_subject,
         )
 
     @app.delete("/v1/teams/{team_id}/network/messages/{message_id}")

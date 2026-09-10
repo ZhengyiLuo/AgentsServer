@@ -4850,6 +4850,8 @@ def sanitize_proxy_request(
                     "after_sequence",
                     "limit",
                     "include_revision",
+                    "include_mail_subject",
+                    "include_mailbox_state",
                 }
             elif (
                 len(pieces) == 2
@@ -4858,7 +4860,7 @@ def sanitize_proxy_request(
             ):
                 route_allowed = True
                 allow_query = normalized_method == "GET"
-                allowed_query_keys = {"include_revision"}
+                allowed_query_keys = {"include_revision", "include_mail_subject", "include_mailbox_state"}
             elif (
                 len(pieces) == 3
                 and pieces[0] == "messages"
@@ -4866,8 +4868,8 @@ def sanitize_proxy_request(
                 and normalized_method in {"GET", "POST"}
             ):
                 route_allowed = True
-                allow_query = normalized_method == "GET"
-                allowed_query_keys = {"version"}
+                allow_query = True
+                allowed_query_keys = {"version"} if normalized_method == "GET" else {"include_mail_subject"}
             elif pieces == ["deletions"] and normalized_method == "GET":
                 route_allowed = True
                 allow_query = True
@@ -4875,7 +4877,7 @@ def sanitize_proxy_request(
             elif (
                 len(pieces) == 3
                 and pieces[0] == "messages"
-                and pieces[2] in {"receipts", "dismissals"}
+                and pieces[2] in {"receipts", "dismissals", "mailbox-state"}
                 and normalized_method == "POST"
             ):
                 route_allowed = True
@@ -4987,7 +4989,7 @@ def sanitize_proxy_request(
                 raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         if "box" in values and values["box"] not in {"inbox", "feed", "sent"}:
             raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
-        for flag_key in ("unread", "include_archived", "include_revision"):
+        for flag_key in ("unread", "include_archived", "include_revision", "include_mail_subject", "include_mailbox_state"):
             if flag_key in values and values[flag_key] not in {"0", "1", "true", "false"}:
                 raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         if "from_kind" in values and values["from_kind"] not in {"server", "human"}:
@@ -6253,6 +6255,11 @@ class SecurePeerClient:
             connection = self._connect()
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """UPDATE client_join_intents SET status='expired',updated_at=?
+                    WHERE status='pending' AND expires_at<=?""",
+                    (timestamp, timestamp),
+                )
                 rows = connection.execute(
                     """SELECT connection_id,pairing_id,pairing_expires_at
                     FROM client_connections
@@ -6276,6 +6283,9 @@ class SecurePeerClient:
                     ).rowcount
                     if changed == 1:
                         expired.append(str(row["connection_id"]))
+                        self._invalidate_auto_completion(
+                            connection, str(row["connection_id"]), state="expired"
+                        )
                 connection.execute("COMMIT")
             except BaseException:
                 if connection.in_transaction:
@@ -6382,6 +6392,12 @@ class SecurePeerClient:
                     host_server_identity TEXT NOT NULL, hub_id TEXT NOT NULL,
                     request_json TEXT NOT NULL, key_path TEXT NOT NULL,
                     created_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS client_join_intents(
+                    connection_id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE,
+                    created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('pending','completed','cancelled','expired')),
+                    updated_at INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS client_routes(
                     route_id TEXT PRIMARY KEY, connection_id TEXT NOT NULL,
@@ -6784,7 +6800,10 @@ class SecurePeerClient:
         requested_scopes: Iterable[str],
         display_name: str | None = None,
         resume_matching: bool = False,
+        complete_on_approval: bool = False,
     ) -> dict[str, Any]:
+        if type(complete_on_approval) is not bool:
+            raise SecurePeerError("invalid_request", "Automatic join choice must be boolean", 422)
         with self._pairing_request_guard:
             self._expire_pending_pairings_locked(limit=PAIRING_STATUS_LIMIT)
             host = canonical_peer_ipv4(host_ip)
@@ -6817,6 +6836,7 @@ class SecurePeerClient:
                 request_id=request_id,
                 requested_scopes=requested_values,
                 display_name=selected_display_name,
+                complete_on_approval=complete_on_approval,
             )
 
     def _begin_pairing_locked(
@@ -6828,6 +6848,7 @@ class SecurePeerClient:
         request_id: str | None = None,
         requested_scopes: Iterable[str],
         display_name: str | None = None,
+        complete_on_approval: bool = False,
     ) -> dict[str, Any]:
         host = canonical_peer_ipv4(host_ip)
         canonical_port = canonical_peer_port(port)
@@ -7001,6 +7022,30 @@ class SecurePeerClient:
                         timestamp,
                     ),
                 )
+                if complete_on_approval:
+                    if self._active_id(connection) is not None or connection.execute(
+                        "SELECT 1 FROM client_meta WHERE key='host_role_pause'"
+                    ).fetchone() is not None:
+                        raise SecurePeerError(
+                            "active_connection_changed",
+                            "Automatic join requires an unbound member server",
+                            409,
+                        )
+                    # A new explicit Join supersedes earlier unconsumed Join
+                    # choices. Replays never enter this branch or extend consent.
+                    self._invalidate_auto_completion(connection)
+                    connection.execute(
+                        """INSERT INTO client_join_intents(
+                        connection_id,request_id,created_at,expires_at,status,updated_at
+                        ) VALUES (?,?,?,?,'pending',?)""",
+                        (
+                            connection_id,
+                            canonical_request_id,
+                            timestamp,
+                            timestamp + PAIRING_TTL_SECONDS,
+                            timestamp,
+                        ),
+                    )
                 connection.execute("COMMIT")
                 attempt_persisted = True
                 attempt = connection.execute(
@@ -7133,6 +7178,21 @@ class SecurePeerClient:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            intent = connection.execute(
+                "SELECT * FROM client_join_intents WHERE connection_id=? AND request_id=?",
+                (connection_id, canonical_request_id),
+            ).fetchone()
+            pairing_expires_at = (
+                response["expires_at"] if response["status"] == "pending" else None
+            )
+            if intent is not None:
+                # Even an already-approved POST replay must retain the original
+                # local authorization deadline after a lost initial response.
+                pairing_expires_at = min(int(intent["expires_at"]), response["expires_at"])
+                connection.execute(
+                    "UPDATE client_join_intents SET expires_at=? WHERE connection_id=? AND request_id=?",
+                    (pairing_expires_at, connection_id, canonical_request_id),
+                )
             connection.execute(
                 """INSERT INTO client_connections(
                     connection_id,host_ip,port,status,pairing_id,pairing_request_id,poll_token,
@@ -7150,11 +7210,7 @@ class SecurePeerClient:
                     response["pairing_id"],
                     canonical_request_id,
                     response["poll_token"],
-                    (
-                        response["expires_at"]
-                        if response["status"] == "pending"
-                        else None
-                    ),
+                    pairing_expires_at,
                     canonical_json(request).decode("utf-8"),
                     hashlib.sha256(canonical_json(request)).digest(),
                     health["host_server_identity"],
@@ -7199,6 +7255,8 @@ class SecurePeerClient:
                     WHERE request_id=? AND connection_id=? AND key_path=?""",
                     (request_id, connection_id, str(expected_key_path)),
                 )
+                if cursor.rowcount == 1:
+                    self._invalidate_auto_completion(connection, connection_id)
                 connection.execute("COMMIT")
             except BaseException:
                 if connection.in_transaction:
@@ -7316,6 +7374,9 @@ class SecurePeerClient:
         result["requested_scopes"] = json.loads(result.pop("requested_scopes_json"))
         relay_available = bool(result.pop("relay_available"))
         result["active"] = row["connection_id"] == active
+        result["complete_on_approval"] = bool(
+            row["complete_on_approval"] if "complete_on_approval" in row.keys() else False
+        )
         result["local_proxy_base_path"] = (
             f"/api/team-hub-secure/{row['connection_id']}"
             if result["active"] and row["status"] == "connected"
@@ -7330,12 +7391,140 @@ class SecurePeerClient:
         row = connection.execute("SELECT value FROM client_meta WHERE key='active_connection_id'").fetchone()
         return row["value"] if row is not None else None
 
+    def _invalidate_auto_completion(
+        self,
+        connection: sqlite3.Connection,
+        connection_id: str | None = None,
+        *,
+        state: str = "cancelled",
+    ) -> None:
+        """Invalidate consent inside the transaction that changes local authority."""
+
+        if state not in {"cancelled", "expired"}:
+            raise ValueError("automatic join terminal state is invalid")
+        clause = " AND connection_id=?" if connection_id is not None else ""
+        parameters: tuple[Any, ...] = (state, self._timestamp())
+        if connection_id is not None:
+            parameters += (connection_id,)
+        connection.execute(
+            "UPDATE client_join_intents SET status=?,updated_at=? WHERE status='pending'" + clause,
+            parameters,
+        )
+
+    def cancel_auto_completions(self) -> None:
+        """Cancel outstanding Join choices, including requests awaiting a response."""
+
+        with self._route_guard:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                self._invalidate_auto_completion(connection)
+                connection.execute("COMMIT")
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            finally:
+                connection.close()
+
+    def auto_completion_info(self, connection_id: str) -> dict[str, Any] | None:
+        canonical = _uuid(connection_id, "connection_id")
+        self.expire_pending_pairings()
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT status,expires_at FROM client_join_intents WHERE connection_id=?",
+                (canonical,),
+            ).fetchone()
+            return {"state": row["status"], "deadline": int(row["expires_at"])} if row is not None else None
+        finally:
+            connection.close()
+
+    def auto_completion_state(self, connection_id: str) -> str | None:
+        info = self.auto_completion_info(connection_id)
+        return str(info["state"]) if info is not None else None
+
+    def auto_completion_snapshot(self, connection_id: str) -> dict[str, Any]:
+        """Read the connection, consent and active binding as one receipt."""
+
+        canonical = _uuid(connection_id, "connection_id")
+        timestamp = self._timestamp()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            row = connection.execute(
+                """SELECT c.*,i.status AS intent_state,i.expires_at AS intent_deadline,
+                (SELECT value FROM client_meta WHERE key='active_connection_id') AS active_id,
+                ((i.status='pending' AND i.expires_at>?
+                AND c.status IN ('pending','approved')) OR
+                (i.status='completed' AND c.status='connected' AND c.connection_id=
+                 (SELECT value FROM client_meta WHERE key='active_connection_id')))
+                AS complete_on_approval
+                FROM client_connections c LEFT JOIN client_join_intents i
+                ON i.connection_id=c.connection_id AND i.request_id=c.pairing_request_id
+                WHERE c.connection_id=?""",
+                (timestamp, canonical),
+            ).fetchone()
+            if row is None:
+                raise SecurePeerError("connection_unavailable", "Secure peer connection is unavailable", 404)
+            deadline = int(row["intent_deadline"]) if row["intent_deadline"] is not None else None
+            state = row["intent_state"]
+            if state == "pending" and deadline is not None and deadline <= timestamp:
+                state = "expired"
+            result = {
+                "connection": self._public_connection(row, row["active_id"]),
+                "state": state,
+                "deadline": deadline,
+            }
+            connection.execute("COMMIT")
+            return result
+        finally:
+            connection.close()
+
+    def list_auto_completion_candidates(self, *, limit: int = 1) -> list[dict[str, Any]]:
+        """Return only newly opted-in, still-authorized submitted Join requests."""
+
+        bounded_limit = max(1, min(int(limit), 8))
+        self.expire_pending_pairings()
+        connection = self._connect()
+        try:
+            active = self._active_id(connection)
+            if active is not None or connection.execute(
+                "SELECT 1 FROM client_meta WHERE key='host_role_pause'"
+            ).fetchone() is not None:
+                return []
+            rows = connection.execute(
+                """SELECT c.*,i.expires_at AS auto_completion_deadline,1 AS complete_on_approval
+                FROM client_connections c JOIN client_join_intents i
+                ON i.connection_id=c.connection_id AND i.request_id=c.pairing_request_id
+                WHERE i.status='pending' AND i.expires_at>?
+                AND c.status IN ('pending','approved')
+                ORDER BY i.created_at,i.connection_id LIMIT ?""",
+                (self._timestamp(), bounded_limit),
+            ).fetchall()
+            return [
+                {**self._public_connection(row, active), "auto_completion_deadline": int(row["auto_completion_deadline"])}
+                for row in rows
+            ]
+        finally:
+            connection.close()
+
     def list_connections(self) -> list[dict[str, Any]]:
         self.expire_pending_pairings()
         connection = self._connect()
         try:
             active = self._active_id(connection)
-            rows = connection.execute("SELECT * FROM client_connections ORDER BY created_at DESC").fetchall()
+            rows = connection.execute(
+                """SELECT c.*,((i.status='pending' AND i.expires_at>?
+                AND c.status IN ('pending','approved')) OR
+                (i.status='completed' AND c.status='connected' AND c.connection_id=
+                 (SELECT value FROM client_meta WHERE key='active_connection_id')))
+                AS complete_on_approval
+                FROM client_connections c LEFT JOIN client_join_intents i
+                ON i.connection_id=c.connection_id AND i.request_id=c.pairing_request_id
+                ORDER BY c.created_at DESC""",
+                (self._timestamp(),),
+            ).fetchall()
             return [self._public_connection(row, active) for row in rows]
         finally:
             connection.close()
@@ -7345,7 +7534,17 @@ class SecurePeerClient:
         self.expire_pending_pairings()
         connection = self._connect()
         try:
-            row = connection.execute("SELECT * FROM client_connections WHERE connection_id=?", (canonical,)).fetchone()
+            row = connection.execute(
+                """SELECT c.*,((i.status='pending' AND i.expires_at>?
+                AND c.status IN ('pending','approved')) OR
+                (i.status='completed' AND c.status='connected' AND c.connection_id=
+                 (SELECT value FROM client_meta WHERE key='active_connection_id')))
+                AS complete_on_approval
+                FROM client_connections c LEFT JOIN client_join_intents i
+                ON i.connection_id=c.connection_id AND i.request_id=c.pairing_request_id
+                WHERE c.connection_id=?""",
+                (self._timestamp(), canonical),
+            ).fetchone()
             if row is None:
                 raise SecurePeerError("connection_unavailable", "Secure peer connection is unavailable", 404)
             return self._public_connection(row, self._active_id(connection))
@@ -7545,14 +7744,26 @@ class SecurePeerClient:
         transitioned = False
         try:
             connection.execute("BEGIN IMMEDIATE")
+            timestamp = self._timestamp()
+            intent = connection.execute(
+                "SELECT expires_at FROM client_join_intents WHERE connection_id=? AND request_id=?",
+                (connection_id, row["pairing_request_id"]),
+            ).fetchone()
+            if intent is not None and int(intent["expires_at"]) <= timestamp:
+                # Network I/O and certificate validation may cross the original
+                # Join deadline. Recheck at the same commit that accepts approval.
+                remote_status = "expired"
+                certificate_path = None
+                certificate_fp = None
+                certificate_expires = None
             changed = connection.execute(
                 """UPDATE client_connections SET status=?,peer_id=?,team_id=?,scopes_json=?,
                 certificate_path=?,certificate_fingerprint=?,certificate_expires_at=?,updated_at=?
                 WHERE connection_id=? AND pairing_id=? AND status='pending'""",
                 (
                     remote_status,
-                    response.get("peer_id"),
-                    response.get("team_id"),
+                    response.get("peer_id") if remote_status == "approved" else None,
+                    response.get("team_id") if remote_status == "approved" else None,
                     canonical_json(response.get("scopes", [])).decode("utf-8") if remote_status == "approved" else None,
                     certificate_path,
                     certificate_fp,
@@ -7563,6 +7774,12 @@ class SecurePeerClient:
                 ),
             ).rowcount
             if changed == 1:
+                if remote_status in {"rejected", "cancelled", "expired"}:
+                    self._invalidate_auto_completion(
+                        connection,
+                        connection_id,
+                        state="expired" if remote_status == "expired" else "cancelled",
+                    )
                 connection.execute("COMMIT")
                 transitioned = True
             else:
@@ -7763,6 +7980,7 @@ class SecurePeerClient:
                 WHERE connection_id=?""",
                 (self._timestamp(), canonical),
             )
+            self._invalidate_auto_completion(connection, canonical)
             connection.execute("COMMIT")
         except BaseException:
             if connection.in_transaction:
@@ -7776,16 +7994,82 @@ class SecurePeerClient:
     def cancel_pairing(
         self, connection_id: str, idempotency_key: str
     ) -> dict[str, Any]:
+        canonical = _uuid(connection_id, "connection_id")
+        _uuid(idempotency_key, "idempotency_key")
+        # Cancel must fence background activation immediately, even while a
+        # stalled approval poll owns the request lock. Do not take the route
+        # guard: the automatic worker may be waiting on its health response.
+        connection = self._connect()
+        auto_cancelled = False
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            intent = connection.execute(
+                """SELECT 1 FROM client_join_intents i JOIN client_connections c
+                ON c.connection_id=i.connection_id AND c.pairing_request_id=i.request_id
+                WHERE c.connection_id=? AND c.status IN ('pending','approved')
+                AND i.status='pending'""",
+                (canonical,),
+            ).fetchone()
+            if intent is not None and self._active_id(connection) != canonical:
+                self._invalidate_auto_completion(connection, canonical)
+                auto_cancelled = True
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
         with self._pairing_request_guard:
             self._expire_pending_pairings_locked(limit=PAIRING_STATUS_LIMIT)
-            return self._cancel_pairing_locked(connection_id, idempotency_key)
+            return self._cancel_pairing_locked(
+                canonical, idempotency_key, auto_cancelled=auto_cancelled
+            )
 
     def _cancel_pairing_locked(
-        self, connection_id: str, idempotency_key: str
+        self, connection_id: str, idempotency_key: str, *, auto_cancelled: bool = False
     ) -> dict[str, Any]:
         row = self._connection_row(connection_id)
         if row["status"] in {"rejected", "cancelled", "expired"}:
             return self._abandon_uncredentialed_connection(row)
+        if row["status"] == "approved":
+            _uuid(idempotency_key, "idempotency_key")
+            # Approval can win the polling transaction while the user's Cancel
+            # waits for that request lock. Consent remains cancellable until
+            # automatic activation consumes it, including during health I/O.
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                intent = connection.execute(
+                    """SELECT 1 FROM client_join_intents i JOIN client_connections c
+                    ON c.connection_id=i.connection_id AND c.pairing_request_id=i.request_id
+                    WHERE c.connection_id=? AND c.pairing_id=?
+                    AND c.status='approved' AND i.status=?""",
+                    (
+                        connection_id,
+                        row["pairing_id"],
+                        "cancelled" if auto_cancelled else "pending",
+                    ),
+                ).fetchone()
+                if intent is None or self._active_id(connection) == connection_id:
+                    raise SecurePeerError("pairing_not_pending", "Pairing is no longer pending", 409)
+                self._invalidate_auto_completion(connection, connection_id)
+                connection.execute(
+                    """UPDATE client_connections SET status='cancelled',peer_id=NULL,
+                    team_id=NULL,scopes_json=NULL,certificate_path=NULL,
+                    certificate_fingerprint=NULL,certificate_expires_at=NULL,
+                    relay_available=0,updated_at=? WHERE connection_id=?""",
+                    (self._timestamp(), connection_id),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            finally:
+                connection.close()
+            self._retire_client_key_material(connection_id)
+            return self.get_connection(connection_id)
         if row["status"] != "pending":
             raise SecurePeerError("pairing_not_pending", "Pairing is no longer pending", 409)
         try:
@@ -7891,6 +8175,7 @@ class SecurePeerClient:
             row = connection.execute("SELECT status FROM client_connections WHERE connection_id=?", (canonical,)).fetchone()
             if row is None or row["status"] not in {"approved", "connected", "deactivated"}:
                 raise SecurePeerError("pairing_incomplete", "Secure peer connection is not approved", 409)
+            self._invalidate_auto_completion(connection)
             connection.execute(
                 "UPDATE client_meta SET value=? WHERE key='active_connection_id'",
                 (canonical,),
@@ -7910,6 +8195,98 @@ class SecurePeerClient:
         return self.get_connection(canonical)
 
     activate_after_health = set_active_connection
+
+    def activate_auto_connection(
+        self,
+        connection_id: str,
+        *,
+        expected_pairing_id: str,
+        expected_transcript_hash: str,
+        expected_host_server_identity: str,
+        expected_hub_id: str,
+    ) -> dict[str, Any]:
+        """Consume an exact fresh Join choice after pinned peer validation."""
+
+        canonical = _uuid(connection_id, "connection_id")
+
+        def selected(connection: sqlite3.Connection) -> sqlite3.Row:
+            row = connection.execute(
+                """SELECT c.*,i.status AS intent_status,i.expires_at AS intent_deadline
+                FROM client_connections c JOIN client_join_intents i
+                ON i.connection_id=c.connection_id AND i.request_id=c.pairing_request_id
+                WHERE c.connection_id=?""",
+                (canonical,),
+            ).fetchone()
+            if (
+                row is None
+                or row["pairing_id"] != expected_pairing_id
+                or row["transcript_hash"] != expected_transcript_hash
+                or row["host_server_identity"] != expected_host_server_identity
+                or row["hub_id"] != expected_hub_id
+            ):
+                raise SecurePeerError("connection_changed", "Automatic join identity changed", 409)
+            return row
+
+        def require_pending(connection: sqlite3.Connection, row: sqlite3.Row) -> None:
+            if (
+                row["intent_status"] != "pending"
+                or int(row["intent_deadline"]) <= self._timestamp()
+                or row["status"] != "approved"
+            ):
+                raise SecurePeerError("automatic_join_unavailable", "Automatic join is no longer authorized", 409)
+            if self._active_id(connection) is not None or connection.execute(
+                "SELECT 1 FROM client_meta WHERE key='host_role_pause'"
+            ).fetchone() is not None:
+                raise SecurePeerError("active_connection_changed", "Active secure peer connection changed", 409)
+
+        with self._route_guard:
+            self.expire_pending_pairings()
+            connection = self._connect()
+            try:
+                before = selected(connection)
+                if (
+                    before["intent_status"] == "completed"
+                    and before["status"] == "connected"
+                    and self._active_id(connection) == canonical
+                ):
+                    return self.get_connection(canonical)
+                require_pending(connection, before)
+            finally:
+                connection.close()
+            self._peer_health_locked(canonical)
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                current = selected(connection)
+                require_pending(connection, current)
+                if current["certificate_fingerprint"] != before["certificate_fingerprint"]:
+                    raise SecurePeerError("connection_changed", "Secure peer credential changed during validation", 409)
+                timestamp = self._timestamp()
+                changed = connection.execute(
+                    """UPDATE client_join_intents SET status='completed',updated_at=?
+                    WHERE connection_id=? AND request_id=? AND status='pending' AND expires_at>?""",
+                    (timestamp, canonical, current["pairing_request_id"], timestamp),
+                ).rowcount
+                if changed != 1:
+                    raise SecurePeerError("automatic_join_unavailable", "Automatic join is no longer authorized", 409)
+                connection.execute(
+                    "UPDATE client_meta SET value=? WHERE key='active_connection_id' AND value IS NULL",
+                    (canonical,),
+                )
+                connection.execute(
+                    """UPDATE client_connections SET status='connected',last_validated_at=?,updated_at=?
+                    WHERE connection_id=? AND status='approved'""",
+                    (timestamp, timestamp, canonical),
+                )
+                self._invalidate_auto_completion(connection)
+                connection.execute("COMMIT")
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            finally:
+                connection.close()
+        return self.get_connection(canonical)
 
     @staticmethod
     def _host_role_pause_record(raw: Any) -> dict[str, Any]:
@@ -7966,6 +8343,7 @@ class SecurePeerClient:
             connection = self._connect()
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                self._invalidate_auto_completion(connection)
                 paused_row = connection.execute(
                     "SELECT value FROM client_meta WHERE key='host_role_pause'"
                 ).fetchone()
@@ -8140,6 +8518,7 @@ class SecurePeerClient:
                 connection.execute(
                     "DELETE FROM client_meta WHERE key='host_role_pause'"
                 )
+                self._invalidate_auto_completion(connection)
                 connection.execute("COMMIT")
             except BaseException:
                 if connection.in_transaction:
@@ -8202,6 +8581,7 @@ class SecurePeerClient:
                 "UPDATE client_connections SET status='deactivated',updated_at=? WHERE connection_id=?",
                 (timestamp, canonical),
             )
+            self._invalidate_auto_completion(connection)
             connection.execute("COMMIT")
         except BaseException:
             if connection.in_transaction:
@@ -8302,6 +8682,7 @@ class SecurePeerClient:
                     "DELETE FROM client_renewals WHERE connection_id=?",
                     (canonical,),
                 )
+                self._invalidate_auto_completion(connection)
                 connection.execute("COMMIT")
             except BaseException:
                 if connection.in_transaction:
@@ -8361,6 +8742,7 @@ class SecurePeerClient:
             connection.execute("DELETE FROM client_routes WHERE connection_id=?", (canonical,))
             connection.execute("DELETE FROM client_renewals WHERE connection_id=?", (canonical,))
             connection.execute("DELETE FROM client_connections WHERE connection_id=?", (canonical,))
+            self._invalidate_auto_completion(connection)
             connection.execute("COMMIT")
         except BaseException:
             if connection.in_transaction:
@@ -8439,6 +8821,7 @@ class SecurePeerClient:
                 connection.execute(
                     "DELETE FROM client_connections WHERE connection_id=?", (canonical,)
                 )
+                self._invalidate_auto_completion(connection)
                 connection.execute("COMMIT")
             except BaseException:
                 if connection.in_transaction:

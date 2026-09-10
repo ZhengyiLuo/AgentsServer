@@ -29,6 +29,12 @@ FILES = (
     "codex_app_server.py",
     "cursor_agent_client.py",
     "cursor_process_guard.py",
+    "claude_history_repair.py",
+    "claude_history_provenance.py",
+    "codex_history_repair.py",
+    "public_chat_shares.py",
+    "public_chat_transcript.py",
+    "public_chat_share_routes.py",
     "install.sh",
     "uninstall.sh",
     "update_runner.py",
@@ -66,6 +72,9 @@ DIRECTORY_FILES = {
         "migrations/0014_managed_network_owner.sql",
         "migrations/0015_team_message_inbox_dismissals.sql",
         "migrations/0016_team_message_all_servers.sql",
+        "migrations/0017_skill_announcement_deletions.sql",
+        "migrations/0018_team_mail_subjects.sql",
+        "migrations/0019_team_mailbox_state.sql",
     ),
 }
 DIRECTORIES = tuple(DIRECTORY_FILES)

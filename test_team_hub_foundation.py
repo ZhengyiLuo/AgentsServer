@@ -51,7 +51,7 @@ class DatabaseTests(unittest.TestCase):
         connection = open_database()
         self.addCleanup(connection.close)
 
-        self.assertEqual(LATEST_SCHEMA_VERSION, 16)
+        self.assertEqual(LATEST_SCHEMA_VERSION, 17)
         self.assertEqual(
             connection.execute("PRAGMA user_version").fetchone()[0],
             LATEST_SCHEMA_VERSION,
@@ -94,6 +94,45 @@ class DatabaseTests(unittest.TestCase):
                 "team_attachment_cleanup_queue",
             }.issubset(table_names)
         )
+
+    def test_version_sixteen_upgrades_skill_announcement_deletion_guard(self) -> None:
+        connection = sqlite3.connect(":memory:", isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, "
+            "name TEXT NOT NULL, sha256 TEXT NOT NULL, applied_at INTEGER NOT NULL)"
+        )
+        for migration in MIGRATIONS[:16]:
+            connection.executescript(migration.source)
+            connection.execute(
+                "INSERT INTO schema_migrations VALUES (?,?,?,?)",
+                (migration.version, migration.name, migration.sha256, NOW),
+            )
+            connection.execute(f"PRAGMA user_version = {migration.version}")
+        old_migrations = [tuple(row) for row in connection.execute("SELECT * FROM schema_migrations")]
+        self.assertEqual(apply_migrations(connection), LATEST_SCHEMA_VERSION)
+        self.assertEqual(
+            [tuple(row) for row in connection.execute("SELECT * FROM schema_migrations WHERE version<=16")],
+            old_migrations,
+        )
+        source_guard = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name='network_content_deletions_require_message'"
+        ).fetchone()[0]
+        self.assertIn("m.kind IN ('message', 'skill')", source_guard)
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "team message deletion source is unavailable"):
+            # Supply a valid actor so the independent source guard is tested.
+            bootstrap = bootstrap_personal_team(
+                connection, email="migration@example.com", display_name="Migration", now=NOW,
+            )
+            connection.execute(
+                "INSERT INTO network_content_deletions "
+                "(id,team_id,resource_kind,resource_id,deleted_by_principal_id,deleted_at) "
+                "VALUES (?,?,'message',?,?,?)",
+                ("deletion_missing", bootstrap.team_id, "missing_message", bootstrap.human_principal_id, NOW),
+            )
+        self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
 
     def test_attachment_reclamation_schema_has_bounded_query_plans(self) -> None:
         connection = open_database()

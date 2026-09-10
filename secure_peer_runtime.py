@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
+import asyncio
 import hashlib
 import hmac
 import json
@@ -198,6 +199,8 @@ class SecurePeerRuntime:
         self._team_export_reservations: dict[Path, int] = {}
         self.config_path = self.data_dir / "host-config.json"
         self._guard = threading.RLock()
+        self._completion_waiters: dict[object, Callable[[], None]] = {}
+        self._completion_closing = False
         # Linearizes durable outbound intent creation with every local
         # route/connection retirement boundary. A handoff is either durably
         # pending before retirement (so retirement returns 409) or observes
@@ -213,6 +216,13 @@ class SecurePeerRuntime:
         self._peer_admission = threading.Condition(threading.RLock())
         self._peer_accepting = False
         self._peer_in_flight = 0
+        # Direct Host helpers share the Hub, but do not require an mTLS
+        # listener. Maintenance drains their workers independently of peers.
+        self._host_admission_closed = False
+        self._host_admission_epoch = 0
+        self._host_in_flight = 0
+        self._host_operation_state = threading.local()
+        self._host_configuration_guard = threading.RLock()
         self._hub_store: HubStore | None = None
         self._host_store: SecurePeerStore | None = None
         self._adapter: SecurePeerHubAdapter | None = None
@@ -358,6 +368,7 @@ class SecurePeerRuntime:
                     raise RuntimeError(self._initialization_error)
                 self._team_authority_epoch = uuid.uuid4().hex
                 self._host_role_active = True
+                self._notify_pairing_completion()
                 return None
             try:
                 paused = self.client.pause_active_connection_for_host()
@@ -369,6 +380,7 @@ class SecurePeerRuntime:
                 paused = self.client.pause_active_connection_for_host()
             self._team_authority_epoch = uuid.uuid4().hex
             self._host_role_active = True
+            self._notify_pairing_completion()
             return paused
 
     def resume_member_after_host(self) -> dict[str, Any] | None:
@@ -521,6 +533,7 @@ class SecurePeerRuntime:
         hub_id: str,
         hub_data_dir: Path,
         hub_store: HubStore | None = None,
+        _resume_admission: bool = True,
     ) -> None:
         """Attach a Host realm under the Team authority transition fence."""
 
@@ -529,6 +542,7 @@ class SecurePeerRuntime:
                 hub_id=hub_id,
                 hub_data_dir=hub_data_dir,
                 hub_store=hub_store,
+                _resume_admission=_resume_admission,
             )
 
     def _attach_host_hub_locked(
@@ -537,6 +551,7 @@ class SecurePeerRuntime:
         hub_id: str,
         hub_data_dir: Path,
         hub_store: HubStore | None = None,
+        _resume_admission: bool = True,
     ) -> None:
         """Attach after the authoritative Hub has acquired its runtime lease."""
 
@@ -548,6 +563,9 @@ class SecurePeerRuntime:
         with self._guard:
             if self._hub_store is not None and self._hub_store is not hub_store:
                 raise RuntimeError("secure peer host is already attached")
+            new_host_store = self._hub_store is None
+            with self._peer_admission:
+                attachment_epoch = self._host_admission_epoch
             # Record the exact live Hub object before the first fallible
             # projection step. Startup recovery can then retry even when local
             # Agent Mail provisioning itself was the interrupted boundary.
@@ -630,6 +648,16 @@ class SecurePeerRuntime:
             self._hub_store = hub_store
             self._host_store = host_store
             self._adapter = adapter
+            with self._peer_admission:
+                # A newly committed Host role may replace a detached one.
+                # Retrying the same object must not undo maintenance closure.
+                if (
+                    new_host_store
+                    and _resume_admission
+                    and self._host_admission_epoch == attachment_epoch
+                    and not self._completion_closing
+                ):
+                    self._host_admission_closed = False
             # Recover the approval -> service-principal transaction boundary.
             pairings = {
                 item.get("pairing_id"): item
@@ -706,7 +734,7 @@ class SecurePeerRuntime:
                 gateway.start()
                 self._gateway = gateway
             with self._peer_admission:
-                self._peer_accepting = self._gateway is not None
+                self._peer_accepting = self._gateway is not None and not self._host_admission_closed
                 self._peer_admission.notify_all()
             self._pending_host_attachment = None
 
@@ -757,6 +785,7 @@ class SecurePeerRuntime:
                 hub_id=hub_id,
                 hub_data_dir=hub_data_dir,
                 hub_store=hub_store,
+                _resume_admission=False,
             )
         except Exception as exc:
             self.mark_host_unavailable(
@@ -773,6 +802,20 @@ class SecurePeerRuntime:
         return True
 
     def configure_host(
+        self,
+        *,
+        enabled: bool,
+        advertised_host: str | None,
+        listen_port: int,
+    ) -> dict[str, Any]:
+        # Do not let two listener changes inherit each other's temporary
+        # closure. This lock is never required by an admitted Hub worker.
+        with self._host_configuration_guard:
+            return self._configure_host_locked(
+                enabled=enabled, advertised_host=advertised_host, listen_port=listen_port
+            )
+
+    def _configure_host_locked(
         self,
         *,
         enabled: bool,
@@ -814,7 +857,7 @@ class SecurePeerRuntime:
         # before stopping or rebinding the listener.  Returning from this
         # control mutation therefore proves that no request from the prior
         # endpoint can commit afterward.
-        self.close_host_admission()
+        closure_epoch, was_closed = self._close_host_admission()
         with self._guard:
             old_gateway = self._gateway
             old_config = dict(self._config)
@@ -878,8 +921,10 @@ class SecurePeerRuntime:
                     self._gateway = restored
                 raise
             finally:
-                if self._gateway is not None:
-                    self.reopen_host_admission()
+                if not was_closed:
+                    # Local-only Host work is valid without a gateway. Do not
+                    # reopen a pre-existing or later maintenance/shutdown gate.
+                    self.reopen_host_admission(expected_epoch=closure_epoch)
             return self.status()
 
     def begin_pairing(
@@ -891,31 +936,152 @@ class SecurePeerRuntime:
         request_id: str,
         display_name: str,
         requested_scopes: list[str],
+        complete_on_approval: bool = False,
     ) -> dict[str, Any]:
         # The core persists the key/request before network delivery so an
         # ambiguous response can be retried with the exact same signed bytes.
-        result = self.client.begin_pairing(
-            host,
-            port,
-            expected_ca_fingerprint=expected_ca_fingerprint,
-            request_id=request_id,
-            requested_scopes=requested_scopes,
-            display_name=display_name,
-            resume_matching=True,
-        )
+        with self._outbound_guard:
+            if complete_on_approval and self._host_role_active:
+                raise SecurePeerError(
+                    "host_role_active",
+                    "This server cannot automatically join while it is the Team Network host",
+                    409,
+                )
+            result = self.client.begin_pairing(
+                host,
+                port,
+                expected_ca_fingerprint=expected_ca_fingerprint,
+                request_id=request_id,
+                requested_scopes=requested_scopes,
+                display_name=display_name,
+                resume_matching=True,
+                complete_on_approval=complete_on_approval,
+            )
         return self._outgoing_pairing(result)
 
     def poll_pairing(self, pairing_id: str) -> dict[str, Any]:
         connection = self._outgoing_for_pairing(pairing_id)
         result = self.client.poll_pairing(str(connection["connection_id"]))
+        self._notify_pairing_completion()
         return self._outgoing_pairing(result)
+
+    def _notify_pairing_completion(self) -> None:
+        with self._guard:
+            callbacks = tuple(self._completion_waiters.values())
+        for callback in callbacks:
+            with suppress(RuntimeError):
+                callback()
+
+    def _pairing_completion_snapshot(
+        self, pairing_id: str, *, expected_transcript_hash: str
+    ) -> tuple[dict[str, Any], int]:
+        selected = self._outgoing_for_pairing(pairing_id)
+        snapshot = self.client.auto_completion_snapshot(str(selected["connection_id"]))
+        connection = snapshot["connection"]
+        if connection.get("pairing_id") != pairing_id or not hmac.compare_digest(
+            str(connection.get("transcript_hash") or ""), expected_transcript_hash
+        ):
+            raise SecurePeerError("pairing_changed", "Pairing transcript changed", 409)
+        state = str(snapshot.get("state") or "unavailable")
+        deadline = int(snapshot.get("deadline") or 0)
+        if self._completion_closing:
+            state = "unavailable"
+        elif state == "completed" and not connection.get("active"):
+            state = "cancelled"
+        elif connection.get("status") in {"rejected", "cancelled", "revoked", "deactivated"}:
+            state = "cancelled"
+        elif state == "pending" and (self._host_role_active or connection.get("status") == "error"):
+            state = "cancelled"
+        elif state == "pending" and deadline <= int(time.time()):
+            state = "expired"
+        if state not in {"pending", "completed", "cancelled", "expired"}:
+            state = "unavailable"
+        return {
+            "version": 1,
+            "completion_state": state,
+            "pairing": self._outgoing_pairing(connection),
+        }, deadline
+
+    async def wait_pairing_completion(
+        self, pairing_id: str, *, expected_transcript_hash: str
+    ) -> dict[str, Any]:
+        """Observe one durable join without owning or cancelling its work."""
+
+        loop = asyncio.get_running_loop()
+        changed = asyncio.Event()
+        observer_deadline = loop.time() + 600.0
+        token = object()
+        with self._guard:
+            if len(self._completion_waiters) >= 32:
+                raise SecurePeerError("completion_capacity", "Too many pairing completion observers", 429)
+            self._completion_waiters[token] = lambda: loop.call_soon_threadsafe(changed.set)
+        try:
+            while True:
+                # Subscribe before reading and clear before each snapshot:
+                # completion between that read and wait cannot be lost.
+                changed.clear()
+                receipt, deadline = await asyncio.to_thread(
+                    self._pairing_completion_snapshot,
+                    pairing_id,
+                    expected_transcript_hash=expected_transcript_hash,
+                )
+                if receipt["completion_state"] != "pending":
+                    return receipt
+                remaining = max(0.0, min(observer_deadline - loop.time(), deadline - time.time()))
+                try:
+                    await asyncio.wait_for(changed.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    # Completion may have committed at the deadline while
+                    # its notification was still queued on this event loop.
+                    latest, _deadline = await asyncio.to_thread(
+                        self._pairing_completion_snapshot,
+                        pairing_id,
+                        expected_transcript_hash=expected_transcript_hash,
+                    )
+                    return (
+                        {**latest, "completion_state": "expired"}
+                        if latest["completion_state"] == "pending"
+                        else latest
+                    )
+        finally:
+            with self._guard:
+                self._completion_waiters.pop(token, None)
+
+    def _complete_automatic_pairing_once(self) -> None:
+        """One bounded approval check inside service-owned Member maintenance."""
+
+        for connection in self.client.list_auto_completion_candidates(limit=1):
+            connection_id = str(connection["connection_id"])
+            observed = self.client.poll_pairing(connection_id)
+            if observed.get("status") == "approved":
+                self.client.activate_auto_connection(
+                    connection_id,
+                    expected_pairing_id=str(connection["pairing_id"]),
+                    expected_transcript_hash=str(connection["transcript_hash"]),
+                    expected_host_server_identity=str(connection["host_server_identity"]),
+                    expected_hub_id=str(connection["hub_id"]),
+                )
+                self._client_failure_counts.pop(connection_id, None)
+                try:
+                    self.publish_display_name(self.display_name)
+                except Exception as exc:
+                    if self.logger is not None:
+                        self.logger.warning(
+                            "secure peer automatic join name update deferred error_type=%s",
+                            type(exc).__name__,
+                        )
+            if observed.get("status") != "pending":
+                self._notify_pairing_completion()
 
     def cancel_pairing(self, pairing_id: str, *, idempotency_key: str) -> dict[str, Any]:
         connection = self._outgoing_for_pairing(pairing_id)
-        self.client.cancel_pairing(
-            str(connection["connection_id"]),
-            idempotency_key=idempotency_key,
-        )
+        try:
+            self.client.cancel_pairing(
+                str(connection["connection_id"]),
+                idempotency_key=idempotency_key,
+            )
+        finally:
+            self._notify_pairing_completion()
         return self.status()
 
     def activate_pairing(
@@ -976,6 +1142,7 @@ class SecurePeerRuntime:
                 # supported rename must otherwise acknowledge the exact node.
                 if exc.status_code not in {403, 404}:
                     raise
+        self._notify_pairing_completion()
         return self.status()
 
     def deactivate_connection(
@@ -999,6 +1166,7 @@ class SecurePeerRuntime:
                 expected_hub_id=expected_hub_id,
             )
             self._client_failure_counts.pop(connection_id, None)
+        self._notify_pairing_completion()
         return self.status()
 
     def forget_connection(
@@ -1053,6 +1221,7 @@ class SecurePeerRuntime:
                     ),
                 )
                 self._client_failure_counts.pop(connection_id, None)
+                self._notify_pairing_completion()
                 return self.status()
             self.client.revoke_remote_connection(
                 connection_id,
@@ -1084,6 +1253,7 @@ class SecurePeerRuntime:
                 expected_certificate_fingerprint=expected_certificate_fingerprint,
             )
             self._client_failure_counts.pop(connection_id, None)
+        self._notify_pairing_completion()
         return self.status()
 
     def _require_connection_delivery_quiescent(self, connection_id: str) -> None:
@@ -1258,6 +1428,7 @@ class SecurePeerRuntime:
         return {
             "id": item.get("pairing_id"),
             "direction": "outgoing",
+            "complete_on_approval": item.get("complete_on_approval") is True,
             "status": self._status(item.get("status"), active=active),
             "trust_state": trust_state,
             "transport_state": transport_state,
@@ -2188,7 +2359,8 @@ class SecurePeerRuntime:
             # Persist outgoing pending deadlines even when no operator is
             # viewing or polling Team Network. This is also the periodic
             # crash-retry boundary for local key retirement.
-            self.client.expire_pending_pairings()
+            if self.client.expire_pending_pairings():
+                self._notify_pairing_completion()
         except Exception as exc:
             if self.logger is not None:
                 self.logger.warning(
@@ -2207,6 +2379,15 @@ class SecurePeerRuntime:
                 ),
             }
         recovery_error = pairing_recovery.get("error")
+        try:
+            self._complete_automatic_pairing_once()
+        except Exception as exc:
+            if self.logger is not None:
+                self.logger.warning(
+                    "secure peer automatic join deferred error_type=%s",
+                    type(exc).__name__,
+                )
+            self._notify_pairing_completion()
         active = next(
             (item for item in self.client.list_connections() if item.get("active")),
             None,
@@ -3502,21 +3683,70 @@ class SecurePeerRuntime:
         return result
 
     def close_host_admission(self) -> None:
-        with self._peer_admission:
-            self._peer_accepting = False
-            while self._peer_in_flight:
-                self._peer_admission.wait(timeout=0.25)
+        self._close_host_admission()
 
-    def reopen_host_admission(self) -> None:
-        with self._guard:
-            ready = (
-                self._hub_store is not None
-                and self._adapter is not None
-                and self._gateway is not None
-            )
+    def _close_host_admission(self) -> tuple[int, bool]:
         with self._peer_admission:
-            self._peer_accepting = ready
+            was_closed = self._host_admission_closed
+            self._host_admission_epoch += 1
+            closure_epoch = self._host_admission_epoch
+            self._host_admission_closed = True
+            self._peer_accepting = False
             self._peer_admission.notify_all()
+            while self._peer_in_flight or self._host_in_flight:
+                self._peer_admission.wait(timeout=0.25)
+            return closure_epoch, was_closed
+
+    def reopen_host_admission(self, *, expected_epoch: int | None = None) -> None:
+        with self._guard:
+            with self._peer_admission:
+                if expected_epoch is not None and self._host_admission_epoch != expected_epoch:
+                    return
+                self._host_admission_epoch += 1
+                local_ready = self._hub_store is not None and not self._completion_closing
+                self._host_admission_closed = not local_ready
+                self._peer_accepting = local_ready and self._adapter is not None and self._gateway is not None
+                self._peer_admission.notify_all()
+
+    @contextmanager
+    def _host_store_operation(self, realm: Mapping[str, Any], *, write: bool):
+        """Count the actual local worker until its exact Hub operation settles.
+
+        Never hold admission while acquiring _guard/SQLite, nor acquire the
+        outbound authority guard here: detach owns that guard while draining.
+        Nested dispatch counts separately and reuses an already-held control
+        lease for this exact store, rather than deadlocking on a second flock.
+        """
+        with self._peer_admission:
+            if self._host_admission_closed or self._completion_closing:
+                raise SecurePeerError("hub_maintenance", "Team Hub is unavailable during server maintenance", 503)
+            self._host_in_flight += 1
+        try:
+            with self._guard:
+                store = self._hub_store
+            if store is None or store.hub_id != realm.get("hub_id") or realm.get("realm") != "host":
+                raise SecurePeerError("team_unavailable", "Team Hub is unavailable", 409)
+            control_store = getattr(self._host_operation_state, "control_store", None)
+            if control_store is not None and control_store is not store:
+                raise SecurePeerError("team_unavailable", "Team Hub operation ownership changed", 409)
+            if write and control_store is None:
+                with HubStore.maintenance_control_lock(store.data_dir):
+                    if store.maintenance_fence() is not None:
+                        raise SecurePeerError("hub_maintenance", "Team Hub is unavailable during server maintenance", 503)
+                    self._host_operation_state.control_store = store
+                    try:
+                        yield store
+                    finally:
+                        del self._host_operation_state.control_store
+            else:
+                if store.maintenance_fence() is not None:
+                    raise SecurePeerError("hub_maintenance", "Team Hub is unavailable during server maintenance", 503)
+                yield store
+        finally:
+            with self._peer_admission:
+                self._host_in_flight -= 1
+                if self._host_in_flight == 0:
+                    self._peer_admission.notify_all()
 
     def proxy(
         self,
@@ -4057,10 +4287,10 @@ class SecurePeerRuntime:
 
         if profile.get("realm") == "host":
             with self._guard:
-                store = self._hub_store
+                expected_store = self._hub_store
             if (
-                store is None
-                or store.hub_id != profile.get("hub_id")
+                expected_store is None
+                or expected_store.hub_id != profile.get("hub_id")
                 or self.server_identity != profile.get("server_identity")
             ):
                 raise SecurePeerError(
@@ -4068,13 +4298,14 @@ class SecurePeerRuntime:
                     "Team Network mail route is no longer available",
                     409,
                 )
-            claims = store.local_agent_mail_claims(team_id)
-            if kind == "request":
-                result = store.create_network_request(claims, team_id, request_body)
-            else:
-                result = store.create_network_mailbox_item(
-                    claims, team_id, request_body
-                )
+            with self._host_store_operation(profile, write=True) as store:
+                claims = store.local_agent_mail_claims(team_id)
+                if kind == "request":
+                    result = store.create_network_request(claims, team_id, request_body)
+                else:
+                    result = store.create_network_mailbox_item(
+                        claims, team_id, request_body
+                    )
             return self._validated_agent_mail_receipt(
                 result,
                 kind=kind,
@@ -6333,10 +6564,18 @@ class SecurePeerRuntime:
     ) -> dict[str, Any]:
         """Serve a host-realm Team Messages call directly from the HubStore."""
 
-        with self._guard:
-            store = self._hub_store
-        if store is None or store.hub_id != realm.get("hub_id"):
-            raise SecurePeerError("team_unavailable", "Team Hub is unavailable", 409)
+        with self._host_store_operation(realm, write=method in {"POST", "PUT", "DELETE"}) as store:
+            return self._team_host_call_admitted(store, realm, method, path, query, body)
+
+    def _team_host_call_admitted(
+        self,
+        store: HubStore,
+        realm: dict[str, Any],
+        method: str,
+        path: str,
+        query: dict[str, str],
+        body: dict[str, Any] | None,
+    ) -> dict[str, Any]:
         team_id = str(realm["team_id"])
         claims = store.local_agent_mail_claims(team_id)
         prefix = f"/v1/teams/{quote(team_id, safe='')}/network/"
@@ -6357,6 +6596,7 @@ class SecurePeerRuntime:
                 since=query.get("since"),
                 after_sequence=int(query.get("after_sequence", "0")),
                 limit=int(query.get("limit", "50")),
+                include_mail_subject=flag("include_mail_subject"),
             )
         if method == "GET" and pieces == ["deletions"]:
             return store.list_network_content_deletions(
@@ -6366,7 +6606,10 @@ class SecurePeerRuntime:
                 limit=int(query.get("limit", "50")),
             )
         if method == "GET" and len(pieces) == 2 and pieces[0] == "messages":
-            return store.get_team_message(claims, team_id, pieces[1])
+            return store.get_team_message(
+                claims, team_id, pieces[1],
+                include_mail_subject=flag("include_mail_subject"),
+            )
         if method == "POST" and pieces == ["messages"]:
             return store.create_team_message(claims, team_id, dict(body or {}))
         if method == "POST" and len(pieces) == 3 and pieces[0] == "messages" and pieces[2] == "receipts":
@@ -6408,7 +6651,10 @@ class SecurePeerRuntime:
         since: str | None = None,
         after_sequence: int = 0,
         limit: int = 50,
+        include_mail_subject: bool = False,
     ) -> dict[str, Any]:
+        if type(include_mail_subject) is not bool:
+            raise SecurePeerError("invalid_request", "Mail subject projection flag is invalid", 422)
         realm = self.team_realm(team_id)
         result = self._team_hub_get(
             realm,
@@ -6419,17 +6665,26 @@ class SecurePeerRuntime:
                 "since": since,
                 "after_sequence": after_sequence,
                 "limit": limit,
+                "include_mail_subject": include_mail_subject,
             },
         )
         result["team_id"] = realm["team_id"]
         return result
 
-    def team_get_message(self, message_id: str, *, team_id: str | None = None) -> dict[str, Any]:
+    def team_get_message(
+        self,
+        message_id: str,
+        *,
+        team_id: str | None = None,
+        include_mail_subject: bool = False,
+    ) -> dict[str, Any]:
+        if type(include_mail_subject) is not bool:
+            raise SecurePeerError("invalid_request", "Mail subject projection flag is invalid", 422)
         realm = self.team_realm(team_id)
         result = self._team_hub_get(
             realm,
             f"/v1/teams/{quote(realm['team_id'], safe='')}/network/messages/{quote(message_id, safe='')}",
-            {},
+            {"include_mail_subject": include_mail_subject},
         )
         result["team_id"] = realm["team_id"]
         return result
@@ -6573,6 +6828,86 @@ class SecurePeerRuntime:
             recipients = [
                 {"kind": str(reference.get("recipient_kind")), "id": str(reference.get("target_id"))}
             ]
+        reply_to = payload.get("in_reply_to_message_id")
+        if reply_to is not None and not (
+            isinstance(reply_to, str)
+            and re.fullmatch(r"[A-Za-z0-9_-]{8,240}", reply_to)
+            and kind == "message"
+            and reference.get("kind") == "recipient"
+            and reference.get("recipient_kind") == "server"
+            and isinstance(reference.get("target_id"), str)
+            and reference["target_id"]
+        ):
+            raise SecurePeerError(
+                "team_reply_invalid", "A mail reply requires the exact sender's server route", 409
+            )
+        title = payload.get("title")
+        subjects_supported = False
+        if kind == "message" and (title is not None or reply_to is not None):
+            # A title must never be silently lost on an older Hub. Check the
+            # selected realm before uploading any attachments or posting mail.
+            if realm["realm"] == "host":
+                with self._guard:
+                    store = self._hub_store
+                health = store.health() if store is not None and store.hub_id == realm.get("hub_id") else None
+            else:
+                health = self._team_hub_get(realm, "/v1/health", {})
+            capabilities = health.get("capabilities") if isinstance(health, dict) else None
+            capability = capabilities.get("team_mail_subjects_v1") if isinstance(capabilities, dict) else None
+            subjects_supported = (
+                isinstance(capability, dict)
+                and capability.get("available") is True
+                and type(capability.get("version")) is int
+                and capability["version"] == 1
+                and type(capability.get("max_subject_chars")) is int
+                and capability["max_subject_chars"] == 160
+            )
+            if title is not None and not subjects_supported:
+                raise SecurePeerError(
+                    "mail_subjects_unavailable",
+                    "This Team Hub does not support mail subjects",
+                    409,
+                )
+        if reply_to is not None:
+            result = self._team_hub_get(
+                realm, f"{team_path}/messages/{quote(reply_to, safe='')}",
+                {"include_mail_subject": True} if subjects_supported else {},
+            )
+            parent = result.get("message") if isinstance(result, dict) else None
+            sender = parent.get("sender") if isinstance(parent, dict) else None
+            delivery = parent.get("delivery") if isinstance(parent, dict) else None
+            parent_recipients = parent.get("recipients") if isinstance(parent, dict) else None
+            # The authenticated host/peer detail projects delivery only from
+            # this automation principal's owned server inbox. Body text, links,
+            # display names and provenance cannot supply reply authority.
+            if not (
+                isinstance(parent, dict)
+                and parent.get("id") == reply_to
+                and parent.get("kind") == "message"
+                and parent.get("skill") is None
+                and parent.get("destination") in (None, "all_servers")
+                and isinstance(sender, dict)
+                and sender.get("kind") == "server"
+                and sender.get("id") == reference["target_id"]
+                and isinstance(delivery, dict)
+                and delivery.get("kind") == "server"
+                and isinstance(delivery.get("id"), str)
+                and bool(delivery["id"])
+                and delivery["id"] != sender["id"]
+                and isinstance(parent_recipients, list)
+                and bool(parent_recipients)
+                and all(isinstance(item, dict) and item.get("kind") == "server"
+                        and isinstance(item.get("id"), str) and bool(item["id"])
+                        for item in parent_recipients)
+                and any(item["id"] == delivery["id"] for item in parent_recipients)
+            ):
+                raise SecurePeerError(
+                    "team_reply_invalid",
+                    "Reply target is not incoming mail from the authorized server sender",
+                    409,
+                )
+            if title is None and subjects_supported:
+                title = HubStore._team_mail_subject(parent.get("title"))
         attachment_ids: list[str] = []
         for index, path in enumerate(attachment_paths):
             attachment_ids.append(
@@ -6591,8 +6926,12 @@ class SecurePeerRuntime:
             "provenance": dict(provenance),
             "idempotency_key": idempotency_key,
         }
-        if payload.get("title"):
+        if kind == "message" and title is not None:
+            body["title"] = title
+        elif payload.get("title"):
             body["title"] = str(payload["title"])
+        if reply_to is not None:
+            body["in_reply_to_message_id"] = reply_to
         skill = payload.get("skill")
         if kind == "skill":
             details = dict(skill or {})
@@ -6781,14 +7120,6 @@ class SecurePeerRuntime:
             raise SecurePeerError(
                 "remote_invalid", "Team Hub returned an invalid attachment chunk size", 502
             )
-        store = None
-        claims = None
-        if realm["realm"] == "host":
-            with self._guard:
-                store = self._hub_store
-            if store is None:
-                raise SecurePeerError("team_unavailable", "Team Hub is unavailable", 409)
-            claims = store.local_agent_mail_claims(str(realm["team_id"]))
         offset = int(attachment["received_bytes"])
         os.lseek(descriptor, offset, os.SEEK_SET)
         while offset < size:
@@ -6796,15 +7127,16 @@ class SecurePeerRuntime:
             if not chunk:
                 break
             if realm["realm"] == "host":
-                assert store is not None and claims is not None
-                store.write_team_attachment_chunk(
-                    claims,
-                    str(realm["team_id"]),
-                    attachment_id,
-                    offset=offset,
-                    total=size,
-                    data=chunk,
-                )
+                with self._host_store_operation(realm, write=True) as store:
+                    claims = store.local_agent_mail_claims(str(realm["team_id"]))
+                    store.write_team_attachment_chunk(
+                        claims,
+                        str(realm["team_id"]),
+                        attachment_id,
+                        offset=offset,
+                        total=size,
+                        data=chunk,
+                    )
             else:
                 response = self.proxy_team_attachment_chunk(
                     str(realm["connection_id"]),
@@ -7035,6 +7367,8 @@ class SecurePeerRuntime:
                 lease.close()
 
     def shutdown(self) -> None:
+        self._completion_closing = True
+        self._notify_pairing_completion()
         self.close_host_admission()
         with self._guard:
             gateway = self._gateway

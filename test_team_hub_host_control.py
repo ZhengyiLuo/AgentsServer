@@ -52,6 +52,52 @@ def _request(name: str, *, request_id: str | None = None, network_name: str | No
 
 
 class TeamHubHostControlTests(unittest.IsolatedAsyncioTestCase):
+    def test_foreign_journal_scope_is_rejected_before_access_or_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            journal = root / "foreign" / "team-hub-host.json"
+            journal.parent.mkdir()
+            original = '{"phase":"failed","_live_reactivation":{"preserve":true}}'
+            journal.write_text(original)
+            with (
+                patch.object(agent_server, "TEAM_HUB_DATA_DIR", root / "isolated" / "team-hub"),
+                patch.object(agent_server, "TEAM_HUB_HOST_CONTROL_STATUS_FILE", journal),
+                patch.object(agent_server, "team_hub_activation_lease") as lease,
+                patch.object(agent_server, "_activate_team_hub_host_sync") as activate,
+                patch.object(agent_server, "atomic_update_json") as write,
+            ):
+                for operation in (
+                    agent_server.read_team_hub_host_control_status,
+                    lambda: agent_server.write_team_hub_host_control_status(phase="complete"),
+                    lambda: agent_server.activate_team_hub_host_sync("Studio"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "active server state directory"):
+                        operation()
+                lease.assert_not_called()
+                activate.assert_not_called()
+                write.assert_not_called()
+            self.assertEqual(journal.read_text(), original)
+
+    def test_journal_scope_accepts_contained_paths_and_rejects_symlink_escapes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            state.mkdir()
+            foreign = root / "foreign"
+            foreign.mkdir()
+            (foreign / "record.json").write_text('{"phase":"failed"}')
+            (state / "linked-admin").symlink_to(foreign, target_is_directory=True)
+            (state / "linked-record.json").symlink_to(foreign / "record.json")
+            with patch.object(agent_server, "TEAM_HUB_DATA_DIR", state / "team-hub"):
+                for journal in (state / "record.json", state / "missing" / "admin" / "record.json"):
+                    with patch.object(agent_server, "TEAM_HUB_HOST_CONTROL_STATUS_FILE", journal):
+                        self.assertEqual(agent_server.scoped_team_hub_host_control_status_path(), journal.resolve())
+                        self.assertEqual(agent_server.read_team_hub_host_control_status(), {"phase": "idle"})
+                for journal in (state, state / "linked-admin" / "record.json", state / "linked-record.json"):
+                    with patch.object(agent_server, "TEAM_HUB_HOST_CONTROL_STATUS_FILE", journal):
+                        with self.assertRaisesRegex(RuntimeError, "active server state directory"):
+                            agent_server.read_team_hub_host_control_status()
+
     def test_request_requires_canonical_bounded_server_name(self) -> None:
         for name in ("", " Studio", "Studio\nInjected", "界" * 54):
             with self.subTest(name=name), self.assertRaises(ValidationError):
@@ -590,6 +636,7 @@ class TeamHubHostControlTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch.object(agent_server, "TEAM_HUB_RUNTIME", runtime),
                 patch.object(agent_server, "SECURE_PEER_RUNTIME", peer),
+                patch.object(agent_server, "TEAM_HUB_DATA_DIR", root / "team-hub"),
                 patch.object(agent_server, "CONFIG_ENV_FILE", root / "config" / "env"),
                 patch.object(
                     agent_server,

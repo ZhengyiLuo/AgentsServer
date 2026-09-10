@@ -1753,7 +1753,7 @@ class VendoredTeamHubParityTests(unittest.TestCase):
             "__init__.py": "154fbe20574096cff3a5012d8720d51e024c5f077cc1044c3ea6cd5ad6f96861",
             "auth.py": "d939fd30bdd93cf53183de5b5ff21be43d2a7a2cc9d2ce6dc00a49c888db41db",
             "cli.py": "c5827f30d90420d2e362389530154255ca6039c1c524edec29a5d219b96328d3",
-            "database.py": "c7a9bb1e132e6eba5d20de358e3c83b43d36a893d324643a944ae54a802cfcab",
+            "database.py": "b4e37974d0ca3ea9a471a4aa46b9d726734cf8dbf0483e757ca4a291b125ccd5",
             "migrations/0001_identity_auth.sql": "f55a62bf6dec527e1f71df91975deaf371e2af8b6e457b9d5577437e914dc186",
             "migrations/0002_teamspace_ledger.sql": "9681100d3d6eb3986e133d761ce9d000dbcf10b5e50954c96bd168391ecacbf3",
             "migrations/0003_service_runtime.sql": "e7668e2748a581a07aeaea78e78db3a62c6c28040881ab2b696b5d5de5ab34cc",
@@ -1770,12 +1770,15 @@ class VendoredTeamHubParityTests(unittest.TestCase):
             "migrations/0014_managed_network_owner.sql": "1b35fe5ac7493ffcf49e93f359170c686c9ac8fd3cb40531b6602efd2bbf6baa",
             "migrations/0015_team_message_inbox_dismissals.sql": "f0a6bb3ceef53686db734cad0a61554c57935e552d52bbefc7e45a586ed2a1d1",
             "migrations/0016_team_message_all_servers.sql": "d0ca28e2648a9f4d5bf11be41bbf6c3594263be7ef7b74cc284ff70e98f863a6",
+            "migrations/0017_skill_announcement_deletions.sql": "e5a1cbca1a8d2623ef34598c833f525a5bc7474b97062805a9cfff41cafe92f8",
+            "migrations/0018_team_mail_subjects.sql": "a0c902e663ce25c30d35fc6dea97e5af4c02c1c7555812d111f310b996fdf30a",
+            "migrations/0019_team_mailbox_state.sql": "346ef56314dfd766f085b2bbff274e3c7eefde9ad6cc1a4804b47077d3181ed6",
             "migrations/__init__.py": "aaf340c45c8d39c2939814977ba4cef8eb6b3bd0671b0f7542ebe06f5431d6ec",
             "security.py": "0c1895c7443e7be07a2f53c7e4c4228e3ee04c65d6cd36f039b7bbba1813e4fa",
-            "secure_peer.py": "bfdb2c735d2e4c88be9efe8fb5f8ccf480c3161f243bfa975d36dfb46dae580d",
-            "secure_peer_hub.py": "a3ec702126b9dc4a3a6dbe73939188a75c04a25da3cf89a4016927abf2728472",
-            "service.py": "d1f3ec5ab0a79f9681856bda23651478bda87ee7e402ad5b6b571d8ffc1766d8",
-            "store.py": "1ae9cb57e498c0029d064e2a9a6dbed40c0b956091a2d58deb8cbb46f2c74084",
+            "secure_peer.py": "bb0a9ccc266ed64092c4d6f5903badfb62f9de9503dce4048c8ced0d3a169b1a",
+            "secure_peer_hub.py": "f99257022e2941575466fedb36a6eb101aaeb7c3868dd4d379c204312b649919",
+            "service.py": "e2b9f68f25b52571ae50993d8f54dbb1650579d531aa9f6fbe6ab8abd784456b",
+            "store.py": "6889dd8f4058ac222d00d338cb0ff23b8bfbc6aba1b17f58682533123e9a072d",
         }
         entries = list(vendored.rglob("*"))
         for path in entries:

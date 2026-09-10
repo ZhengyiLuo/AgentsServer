@@ -2,7 +2,7 @@
 """Capability-scoped Team Network helper for AgentsDock agents.
 
 Read commands (inbox, feed, sent, read, skills, skill get) are available on
-every ordinary turn.  ``routes`` and ``send`` exist only when the user
+every ordinary turn.  ``routes``, ``send``, and ``reply`` exist only when the user
 mentioned Team Network recipients with ``@@`` on this turn; the server freezes
 those recipients into opaque per-run routes.  Message bodies arrive on stdin so
 they never appear in process arguments.
@@ -18,7 +18,9 @@ import hashlib
 import ipaddress
 import json
 import os
+import re
 import sys
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -254,6 +256,7 @@ def list_box(args: argparse.Namespace, box: str) -> dict[str, Any]:
                 "after_sequence": getattr(args, "after", None),
                 "limit": args.limit,
                 "team": getattr(args, "team", None),
+                "include_mail_subject": getattr(args, "include_mail_subject", False),
             }
         ),
         capability,
@@ -285,7 +288,10 @@ def read(args: argparse.Namespace) -> dict[str, Any]:
     return _request_json(
         "GET",
         f"/api/agent/team/messages/{urllib.parse.quote(message_id, safe='')}"
-        + _query({"download": bool(args.download), "team": getattr(args, "team", None)}),
+        + _query({
+            "download": bool(args.download), "team": getattr(args, "team", None),
+            "include_mail_subject": getattr(args, "include_mail_subject", False),
+        }),
         capability,
         timeout=600.0 if args.download else 60.0,
     )
@@ -368,6 +374,15 @@ def _attachment_paths(values: list[str]) -> list[str]:
     return paths
 
 
+def _mail_subject(value: str) -> str:
+    if any(unicodedata.category(char) in {"Cc", "Cs", "Zl", "Zp"} for char in value):
+        raise TeamCLIError("--title must be a single line without control characters")
+    subject = value.strip()
+    if not 1 <= len(subject) <= 160:
+        raise TeamCLIError("--title must be between 1 and 160 characters")
+    return subject
+
+
 def send(args: argparse.Namespace) -> dict[str, Any]:
     capability, _session_id = _provider_authority(args.authority_file)
     route_id = str(args.route or "").strip()
@@ -376,8 +391,16 @@ def send(args: argparse.Namespace) -> dict[str, Any]:
     kind = str(args.kind or "message")
     if kind not in {"message", "skill"}:
         raise TeamCLIError("--kind must be message or skill")
-    if kind == "message" and args.title:
-        raise TeamCLIError("--title requires --kind skill")
+    reply_id = getattr(args, "in_reply_to", None)
+    if reply_id is not None:
+        if kind != "message":
+            raise TeamCLIError("--in-reply-to requires --kind message")
+        if not isinstance(reply_id, str) or re.fullmatch(r"[A-Za-z0-9_-]{8,240}", reply_id) is None:
+            raise TeamCLIError("reply MESSAGE_ID must contain 8 to 240 ASCII letters, digits, underscores, or hyphens")
+    title = (
+        _mail_subject(args.title) if kind == "message" and args.title is not None
+        else str(args.title).strip() if args.title else None
+    )
     body = _read_body()
     attachments = _attachment_paths(list(args.attach or []))
     payload: dict[str, Any] = {
@@ -386,8 +409,10 @@ def send(args: argparse.Namespace) -> dict[str, Any]:
         "body_format": "markdown",
         "attachments": attachments,
     }
-    if args.title:
-        payload["title"] = str(args.title).strip()
+    if title is not None:
+        payload["title"] = title
+    if reply_id is not None:
+        payload["in_reply_to_message_id"] = reply_id
     if kind == "skill":
         if not args.skill_slug:
             raise TeamCLIError("--skill-slug is required for --kind skill")
@@ -450,6 +475,7 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--limit", type=int, default=20)
         command.add_argument("--after", type=int, default=None, help="sequence cursor")
         command.add_argument("--team", default=None, help="team id when this server is in several teams")
+        command.add_argument("--include-mail-subject", action="store_true", help="request mail subjects from a compatible Team Hub")
         return command
 
     inbox_command = listing("inbox", "messages sent to this server")
@@ -472,6 +498,7 @@ def parser() -> argparse.ArgumentParser:
     read_command.add_argument("message_id")
     read_command.add_argument("--download", action="store_true", help="fetch attachments into the local team cache and print their paths")
     read_command.add_argument("--team", default=None)
+    read_command.add_argument("--include-mail-subject", action="store_true", help="request the mail subject from a compatible Team Hub")
     read_command.set_defaults(handler=read)
 
     skills_command = commands.add_parser(
@@ -503,22 +530,42 @@ def parser() -> argparse.ArgumentParser:
     )
     routes_command.set_defaults(handler=routes)
 
+    def message_send_options(command: argparse.ArgumentParser) -> None:
+        command.add_argument("--route", required=True)
+        command.add_argument("--title", default=None, help="optional single-line mail subject (max 160 characters; requires Hub support), or required skill title")
+        command.add_argument("--attach", action="append", default=[], metavar="/abs/path")
+        command.add_argument("--idempotency-key", help=argparse.SUPPRESS)
+
     send_command = commands.add_parser(
         "send",
         help="send one message to a route; the Markdown body is read from stdin",
         allow_abbrev=False,
     )
-    send_command.add_argument("--route", required=True)
+    message_send_options(send_command)
     send_command.add_argument("--kind", choices=("message", "skill"), default="message")
-    send_command.add_argument("--title", default=None)
+    send_command.add_argument(
+        "--in-reply-to", default=None, metavar="MESSAGE_ID",
+        help="reply to this message using its sender's frozen @@ route; no reply-all (message kind only)",
+    )
     send_command.add_argument("--skill-slug", default=None)
     send_command.add_argument("--summary", default=None)
     send_command.add_argument("--tags", default=None, help="comma-separated tags")
     send_command.add_argument("--change-note", default=None)
     send_command.add_argument("--expected-version", type=int, default=None)
-    send_command.add_argument("--attach", action="append", default=[], metavar="/abs/path")
-    send_command.add_argument("--idempotency-key", help=argparse.SUPPRESS)
     send_command.set_defaults(handler=send)
+
+    reply_command = commands.add_parser(
+        "reply",
+        help="reply to a message sender through this turn's frozen @@ sender route; no reply-all",
+        description="Reply only to the message sender using a frozen route from this turn's explicit @@ sender mention; no reply-all. The Markdown body is read from stdin.",
+        allow_abbrev=False,
+    )
+    reply_command.add_argument("in_reply_to", metavar="MESSAGE_ID")
+    message_send_options(reply_command)
+    reply_command.set_defaults(
+        handler=send, kind="message", skill_slug=None, summary=None, tags=None,
+        change_note=None, expected_version=None,
+    )
     return root
 
 

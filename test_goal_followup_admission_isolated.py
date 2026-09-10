@@ -235,7 +235,7 @@ class GoalFollowupAdmissionTests(unittest.IsolatedAsyncioTestCase):
         await self.assert_rejected(guard="delivery_uncertain")
 
     async def test_delivery_authorization_and_order_guards_remain_stronger(self):
-        for purpose in ("local_delivery", "peer_delivery", "scheduled_job"):
+        for purpose in ("local_delivery", "peer_delivery"):
             with self.subTest(purpose=purpose):
                 self.selected["purpose"] = purpose
                 await self.assert_rejected(guard="selected_cross_chat_delivery")
@@ -243,6 +243,16 @@ class GoalFollowupAdmissionTests(unittest.IsolatedAsyncioTestCase):
                 self.queue[0]["purpose"] = purpose
                 await self.assert_rejected(guard="prior_cross_chat_delivery")
                 self.queue[0].pop("purpose")
+
+    async def test_special_purpose_input_cannot_enter_plain_goal_steering(self):
+        # Scheduler-specific queue precedence belongs to its separate change.
+        # Goal admission itself must reject all special-purpose selected input,
+        # without relying on that change or changing ownership/queue contents.
+        for purpose in ("scheduled_job", "standalone_task"):
+            with self.subTest(purpose=purpose):
+                self.selected["purpose"] = purpose
+                await self.assert_rejected(guard=None)
+                self.selected.pop("purpose")
 
     async def test_non_goal_and_paused_goal_keep_legacy_lifecycle_probe(self):
         self.active.pop("native_steer_queue")

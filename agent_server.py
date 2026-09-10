@@ -51518,7 +51518,8 @@ async def consume_codex_native_turn(
 ) -> None:
     """Project a native control turn and own its reserved chat slot."""
     assistant_deltas: dict[str, list[str]] = {}
-    reasoning_deltas: dict[str, list[str]] = {}
+    reasoning_summary_deltas: dict[str, list[str]] = {}
+    plan_deltas: dict[str, list[str]] = {}
     terminal_status = "completed"
     terminal_error: str | None = None
     schedule_queue = True
@@ -51614,8 +51615,11 @@ async def consume_codex_native_turn(
                 seen_goal_turn_ids.add(notification_turn_id)
                 turn_id = notification_turn_id
                 goal_turn_running = True
+                terminal_status = "completed"
+                terminal_error = None
                 assistant_deltas.clear()
-                reasoning_deltas.clear()
+                reasoning_summary_deltas.clear()
+                plan_deltas.clear()
             if turn_id and notification_turn_id and notification_turn_id != turn_id:
                 continue
             if method == "turn/started":
@@ -51623,6 +51627,8 @@ async def consume_codex_native_turn(
                 interrupt_turn_id = notification_turn_id
                 if notification_turn_id and not turn_id:
                     turn_id = notification_turn_id
+                    terminal_status = "completed"
+                    terminal_error = None
                 if notification_turn_id:
                     async with ACTIVE_LOCK:
                         active = ACTIVE.get(session_id)
@@ -51680,12 +51686,13 @@ async def consume_codex_native_turn(
                     str(params.get("delta") or "")
                 )
                 continue
-            if method in {
-                "item/reasoning/summaryTextDelta",
-                "item/reasoning/textDelta",
-                "item/plan/delta",
-            } and item_id:
-                reasoning_deltas.setdefault(item_id, []).append(
+            if method == "item/reasoning/summaryTextDelta" and item_id:
+                reasoning_summary_deltas.setdefault(item_id, []).append(
+                    str(params.get("delta") or "")
+                )
+                continue
+            if method == "item/plan/delta" and item_id:
+                plan_deltas.setdefault(item_id, []).append(
                     str(params.get("delta") or "")
                 )
                 continue
@@ -51697,6 +51704,8 @@ async def consume_codex_native_turn(
                         "tool_started",
                         {
                             "run_id": operation_id,
+                            "provider_turn_id": turn_id,
+                            "item_id": item_id,
                             "tool": tool,
                             "purpose": f"codex_{operation}",
                         },
@@ -51705,16 +51714,18 @@ async def consume_codex_native_turn(
             if method == "item/completed" and item:
                 item_type = str(item.get("type") or "")
                 if item_type == "agentMessage":
+                    buffered = assistant_deltas.pop(item_id, [])
                     text = clean_assistant_text(
                         str(
                             item.get("text")
-                            or "".join(assistant_deltas.pop(item_id, []))
+                            or "".join(buffered)
                         )
                     )
                     if text:
+                        phase = str(item.get("phase") or "")
                         event_type = (
                             "reasoning_summary"
-                            if str(item.get("phase") or "") == "commentary"
+                            if phase == "commentary"
                             else "assistant_text"
                         )
                         await append_event(
@@ -51722,20 +51733,29 @@ async def consume_codex_native_turn(
                             event_type,
                             {
                                 "run_id": operation_id,
+                                "provider_turn_id": turn_id,
+                                "item_id": item_id,
+                                **({"phase": phase} if phase in {"commentary", "final_answer"} else {}),
                                 "text": text,
                                 "purpose": f"codex_{operation}",
                             },
                         )
                 elif item_type in {"reasoning", "plan"}:
-                    text = codex_reasoning_text(item) or "".join(
-                        reasoning_deltas.pop(item_id, [])
-                    )
+                    if item_type == "reasoning":
+                        buffered = reasoning_summary_deltas.pop(item_id, [])
+                        text = codex_app_server_reasoning_summary(item) or "".join(buffered)
+                    else:
+                        buffered = plan_deltas.pop(item_id, [])
+                        text = codex_reasoning_text(item) or "".join(buffered)
                     if text:
                         await append_event(
                             session_id,
                             "reasoning_summary",
                             {
                                 "run_id": operation_id,
+                                "provider_turn_id": turn_id,
+                                "item_id": item_id,
+                                "phase": "plan" if item_type == "plan" else "summary",
                                 "text": text,
                                 "purpose": f"codex_{operation}",
                             },
@@ -51768,6 +51788,8 @@ async def consume_codex_native_turn(
                             "tool_finished",
                             {
                                 "run_id": operation_id,
+                                "provider_turn_id": turn_id,
+                                "item_id": item_id,
                                 "tool_id": tool["id"],
                                 "tool": tool,
                                 "output": output,
@@ -51778,10 +51800,13 @@ async def consume_codex_native_turn(
                         )
                 continue
             if method == "error":
-                terminal_status = "failed"
-                terminal_error = concise_error_message(
+                message = concise_error_message(
                     params.get("error") or params.get("message") or params
                 )
+                if is_codex_app_server_retry_notice(params, message):
+                    continue
+                terminal_status = "failed"
+                terminal_error = message
                 continue
             if method == "turn/completed":
                 completed_turn = (
@@ -51792,6 +51817,10 @@ async def consume_codex_native_turn(
                 terminal_status = str(completed_turn.get("status") or "failed")
                 if completed_turn.get("error"):
                     terminal_error = concise_error_message(completed_turn["error"])
+                elif terminal_status == "completed":
+                    # The provider's successful terminal packet supersedes
+                    # transient error notices from this exact native turn.
+                    terminal_error = None
                 if goal_resume:
                     goal_turn_running = False
                     goal_clock_started = None
@@ -54666,6 +54695,14 @@ def concise_error_message(value: Any) -> str:
 
 def is_codex_reconnect_notice(message: str) -> bool:
     return bool(re.match(r"^Reconnecting\.\.\.\s+\d+/\d+\b", str(message or "").strip(), re.IGNORECASE))
+
+
+def is_codex_app_server_retry_notice(params: dict[str, Any], message: str) -> bool:
+    """Retry progress is not a terminal error; an explicit refusal wins."""
+    will_retry = params.get("willRetry")
+    return will_retry is True or (
+        will_retry is not False and is_codex_reconnect_notice(message)
+    )
 
 
 def codex_result_error(event: dict[str, Any]) -> str | None:

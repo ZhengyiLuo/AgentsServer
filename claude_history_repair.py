@@ -141,7 +141,7 @@ def _steer_intervals(events: list[dict], provider_id: str) -> list[tuple[float, 
         if kind == "turn_queue_run_now":
             key = event.get("interrupted_run_id")
             destination = queues
-        elif kind == "turn_finished":
+        elif kind in ("turn_finished", "turn_stopped"):
             key = event.get("run_id")
             destination = finished
         else:
@@ -157,9 +157,17 @@ def _steer_intervals(events: list[dict], provider_id: str) -> list[tuple[float, 
         queue, terminal, start = queued[0], ended[0], following[0]
         queued_id = queue.get("queued_id")
         next_run = start.get("run_id")
+        terminal_proven = (
+            terminal.get("type") == "turn_finished"
+            and terminal.get("stopped") is True
+            and terminal.get("exit_code") is None
+        ) or (
+            terminal.get("type") == "turn_stopped"
+            and terminal.get("native_steer") is True
+            and terminal.get("superseded_by_run_id") == next_run
+        )
         if (
-            terminal.get("stopped") is not True
-            or terminal.get("exit_code") is not None
+            not terminal_proven
             or terminal.get("provider_session_id") != provider_id
             or not isinstance(queued_id, str) or not queued_id
             or start.get("queued_id") != queued_id
@@ -203,12 +211,13 @@ def _native_control(event: dict, session_id: str) -> dict | None:
     if not (
         event.get("session_id") == session_id and event.get("backend") == "claude"
         and event.get("imported") is not True
-        and event.get("type") in ("turn_queue_run_now", "turn_finished", "turn_started")
+        and event.get("type") in ("turn_queue_run_now", "turn_finished", "turn_stopped", "turn_started")
     ):
         return None
     return {key: event[key] for key in (
         "type", "ts", "run_id", "queued_id", "interrupted_run_id",
         "steer_interrupted_run_id", "provider_session_id", "stopped", "exit_code",
+        "native_steer", "superseded_by_run_id",
     ) if key in event}
 
 
@@ -404,7 +413,7 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
             interruption_count += 1
             if interruption_count > MAX_TARGETS:
                 raise _Unproven()
-        if event.get("isMeta") is True or event.get("isCompactSummary") is True:
+        if event.get("isMeta") is True or event.get("isCompactSummary") is True or event.get("isSidechain") is True:
             metadata.setdefault(key, []).append(offset)
         else:
             # Preserve the existing global ambiguity rule for isMeta repairs.
@@ -629,8 +638,7 @@ def _prove_recent_scheduled(session_id: str, provider_id: str, events: Path, roo
                 ranges.setdefault(key, []).append((run, start_time, end_time))
     source_matches, occurrence_counts, identity_counts, source_metadata = {}, {}, {}, {}
     for event, offset in _bounded_records(source, source_stamp, window_start, checkpoint_end):
-        if (event.get("type") != "user" or event.get("sessionId") != provider_id
-                or event.get("isSidechain") is True):
+        if event.get("type") != "user" or event.get("sessionId") != provider_id:
             continue
         identity = (event.get("uuid"), provider_id, event.get("timestamp"))
         if not all(isinstance(value, str) and value for value in identity):
@@ -640,7 +648,7 @@ def _prove_recent_scheduled(session_id: str, provider_id: str, events: Path, roo
         timestamp = _timestamp(identity[2])
         if not isinstance(display_text, str) or not display_text or timestamp is None:
             continue
-        if event.get("isMeta") is True or event.get("isCompactSummary") is True:
+        if event.get("isMeta") is True or event.get("isCompactSummary") is True or event.get("isSidechain") is True:
             source_metadata.setdefault((identity, _text_key(display_text)), []).append(offset)
             if len(identity_counts) + len(source_metadata) > MAX_KEYS:
                 raise _Unproven()

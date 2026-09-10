@@ -130,6 +130,13 @@ class ClaudeHistoryMetadataTests(unittest.TestCase):
         for flag in (None, False, "true", 1):
             self.assertEqual(self.item(user_event(text, isCompactSummary=flag)), {"kind": "user", "text": text})
 
+    def test_sidechain_scope_is_not_parent_user_input_but_marker_quotes_remain(self) -> None:
+        marker = "[Request interrupted by user for tool use]"
+        self.assertIsNone(self.item(user_event(marker, isSidechain=True)))
+        self.assertIsNone(self.item({"type": "assistant", "isSidechain": True, "message": {"content": "Child output"}}))
+        for flag in (None, False, "true", 1):
+            self.assertEqual(self.item(user_event(marker, isSidechain=flag)), {"kind": "user", "text": marker})
+
     def test_assistant_text_and_non_user_events_are_unchanged(self) -> None:
         self.assertEqual(self.item({
             "type": "assistant", "isMeta": True,

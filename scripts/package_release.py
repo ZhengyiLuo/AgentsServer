@@ -20,6 +20,7 @@ FILES = (
     "secure_peer_runtime.py",
     "team_mail_runtime.py",
     "team_mail_websocket.py",
+    "team_mail_grants.py",
     "secure_peer_delivery.py",
     "agentsdock_jobs.py",
     "agentsdock_chats.py",

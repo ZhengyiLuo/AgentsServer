@@ -1,6 +1,11 @@
-# AgentsServer 0.1.26-beta.52
+# AgentsServer 0.1.26-beta.53
 
 Fixes-only beta based on the published `0.1.26-beta.51` release.
+
+The beta.52 candidate was not published: its full release gate exposed one
+timeline-test fixture that did not yet expect history-preparation offloads.
+This retry verifies those preparation calls and the existing page-read calls
+in their exact sequence; no production behavior changed for this correction.
 
 - Keep native Codex goal commentary, final answers, public summaries, plans,
   and tools associated with their exact provider turn and item. Retriable

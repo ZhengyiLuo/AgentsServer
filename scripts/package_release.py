@@ -72,6 +72,7 @@ DIRECTORY_FILES = {
         "migrations/0015_team_message_inbox_dismissals.sql",
         "migrations/0016_team_message_all_servers.sql",
         "migrations/0017_skill_announcement_deletions.sql",
+        "migrations/0018_team_mail_subjects.sql",
     ),
 }
 DIRECTORIES = tuple(DIRECTORY_FILES)

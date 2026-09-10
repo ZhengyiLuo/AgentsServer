@@ -3214,6 +3214,11 @@ class HubStore:
                     # an exact key list keep working unchanged.
                     "team_messages_v1": self.team_messages_capability(),
                     "team_all_servers_alias_v1": self.team_all_servers_capability(),
+                    "team_mail_subjects_v1": {
+                        "available": True,
+                        "version": 1,
+                        "max_subject_chars": MAX_TEAM_MESSAGE_TITLE_CHARS,
+                    },
                 },
             }
         finally:
@@ -11694,6 +11699,19 @@ class HubStore:
     # -- validation helpers -------------------------------------------------
 
     @staticmethod
+    def _team_mail_subject(value: Any) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str) or any(
+            unicodedata.category(char) in {"Cc", "Cs", "Zl", "Zp"} for char in value
+        ):
+            raise HubError("invalid_request", "Mail subject must be a single line without control characters", 422)
+        subject = value.strip()
+        if not 1 <= len(subject) <= MAX_TEAM_MESSAGE_TITLE_CHARS:
+            raise HubError("invalid_request", "Mail subject must be between 1 and 160 characters", 422)
+        return subject
+
+    @staticmethod
     def _team_text(
         value: Any,
         field: str,
@@ -12087,6 +12105,7 @@ class HubStore:
         *,
         include_body: bool,
         include_revision: bool = False,
+        include_mail_subject: bool = False,
         owned: list[tuple[str, str]] | None = None,
         delivery_address: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
@@ -12101,7 +12120,9 @@ class HubStore:
             # Old pre-V2 writers could persist a title on an ordinary message.
             # Keep the wire contract strict so one legacy row cannot poison a
             # client's entire inbox/feed response.
-            "title": row["title"] if row["kind"] == "skill" else None,
+            "title": row["title"] if row["kind"] == "skill" else (
+                row["mail_subject"] if include_mail_subject else None
+            ),
             "body_format": row["current_body_format"],
             "body_bytes": int(row["body_bytes"]),
             "body_sha256": bytes(row["current_body_sha256"]).hex(),
@@ -12254,11 +12275,10 @@ class HubStore:
         kind = request.get("kind")
         if kind not in {"message", "skill"}:
             raise HubError("invalid_request", "Message kind is invalid", 422)
-        title = self._team_text(
-            request.get("title"), "title", 1, MAX_TEAM_MESSAGE_TITLE_CHARS, allow_none=True
+        title = (
+            self._team_mail_subject(request.get("title")) if kind == "message" else
+            self._team_text(request.get("title"), "title", 1, MAX_TEAM_MESSAGE_TITLE_CHARS, allow_none=True)
         )
-        if kind == "message" and title is not None:
-            raise HubError("invalid_request", "Only skill posts carry a title", 422)
         body, body_format, body_digest, body_bytes = self._team_body(request)
         provenance_json = self._team_provenance(request.get("provenance"))
         idempotency_key = self._team_idempotency_key(request)
@@ -12584,14 +12604,15 @@ class HubStore:
                         id,team_id,kind,title,body_format,body,body_sha256,
                         sender_kind,sender_principal_id,sender_node_id,provenance_json,
                         in_reply_to_message_id,skill_id,skill_version,
-                        attachment_count,attachment_bytes,idempotency_key,created_at,destination
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        attachment_count,attachment_bytes,idempotency_key,created_at,destination,
+                        mail_subject
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         message_id,
                         team_id,
                         kind,
-                        title,
+                        title if kind == "skill" else None,
                         body_format,
                         body,
                         body_digest,
@@ -12611,6 +12632,7 @@ class HubStore:
                         ).digest(),
                         timestamp,
                         "all_servers" if all_servers else None,
+                        title if kind == "message" else None,
                     ),
                 )
                 for recipient_kind, node_id, principal_id in resolved:
@@ -12668,7 +12690,9 @@ class HubStore:
                 ).fetchone()
                 assert row is not None
                 response = {
-                    "message": self._team_message_public(connection, row, include_body=True)
+                    "message": self._team_message_public(
+                        connection, row, include_body=True, include_mail_subject=title is not None
+                    )
                 }
                 if len(canonical_json(response)) > MAX_NETWORK_PAGE_RESPONSE_BYTES:
                     raise HubError("recipient_limit", "Message recipient response exceeds the size limit", 413)
@@ -12736,6 +12760,7 @@ class HubStore:
         after_sequence: int = 0,
         limit: int = 50,
         include_revision: bool = False,
+        include_mail_subject: bool = False,
     ) -> dict[str, Any]:
         if box not in {"inbox", "feed", "sent"}:
             raise HubError("invalid_request", "Message box is invalid", 422)
@@ -12824,6 +12849,7 @@ class HubStore:
                     row,
                     include_body=False,
                     include_revision=include_revision,
+                    include_mail_subject=include_mail_subject,
                     owned=owned if box == "inbox" else None,
                     delivery_address=(str(address_kind), str(address_id))
                     if box == "inbox"
@@ -12869,6 +12895,7 @@ class HubStore:
         message_id: str,
         *,
         include_revision: bool = False,
+        include_mail_subject: bool = False,
     ) -> dict[str, Any]:
         connection = self.connect()
         try:
@@ -12900,6 +12927,7 @@ class HubStore:
                     row,
                     include_body=True,
                     include_revision=include_revision,
+                    include_mail_subject=include_mail_subject,
                     owned=owned,
                 )
             }
@@ -12977,6 +13005,8 @@ class HubStore:
         team_id: str,
         message_id: str,
         request: dict[str, Any],
+        *,
+        include_mail_subject: bool = False,
     ) -> dict[str, Any]:
         """Append an author-only body revision to a broadcast Team Message."""
 
@@ -13008,7 +13038,9 @@ class HubStore:
                     fingerprint,
                 )
                 if cached is not None:
-                    return cached
+                    return self._team_revision_response_subject(
+                        connection, team_id, message_id, cached, include_mail_subject
+                    )
                 row = connection.execute(
                     self._team_message_select()
                     + """
@@ -13140,11 +13172,32 @@ class HubStore:
                     "team.message.revised",
                     timestamp,
                 )
-                return response
+                return self._team_revision_response_subject(
+                    connection, team_id, message_id, response, include_mail_subject
+                )
         except sqlite3.IntegrityError as exc:
             raise HubError("conflict", "Team message revision conflicts", 409) from exc
         finally:
             connection.close()
+
+    @staticmethod
+    def _team_revision_response_subject(
+        connection: sqlite3.Connection,
+        team_id: str,
+        message_id: str,
+        response: dict[str, Any],
+        include_mail_subject: bool,
+    ) -> dict[str, Any]:
+        # Cache the legacy-compatible mutation response; negotiate its immutable
+        # subject on each reply, including idempotent retries from old readers.
+        subject = None
+        if include_mail_subject:
+            row = connection.execute(
+                "SELECT mail_subject FROM team_messages WHERE team_id=? AND id=? AND kind='message'",
+                (team_id, message_id),
+            ).fetchone()
+            subject = row["mail_subject"] if row is not None else None
+        return {**response, "message": {**response["message"], "title": subject}}
 
     def delete_team_message(
         self,

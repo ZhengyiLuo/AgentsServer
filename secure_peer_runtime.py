@@ -6498,6 +6498,7 @@ class SecurePeerRuntime:
                 since=query.get("since"),
                 after_sequence=int(query.get("after_sequence", "0")),
                 limit=int(query.get("limit", "50")),
+                include_mail_subject=flag("include_mail_subject"),
             )
         if method == "GET" and pieces == ["deletions"]:
             return store.list_network_content_deletions(
@@ -6507,7 +6508,10 @@ class SecurePeerRuntime:
                 limit=int(query.get("limit", "50")),
             )
         if method == "GET" and len(pieces) == 2 and pieces[0] == "messages":
-            return store.get_team_message(claims, team_id, pieces[1])
+            return store.get_team_message(
+                claims, team_id, pieces[1],
+                include_mail_subject=flag("include_mail_subject"),
+            )
         if method == "POST" and pieces == ["messages"]:
             return store.create_team_message(claims, team_id, dict(body or {}))
         if method == "POST" and len(pieces) == 3 and pieces[0] == "messages" and pieces[2] == "receipts":
@@ -6549,7 +6553,10 @@ class SecurePeerRuntime:
         since: str | None = None,
         after_sequence: int = 0,
         limit: int = 50,
+        include_mail_subject: bool = False,
     ) -> dict[str, Any]:
+        if type(include_mail_subject) is not bool:
+            raise SecurePeerError("invalid_request", "Mail subject projection flag is invalid", 422)
         realm = self.team_realm(team_id)
         result = self._team_hub_get(
             realm,
@@ -6560,17 +6567,26 @@ class SecurePeerRuntime:
                 "since": since,
                 "after_sequence": after_sequence,
                 "limit": limit,
+                "include_mail_subject": include_mail_subject,
             },
         )
         result["team_id"] = realm["team_id"]
         return result
 
-    def team_get_message(self, message_id: str, *, team_id: str | None = None) -> dict[str, Any]:
+    def team_get_message(
+        self,
+        message_id: str,
+        *,
+        team_id: str | None = None,
+        include_mail_subject: bool = False,
+    ) -> dict[str, Any]:
+        if type(include_mail_subject) is not bool:
+            raise SecurePeerError("invalid_request", "Mail subject projection flag is invalid", 422)
         realm = self.team_realm(team_id)
         result = self._team_hub_get(
             realm,
             f"/v1/teams/{quote(realm['team_id'], safe='')}/network/messages/{quote(message_id, safe='')}",
-            {},
+            {"include_mail_subject": include_mail_subject},
         )
         result["team_id"] = realm["team_id"]
         return result
@@ -6714,6 +6730,86 @@ class SecurePeerRuntime:
             recipients = [
                 {"kind": str(reference.get("recipient_kind")), "id": str(reference.get("target_id"))}
             ]
+        reply_to = payload.get("in_reply_to_message_id")
+        if reply_to is not None and not (
+            isinstance(reply_to, str)
+            and re.fullmatch(r"[A-Za-z0-9_-]{8,240}", reply_to)
+            and kind == "message"
+            and reference.get("kind") == "recipient"
+            and reference.get("recipient_kind") == "server"
+            and isinstance(reference.get("target_id"), str)
+            and reference["target_id"]
+        ):
+            raise SecurePeerError(
+                "team_reply_invalid", "A mail reply requires the exact sender's server route", 409
+            )
+        title = payload.get("title")
+        subjects_supported = False
+        if kind == "message" and (title is not None or reply_to is not None):
+            # A title must never be silently lost on an older Hub. Check the
+            # selected realm before uploading any attachments or posting mail.
+            if realm["realm"] == "host":
+                with self._guard:
+                    store = self._hub_store
+                health = store.health() if store is not None and store.hub_id == realm.get("hub_id") else None
+            else:
+                health = self._team_hub_get(realm, "/v1/health", {})
+            capabilities = health.get("capabilities") if isinstance(health, dict) else None
+            capability = capabilities.get("team_mail_subjects_v1") if isinstance(capabilities, dict) else None
+            subjects_supported = (
+                isinstance(capability, dict)
+                and capability.get("available") is True
+                and type(capability.get("version")) is int
+                and capability["version"] == 1
+                and type(capability.get("max_subject_chars")) is int
+                and capability["max_subject_chars"] == 160
+            )
+            if title is not None and not subjects_supported:
+                raise SecurePeerError(
+                    "mail_subjects_unavailable",
+                    "This Team Hub does not support mail subjects",
+                    409,
+                )
+        if reply_to is not None:
+            result = self._team_hub_get(
+                realm, f"{team_path}/messages/{quote(reply_to, safe='')}",
+                {"include_mail_subject": True} if subjects_supported else {},
+            )
+            parent = result.get("message") if isinstance(result, dict) else None
+            sender = parent.get("sender") if isinstance(parent, dict) else None
+            delivery = parent.get("delivery") if isinstance(parent, dict) else None
+            parent_recipients = parent.get("recipients") if isinstance(parent, dict) else None
+            # The authenticated host/peer detail projects delivery only from
+            # this automation principal's owned server inbox. Body text, links,
+            # display names and provenance cannot supply reply authority.
+            if not (
+                isinstance(parent, dict)
+                and parent.get("id") == reply_to
+                and parent.get("kind") == "message"
+                and parent.get("skill") is None
+                and parent.get("destination") in (None, "all_servers")
+                and isinstance(sender, dict)
+                and sender.get("kind") == "server"
+                and sender.get("id") == reference["target_id"]
+                and isinstance(delivery, dict)
+                and delivery.get("kind") == "server"
+                and isinstance(delivery.get("id"), str)
+                and bool(delivery["id"])
+                and delivery["id"] != sender["id"]
+                and isinstance(parent_recipients, list)
+                and bool(parent_recipients)
+                and all(isinstance(item, dict) and item.get("kind") == "server"
+                        and isinstance(item.get("id"), str) and bool(item["id"])
+                        for item in parent_recipients)
+                and any(item["id"] == delivery["id"] for item in parent_recipients)
+            ):
+                raise SecurePeerError(
+                    "team_reply_invalid",
+                    "Reply target is not incoming mail from the authorized server sender",
+                    409,
+                )
+            if title is None and subjects_supported:
+                title = HubStore._team_mail_subject(parent.get("title"))
         attachment_ids: list[str] = []
         for index, path in enumerate(attachment_paths):
             attachment_ids.append(
@@ -6732,8 +6828,12 @@ class SecurePeerRuntime:
             "provenance": dict(provenance),
             "idempotency_key": idempotency_key,
         }
-        if payload.get("title"):
+        if kind == "message" and title is not None:
+            body["title"] = title
+        elif payload.get("title"):
             body["title"] = str(payload["title"])
+        if reply_to is not None:
+            body["in_reply_to_message_id"] = reply_to
         skill = payload.get("skill")
         if kind == "skill":
             details = dict(skill or {})

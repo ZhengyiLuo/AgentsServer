@@ -15,7 +15,7 @@ NEW_MODULES = {
     "claude_history_repair.py", "claude_history_provenance.py", "public_chat_shares.py",
     "public_chat_transcript.py", "public_chat_share_routes.py",
 }
-NEW_MIGRATION = "migrations/0017_skill_announcement_deletions.sql"
+NEW_MIGRATION = "migrations/0018_team_mail_subjects.sql"
 
 
 def shell_array(source, name):
@@ -60,7 +60,7 @@ class ReleaseFileManifestTests(unittest.TestCase):
         self.assertTrue(NEW_MODULES <= set(package))
         self.manifest["validate_release_files"](ROOT)
 
-    def test_package_and_installer_require_migration_17_and_exact_hub_members(self):
+    def test_package_and_installer_require_migration_18_and_exact_hub_members(self):
         package = self.manifest["DIRECTORY_FILES"]["agentsdock_team_hub"]
         self.assertEqual(shell_array(self.installer, "TEAM_HUB_RELEASE_FILES"), package)
         self.assertIn(NEW_MIGRATION, package)

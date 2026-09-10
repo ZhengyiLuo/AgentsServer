@@ -4850,6 +4850,7 @@ def sanitize_proxy_request(
                     "after_sequence",
                     "limit",
                     "include_revision",
+                    "include_mail_subject",
                 }
             elif (
                 len(pieces) == 2
@@ -4858,7 +4859,7 @@ def sanitize_proxy_request(
             ):
                 route_allowed = True
                 allow_query = normalized_method == "GET"
-                allowed_query_keys = {"include_revision"}
+                allowed_query_keys = {"include_revision", "include_mail_subject"}
             elif (
                 len(pieces) == 3
                 and pieces[0] == "messages"
@@ -4866,8 +4867,8 @@ def sanitize_proxy_request(
                 and normalized_method in {"GET", "POST"}
             ):
                 route_allowed = True
-                allow_query = normalized_method == "GET"
-                allowed_query_keys = {"version"}
+                allow_query = True
+                allowed_query_keys = {"version"} if normalized_method == "GET" else {"include_mail_subject"}
             elif pieces == ["deletions"] and normalized_method == "GET":
                 route_allowed = True
                 allow_query = True
@@ -4987,7 +4988,7 @@ def sanitize_proxy_request(
                 raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         if "box" in values and values["box"] not in {"inbox", "feed", "sent"}:
             raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
-        for flag_key in ("unread", "include_archived", "include_revision"):
+        for flag_key in ("unread", "include_archived", "include_revision", "include_mail_subject"):
             if flag_key in values and values[flag_key] not in {"0", "1", "true", "false"}:
                 raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         if "from_kind" in values and values["from_kind"] not in {"server", "human"}:

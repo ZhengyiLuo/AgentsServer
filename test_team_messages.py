@@ -349,20 +349,20 @@ class TeamMessagesServiceTests(unittest.TestCase):
         feed = self.get(self.owner, f"{self.base}/messages?box=feed")
         self.assertEqual(len(feed["messages"]), 1)
 
-    def test_plain_message_rejects_title_and_legacy_title_is_sanitized(self) -> None:
-        rejected = self.post(
+    def test_plain_message_subject_is_opt_in_and_legacy_title_is_sanitized(self) -> None:
+        titled = self.post(
             self.owner,
             f"{self.base}/messages",
             {
                 "kind": "message",
-                "title": "Unexpected",
+                "title": "New subject",
                 "body": "plain",
                 "recipients": [{"kind": "all"}],
                 "idempotency_key": _key(),
             },
-            expected=422,
         )
-        self.assertEqual(rejected["error"]["code"], "invalid_request")
+        self.assertEqual(titled["message"]["title"], "New subject")
+        self.assertIsNone(self.get(self.owner, f"{self.base}/messages/{titled['message']['id']}")["message"]["title"])
 
         sent = self.send(self.owner, [{"kind": "all"}], body="legacy")
         store = self.app.state.store
@@ -383,6 +383,8 @@ class TeamMessagesServiceTests(unittest.TestCase):
             self.owner, f"{self.base}/messages/{sent['id']}"
         )["message"]
         self.assertIsNone(detail["title"])
+        opted_in = self.get(self.owner, f"{self.base}/messages/{sent['id']}?include_mail_subject=true")["message"]
+        self.assertIsNone(opted_in["title"])
         feed = self.get(self.owner, f"{self.base}/messages?box=feed")
         self.assertIsNone(feed["messages"][0]["title"])
 

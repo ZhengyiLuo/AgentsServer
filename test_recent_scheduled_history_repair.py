@@ -129,6 +129,19 @@ class RecentScheduledRepairTests(unittest.TestCase):
         self.assertTrue(self.cache.is_hidden("chat-one", self.imported[0]))
         self.assertIsNone(self.cache.project_event("chat-one", self.terminal))
 
+    def test_metadata_and_human_with_duplicate_source_identity_fail_visible(self):
+        source_rows, checkpoint = self.fixture(human=True)
+        source_rows[0]["isCompactSummary"] = True
+        source_rows[1]["uuid"] = source_rows[0]["uuid"]
+        raw = self.source.read_bytes()[:checkpoint["previous_source_offset"]] + encode(source_rows)
+        self.source.write_bytes(raw)
+        checkpoint["cursor"]["source_offset"] = len(raw)
+        self.rows[24]["purpose"] = "normal_chat"
+        self.events.write_bytes(encode(self.rows))
+        self.prepare()
+        for row in self.imported:
+            self.assertFalse(self.cache.is_hidden("chat-one", row))
+
     def test_full_text_mismatch_cannot_be_proven_by_display_prefix(self):
         source_rows, checkpoint = self.fixture()
         source_rows[0]["text"] = self.full_text[:-len("scheduled ending")] + "different ending"

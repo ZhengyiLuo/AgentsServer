@@ -52397,6 +52397,9 @@ async def acquire_codex_control_thread(
                 or active.get("backend") != BACKEND_CODEX
                 or active.get("transport") != CODEX_TRANSPORT_APP_SERVER
                 or not str(active.get("provider_thread_id") or "").strip()
+                or (reserve_session and (
+                    active.get("codex_goal_handoff_closed") or active.get("stop_requested")
+                ))
             ):
                 raise HTTPException(
                     status_code=409,
@@ -52451,6 +52454,9 @@ async def acquire_codex_control_thread(
                     or active.get("transport") != CODEX_TRANSPORT_APP_SERVER
                     or str(active.get("provider_thread_id") or "").strip()
                     != thread_id
+                    or (reserve_session and (
+                        active.get("codex_goal_handoff_closed") or active.get("stop_requested")
+                    ))
                 )
             if active_changed:
                 raise HTTPException(
@@ -52993,8 +52999,10 @@ async def consume_codex_native_turn(
     *,
     turn_id: str | None = None,
     interrupted_before_start: bool = False,
-) -> None:
-    """Project a native control turn and own its reserved chat slot."""
+    finalize_operation: bool = True,
+    initial_sequence: int = 0,
+) -> dict[str, Any]:
+    """Consume native work; an inline ordinary runner retains its own cleanup."""
     assistant_deltas: dict[str, list[str]] = {}
     reasoning_summary_deltas: dict[str, list[str]] = {}
     plan_deltas: dict[str, list[str]] = {}
@@ -53002,6 +53010,8 @@ async def consume_codex_native_turn(
     terminal_error: str | None = None
     schedule_queue = True
     goal_resume = operation == "goal_resume"
+    last_turn_id = turn_id
+    result_text = ""
     goal_turn_running = bool(turn_id)
     goal_clock_started: float | None = None
     goal_clock_used = 0.0
@@ -53015,8 +53025,8 @@ async def consume_codex_native_turn(
     notification_task: asyncio.Task[Any] | None = None
     steer_request: dict[str, Any] | None = None
     pending_steer: dict[str, Any] | None = None
-    handled_sequence = 0
-    synthetic_sequence = 0
+    handled_sequence = initial_sequence
+    synthetic_sequence = initial_sequence
 
     async def next_goal_notification() -> tuple[int, dict[str, Any]]:
         nonlocal synthetic_sequence
@@ -53095,7 +53105,7 @@ async def consume_codex_native_turn(
                                 )
                 try:
                     if goal_steer_queue is None:
-                        notification = await subscription.next_notification(timeout=0.5)
+                        handled_sequence, notification = await next_goal_notification()
                     else:
                         if notification_task is None:
                             notification_task = asyncio.create_task(next_goal_notification())
@@ -53136,6 +53146,26 @@ async def consume_codex_native_turn(
                     # Drain already queued output before using control state:
                     # projection may have persisted complete ahead of us.
                     if not goal_turn_running and (goal_status != "active" or stopped):
+                        # Serialize the last owner decision with Resume. A goal
+                        # mutation accepted during cleanup must not start work
+                        # after this stream's consumer has exited.
+                        async with session_lifecycle_lock(session_id):
+                            async with ACTIVE_LOCK:
+                                active = ACTIVE.get(session_id)
+                                latest_goal = (STORE.sessions.get(session_id) or {}).get("codex_goal")
+                                stopped = bool(
+                                    operation_id in STOPPED_RUNS
+                                    or (active and active.get("stop_requested"))
+                                )
+                                enqueued = getattr(subscription, "_last_enqueued_sequence", 0)
+                                pending_output = isinstance(enqueued, int) and enqueued > handled_sequence
+                                if not stopped and (
+                                    pending_output
+                                    or (isinstance(latest_goal, dict) and latest_goal.get("status") == "active")
+                                ):
+                                    continue
+                                if active and active.get("run_id") == operation_id:
+                                    active["codex_goal_handoff_closed"] = True
                         terminal_status = "interrupted" if stopped else "completed"
                         break
                     if time.monotonic() >= goal_activity_deadline:
@@ -53180,6 +53210,7 @@ async def consume_codex_native_turn(
             if turn_id and notification_turn_id and notification_turn_id != turn_id:
                 continue
             if method == "turn/started":
+                last_turn_id = notification_turn_id or last_turn_id
                 interrupt_after_start = False
                 interrupt_turn_id = notification_turn_id
                 if notification_turn_id and not turn_id:
@@ -53200,6 +53231,12 @@ async def consume_codex_native_turn(
                                 active["provider_turn_id"] = notification_turn_id
                                 active["provider_turn_ready"] = True
                             else:
+                                if not active.get("provider_turn_id"):
+                                    # A continuation can arrive before an ordinary
+                                    # runner hands its retained stream to us.
+                                    active["provider_turn_id"] = notification_turn_id
+                                    active["provider_turn_ready"] = True
+                                    active["native_interrupt_sent"] = False
                                 interrupt_turn_id = str(
                                     active.get("provider_turn_id")
                                     or notification_turn_id
@@ -53285,6 +53322,8 @@ async def consume_codex_native_turn(
                             if phase == "commentary"
                             else "assistant_text"
                         )
+                        if event_type == "assistant_text":
+                            result_text = text
                         await append_event(
                             session_id,
                             event_type,
@@ -53446,141 +53485,150 @@ async def consume_codex_native_turn(
                 session_id, manager, thread_id, reservation_id,
             )
         subscription.close()
-        terminal_claimed = False
-        try:
-            # The subscription is intentionally low-latency and can observe
-            # terminal delivery before async projection finishes. Drain the
-            # per-thread projection tail before reading usage state or
-            # claiming terminal publication so attribution cannot race.
-            await manager.wait_for_notification_handler(
-                project_codex_notification,
-                thread_id,
-            )
-            compaction_usage: dict[str, Any] = {}
-            if operation == "compaction":
-                async with ACTIVE_LOCK:
-                    active = ACTIVE.get(session_id)
-                    if (
-                        active
-                        and str(active.get("run_id") or "") == operation_id
-                        and str(
-                            active.get("codex_control_reservation_id") or ""
-                        ).strip() == str(reservation_id or "").strip()
-                    ):
-                        before = active.get(
-                            "codex_compaction_token_usage_before"
+        if finalize_operation:
+            terminal_claimed = False
+            try:
+                # The subscription is intentionally low-latency and can observe
+                # terminal delivery before async projection finishes. Drain the
+                # per-thread projection tail before reading usage state or
+                # claiming terminal publication so attribution cannot race.
+                await manager.wait_for_notification_handler(
+                    project_codex_notification,
+                    thread_id,
+                )
+                compaction_usage: dict[str, Any] = {}
+                if operation == "compaction":
+                    async with ACTIVE_LOCK:
+                        active = ACTIVE.get(session_id)
+                        if (
+                            active
+                            and str(active.get("run_id") or "") == operation_id
+                            and str(
+                                active.get("codex_control_reservation_id") or ""
+                            ).strip() == str(reservation_id or "").strip()
+                        ):
+                            before = active.get(
+                                "codex_compaction_token_usage_before"
+                            )
+                            after = active.get(
+                                "codex_compaction_token_usage_after"
+                            )
+                            compaction_usage = {
+                                "token_usage_before": (
+                                    dict(before)
+                                    if isinstance(before, dict)
+                                    else None
+                                ),
+                                "token_usage_after": (
+                                    dict(after)
+                                    if isinstance(after, dict)
+                                    else None
+                                ),
+                            }
+                terminal_claimed = await claim_codex_control_terminal_publication(
+                    session_id,
+                    operation_id,
+                    thread_id,
+                    reservation_id,
+                )
+                if terminal_claimed and session_id in STORE.sessions:
+                    after_snapshot = compaction_usage.get("token_usage_after")
+                    if isinstance(after_snapshot, dict):
+                        await record_codex_token_usage(
+                            session_id,
+                            after_snapshot,
+                            force_checkpoint=True,
                         )
-                        after = active.get(
-                            "codex_compaction_token_usage_after"
+                    if terminal_error:
+                        await append_event(
+                            session_id,
+                            "error",
+                            {
+                                "run_id": operation_id,
+                                "message": terminal_error,
+                                "purpose": f"codex_{operation}",
+                            },
                         )
-                        compaction_usage = {
-                            "token_usage_before": (
-                                dict(before)
-                                if isinstance(before, dict)
-                                else None
-                            ),
-                            "token_usage_after": (
-                                dict(after)
-                                if isinstance(after, dict)
-                                else None
-                            ),
-                        }
-            terminal_claimed = await claim_codex_control_terminal_publication(
-                session_id,
-                operation_id,
-                thread_id,
-                reservation_id,
-            )
-            if terminal_claimed and session_id in STORE.sessions:
-                after_snapshot = compaction_usage.get("token_usage_after")
-                if isinstance(after_snapshot, dict):
-                    await record_codex_token_usage(
-                        session_id,
-                        after_snapshot,
-                        force_checkpoint=True,
+                    terminal_event_type = (
+                        "codex_compaction_completed"
+                        if operation == "compaction"
+                        else "turn_finished"
+                        if goal_resume
+                        else f"codex_{operation}_finished"
                     )
-                if terminal_error:
+                    operation_label = {
+                        "compaction": "Context compaction",
+                        "review": "Code review",
+                        "shell": "Shell command",
+                    }.get(operation, operation.replace("_", " ").title())
+                    terminal_message = (
+                        f"{operation_label} completed."
+                        if terminal_status == "completed"
+                        else f"{operation_label} {terminal_status}."
+                    )
                     await append_event(
                         session_id,
-                        "error",
+                        terminal_event_type,
                         {
                             "run_id": operation_id,
-                            "message": terminal_error,
-                            "purpose": f"codex_{operation}",
+                            "operation_id": operation_id,
+                            "turn_id": turn_id,
+                            "status": terminal_status,
+                            **({"backend": BACKEND_CODEX, "purpose": "codex_goal_resume"} if goal_resume else {}),
+                            "error": terminal_error,
+                            "message": terminal_message,
+                            **compaction_usage,
                         },
                     )
-                terminal_event_type = (
-                    "codex_compaction_completed"
-                    if operation == "compaction"
-                    else "turn_finished"
-                    if goal_resume
-                    else f"codex_{operation}_finished"
-                )
-                operation_label = {
-                    "compaction": "Context compaction",
-                    "review": "Code review",
-                    "shell": "Shell command",
-                }.get(operation, operation.replace("_", " ").title())
-                terminal_message = (
-                    f"{operation_label} completed."
-                    if terminal_status == "completed"
-                    else f"{operation_label} {terminal_status}."
-                )
-                await append_event(
-                    session_id,
-                    terminal_event_type,
-                    {
-                        "run_id": operation_id,
-                        "operation_id": operation_id,
-                        "turn_id": turn_id,
-                        "status": terminal_status,
-                        **({"backend": BACKEND_CODEX, "purpose": "codex_goal_resume"} if goal_resume else {}),
-                        "error": terminal_error,
-                        "message": terminal_message,
-                        **compaction_usage,
-                    },
-                )
-        finally:
-            STOPPED_RUNS.discard(operation_id)
-            if terminal_claimed:
-                # The slot is already exactly released. Remove the admission
-                # fence before touching shared-thread LRU state: unpin can be
-                # slow or cancellation-hostile, but must never park the chat.
-                release_codex_interactive_control_lease(thread_id)
-                try:
-                    publication_cleanup = asyncio.create_task(
-                        finish_codex_control_terminal_publication(
-                            session_id,
-                            reservation_id=reservation_id,
-                            schedule_queue=schedule_queue,
-                        )
-                    )
+            finally:
+                STOPPED_RUNS.discard(operation_id)
+                if terminal_claimed:
+                    # The slot is already exactly released. Remove the admission
+                    # fence before touching shared-thread LRU state: unpin can be
+                    # slow or cancellation-hostile, but must never park the chat.
+                    release_codex_interactive_control_lease(thread_id)
                     try:
-                        await asyncio.shield(publication_cleanup)
-                    except asyncio.CancelledError:
-                        await join_task_despite_caller_cancellation(
-                            publication_cleanup
+                        publication_cleanup = asyncio.create_task(
+                            finish_codex_control_terminal_publication(
+                                session_id,
+                                reservation_id=reservation_id,
+                                schedule_queue=schedule_queue,
+                            )
                         )
-                        raise
-                finally:
+                        try:
+                            await asyncio.shield(publication_cleanup)
+                        except asyncio.CancelledError:
+                            await join_task_despite_caller_cancellation(
+                                publication_cleanup
+                            )
+                            raise
+                    finally:
+                        await release_codex_control_thread(
+                            session_id,
+                            manager,
+                            thread_id,
+                            reserved_session=True,
+                            reservation_id=reservation_id,
+                            lease_already_released=True,
+                            schedule_queue=False,
+                        )
+                else:
                     await release_codex_control_thread(
                         session_id,
                         manager,
                         thread_id,
                         reserved_session=True,
                         reservation_id=reservation_id,
-                        lease_already_released=True,
-                        schedule_queue=False,
+                        schedule_queue=schedule_queue,
                     )
-            else:
-                await release_codex_control_thread(
-                    session_id,
-                    manager,
-                    thread_id,
-                    reserved_session=True,
-                    reservation_id=reservation_id,
-                    schedule_queue=schedule_queue,
-                )
+        else:
+            await manager.wait_for_notification_handler(
+                project_codex_notification, thread_id,
+            )
+    return {
+        "status": terminal_status, "error": terminal_error,
+        "turn_id": last_turn_id, "result_text": result_text,
+    }
 
 
 def invalidated_codex_thread_error(thread_id: str) -> CodexAppServerError:
@@ -62396,6 +62444,63 @@ class NativeSteerHandoffError(CodexAppServerError):
         self.delivery_uncertain = delivery_uncertain
 
 
+async def retain_codex_goal_run_owner(
+    session_id: str, run_id: str, manager: CodexAppServerManager,
+    thread_id: str,
+    *, subscription: Any = None, handled_sequence: int = 0,
+) -> bool:
+    """Keep an ordinary runner supervised when its native goal continues.
+
+    Goal activation and this terminal decision share the lifecycle lock. A
+    successful Resume cannot land between the decision and owner release.
+    Native tool goal updates are drained before examining provider state.
+    """
+    await manager.wait_for_notification_handler(
+        project_codex_notification, thread_id,
+    )
+    async with session_lifecycle_lock(session_id):
+        async with ACTIVE_LOCK:
+            active = ACTIVE.get(session_id)
+            if not (
+                active and active.get("run_id") == run_id
+                and active.get("provider_thread_id") == thread_id
+                and session_id in BUSY_SESSIONS
+                and (CURRENT_TURNS.get(session_id) or {}).get("run_id") == run_id
+            ):
+                return False
+            goal = (STORE.sessions.get(session_id) or {}).get("codex_goal")
+            enqueued = getattr(subscription, "_last_enqueued_sequence", 0)
+            pending_output = isinstance(enqueued, int) and enqueued > handled_sequence
+            retain = bool(
+                CODEX_GOALS_ENABLED
+                and isinstance(goal, dict)
+                and (goal.get("status") == "active" or pending_output)
+                and not active.get("stop_requested")
+                and run_id not in STOPPED_RUNS
+            )
+            active["codex_goal_handoff_closed"] = not retain
+            if not retain:
+                return False
+            # Same supervised task, authority, runtime lease and thread pin.
+            # Do not create a synthetic user message or a detached successor.
+            active["codex_native_operation"] = True
+            active["codex_native_operation_kind"] = "goal_resume"
+            active["codex_control_reservation_id"] = run_id
+            active["codex_app_server_turn"] = None
+            active["provider_turn_id"] = None
+            active["provider_turn_ready"] = False
+            active["native_interrupt_sent"] = False
+            active["native_steer_queue"] = asyncio.Queue(maxsize=1)
+            CURRENT_TURNS[session_id]["purpose"] = "codex_goal_resume"
+            CURRENT_TURNS[session_id]["codex_control_reservation_id"] = run_id
+            # Register the existing supervisor, not a new task, so Delete and
+            # server drain see the same native owner as Stop and Force Send.
+            owner = asyncio.current_task()
+            if owner is not None:
+                register_codex_native_action(session_id, run_id, owner)
+            return True
+
+
 async def run_codex_app_server(
     session_id: str,
     run_id: str,
@@ -62464,6 +62569,7 @@ async def run_codex_app_server(
     current_diff_baseline = diff_baseline
     manifest_watch_task: asyncio.Task[None] | None = None
     goal_time_budget_task: asyncio.Task[None] | None = None
+    goal_continuation_result: dict[str, Any] | None = None
     logical_state_lock = asyncio.Lock()
     steer_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     notification_task: asyncio.Task[tuple[int, dict[str, Any]]] | None = None
@@ -63548,7 +63654,10 @@ async def run_codex_app_server(
             return False
         if method == "error":
             error_value = params.get("error") or params.get("message") or params
-            terminal_error = concise_error_message(error_value)
+            message = concise_error_message(error_value)
+            if is_codex_app_server_retry_notice(params, message):
+                return False
+            terminal_error = message
             # Delay terminal error publication until turn/completed. A stale
             # resumed thread may be recovered transparently onto a fresh
             # bounded-memory thread.
@@ -63562,6 +63671,8 @@ async def run_codex_app_server(
             terminal_status = str(completed_turn.get("status") or "failed")
             if completed_turn.get("error"):
                 terminal_error = concise_error_message(completed_turn.get("error"))
+            elif terminal_status == "completed":
+                terminal_error = None
             turn_completed = True
             return True
         return False
@@ -63923,6 +64034,7 @@ async def run_codex_app_server(
                         provider_id,
                         [{"type": "text", "text": prompt, "text_elements": []}],
                         overrides=overrides,
+                        retain_thread_stream=not standalone_provider_context,
                     )
                 except asyncio.CancelledError as exc:
                     pending_turn = getattr(exc, "pending_turn", None)
@@ -64198,6 +64310,35 @@ async def run_codex_app_server(
                                 )
                             )
 
+                if (
+                    turn_completed and terminal_status == "completed"
+                    and not standalone_provider_context
+                    and await retain_codex_goal_run_owner(
+                        session_id, current_run_id, manager, provider_id,
+                        subscription=turn._subscription,
+                        handled_sequence=handled_notification_sequence,
+                    )
+                ):
+                    # Complete the initial answer, but not the supervised run.
+                    # Its thread-wide stream already contains any early native
+                    # continuation, including goals created by provider tools.
+                    await flush_pending_unknown(final=True)
+                    if goal_time_budget_task is not None:
+                        goal_time_budget_task.cancel()
+                        await asyncio.gather(goal_time_budget_task, return_exceptions=True)
+                        goal_time_budget_task = None
+                    goal_continuation_result = await consume_codex_native_turn(
+                        session_id, current_run_id, "goal_resume", manager,
+                        provider_id, current_run_id, turn._subscription,
+                        finalize_operation=False,
+                        initial_sequence=handled_notification_sequence,
+                    )
+                    terminal_status = goal_continuation_result["status"]
+                    terminal_error = goal_continuation_result["error"]
+                    # Never overwrite a later goal answer with the first reply
+                    # in the terminal payload when the goal eventually ends.
+                    text_parts[:] = [goal_continuation_result["result_text"]]
+
         stopped = (
             terminal_status in {"interrupted", "cancelled", "canceled"}
             or current_run_id in STOPPED_RUNS
@@ -64471,7 +64612,11 @@ async def run_codex_app_server(
             "backend": BACKEND_CODEX,
             "transport": CODEX_TRANSPORT_APP_SERVER,
             "provider_thread_id": provider_id or None,
-            "provider_turn_id": turn.turn_id if turn is not None else None,
+            "provider_turn_id": (
+                goal_continuation_result.get("turn_id")
+                if goal_continuation_result is not None
+                else turn.turn_id if turn is not None else None
+            ),
             "exit_code": exit_code,
             "result_text": clean_assistant_text("\n\n".join(text_parts).strip()),
             "stopped": stopped,

@@ -1368,6 +1368,87 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(steer["params"]["clientUserMessageId"], "message-a")
         self.assertNotIn("additionalContext", steer["params"])
 
+    async def test_retained_turn_stream_receives_goal_continuation_after_completion(self) -> None:
+        factory = FakeProcessFactory()
+        process = factory.process
+        started = {
+            "method": "turn/started",
+            "params": {"threadId": "thread_goal", "turn": {"id": "turn_initial"}},
+        }
+        goal_updated = {
+            "method": "thread/goal/updated",
+            "params": {"threadId": "thread_goal", "goal": {"status": "active"}},
+        }
+
+        def start_turn(_message: dict[str, Any]) -> dict[str, Any]:
+            process.feed(started)
+            process.feed(goal_updated)
+            return {"turn": {"id": "turn_initial"}}
+
+        process.responders["turn/start"] = start_turn
+        manager = CodexAppServerManager(
+            "codex", cwd="/tmp", env_factory=lambda: {"PATH": "/usr/bin"},
+            process_factory=factory, request_timeout=1,
+        )
+        self.addAsyncCleanup(manager.close)
+        turn = await manager.start_turn(
+            "thread_goal", [{"type": "text", "text": "Start goal"}],
+            retain_thread_stream=True,
+        )
+        self.assertEqual(await turn.next_notification(timeout=1), started)
+        self.assertEqual(await turn.next_notification(timeout=1), goal_updated)
+        turn.adopt_turn_id("turn_initial")
+        completed = {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread_goal",
+                "turn": {"id": "turn_initial", "status": "completed"},
+            },
+        }
+        continued = {
+            "method": "turn/started",
+            "params": {"threadId": "thread_goal", "turn": {"id": "turn_continued"}},
+        }
+        process.feed(completed)
+        process.feed(continued)
+        self.assertEqual(await turn.next_notification(timeout=1), completed)
+        self.assertEqual(await turn.next_notification(timeout=1), continued)
+        self.assertIsNone(manager.client.active_turn("thread_goal"))
+        self.assertTrue(turn._completed)
+        self.assertEqual(turn.turn_id, "turn_initial")
+        process.feed({**goal_updated, "params": {"threadId": "thread_other"}})
+        process.feed(goal_updated)
+        self.assertEqual(await turn.next_notification(timeout=1), goal_updated)
+        await turn.close()
+        with self.assertRaises(CodexAppServerSubscriptionClosed):
+            await turn.next_notification(timeout=1)
+
+    async def test_retained_completed_stream_closes_with_thread_or_process(self) -> None:
+        for cleanup in ("thread", "process"):
+            with self.subTest(cleanup=cleanup):
+                factory = FakeProcessFactory()
+                process = factory.process
+                process.responders["turn/start"] = lambda _: {"turn": {"id": "turn_initial"}}
+                client = self.make_client(factory)
+                self.addAsyncCleanup(client.close)
+                turn = await client.start_turn(
+                    "thread_goal", [], retain_thread_stream=True,
+                )
+                process.feed({
+                    "method": "turn/completed",
+                    "params": {"threadId": "thread_goal", "turn": {"id": "turn_initial"}},
+                })
+                await turn.next_notification(timeout=1)
+                if cleanup == "thread":
+                    process.feed({"method": "thread/closed", "params": {"threadId": "thread_goal"}})
+                    self.assertEqual((await turn.next_notification(timeout=1))["method"], "thread/closed")
+                    expected_error = CodexAppServerSubscriptionClosed
+                else:
+                    process.crash()
+                    expected_error = CodexAppServerDisconnected
+                with self.assertRaises(expected_error):
+                    await turn.next_notification(timeout=1)
+
     async def test_goal_continuation_retargets_active_turn_and_interrupt(self) -> None:
         factory = FakeProcessFactory()
         process = factory.process

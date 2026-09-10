@@ -22787,7 +22787,8 @@ def codex_goal_followup_requires_native(
     goal = session.get("codex_goal")
     return bool(
         str(session.get("backend") or DEFAULT_BACKEND) == BACKEND_CODEX
-        and active.get("transport") == CODEX_TRANSPORT_APP_SERVER
+        # This only forbids Stop fallback; it does not authorize steering.
+        # A native goal can outlive its local owner or still be pre-binding.
         and (
             (isinstance(goal, dict) and goal.get("status") == "active")
             or active.get("codex_native_operation_kind") == "goal_resume"

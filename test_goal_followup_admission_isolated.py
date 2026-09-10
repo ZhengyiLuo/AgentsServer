@@ -136,10 +136,12 @@ class GoalFollowupAdmissionTests(unittest.IsolatedAsyncioTestCase):
         return (
             deepcopy(self.session), dict(self.active), deepcopy(self.current),
             deepcopy(list(self.queue)), list(self.queue),
+            dict(self.ns["ACTIVE"]), dict(self.ns["CURRENT_TURNS"]),
+            set(self.ns["BUSY_SESSIONS"]),
         )
 
     def assert_untouched(self, before):
-        session, active, current, queue_values, queue_objects = before
+        session, active, current, queue_values, queue_objects, active_map, current_map, busy = before
         self.assertEqual(self.session, session)
         self.assertEqual(self.active, active)
         self.assertEqual(self.current, current)
@@ -149,7 +151,9 @@ class GoalFollowupAdmissionTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(actual, original)
         self.assertEqual(self.ns["RUN_NOW_TURNS"], {})
         self.assertEqual(self.ns["STEERING_SESSIONS"], set())
-        self.assertEqual(self.ns["BUSY_SESSIONS"], {"chat"})
+        self.assertEqual(self.ns["ACTIVE"], active_map)
+        self.assertEqual(self.ns["CURRENT_TURNS"], current_map)
+        self.assertEqual(self.ns["BUSY_SESSIONS"], busy)
         for call in self.forbidden.values():
             call.assert_not_called()
 
@@ -173,6 +177,37 @@ class GoalFollowupAdmissionTests(unittest.IsolatedAsyncioTestCase):
     async def test_starting_provider_keeps_goal_and_exact_queue_position(self):
         self.active["provider_turn_ready"] = False
         await self.assert_rejected()
+
+    async def test_idle_cached_active_goal_rejects_before_stop_or_queue_mutation(self):
+        self.ns["ACTIVE"].clear()
+        self.ns["CURRENT_TURNS"].clear()
+        self.ns["BUSY_SESSIONS"].clear()
+        for backend in ("codex", "claude"):
+            for capabilities in (["codex_goal_steer_v1"], []):
+                with self.subTest(backend=backend, capabilities=capabilities):
+                    self.selected["backend"] = backend
+                    self.selected["client_capabilities"] = capabilities
+                    await self.assert_rejected()
+
+    async def test_prebind_goal_owner_without_active_record_cannot_fallback(self):
+        self.ns["ACTIVE"].clear()
+        self.current["run_id"] = None
+        self.current.pop("purpose")
+        await self.assert_rejected()
+        self.current["purpose"] = "codex_goal_resume"
+        for goal in (None, {"status": "paused"}, {"status": "complete"}):
+            with self.subTest(goal=goal):
+                self.session["codex_goal"] = goal
+                await self.assert_rejected()
+
+    async def test_active_goal_rejection_does_not_require_native_transport(self):
+        self.active.pop("native_steer_queue")
+        self.active.pop("codex_native_operation_kind")
+        self.current.pop("purpose")
+        for transport in (None, "exec", "agent_sdk"):
+            with self.subTest(transport=transport):
+                self.active["transport"] = transport
+                await self.assert_rejected()
 
     async def test_runtime_or_backend_change_cannot_pause_goal_via_fallback(self):
         self.ns["queued_codex_runtime_matches_active"].return_value = False

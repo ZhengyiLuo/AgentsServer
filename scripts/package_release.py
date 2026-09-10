@@ -29,6 +29,8 @@ FILES = (
     "codex_app_server.py",
     "cursor_agent_client.py",
     "cursor_process_guard.py",
+    "claude_history_repair.py",
+    "claude_history_provenance.py",
     "install.sh",
     "uninstall.sh",
     "update_runner.py",

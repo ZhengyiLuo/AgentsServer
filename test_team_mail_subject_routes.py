@@ -1,6 +1,7 @@
 """Mail-subject query forwarding with ASGI/mocked transports and isolated state."""
 
 import ast
+from contextlib import contextmanager
 from pathlib import Path
 import tempfile
 import threading
@@ -187,14 +188,15 @@ class MailSubjectPeerRoutesTests(unittest.TestCase):
 def isolated_runtime():
     tree = ast.parse((REPO / "secure_peer_runtime.py").read_text())
     source = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SecurePeerRuntime")
-    names = {"_team_host_call", "_team_hub_get", "team_list_messages", "team_get_message", "team_send_message"}
+    names = {"_team_host_call", "_team_host_call_admitted", "_host_store_operation", "_team_hub_get", "team_list_messages", "team_get_message", "team_send_message"}
     selected = ast.ClassDef(name="Runtime", bases=[], keywords=[], decorator_list=[], body=[
         node for node in source.body if isinstance(node, ast.FunctionDef) and node.name in names
     ])
     module = ast.Module(body=[
         ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), selected,
     ], type_ignores=[])
-    namespace = {"quote": quote, "urlencode": urlencode, "SecurePeerError": SecurePeerError, "Mapping": Mapping, "Path": Path}
+    namespace = {"quote": quote, "urlencode": urlencode, "SecurePeerError": SecurePeerError, "Mapping": Mapping, "Path": Path,
+        "contextmanager": contextmanager, "HubStore": HubStore}
     exec(compile(ast.fix_missing_locations(module), "<isolated-mail-subject-runtime>", "exec"), namespace)
     return namespace["Runtime"]
 
@@ -203,7 +205,13 @@ class MailSubjectRuntimeRoutesTests(unittest.TestCase):
     def setUp(self):
         self.runtime = isolated_runtime()()
         self.runtime._guard = threading.RLock()
+        self.runtime._peer_admission = threading.Condition(threading.RLock())
+        self.runtime._host_admission_closed = False
+        self.runtime._host_in_flight = 0
+        self.runtime._host_operation_state = threading.local()
+        self.runtime._completion_closing = False
         self.store = mock.Mock(hub_id="subject-hub-001")
+        self.store.maintenance_fence.return_value = None
         self.runtime._hub_store = self.store
         self.runtime.team_realm = mock.Mock()
         self.runtime.proxy = mock.Mock(return_value={"ok": True})
@@ -242,6 +250,8 @@ class MailSubjectRuntimeRoutesTests(unittest.TestCase):
             self.assertIs(method.call_args.kwargs["include_mail_subject"], False)
             operation(include_mail_subject=True)
             self.assertIs(method.call_args.kwargs["include_mail_subject"], True)
+        self.assertEqual(self.runtime._host_in_flight, 0)
+        self.assertEqual(self.store.maintenance_fence.call_count, 4)
         self.runtime.proxy.assert_not_called()
 
     def send(self, **payload):

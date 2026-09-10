@@ -23,6 +23,7 @@ _FUNCTIONS = {
     "is_codex_app_server_retry_notice",
     "codex_reasoning_text",
     "codex_app_server_reasoning_summary",
+    "session_lifecycle_lock",
 }
 _TREE = ast.parse(_SOURCE.read_text(encoding="utf-8"), filename=str(_SOURCE))
 _SELECTED = [node for node in _TREE.body if isinstance(
@@ -86,7 +87,7 @@ class Subscription:
 
 class NativeTurnProjectionTests(unittest.IsolatedAsyncioTestCase):
     async def run_projection(self, notifications, *, goal=False, claimed=True,
-                             interrupted_before_start=False):
+                             interrupted_before_start=False, stopped=False):
         store = SimpleNamespace(sessions={"chat": {
             "codex_goal": {"status": "active", "id": "goal"},
         }})
@@ -94,8 +95,9 @@ class NativeTurnProjectionTests(unittest.IsolatedAsyncioTestCase):
             "asyncio": asyncio, "time": time, "json": json, "re": re,
             "suppress": suppress,
             "STORE": store, "ACTIVE_LOCK": asyncio.Lock(),
+            "SESSION_LIFECYCLE_LOCKS": {},
             "ACTIVE": {"chat": {"run_id": "operation"}},
-            "STOPPED_RUNS": {"operation", "unrelated"},
+            "STOPPED_RUNS": {"unrelated"} | ({"operation"} if stopped or interrupted_before_start else set()),
             "BACKEND_CODEX": "codex",
             "CODEX_APP_SERVER_LIFECYCLE_TIMEOUT_SECONDS": 30,
             "IDLE_KILL_SECONDS": 30,
@@ -307,6 +309,7 @@ class NativeTurnProjectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.events("assistant_text"), [])
         self.assertEqual(self.events("error"), [])
         self.assertEqual(self.events("turn_finished")[0]["status"], "completed")
+        self.assertTrue(self.namespace["ACTIVE"]["chat"]["codex_goal_handoff_closed"])
         self.namespace["stop_codex_goal_resume"].assert_not_awaited()
         self.assert_clean_release()
 
@@ -339,7 +342,7 @@ class NativeTurnProjectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancellation_preserves_interrupted_cleanup_and_never_sends(self):
         with self.assertRaises(asyncio.CancelledError):
-            await self.run_projection([started(), asyncio.CancelledError()], goal=True)
+            await self.run_projection([started(), asyncio.CancelledError()], goal=True, stopped=True)
         self.assertEqual(self.events("error"), [])
         self.assertEqual(self.events("turn_finished")[0]["status"], "interrupted")
         self.namespace["stop_codex_goal_resume"].assert_awaited_once()

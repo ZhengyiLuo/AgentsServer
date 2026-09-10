@@ -25,6 +25,7 @@ NAMES = {
     "join_task_despite_caller_cancellation", "concise_error_message",
     "is_codex_reconnect_notice", "is_codex_app_server_retry_notice",
     "codex_reasoning_text", "codex_app_server_reasoning_summary",
+    "session_lifecycle_lock",
 }
 TREE = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
 NODES = [node for node in TREE.body if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in NAMES]
@@ -86,6 +87,7 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
             "CODEX_APP_SERVER_LIFECYCLE_TIMEOUT_SECONDS": 2, "IDLE_KILL_SECONDS": 2,
             "ACTIVE": {"chat": self.active}, "CURRENT_TURNS": {"chat": self.current},
             "ACTIVE_LOCK": asyncio.Lock(), "QUEUE_LOCK": asyncio.Lock(),
+            "SESSION_LIFECYCLE_LOCKS": {},
             "QUEUED_TURNS": {}, "BUSY_SESSIONS": {"chat"}, "STOPPED_RUNS": set(),
             "STOP_REQUESTS": set(), "DELETING_SESSIONS": set(), "DELETED_SESSION_TOMBSTONES": set(),
             "SERVER_MAINTENANCE_SESSIONS": set(),
@@ -210,6 +212,9 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.goal["status"], "active")
         self.assertTrue(self.active["provider_turn_ready"])
         await self.finish(task)
+        self.assertEqual(task.result()["status"], "completed")
+        self.assertIsNone(task.result()["error"])
+        self.assertTrue(self.active["codex_goal_handoff_closed"])
         self.ns["stop_codex_goal_resume"].assert_not_awaited()
 
     async def test_ready_steer_is_not_starved_by_notification_backlog(self):

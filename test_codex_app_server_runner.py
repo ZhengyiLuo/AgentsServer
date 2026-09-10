@@ -1306,7 +1306,9 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             manager.notification_barriers,
-            [(agent_server.project_codex_notification, "thread-native")],
+            # Drain before testing native goal ownership, then before final
+            # cleanup. Neither drain resends the user's prompt.
+            [(agent_server.project_codex_notification, "thread-native")] * 2,
         )
 
     async def test_scheduled_run_metadata_is_attached_to_live_reasoning_and_tools(
@@ -3864,7 +3866,10 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             run_now = await asyncio.wait_for(force_send, timeout=2)
             turn.feed(agent_message("final-after", "Done.", "final_answer"))
             turn.feed(completed_notification())
-            await asyncio.wait_for(runner, timeout=2)
+            # Forty authoritative events must all drain; the Linux debug-mode
+            # release runner can take longer than two seconds under load.
+            # This deadline is only a deadlock guard, not a throughput target.
+            await asyncio.wait_for(runner, timeout=10)
 
         traces = [
             call.args[2]

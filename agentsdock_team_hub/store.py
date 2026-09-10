@@ -9438,6 +9438,58 @@ class HubStore:
         finally:
             connection.close()
 
+    def _network_server_mail_route_lifecycle(
+        self, connection: sqlite3.Connection, team_id: str, server_id: str
+    ) -> str | None:
+        """Identify the current trusted inbox incarnation, not its mutable name.
+
+        Call under the caller's read/write transaction. This is an identity
+        precondition, not a credential, and does not grant network access.
+        """
+        node = connection.execute(
+            """SELECT n.id,n.principal_id,n.server_identity,n.enrolled_at
+               FROM nodes AS n JOIN principals AS p ON p.id=n.principal_id
+               WHERE n.team_id=? AND n.id=? AND n.status IN ('active','offline')
+                 AND p.status='active'""",
+            (team_id, server_id),
+        ).fetchone()
+        if node is None:
+            return None
+        identity: dict[str, Any] = {
+            "version": 1, "team_id": team_id, "node_id": str(node["id"]),
+            "principal_id": str(node["principal_id"]),
+            "server_identity": str(node["server_identity"]),
+            "enrolled_at": int(node["enrolled_at"]),
+        }
+        if self.managed_host_identity is not None and node["server_identity"] == self.managed_host_identity:
+            identity["kind"] = "host"
+        elif connection.execute(
+            "SELECT 1 FROM network_peer_bindings WHERE team_id=? AND node_id=? LIMIT 1",
+            (team_id, server_id),
+        ).fetchone() is not None:
+            peer = connection.execute(
+                """SELECT b.peer_id,b.service_principal_id,b.created_at
+                   FROM network_peer_bindings AS b
+                   JOIN principals AS p ON p.id=b.service_principal_id
+                   JOIN service_accounts AS s ON s.principal_id=p.id
+                   JOIN memberships AS m ON m.team_id=b.team_id AND m.principal_id=p.id
+                   WHERE b.team_id=? AND b.node_id=? AND b.peer_server_identity=?
+                     AND b.status='active' AND p.kind='service' AND p.status='active'
+                     AND s.service_identifier='agentsdock.secure-peer.' || b.peer_id
+                     AND m.role='automation' AND m.status='active'""",
+                (team_id, server_id, node["server_identity"]),
+            ).fetchone()
+            if peer is None:
+                return None
+            identity.update({
+                "kind": "peer", "peer_id": str(peer["peer_id"]),
+                "service_principal_id": str(peer["service_principal_id"]),
+                "created_at": int(peer["created_at"]),
+            })
+        else:
+            identity["kind"] = "legacy"
+        return canonical_fingerprint(identity).hex()
+
     def get_network_server(
         self,
         claims: AccessClaims,
@@ -9523,6 +9575,9 @@ class HubStore:
                     "status": str(row["status"]),
                     "is_host": is_host,
                     "owned_by_caller": row["id"] == owned_node_id,
+                    "mail_route_lifecycle_id": self._network_server_mail_route_lifecycle(
+                        connection, team_id, str(row["id"])
+                    ),
                 }
             }
             connection.execute("COMMIT")
@@ -12310,6 +12365,7 @@ class HubStore:
         ):
             raise HubError("invalid_request", "Message recipients are invalid", 422)
         requested: list[tuple[str, str | None]] = []
+        recipient_lifecycles: dict[str, str | None] = {}
         for entry in raw_recipients:
             if not isinstance(entry, dict) or entry.get("kind") not in {"server", "human", "all", "all_servers"}:
                 raise HubError("invalid_request", "Message recipients are invalid", 422)
@@ -12321,6 +12377,16 @@ class HubStore:
                 recipient_id = None
             elif not isinstance(recipient_id, str) or not 1 <= len(recipient_id) <= 240:
                 raise HubError("invalid_request", "Message recipients are invalid", 422)
+            lifecycle = entry.get("mail_route_lifecycle_id")
+            if lifecycle is not None and (
+                recipient_kind != "server" or not isinstance(lifecycle, str)
+                or re.fullmatch(r"[0-9a-f]{64}", lifecycle) is None
+            ):
+                raise HubError("invalid_request", "Mail route identity is invalid", 422)
+            if recipient_kind == "server":
+                if recipient_id in recipient_lifecycles and recipient_lifecycles[recipient_id] != lifecycle:
+                    raise HubError("invalid_request", "Conflicting mail route identities", 422)
+                recipient_lifecycles[str(recipient_id)] = lifecycle
             if (recipient_kind, recipient_id) not in requested:
                 requested.append((recipient_kind, recipient_id))
         all_servers = ("all_servers", None) in requested
@@ -12386,6 +12452,9 @@ class HubStore:
                     else None
                 ),
                 "provenance": provenance_json,
+                **({"mail_route_lifecycles": sorted(
+                    (key, value) for key, value in recipient_lifecycles.items() if value is not None
+                )} if any(value is not None for value in recipient_lifecycles.values()) else {}),
             }
         )
         connection = self.connect()
@@ -12458,6 +12527,15 @@ class HubStore:
                                 "recipient_unavailable",
                                 "Team Network server recipient is unavailable",
                                 404,
+                            )
+                        expected_lifecycle = recipient_lifecycles.get(str(recipient_id))
+                        if expected_lifecycle is not None and expected_lifecycle != self._network_server_mail_route_lifecycle(
+                            connection, team_id, str(recipient_id)
+                        ):
+                            raise HubError(
+                                "mail_route_changed",
+                                "The recipient changed or left the team. Select its @@ mention again to grant a new route.",
+                                409,
                             )
                         resolved.append(("server", str(found["id"]), None))
                         continue

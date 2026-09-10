@@ -6309,6 +6309,102 @@ class SecurePeerRuntime:
             )
         return realms[0]
 
+    def _team_network_server(
+        self,
+        realm: Mapping[str, Any],
+        server_id: str,
+    ) -> dict[str, Any] | None:
+        """Read one exact, currently visible server; never search by label."""
+
+        team_id = str(realm.get("team_id") or "")
+        try:
+            if realm.get("realm") == "host":
+                with self._guard:
+                    store = self._hub_store
+                if store is None or store.hub_id != realm.get("hub_id"):
+                    raise SecurePeerError("team_unavailable", "Team Hub is unavailable", 409)
+                projection = store.get_network_server(
+                    store.local_agent_mail_claims(team_id), team_id, server_id,
+                )
+            else:
+                projection = self._team_hub_get(
+                    dict(realm),
+                    f"/v1/teams/{quote(team_id, safe='')}/network/servers/"
+                    f"{quote(server_id, safe='')}",
+                    {}, preserve_not_found=True,
+                )
+        except (HubError, SecurePeerError) as exc:
+            if getattr(exc, "status_code", None) == 404:
+                return None
+            raise
+        item = projection.get("server") if isinstance(projection, Mapping) else None
+        if not isinstance(item, Mapping) or str(item.get("id") or "") != server_id:
+            raise SecurePeerError("team_reference_invalid", "Team Network server projection is invalid", 409)
+        return dict(item)
+
+    @staticmethod
+    def _durable_server_binding(
+        realm: Mapping[str, Any],
+        target: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        binding = {
+            "version": 1, "team_id": realm.get("team_id"),
+            "hub_id": realm.get("hub_id"), "target_id": target.get("id"),
+            "server_identity": target.get("server_identity"),
+            "lifecycle_id": target.get("mail_route_lifecycle_id"),
+        }
+        if (target.get("status") not in {"active", "offline"}
+            or not isinstance(binding["lifecycle_id"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", binding["lifecycle_id"]) is None) or any(
+            not isinstance(value, str) or not 0 < len(value) <= 512
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)
+            for key, value in binding.items() if key != "version"
+        ):
+            raise SecurePeerError(
+                "team_mail_route_unavailable",
+                "The server's durable mail identity is unavailable or changed",
+                409,
+            )
+        return binding
+
+    def resolve_durable_server_reference(
+        self,
+        binding: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Revalidate persistent identity using this turn's live Team authority."""
+
+        keys = {"version", "team_id", "hub_id", "target_id", "server_identity", "lifecycle_id"}
+        if not isinstance(binding, Mapping) or set(binding) != keys or type(binding.get("version")) is not int or binding["version"] != 1 or any(
+            not isinstance(binding.get(key), str) or not 0 < len(binding[key]) <= 512
+            or any(ord(char) < 32 or ord(char) == 127 for char in binding[key])
+            for key in keys - {"version"}
+        ):
+            raise SecurePeerError("team_mail_route_invalid", "The durable server mail identity is invalid", 409)
+        if re.fullmatch(r"[0-9a-f]{64}", binding["lifecycle_id"]) is None:
+            raise SecurePeerError("team_mail_route_invalid", "The durable server mail lifecycle is invalid", 409)
+        realms = [realm for realm in self.team_realms()
+                  if realm.get("team_id") == binding["team_id"] and realm.get("hub_id") == binding["hub_id"]]
+        if len(realms) != 1:
+            raise SecurePeerError("team_mail_route_unavailable", "The original Team Hub is unavailable or changed", 409)
+        target = self._team_network_server(realms[0], binding["target_id"])
+        if target is None or self._durable_server_binding(realms[0], target) != dict(binding):
+            raise SecurePeerError("team_mail_route_changed", "The authorized server mail recipient is unavailable or changed", 409)
+        return {
+            "kind": "recipient", "recipient_kind": "server",
+            "team_id": binding["team_id"], "target_id": binding["target_id"],
+            "display_name_snapshot": str(target.get("recipient_display_name") or target.get("display_name") or ""),
+            "durable_server_binding": dict(binding),
+        }
+
+    def validate_durable_server_reference(
+        self,
+        reference: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        resolved = self.resolve_durable_server_reference(reference.get("durable_server_binding"))
+        if any(reference.get(key) != resolved[key] for key in ("kind", "recipient_kind", "team_id", "target_id")):
+            raise SecurePeerError("team_mail_route_invalid", "The durable mail route does not match its recipient", 409)
+        return {**reference, **resolved}
+
     def resolve_team_references(
         self,
         references: list[Mapping[str, Any]],
@@ -6355,44 +6451,7 @@ class SecurePeerRuntime:
             cache_key = (team_id, server_id)
             if cache_key in server_targets:
                 return server_targets[cache_key]
-            realm = realm_for(team_id)
-            try:
-                if realm["realm"] == "host":
-                    with self._guard:
-                        store = self._hub_store
-                    if store is None or store.hub_id != realm.get("hub_id"):
-                        raise SecurePeerError(
-                            "team_unavailable", "Team Hub is unavailable", 409
-                        )
-                    projection = store.get_network_server(
-                        store.local_agent_mail_claims(team_id),
-                        team_id,
-                        server_id,
-                    )
-                else:
-                    projection = self._team_hub_get(
-                        realm,
-                        f"/v1/teams/{quote(team_id, safe='')}/network/servers/"
-                        f"{quote(server_id, safe='')}",
-                        {},
-                        preserve_not_found=True,
-                    )
-            except (HubError, SecurePeerError) as exc:
-                if getattr(exc, "status_code", None) == 404:
-                    server_targets[cache_key] = None
-                    return None
-                raise
-            item = projection.get("server") if isinstance(projection, Mapping) else None
-            if (
-                not isinstance(item, Mapping)
-                or str(item.get("id") or "") != server_id
-            ):
-                raise SecurePeerError(
-                    "team_reference_invalid",
-                    "Team Network server projection is invalid",
-                    409,
-                )
-            server_targets[cache_key] = dict(item)
+            server_targets[cache_key] = self._team_network_server(realm_for(team_id), server_id)
             return server_targets[cache_key]
 
         def team_member(team_id: str, principal_id: str) -> dict[str, Any] | None:
@@ -6510,6 +6569,11 @@ class SecurePeerRuntime:
                         "Mentioned Team Network server is unavailable or changed",
                         409,
                     )
+                # Old Hubs retain one-use mention behavior. They cannot mint
+                # a persistent grant without authoritative incarnation proof.
+                reference.pop("durable_server_binding", None)
+                if target.get("mail_route_lifecycle_id") is not None:
+                    reference["durable_server_binding"] = self._durable_server_binding(realm_for(team_id), target)
             elif reference.get("recipient_kind") == "human":
                 target = team_member(team_id, target_id)
                 if (
@@ -6836,7 +6900,14 @@ class SecurePeerRuntime:
     ) -> dict[str, Any]:
         """Create one team message for a frozen @@ reference, with attachments."""
 
+        if "durable_server_binding" in reference:
+            # Provider callers hold team_authorized_write's generation fence;
+            # resolve the exact recipient again before any uploads or send.
+            reference = self.validate_durable_server_reference(reference)
         realm = self.team_realm(str(reference.get("team_id") or "") or None)
+        binding = reference.get("durable_server_binding")
+        if isinstance(binding, Mapping) and realm.get("hub_id") != binding["hub_id"]:
+            raise SecurePeerError("team_mail_route_changed", "The original Team Hub changed before mail delivery", 409)
         if not realm.get("can_write"):
             raise SecurePeerError(
                 "forbidden", "This server's Team Network connection is read-only", 403
@@ -6881,6 +6952,10 @@ class SecurePeerRuntime:
             recipients = [
                 {"kind": str(reference.get("recipient_kind")), "id": str(reference.get("target_id"))}
             ]
+            if isinstance(binding, Mapping):
+                # The Hub checks this exact incarnation inside its message
+                # transaction, closing a remote revoke/rejoin lookup race.
+                recipients[0]["mail_route_lifecycle_id"] = binding["lifecycle_id"]
         reply_to = payload.get("in_reply_to_message_id")
         if reply_to is not None and not (
             isinstance(reply_to, str)

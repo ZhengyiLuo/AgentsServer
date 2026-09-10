@@ -269,6 +269,7 @@ class NetworkReceiptRequest(StrictModel):
 class TeamRecipientRequest(StrictModel):
     kind: Literal["server", "human", "all", "all_servers"]
     id: str | None = Field(default=None, min_length=1, max_length=240)
+    mail_route_lifecycle_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class TeamSkillDetailsRequest(StrictModel):

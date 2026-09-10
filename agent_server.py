@@ -46516,13 +46516,15 @@ def history_timeline_message_keys(
             elif (
                 event_type == "reasoning_summary"
                 and event.get("phase") == "commentary"
-                and event.get("backend") in (BACKEND_CLAUDE, BACKEND_CODEX)
+                and event.get("backend") in (None, "", BACKEND_CLAUDE, BACKEND_CODEX)
             ):
                 # Explicit public commentary from either provider corresponds
                 # to assistant transcript records, unlike private reasoning.
                 # Count these public text blocks as
                 # ownership credits so the next history sync cannot import
                 # this chat's own progress back as duplicate messages.
+                # Older native streams omitted backend on progress events;
+                # explicit public phase still establishes assistant content.
                 key = history_dedup_key("assistant", event.get("text"), source_text_sha256=event.get("source_text_sha256"))
             elif tail and event_type in {"turn_finished", "job_summary"}:
                 # A compacted scheduled run can retain only its canonical

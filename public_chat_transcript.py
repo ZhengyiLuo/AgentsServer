@@ -28,6 +28,19 @@ class PublicTranscriptError(ValueError):
     pass
 
 
+def _is_goal_followup(event: dict) -> bool:
+    return bool(
+        event.get("type") == "turn_steered"
+        and event.get("native_goal_steer") is True
+        and event.get("native_steer") is True
+        and event.get("provider_user_authored") is True
+        and event.get("backend") == "codex"
+        and event.get("purpose") == "codex_goal_resume"
+        and isinstance(event.get("run_id"), str)
+        and event["run_id"].strip()
+    )
+
+
 def _public_timestamp(value):
     if isinstance(value, str) and len(value) <= 64:
         try:
@@ -131,7 +144,7 @@ def make_public_event_projector(
         run = event.get("run_id") or ""
         if not isinstance(run, str):
             raise PublicTranscriptError("Chat history has an invalid run identity")
-        if kind == "turn_started":
+        if kind == "turn_started" or _is_goal_followup(event):
             private_segments.discard(run)
         purpose = event.get("purpose")
         internal = (
@@ -146,7 +159,7 @@ def make_public_event_projector(
         if run in private_runs or run in private_segments or not event_is_visible(event):
             return None
         projected = project_provider_event(event, session_id)
-        if kind != "turn_started":
+        if kind != "turn_started" and not _is_goal_followup(event):
             return projected
         prompt = projected.get("prompt")
         if not isinstance(prompt, str):
@@ -226,7 +239,7 @@ def read_public_transcript(
                 kind = raw.get("type")
                 if not isinstance(kind, str):
                     raise PublicTranscriptError("Chat history contains an invalid event type")
-                if kind not in {"turn_started", "assistant_text", "turn_finished", "reasoning_summary"}:
+                if kind not in {"turn_started", "assistant_text", "turn_finished", "reasoning_summary"} and not _is_goal_followup(raw):
                     continue
                 if kind == "reasoning_summary" and raw.get("phase") != "commentary":
                     continue
@@ -236,7 +249,7 @@ def read_public_transcript(
                 if not isinstance(event, dict):
                     raise PublicTranscriptError("Chat history projection is invalid")
                 run = str(event.get("run_id") or "")
-                if kind == "turn_started":
+                if kind == "turn_started" or _is_goal_followup(event):
                     outputs[run] = []
                     role, text = "user", event.get("prompt")
                 else:

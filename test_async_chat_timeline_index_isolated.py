@@ -26,6 +26,7 @@ FUNCTIONS = {
     "semantic_timeline_landmark_anchor", "semantic_timeline_ordinary_candidates",
     "semantic_timeline_event_identity", "semantic_timeline_event_is_display",
     "semantic_timeline_event_is_completed_commentary", "semantic_timeline_event_is_trace_anchor",
+    "is_native_goal_steer_event",
 }
 CONSTANTS = {
     "TIMELINE_INDEX_PROJECTION_VERSION", "TIMELINE_INDEX_HIDDEN_TYPES", "TIMELINE_INDEX_JOB_TYPES",

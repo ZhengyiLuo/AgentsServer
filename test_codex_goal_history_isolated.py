@@ -35,6 +35,7 @@ FUNCTIONS = {
     "should_bump_session_updated_at", "update_session_event_metadata",
     "clear_imported_active_runs", "prepare_codex_goal_history_repair",
     "sync_history_search_index", "history_search_event_record",
+    "is_native_goal_steer_event",
 }
 GOAL = (
     '<codex_internal_context source="goal">\n'
@@ -228,6 +229,26 @@ class GoalHistoryTests(unittest.IsolatedAsyncioTestCase):
         session["active_run"] = {"run_id": "import_old"}
         self.assertEqual(self.ns["clear_imported_active_runs"](), 1)
         self.assertNotIn("active_run", session)
+
+    async def test_accepted_goal_followup_does_not_replace_owner_or_make_unread_output(self):
+        from test_goal_followup_projection_isolated import followup
+
+        owner = {"run_id": "goal-owner", "purpose": "codex_goal_resume", "backend": "codex"}
+        goal = {"status": "active", "objective": "Keep working", "tokensUsed": 900}
+        session = {"id": "chat", "latest_agent_event_seq": 1, "active_run": owner, "codex_goal": goal}
+        self.ns["STORE"] = SimpleNamespace(sessions={"chat": session}, save=AsyncMock())
+        await self.ns["update_session_event_metadata"]("chat", followup(3))
+        self.assertIs(session["active_run"], owner)
+        self.assertIs(session["codex_goal"], goal)
+        self.assertEqual(session["latest_agent_event_seq"], 1)
+
+    def test_goal_followup_is_searchable_as_human_input(self):
+        from test_goal_followup_projection_isolated import followup
+
+        self.ns["HISTORY_SEARCH_EVENT_TYPES"].add("turn_steered")
+        row = followup(3)
+        self.assertEqual(self.ns["history_search_event_record"](row), ("user", row["prompt"]))
+        self.assertIsNone(self.ns["history_search_event_record"]({**row, "provider_user_authored": False}))
 
     def test_prepared_cache_avoids_provider_discovery_on_reopen(self):
         self.ns["STORE"] = SimpleNamespace(sessions={"chat": {

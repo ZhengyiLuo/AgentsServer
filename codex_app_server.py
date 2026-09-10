@@ -903,6 +903,7 @@ class CodexAppServerClient:
         notification_boundary_subscription: CodexAppServerSubscription | None = None,
         discard_on_send_timeout: bool = True,
         transport_turn: CodexAppServerTurn | None = None,
+        before_send: Callable[[], bool] | None = None,
     ) -> Any:
         proc = self._proc
         if not proc or proc.returncode is not None or not proc.stdin:
@@ -931,6 +932,7 @@ class CodexAppServerClient:
                 expected_process=proc,
                 discard_on_send_timeout=discard_on_send_timeout,
                 transport_turn=transport_turn,
+                before_send=before_send,
             )
             try:
                 return await asyncio.wait_for(
@@ -994,6 +996,7 @@ class CodexAppServerClient:
         expected_process: asyncio.subprocess.Process | None = None,
         discard_on_send_timeout: bool = True,
         transport_turn: CodexAppServerTurn | None = None,
+        before_send: Callable[[], bool] | None = None,
     ) -> None:
         loop = asyncio.get_running_loop()
         effective_timeout = self.request_timeout if timeout is None else timeout
@@ -1038,6 +1041,23 @@ class CodexAppServerClient:
                 if loop.time() >= deadline:
                     send_timeout = asyncio.TimeoutError()
                 else:
+                    # A control request can wait behind another writer after
+                    # its caller checked ownership. Recheck synchronously at
+                    # the actual write boundary; there is no await between
+                    # this decision and stdin.write. Rejection sends no bytes.
+                    if before_send is not None:
+                        try:
+                            allowed = before_send() is True
+                        except Exception as exc:
+                            raise CodexAppServerProtocolError(
+                                "app-server send guard failed before delivery",
+                                request_sent=False, safe_to_retry=True,
+                            ) from exc
+                        if not allowed:
+                            raise CodexAppServerProtocolError(
+                                "app-server control owner changed before delivery",
+                                request_sent=False, safe_to_retry=True,
+                            )
                     try:
                         if transport_turn is not None:
                             transport_turn.transport_generation = self._generation
@@ -2206,6 +2226,7 @@ class CodexAppServerClient:
         *,
         client_user_message_id: str | None = None,
         notification_subscription: CodexAppServerSubscription | None = None,
+        before_send: Callable[[], bool] | None = None,
     ) -> tuple[str, int]:
         """Return the exact receive-order boundary of the steer response.
 
@@ -2235,6 +2256,7 @@ class CodexAppServerClient:
             "turn/steer",
             params,
             notification_boundary_subscription=notification_subscription,
+            before_send=before_send,
         )
         if (
             not isinstance(response, tuple)
@@ -2644,6 +2666,25 @@ class CodexAppServerManager:
             turn_id,
             input_items,
             client_user_message_id=client_user_message_id,
+        )
+
+    async def steer_turn_with_notification_watermark(
+        self,
+        thread_id: str,
+        turn_id: str,
+        input_items: list[dict[str, Any]],
+        *,
+        client_user_message_id: str | None = None,
+        notification_subscription: CodexAppServerSubscription | None = None,
+        before_send: Callable[[], bool] | None = None,
+    ) -> tuple[str, int]:
+        return await self.client.steer_turn_with_notification_watermark(
+            thread_id,
+            turn_id,
+            input_items,
+            client_user_message_id=client_user_message_id,
+            notification_subscription=notification_subscription,
+            before_send=before_send,
         )
 
     async def interrupt_turn(self, thread_id: str, turn_id: str) -> None:

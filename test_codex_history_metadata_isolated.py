@@ -27,7 +27,7 @@ def projection():
     ns = load_projection()
     names = {
         "normalized_history_sync_cursor", "load_provider_history_with_cursor",
-        "history_dedup_key", "history_timeline_message_keys",
+        "history_dedup_key", "history_timeline_message_keys", "is_native_goal_steer_event",
         "reconcile_cursor_history_items", "unsynced_history_items",
         "append_durable_event_batch_sync", "append_imported_events_sync",
     }

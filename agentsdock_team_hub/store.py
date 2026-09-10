@@ -57,6 +57,7 @@ from .auth import (
     redeem_invitation,
 )
 from .database import LATEST_SCHEMA_VERSION, MIGRATIONS, open_database
+from .mail_hints import MailArrival, MailHintBroker, MailHintSubscription
 from .security import (
     ACCESS_TOKEN_TTL_SECONDS,
     BOOTSTRAP_PROOF_TTL_SECONDS,
@@ -393,6 +394,8 @@ class HubStore:
     ) -> None:
         self.data_dir = Path(os.path.abspath(os.path.expanduser(os.fspath(data_dir))))
         self.database_path = self.data_dir / "team-hub.sqlite3"
+        # Passive in-process prerequisite only: no stream, worker, or polling.
+        self.mail_hint_broker = MailHintBroker()
         self.signing_key_path = self.data_dir / "access-token-signing.key"
         self.bootstrap_proof_path = self.data_dir / "bootstrap-owner.proof"
         self.maintenance_fence_path = self.data_dir / "maintenance-fence.json"
@@ -12754,11 +12757,127 @@ class HubStore:
                         "team.skill.versioned",
                         timestamp,
                     )
-                return response
+            # The write context has committed before publishing. Idempotent
+            # early returns and rolled-back transactions never reach this hook.
+            if kind == "message":
+                self._publish_team_mail_arrival(
+                    team_id, int(row["queue_ordinal"]), message_id, resolved
+                )
+            return response
         except sqlite3.IntegrityError as exc:
             raise HubError("conflict", "Team message conflicts with existing data", 409) from exc
         finally:
             connection.close()
+
+    def _publish_team_mail_arrival(
+        self,
+        team_id: str,
+        sequence: int,
+        message_id: str,
+        resolved: list[tuple[str, str | None, str | None]],
+    ) -> None:
+        """Best-effort memory-only hints; failures cannot undo committed mail."""
+        for recipient_kind, node_id, _ in resolved:
+            if recipient_kind != "server" or node_id is None:
+                continue
+            try:
+                self.mail_hint_broker.publish(MailArrival(team_id, node_id, sequence, message_id))
+            except Exception:
+                # A healthy-looking idle stream must not silently miss mail.
+                # Retire it so its owner reconnects to the durable watermark.
+                with suppress(Exception):
+                    self.mail_hint_broker.invalidate(team_id, node_id)
+
+    @staticmethod
+    def _team_mail_arrival(
+        connection: sqlite3.Connection, team_id: str, recipient_server_id: str
+    ) -> MailArrival:
+        row = connection.execute(
+            """SELECT through_sequence,arrival_id FROM team_mail_arrivals
+               WHERE team_id=? AND recipient_node_id=?""",
+            (team_id, recipient_server_id),
+        ).fetchone()
+        try:
+            return MailArrival(
+                team_id, recipient_server_id,
+                int(row["through_sequence"]) if row is not None else 0,
+                str(row["arrival_id"]) if row is not None else None,
+            )
+        except ValueError as exc:
+            # SQLite integers can exceed JavaScript's exact integer domain.
+            # Never expose a lossy cursor, and do not prevent ordinary mail.
+            raise HubError("mail_cursor_unavailable", "Mail arrival cursor is unavailable", 409) from exc
+
+    @staticmethod
+    def _team_mail_anchor_matches(connection: sqlite3.Connection, anchor: MailArrival) -> bool:
+        if anchor.through_sequence == 0:
+            return True
+        # Deliberately ignore receipt/unread/dismissal/deletion state. Original
+        # message and recipient identities are immutable, including soft deletes.
+        return connection.execute(
+            """SELECT 1 FROM team_messages AS m
+               JOIN team_message_recipients AS r
+                 ON r.team_id=m.team_id AND r.message_id=m.id
+               WHERE m.queue_ordinal=? AND m.id=? AND m.team_id=? AND m.kind='message'
+                 AND r.recipient_kind='server' AND r.recipient_node_id=?""",
+            (anchor.through_sequence, anchor.arrival_id, anchor.team_id, anchor.recipient_server_id),
+        ).fetchone() is not None
+
+    def team_mail_arrival_snapshot(
+        self, claims: AccessClaims, team_id: str, *, previous_cursor: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """One authenticated scalar snapshot; not an Inbox fetch or unread count.
+
+        The exact client anchor detects restore/reuse even when the restored
+        mailbox has advanced past its old maximum. Realm/connection authority
+        belongs to the future transport wrapper, not to supplied cursor fields.
+        """
+        try:
+            previous = MailArrival.from_dict(previous_cursor) if previous_cursor is not None else None
+        except ValueError as exc:
+            raise HubError("invalid_request", "Mail arrival cursor is invalid", 422) from exc
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            self._require_network_scope(connection, claims, team_id, write=False)
+            node = self._caller_network_node(connection, claims, team_id)
+            recipient = str(node["node_id"])
+            if previous is not None and previous.mailbox != (team_id, recipient):
+                raise HubError("forbidden", "Mail arrival cursor belongs to another mailbox", 403)
+            latest = self._team_mail_arrival(connection, team_id, recipient)
+            reset = previous is None or (
+                previous.through_sequence > latest.through_sequence
+                or not self._team_mail_anchor_matches(connection, previous)
+            )
+            response = latest.as_dict(reset=reset)
+            connection.execute("COMMIT")
+            return response
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def subscribe_team_mail_arrivals(
+        self, claims: AccessClaims, team_id: str, *, previous_cursor: dict[str, Any] | None = None
+    ) -> tuple[MailHintSubscription, dict[str, Any]]:
+        """Bind first, subscribe, then read a *fresh* authenticated snapshot.
+
+        Reusing the identity lookup's SQLite snapshot would lose a commit
+        between that lookup and subscription. The second read also rechecks
+        membership/binding; every future transport send needs its own fence.
+        """
+        bound = self.team_mail_arrival_snapshot(claims, team_id, previous_cursor=previous_cursor)
+        subscription = self.mail_hint_broker.subscribe(team_id, bound["recipient_server_id"])
+        try:
+            snapshot = self.team_mail_arrival_snapshot(claims, team_id, previous_cursor=previous_cursor)
+            if snapshot["recipient_server_id"] != bound["recipient_server_id"]:
+                raise HubError("forbidden", "Mail mailbox binding changed", 403)
+            return subscription, snapshot
+        except BaseException:
+            subscription.close()
+            raise
 
     def list_team_messages(
         self,
@@ -12777,6 +12896,8 @@ class HubStore:
         include_revision: bool = False,
         include_mail_subject: bool = False,
         include_mailbox_state: bool = False,
+        include_mailbox_coverage: bool = False,
+        after_arrival_id: str | None = None,
     ) -> dict[str, Any]:
         if box not in {"inbox", "feed", "sent"}:
             raise HubError("invalid_request", "Message box is invalid", 422)
@@ -12885,6 +13006,30 @@ class HubStore:
                 ),
                 "has_more": len(rows) > limit,
             }
+            # Coverage is opt-in and store-only until a negotiated transport is
+            # implemented. Filtered/foreign/stale-prefix pages are never proof
+            # that the recipient reviewed the entire arrival prefix.
+            coverage_latest: MailArrival | None = None
+            if (
+                include_mailbox_coverage and box == "inbox" and address_kind == "server"
+                and not unread and from_kind is None and since_epoch is None
+            ):
+                try:
+                    anchor = MailArrival(team_id, str(address_id), after_sequence, after_arrival_id)
+                except ValueError:
+                    anchor = None
+                if anchor is not None and self._team_mail_anchor_matches(connection, anchor):
+                    coverage_latest = self._team_mail_arrival(connection, team_id, str(address_id))
+
+            def apply_coverage() -> None:
+                if coverage_latest is not None:
+                    covered = (
+                        MailArrival(team_id, str(address_id), messages[-1]["sequence"], messages[-1]["id"])
+                        if response["has_more"] and messages else coverage_latest
+                    )
+                    response["mailbox_coverage"] = covered.as_dict()
+
+            apply_coverage()
             # Expanded all-server mail can make an ordinary page larger than
             # the peer transport. Preserve the cursor, returning a shorter
             # complete page instead of omitting any recipients or messages.
@@ -12892,6 +13037,7 @@ class HubStore:
                 messages.pop()
                 response["next_after_sequence"] = messages[-1]["sequence"]
                 response["has_more"] = True
+                apply_coverage()
             if len(canonical_json(response)) > MAX_NETWORK_PAGE_RESPONSE_BYTES:
                 raise HubError(
                     "invalid_request", "Message page exceeds the response limit; lower limit", 422

@@ -2542,11 +2542,16 @@ class CompactTimelinePagingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("reasoning_summary", [event["type"] for event in visible_response["events"]])
         self.assertNotIn("raw_event", [event["type"] for event in visible_response["events"]])
         self.assertEqual([event["seq"] for event in compact_response["events"]], [12, 14, 16])
-        self.assertEqual(offload.await_count, 3)
-        self.assertIs(offload.await_args_list[0].args[0], agent_server.read_client_events_page)
-        self.assertIs(offload.await_args_list[1].args[0], agent_server.read_visible_events_page)
-        self.assertIs(offload.await_args_list[2].args[0], agent_server.read_visible_events_after_page)
-        self.assertTrue(offload.await_args_list[2].kwargs["compact"])
+        self.assertEqual(offload.await_count, 6)
+        for index in (0, 2, 4):
+            self.assertEqual(offload.await_args_list[index].args, (
+                agent_server.prepare_provider_history_metadata_repair, self.session_id,
+            ))
+            self.assertEqual(offload.await_args_list[index].kwargs, {})
+        self.assertIs(offload.await_args_list[1].args[0], agent_server.read_client_events_page)
+        self.assertIs(offload.await_args_list[3].args[0], agent_server.read_visible_events_page)
+        self.assertIs(offload.await_args_list[5].args[0], agent_server.read_visible_events_after_page)
+        self.assertTrue(offload.await_args_list[5].kwargs["compact"])
 
     async def test_endpoint_exposes_additive_semantic_paging_fields(self) -> None:
         session = {

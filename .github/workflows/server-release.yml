@@ -65,4 +65,5 @@ jobs:
           fi
           gh release create "$RELEASE_TAG" dist/* "${release_args[@]}" \
             --title "AgentsServer $RELEASE_TAG" \
+            --target "$GITHUB_SHA" \
             --generate-notes

@@ -1476,6 +1476,8 @@ def create_app(
         include_revision: Annotated[bool, Query()] = False,
         include_mail_subject: Annotated[bool, Query()] = False,
         include_mailbox_state: Annotated[bool, Query()] = False,
+        include_mailbox_coverage: Annotated[bool, Query()] = False,
+        after_arrival_id: Annotated[str | None, Query(pattern=r"^tmsg_[0-9a-f]{32}$")] = None,
     ) -> dict[str, Any]:
         return store.list_team_messages(
             claims,
@@ -1492,6 +1494,8 @@ def create_app(
             include_revision=include_revision,
             include_mail_subject=include_mail_subject,
             include_mailbox_state=include_mailbox_state,
+            include_mailbox_coverage=include_mailbox_coverage,
+            after_arrival_id=after_arrival_id,
         )
 
     @app.get("/v1/teams/{team_id}/network/deletions")

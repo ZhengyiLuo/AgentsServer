@@ -128,6 +128,7 @@ from agentsdock_team_hub.store import (
 )
 from agentsdock_team_hub.secure_peer import SecurePeerError
 from secure_peer_runtime import SECURE_PEER_HEARTBEAT_SECONDS, SecurePeerRuntime
+from team_mail_websocket import serve_team_mail_hints
 from claude_history_repair import ClaudeMetadataRepairCache, enrich_interruption_origins
 from codex_history_repair import CodexGoalHistoryRepairCache
 from claude_history_provenance import ClaudeInterruptionTracker, normalize_claude_interruption_context
@@ -7566,8 +7567,10 @@ async def persist_provider_cross_chat_pair_grants(
                 else:
                     routes[routes.index(current)] = route
                 changes_by_session[owner_id].append({
-                    "after": route,
-                    "before": dict(current) if current else None,
+                    # The journal is an immutable revision-CAS proof, not a
+                    # reference to a route that a later edit may mutate.
+                    "after": {**route, "actions": list(route["actions"])},
+                    "before": {**current, "actions": list(current["actions"])} if current else None,
                 })
         mutations: dict[str, dict[str, Any]] = {}
         previous: dict[str, dict[str, Any]] = {}
@@ -7916,8 +7919,22 @@ async def rollback_durable_provider_cross_chat_reference_grants(
                     reconcile_pending_provider_cross_chat_grant(
                         session_id, session, force_rollback=True,
                     )
-            await STORE.persist_restored_state(durable=True)
-        return
+            rollback_error: BaseException | None = None
+            for _attempt in range(3):
+                try:
+                    await STORE.persist_restored_state(durable=True)
+                    return
+                except BaseException as exc:
+                    rollback_error = exc
+            # Keep every participant narrowed even if persistence remains
+            # unavailable; never re-expose an unaccepted grant on failure.
+            logger.critical(
+                "durable paired cross-chat admission rollback could not be persisted "
+                "source=%s",
+                source_session_id,
+            )
+            assert rollback_error is not None
+            raise rollback_error
     async with STORE._lock:
         source = STORE.sessions.get(source_session_id)
         if source is None:
@@ -73229,6 +73246,7 @@ async def health() -> dict[str, Any]:
             and bool(tmux["available"])
         ),
         "capabilities": {
+            "team_mail_hints_v1": SECURE_PEER_RUNTIME.team_mail_hint_capability(),
             "websocket_auth_v1": {
                 "available": True,
                 "required": False,
@@ -85766,6 +85784,17 @@ async def session_events(
         pass
     finally:
         await HUB.unsubscribe(session_id, ws)
+
+
+@app.websocket("/api/team-mail-hints/events")
+async def team_mail_hint_events(ws: WebSocket) -> None:
+    # No query-string credentials on this metadata lane. Authentication is
+    # checked again immediately before each bounded serial websocket write.
+    await serve_team_mail_hints(
+        ws, SECURE_PEER_RUNTIME, server_identity=server_identity(),
+        authorized=lambda: not ws.query_params and websocket_authorized(ws),
+        protocols=websocket_requested_protocols(ws),
+    )
 
 
 @app.websocket("/api/emergency-alerts/events")

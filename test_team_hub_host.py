@@ -1754,6 +1754,7 @@ class VendoredTeamHubParityTests(unittest.TestCase):
             "auth.py": "d939fd30bdd93cf53183de5b5ff21be43d2a7a2cc9d2ce6dc00a49c888db41db",
             "cli.py": "c5827f30d90420d2e362389530154255ca6039c1c524edec29a5d219b96328d3",
             "database.py": "b4e37974d0ca3ea9a471a4aa46b9d726734cf8dbf0483e757ca4a291b125ccd5",
+            "mail_hint_streams.py": "35cd603540187f6ae241118c2699463501d464bb91e0b7367d82b349dd137d16",
             "mail_hints.py": "e3749610b85a8729335b9e80bfea99080be7ab45e46b1e505cb24f784daa07a4",
             "migrations/0001_identity_auth.sql": "f55a62bf6dec527e1f71df91975deaf371e2af8b6e457b9d5577437e914dc186",
             "migrations/0002_teamspace_ledger.sql": "9681100d3d6eb3986e133d761ce9d000dbcf10b5e50954c96bd168391ecacbf3",
@@ -1777,9 +1778,9 @@ class VendoredTeamHubParityTests(unittest.TestCase):
             "migrations/0020_team_mail_arrivals.sql": "4f4c393a441b1eace56bc8b3cca4e0f2094cc68e8cb10b07a3a88c15ef6a7f7f",
             "migrations/__init__.py": "aaf340c45c8d39c2939814977ba4cef8eb6b3bd0671b0f7542ebe06f5431d6ec",
             "security.py": "0c1895c7443e7be07a2f53c7e4c4228e3ee04c65d6cd36f039b7bbba1813e4fa",
-            "secure_peer.py": "bb0a9ccc266ed64092c4d6f5903badfb62f9de9503dce4048c8ced0d3a169b1a",
-            "secure_peer_hub.py": "f99257022e2941575466fedb36a6eb101aaeb7c3868dd4d379c204312b649919",
-            "service.py": "e2b9f68f25b52571ae50993d8f54dbb1650579d531aa9f6fbe6ab8abd784456b",
+            "secure_peer.py": "a6725fa13db1d83d3e58988feef9287f967e2a0937fb161774c283989ec45f5b",
+            "secure_peer_hub.py": "2f6f2655fdb8147ca908c434aae93d7ca40837d52ef7379084fe5d6f3b75d995",
+            "service.py": "9064f01b2ef8566ecaff2d87db3cbb6b026fe065f39fe3b89118ef1239f97942",
             "store.py": "c7bf4d0ee1340ca0866db608b122b16fb4354e1c122d7dfd11d28151953ac42b",
         }
         entries = list(vendored.rglob("*"))

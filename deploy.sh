@@ -14,6 +14,8 @@ RUNTIME_FILES=(
   "$SCRIPT_DIR/agent_server.py"
   "$SCRIPT_DIR/team_hub_host.py"
   "$SCRIPT_DIR/secure_peer_runtime.py"
+  "$SCRIPT_DIR/team_mail_runtime.py"
+  "$SCRIPT_DIR/team_mail_websocket.py"
   "$SCRIPT_DIR/secure_peer_delivery.py"
   "$SCRIPT_DIR/agentsdock_jobs.py"
   "$SCRIPT_DIR/agentsdock_chats.py"
@@ -354,7 +356,7 @@ ssh "$REMOTE_HOST" "
 "
 
 echo "Compiling server on $REMOTE_HOST"
-ssh "$REMOTE_HOST" "chmod 755 '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/agentsdock_chats.py' '$REMOTE_SERVER_DIR/agentsdock_emergency.py' '$REMOTE_SERVER_DIR/agentsdock_publish.py' '$REMOTE_SERVER_DIR/agentsdock_mail.py' '$REMOTE_SERVER_DIR/agentsdock_team.py' && '$REMOTE_PYTHON' -m compileall -q '$REMOTE_SERVER_DIR/agentsdock_team_hub' && '$REMOTE_PYTHON' -m py_compile '$REMOTE_SERVER_PATH' '$REMOTE_SERVER_DIR/team_hub_host.py' '$REMOTE_SERVER_DIR/secure_peer_runtime.py' '$REMOTE_SERVER_DIR/secure_peer_delivery.py' '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/agentsdock_chats.py' '$REMOTE_SERVER_DIR/agentsdock_emergency.py' '$REMOTE_SERVER_DIR/agentsdock_publish.py' '$REMOTE_SERVER_DIR/agentsdock_mail.py' '$REMOTE_SERVER_DIR/agentsdock_team.py' '$REMOTE_SERVER_DIR/claude_sdk_client.py' '$REMOTE_SERVER_DIR/codex_app_server.py' '$REMOTE_SERVER_DIR/cursor_agent_client.py' '$REMOTE_SERVER_DIR/cursor_process_guard.py' '$REMOTE_SERVER_DIR/claude_history_repair.py' '$REMOTE_SERVER_DIR/claude_history_provenance.py' '$REMOTE_SERVER_DIR/codex_history_repair.py' '$REMOTE_SERVER_DIR/public_chat_shares.py' '$REMOTE_SERVER_DIR/public_chat_transcript.py' '$REMOTE_SERVER_DIR/public_chat_share_routes.py' '$REMOTE_SERVER_DIR/update_runner.py'"
+ssh "$REMOTE_HOST" "chmod 755 '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/agentsdock_chats.py' '$REMOTE_SERVER_DIR/agentsdock_emergency.py' '$REMOTE_SERVER_DIR/agentsdock_publish.py' '$REMOTE_SERVER_DIR/agentsdock_mail.py' '$REMOTE_SERVER_DIR/agentsdock_team.py' && '$REMOTE_PYTHON' -m compileall -q '$REMOTE_SERVER_DIR/agentsdock_team_hub' && '$REMOTE_PYTHON' -m py_compile '$REMOTE_SERVER_PATH' '$REMOTE_SERVER_DIR/team_hub_host.py' '$REMOTE_SERVER_DIR/secure_peer_runtime.py' '$REMOTE_SERVER_DIR/team_mail_runtime.py' '$REMOTE_SERVER_DIR/team_mail_websocket.py' '$REMOTE_SERVER_DIR/secure_peer_delivery.py' '$REMOTE_SERVER_DIR/agentsdock_jobs.py' '$REMOTE_SERVER_DIR/agentsdock_chats.py' '$REMOTE_SERVER_DIR/agentsdock_emergency.py' '$REMOTE_SERVER_DIR/agentsdock_publish.py' '$REMOTE_SERVER_DIR/agentsdock_mail.py' '$REMOTE_SERVER_DIR/agentsdock_team.py' '$REMOTE_SERVER_DIR/claude_sdk_client.py' '$REMOTE_SERVER_DIR/codex_app_server.py' '$REMOTE_SERVER_DIR/cursor_agent_client.py' '$REMOTE_SERVER_DIR/cursor_process_guard.py' '$REMOTE_SERVER_DIR/claude_history_repair.py' '$REMOTE_SERVER_DIR/claude_history_provenance.py' '$REMOTE_SERVER_DIR/codex_history_repair.py' '$REMOTE_SERVER_DIR/public_chat_shares.py' '$REMOTE_SERVER_DIR/public_chat_transcript.py' '$REMOTE_SERVER_DIR/public_chat_share_routes.py' '$REMOTE_SERVER_DIR/update_runner.py'"
 
 echo "Restarting $SERVICE_NAME"
 ssh "$REMOTE_HOST" "systemctl --user restart '$SERVICE_NAME'"

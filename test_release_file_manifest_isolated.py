@@ -12,6 +12,7 @@ import unittest
 
 ROOT = Path(__file__).parent
 NEW_MODULES = {
+    "team_mail_runtime.py", "team_mail_websocket.py",
     "claude_history_repair.py", "claude_history_provenance.py", "codex_history_repair.py", "public_chat_shares.py",
     "public_chat_transcript.py", "public_chat_share_routes.py",
 }

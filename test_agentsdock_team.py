@@ -718,20 +718,39 @@ class AgentsDockTeamCLITests(unittest.TestCase):
                 2,
             )
 
-    def test_send_rejects_title_for_plain_message(self) -> None:
+    def test_send_accepts_title_for_plain_message(self) -> None:
+        route_id = "team_" + "b" * 32
         with (
             patch.dict(agentsdock_team.os.environ, {"AGENTSDOCK_SERVER_URL": "http://127.0.0.1:7850"}),
             patch.object(agentsdock_team.sys, "stdin", io.StringIO("body")),
             patch.object(agentsdock_team.urllib.request, "build_opener") as opener,
         ):
+            opener.return_value.open.return_value = FakeResponse({
+                "ok": True,
+                "route_id": route_id,
+                "message_id": "tmsg_subject_1",
+                "kind": "message",
+                "accepted": True,
+                "duplicate": False,
+                "attachments": 0,
+            })
             self.assertEqual(
                 agentsdock_team.main([
                     "--authority-file", self.authority(), "send",
-                    "--route", "team_" + "b" * 32, "--title", "Unexpected",
+                    "--route", route_id, "--title", "  Build update  ",
                 ]),
-                2,
+                0,
             )
-        opener.assert_not_called()
+        opener.assert_called_once()
+        opener.return_value.open.assert_called_once()
+        request = opener.return_value.open.call_args.args[0]
+        self.assertEqual(request.method, "POST")
+        self.assertEqual(request.full_url, f"http://127.0.0.1:7850/api/agent/team/routes/{route_id}")
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(payload["title"], "Build update")
+        self.assertEqual(payload["kind"], "message")
+        self.assertEqual(payload["body"], "body")
+        self.assertNotIn("skill", payload)
 
 
 class ProviderTeamEndpointTests(unittest.IsolatedAsyncioTestCase):
@@ -894,7 +913,8 @@ class ProviderTeamEndpointTests(unittest.IsolatedAsyncioTestCase):
                 self.request(), box="inbox", unread=True, limit=500
             )
         listed.assert_called_once_with(
-            box="inbox", team_id=None, unread=True, since=None, after_sequence=0, limit=100
+            box="inbox", team_id=None, unread=True, since=None, after_sequence=0, limit=100,
+            include_mail_subject=False,
         )
         self.assertIn("team-authored", result["notice"])
         with self.assertRaises(HTTPException) as raised:

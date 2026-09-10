@@ -44,6 +44,7 @@ from agentsdock_team_hub.store import (
     HubStore,
 )
 from secure_peer_delivery import SecurePeerDeliveryLedger
+from team_mail_runtime import RuntimeMailHints
 
 
 SECURE_PEER_CONTROL_VERSION = 2
@@ -163,6 +164,7 @@ class SecurePeerRuntime:
         logger: Any = None,
         team_cache_max_bytes: int | None = None,
         agent_relay_enabled: bool = False,
+        mail_hints_enabled: bool = False,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.server_identity = str(server_identity)
@@ -245,6 +247,8 @@ class SecurePeerRuntime:
         # The explicit constructor flag remains for isolated protocol tests
         # and migration tooling; pairing alone can never widen this value.
         self._relay_enabled = bool(agent_relay_enabled)
+        # Next-beta lane remains unavailable unless isolated acceptance opts in.
+        self._mail_hints = RuntimeMailHints(self, enabled=mail_hints_enabled)
         self._remote_routes_cache: dict[str, list[dict[str, Any]]] = {}
         self._remote_routes_refreshed_at: dict[str, int] = {}
         self._delivery_target_validator: Any = None
@@ -730,6 +734,10 @@ class SecurePeerRuntime:
                     relay_enabled=lambda: self._relay_enabled,
                     peer_heartbeat=self._record_authenticated_peer_heartbeat,
                     peer_revoker=self._revoke_authenticated_peer,
+                    **({
+                        "mail_hint_subscriber": self._subscribe_peer_mail_hints,
+                        "mail_hint_snapshot": self._peer_mail_hint_snapshot,
+                    } if self._mail_hints.enabled else {}),
                 )
                 gateway.start()
                 self._gateway = gateway
@@ -966,6 +974,7 @@ class SecurePeerRuntime:
         return self._outgoing_pairing(result)
 
     def _notify_pairing_completion(self) -> None:
+        self._mail_hints.invalidate()
         with self._guard:
             callbacks = tuple(self._completion_waiters.values())
         for callback in callbacks:
@@ -2408,6 +2417,8 @@ class SecurePeerRuntime:
         renewal_error: BaseException | None = None
         try:
             renewal = self.client.renew_if_due(connection_id)
+            if renewal.get("renewed"):
+                self._mail_hints.invalidate()
             renewed_connection = renewal.get("connection")
             if (
                 isinstance(renewed_connection, Mapping)
@@ -3685,6 +3696,37 @@ class SecurePeerRuntime:
     def close_host_admission(self) -> None:
         self._close_host_admission()
 
+    def team_mail_hint_capability(self) -> dict[str, Any]:
+        return self._mail_hints.capability()
+
+    def subscribe_team_mail_hints(self, team_id: str, previous_cursor=None):
+        return self._mail_hints.subscribe(team_id, previous_cursor)
+
+    def _peer_mail_authority(self, adapter, epoch: int) -> None:
+        if (not self._mail_hints.enabled or self._completion_closing
+                or not self._peer_accepting or self._host_admission_closed
+                or self._host_admission_epoch != epoch or self._adapter is not adapter):
+            raise SecurePeerError("hub_maintenance", "Mail stream authority is unavailable", 503)
+
+    def _subscribe_peer_mail_hints(self, peer: PeerAuthorization, previous_cursor=None):
+        adapter, epoch = self._adapter, self._host_admission_epoch
+        self._peer_mail_authority(adapter, epoch)
+        lease = adapter.subscribe_team_mail_hints(peer, previous_cursor,
+            authority_guard=lambda: self._peer_mail_authority(adapter, epoch))
+        try:
+            self._peer_mail_authority(adapter, epoch)
+            return lease
+        except BaseException:
+            lease.close()
+            raise
+
+    def _peer_mail_hint_snapshot(self, peer: PeerAuthorization, previous_cursor=None):
+        adapter, epoch = self._adapter, self._host_admission_epoch
+        self._peer_mail_authority(adapter, epoch)
+        result = adapter.team_mail_hint_snapshot(peer, previous_cursor)
+        self._peer_mail_authority(adapter, epoch)
+        return result
+
     def _close_host_admission(self) -> tuple[int, bool]:
         with self._peer_admission:
             was_closed = self._host_admission_closed
@@ -3693,6 +3735,15 @@ class SecurePeerRuntime:
             self._host_admission_closed = True
             self._peer_accepting = False
             self._peer_admission.notify_all()
+        # Close lifetime sockets OUTSIDE the ordinary request drain. Their
+        # dedicated leases do not hold either in-flight counter.
+        self._mail_hints.invalidate()
+        adapter, gateway = self._adapter, self._gateway
+        if gateway is not None and hasattr(gateway, "close_mail_hint_streams"):
+            gateway.close_mail_hint_streams()
+        if adapter is not None:
+            adapter.close_mail_hint_streams()
+        with self._peer_admission:
             while self._peer_in_flight or self._host_in_flight:
                 self._peer_admission.wait(timeout=0.25)
             return closure_epoch, was_closed
@@ -6597,6 +6648,8 @@ class SecurePeerRuntime:
                 after_sequence=int(query.get("after_sequence", "0")),
                 limit=int(query.get("limit", "50")),
                 include_mail_subject=flag("include_mail_subject"),
+                include_mailbox_coverage=flag("include_mailbox_coverage"),
+                after_arrival_id=query.get("after_arrival_id"),
             )
         if method == "GET" and pieces == ["deletions"]:
             return store.list_network_content_deletions(

@@ -4123,6 +4123,11 @@ class SecurePeerRuntimeTests(unittest.TestCase):
                 ) as expire,
                 mock.patch.object(
                     runtime.client,
+                    "list_auto_completion_candidates",
+                    wraps=runtime.client.list_auto_completion_candidates,
+                ) as candidates,
+                mock.patch.object(
+                    runtime.client,
                     "recover_pairing_attempts",
                     return_value={"remaining": 0},
                 ),
@@ -4133,7 +4138,10 @@ class SecurePeerRuntimeTests(unittest.TestCase):
                 ),
             ):
                 result = runtime.maintenance_once()
-            expire.assert_called_once_with()
+            # Maintenance expires pending work directly, then the bounded
+            # automatic-completion scan expires again before choosing work.
+            self.assertEqual(expire.call_args_list, [mock.call(), mock.call()])
+            candidates.assert_called_once_with(limit=1)
             self.assertFalse(result["active"])
             runtime.shutdown()
 

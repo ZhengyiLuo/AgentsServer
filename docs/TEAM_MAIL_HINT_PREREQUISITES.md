@@ -1,9 +1,11 @@
 # Team Mail hint prerequisites — transport disabled
 
-This is a store/broker foundation, not working notifications. No capability,
-HTTP route, secure-peer stream, websocket, renderer listener, badge, polling,
-outbox dispatcher, or agent execution is enabled. Do not package or deploy it
-as an accepted notification lane. End-to-end transport acceptance is pending.
+This records the store/broker foundation, not accepted working notifications.
+Next-beta transport code now exists behind a false production gate; its exact
+contract and validation boundary are in [TEAM_MAIL_HINT_TRANSPORT.md](TEAM_MAIL_HINT_TRANSPORT.md).
+No notification stream, polling, outbox dispatcher or agent execution is
+enabled in production. Do not deploy it as an accepted notification lane.
+End-to-end transport and desktop acceptance remain pending.
 
 ## Durable recipient cursor
 
@@ -117,5 +119,8 @@ human/feed/skill exclusions, cursor restoration/reuse, query plans, snapshot
 races, exact ownership, bounded coalescing/recipient wakeups, subscriber cleanup,
 safe integers, capped pages, missing anchors, and deleted complete coverage.
 The release allowlists include the module/migration; this is not a release or
-deployment instruction. Transport, reconnect/backpressure/revocation acceptance,
-and the actual desktop notification journey remain unimplemented.
+deployment instruction. The next-beta transport is now implemented behind a
+false production gate, with real pinned-TLS framing, disconnect/backpressure,
+authority and Member-runtime composition checks. See the transport document
+for the precise acceptance evidence and remaining real-process/UI boundaries;
+these prerequisites alone still do not establish an enabled notification lane.

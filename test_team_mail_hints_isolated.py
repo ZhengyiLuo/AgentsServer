@@ -378,14 +378,20 @@ class TeamMailArrivalStoreTests(unittest.TestCase):
         with self.assertRaises(HubError) as unsafe: self.snapshot()
         self.assertEqual(unsafe.exception.code, "mail_cursor_unavailable")
 
-    def test_no_transport_capability_or_existing_route_is_enabled(self):
+    def test_transport_requires_explicit_runtime_opt_in(self):
         capability = self.store.team_messages_capability()
         self.assertNotIn("mailbox_coverage", capability)
         self.assertNotIn("mail_hints", capability)
-        for filename in ("service.py", "secure_peer_hub.py", "secure_peer.py"):
-            source = (ROOT / "agentsdock_team_hub" / filename).read_text()
-            self.assertNotIn("subscribe_team_mail_arrivals", source)
-            self.assertNotIn("include_mailbox_coverage", source)
+        runtime = ast.parse((ROOT / "secure_peer_runtime.py").read_text())
+        cls = next(node for node in runtime.body if isinstance(node, ast.ClassDef) and node.name == "SecurePeerRuntime")
+        init = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "__init__")
+        defaults = dict(zip((arg.arg for arg in init.args.kwonlyargs), init.args.kw_defaults))
+        self.assertIs(defaults["mail_hints_enabled"].value, False)
+        server = ast.parse((ROOT / "agent_server.py").read_text())
+        calls = [node for node in ast.walk(server) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name) and node.func.id == "SecurePeerRuntime"]
+        self.assertTrue(calls)
+        self.assertTrue(all("mail_hints_enabled" not in {keyword.arg for keyword in node.keywords} for node in calls))
         ast.parse((ROOT / "agentsdock_team_hub/store.py").read_text())
 
 

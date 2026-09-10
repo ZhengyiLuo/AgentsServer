@@ -25027,9 +25027,12 @@ def _prune_history_message_key(event: dict[str, Any]) -> tuple[str, str] | None:
         # leave later assistant rows attached to the wrong user turn.
         if event.get(TIMELINE_IMPORTED_PROMPT_HIDDEN_FIELD) is True:
             return None
-        return history_dedup_key("user", event.get("prompt"))
+        # Pruning stores the full normalized text beside its lookup digest.
+        # Provider-history keys are already hashed and cannot prove equality
+        # when two digest values collide.
+        return "user", " ".join(str(event.get("prompt") or "").split())
     if event_type == "assistant_text":
-        return history_dedup_key("assistant", event.get("text"))
+        return "assistant", " ".join(str(event.get("text") or "").split())
     return None
 
 

@@ -1392,10 +1392,13 @@ exit 0
     def test_installer_and_release_archive_include_runtime_tools_and_uninstaller(self):
         installer_source = INSTALLER.read_text()
         packager_source = PACKAGER.read_text()
-        self.assertIn(
-            "RELEASE_FILES=(activation_transaction.py agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py claude_sdk_client.py codex_app_server.py cursor_agent_client.py cursor_process_guard.py",
-            installer_source,
-        )
+        release_files_match = re.search(r"(?m)^RELEASE_FILES=\(([^)]*)\)$", installer_source)
+        self.assertIsNotNone(release_files_match)
+        release_files = release_files_match.group(1).split()
+        for filename in (
+            "activation_transaction.py agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py claude_sdk_client.py claude_background_reconciliation.py codex_app_server.py cursor_agent_client.py cursor_process_guard.py"
+        ).split():
+            self.assertIn(filename, release_files)
         self.assertIn('"$STAGE_DIR/activation_transaction.py"', installer_source)
         self.assertIn('"$STAGE_DIR/agentsdock_team.py"', installer_source)
         self.assertIn("RELEASE_DIRECTORIES=(agentsdock_team_hub)", installer_source)

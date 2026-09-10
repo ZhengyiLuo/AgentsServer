@@ -1525,7 +1525,7 @@ if [[ "$TEAM_HUB_MODE" == "host" && "$TEAM_HUB_OPERATION_PENDING" != "true" ]]; 
   fi
 fi
 
-RELEASE_FILES=(activation_transaction.py agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py claude_sdk_client.py codex_app_server.py cursor_agent_client.py cursor_process_guard.py claude_history_repair.py claude_history_provenance.py codex_history_repair.py public_chat_shares.py public_chat_transcript.py public_chat_share_routes.py install.sh uninstall.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem)
+RELEASE_FILES=(activation_transaction.py agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py claude_sdk_client.py codex_app_server.py cursor_agent_client.py cursor_process_guard.py claude_history_repair.py claude_history_provenance.py codex_history_repair.py public_chat_shares.py public_chat_transcript.py public_chat_share_routes.py install.sh uninstall.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem)
 RELEASE_DIRECTORIES=(agentsdock_team_hub)
 TEAM_HUB_RELEASE_FILES=(
   __init__.py
@@ -3045,6 +3045,7 @@ validate_staged_release_runtime() (
     "$STAGE_DIR/agentsdock_publish.py" \
     "$STAGE_DIR/agentsdock_mail.py" \
     "$STAGE_DIR/agentsdock_team.py" \
+    "$STAGE_DIR/provider_commands.py" \
     "$STAGE_DIR/claude_sdk_client.py" \
     "$STAGE_DIR/codex_app_server.py" \
     "$STAGE_DIR/cursor_agent_client.py" \
@@ -3057,7 +3058,7 @@ validate_staged_release_runtime() (
     "$STAGE_DIR/public_chat_share_routes.py" \
     "$STAGE_DIR/update_runner.py"
   "$STAGE_DIR/.venv/bin/python" -m compileall -q "$STAGE_DIR/agentsdock_team_hub"
-  PYTHONPATH="$STAGE_DIR" "$STAGE_DIR/.venv/bin/python" -c 'import agentsdock_team_hub, cursor_agent_client, cursor_process_guard, secure_peer_delivery, secure_peer_runtime, team_hub_host, agentsdock_mail, agentsdock_team, claude_history_repair, claude_history_provenance, codex_history_repair, public_chat_shares, public_chat_transcript, public_chat_share_routes; from agentsdock_team_hub import secure_peer, secure_peer_hub' >/dev/null
+  PYTHONPATH="$STAGE_DIR" "$STAGE_DIR/.venv/bin/python" -c 'import agentsdock_team_hub, cursor_agent_client, cursor_process_guard, secure_peer_delivery, secure_peer_runtime, team_hub_host, agentsdock_mail, agentsdock_team, provider_commands, claude_history_repair, claude_history_provenance, codex_history_repair, public_chat_shares, public_chat_transcript, public_chat_share_routes; from agentsdock_team_hub import secure_peer, secure_peer_hub' >/dev/null
 )
 
 abort_unclaimed_team_hub_reactivation() {

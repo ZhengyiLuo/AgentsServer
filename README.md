@@ -1304,6 +1304,7 @@ The server exposes JSON endpoints under `/api`.
 - `PATCH /api/sessions/{session_id}`
 - `GET /api/sessions/{session_id}/events`
 - `GET /api/sessions/{session_id}/subagents`
+- `GET /api/sessions/{session_id}/provider-commands`
 - `POST /api/sessions/{session_id}/prompt`
 - `POST /api/sessions/{session_id}/stop`
 - `POST /api/sessions/{session_id}/fork`
@@ -1335,12 +1336,37 @@ The subagents endpoint folds Claude local-agent lifecycle records into bounded
 `subagent_state` snapshots without returning provider prompts, raw events,
 tool-result output, commands, or output-file paths.
 
+### Native provider commands
+
+Authenticated clients can call
+`GET /api/sessions/{session_id}/provider-commands?refresh=false` to retrieve a
+bounded, sanitized inventory for that chat's backend and working directory.
+Codex returns native skills from app-server `skills/list`; Claude returns the
+commands reported by the Claude Agent SDK. Cursor currently reports explicit
+unsupported metadata and an empty inventory.
+
+Clients select an entry by sending only its opaque `id` and inventory
+`revision` in the optional turn field `skill_selection`. They never receive or
+submit a provider filesystem path. AgentsServer re-discovers and revalidates
+the selection against the session, backend, working directory, and current
+provider inventory immediately before execution. A valid Codex selection uses
+Codex's structured skill input, while a valid Claude selection invokes the
+provider-reported command through the SDK. Unknown or unselected leading-slash
+text remains an ordinary literal message, and normal approval policy is
+unchanged.
+
+Opaque IDs and revisions are scoped to the current AgentsServer process so
+native filesystem paths cannot be inferred from them. After a server restart,
+clients must fetch a fresh inventory. A previously queued selection is
+visibly removed as stale during promotion, and later queue entries continue in
+FIFO order.
+
 ## Repository Hygiene
 
 Before publishing:
 
 ```bash
-python3 -m py_compile agent_server.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_publish.py claude_sdk_client.py codex_app_server.py cursor_agent_client.py update_runner.py
+python3 -m py_compile agent_server.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_publish.py provider_commands.py claude_sdk_client.py codex_app_server.py cursor_agent_client.py update_runner.py
 rg -n 'private-host|/home/<name>|/Users/<name>|token-value' .
 ```
 

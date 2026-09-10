@@ -743,6 +743,7 @@ exit 0
         self.assertIn('"$SCRIPT_DIR/agentsdock_emergency.py"', source)
         self.assertIn('"$SCRIPT_DIR/agentsdock_publish.py"', source)
         self.assertIn('"$SCRIPT_DIR/agentsdock_team.py"', source)
+        self.assertIn('"$SCRIPT_DIR/provider_commands.py"', source)
         self.assertIn('"$SCRIPT_DIR/claude_sdk_client.py"', source)
         self.assertIn('"$SCRIPT_DIR/codex_app_server.py"', source)
         self.assertIn('"$SCRIPT_DIR/cursor_agent_client.py"', source)
@@ -761,9 +762,10 @@ exit 0
         self.assertIn("'$REMOTE_SERVER_DIR/secure_peer_runtime.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/secure_peer_delivery.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/agentsdock_team.py'", source)
+        self.assertIn("'$REMOTE_SERVER_DIR/provider_commands.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/agentsdock_team_hub'", source)
         self.assertIn(
-            "import agentsdock_team_hub, claude_agent_sdk, cursor_agent_client, cursor_process_guard, secure_peer_delivery, secure_peer_runtime, team_hub_host, agentsdock_mail, agentsdock_team",
+            "import agentsdock_team_hub, claude_agent_sdk, cursor_agent_client, cursor_process_guard, secure_peer_delivery, secure_peer_runtime, team_hub_host, agentsdock_mail, agentsdock_team, provider_commands",
             source,
         )
         self.assertIn("from agentsdock_team_hub import secure_peer, secure_peer_hub", source)
@@ -1393,7 +1395,7 @@ exit 0
         installer_source = INSTALLER.read_text()
         packager_source = PACKAGER.read_text()
         self.assertIn(
-            "RELEASE_FILES=(activation_transaction.py agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py claude_sdk_client.py codex_app_server.py cursor_agent_client.py cursor_process_guard.py",
+            "RELEASE_FILES=(activation_transaction.py agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py claude_sdk_client.py codex_app_server.py cursor_agent_client.py cursor_process_guard.py",
             installer_source,
         )
         self.assertIn('"$STAGE_DIR/activation_transaction.py"', installer_source)
@@ -1402,11 +1404,16 @@ exit 0
         self.assertIn('"$STAGE_DIR/agentsdock_chats.py"', installer_source)
         self.assertIn('"$STAGE_DIR/agentsdock_emergency.py"', installer_source)
         self.assertIn('"$STAGE_DIR/agentsdock_publish.py"', installer_source)
+        self.assertIn('"$STAGE_DIR/provider_commands.py"', installer_source)
         self.assertIn('"$STAGE_DIR/claude_sdk_client.py"', installer_source)
         self.assertIn('"$STAGE_DIR/codex_app_server.py"', installer_source)
         self.assertIn('"$STAGE_DIR/cursor_agent_client.py"', installer_source)
         self.assertIn(
             "import agentsdock_team_hub, cursor_agent_client, cursor_process_guard, secure_peer_delivery",
+            installer_source,
+        )
+        self.assertIn(
+            "agentsdock_team, provider_commands, claude_history_repair",
             installer_source,
         )
         self.assertIn('"$STAGE_DIR/secure_peer_runtime.py"', installer_source)
@@ -1418,6 +1425,7 @@ exit 0
         self.assertIn('"agentsdock_emergency.py"', packager_source)
         self.assertIn('"agentsdock_mail.py"', packager_source)
         self.assertIn('"agentsdock_team.py"', packager_source)
+        self.assertIn('"provider_commands.py"', packager_source)
         self.assertIn('"claude_sdk_client.py"', packager_source)
         self.assertIn('"codex_app_server.py"', packager_source)
         self.assertIn('"cursor_agent_client.py"', packager_source)
@@ -1472,6 +1480,10 @@ exit 0
             )
             self.assertIn(
                 f"agents-server-{version}/agentsdock_team.py",
+                members,
+            )
+            self.assertIn(
+                f"agents-server-{version}/provider_commands.py",
                 members,
             )
             self.assertIn(

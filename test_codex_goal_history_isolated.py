@@ -28,6 +28,7 @@ FUNCTIONS = {
     "codex_history_assistant_metadata", "codex_history_assistant_item", "merge_codex_history_duplicate",
     "codex_history_user_event_item",
     "parse_codex_history_events", "codex_transcript_preview", "history_item_cursor_digest",
+    "history_dedup_key",
     "parse_provider_history_delta", "project_legacy_imported_provider_event",
     "project_provider_history_event_for_egress", "client_safe_event",
     "append_imported_history", "append_staged_imported_history",

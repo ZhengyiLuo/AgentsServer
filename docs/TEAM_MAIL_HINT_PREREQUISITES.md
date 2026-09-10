@@ -75,6 +75,21 @@ per-source, adapter, or runtime in-flight slots. Multiple independent writers
 or HubStore instances do not share this in-memory broker. No cross-process
 notification guarantee is provided by this prerequisite.
 
+Supported writer topology was traced on September 10: the managed host's
+`service.create_app` creates one store retained in `app.state.store`, shared by
+identity with `SecurePeerHubAdapter` and the local provider helper dispatch.
+Managed/standalone serve entry points acquire the runtime lease. Provider helper
+subprocesses use HTTP back to AgentsServer, not independent HubStore writers.
+No second V2 mail INSERT path was found. CLI recovery/proof commands and legacy
+network mailbox tables are not ordinary Team Messages writers. Constructors
+alone do not enforce single-owner embedding; a custom embedder is not covered.
+
+Future passive local subscriptions must also avoid the managed host's ordinary
+ASGI `_in_flight` drain, not only secure-peer request counters. A Member stream
+fanout cannot assume its own retained anchor proves each desktop's older one:
+use a one-time authenticated exact-anchor check per new local subscriber or a
+conservative reset. Neither option requires polling or an automatic Inbox fetch.
+
 ## Fresh page coverage
 
 The store-only `list_team_messages(..., include_mailbox_coverage=True)` option

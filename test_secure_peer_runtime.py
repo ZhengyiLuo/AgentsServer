@@ -78,6 +78,11 @@ class SecurePeerRuntimeTests(unittest.TestCase):
 
             class HostStore:
                 hub_id = "hub_host_delete"
+                data_dir = Path(temporary) / "hub"
+
+                @staticmethod
+                def maintenance_fence():
+                    return None
 
                 @staticmethod
                 def local_agent_mail_claims(team_id):

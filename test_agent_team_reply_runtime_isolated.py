@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import re
@@ -24,11 +25,11 @@ ROOT = Path(__file__).parent
 def runtime_class():
     tree = ast.parse((ROOT / "secure_peer_runtime.py").read_text())
     original = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SecurePeerRuntime")
-    names = {"team_realm", "team_authorized_write", "team_send_message", "_team_host_call", "_team_hub_get", "_team_hub_post"}
+    names = {"team_realm", "team_authorized_write", "team_send_message", "_team_host_call", "_team_host_call_admitted", "_host_store_operation", "_team_hub_get", "_team_hub_post"}
     selected = ast.ClassDef(name="Runtime", bases=[], keywords=[], decorator_list=[], body=[
         node for node in original.body if isinstance(node, ast.FunctionDef) and node.name in names])
     prefix = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
-    namespace = {"Mapping": Mapping, "Path": Path, "re": re, "json": json,
+    namespace = {"Mapping": Mapping, "Path": Path, "re": re, "json": json, "contextmanager": contextmanager,
         "quote": quote, "urlencode": urlencode, "HubStore": HubStore, "SecurePeerError": SecurePeerError}
     exec(compile(ast.fix_missing_locations(ast.Module(body=[prefix, selected], type_ignores=[])),
         "<isolated-team-reply-runtime>", "exec"), namespace)
@@ -51,6 +52,11 @@ class TeamReplyRuntimeTests(unittest.TestCase):
         self.runtime = runtime_class()()
         self.runtime._guard = threading.RLock()
         self.runtime._outbound_guard = threading.RLock()
+        self.runtime._peer_admission = threading.Condition(threading.RLock())
+        self.runtime._host_admission_closed = False
+        self.runtime._host_in_flight = 0
+        self.runtime._host_operation_state = threading.local()
+        self.runtime._completion_closing = False
         self.runtime._require_team_authority_generation_locked = mock.Mock()
         self.runtime._hub_store = self.store
         self.runtime._team_upload_attachment = mock.Mock(return_value="unused-attachment")

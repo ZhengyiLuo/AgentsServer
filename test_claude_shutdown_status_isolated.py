@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,6 +41,8 @@ async def probe(error, late_shutdown=False):
     provider_id = ""
     sdk_ownership_token = ""
     current_handle = None
+    current_reconciliation_batches = []
+    receipts_persisted_run_ids = set()
     manager = None
     cwd = "unused"
     current_prompt = "user prompt"
@@ -65,7 +68,7 @@ if late_shutdown:
         "previous_error": previous_error, "initial_result": result,
         "initial_projection_error": projection_error,
         "concise_error_message": str, "clean_assistant_text": str,
-        "suppress": suppress, "BACKEND_CLAUDE": "claude",
+        "suppress": suppress, "asyncio": asyncio, "BACKEND_CLAUDE": "claude",
         "CLAUDE_TRANSPORT_AGENT_SDK": "agent_sdk",
         "claude_empty_turn_failure_message": lambda **kwargs: None,
         "run_event_metadata": lambda run_id: {},
@@ -78,6 +81,7 @@ if late_shutdown:
         "interrupt_claude_sdk_run_bounded", "evict_claude_sdk_chat",
         "persist_run_provider_session", "finish_outputs",
         "collect_recent_leftover_manifests", "append_turn_finished_event", "append_event",
+        "acknowledge_claude_background_reconciliation", "persist_claude_background_task_receipts",
     ):
         namespace[name] = AsyncMock()
     namespace["release_turn_slot"] = AsyncMock(return_value=True)
@@ -86,6 +90,15 @@ if late_shutdown:
 
 
 class ClaudeShutdownStatusTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reconciliation_write_failure_or_cancellation_still_releases_exact_slot(self):
+        for error in (OSError("receipt write failed"), asyncio.CancelledError()):
+            env = load_probe("iterator", shutting_down=True)
+            env["persist_claude_background_task_receipts"].side_effect = error
+            await env["probe"](ClaudeSDKSupervisorClosed("closed"))
+            env["release_turn_slot"].assert_awaited_once_with("isolated-chat", expected_run_id="exact-current-run")
+            self.assertEqual(env["STOPPED_RUNS"], {"unrelated-run"})
+            env["append_turn_finished_event"].assert_awaited_once()
+
     async def check_case(self, path, error, *, stopped, late_shutdown=False, **options):
         env = load_probe(path, **options)
         await env["probe"](error, late_shutdown)

@@ -131,6 +131,15 @@ from secure_peer_runtime import SECURE_PEER_HEARTBEAT_SECONDS, SecurePeerRuntime
 from claude_history_repair import ClaudeMetadataRepairCache, enrich_interruption_origins
 from codex_history_repair import CodexGoalHistoryRepairCache
 from claude_history_provenance import ClaudeInterruptionTracker, normalize_claude_interruption_context
+from claude_background_reconciliation import (
+    CONSUMED_EVENT as CLAUDE_BACKGROUND_CONSUMED_EVENT,
+    RECONCILED_EVENT as CLAUDE_BACKGROUND_RECONCILED_EVENT,
+    SESSION_FIELD as CLAUDE_BACKGROUND_SESSION_FIELD,
+    normalize_task_receipts,
+    pending_reconciliation_state,
+    pending_task_reconciliations,
+    reconciliation_envelope,
+)
 from public_chat_share_routes import create_public_chat_share_router, redact_public_share_path
 from public_chat_transcript import (
     PublicTranscriptError,
@@ -29145,6 +29154,8 @@ def codex_subagent_thread_identity(
 
 def normalize_subagent_status(value: Any) -> str:
     status = str(value or "").strip().lower()
+    if status == "tracking_lost":
+        return "tracking_lost"
     if status in {"completed", "complete", "done"}:
         return "completed"
     if status in {"failed", "error", "errored", "systemerror", "notfound"}:
@@ -30029,6 +30040,26 @@ def build_claude_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str
                 event_type = str(event.get("type") or "")
                 run_id = str(event.get("run_id") or "")
 
+                if event_type == "claude_background_tasks_reconciled" and event.get("backend") == BACKEND_CLAUDE and event.get("imported") is not True:
+                    for receipt in normalize_task_receipts(
+                        event.get("tasks"), run_id=run_id,
+                        provider_session_id=event.get("provider_session_id"),
+                    ):
+                        _, previous = find(run_id, receipt["task_id"], receipt.get("tool_use_id", ""))
+                        state = ensure(
+                            event, task_id=receipt["task_id"],
+                            tool_id=receipt.get("tool_use_id", ""),
+                            name="" if previous is not None else "Claude background task",
+                            kind="" if previous is not None else receipt["task_type"],
+                            status=receipt["status"], background=True,
+                        )
+                        note(state, event, (
+                            "Background task tracking lost; completion is not confirmed"
+                            if receipt["status"] == "tracking_lost"
+                            else f"Background task {state['status']}"
+                        ))
+                    continue
+
                 if event_type == "tool_started":
                     tool = event.get("tool") if isinstance(event.get("tool"), dict) else {}
                     if str(tool.get("name") or "").strip().lower() != "agent":
@@ -30112,10 +30143,10 @@ def build_claude_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str
                                 event,
                                 task_id=background_task_id,
                                 name=task.get("description"),
-                                status="running",
+                                status=normalize_subagent_status(task.get("status")),
                                 background=True,
                             )
-                            note(state, event, task.get("description") or "Subagent running")
+                            note(state, event, task.get("description") or f"Subagent {state['status']}")
                         continue
 
                     if raw.get("type") == "system" and subtype == "task_started" and raw.get("task_type") == "local_agent" and task_id:
@@ -30287,6 +30318,8 @@ TIMELINE_INDEX_HIDDEN_TYPES = {
     "codex_goal_updated",
     "codex_goal_cleared",
     "claude_subagents_stopped",
+    "claude_background_tasks_reconciled",
+    "claude_background_task_reconciliation_consumed",
     # Legacy beta servers briefly emitted usage as timeline events. Keep those
     # old rows out of pagination even though current servers never emit them.
     "codex_token_usage",
@@ -30671,6 +30704,7 @@ def prepare_claude_history_metadata_repair(session_id: str) -> None:
         legacy = dict(source_event)
         legacy.pop("isMeta", None)
         legacy.pop("isCompactSummary", None)
+        legacy.pop("isSidechain", None)
         item = claude_history_event_item(legacy, expected_session_id=session_id)
         return item["text"] if item and item.get("kind") == "user" else None
 
@@ -44703,6 +44737,11 @@ def claude_history_event_item(
     *,
     expected_session_id: str | None = None,
 ) -> dict[str, Any] | None:
+    if event.get("isSidechain") is True:
+        # Provider-owned child transcript rows are not parent-chat messages.
+        # The structured scope flag, never interruption wording, establishes
+        # this boundary; genuine human text in the main conversation remains.
+        return None
     event_type = event.get("type")
     provider_origin = {
         "provider": "claude",
@@ -59010,6 +59049,81 @@ async def finish_cancelled_claude_sdk_start(
             schedule_next_queued_turn(session_id)
 
 
+async def persist_claude_background_task_receipts(
+    session_id: str,
+    run_id: str,
+    provider_id: str,
+    handle: Any,
+    *,
+    tracking_lost: bool = False,
+) -> dict[str, Any] | None:
+    """Seal exact provider task facts before handing off their logical owner."""
+    tasks = normalize_task_receipts(
+        getattr(handle, "background_task_receipts", ()),
+        run_id=run_id,
+        provider_session_id=provider_id,
+        tracking_lost=tracking_lost,
+    )
+    overflow = getattr(handle, "background_task_overflow_count", 0)
+    overflow = min(overflow, 1_000_000) if type(overflow) is int and overflow > 0 else 0
+    if not provider_id or (not tasks and not overflow):
+        return None
+    batch = {
+        "reconciliation_id": f"reconcile_{uuid.uuid4().hex}",
+        "tasks": tasks,
+        "overflow_count": overflow,
+    }
+    async with STORE._lock:
+        session = STORE.sessions.get(session_id)
+        if session is None:
+            return None
+        previous = session.get(CLAUDE_BACKGROUND_SESSION_FIELD)
+        pending = pending_reconciliation_state(previous, batch, provider_session_id=provider_id)
+        session[CLAUDE_BACKGROUND_SESSION_FIELD] = pending
+        # Observed task facts are not rollbackable actions. Keep this exact
+        # checkpoint on failure; cancelled STORE.save has already committed.
+        await STORE.save(durable=True)
+    stored = await append_event(session_id, CLAUDE_BACKGROUND_RECONCILED_EVENT, {
+        "run_id": run_id, "backend": BACKEND_CLAUDE,
+        "provider_session_id": provider_id, **batch,
+    })
+    return None if stored.get("discarded") else pending
+
+
+async def acknowledge_claude_background_reconciliation(
+    session_id: str,
+    run_id: str,
+    provider_id: str,
+    handle: Any,
+    batches: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Query acceptance is not delivery: only the bound context hook consumes."""
+    if not batches or getattr(handle, "background_task_reconciliation_consumed", False) is not True:
+        return batches
+    identifiers = [batch["reconciliation_id"] for batch in batches]
+    stored = await append_event(session_id, CLAUDE_BACKGROUND_CONSUMED_EVENT, {
+        "run_id": run_id, "backend": BACKEND_CLAUDE,
+        "provider_session_id": provider_id,
+        "reconciliation_ids": identifiers,
+    })
+    if stored.get("discarded"):
+        return batches
+    async with STORE._lock:
+        session = STORE.sessions.get(session_id)
+        pending = session.get(CLAUDE_BACKGROUND_SESSION_FIELD) if session is not None else None
+        if isinstance(pending, dict) and pending.get("provider_session_id") == provider_id and pending.get("reconciliation_id") in identifiers:
+            session.pop(CLAUDE_BACKGROUND_SESSION_FIELD, None)
+            try:
+                await STORE.save(durable=True)
+            except Exception:
+                # A failed write retains pending facts for a later retry.
+                # CancelledError is different: STORE.save already committed
+                # its covering snapshot, so the clear must remain in memory.
+                session[CLAUDE_BACKGROUND_SESSION_FIELD] = pending
+                raise
+    return []
+
+
 async def run_claude_sdk(
     session_id: str,
     run_id: str,
@@ -59148,6 +59262,10 @@ async def run_claude_sdk(
             active["claude_sdk_owner_token"] = str(ownership_token)
             active["claude_permission_run_id"] = run_id
             active["claude_permissions_open"] = True
+    initial_reconciliation_batches = pending_task_reconciliations(
+        (STORE.sessions.get(session_id) or {}).get(CLAUDE_BACKGROUND_SESSION_FIELD),
+        provider_session_id=str(resume_provider_id or ""),
+    )
     try:
         handle = await manager.start_run(
             session_id,
@@ -59156,6 +59274,8 @@ async def run_claude_sdk(
             options=options,
             configuration_key=configuration_key,
             on_supervisor_ready=activate_initial_supervisor,
+            **({"background_task_reconciliation": reconciliation_envelope(initial_reconciliation_batches)}
+               if initial_reconciliation_batches else {}),
         )
     except asyncio.CancelledError:
         cleanup_task = asyncio.create_task(
@@ -59277,6 +59397,8 @@ async def run_claude_sdk(
     )
     current_run_id = run_id
     current_handle = handle
+    current_reconciliation_batches = initial_reconciliation_batches
+    receipts_persisted_run_ids: set[str] = set()
     current_diff_baseline = diff_baseline
     current_prompt = prompt
     text_parts: list[str] = []
@@ -59564,6 +59686,10 @@ async def run_claude_sdk(
 
     try:
         while True:
+            current_reconciliation_batches = await acknowledge_claude_background_reconciliation(
+                session_id, current_run_id, provider_id, current_handle,
+                current_reconciliation_batches,
+            )
             now_monotonic = time.monotonic()
             if await sdk_deadline_expired(now_monotonic):
                 break
@@ -59978,6 +60104,20 @@ async def run_claude_sdk(
                 break
             candidate_paths: set[str] = set()
             candidate_artifacts: set[str] = set()
+            current_reconciliation_batches = await acknowledge_claude_background_reconciliation(
+                session_id, current_run_id, provider_id, current_handle,
+                current_reconciliation_batches,
+            )
+            previous_task_batch = await persist_claude_background_task_receipts(
+                session_id, current_run_id, provider_id, current_handle,
+                tracking_lost=prior_aborted,
+            )
+            if previous_task_batch is not None:
+                receipts_persisted_run_ids.add(current_run_id)
+            candidate_reconciliation_batches = (
+                [previous_task_batch] if previous_task_batch is not None
+                else current_reconciliation_batches
+            )
             steer_state.update({
                 "candidate_baseline": candidate_baseline,
                 "candidate_paths": candidate_paths,
@@ -60125,6 +60265,8 @@ async def run_claude_sdk(
                     options=candidate_options,
                     configuration_key=candidate_configuration_key,
                     on_supervisor_ready=activate_candidate_supervisor,
+                    **({"background_task_reconciliation": reconciliation_envelope(candidate_reconciliation_batches)}
+                       if candidate_reconciliation_batches else {}),
                 )
                 # start_run returns only after query() acceptance. From this
                 # exact point onward the steering message is never safe to
@@ -60205,6 +60347,7 @@ async def run_claude_sdk(
 
             current_run_id = candidate_run_id
             current_handle = candidate_handle
+            current_reconciliation_batches = candidate_reconciliation_batches
             options = candidate_options
             configuration_key = candidate_configuration_key
             sdk_ownership_token = str(
@@ -60280,6 +60423,7 @@ async def run_claude_sdk(
                     "backend": BACKEND_CLAUDE,
                     "transport": CLAUDE_TRANSPORT_AGENT_SDK,
                     "native_steer": True,
+                    "provider_session_id": provider_id or None,
                     "superseded_by_run_id": candidate_run_id,
                     **previous_metadata,
                 })
@@ -60530,6 +60674,7 @@ async def run_claude_sdk(
         await join_task_despite_caller_cancellation(cleanup_task)
 
     async def finalize_sdk_run() -> None:
+        nonlocal current_reconciliation_batches, cancelled_error
         if retire_supervisor:
             with suppress(Exception):
                 await interrupt_claude_sdk_run_bounded(current_handle)
@@ -60558,6 +60703,23 @@ async def run_claude_sdk(
             or current_run_id in STOPPED_RUNS
             or (result_details or {}).get("aborted")
         )
+        try:
+            current_reconciliation_batches = await acknowledge_claude_background_reconciliation(
+                session_id, current_run_id, provider_id, current_handle,
+                current_reconciliation_batches,
+            )
+            if current_run_id not in receipts_persisted_run_ids:
+                await persist_claude_background_task_receipts(
+                    session_id, current_run_id, provider_id, current_handle,
+                    tracking_lost=stopped or retire_supervisor,
+                )
+        except asyncio.CancelledError as exc:
+            cancelled_error = cancelled_error or exc
+            stopped = True
+        except Exception:
+            # A failed receipt write must not retain the parent execution
+            # slot. Its unconsumed checkpoint remains available for retry.
+            logger.exception("Claude background task reconciliation persistence failed")
         result_text = clean_assistant_text(
             str((result_details or {}).get("result_text") or "")
         )

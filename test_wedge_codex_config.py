@@ -1,9 +1,7 @@
-"""Regression tests for bounding Codex native subagent forks (batch E).
+"""Regressions for explicit Codex thread settings and child-run cleanup.
 
-Nothing bounded Codex ``spawn_agent`` fan-out or compaction before 2026-09-04:
-AgentsServer passed no per-thread ``config`` to thread/start, thread/resume or
-thread/fork, the developer instructions never told the model to avoid
-``fork_turns="all"``, and finished child rollouts were never unsubscribed.
+Unset concurrency belongs to Codex; AgentsDock forwards explicit overrides
+without injecting its former four-child cap.
 """
 
 import asyncio
@@ -20,21 +18,21 @@ import test_codex_app_server_runner as runner_fixtures
 from test_codex_app_server_policy import FakeCodexAppServerManager
 
 
-DEFAULT_CONFIG = {"agents": {"max_concurrent_threads_per_session": 4}}
+DEFAULT_CONFIG = {}
 
 
 class CodexThreadConfigSettingsTests(unittest.TestCase):
     def setUp(self) -> None:
         agent_server._CODEX_THREAD_CONFIG_WARNED_KEYS.clear()
 
-    def test_missing_settings_file_keeps_bounded_defaults(self) -> None:
+    def test_missing_settings_file_leaves_provider_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "codex-settings.json"
             config = agent_server.read_codex_thread_config_overrides(path)
 
         self.assertEqual(config, DEFAULT_CONFIG)
         # Callers may mutate the result; the module default must stay intact.
-        config["agents"]["max_concurrent_threads_per_session"] = 99
+        config["agents"] = {"max_concurrent_threads_per_session": 99}
         self.assertEqual(agent_server.CODEX_THREAD_CONFIG_DEFAULTS, DEFAULT_CONFIG)
 
     def test_settings_without_thread_config_keep_defaults(self) -> None:
@@ -186,15 +184,13 @@ class CodexThreadParamsConfigTests(unittest.IsolatedAsyncioTestCase):
     def expected_config(self, config: dict[str, object]) -> dict[str, object]:
         return {**config, **agent_server.codex_provider_mcp_config()}
 
-    def test_thread_params_carry_bounded_defaults_without_settings(self) -> None:
+    def test_thread_params_do_not_inject_a_subagent_cap_without_settings(self) -> None:
         params = agent_server.codex_thread_params({"id": "chat"}, "/repo")
 
         # Sent as dotted -c style keys so only the leaf is overridden.
         self.assertEqual(
             params["config"],
-            self.expected_config({
-                "agents.max_concurrent_threads_per_session": 4,
-            }),
+            self.expected_config({}),
         )
         # Existing keys are untouched by the additive config object.
         self.assertEqual(params["cwd"], "/repo")

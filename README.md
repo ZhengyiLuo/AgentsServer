@@ -937,7 +937,31 @@ represent second 60.
 
 ## Cross-chat handoffs
 
-### Current route-hint contract (API contract 27, capability v13)
+### Permanent chat pairs and independent messages (API contract 28)
+
+An accepted explicit structured `@Chat` grants the exact two chats permanent
+bidirectional permission. Each later run receives fresh, live-run-bound
+credentials and discovers its permitted routes with `chats list` when needed.
+The permission persists without another mention; it does not extend to other
+chats, forks, or a recipient's other routes.
+
+Clients negotiate `chat_conversation_async_route_v1` using the additive health
+capability. For paired routes advertising `mode: async_route_v1`, `send` and
+`ask` each send one independent message and return after acceptance. An idle
+recipient starts a normal turn; a busy recipient receives a normal queued
+message. `respond-current` explicitly sends another message on the exact
+reverse pair. Ordinary final answers are never forwarded automatically, and
+there is no reply obligation, exchange leg budget, or one-use route permission.
+The existing message-size and rolling rate limits still apply.
+
+The desktop receives `chat_conversation_message_*` lifecycle events keyed by
+the message envelope, shows the sender's card at acceptance, and shows an
+incoming queued item until recipient execution starts. Cancel and revoke use
+the existing durable delivery ledger and final admission fence. See
+[the async route contract](docs/ASYNC_CHAT_ROUTES.md) for negotiation, event
+fields, compatibility, and isolated validation.
+
+### Legacy route-hint exchange contract (capability v13)
 
 An inline structured `@Chat` is an optional target hint. It never forwards the
 raw user prompt. On successful ordinary-turn admission, an exact local

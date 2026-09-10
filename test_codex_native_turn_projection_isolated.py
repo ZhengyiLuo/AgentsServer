@@ -175,6 +175,24 @@ class NativeTurnProjectionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(data["purpose"], "codex_review")
         self.assert_clean_release()
 
+    async def test_goal_runtime_user_items_do_not_publish_human_turns(self):
+        from test_codex_goal_history_isolated import GOAL
+
+        runtime = {"id": "goal-input", "type": "userMessage", "content": [
+            {"type": "text", "text": GOAL},
+        ], "internal_chat_message_metadata_passthrough": {
+            "content_item_kinds": ["goal.internal_context"],
+        }}
+        events = await self.run_projection([
+            started(), notice("item/started", item=runtime),
+            notice("item/completed", item=runtime),
+            item("answer", "agentMessage", text="Actual answer.", phase="final_answer"),
+            completed(),
+        ], goal=True)
+        self.assertNotIn("codex_internal_context", json.dumps(events))
+        self.assertEqual(self.events("turn_started"), [])
+        self.assertEqual([event["text"] for event in self.events("assistant_text")], ["Actual answer."])
+
     async def test_reasoning_uses_only_public_summary_and_plan_has_separate_buffer(self):
         class RawReasoning(dict):
             def get(self, key, default=None):

@@ -3219,6 +3219,7 @@ class HubStore:
                         "version": 1,
                         "max_subject_chars": MAX_TEAM_MESSAGE_TITLE_CHARS,
                     },
+                    "team_mailbox_state_v1": {"available": True, "version": 1, "address_kinds": ["server"]},
                 },
             }
         finally:
@@ -12106,6 +12107,7 @@ class HubStore:
         include_body: bool,
         include_revision: bool = False,
         include_mail_subject: bool = False,
+        include_mailbox_state: bool = False,
         owned: list[tuple[str, str]] | None = None,
         delivery_address: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
@@ -12177,7 +12179,20 @@ class HubStore:
                     and recipient["id"] == delivery_id
                 ]
             item["delivery"] = mine[0] if mine else None
+            if include_mailbox_state and row["kind"] == "message" and item["delivery"] is not None:
+                delivery = item["delivery"]
+                recipient = next((entry for entry in recipient_rows
+                    if entry["recipient_kind"] == "server" and entry["recipient_node_id"] == delivery["id"]
+                    and delivery["kind"] == "server" and entry["dismissed_at"] is None), None)
+                if recipient is not None:
+                    item["mailbox_state"] = self._team_mailbox_state_public(recipient)
         return item
+
+    @staticmethod
+    def _team_mailbox_state_public(recipient: sqlite3.Row) -> dict[str, Any]:
+        return {"address_kind": "server", "address_id": recipient["recipient_node_id"],
+            "unread": bool(recipient["inbox_unread"]) if recipient["inbox_unread"] is not None else recipient["state"] != "read",
+            "version": int(recipient["mailbox_state_version"])}
 
     @staticmethod
     def _team_message_revision_public(
@@ -12761,6 +12776,7 @@ class HubStore:
         limit: int = 50,
         include_revision: bool = False,
         include_mail_subject: bool = False,
+        include_mailbox_state: bool = False,
     ) -> dict[str, Any]:
         if box not in {"inbox", "feed", "sent"}:
             raise HubError("invalid_request", "Message box is invalid", 422)
@@ -12816,7 +12832,7 @@ class HubStore:
                 params = [address_kind, address_id, *params]
                 where.append("r.dismissed_at IS NULL")
                 if unread:
-                    where.append("r.state<>'read'")
+                    where.append("COALESCE(r.inbox_unread,r.state<>'read')=1" if include_mailbox_state and address_kind == "server" else "r.state<>'read'")
             else:
                 if claims.auth_kind in NETWORK_AUTOMATION_AUTH_KINDS:
                     server_ids = [identity for kind, identity in owned if kind == "server"]
@@ -12850,6 +12866,7 @@ class HubStore:
                     include_body=False,
                     include_revision=include_revision,
                     include_mail_subject=include_mail_subject,
+                    include_mailbox_state=include_mailbox_state,
                     owned=owned if box == "inbox" else None,
                     delivery_address=(str(address_kind), str(address_id))
                     if box == "inbox"
@@ -12896,6 +12913,7 @@ class HubStore:
         *,
         include_revision: bool = False,
         include_mail_subject: bool = False,
+        include_mailbox_state: bool = False,
     ) -> dict[str, Any]:
         connection = self.connect()
         try:
@@ -12928,6 +12946,7 @@ class HubStore:
                     include_body=True,
                     include_revision=include_revision,
                     include_mail_subject=include_mail_subject,
+                    include_mailbox_state=include_mailbox_state,
                     owned=owned,
                 )
             }
@@ -13492,6 +13511,65 @@ class HubStore:
                     "address": {"kind": address[0], "id": address[1]}}
                 self._idempotency_store(connection, team_id, claims.principal_id,
                     "team.message.dismiss", key, fingerprint, "team_message_recipient", recipient["id"], response, timestamp)
+                return response
+        finally:
+            connection.close()
+
+    def set_team_message_mailbox_state(
+        self, claims: AccessClaims, team_id: str, message_id: str, request: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Compare-and-set one server inbox's attention; never rewind receipts."""
+        address = (request.get("address_kind"), request.get("address_id"))
+        unread = request.get("unread")
+        expected = request.get("expected_version")
+        if address[0] != "server" or not isinstance(address[1], str) or type(unread) is not bool \
+                or type(expected) is not int or not 0 <= expected < 9_007_199_254_740_991:
+            raise HubError("invalid_request", "Server mailbox state is invalid", 422)
+        key = self._team_idempotency_key(request)
+        fingerprint = canonical_fingerprint({"message_id": message_id, "address": address,
+            "unread": unread, "expected_version": expected})
+        timestamp = _now()
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                membership = self._require_network_scope(connection, claims, team_id, write=False)
+                owned = self._team_owned_addresses(connection, claims, team_id, str(membership["role"]))
+                if address not in owned:
+                    raise HubError("forbidden", "This mailbox is not owned by the caller", 403)
+                message = connection.execute("""SELECT m.kind FROM team_messages AS m
+                    WHERE m.team_id=? AND m.id=? AND NOT EXISTS (
+                        SELECT 1 FROM network_content_deletions AS d
+                        WHERE d.team_id=m.team_id AND d.resource_kind='message' AND d.resource_id=m.id)
+                    """, (team_id, message_id)).fetchone()
+                recipient = next((row for row in self._team_message_recipients(connection, team_id, message_id)
+                    if row["recipient_kind"] == "server" and row["recipient_node_id"] == address[1]
+                    and row["dismissed_at"] is None), None)
+                if message is None or message["kind"] != "message" or recipient is None:
+                    raise HubError("not_found", "Message is not in this mailbox", 404)
+                cached = self._idempotency_lookup(connection, team_id, claims.principal_id,
+                    "team.message.mailbox_state", key, fingerprint)
+                if cached is not None:
+                    return cached
+                if int(recipient["mailbox_state_version"]) != expected:
+                    raise HubError("mailbox_state_conflict", "Mailbox state changed. Refresh the mailbox and try again.", 409)
+                connection.execute("""UPDATE team_message_recipients
+                    SET inbox_unread=?,mailbox_state_version=mailbox_state_version+1 WHERE id=?""",
+                    (int(unread), recipient["id"]))
+                if not unread and recipient["state"] != "read":
+                    connection.execute("""UPDATE team_message_recipients SET state='read',
+                        delivered_at=COALESCE(delivered_at,?),read_at=COALESCE(read_at,?) WHERE id=?""",
+                        (timestamp, timestamp, recipient["id"]))
+                    self._outbox(connection, team_id, "team_message_recipient", recipient["id"], "team.message.read", timestamp)
+                updated = next(row for row in self._team_message_recipients(connection, team_id, message_id)
+                    if row["id"] == recipient["id"])
+                response = {"message_id": message_id, "mailbox_state": self._team_mailbox_state_public(updated),
+                    "recipients": [self._team_recipient_public(updated)]}
+                self._idempotency_store(connection, team_id, claims.principal_id, "team.message.mailbox_state",
+                    key, fingerprint, "team_message_recipient", recipient["id"], response, timestamp)
+                self._audit(connection, team_id, claims.principal_id, "team.message.mailbox_state",
+                    "team_message_recipient", recipient["id"], "succeeded", {"unread": unread, "version": expected + 1}, timestamp)
+                self._outbox(connection, team_id, "team_mailbox_state", f"{recipient['id']}:{expected + 1}",
+                    "team.mailbox.state.changed", timestamp)
                 return response
         finally:
             connection.close()

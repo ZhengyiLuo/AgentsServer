@@ -31,6 +31,7 @@ FILES = (
     "cursor_process_guard.py",
     "claude_history_repair.py",
     "claude_history_provenance.py",
+    "codex_history_repair.py",
     "public_chat_shares.py",
     "public_chat_transcript.py",
     "public_chat_share_routes.py",
@@ -73,6 +74,7 @@ DIRECTORY_FILES = {
         "migrations/0016_team_message_all_servers.sql",
         "migrations/0017_skill_announcement_deletions.sql",
         "migrations/0018_team_mail_subjects.sql",
+        "migrations/0019_team_mailbox_state.sql",
     ),
 }
 DIRECTORIES = tuple(DIRECTORY_FILES)

@@ -226,6 +226,14 @@ def provider_handle(index: int, action: str) -> tuple[str, bool]:
 
 
 def respond_current(args: argparse.Namespace) -> dict[str, Any]:
+    if _bounded_runtime_value("AGENTSDOCK_CROSS_CHAT_RESPONSE_MODE") == "async_route_v1":
+        route_id = _bounded_runtime_value("AGENTSDOCK_CROSS_CHAT_RESPONSE_ROUTE_ID")
+        if re.fullmatch(r"route_[0-9a-f]{32}", route_id) is None:
+            raise ChatsCLIError("the current inbound conversation route is unavailable")
+        values = vars(args).copy()
+        values.update({"route": route_id, "target": None, "target_index": None,
+                       "mode": "async_route_v1", "async_response": True})
+        return send_action(argparse.Namespace(**values), "instruction")
     exchange_id = _bounded_runtime_value(
         "AGENTSDOCK_CROSS_CHAT_RESPONSE_EXCHANGE_ID"
     )
@@ -601,6 +609,23 @@ def list_routes(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def negotiated_route_mode(capability: str, route_id: str, requested: str = "") -> str:
+    """Discover mode through a read before sending any state-changing request."""
+
+    response = get_json("/api/agent/cross-chat/routes", capability)
+    routes = response.get("routes")
+    if not isinstance(routes, list):
+        raise ChatsCLIError("AgentsServer returned an invalid route list")
+    matches = [route for route in routes if isinstance(route, dict)
+               and route.get("route_id") == route_id]
+    if len(matches) != 1 or matches[0].get("available") is not True:
+        raise ChatsCLIError("the requested route is unavailable")
+    mode = str(matches[0].get("mode") or "")
+    if mode not in {"", "async_route_v1"} or (requested and mode != requested):
+        raise ChatsCLIError("AgentsServer did not negotiate the requested conversation mode")
+    return mode
+
+
 def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
     capability = authority(args.authority_file)
     message = str(args.message or "").strip()
@@ -622,8 +647,20 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
         if action == "request_reply":
             args.async_response = grant_is_async
     destination = route if route else target
+    requested_mode = str(getattr(args, "mode", None) or "")
+    if requested_mode and not route:
+        raise ChatsCLIError("conversation mode requires an exact route")
+    discover_mode = bool(requested_mode) or (
+        _bounded_runtime_value("AGENTSDOCK_CROSS_CHAT_MODE") == "async_route_v1"
+    )
+    mode = negotiated_route_mode(capability, route, requested_mode) if route and discover_mode else ""
+    if mode == "async_route_v1":
+        # Ask is an explicitly sent question in this mode. Any response is a
+        # separate message, so neither alias opens a legacy exchange or wait.
+        action = "instruction"
     live_wait = (
         action == "request_reply"
+        and mode != "async_route_v1"
         and not bool(getattr(args, "async_response", False))
     )
     stable_key = "cli_" + hashlib.sha256(
@@ -639,6 +676,8 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
         "idempotency_key": args.idempotency_key or stable_key,
         "artifact_grants": [],
     }
+    if mode:
+        payload["mode"] = mode
     if live_wait:
         heartbeat_seconds = live_response_heartbeat_seconds(
             int(getattr(
@@ -658,6 +697,14 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
         path = "/api/agent/cross-chat/handoffs"
         payload["target_session_id"] = target
     result = post_json(path, payload, capability)
+    if mode == "async_route_v1":
+        if (set(result) != {"ok", "route_id", "action", "accepted", "mode", "message_id", "duplicate"}
+                or result.get("ok") is not True or result.get("accepted") is not True
+                or result.get("route_id") != route or result.get("action") != "instruction"
+                or result.get("mode") != mode or not isinstance(result.get("duplicate"), bool)
+                or re.fullmatch(r"handoff_[0-9a-f]{32}", str(result.get("message_id") or "")) is None):
+            raise ChatsCLIError("AgentsServer returned an invalid asynchronous message receipt")
+        return result
     minimal_expected = {"ok", "action", "accepted"}
     if route:
         minimal_expected.add("route_id")
@@ -926,6 +973,7 @@ def parser() -> argparse.ArgumentParser:
     send_destination.add_argument("--target-index", type=positive_target_index)
     command.add_argument("--message", required=True)
     command.add_argument("--idempotency-key")
+    command.add_argument("--mode", choices=["async_route_v1"])
     command.set_defaults(handler=send)
     ask_command = commands.add_parser(
         "ask",
@@ -938,6 +986,7 @@ def parser() -> argparse.ArgumentParser:
     ask_destination.add_argument("--target-index", type=positive_target_index)
     ask_command.add_argument("--message", required=True)
     ask_command.add_argument("--idempotency-key")
+    ask_command.add_argument("--mode", choices=["async_route_v1"])
     ask_command.add_argument(
         "--async-response",
         action="store_true",

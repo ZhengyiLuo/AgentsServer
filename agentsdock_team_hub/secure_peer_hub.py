@@ -484,6 +484,16 @@ class SecurePeerHubAdapter:
             "idempotency_key": cls._identifier(value["idempotency_key"], minimum=8)}
 
     @classmethod
+    def _team_mailbox_state_body(cls, request: ProxyRequest) -> dict[str, Any]:
+        fields = {"address_kind", "address_id", "unread", "expected_version", "idempotency_key"}
+        value = cls._object_body(request, allowed=fields, required=fields)
+        if value["address_kind"] != "server" or type(value["unread"]) is not bool \
+                or type(value["expected_version"]) is not int or not 0 <= value["expected_version"] < 9_007_199_254_740_991:
+            raise HubError("invalid_request", "Server mailbox state is invalid", 422)
+        return {**value, "address_id": cls._identifier(value["address_id"], minimum=8),
+            "idempotency_key": cls._identifier(value["idempotency_key"], minimum=8)}
+
+    @classmethod
     def _team_message_revision_body(cls, request: ProxyRequest) -> dict[str, Any]:
         value = cls._object_body(
             request,
@@ -555,8 +565,9 @@ class SecurePeerHubAdapter:
             raise HubError("invalid_request", "Query is invalid", 422)
         if "version" in values and not 1 <= int(values["version"]) <= 200:
             raise HubError("invalid_request", "Query is invalid", 422)
-        if "include_mail_subject" in values and values["include_mail_subject"] not in {"0", "1", "true", "false"}:
-            raise HubError("invalid_request", "Query is invalid", 422)
+        for flag in ("include_mail_subject", "include_mailbox_state"):
+            if flag in values and values[flag] not in {"0", "1", "true", "false"}:
+                raise HubError("invalid_request", "Query is invalid", 422)
         if "cursor" in values:
             if re.fullmatch(r"v1\.[A-Za-z0-9_-]{38,500}", values["cursor"]) is None:
                 raise HubError("invalid_request", "Query is invalid", 422)
@@ -930,6 +941,7 @@ class SecurePeerHubAdapter:
                             "limit",
                             "include_revision",
                             "include_mail_subject",
+                            "include_mailbox_state",
                         },
                     )
                     result = self.store.list_team_messages(
@@ -946,15 +958,17 @@ class SecurePeerHubAdapter:
                         limit=int(values.get("limit", "50")),
                         include_revision=self._query_flag(values, "include_revision"),
                         include_mail_subject=self._query_flag(values, "include_mail_subject"),
+                        include_mailbox_state=self._query_flag(values, "include_mailbox_state"),
                     )
                 elif len(pieces) == 4 and pieces[1:3] == [_NETWORK_CHILD, "messages"]:
-                    values = self._team_query(request, allowed={"include_revision", "include_mail_subject"})
+                    values = self._team_query(request, allowed={"include_revision", "include_mail_subject", "include_mailbox_state"})
                     result = self.store.get_team_message(
                         claims,
                         team_id,
                         self._resource_id(pieces[3]),
                         include_revision=self._query_flag(values, "include_revision"),
                         include_mail_subject=self._query_flag(values, "include_mail_subject"),
+                        include_mailbox_state=self._query_flag(values, "include_mailbox_state"),
                     )
                 elif (
                     len(pieces) == 5
@@ -1119,6 +1133,13 @@ class SecurePeerHubAdapter:
                 ):
                     result = self.store.dismiss_team_message(
                         claims, team_id, self._resource_id(pieces[3]), self._team_dismissal_body(request)
+                    )
+                elif (
+                    len(pieces) == 5 and pieces[1:3] == [_NETWORK_CHILD, "messages"]
+                    and pieces[4] == "mailbox-state"
+                ):
+                    result = self.store.set_team_message_mailbox_state(
+                        claims, team_id, self._resource_id(pieces[3]), self._team_mailbox_state_body(request)
                     )
                 elif len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "attachments"]:
                     result = self.store.declare_team_attachment(

@@ -7566,8 +7566,10 @@ async def persist_provider_cross_chat_pair_grants(
                 else:
                     routes[routes.index(current)] = route
                 changes_by_session[owner_id].append({
-                    "after": route,
-                    "before": dict(current) if current else None,
+                    # The journal is an immutable revision-CAS proof, not a
+                    # reference to a route that a later edit may mutate.
+                    "after": {**route, "actions": list(route["actions"])},
+                    "before": {**current, "actions": list(current["actions"])} if current else None,
                 })
         mutations: dict[str, dict[str, Any]] = {}
         previous: dict[str, dict[str, Any]] = {}
@@ -7916,8 +7918,22 @@ async def rollback_durable_provider_cross_chat_reference_grants(
                     reconcile_pending_provider_cross_chat_grant(
                         session_id, session, force_rollback=True,
                     )
-            await STORE.persist_restored_state(durable=True)
-        return
+            rollback_error: BaseException | None = None
+            for _attempt in range(3):
+                try:
+                    await STORE.persist_restored_state(durable=True)
+                    return
+                except BaseException as exc:
+                    rollback_error = exc
+            # Keep every participant narrowed even if persistence remains
+            # unavailable; never re-expose an unaccepted grant on failure.
+            logger.critical(
+                "durable paired cross-chat admission rollback could not be persisted "
+                "source=%s",
+                source_session_id,
+            )
+            assert rollback_error is not None
+            raise rollback_error
     async with STORE._lock:
         source = STORE.sessions.get(source_session_id)
         if source is None:

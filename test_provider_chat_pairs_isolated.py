@@ -42,6 +42,7 @@ FUNCTIONS = {
     "async_route_queue_fields", "public_queued_turn", "queued_turn_from_event", "queued_turn_run_metadata",
     "sanitized_provider_route_label", "enqueue_turn",
     "provider_cross_chat_reciprocal_admission_fields",
+    "join_task_despite_caller_cancellation",
 }
 CONSTANTS = {
     "PROVIDER_CROSS_CHAT_ROUTE_ID_RE", "PROVIDER_CROSS_CHAT_ROUTE_REVISION_RE",
@@ -220,6 +221,82 @@ class ChatPairTests(unittest.IsolatedAsyncioTestCase):
         await self.call("rollback_durable_provider_cross_chat_reference_grants", "a", mutation)
         self.assertEqual(self.store.sessions, before)
         self.assertEqual(len(self.store.saved), 2)
+
+    async def test_staged_pair_journal_is_detached_from_later_route_revision(self):
+        mutation = await self.stage()
+        source = self.store.sessions["a"]
+        route = source["provider_cross_chat_routes"][0]
+        pending_after = source[self.pending_key]["rollback_changes"][0]["after"]
+        original_after = deepcopy(pending_after)
+        self.assertIsNot(pending_after, route)
+        self.assertIsNot(pending_after["actions"], route["actions"])
+        route["revision"] = "rev_" + "f" * 32
+        route["actions"].remove("request_reply")
+        self.assertEqual(pending_after, original_after)
+        await self.call("rollback_durable_provider_cross_chat_reference_grants", "a", mutation)
+        retained = source["provider_cross_chat_routes"][0]
+        self.assertEqual(retained["revision"], "rev_" + "f" * 32)
+        self.assertEqual(retained["actions"], ["instruction"])
+        self.assertEqual(len(source["provider_cross_chat_route_audit"]), 1)
+        self.assertEqual(self.routes("b"), [])
+        self.assertEqual(self.store.sessions["b"]["provider_cross_chat_route_audit"], [])
+        self.assertIsNone(self.call("live_provider_cross_chat_route", "a", retained))
+
+    async def test_pair_rollback_retries_transient_persistence_without_restoring_authority(self):
+        before = deepcopy(self.store.sessions)
+        mutation = await self.stage(targets=("b", "c"))
+        self.store.failure = OSError("transient rollback failure")
+        await self.call("rollback_durable_provider_cross_chat_reference_grants", "a", mutation)
+        self.assertEqual(self.store.sessions, before)
+        self.assertEqual(len(self.store.saved), 3)
+        self.assertEqual(self.store.saved[1:], [before, before])
+
+    async def test_pair_rollback_persistent_failure_stays_narrowed_and_raises_after_three_attempts(self):
+        before = deepcopy(self.store.sessions)
+        mutation = await self.stage(targets=("b", "c"))
+        failure = OSError("persistent rollback failure")
+        self.store.persist_restored_state = AsyncMock(side_effect=failure)
+        with self.assertRaises(OSError) as raised:
+            await self.call("rollback_durable_provider_cross_chat_reference_grants", "a", mutation)
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(self.store.persist_restored_state.await_count, 3)
+        self.assertTrue(all(call.kwargs == {"durable": True}
+                            for call in self.store.persist_restored_state.await_args_list))
+        self.assertEqual(self.store.sessions, before)
+
+    async def test_pair_rollback_joins_durable_writer_despite_repeated_cancellation(self):
+        before = deepcopy(self.store.sessions)
+        mutation = await self.stage(targets=("b", "c"))
+        store_node = next(node for node in TREE.body if isinstance(node, ast.ClassDef) and node.name == "SessionStore")
+        persist_node = deepcopy(next(node for node in store_node.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "persist_restored_state"))
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[persist_node], type_ignores=[])), "<isolated-rollback-persistence>", "exec"), self.namespace)
+        self.store.persist_restored_state = self.namespace["persist_restored_state"].__get__(self.store)
+        writer_started = asyncio.Event()
+        writer_release = asyncio.Event()
+        committed = []
+
+        async def blocked_save(*, durable):
+            self.assertTrue(durable)
+            writer_started.set()
+            await writer_release.wait()
+            committed.append(deepcopy(self.store.sessions))
+
+        self.store.save = AsyncMock(side_effect=blocked_save)
+        rollback = asyncio.create_task(self.call("rollback_durable_provider_cross_chat_reference_grants", "a", mutation))
+        try:
+            await asyncio.wait_for(writer_started.wait(), 1)
+            for _ in range(2):
+                rollback.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(rollback.done())
+                self.assertTrue(self.store._lock.locked())
+                self.assertEqual(self.store.sessions, before)
+        finally:
+            writer_release.set()
+            await asyncio.wait_for(rollback, 1)
+        self.assertEqual(committed, [before])
+        self.assertEqual(self.store.save.await_count, 1)
+        self.assertFalse(self.store._lock.locked())
 
     async def test_restart_accepts_both_directions_from_exact_source_event(self):
         mutation = await self.stage(event_type="turn_queued")

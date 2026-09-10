@@ -442,7 +442,7 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             [],
         )
 
-    async def test_durable_grant_upsert_is_idempotent_and_directional(self) -> None:
+    async def test_durable_grant_upsert_is_idempotent_and_paired(self) -> None:
         reference = self.grant_reference()
         with (
             self.native_transports(),
@@ -486,14 +486,19 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(len(routes), 1)
         self.assertEqual(routes[0]["actions"], ["instruction", "request_reply"])
-        self.assertEqual(
-            agent_server.STORE.sessions["target"]["provider_cross_chat_routes"],
-            [],
-        )
-        self.assertNotIn(
-            agent_server.PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY,
-            agent_server.STORE.sessions["source"],
-        )
+        reverse_routes = agent_server.STORE.sessions["target"]["provider_cross_chat_routes"]
+        self.assertEqual(len(reverse_routes), 1)
+        self.assertEqual(reverse_routes[0]["actions"], ["instruction", "request_reply"])
+        self.assertEqual(routes[0]["target_session_id"], "target")
+        self.assertEqual(reverse_routes[0]["target_session_id"], "source")
+        self.assertEqual(routes[0]["pair_id"], reverse_routes[0]["pair_id"])
+        self.assertEqual(routes[0]["paired_route_id"], reverse_routes[0]["route_id"])
+        self.assertEqual(reverse_routes[0]["paired_route_id"], routes[0]["route_id"])
+        for session_id in ("source", "target"):
+            self.assertNotIn(
+                agent_server.PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY,
+                agent_server.STORE.sessions[session_id],
+            )
 
     async def test_pending_grant_restart_reconciles_exact_admission_event(
         self,
@@ -539,6 +544,7 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
                         "session_id": "source",
                         "type": "turn_started",
                         "provider_cross_chat_grant_admission_id": admission_id,
+                        "provider_cross_chat_route_snapshot": mutation["routes"],
                     }) + "\n", encoding="utf-8")
                 recovered = agent_server.SessionStore()
                 with (
@@ -573,6 +579,7 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             "session_id": "source",
             "type": "turn_started",
             "provider_cross_chat_grant_admission_id": admission_id,
+            "provider_cross_chat_route_snapshot": mutation["routes"],
         }) + "\n", encoding="utf-8")
         recovered = agent_server.SessionStore()
         with (
@@ -794,10 +801,11 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
                 mutation,
             )
         self.assertEqual(save.await_count, 3)
-        self.assertEqual(
-            agent_server.STORE.sessions["source"]["provider_cross_chat_routes"],
-            [],
-        )
+        for session_id in ("source", "target"):
+            session = agent_server.STORE.sessions[session_id]
+            self.assertEqual(session["provider_cross_chat_routes"], [])
+            self.assertEqual(session["provider_cross_chat_route_audit"], [])
+            self.assertNotIn(agent_server.PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY, session)
 
     async def test_durable_session_save_fsyncs_file_rename_and_directory(
         self,

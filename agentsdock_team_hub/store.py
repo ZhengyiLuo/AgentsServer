@@ -3220,6 +3220,7 @@ class HubStore:
                         "max_subject_chars": MAX_TEAM_MESSAGE_TITLE_CHARS,
                     },
                     "team_mailbox_state_v1": {"available": True, "version": 1, "address_kinds": ["server"]},
+                    "team_host_content_deletion_v1": {"available": True, "version": 1},
                 },
             }
         finally:
@@ -10159,7 +10160,8 @@ class HubStore:
                 if row is None:
                     raise HubError("not_found", "Resource not found", 404)
                 if (
-                    not self._network_source_author_matches(
+                    not self._network_host_operator_can_moderate(claims, team_id, str(membership["role"]))
+                    and not self._network_source_author_matches(
                         connection,
                         claims,
                         team_id,
@@ -11957,6 +11959,24 @@ class HubStore:
             return "teamspace.write" in claims.scopes
         return membership_role in {"owner", "admin", "member"}
 
+    @staticmethod
+    def _network_host_operator_can_moderate(
+        claims: AccessClaims, team_id: str, membership_role: str,
+    ) -> bool:
+        """Only after _require_network_scope validates the live host session.
+
+        The authenticated Host desktop actor is distinct from local-agent
+        mail, paired servers and ordinary human members running on the host.
+        Moderation does not confer authorship, editing or extra visibility.
+        """
+        return (
+            claims.auth_kind == "managed_server"
+            and claims.principal_id == MANAGED_SERVER_PRINCIPAL_ID
+            and claims.team_id == team_id
+            and membership_role == "automation"
+            and "teamspace.write" in claims.scopes
+        )
+
     # -- projections --------------------------------------------------------
 
     @staticmethod
@@ -13227,8 +13247,8 @@ class HubStore:
     ) -> dict[str, Any]:
         """Hide a Team Message announcement without mutating its source.
 
-        A skill version's poster may remove its announcement. Library versions
-        and archive state are independent and remain intact.
+        A poster or authenticated Host operator may remove an announcement.
+        Library versions and archive state remain independent and intact.
         """
 
         timestamp = _now()
@@ -13262,15 +13282,19 @@ class HubStore:
                 ).fetchone()
                 if row is None:
                     raise HubError("not_found", "Resource not found", 404)
+                host_moderator = self._network_host_operator_can_moderate(
+                    claims, team_id, str(membership["role"]),
+                )
                 if row["kind"] == "skill":
-                    if not self._team_message_author_matches(
+                    if not host_moderator and not self._team_message_author_matches(
                         connection, claims, team_id, row
                     ):
                         raise HubError(
-                            "forbidden", "Only the poster can delete this announcement", 403
+                            "forbidden", "Only the poster or Host operator can delete this announcement", 403
                         )
                 elif (
-                    not self._network_source_author_matches(
+                    not host_moderator
+                    and not self._network_source_author_matches(
                         connection,
                         claims,
                         team_id,

@@ -45165,37 +45165,103 @@ def codex_history_user_item(
     return item
 
 
+def codex_history_assistant_metadata(value: Any) -> dict[str, str]:
+    """Allow only descriptive public phase and an original aware timestamp.
+
+    No provider identifiers, authority, or private reasoning are inferred from
+    text. These fields never participate in the legacy kind/text digest.
+    """
+    metadata: dict[str, str] = {}
+    if not isinstance(value, dict):
+        return metadata
+    if value.get("phase") in ("commentary", "final_answer"):
+        metadata["phase"] = value["phase"]
+    timestamp = value.get("ts")
+    if isinstance(timestamp, str) and re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)",
+        timestamp,
+    ):
+        try:
+            if datetime.fromisoformat(timestamp.replace("Z", "+00:00")).utcoffset() is not None:
+                metadata["ts"] = timestamp
+        except ValueError:
+            pass
+    return metadata
+
+
+def codex_history_assistant_item(event: dict[str, Any], text: str) -> dict[str, Any] | None:
+    item = normalized_history_item("assistant", text)
+    if item is not None:
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        item.update(codex_history_assistant_metadata({
+            "phase": payload.get("phase"), "ts": event.get("timestamp"),
+        }))
+    return item
+
+
+def codex_history_user_event_item(
+    event: dict[str, Any], text: str, *, expected_session_id: str | None = None,
+) -> dict[str, Any] | None:
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    item = codex_history_user_item(payload, text, expected_session_id=expected_session_id)
+    if item is not None:
+        # Classification and positive human provenance are unchanged. User
+        # timestamps are descriptive; assistant phase never applies to input.
+        item.update(codex_history_assistant_metadata({"ts": event.get("timestamp")}))
+    return item
+
+
+def merge_codex_history_duplicate(previous: dict[str, Any], item: dict[str, Any]) -> bool:
+    """Enrich a retained duplicate, but never collapse known distinct phases."""
+    if previous.get("kind") != item.get("kind") or str(previous.get("text") or "").strip() != str(item.get("text") or "").strip():
+        return False
+    if item.get("kind") == "assistant":
+        prior = codex_history_assistant_metadata(previous)
+        incoming = codex_history_assistant_metadata(item)
+        if prior.get("phase") and incoming.get("phase") and prior["phase"] != incoming["phase"]:
+            return False
+    else:
+        prior = codex_history_assistant_metadata({"ts": previous.get("ts")})
+        incoming = codex_history_assistant_metadata({"ts": item.get("ts")})
+    for key, value in incoming.items():
+        if key not in prior:
+            previous[key] = value
+    if item.get("provider_user_authored") is True:
+        previous["provider_user_authored"] = True
+    return True
+
+
 def codex_history_event_item(
     event: dict[str, Any],
     *,
     expected_session_id: str | None = None,
-) -> dict[str, str] | None:
+) -> dict[str, Any] | None:
     event_type = event.get("type")
     payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
     if event_type == "event_msg":
         payload_type = payload.get("type")
         if payload_type == "user_message":
-            return codex_history_user_item(
-                payload,
+            return codex_history_user_event_item(
+                event,
                 str(payload.get("message") or ""),
                 expected_session_id=expected_session_id,
             )
         if payload_type == "agent_message":
-            return normalized_history_item(
-                "assistant",
+            return codex_history_assistant_item(
+                event,
                 str(payload.get("message") or ""),
             )
     elif event_type == "response_item" and payload.get("type") == "message":
         role = payload.get("role")
         if role == "user":
-            return codex_history_user_item(
-                payload,
+            return codex_history_user_event_item(
+                event,
                 text_from_content(payload.get("content"), compact=False),
                 expected_session_id=expected_session_id,
             )
         if role == "assistant":
-            return normalized_history_item(
-                "assistant",
+            return codex_history_assistant_item(
+                event,
                 text_from_content(payload.get("content")),
             )
     return None
@@ -45213,9 +45279,7 @@ def append_codex_history_event(
     )
     if item is None:
         return
-    if items and items[-1]["kind"] == item["kind"] and items[-1]["text"].strip() == item["text"].strip():
-        if item.get("provider_user_authored") is True:
-            items[-1]["provider_user_authored"] = True
+    if items and merge_codex_history_duplicate(items[-1], item):
         return
     items.append(item)
 
@@ -45615,6 +45679,8 @@ def normalized_history_sync_cursor(
         cursor["claude_interruption_context"] = normalize_claude_interruption_context(
             raw["claude_interruption_context"], provider_session_id=provider_id,
         )
+    if backend == BACKEND_CODEX and raw.get("codex_last_item_phase") in ("commentary", "final_answer"):
+        cursor["codex_last_item_phase"] = raw["codex_last_item_phase"]
     return cursor
 
 
@@ -45933,6 +45999,7 @@ def parse_provider_history_delta(
     previous_last_item_digest: str,
     expected_session_id: str | None = None,
     interruption_context: dict[str, Any] | None = None,
+    codex_phase_context: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], int, str, bool]:
     """Consume the front of an append-only delta without skipping messages."""
 
@@ -45977,16 +46044,42 @@ def parse_provider_history_delta(
             item_digest,
             last_item_digest,
         ):
-            # Match full-parser adjacent duplicate coalescing, including when
-            # the duplicate provider record straddles the durable byte cursor.
-            cursor_offset = record_end
-            continue
+            duplicate = True
+            if backend == BACKEND_CODEX:
+                if items:
+                    duplicate = merge_codex_history_duplicate(items[-1], item)
+                    if duplicate and codex_phase_context is not None:
+                        codex_phase_context.clear()
+                        if items[-1].get("phase") in ("commentary", "final_answer"):
+                            codex_phase_context["phase"] = items[-1]["phase"]
+                elif codex_phase_context is not None:
+                    previous_phase = codex_phase_context.get("phase")
+                    incoming_phase = item.get("phase")
+                    duplicate = not (
+                        previous_phase in ("commentary", "final_answer")
+                        and incoming_phase in ("commentary", "final_answer")
+                        and previous_phase != incoming_phase
+                    )
+                    if duplicate and previous_phase not in ("commentary", "final_answer") and incoming_phase in ("commentary", "final_answer"):
+                        # This consumed raw copy proves only the cursor's
+                        # current phase, not the presentation of its old row.
+                        codex_phase_context["phase"] = incoming_phase
+            if duplicate:
+                # A retained copy can be enriched before persistence. Across
+                # an already committed cursor, preserve legacy dedup when the
+                # old phase is absent; never infer or rewrite historical rows.
+                cursor_offset = record_end
+                continue
         if len(items) >= maximum:
             blocked_on_unseen_message = True
             if tracker is not None:
                 tracker = ClaudeInterruptionTracker(prior_context)
             continue
         items.append(item)
+        if backend == BACKEND_CODEX and codex_phase_context is not None:
+            codex_phase_context.clear()
+            if item.get("phase") in ("commentary", "final_answer"):
+                codex_phase_context["phase"] = item["phase"]
         last_item_digest = item_digest
         cursor_offset = record_end
     if tracker is not None and interruption_context is not None:
@@ -46017,6 +46110,12 @@ def load_provider_history_with_cursor(
     start = int(previous["source_offset"]) if continued and previous else 0
     end = int(snapshot["source_offset"])
     interruption_context: dict[str, Any] = {"version": 1}
+    codex_phase_context: dict[str, str] = {}
+    if (
+        backend == BACKEND_CODEX and continued and previous
+        and previous.get("codex_last_item_phase") in ("commentary", "final_answer")
+    ):
+        codex_phase_context["phase"] = previous["codex_last_item_phase"]
     if backend == BACKEND_CLAUDE and continued and previous:
         interruption_context = (
             normalize_claude_interruption_context(previous["claude_interruption_context"], provider_session_id=provider_id)
@@ -46041,6 +46140,7 @@ def load_provider_history_with_cursor(
             ),
             expected_session_id=str(sess.get("id") or "") or None,
             interruption_context=interruption_context,
+            codex_phase_context=codex_phase_context,
         )
         caught_up = not delta_overflow and cursor_offset == end
     else:
@@ -46061,6 +46161,8 @@ def load_provider_history_with_cursor(
         last_item_digest = (
             history_item_cursor_digest(items[-1]) if items else ""
         )
+        if backend == BACKEND_CODEX and items and items[-1].get("phase") in ("commentary", "final_answer"):
+            codex_phase_context["phase"] = items[-1]["phase"]
         caught_up = True
     source_digest = (
         str(snapshot["source_digest"])
@@ -46127,6 +46229,8 @@ def load_provider_history_with_cursor(
     }
     if backend == BACKEND_CLAUDE:
         cursor["claude_interruption_context"] = normalize_claude_interruption_context(interruption_context, provider_session_id=provider_id)
+    if backend == BACKEND_CODEX and codex_phase_context.get("phase") in ("commentary", "final_answer"):
+        cursor["codex_last_item_phase"] = codex_phase_context["phase"]
     return path, items, cursor, continued
 
 
@@ -46239,12 +46343,11 @@ def history_timeline_message_keys(
             elif (
                 event_type == "reasoning_summary"
                 and event.get("phase") == "commentary"
-                and event.get("backend") == BACKEND_CLAUDE
+                and event.get("backend") in (BACKEND_CLAUDE, BACKEND_CODEX)
             ):
-                # Claude's SDK emits every public text block before its
-                # terminal ResultMessage. Those blocks are live commentary,
-                # but they still correspond one-for-one with assistant
-                # records in Claude's provider transcript. Count them as
+                # Explicit public commentary from either provider corresponds
+                # to assistant transcript records, unlike private reasoning.
+                # Count these public text blocks as
                 # ownership credits so the next history sync cannot import
                 # this chat's own progress back as duplicate messages.
                 key = history_dedup_key("assistant", event.get("text"))
@@ -46790,6 +46893,7 @@ async def append_imported_history(
         "history_imported",
         history_event,
     )]
+    last_source_timestamp = None
     for item in items:
         origin = normalized_history_provider_origin(item.get("provider_origin")) if backend == BACKEND_CLAUDE else None
         provenance: dict[str, Any] = {"provider_origin": origin} if origin is not None else {}
@@ -46797,6 +46901,12 @@ async def append_imported_history(
             provenance["provider_user_authored"] = True
         if origin is not None and "timestamp" in origin:
             provenance["ts"] = origin["timestamp"]
+        if backend == BACKEND_CODEX and item.get("kind") in ("user", "assistant"):
+            provenance.update(codex_history_assistant_metadata(
+                item if item.get("kind") == "assistant" else {"ts": item.get("ts")},
+            ))
+        if "ts" in provenance:
+            last_source_timestamp = provenance["ts"]
         if item["kind"] == "user":
             imported_events.append(("turn_started", {
                 "run_id": run_id,
@@ -46807,7 +46917,7 @@ async def append_imported_history(
                 **provenance,
             }))
         elif item["kind"] == "assistant":
-            imported_events.append(("assistant_text", {
+            imported_events.append(("reasoning_summary" if provenance.get("phase") == "commentary" else "assistant_text", {
                 "run_id": run_id,
                 "backend": backend,
                 "text": item["text"],
@@ -46821,7 +46931,9 @@ async def append_imported_history(
                 "imported": True,
                 **provenance,
             }))
-    imported_events.append(imported_history_terminal_event(run_id, backend, metadata_only=metadata_only))
+    imported_events.append(imported_history_terminal_event(
+        run_id, backend, metadata_only=metadata_only, source_timestamp=last_source_timestamp,
+    ))
     committed = await append_durable_event_batch(session_id, imported_events)
     if len(committed) != len(imported_events):
         raise RuntimeError("history event batch was not fully persisted")
@@ -46838,6 +46950,7 @@ def imported_history_terminal_event(
     backend: str,
     *,
     metadata_only: bool = False,
+    source_timestamp: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Close an import run so no client can mistake replayed history for a live turn."""
 
@@ -46848,6 +46961,9 @@ def imported_history_terminal_event(
         "result_text": "",
         "message": "Imported history replay finished.",
         **({"metadata_only": True} if metadata_only else {}),
+        # The synthetic boundary is not evidence that historical work ran
+        # until import time. Callers pass only validated source timestamps.
+        **({"ts": source_timestamp} if source_timestamp is not None else {}),
     })
 
 
@@ -46876,6 +46992,7 @@ async def append_staged_imported_history(
         "message": message,
         **({"metadata_only": True, "imported": True} if metadata_only else {}),
     })]
+    last_source_timestamp = None
     for item in items:
         origin = normalized_history_provider_origin(item.get("provider_origin")) if backend == BACKEND_CLAUDE else None
         provenance: dict[str, Any] = {"provider_origin": origin} if origin is not None else {}
@@ -46883,6 +47000,12 @@ async def append_staged_imported_history(
             provenance["provider_user_authored"] = True
         if origin is not None and "timestamp" in origin:
             provenance["ts"] = origin["timestamp"]
+        if backend == BACKEND_CODEX and item.get("kind") in ("user", "assistant"):
+            provenance.update(codex_history_assistant_metadata(
+                item if item.get("kind") == "assistant" else {"ts": item.get("ts")},
+            ))
+        if "ts" in provenance:
+            last_source_timestamp = provenance["ts"]
         if item["kind"] == "user":
             imported_events.append(("turn_started", {
                 "run_id": run_id,
@@ -46893,7 +47016,7 @@ async def append_staged_imported_history(
                 **provenance,
             }))
         elif item["kind"] == "assistant":
-            imported_events.append(("assistant_text", {
+            imported_events.append(("reasoning_summary" if provenance.get("phase") == "commentary" else "assistant_text", {
                 "run_id": run_id,
                 "backend": backend,
                 "text": item["text"],
@@ -46907,7 +47030,9 @@ async def append_staged_imported_history(
                 "imported": True,
                 **provenance,
             }))
-    imported_events.append(imported_history_terminal_event(run_id, backend, metadata_only=metadata_only))
+    imported_events.append(imported_history_terminal_event(
+        run_id, backend, metadata_only=metadata_only, source_timestamp=last_source_timestamp,
+    ))
     written = await append_imported_events(session_id, imported_events)
     if written != len(imported_events):
         raise RuntimeError("history event batch was not fully persisted")

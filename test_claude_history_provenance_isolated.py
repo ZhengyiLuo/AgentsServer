@@ -23,6 +23,7 @@ SOURCE = Path(__file__).with_name("agent_server.py")
 FUNCTIONS = {
     "compact_import_text", "is_import_boilerplate", "text_from_content", "message_text",
     "normalized_history_provider_origin", "normalized_history_item", "add_history_item",
+    "codex_history_assistant_metadata",
     "normalized_history_import_limit", "claude_history_event_item", "append_claude_history_event",
     "parse_claude_history_events", "parse_provider_history_delta", "history_item_cursor_digest",
     "history_dedup_key", "reconcile_cursor_history_items", "unsynced_history_items",
@@ -381,11 +382,26 @@ class ImportedHistoryProvenanceTests(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn("id", payload)
                     self.assertNotIn("session_id", payload)
                 for _kind, payload in (specifications[0], specifications[-1]):
-                    self.assertNotIn("ts", payload)
                     self.assertNotIn("provider_origin", payload)
                     self.assertNotIn("metadata_only", payload)
+                self.assertNotIn("ts", specifications[0][1])
+                self.assertEqual(specifications[-1][1]["ts"], TIMESTAMP)
                 if name == "append_imported_history":
                     self.assertEqual(specifications[0][1]["_history_sync_checkpoint"], {"test": "checkpoint"})
+
+    async def test_old_source_times_do_not_extend_import_completion_until_import_day(self) -> None:
+        items = [self.projection["claude_history_event_item"](source_event(kind, kind, timestamp=timestamp))
+                 for kind, timestamp in (("user", "2026-09-01T12:00:00Z"), ("assistant", "2026-09-01T12:00:05Z"))]
+        for name in ("append_imported_history", "append_staged_imported_history"):
+            _result, specifications = await self.append(name, items)
+            events = [{"type": kind, "ts": "2026-09-10T00:00:00Z", **payload} for kind, payload in specifications]
+            self.assertEqual([event["ts"] for event in events[1:]], [
+                "2026-09-01T12:00:00Z", "2026-09-01T12:00:05Z", "2026-09-01T12:00:05Z",
+            ])
+            start = datetime.fromisoformat(events[1]["ts"])
+            end = datetime.fromisoformat(events[-1]["ts"])
+            self.assertEqual((end - start).total_seconds(), 5)
+            self.assertTrue(events[-1]["imported"])
 
     async def test_invalid_timestamp_keeps_identity_and_leaves_import_time_fallback(self) -> None:
         item = {"kind": "user", "text": "Real", "provider_origin": origin(timestamp="bad", grants=["private"]), "ts": "UNTRUSTED"}
@@ -393,6 +409,7 @@ class ImportedHistoryProvenanceTests(unittest.IsolatedAsyncioTestCase):
             _result, specifications = await self.append(name, [item])
             payload = specifications[1][1]
             self.assertNotIn("ts", payload)
+            self.assertNotIn("ts", specifications[-1][1])
             self.assertEqual(payload["provider_origin"], {key: value for key, value in origin().items() if key != "timestamp"})
             _result, legacy = await self.append(name, [{"kind": "user", "text": "Plain"}], backend="codex")
             self.assertNotIn("provider_origin", legacy[1][1])

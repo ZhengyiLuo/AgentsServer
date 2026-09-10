@@ -299,6 +299,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.previous_run_now = agent_server.RUN_NOW_TURNS
         self.previous_steering = agent_server.STEERING_SESSIONS
         self.previous_active_lock = agent_server.ACTIVE_LOCK
+        self.previous_lifecycle_locks = agent_server.SESSION_LIFECYCLE_LOCKS
         self.previous_run_now_requests = agent_server.RUN_NOW_REQUESTS
         self.previous_run_now_completed = agent_server.RUN_NOW_COMPLETED_RESULTS
         self.previous_run_metadata = agent_server.RUN_METADATA
@@ -340,6 +341,9 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         # deliberately contends the production lock binds it to that loop, so
         # every case needs a fresh lock just like it gets fresh runtime maps.
         agent_server.ACTIVE_LOCK = asyncio.Lock()
+        # Goal handoff now deliberately contends a per-chat lifecycle lock.
+        # It must not retain a binding to a preceding test's event loop.
+        agent_server.SESSION_LIFECYCLE_LOCKS = {}
         agent_server.RUN_NOW_REQUESTS = {}
         agent_server.RUN_NOW_COMPLETED_RESULTS = OrderedDict()
         agent_server.RUN_METADATA = {}
@@ -362,6 +366,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         agent_server.RUN_NOW_TURNS = self.previous_run_now
         agent_server.STEERING_SESSIONS = self.previous_steering
         agent_server.ACTIVE_LOCK = self.previous_active_lock
+        agent_server.SESSION_LIFECYCLE_LOCKS = self.previous_lifecycle_locks
         agent_server.RUN_NOW_REQUESTS = self.previous_run_now_requests
         agent_server.RUN_NOW_COMPLETED_RESULTS = self.previous_run_now_completed
         agent_server.RUN_METADATA = self.previous_run_metadata

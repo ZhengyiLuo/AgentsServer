@@ -45732,7 +45732,7 @@ def history_item_cursor_digest(item: dict[str, Any]) -> str:
         identity,
         ensure_ascii=False,
         separators=(",", ":"),
-    ).encode("utf-8")
+    ).encode("utf-8", errors="surrogatepass")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -46415,7 +46415,9 @@ def history_dedup_key(
     if isinstance(source_text_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", source_text_sha256):
         return str(kind or ""), source_text_sha256
     normalized = " ".join(str(text or "").split())
-    return str(kind or ""), hashlib.sha256(normalized.encode("utf-8")).hexdigest() if normalized else ""
+    # JSON permits escaped lone surrogates. Keep their identity losslessly;
+    # replacing them would collide with genuine replacement characters.
+    return str(kind or ""), hashlib.sha256(normalized.encode("utf-8", errors="surrogatepass")).hexdigest() if normalized else ""
 
 
 def history_timeline_message_keys(

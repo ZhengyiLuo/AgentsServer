@@ -4,6 +4,8 @@ from pathlib import Path
 import unittest
 from unittest.mock import Mock
 
+from claude_history_repair import _text_key
+
 from test_claude_history_metadata_isolated import load_projection as claude_projection, user_event
 from test_codex_history_metadata_isolated import projection as codex_projection, assistant
 from test_codex_goal_history_isolated import source_user
@@ -48,6 +50,27 @@ class FullTextHistoryTests(unittest.TestCase):
                 self.assertEqual(len(items), 2)
                 self.assertEqual(items[0]["text"], items[1]["text"])
                 self.assertNotEqual(items[0]["source_text_sha256"], items[1]["source_text_sha256"])
+
+    def test_escaped_lone_surrogates_remain_lossless_and_distinct(self):
+        # Escaped lone surrogates are legal JSON payloads. A fingerprint must
+        # neither crash history reconciliation nor replace distinct content.
+        texts = ["prefix \ud800", "prefix \ud801", "prefix \ufffd"]
+        for backend in ("claude", "codex"):
+            for role in ("user", "assistant"):
+                with self.subTest(backend=backend, role=role):
+                    items = self.parse(backend, texts, role)
+                    self.assertEqual(len(items), 3)
+                    keys = [getattr(self, backend)["history_dedup_key"](
+                        role, item["text"],
+                    )[1] for item in items]
+                    self.assertEqual(len(set(keys)), 3)
+                    self.assertEqual(keys, [hashlib.sha256(
+                        text.encode("utf-8", errors="surrogatepass")
+                    ).hexdigest() for text in texts])
+                    self.assertEqual(keys, [_text_key(text) for text in texts])
+                    digests = [getattr(self, backend)["history_item_cursor_digest"](item)
+                               for item in items]
+                    self.assertEqual(len(set(digests)), 3)
 
     def test_ordered_timeline_credit_consumes_only_one_exact_full_source(self):
         scheduled = "monitor " * 2_000 + "scheduled ending"

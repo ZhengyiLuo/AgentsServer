@@ -84,7 +84,7 @@ def _records(path: Path, expected: tuple[int, int, int, int]):
 
 
 def _text_key(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return hashlib.sha256(text.encode("utf-8", errors="surrogatepass")).hexdigest()
 
 
 def _target(event: dict) -> tuple[int, str, str] | None:

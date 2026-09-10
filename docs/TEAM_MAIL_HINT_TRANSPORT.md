@@ -142,7 +142,24 @@ only that page's coverage. A body-free golden frame artifact permits separate
 validation with the actual desktop parser. Real TLS denial cases preserve
 403/429 and release all passive/request capacity.
 
-Pending: full local server→compiled desktop→fresh page badge-clear journey,
-offline process restart/restore and authority teardown across actual
-processes. These private-socket tests do not claim listener, ASGI framework,
-desktop UI, release or production acceptance, and do not enable either gate.
+The follow-up private-process acceptance ran the actual Starlette/uvicorn
+websocket endpoint over one owner-only AF_UNIX socket. The compiled desktop
+used a real WebSocket client with only its dial constrained to that socket;
+actual HubStore commits, pinned mTLS, Member runtime, local ASGI, client stream,
+AppService, IPC, preload and full renderer all executed. Fresh Inbox pages
+also crossed the actual peer proxy. Arrival 7 showed the quiet dot; its fresh
+page cleared it; a held page 7 could not clear arrival 9; a fresh page 9 could.
+The unsent draft, focus, navigation and automatic request counts were unchanged.
+Evidence: desktop QA `mail-hints-journey-brwJgD/report.json` and seven inspected
+screenshots. Chat/topology DTOs remained controlled; input was synthetic CDP.
+
+The follow-up burst is not accepted: 50 additional commits reached sequence
+59, but the private fixture transmitted no burst hints after its authority/
+reconnect transition. Existing frames remained 0/7/9 and desktop projection
+became null. This is not evidence of successful burst delivery or notification
+performance. Both owned processes exited cleanly and the listener was removed.
+
+Pending: deployed TCP-host/mobile acceptance, physical long-chat input/scroll
+performance, and offline process restart/authority teardown across deployed
+processes. This private-socket acceptance does not claim release or production
+enablement, and neither gate has been enabled.

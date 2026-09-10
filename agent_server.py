@@ -7336,6 +7336,10 @@ async def stage_provider_team_mail_grants(
                             and route["target_id"] == reference["target_id"]), None)
             binding = reference.get("durable_server_binding")
             if binding is None and "durable_server_binding" not in reference:
+                if current is not None:
+                    # A temporary downgrade cannot turn an existing durable
+                    # grant into revision-free permission that survives revoke.
+                    continue
                 # An older Hub can authorize the exact visible one-use @@
                 # reference, but cannot prove an incarnation for permanence.
                 legacy_references.append({

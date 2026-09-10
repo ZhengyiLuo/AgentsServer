@@ -213,6 +213,46 @@ class DurableMailGrantTests(unittest.TestCase):
         self.assertEqual(caught.exception.status_code, 403)
         self.assertEqual(endpoint.runtime.team_send_message.call_count, 1)
 
+    def test_downgraded_hub_cannot_bypass_revocation_of_existing_grant(self):
+        async def check():
+            namespace = endpoint_fixture()
+            session = namespace["STORE"].sessions["qa-away-chat"]
+            session[grants.ROUTES_KEY] = [route()]
+            selected = SimpleNamespace(kind="recipient", recipient_kind="server", team_id="qa-team",
+                                       target_id="qa-node-1", display_name_snapshot="QA recipient")
+            namespace["SECURE_PEER_RUNTIME"].resolve_team_references = lambda refs: refs
+            mutation = await namespace["stage_provider_team_mail_grants"](
+                "qa-away-chat", [selected], admission_id="grant_admission_" + "e" * 32, event_type="turn_queued")
+            ceiling = grants.admission_snapshot(mutation, session)
+            self.assertEqual(ceiling, grants.snapshot([route()]))
+            await namespace["delete_agent_team_mail_route"](
+                "qa-away-chat", route()["route_id"], route()["revision"])
+            # Execute the actual issuer's reference filter and Team handle
+            # projection only; no authority creation, server import or I/O.
+            tree = ast.parse(Path(__file__).with_name("agent_server.py").read_text())
+            issuer = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef)
+                          and node.name == "issue_cross_chat_capability")
+            filter_node = next(node for node in issuer.body if isinstance(node, ast.If)
+                               and ast.unparse(node.test) == "team_mail_route_snapshot is not None")
+            projection_index = next(index for index, node in enumerate(issuer.body)
+                                    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+                                    and node.target.id == "team_routes")
+            scope = {"team_mail_grants": grants, "team_mail_route_snapshot": ceiling,
+                     "validated_team_references": [selected], "AGENT_TOKEN": True,
+                     "source_session_id": "qa-away-chat", "STORE": namespace["STORE"],
+                     "secrets": SimpleNamespace(token_hex=lambda size: "0" * (size * 2)), "Any": Any}
+            exec(compile(ast.Module(body=[filter_node], type_ignores=[]), "<issuer-filter>", "exec"), scope)
+            scope["resolved_team_references"] = [vars(item) for item in scope["validated_team_references"]]
+            exec(compile(ast.Module(body=issuer.body[projection_index:projection_index + 2], type_ignores=[]),
+                         "<issuer-routes>", "exec"), scope)
+            self.assertEqual(scope["team_routes"], {})
+            with self.assertRaises(HTTPException):
+                await namespace["resolve_provider_durable_team_reference"]("qa-away-chat", {
+                    "durable_mail_grant": grants.snapshot([route()])[0],
+                    "durable_server_binding": route()["durable_server_binding"],
+                }, "qa-generation")
+        asyncio.run(check())
+
 
 if __name__ == "__main__":
     unittest.main()

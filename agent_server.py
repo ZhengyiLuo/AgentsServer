@@ -30670,13 +30670,26 @@ def prepare_claude_history_metadata_repair(session_id: str) -> None:
         # makes the proof ambiguous and remains visible.
         legacy = dict(source_event)
         legacy.pop("isMeta", None)
+        legacy.pop("isCompactSummary", None)
         item = claude_history_event_item(legacy, expected_session_id=session_id)
         return item["text"] if item and item.get("kind") == "user" else None
 
-    CLAUDE_METADATA_REPAIR_CACHE.prepare(
+    def normalize_full_user(source_event: dict[str, Any]) -> str | None:
+        if source_event.get("type") != "user" or source_event.get("isMeta") is True:
+            return None
+        return strip_agentsdock_generated_user_text(
+            message_text(source_event.get("message"), compact=False),
+            expected_session_id=session_id, provider_history=True,
+        )
+
+    changed = CLAUDE_METADATA_REPAIR_CACHE.prepare(
         session_id, provider_id, events_path(session_id), CLAUDE_PROJECTS_ROOT,
         normalize_legacy_user,
+        normalize_full_user=normalize_full_user,
     )
+    if changed and CLAUDE_METADATA_REPAIR_CACHE.signature(session_id):
+        HISTORY_SEARCH_REPAIR_DIRTY.add(session_id)
+        HISTORY_SEARCH_DIRTY.add(session_id)
 
 
 def project_legacy_imported_provider_event(
@@ -30721,6 +30734,7 @@ def project_legacy_imported_provider_event(
     if CLAUDE_METADATA_REPAIR_CACHE.is_hidden(session_id, event):
         projected = dict(event)
         projected["prompt"] = ""
+        projected["provider_history_repair"] = "source_proven_import"
         projected[TIMELINE_IMPORTED_PROMPT_HIDDEN_FIELD] = True
         return projected
     prompt = str(event["prompt"])
@@ -43811,14 +43825,19 @@ def normalized_history_item(
     text: str,
     *,
     provider_origin: Any = None,
+    source_text_sha256: Any = None,
 ) -> dict[str, Any] | None:
     origin = normalized_history_provider_origin(provider_origin)
     if kind == "interruption" and (origin is None or origin.get("kind") != "interruption"):
         return None
+    source_key = history_dedup_key(kind, text, source_text_sha256=source_text_sha256)[1]
     text = compact_import_text(text)
     if not text or (kind == "user" and is_import_boilerplate(text)):
         return None
     item: dict[str, Any] = {"kind": kind, "text": text}
+    if source_key != history_dedup_key(kind, text)[1]:
+        # Presentation stays bounded; matching retains the entire source text.
+        item["source_text_sha256"] = source_key
     if origin is not None:
         item["provider_origin"] = origin
     return item
@@ -43830,8 +43849,12 @@ def add_history_item(
     text: str,
     *,
     provider_origin: Any = None,
+    source_text_sha256: Any = None,
 ) -> None:
-    item = normalized_history_item(kind, text, provider_origin=provider_origin)
+    item = normalized_history_item(
+        kind, text, provider_origin=provider_origin,
+        source_text_sha256=source_text_sha256,
+    )
     if item is None:
         return
     if items and items[-1]["kind"] == item["kind"]:
@@ -43840,7 +43863,9 @@ def add_history_item(
             origin = item["provider_origin"]
             if previous_origin is not None and all(previous_origin.get(field) == origin.get(field) for field in ("event_id", "session_id")):
                 return
-        elif items[-1]["text"].strip() == item["text"].strip():
+        elif items[-1]["text"].strip() == item["text"].strip() and history_dedup_key(
+            kind, items[-1]["text"], source_text_sha256=items[-1].get("source_text_sha256"),
+        ) == history_dedup_key(kind, item["text"], source_text_sha256=item.get("source_text_sha256")):
             return
     items.append(item)
 
@@ -44688,9 +44713,11 @@ def claude_history_event_item(
         "prompt_id": event.get("promptId"),
     }
     if event_type == "user":
-        if event.get("isMeta") is True:
+        if event.get("isMeta") is True or event.get("isCompactSummary") is True:
             # Claude marks generated skill/command context as metadata even
-            # though it occupies a user-role transcript row. Preserve genuine
+            # though it occupies a user-role transcript row. Compaction
+            # summaries are likewise provider context, not human input.
+            # Preserve genuine
             # user quotations: the structured flag, never the text, decides.
             return None
         if is_claude_task_notification_history_event(event):
@@ -44711,7 +44738,7 @@ def claude_history_event_item(
     if event_type == "assistant":
         return normalized_history_item(
             "assistant",
-            message_text(event.get("message")),
+            message_text(event.get("message"), compact=False),
             provider_origin=provider_origin,
         )
     return None
@@ -44731,6 +44758,7 @@ def append_claude_history_event(
         add_history_item(
             items, item["kind"], item["text"],
             provider_origin=item.get("provider_origin"),
+            source_text_sha256=item.get("source_text_sha256"),
         )
 
 
@@ -45325,6 +45353,14 @@ def merge_codex_history_duplicate(previous: dict[str, Any], item: dict[str, Any]
     """Enrich a retained duplicate, but never collapse known distinct phases."""
     if previous.get("kind") != item.get("kind") or str(previous.get("text") or "").strip() != str(item.get("text") or "").strip():
         return False
+    if history_dedup_key(
+        previous.get("kind", ""), previous.get("text", ""),
+        source_text_sha256=previous.get("source_text_sha256"),
+    ) != history_dedup_key(
+        item.get("kind", ""), item.get("text", ""),
+        source_text_sha256=item.get("source_text_sha256"),
+    ):
+        return False
     if item.get("kind") == "assistant":
         prior = codex_history_assistant_metadata(previous)
         incoming = codex_history_assistant_metadata(item)
@@ -45372,7 +45408,7 @@ def codex_history_event_item(
         if role == "assistant":
             return codex_history_assistant_item(
                 event,
-                text_from_content(payload.get("content")),
+                text_from_content(payload.get("content"), compact=False),
             )
     return None
 
@@ -45791,6 +45827,9 @@ def normalized_history_sync_cursor(
         )
     if backend == BACKEND_CODEX and raw.get("codex_last_item_phase") in ("commentary", "final_answer"):
         cursor["codex_last_item_phase"] = raw["codex_last_item_phase"]
+    source_sha256 = raw.get("last_item_source_text_sha256")
+    if isinstance(source_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", source_sha256):
+        cursor["last_item_source_text_sha256"] = source_sha256
     return cursor
 
 
@@ -46110,6 +46149,7 @@ def parse_provider_history_delta(
     expected_session_id: str | None = None,
     interruption_context: dict[str, Any] | None = None,
     codex_phase_context: dict[str, str] | None = None,
+    source_text_context: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], int, str, bool]:
     """Consume the front of an append-only delta without skipping messages."""
 
@@ -46117,6 +46157,7 @@ def parse_provider_history_delta(
     items: list[dict[str, Any]] = []
     cursor_offset = start
     last_item_digest = previous_last_item_digest
+    source_context = source_text_context if source_text_context is not None else {}
     blocked_on_unseen_message = False
     tracker = ClaudeInterruptionTracker(interruption_context) if backend == BACKEND_CLAUDE else None
     for event, record_end in bounded_jsonl_records_range(
@@ -46150,7 +46191,12 @@ def parse_provider_history_delta(
             cursor_offset = record_end
             continue
         item_digest = history_item_cursor_digest(item)
-        if last_item_digest and hmac.compare_digest(
+        source_sha256 = str(item.get("source_text_sha256") or "")
+        previous_source_sha256 = str(source_context.get("sha256") or "")
+        # Keep the legacy cursor digest stable, but never let its bounded-text
+        # equality erase a different long source. Old cursors lack this proof;
+        # retain that boundary item conservatively until full matching runs.
+        if last_item_digest and source_sha256 == previous_source_sha256 and hmac.compare_digest(
             item_digest,
             last_item_digest,
         ):
@@ -46186,6 +46232,9 @@ def parse_provider_history_delta(
                 tracker = ClaudeInterruptionTracker(prior_context)
             continue
         items.append(item)
+        source_context.clear()
+        if source_sha256:
+            source_context["sha256"] = source_sha256
         if backend == BACKEND_CODEX and codex_phase_context is not None:
             codex_phase_context.clear()
             if item.get("phase") in ("commentary", "final_answer"):
@@ -46221,6 +46270,9 @@ def load_provider_history_with_cursor(
     end = int(snapshot["source_offset"])
     interruption_context: dict[str, Any] = {"version": 1}
     codex_phase_context: dict[str, str] = {}
+    source_text_context: dict[str, str] = {}
+    if continued and previous and previous.get("last_item_source_text_sha256"):
+        source_text_context["sha256"] = previous["last_item_source_text_sha256"]
     if (
         backend == BACKEND_CODEX and continued and previous
         and previous.get("codex_last_item_phase") in ("commentary", "final_answer")
@@ -46251,6 +46303,7 @@ def load_provider_history_with_cursor(
             expected_session_id=str(sess.get("id") or "") or None,
             interruption_context=interruption_context,
             codex_phase_context=codex_phase_context,
+            source_text_context=source_text_context,
         )
         caught_up = not delta_overflow and cursor_offset == end
     else:
@@ -46271,6 +46324,8 @@ def load_provider_history_with_cursor(
         last_item_digest = (
             history_item_cursor_digest(items[-1]) if items else ""
         )
+        if items and items[-1].get("source_text_sha256"):
+            source_text_context["sha256"] = items[-1]["source_text_sha256"]
         if backend == BACKEND_CODEX and items and items[-1].get("phase") in ("commentary", "final_answer"):
             codex_phase_context["phase"] = items[-1]["phase"]
         caught_up = True
@@ -46341,18 +46396,26 @@ def load_provider_history_with_cursor(
         cursor["claude_interruption_context"] = normalize_claude_interruption_context(interruption_context, provider_session_id=provider_id)
     if backend == BACKEND_CODEX and codex_phase_context.get("phase") in ("commentary", "final_answer"):
         cursor["codex_last_item_phase"] = codex_phase_context["phase"]
+    if source_text_context.get("sha256"):
+        cursor["last_item_source_text_sha256"] = source_text_context["sha256"]
     return path, items, cursor, continued
 
 
-def history_dedup_key(kind: str, text: Any) -> tuple[str, str]:
+def history_dedup_key(
+    kind: str, text: Any, *, source_text_sha256: Any = None,
+) -> tuple[str, str]:
     """Compare a transcript message to a timeline message by shape, not bytes.
 
     The same message reaches the two sides by different paths (import
     compaction on one, assistant-text cleaning on the other), so whitespace
-    is normalized before comparing.
+    is normalized before hashing. Compacted imports carry the hash captured
+    from their complete source; display prefixes never establish a match.
     """
 
-    return str(kind or ""), " ".join(str(text or "").split())
+    if isinstance(source_text_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", source_text_sha256):
+        return str(kind or ""), source_text_sha256
+    normalized = " ".join(str(text or "").split())
+    return str(kind or ""), hashlib.sha256(normalized.encode("utf-8")).hexdigest() if normalized else ""
 
 
 def history_timeline_message_keys(
@@ -46447,9 +46510,9 @@ def history_timeline_message_keys(
                 continue
             event_type = event.get("type")
             if event_type == "turn_started" or is_native_goal_steer_event(event):
-                key = history_dedup_key("user", event.get("prompt"))
+                key = history_dedup_key("user", event.get("prompt"), source_text_sha256=event.get("source_text_sha256"))
             elif event_type == "assistant_text":
-                key = history_dedup_key("assistant", event.get("text"))
+                key = history_dedup_key("assistant", event.get("text"), source_text_sha256=event.get("source_text_sha256"))
             elif (
                 event_type == "reasoning_summary"
                 and event.get("phase") == "commentary"
@@ -46460,7 +46523,7 @@ def history_timeline_message_keys(
                 # Count these public text blocks as
                 # ownership credits so the next history sync cannot import
                 # this chat's own progress back as duplicate messages.
-                key = history_dedup_key("assistant", event.get("text"))
+                key = history_dedup_key("assistant", event.get("text"), source_text_sha256=event.get("source_text_sha256"))
             elif tail and event_type in {"turn_finished", "job_summary"}:
                 # A compacted scheduled run can retain only its canonical
                 # result event.  The provider transcript still contains that
@@ -46473,7 +46536,7 @@ def history_timeline_message_keys(
                 result_text = event.get("result_text")
                 if not isinstance(result_text, str) or not result_text.strip():
                     continue
-                key = history_dedup_key("assistant", result_text)
+                key = history_dedup_key("assistant", result_text, source_text_sha256=event.get("source_text_sha256"))
             else:
                 continue
             timeline_has_messages = True
@@ -46532,7 +46595,10 @@ def reconcile_cursor_history_items(
     timeline_index = 0
     consumed_seq = after_seq
     for item in items:
-        item_key = history_dedup_key(item.get("kind", ""), item.get("text", ""))
+        item_key = history_dedup_key(
+            item.get("kind", ""), item.get("text", ""),
+            source_text_sha256=item.get("source_text_sha256"),
+        )
         if (
             timeline_index < len(timeline_messages)
             and item_key == timeline_messages[timeline_index][1]
@@ -46609,7 +46675,10 @@ def unsynced_history_items(
     timeline_keys = [key for _seq, key in timeline_messages]
 
     transcript_keys = [
-        history_dedup_key(item.get("kind", ""), item.get("text", ""))
+        history_dedup_key(
+            item.get("kind", ""), item.get("text", ""),
+            source_text_sha256=item.get("source_text_sha256"),
+        )
         for item in items
     ]
     # Content alone cannot distinguish an original ``A, B`` prefix from the
@@ -47007,6 +47076,9 @@ async def append_imported_history(
     for item in items:
         origin = normalized_history_provider_origin(item.get("provider_origin")) if backend == BACKEND_CLAUDE else None
         provenance: dict[str, Any] = {"provider_origin": origin} if origin is not None else {}
+        source_sha256 = item.get("source_text_sha256")
+        if isinstance(source_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", source_sha256):
+            provenance["source_text_sha256"] = source_sha256
         if backend == BACKEND_CODEX and item.get("provider_user_authored") is True:
             provenance["provider_user_authored"] = True
         if origin is not None and "timestamp" in origin:
@@ -47106,6 +47178,9 @@ async def append_staged_imported_history(
     for item in items:
         origin = normalized_history_provider_origin(item.get("provider_origin")) if backend == BACKEND_CLAUDE else None
         provenance: dict[str, Any] = {"provider_origin": origin} if origin is not None else {}
+        source_sha256 = item.get("source_text_sha256")
+        if isinstance(source_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", source_sha256):
+            provenance["source_text_sha256"] = source_sha256
         if backend == BACKEND_CODEX and item.get("provider_user_authored") is True:
             provenance["provider_user_authored"] = True
         if origin is not None and "timestamp" in origin:

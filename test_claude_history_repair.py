@@ -37,6 +37,8 @@ def load_server_repair(cache):
         "CLAUDE_METADATA_REPAIR_CACHE": cache,
         "TIMELINE_IMPORTED_PROMPT_HIDDEN_FIELD": "_agentsdock_imported_prompt_hidden",
         "strip_all_legacy_agentsdock_provider_authority_suffixes": lambda text, **kwargs: text,
+        "HISTORY_SEARCH_REPAIR_DIRTY": set(),
+        "HISTORY_SEARCH_DIRTY": set(),
     })
     exec(compile(module, str(source), "exec"), namespace)
     return namespace
@@ -58,6 +60,7 @@ class ClaudeHistoryRepairTests(unittest.TestCase):
     def normalize(self, event):
         legacy = dict(event)
         legacy.pop("isMeta", None)
+        legacy.pop("isCompactSummary", None)
         item = self.helpers["claude_history_event_item"](legacy)
         return item["text"] if item else None
 
@@ -123,6 +126,17 @@ class ClaudeHistoryRepairTests(unittest.TestCase):
                               user_event(" \nGenerated wrapper\n", **flag)])
                 self.prepare()
                 self.assertFalse(self.cache.is_hidden("chat-1", self.wrapper))
+
+    def test_compaction_summary_requires_source_metadata_not_matching_wording(self):
+        self.fixture([user_event("Generated wrapper", isCompactSummary=True), user_event("Real question")])
+        self.assertTrue(self.prepare())
+        projected = load_server_repair(self.cache)["project_provider_history_event_for_egress"](self.wrapper, "chat-1")
+        self.assertEqual(projected["prompt"], "")
+        self.assertEqual(projected["provider_history_repair"], "source_proven_import")
+        self.cache = repair.ClaudeMetadataRepairCache()
+        self.fixture([user_event("Generated wrapper", isCompactSummary=True), user_event("Generated wrapper")])
+        self.prepare()
+        self.assertFalse(self.cache.is_hidden("chat-1", self.wrapper))
 
     def test_reused_metadata_is_unique_within_its_original_batch(self):
         self.fixture([user_event("Generated wrapper", isMeta=True),

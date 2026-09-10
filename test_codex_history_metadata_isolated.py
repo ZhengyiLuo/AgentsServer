@@ -219,7 +219,7 @@ class CodexHistoryMetadataTests(unittest.IsolatedAsyncioTestCase):
             imported = self.parse([assistant("Imported progress", phase="commentary")])
             self.assertEqual(self.ns["unsynced_history_items"]("chat", imported, timeline_through_seq=3), [])
             keys, _, _ = self.ns["history_timeline_message_keys"]("chat", timeline_after_seq=0, timeline_through_seq=3, tail=False, include_imported=False)
-            self.assertEqual(keys, [(1, ("assistant", "Public progress"))])
+        self.assertEqual(keys, [(1, self.ns["history_dedup_key"]("assistant", "Public progress"))])
 
     def test_persistence_preserves_aware_timestamp_instead_of_import_time(self):
         with tempfile.TemporaryDirectory() as directory:

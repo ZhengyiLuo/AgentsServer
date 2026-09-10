@@ -32,6 +32,7 @@ FUNCTIONS = {
     "parse_claude_history_events",
     "claude_transcript_preview",
     "history_item_cursor_digest",
+    "history_dedup_key",
     "parse_provider_history_delta",
 }
 CONSTANTS = {
@@ -122,6 +123,12 @@ class ClaudeHistoryMetadataTests(unittest.TestCase):
             for metadata in ({}, {"isMeta": False}, {"isMeta": "true"}, {"isMeta": 1}, {"origin": {"kind": "human"}}):
                 with self.subTest(text=text, metadata=metadata):
                     self.assertEqual(self.item(user_event(text, **metadata)), {"kind": "user", "text": text})
+
+    def test_compact_summary_flag_not_summary_wording_decides_user_origin(self) -> None:
+        text = "This session is being continued from a previous conversation. Summary: a real user may quote this."
+        self.assertIsNone(self.item(user_event(text, isCompactSummary=True)))
+        for flag in (None, False, "true", 1):
+            self.assertEqual(self.item(user_event(text, isCompactSummary=flag)), {"kind": "user", "text": text})
 
     def test_assistant_text_and_non_user_events_are_unchanged(self) -> None:
         self.assertEqual(self.item({

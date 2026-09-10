@@ -8411,6 +8411,14 @@ class SecurePeerPairingRequest(SecurePeerControlRequest):
         min_length=1,
         max_length=len(SECURE_PEER_SCOPES),
     )
+    complete_on_approval: bool = False
+
+    @field_validator("complete_on_approval", mode="before")
+    @classmethod
+    def require_completion_boolean(cls, value: Any) -> Any:
+        if type(value) is not bool:
+            raise ValueError("complete_on_approval must be a JSON boolean")
+        return value
 
     @field_validator("host")
     @classmethod
@@ -70724,6 +70732,15 @@ def canonical_secure_peer_path_uuid(value: str, label: str) -> str:
     return value
 
 
+def secure_peer_automatic_completion_capability() -> dict[str, Any]:
+    return {
+        "available": bool(AGENT_TOKEN and SECURE_PEER_RUNTIME.state_available()),
+        "version": 1,
+        "completion_path": "/api/admin/secure-peers/v1/pairings/{pairing_id}/completion",
+        "max_wait_seconds": 600,
+    }
+
+
 @app.get("/api/admin/secure-peers/v1/status")
 async def secure_peer_status_endpoint(request: Request) -> Response:
     require_secure_peer_control(request)
@@ -70801,6 +70818,7 @@ async def secure_peer_pairing_create_endpoint(
             request_id=str(body.request_id),
             display_name=body.display_name,
             requested_scopes=list(body.requested_scopes),
+            complete_on_approval=body.complete_on_approval,
         )
     except SecurePeerError as exc:
         return secure_peer_error_response(exc)
@@ -70822,6 +70840,56 @@ async def secure_peer_pairing_get_endpoint(
     except SecurePeerError as exc:
         return secure_peer_error_response(exc)
     return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/admin/secure-peers/v1/pairings/{pairing_id}/completion")
+async def secure_peer_pairing_completion_endpoint(
+    pairing_id: str,
+    request: Request,
+    expected_server_identity: str = Query(min_length=8, max_length=240),
+    expected_server_instance_id: str = Query(min_length=8, max_length=240),
+    expected_transcript_hash: str = Query(pattern=r"^[0-9a-f]{64}$"),
+) -> Response:
+    require_secure_peer_control(request)
+
+    def require_target() -> None:
+        if (
+            expected_server_identity != server_identity()
+            or expected_server_instance_id != SERVER_INSTANCE_ID
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="The connected AgentsServer instance changed before confirmation",
+            )
+
+    require_target()
+    clean_id = canonical_secure_peer_path_uuid(pairing_id, "Pairing")
+
+    async def disconnected() -> None:
+        while (await request.receive()).get("type") != "http.disconnect":
+            pass
+
+    completion = asyncio.create_task(SECURE_PEER_RUNTIME.wait_pairing_completion(
+        clean_id, expected_transcript_hash=expected_transcript_hash
+    ))
+    disconnect = asyncio.create_task(disconnected())
+    try:
+        done, _pending = await asyncio.wait(
+            {completion, disconnect}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if disconnect in done:
+            return Response(status_code=499, headers={"Cache-Control": "no-store"})
+        result = await completion
+        require_target()
+        return JSONResponse(result, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+    except SecurePeerError as exc:
+        return secure_peer_error_response(exc)
+    finally:
+        # Only observer tasks are cancelled. The service-owned durable join
+        # continues even when a window closes or this request disconnects.
+        completion.cancel()
+        disconnect.cancel()
+        await asyncio.gather(completion, disconnect, return_exceptions=True)
 
 
 @app.post("/api/admin/secure-peers/v1/pairings/{pairing_id}/cancel")
@@ -71617,6 +71685,7 @@ async def health() -> dict[str, Any]:
                 "version": 1,
                 "supported_backends": [BACKEND_CLAUDE, BACKEND_CODEX],
             },
+            "automatic_pairing_completion_v1": secure_peer_automatic_completion_capability(),
             "secure_peer_v1": {
                 "available": bool(AGENT_TOKEN),
                 "state_available": SECURE_PEER_RUNTIME.state_available(),

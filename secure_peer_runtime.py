@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import suppress
 from datetime import datetime, timezone
+import asyncio
 import hashlib
 import hmac
 import json
@@ -198,6 +199,8 @@ class SecurePeerRuntime:
         self._team_export_reservations: dict[Path, int] = {}
         self.config_path = self.data_dir / "host-config.json"
         self._guard = threading.RLock()
+        self._completion_waiters: dict[object, Callable[[], None]] = {}
+        self._completion_closing = False
         # Linearizes durable outbound intent creation with every local
         # route/connection retirement boundary. A handoff is either durably
         # pending before retirement (so retirement returns 409) or observes
@@ -358,6 +361,7 @@ class SecurePeerRuntime:
                     raise RuntimeError(self._initialization_error)
                 self._team_authority_epoch = uuid.uuid4().hex
                 self._host_role_active = True
+                self._notify_pairing_completion()
                 return None
             try:
                 paused = self.client.pause_active_connection_for_host()
@@ -369,6 +373,7 @@ class SecurePeerRuntime:
                 paused = self.client.pause_active_connection_for_host()
             self._team_authority_epoch = uuid.uuid4().hex
             self._host_role_active = True
+            self._notify_pairing_completion()
             return paused
 
     def resume_member_after_host(self) -> dict[str, Any] | None:
@@ -891,31 +896,152 @@ class SecurePeerRuntime:
         request_id: str,
         display_name: str,
         requested_scopes: list[str],
+        complete_on_approval: bool = False,
     ) -> dict[str, Any]:
         # The core persists the key/request before network delivery so an
         # ambiguous response can be retried with the exact same signed bytes.
-        result = self.client.begin_pairing(
-            host,
-            port,
-            expected_ca_fingerprint=expected_ca_fingerprint,
-            request_id=request_id,
-            requested_scopes=requested_scopes,
-            display_name=display_name,
-            resume_matching=True,
-        )
+        with self._outbound_guard:
+            if complete_on_approval and self._host_role_active:
+                raise SecurePeerError(
+                    "host_role_active",
+                    "This server cannot automatically join while it is the Team Network host",
+                    409,
+                )
+            result = self.client.begin_pairing(
+                host,
+                port,
+                expected_ca_fingerprint=expected_ca_fingerprint,
+                request_id=request_id,
+                requested_scopes=requested_scopes,
+                display_name=display_name,
+                resume_matching=True,
+                complete_on_approval=complete_on_approval,
+            )
         return self._outgoing_pairing(result)
 
     def poll_pairing(self, pairing_id: str) -> dict[str, Any]:
         connection = self._outgoing_for_pairing(pairing_id)
         result = self.client.poll_pairing(str(connection["connection_id"]))
+        self._notify_pairing_completion()
         return self._outgoing_pairing(result)
+
+    def _notify_pairing_completion(self) -> None:
+        with self._guard:
+            callbacks = tuple(self._completion_waiters.values())
+        for callback in callbacks:
+            with suppress(RuntimeError):
+                callback()
+
+    def _pairing_completion_snapshot(
+        self, pairing_id: str, *, expected_transcript_hash: str
+    ) -> tuple[dict[str, Any], int]:
+        selected = self._outgoing_for_pairing(pairing_id)
+        snapshot = self.client.auto_completion_snapshot(str(selected["connection_id"]))
+        connection = snapshot["connection"]
+        if connection.get("pairing_id") != pairing_id or not hmac.compare_digest(
+            str(connection.get("transcript_hash") or ""), expected_transcript_hash
+        ):
+            raise SecurePeerError("pairing_changed", "Pairing transcript changed", 409)
+        state = str(snapshot.get("state") or "unavailable")
+        deadline = int(snapshot.get("deadline") or 0)
+        if self._completion_closing:
+            state = "unavailable"
+        elif state == "completed" and not connection.get("active"):
+            state = "cancelled"
+        elif connection.get("status") in {"rejected", "cancelled", "revoked", "deactivated"}:
+            state = "cancelled"
+        elif state == "pending" and (self._host_role_active or connection.get("status") == "error"):
+            state = "cancelled"
+        elif state == "pending" and deadline <= int(time.time()):
+            state = "expired"
+        if state not in {"pending", "completed", "cancelled", "expired"}:
+            state = "unavailable"
+        return {
+            "version": 1,
+            "completion_state": state,
+            "pairing": self._outgoing_pairing(connection),
+        }, deadline
+
+    async def wait_pairing_completion(
+        self, pairing_id: str, *, expected_transcript_hash: str
+    ) -> dict[str, Any]:
+        """Observe one durable join without owning or cancelling its work."""
+
+        loop = asyncio.get_running_loop()
+        changed = asyncio.Event()
+        observer_deadline = loop.time() + 600.0
+        token = object()
+        with self._guard:
+            if len(self._completion_waiters) >= 32:
+                raise SecurePeerError("completion_capacity", "Too many pairing completion observers", 429)
+            self._completion_waiters[token] = lambda: loop.call_soon_threadsafe(changed.set)
+        try:
+            while True:
+                # Subscribe before reading and clear before each snapshot:
+                # completion between that read and wait cannot be lost.
+                changed.clear()
+                receipt, deadline = await asyncio.to_thread(
+                    self._pairing_completion_snapshot,
+                    pairing_id,
+                    expected_transcript_hash=expected_transcript_hash,
+                )
+                if receipt["completion_state"] != "pending":
+                    return receipt
+                remaining = max(0.0, min(observer_deadline - loop.time(), deadline - time.time()))
+                try:
+                    await asyncio.wait_for(changed.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    # Completion may have committed at the deadline while
+                    # its notification was still queued on this event loop.
+                    latest, _deadline = await asyncio.to_thread(
+                        self._pairing_completion_snapshot,
+                        pairing_id,
+                        expected_transcript_hash=expected_transcript_hash,
+                    )
+                    return (
+                        {**latest, "completion_state": "expired"}
+                        if latest["completion_state"] == "pending"
+                        else latest
+                    )
+        finally:
+            with self._guard:
+                self._completion_waiters.pop(token, None)
+
+    def _complete_automatic_pairing_once(self) -> None:
+        """One bounded approval check inside service-owned Member maintenance."""
+
+        for connection in self.client.list_auto_completion_candidates(limit=1):
+            connection_id = str(connection["connection_id"])
+            observed = self.client.poll_pairing(connection_id)
+            if observed.get("status") == "approved":
+                self.client.activate_auto_connection(
+                    connection_id,
+                    expected_pairing_id=str(connection["pairing_id"]),
+                    expected_transcript_hash=str(connection["transcript_hash"]),
+                    expected_host_server_identity=str(connection["host_server_identity"]),
+                    expected_hub_id=str(connection["hub_id"]),
+                )
+                self._client_failure_counts.pop(connection_id, None)
+                try:
+                    self.publish_display_name(self.display_name)
+                except Exception as exc:
+                    if self.logger is not None:
+                        self.logger.warning(
+                            "secure peer automatic join name update deferred error_type=%s",
+                            type(exc).__name__,
+                        )
+            if observed.get("status") != "pending":
+                self._notify_pairing_completion()
 
     def cancel_pairing(self, pairing_id: str, *, idempotency_key: str) -> dict[str, Any]:
         connection = self._outgoing_for_pairing(pairing_id)
-        self.client.cancel_pairing(
-            str(connection["connection_id"]),
-            idempotency_key=idempotency_key,
-        )
+        try:
+            self.client.cancel_pairing(
+                str(connection["connection_id"]),
+                idempotency_key=idempotency_key,
+            )
+        finally:
+            self._notify_pairing_completion()
         return self.status()
 
     def activate_pairing(
@@ -976,6 +1102,7 @@ class SecurePeerRuntime:
                 # supported rename must otherwise acknowledge the exact node.
                 if exc.status_code not in {403, 404}:
                     raise
+        self._notify_pairing_completion()
         return self.status()
 
     def deactivate_connection(
@@ -999,6 +1126,7 @@ class SecurePeerRuntime:
                 expected_hub_id=expected_hub_id,
             )
             self._client_failure_counts.pop(connection_id, None)
+        self._notify_pairing_completion()
         return self.status()
 
     def forget_connection(
@@ -1053,6 +1181,7 @@ class SecurePeerRuntime:
                     ),
                 )
                 self._client_failure_counts.pop(connection_id, None)
+                self._notify_pairing_completion()
                 return self.status()
             self.client.revoke_remote_connection(
                 connection_id,
@@ -1084,6 +1213,7 @@ class SecurePeerRuntime:
                 expected_certificate_fingerprint=expected_certificate_fingerprint,
             )
             self._client_failure_counts.pop(connection_id, None)
+        self._notify_pairing_completion()
         return self.status()
 
     def _require_connection_delivery_quiescent(self, connection_id: str) -> None:
@@ -1258,6 +1388,7 @@ class SecurePeerRuntime:
         return {
             "id": item.get("pairing_id"),
             "direction": "outgoing",
+            "complete_on_approval": item.get("complete_on_approval") is True,
             "status": self._status(item.get("status"), active=active),
             "trust_state": trust_state,
             "transport_state": transport_state,
@@ -2188,7 +2319,8 @@ class SecurePeerRuntime:
             # Persist outgoing pending deadlines even when no operator is
             # viewing or polling Team Network. This is also the periodic
             # crash-retry boundary for local key retirement.
-            self.client.expire_pending_pairings()
+            if self.client.expire_pending_pairings():
+                self._notify_pairing_completion()
         except Exception as exc:
             if self.logger is not None:
                 self.logger.warning(
@@ -2207,6 +2339,15 @@ class SecurePeerRuntime:
                 ),
             }
         recovery_error = pairing_recovery.get("error")
+        try:
+            self._complete_automatic_pairing_once()
+        except Exception as exc:
+            if self.logger is not None:
+                self.logger.warning(
+                    "secure peer automatic join deferred error_type=%s",
+                    type(exc).__name__,
+                )
+            self._notify_pairing_completion()
         active = next(
             (item for item in self.client.list_connections() if item.get("active")),
             None,
@@ -7035,6 +7176,8 @@ class SecurePeerRuntime:
                 lease.close()
 
     def shutdown(self) -> None:
+        self._completion_closing = True
+        self._notify_pairing_completion()
         self.close_host_admission()
         with self._guard:
             gateway = self._gateway

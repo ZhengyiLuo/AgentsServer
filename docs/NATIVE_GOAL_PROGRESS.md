@@ -25,6 +25,9 @@ turn or pausing its persistent goal. The client must advertise
 must match. Files, structured references, `/mail`, and other special-purpose
 deliveries do not use this lane. An incompatible follow-up stays queued with an
 actionable conflict instead of falling through the explicit Stop lifecycle.
+This protection also applies while an active cached goal has no local provider
+turn, or its resume reservation is still binding. Lack of a steering transport
+is not permission to invoke Stop; the exact queued row and goal remain unchanged.
 
 The transport rechecks the exact goal, run, reservation, native turn, process
 generation, and Pause/Stop state immediately before writing. Accepted input is

@@ -1,7 +1,11 @@
-# AgentsServer 0.1.26-beta.55
+# AgentsServer 0.1.26-beta.56
 
 Narrow fixes on the published beta.54 source. API contract 28 and Hub schema
 19 are unchanged. No new Mail polling, subscriptions, or migrations are added.
+
+Beta.55 was cancelled before publication after checking the exact reported
+progress replay. Its tag is retained, not overwritten. This candidate adds the
+missing legacy native-progress credit fix described below.
 
 - Match imported provider messages using full normalized source fingerprints,
   not truncated display text. Long scheduled prompts no longer become duplicate
@@ -15,6 +19,10 @@ Narrow fixes on the published beta.54 source. API contract 28 and Hub schema
   no file reads and ordinary refreshes do not repeatedly scan transcripts.
 - Mark source-proven repaired rows so updated clients can replace stale cached
   content without restoring bogus messages on refresh, replay, or reopening.
+- Count explicitly phased public progress even when older native events omit
+  the backend label. This prevents the two observed Codex updates from being
+  reimported as a false post-answer activity block; private reasoning still
+  receives no assistant-message matching credit.
 - Retain an existing native goal owner when an ordinary reply completes after
   Resume. One owned stream and one terminal cleanup remain responsible for the
   run; explicit Stop/Pause stays authoritative.

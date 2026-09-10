@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
 import asyncio
 import hashlib
@@ -216,6 +216,13 @@ class SecurePeerRuntime:
         self._peer_admission = threading.Condition(threading.RLock())
         self._peer_accepting = False
         self._peer_in_flight = 0
+        # Direct Host helpers share the Hub, but do not require an mTLS
+        # listener. Maintenance drains their workers independently of peers.
+        self._host_admission_closed = False
+        self._host_admission_epoch = 0
+        self._host_in_flight = 0
+        self._host_operation_state = threading.local()
+        self._host_configuration_guard = threading.RLock()
         self._hub_store: HubStore | None = None
         self._host_store: SecurePeerStore | None = None
         self._adapter: SecurePeerHubAdapter | None = None
@@ -526,6 +533,7 @@ class SecurePeerRuntime:
         hub_id: str,
         hub_data_dir: Path,
         hub_store: HubStore | None = None,
+        _resume_admission: bool = True,
     ) -> None:
         """Attach a Host realm under the Team authority transition fence."""
 
@@ -534,6 +542,7 @@ class SecurePeerRuntime:
                 hub_id=hub_id,
                 hub_data_dir=hub_data_dir,
                 hub_store=hub_store,
+                _resume_admission=_resume_admission,
             )
 
     def _attach_host_hub_locked(
@@ -542,6 +551,7 @@ class SecurePeerRuntime:
         hub_id: str,
         hub_data_dir: Path,
         hub_store: HubStore | None = None,
+        _resume_admission: bool = True,
     ) -> None:
         """Attach after the authoritative Hub has acquired its runtime lease."""
 
@@ -553,6 +563,9 @@ class SecurePeerRuntime:
         with self._guard:
             if self._hub_store is not None and self._hub_store is not hub_store:
                 raise RuntimeError("secure peer host is already attached")
+            new_host_store = self._hub_store is None
+            with self._peer_admission:
+                attachment_epoch = self._host_admission_epoch
             # Record the exact live Hub object before the first fallible
             # projection step. Startup recovery can then retry even when local
             # Agent Mail provisioning itself was the interrupted boundary.
@@ -635,6 +648,16 @@ class SecurePeerRuntime:
             self._hub_store = hub_store
             self._host_store = host_store
             self._adapter = adapter
+            with self._peer_admission:
+                # A newly committed Host role may replace a detached one.
+                # Retrying the same object must not undo maintenance closure.
+                if (
+                    new_host_store
+                    and _resume_admission
+                    and self._host_admission_epoch == attachment_epoch
+                    and not self._completion_closing
+                ):
+                    self._host_admission_closed = False
             # Recover the approval -> service-principal transaction boundary.
             pairings = {
                 item.get("pairing_id"): item
@@ -711,7 +734,7 @@ class SecurePeerRuntime:
                 gateway.start()
                 self._gateway = gateway
             with self._peer_admission:
-                self._peer_accepting = self._gateway is not None
+                self._peer_accepting = self._gateway is not None and not self._host_admission_closed
                 self._peer_admission.notify_all()
             self._pending_host_attachment = None
 
@@ -762,6 +785,7 @@ class SecurePeerRuntime:
                 hub_id=hub_id,
                 hub_data_dir=hub_data_dir,
                 hub_store=hub_store,
+                _resume_admission=False,
             )
         except Exception as exc:
             self.mark_host_unavailable(
@@ -778,6 +802,20 @@ class SecurePeerRuntime:
         return True
 
     def configure_host(
+        self,
+        *,
+        enabled: bool,
+        advertised_host: str | None,
+        listen_port: int,
+    ) -> dict[str, Any]:
+        # Do not let two listener changes inherit each other's temporary
+        # closure. This lock is never required by an admitted Hub worker.
+        with self._host_configuration_guard:
+            return self._configure_host_locked(
+                enabled=enabled, advertised_host=advertised_host, listen_port=listen_port
+            )
+
+    def _configure_host_locked(
         self,
         *,
         enabled: bool,
@@ -819,7 +857,7 @@ class SecurePeerRuntime:
         # before stopping or rebinding the listener.  Returning from this
         # control mutation therefore proves that no request from the prior
         # endpoint can commit afterward.
-        self.close_host_admission()
+        closure_epoch, was_closed = self._close_host_admission()
         with self._guard:
             old_gateway = self._gateway
             old_config = dict(self._config)
@@ -883,8 +921,10 @@ class SecurePeerRuntime:
                     self._gateway = restored
                 raise
             finally:
-                if self._gateway is not None:
-                    self.reopen_host_admission()
+                if not was_closed:
+                    # Local-only Host work is valid without a gateway. Do not
+                    # reopen a pre-existing or later maintenance/shutdown gate.
+                    self.reopen_host_admission(expected_epoch=closure_epoch)
             return self.status()
 
     def begin_pairing(
@@ -3643,21 +3683,70 @@ class SecurePeerRuntime:
         return result
 
     def close_host_admission(self) -> None:
-        with self._peer_admission:
-            self._peer_accepting = False
-            while self._peer_in_flight:
-                self._peer_admission.wait(timeout=0.25)
+        self._close_host_admission()
 
-    def reopen_host_admission(self) -> None:
-        with self._guard:
-            ready = (
-                self._hub_store is not None
-                and self._adapter is not None
-                and self._gateway is not None
-            )
+    def _close_host_admission(self) -> tuple[int, bool]:
         with self._peer_admission:
-            self._peer_accepting = ready
+            was_closed = self._host_admission_closed
+            self._host_admission_epoch += 1
+            closure_epoch = self._host_admission_epoch
+            self._host_admission_closed = True
+            self._peer_accepting = False
             self._peer_admission.notify_all()
+            while self._peer_in_flight or self._host_in_flight:
+                self._peer_admission.wait(timeout=0.25)
+            return closure_epoch, was_closed
+
+    def reopen_host_admission(self, *, expected_epoch: int | None = None) -> None:
+        with self._guard:
+            with self._peer_admission:
+                if expected_epoch is not None and self._host_admission_epoch != expected_epoch:
+                    return
+                self._host_admission_epoch += 1
+                local_ready = self._hub_store is not None and not self._completion_closing
+                self._host_admission_closed = not local_ready
+                self._peer_accepting = local_ready and self._adapter is not None and self._gateway is not None
+                self._peer_admission.notify_all()
+
+    @contextmanager
+    def _host_store_operation(self, realm: Mapping[str, Any], *, write: bool):
+        """Count the actual local worker until its exact Hub operation settles.
+
+        Never hold admission while acquiring _guard/SQLite, nor acquire the
+        outbound authority guard here: detach owns that guard while draining.
+        Nested dispatch counts separately and reuses an already-held control
+        lease for this exact store, rather than deadlocking on a second flock.
+        """
+        with self._peer_admission:
+            if self._host_admission_closed or self._completion_closing:
+                raise SecurePeerError("hub_maintenance", "Team Hub is unavailable during server maintenance", 503)
+            self._host_in_flight += 1
+        try:
+            with self._guard:
+                store = self._hub_store
+            if store is None or store.hub_id != realm.get("hub_id") or realm.get("realm") != "host":
+                raise SecurePeerError("team_unavailable", "Team Hub is unavailable", 409)
+            control_store = getattr(self._host_operation_state, "control_store", None)
+            if control_store is not None and control_store is not store:
+                raise SecurePeerError("team_unavailable", "Team Hub operation ownership changed", 409)
+            if write and control_store is None:
+                with HubStore.maintenance_control_lock(store.data_dir):
+                    if store.maintenance_fence() is not None:
+                        raise SecurePeerError("hub_maintenance", "Team Hub is unavailable during server maintenance", 503)
+                    self._host_operation_state.control_store = store
+                    try:
+                        yield store
+                    finally:
+                        del self._host_operation_state.control_store
+            else:
+                if store.maintenance_fence() is not None:
+                    raise SecurePeerError("hub_maintenance", "Team Hub is unavailable during server maintenance", 503)
+                yield store
+        finally:
+            with self._peer_admission:
+                self._host_in_flight -= 1
+                if self._host_in_flight == 0:
+                    self._peer_admission.notify_all()
 
     def proxy(
         self,
@@ -4198,10 +4287,10 @@ class SecurePeerRuntime:
 
         if profile.get("realm") == "host":
             with self._guard:
-                store = self._hub_store
+                expected_store = self._hub_store
             if (
-                store is None
-                or store.hub_id != profile.get("hub_id")
+                expected_store is None
+                or expected_store.hub_id != profile.get("hub_id")
                 or self.server_identity != profile.get("server_identity")
             ):
                 raise SecurePeerError(
@@ -4209,13 +4298,14 @@ class SecurePeerRuntime:
                     "Team Network mail route is no longer available",
                     409,
                 )
-            claims = store.local_agent_mail_claims(team_id)
-            if kind == "request":
-                result = store.create_network_request(claims, team_id, request_body)
-            else:
-                result = store.create_network_mailbox_item(
-                    claims, team_id, request_body
-                )
+            with self._host_store_operation(profile, write=True) as store:
+                claims = store.local_agent_mail_claims(team_id)
+                if kind == "request":
+                    result = store.create_network_request(claims, team_id, request_body)
+                else:
+                    result = store.create_network_mailbox_item(
+                        claims, team_id, request_body
+                    )
             return self._validated_agent_mail_receipt(
                 result,
                 kind=kind,
@@ -6474,10 +6564,18 @@ class SecurePeerRuntime:
     ) -> dict[str, Any]:
         """Serve a host-realm Team Messages call directly from the HubStore."""
 
-        with self._guard:
-            store = self._hub_store
-        if store is None or store.hub_id != realm.get("hub_id"):
-            raise SecurePeerError("team_unavailable", "Team Hub is unavailable", 409)
+        with self._host_store_operation(realm, write=method in {"POST", "PUT", "DELETE"}) as store:
+            return self._team_host_call_admitted(store, realm, method, path, query, body)
+
+    def _team_host_call_admitted(
+        self,
+        store: HubStore,
+        realm: dict[str, Any],
+        method: str,
+        path: str,
+        query: dict[str, str],
+        body: dict[str, Any] | None,
+    ) -> dict[str, Any]:
         team_id = str(realm["team_id"])
         claims = store.local_agent_mail_claims(team_id)
         prefix = f"/v1/teams/{quote(team_id, safe='')}/network/"
@@ -7022,14 +7120,6 @@ class SecurePeerRuntime:
             raise SecurePeerError(
                 "remote_invalid", "Team Hub returned an invalid attachment chunk size", 502
             )
-        store = None
-        claims = None
-        if realm["realm"] == "host":
-            with self._guard:
-                store = self._hub_store
-            if store is None:
-                raise SecurePeerError("team_unavailable", "Team Hub is unavailable", 409)
-            claims = store.local_agent_mail_claims(str(realm["team_id"]))
         offset = int(attachment["received_bytes"])
         os.lseek(descriptor, offset, os.SEEK_SET)
         while offset < size:
@@ -7037,15 +7127,16 @@ class SecurePeerRuntime:
             if not chunk:
                 break
             if realm["realm"] == "host":
-                assert store is not None and claims is not None
-                store.write_team_attachment_chunk(
-                    claims,
-                    str(realm["team_id"]),
-                    attachment_id,
-                    offset=offset,
-                    total=size,
-                    data=chunk,
-                )
+                with self._host_store_operation(realm, write=True) as store:
+                    claims = store.local_agent_mail_claims(str(realm["team_id"]))
+                    store.write_team_attachment_chunk(
+                        claims,
+                        str(realm["team_id"]),
+                        attachment_id,
+                        offset=offset,
+                        total=size,
+                        data=chunk,
+                    )
             else:
                 response = self.proxy_team_attachment_chunk(
                     str(realm["connection_id"]),

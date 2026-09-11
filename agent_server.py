@@ -140,7 +140,7 @@ from agentsdock_team_hub.secure_peer import SecurePeerError
 from secure_peer_runtime import SECURE_PEER_HEARTBEAT_SECONDS, SecurePeerRuntime
 from team_mail_websocket import serve_team_mail_hints
 from claude_history_repair import ClaudeMetadataRepairCache, enrich_interruption_origins
-from codex_history_repair import CodexGoalHistoryRepairCache
+from codex_history_repair import CodexGoalHistoryRepairCache, CodexNativeHistoryRepairCache, codex_public_item_origin, filter_native_codex_history_items
 from claude_history_provenance import ClaudeInterruptionTracker, normalize_claude_interruption_context
 from claude_background_reconciliation import (
     CONSUMED_EVENT as CLAUDE_BACKGROUND_CONSUMED_EVENT,
@@ -5097,7 +5097,7 @@ ARTIFACT_PUBLICATION_LOCK_STRIPES = tuple(asyncio.Lock() for _ in range(64))
 TIMELINE_PIN_LOCK_STRIPES = tuple(asyncio.Lock() for _ in range(64))
 TIMELINE_INDEX_CACHE_MAX = int(agentsdock_setting("TIMELINE_INDEX_CACHE_MAX", "24"))
 TIMELINE_INDEX_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
-TIMELINE_INDEX_PROJECTION_VERSION = 4
+TIMELINE_INDEX_PROJECTION_VERSION = 5
 # Retained as a compatibility/testing surface; synchronization uses the fixed
 # stripe pool below so deleted-session churn cannot leak one lock per chat.
 TIMELINE_INDEX_LOCKS: dict[str, threading.Lock] = {}
@@ -5112,7 +5112,7 @@ FORK_INTERNAL_RUN_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 FORK_INTERNAL_RUN_LOCKS: dict[str, threading.Lock] = {}
 HISTORY_SEARCH_DB = STATE_DIR / "history_search.sqlite3"
 HISTORY_SEARCH_LOCK = threading.Lock()
-HISTORY_SEARCH_INDEX_VERSION = "6"
+HISTORY_SEARCH_INDEX_VERSION = "7"
 HISTORY_SEARCH_DIRTY: set[str] = set()
 HISTORY_SEARCH_REPAIR_DIRTY: set[str] = set()
 HISTORY_SEARCH_SYNC_INTERVAL_SECONDS = max(
@@ -31172,12 +31172,33 @@ def timeline_index_event_is_hidden(event: dict[str, Any]) -> bool:
 TIMELINE_IMPORTED_PROMPT_HIDDEN_FIELD = "_agentsdock_imported_prompt_hidden"
 CLAUDE_METADATA_REPAIR_CACHE = ClaudeMetadataRepairCache()
 CODEX_GOAL_HISTORY_REPAIR_CACHE = CodexGoalHistoryRepairCache()
+CODEX_NATIVE_HISTORY_REPAIR_CACHE = CodexNativeHistoryRepairCache()
 
 
 def prepare_provider_history_metadata_repair(session_id: str) -> None:
     """Prepare bounded source proofs only at explicit history-read boundaries."""
     prepare_claude_history_metadata_repair(session_id)
     prepare_codex_goal_history_repair(session_id)
+    prepare_codex_native_history_repair(session_id)
+
+
+def prepare_codex_native_history_repair(session_id: str) -> None:
+    session = STORE.sessions.get(session_id)
+    provider_id = provider_session_identifier(session_provider_id(session)) if isinstance(session, dict) else None
+    if not provider_id or session.get("backend") != BACKEND_CODEX or session.get("_deleting") is True:
+        CODEX_NATIVE_HISTORY_REPAIR_CACHE.forget(session_id)
+        return
+    if CODEX_NATIVE_HISTORY_REPAIR_CACHE.is_prepared(session_id, provider_id):
+        return
+    cursor = normalized_history_sync_cursor(session)
+    source = Path(cursor["source_path"]) if cursor else find_codex_history(provider_id)
+    changed = CODEX_NATIVE_HISTORY_REPAIR_CACHE.prepare(
+        session_id, provider_id, events_path(session_id), source, CODEX_SESSIONS_ROOT,
+        lambda event: codex_history_event_item(event, expected_session_id=session_id),
+    )
+    if changed:
+        HISTORY_SEARCH_REPAIR_DIRTY.add(session_id)
+        HISTORY_SEARCH_DIRTY.add(session_id)
 
 
 def prepare_codex_goal_history_repair(session_id: str) -> None:
@@ -31300,6 +31321,9 @@ def project_legacy_imported_provider_event(
     provider-origin metadata.
     """
 
+    replay = CODEX_NATIVE_HISTORY_REPAIR_CACHE.project_event(session_id, event)
+    if replay is not None:
+        return replay
     interruption = CLAUDE_METADATA_REPAIR_CACHE.project_event(session_id, event)
     if interruption is not None:
         return interruption
@@ -31730,7 +31754,10 @@ def build_timeline_index(session_id: str) -> dict[str, Any]:
 def _build_timeline_index_locked(session_id: str) -> dict[str, Any]:
     prepare_provider_history_metadata_repair(session_id)
     claude_metadata_signature = CLAUDE_METADATA_REPAIR_CACHE.signature(session_id)
-    codex_goal_history_signature = CODEX_GOAL_HISTORY_REPAIR_CACHE.signature(session_id)
+    codex_goal_history_signature = (
+        CODEX_GOAL_HISTORY_REPAIR_CACHE.signature(session_id),
+        CODEX_NATIVE_HISTORY_REPAIR_CACHE.signature(session_id),
+    )
     path = events_path(session_id)
     if not path.exists():
         with TIMELINE_INDEX_CACHE_LOCK:
@@ -44370,7 +44397,36 @@ async def finalize_cross_chat_terminal(event: dict[str, Any]) -> None:
 
 
 async def append_turn_finished_event(session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    event = await append_event(session_id, "turn_finished", payload)
+    try:
+        event = await append_event(session_id, "turn_finished", payload)
+    except BaseException as write_error:
+        # Execution has ended even when its terminal record cannot be written
+        # (for example ENOSPC). Do not invent a persisted event or forward a
+        # result, but do retire this exact run's authority and cached activity.
+        run_id = str(payload.get("run_id") or "")
+        if run_id:
+            async def cleanup_unrecorded_terminal() -> None:
+                async with ACTIVE_LOCK:
+                    owners = {str((record or {}).get("run_id") or "") for record in
+                              (ACTIVE.get(session_id), CURRENT_TURNS.get(session_id))}
+                    session = STORE.sessions.get(session_id)
+                    cached = session.get("active_run") if isinstance(session, dict) else None
+                    if (owners <= {"", run_id} and isinstance(cached, dict)
+                            and str(cached.get("run_id") or "") == run_id):
+                        session.pop("active_run", None)
+                await revoke_cross_chat_capability(run_id)
+
+            cleanup = asyncio.create_task(cleanup_unrecorded_terminal())
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                with suppress(Exception):
+                    await join_task_despite_caller_cancellation(cleanup)
+            except Exception:
+                logger.exception("Exact-run cleanup failed after terminal storage failure")
+        logger.error("Turn completion recording did not finish (error_type=%s, errno=%s)",
+                     type(write_error).__name__, getattr(write_error, "errno", None))
+        raise
     try:
         purpose = str(event.get("purpose") or "")
         if purpose == "handoff_digest":
@@ -46036,6 +46092,9 @@ def codex_history_assistant_item(event: dict[str, Any], text: str) -> dict[str, 
         item.update(codex_history_assistant_metadata({
             "phase": payload.get("phase"), "ts": event.get("timestamp"),
         }))
+        origin = codex_public_item_origin(event)
+        if origin is not None:
+            item["provider_origin"] = origin
     return item
 
 
@@ -46048,11 +46107,19 @@ def codex_history_user_event_item(
         # Classification and positive human provenance are unchanged. User
         # timestamps are descriptive; assistant phase never applies to input.
         item.update(codex_history_assistant_metadata({"ts": event.get("timestamp")}))
+        origin = codex_public_item_origin(event)
+        if origin is not None:
+            item["provider_origin"] = origin
     return item
 
 
 def merge_codex_history_duplicate(previous: dict[str, Any], item: dict[str, Any]) -> bool:
     """Enrich a retained duplicate, but never collapse known distinct phases."""
+    old_origin, new_origin = previous.get("provider_origin"), item.get("provider_origin")
+    if isinstance(old_origin, dict) and isinstance(new_origin, dict) and any(
+        old_origin.get(key) != new_origin.get(key) for key in ("event_id", "turn_id")
+    ):
+        return False
     if previous.get("kind") != item.get("kind") or str(previous.get("text") or "").strip() != str(item.get("text") or "").strip():
         return False
     if history_dedup_key(
@@ -46076,6 +46143,8 @@ def merge_codex_history_duplicate(previous: dict[str, Any], item: dict[str, Any]
             previous[key] = value
     if item.get("provider_user_authored") is True:
         previous["provider_user_authored"] = True
+    if isinstance(item.get("provider_origin"), dict) and "provider_origin" not in previous:
+        previous["provider_origin"] = item["provider_origin"]
     return True
 
 
@@ -47757,6 +47826,8 @@ async def append_imported_history(
     session_id = str(sess["id"])
     provider_id = str(session_provider_id(sess) or "")
     backend = str(sess.get("backend") or DEFAULT_BACKEND).lower()
+    if backend == BACKEND_CODEX and sync_checkpoint is not None:
+        items = await asyncio.to_thread(filter_native_codex_history_items, session_id, provider_id, events_path(session_id), items)
     metadata_only = bool(items) and all(item.get("kind") == "interruption" for item in items)
     items = [item for item in items if item.get("kind") != "interruption" or (
         backend == BACKEND_CLAUDE
@@ -47780,8 +47851,13 @@ async def append_imported_history(
     )]
     last_source_timestamp = None
     for item in items:
-        origin = normalized_history_provider_origin(item.get("provider_origin")) if backend == BACKEND_CLAUDE else None
+        origin = normalized_history_provider_origin(item.get("provider_origin")) if backend == BACKEND_CLAUDE else (
+            {**item["provider_origin"], "session_id": provider_id}
+            if backend == BACKEND_CODEX and isinstance(item.get("provider_origin"), dict) and item["provider_origin"].get("provider") == "codex" else None
+        )
         provenance: dict[str, Any] = {"provider_origin": origin} if origin is not None else {}
+        if backend == BACKEND_CODEX and item.get("provider_history_repair") == "source_proven_native_replay" and item.get("text") == "":
+            provenance.update(metadata_only=True, provider_history_repair="source_proven_native_replay")
         source_sha256 = item.get("source_text_sha256")
         if isinstance(source_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", source_sha256):
             provenance["source_text_sha256"] = source_sha256
@@ -47825,6 +47901,8 @@ async def append_imported_history(
     committed = await append_durable_event_batch(session_id, imported_events)
     if len(committed) != len(imported_events):
         raise RuntimeError("history event batch was not fully persisted")
+    if backend == BACKEND_CODEX:
+        CODEX_NATIVE_HISTORY_REPAIR_CACHE.forget(session_id)
     return {
         "imported": len(items),
         "source_path": str(source_path),
@@ -47882,7 +47960,10 @@ async def append_staged_imported_history(
     })]
     last_source_timestamp = None
     for item in items:
-        origin = normalized_history_provider_origin(item.get("provider_origin")) if backend == BACKEND_CLAUDE else None
+        origin = normalized_history_provider_origin(item.get("provider_origin")) if backend == BACKEND_CLAUDE else (
+            {**item["provider_origin"], "session_id": provider_id}
+            if backend == BACKEND_CODEX and isinstance(item.get("provider_origin"), dict) and item["provider_origin"].get("provider") == "codex" else None
+        )
         provenance: dict[str, Any] = {"provider_origin": origin} if origin is not None else {}
         source_sha256 = item.get("source_text_sha256")
         if isinstance(source_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", source_sha256):
@@ -47927,6 +48008,8 @@ async def append_staged_imported_history(
     written = await append_imported_events(session_id, imported_events)
     if written != len(imported_events):
         raise RuntimeError("history event batch was not fully persisted")
+    if backend == BACKEND_CODEX:
+        CODEX_NATIVE_HISTORY_REPAIR_CACHE.forget(session_id)
     return {
         "imported": len(items),
         "source_path": str(source_path),
@@ -61772,7 +61855,7 @@ async def run_claude_sdk(
             expected_run_id=current_run_id,
         )
         if released:
-            with suppress(Exception):
+            try:
                 await append_turn_finished_event(session_id, {
                     "run_id": current_run_id,
                     "backend": BACKEND_CLAUDE,
@@ -61794,6 +61877,11 @@ async def run_claude_sdk(
                     **({"delivery_unknown": True} if delivery_unknown else {}),
                     **run_event_metadata(current_run_id),
                 })
+            except Exception:
+                # Retire ownership, but do not automatically run more work
+                # after its predecessor's completion could not be recorded.
+                drain_queue = False
+                logger.exception("Claude completion recording failed; automatic queue drain deferred")
         RUN_METADATA.pop(current_run_id, None)
         STOPPED_RUNS.discard(current_run_id)
         if released and drain_queue:
@@ -67548,6 +67636,16 @@ async def _start_turn_locked(
             raise cleanup_error from start_error
         if cleanup_cancellation is not None:
             raise cleanup_cancellation
+        if (started_event is None and isinstance(start_error, OSError)
+                and start_error.errno is not None
+                and start_error.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)}):
+            # No provider task was registered and existing rollback completed.
+            # Reuse the ordinary admission retry path; the next attempt must
+            # succeed at its real acceptance write, not a disk-space guess.
+            raise TransientAdmissionWait(
+                status_code=503,
+                detail="Server state storage is full. No agent turn was started. Free storage and retry.",
+            ) from start_error
         raise
 
 

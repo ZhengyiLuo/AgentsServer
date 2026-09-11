@@ -47,6 +47,13 @@ messages are excluded from execution recovery; receipt projection is recovered
 without running the recipient. Batch reads atomically capture their high-water
 mark and retain individual message identity across reconnects.
 
+A stable read request key belongs to the receiving chat, not a particular agent
+run. Reusing it after a provider or server reconnect replays the same receipt
+and snapshot; the original reader run remains attribution only. Every retry
+still checks the requested sender, page size, current pair permissions, and
+cancellation/deletion state. Ambiguous keys created by older run-scoped versions
+return a conflict rather than selecting or merging historical snapshots.
+
 Startup can migrate an older permanent-route queue item only when its ledger
 and complete, unchanged history prove that it never started or crossed a
 delivery fence. Migration preserves the message identity and removes the exact

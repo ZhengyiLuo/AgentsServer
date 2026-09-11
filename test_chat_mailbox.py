@@ -99,8 +99,8 @@ class ChatMailboxTests(unittest.TestCase):
             self.assertTrue(mailbox.exclude_message(self.connection, "cancelled-message", target_session_id="recipient",
                                                      reason="cancelled", now=NOW))
             self.connection.execute("DELETE FROM cross_chat_envelopes WHERE id='deleted-message'")
-            repeated = self.read()
-            revoked = self.read(allowed_pair_ids=[])
+            repeated = self.read(reader_run_id="fresh-reader")
+            revoked = self.read(reader_run_id="another-reader", allowed_pair_ids=[])
         self.assertEqual(first["snapshot_seq"], repeated["snapshot_seq"])
         self.assertEqual([row["message_id"] for row in repeated["messages"]], ["remaining-message"])
         self.assertEqual(repeated["unavailable_count"], 2)
@@ -119,8 +119,11 @@ class ChatMailboxTests(unittest.TestCase):
         self.connection.row_factory = sqlite3.Row
         self.addCleanup(self.connection.close)
         with self.transaction():
-            repeated = self.read()
+            repeated = self.read(reader_run_id="reconnected-reader")
         self.assertEqual(first["messages"], repeated["messages"])
+        self.assertEqual(first["read_id"], repeated["read_id"])
+        self.assertTrue(repeated["replayed"])
+        self.assertEqual(self.connection.execute("SELECT reader_run_id FROM chat_mailbox_reads").fetchone()[0], "reader-run")
         self.assertEqual([row["message_id"] for row in mailbox.pending_read_events(self.connection)], ["durable-message"])
         with self.transaction():
             self.assertTrue(mailbox.mark_read_event_published(self.connection, "durable-message"))
@@ -138,6 +141,42 @@ class ChatMailboxTests(unittest.TestCase):
         self.assertLessEqual(len(json.dumps(page, ensure_ascii=True).encode()), mailbox.MAX_PAGE_BYTES)
         unread = mailbox.list_messages(self.connection, "recipient", None, [PAIR], unread_only=True)
         self.assertEqual([row["message_id"] for row in unread["messages"]], ["large-two"])
+
+    def test_fresh_run_continues_original_snapshot_without_consuming_late_arrivals(self):
+        with self.transaction():
+            self.store("snapshot-first")
+            self.store("snapshot-second")
+            first = self.read(limit=1)
+        with self.transaction():
+            self.store("late-arrival")
+            repeated = self.read(limit=1, reader_run_id="fresh-reader")
+            second = self.read(limit=1, reader_run_id="fresh-reader", after_seq=first["next_after_seq"])
+            with self.assertRaises(mailbox.MailboxConflict):
+                self.read(limit=1, reader_run_id="fresh-reader", source_session_id="other-sender")
+            with self.assertRaises(mailbox.MailboxConflict):
+                self.read(limit=2, reader_run_id="fresh-reader")
+        self.assertEqual(repeated["messages"], first["messages"])
+        self.assertEqual(second["read_id"], first["read_id"])
+        self.assertEqual([row["message_id"] for row in second["messages"]], ["snapshot-second"])
+        unread = mailbox.list_messages(self.connection, "recipient", "sender", [PAIR], unread_only=True)
+        self.assertEqual([row["message_id"] for row in unread["messages"]], ["late-arrival"])
+
+    def test_ambiguous_legacy_run_scoped_request_is_rejected_without_new_claim(self):
+        with self.transaction():
+            self.store("already-read")
+            first = self.read()
+            self.connection.execute("""INSERT INTO chat_mailbox_reads
+                (id,target_session_id,source_session_id,reader_run_id,request_id,snapshot_seq,page_limit,created_at)
+                SELECT 'legacy-second-receipt',target_session_id,source_session_id,'legacy-other-run',
+                       request_id,snapshot_seq,page_limit,created_at FROM chat_mailbox_reads WHERE id=?""",
+                (first["read_id"],))
+            self.store("still-unread")
+        mailbox.initialize(self.connection)  # Additive index accepts existing historical duplicates.
+        with self.transaction(), self.assertRaisesRegex(mailbox.MailboxConflict, "multiple historical"):
+            self.read(reader_run_id="fresh-reader")
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM chat_mailbox_reads").fetchone()[0], 2)
+        unread = mailbox.list_messages(self.connection, "recipient", "sender", [PAIR], unread_only=True)
+        self.assertEqual([row["message_id"] for row in unread["messages"]], ["still-unread"])
 
     def test_reply_identity_foreign_scope_and_invalid_snapshot_cursor_fail_closed(self):
         with self.transaction():

@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock
 import uuid
+from codex_history_repair import codex_public_item_origin, filter_native_codex_history_items
 
 
 SOURCE = Path(__file__).with_name("agent_server.py")
@@ -93,6 +94,9 @@ def load_projection():
         "TIMELINE_IMPORTED_PROMPT_HIDDEN_FIELD": "_agentsdock_imported_prompt_hidden",
         "CLAUDE_METADATA_REPAIR_CACHE": SimpleNamespace(project_event=lambda *_: None, is_hidden=lambda *_: False),
         "CODEX_GOAL_HISTORY_REPAIR_CACHE": SimpleNamespace(is_hidden=Mock(return_value=False)),
+        "CODEX_NATIVE_HISTORY_REPAIR_CACHE": SimpleNamespace(project_event=lambda *_: None, forget=lambda *_: None),
+        "codex_public_item_origin": codex_public_item_origin,
+        "filter_native_codex_history_items": filter_native_codex_history_items,
         "strip_agentsdock_generated_user_text": lambda text, **kwargs: text,
         "strip_all_legacy_agentsdock_provider_authority_suffixes": lambda text, **kwargs: text,
         "session_provider_id": lambda session: session.get("codex_thread_id"),

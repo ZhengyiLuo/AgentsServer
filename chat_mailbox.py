@@ -83,6 +83,8 @@ def initialize(connection: sqlite3.Connection) -> None:
         """CREATE INDEX IF NOT EXISTS chat_mailbox_read_outbox
             ON chat_mailbox_messages(read_event_published, mailbox_seq)
             WHERE read_at IS NOT NULL AND excluded_at IS NULL""",
+        """CREATE INDEX IF NOT EXISTS chat_mailbox_read_request
+            ON chat_mailbox_reads(target_session_id, request_id)""",
     )
     for statement in statements:
         connection.execute(statement)
@@ -216,7 +218,8 @@ def read_sender(connection: sqlite3.Connection, *, target_session_id: str, sourc
     """Atomically read one page of a fixed unread snapshot, with retry receipts.
 
     Arrivals after snapshot_seq remain unread. A retry only returns its original
-    page IDs, subject to current authorization and cancellation/deletion state.
+    page IDs across fresh authorized runs, subject to current authorization and
+    cancellation/deletion state. The first reader run is attribution, not authority.
     Read means included in this tool response, not proof of model understanding.
     """
     _transaction(connection)
@@ -226,9 +229,14 @@ def read_sender(connection: sqlite3.Connection, *, target_session_id: str, sourc
     _cursor(after_seq)
     _limit(limit)
     clause, args = _scope(target_session_id, source_session_id, allowed_pair_ids)
-    batch = connection.execute("""SELECT * FROM chat_mailbox_reads
-        WHERE target_session_id=? AND reader_run_id=? AND request_id=?""",
-        (target_session_id, reader_run_id, request_id)).fetchone()
+    batches = connection.execute("""SELECT * FROM chat_mailbox_reads
+        WHERE target_session_id=? AND request_id=? LIMIT 2""",
+        (target_session_id, request_id)).fetchall()
+    if len(batches) > 1:
+        # Older versions permitted this key once per run. Never guess which
+        # historical snapshot a caller intended, or consume another batch.
+        raise MailboxConflict("Read request matches multiple historical snapshots")
+    batch = batches[0] if batches else None
     if batch is None:
         if after_seq:
             raise MailboxConflict("A mailbox read must start at its first page")

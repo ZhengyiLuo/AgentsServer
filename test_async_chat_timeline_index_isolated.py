@@ -62,6 +62,7 @@ def load_index(path: Path):
         "prepare_claude_history_metadata_repair": lambda _session_id, **_kwargs: None,
         "CLAUDE_METADATA_REPAIR_CACHE": SimpleNamespace(signature=lambda _session_id: ()),
         "CODEX_GOAL_HISTORY_REPAIR_CACHE": SimpleNamespace(signature=lambda _session_id: ()),
+        "CODEX_NATIVE_HISTORY_REPAIR_CACHE": SimpleNamespace(signature=lambda _session_id: ()),
         "session_codex_thread_id": lambda _session: "",
         "session_codex_subagent_states": lambda _session_id: [],
         "codex_subagent_ownership_snapshot": lambda: {},

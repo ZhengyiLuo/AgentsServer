@@ -30831,10 +30831,10 @@ def project_legacy_imported_provider_event(
     event: dict[str, Any],
     session_id: str,
 ) -> dict[str, Any]:
-    """Hide or clean only legacy provider-import user records.
+    """Hide or clean only source-proven legacy provider-import records.
 
-    Native user turns, assistant output, partial markers, and ordinary pasted
-    text are never rewritten. The import provenance and generated run shape
+    Native turns, unproven assistant output, partial markers, and ordinary
+    pasted text are never rewritten. The import provenance and generated run shape
     are required because older durable events no longer retain Claude's richer
     provider-origin metadata.
     """

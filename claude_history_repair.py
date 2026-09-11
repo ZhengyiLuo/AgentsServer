@@ -101,6 +101,144 @@ def _target(event: dict) -> tuple[int, str, str] | None:
     return seq, run, _text_key(prompt)
 
 
+def _assistant_target(event: dict) -> tuple | None:
+    origin = event.get("provider_origin")
+    text, seq, run = event.get("text"), event.get("seq"), event.get("run_id")
+    if (event.get("type") not in ("assistant_text", "reasoning_summary")
+            or event.get("imported") is not True or event.get("backend") != "claude"
+            or type(seq) is not int or seq <= 0 or not isinstance(run, str) or not run.startswith("import_")
+            or not isinstance(text, str) or not text.strip() or len(text) > MAX_LINE_BYTES
+            or not isinstance(origin, dict) or origin.get("provider") != "claude"
+            or origin.get("kind") not in (None, "assistant")
+            or event.get("provider_user_authored") is True
+            or any(event.get(key) for key in ("clientUserMessageId", "clientId", "client_user_message_id", "client_id"))):
+        return None
+    identity = tuple(origin.get(key) for key in ("event_id", "session_id", "timestamp"))
+    if (not all(isinstance(value, str) and 0 < len(value) <= 256 for value in identity)
+            or _timestamp(identity[2]) is None):
+        return None
+    return event["type"], seq, run, _text_key(text.strip()), identity
+
+
+class _AssistantReplays:
+    """Bounded exact source/output correlation, fed by the existing two reads."""
+    def __init__(self, provider_id: str) -> None:
+        self.provider_id = provider_id
+        self.starts, self.ends, self.owners, self.native = {}, {}, {}, []
+        self.candidates, self.sources, self.identities, self.source_credits = [], {}, {}, {}
+
+    def event(self, event: dict) -> None:
+        target = _assistant_target(event)
+        if target is not None and target[4][1] == self.provider_id:
+            self.candidates.append((target, event.get("phase")))
+        run = event.get("run_id")
+        if (isinstance(run, str) and run and not run.startswith("import_")
+                and event.get("backend") == "claude" and event.get("imported") is not True):
+            kind = event.get("type")
+            if kind == "turn_started":
+                self.starts.setdefault(run, []).append(event)
+            elif kind == "turn_finished":
+                self.ends.setdefault(run, []).append(event)
+            elif kind == "provider_session":
+                self.owners.setdefault(run, []).append(event)
+            elif (kind in ("reasoning_summary", "assistant_text")
+                    and (event.get("phase") in ("commentary", "final_answer")
+                         or (kind == "assistant_text" and event.get("phase") is None))
+                    and isinstance(event.get("text"), str) and event["text"].strip()
+                    and len(event["text"]) <= MAX_LINE_BYTES):
+                self.native.append((event, _text_key(event["text"].strip())))
+        if sum(map(len, (self.starts, self.ends, self.owners, self.native, self.candidates))) > MAX_TARGETS:
+            raise _Unproven()
+
+    def source(self, event: dict, offset: int) -> None:
+        if event.get("type") != "assistant" or event.get("sessionId") != self.provider_id:
+            return
+        identity = (event.get("uuid"), self.provider_id, event.get("timestamp"))
+        if not all(isinstance(value, str) and 0 < len(value) <= 256 for value in identity):
+            return
+        self.identities[identity] = self.identities.get(identity, 0) + 1
+        if event.get("isSidechain") is True or event.get("isMeta") is True:
+            return
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        # Only public text blocks. Thinking/tool payloads cannot establish a
+        # public replay, even if their wording happens to match another row.
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = "\n".join(block["text"] for block in content if isinstance(block, dict)
+                             and block.get("type") == "text" and isinstance(block.get("text"), str))
+        else:
+            return
+        if text.strip() and len(text) <= MAX_LINE_BYTES:
+            digest = _text_key(text.strip())
+            self.sources.setdefault((identity, digest), []).append(offset)
+            timestamp = _timestamp(identity[2])
+            if timestamp is not None:
+                self.source_credits.setdefault((int(timestamp), digest), set()).add(identity)
+        if len(self.identities) + len(self.sources) > MAX_KEYS:
+            raise _Unproven()
+
+    def prove(self, eligible: dict) -> frozenset:
+        native = {}
+        for event, digest in self.native:
+            run = event["run_id"]
+            starts, ends = self.starts.get(run, ()), self.ends.get(run, ())
+            if len(starts) != 1 or len(ends) != 1:
+                continue
+            start, end = starts[0], ends[0]
+            owners = (start, event, end, *self.owners.get(run, ()))
+            provider_ids = {row.get("provider_session_id") for row in owners
+                            if row.get("provider_session_id") not in (None, "")}
+            if (start.get("purpose") != "scheduled_job" or not start.get("job_id")
+                    or provider_ids != {self.provider_id}
+                    or end.get("exit_code") != 0 or end.get("stopped") is True
+                    or any(type(row.get("seq")) is not int or not start["seq"] <= row["seq"] <= end["seq"]
+                           for row in self.owners.get(run, ()))
+                    or event.get("job_id") not in (None, "", start["job_id"])):
+                continue
+            if (event.get("phase") is None
+                    and (not isinstance(end.get("result_text"), str)
+                         or _text_key(end["result_text"].strip()) != digest)):
+                continue
+            times = [_timestamp(row.get("ts")) for row in (start, event, end)]
+            seqs = [row.get("seq") for row in (start, event, end)]
+            if (any(value is None for value in times) or not times[0] <= times[1] <= times[2]
+                    or not all(type(value) is int for value in seqs) or not seqs[0] < seqs[1] < seqs[2]):
+                continue
+            native.setdefault((int(times[1]), digest), []).append(event)
+        counts = {}
+        for target, _phase in self.candidates:
+            key = (target[2], target[4])
+            counts[key] = counts.get(key, 0) + 1
+        proven = set()
+        for target, phase in self.candidates:
+            _kind, seq, run, digest, identity = target
+            batch = eligible.get(run)
+            matches = native.get((int(_timestamp(identity[2])), digest), ())
+            offsets = self.sources.get((identity, digest), ())
+            if (batch is None or len(matches) != 1 or len(offsets) != 1
+                    or self.identities.get(identity) != 1 or counts[(run, identity)] != 1):
+                continue
+            match = matches[0]
+            expected_phase = match.get("phase") or "final_answer"
+            if (phase not in (None, expected_phase)
+                    or match.get("provider_message_id") not in (None, "", identity[0])):
+                continue
+            source_time, native_time = _timestamp(identity[2]), _timestamp(match.get("ts"))
+            if ("." in match["ts"] and source_time != native_time):
+                continue
+            # One coarse native timestamp is not credit for two distinct
+            # source messages. An exact native message UUID may disambiguate.
+            if (not match.get("provider_message_id")
+                    and len(self.source_credits.get((int(source_time), digest), ())) != 1):
+                continue
+            first, last, start, end = batch[:4]
+            if first < seq < last and start < offsets[0] <= end:
+                proven.add(target)
+        return frozenset(proven)
+
+
 @dataclass(frozen=True)
 class _Proof:
     provider_id: str
@@ -110,6 +248,7 @@ class _Proof:
     targets: frozenset[tuple[int, str, str]]
     interruptions: tuple[tuple[tuple[int, str, str], str], ...] = ()
     companions: frozenset[tuple[str, int, str]] = frozenset()
+    assistant_replays: frozenset[tuple] = frozenset()
     interruption_index: MappingProxyType = field(init=False, repr=False)
     cache_signature: frozenset = field(init=False, repr=False)
 
@@ -117,7 +256,8 @@ class _Proof:
         object.__setattr__(self, "interruption_index", MappingProxyType(dict(self.interruptions)))
         object.__setattr__(self, "cache_signature", self.targets | frozenset(
             ("interruption", key, origin) for key, origin in self.interruptions)
-            | frozenset(("companion", *key) for key in self.companions))
+            | frozenset(("companion", *key) for key in self.companions)
+            | frozenset(("assistant_replay", *key) for key in self.assistant_replays))
 
     def signature(self) -> frozenset:
         return self.cache_signature
@@ -262,9 +402,11 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
     terminal_counts = {}
     native_events = []
     scheduled_starts, scheduled_ends, candidate_origins = {}, {}, {}
+    assistant_replays = _AssistantReplays(provider_id)
     for event, _offset, _line in _records(events, events_stamp):
         if event.get("session_id") not in (None, "", session_id):
             continue
+        assistant_replays.event(event)
         control = _native_control(event, session_id)
         if control is not None:
             native_events.append(control)
@@ -321,7 +463,7 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
                     )
         if max(len(batches), len(candidates), len(terminals)) > MAX_TARGETS:
             raise _Unproven()
-    if not batches or not candidates:
+    if not batches or not (candidates or assistant_replays.candidates):
         return empty
     paths = {batch[1]["cursor"].get("source_path") for batch in batches.values()}
     if len(paths) != 1:
@@ -386,6 +528,7 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
         for wanted in prefix_digests.get(offset, ()):
             if hmac.compare_digest(digest.hexdigest(), wanted):
                 verified.add((offset, wanted))
+        assistant_replays.source(event, offset)
         origin = tracker.consume(event)
         if event.get("type") != "user":
             continue
@@ -483,8 +626,11 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
                 and terminal_counts.get(run) == 1):
             companions.add(("history_imported", eligible_batches[run][0], run))
             companions.add(("turn_finished", eligible_batches[run][1], run))
+    verified_batches = {run: batch for run, batch in eligible_batches.items()
+                        if (batch[3], batch[4]) in verified
+                        and (batch[2] == 0 or (batch[2], batch[5]) in verified)}
     return _Proof(provider_id, events_stamp, source, source_stamp, frozenset(targets),
-                  tuple(corrected), frozenset(companions))
+                  tuple(corrected), frozenset(companions), assistant_replays.prove(verified_batches))
 
 
 def _bounded_records(path: Path, expected, start: int, end: int):
@@ -539,6 +685,7 @@ def _prove_recent_scheduled(session_id: str, provider_id: str, events: Path, roo
         return empty
     starts, ends, batches, terminals, rows, candidates = {}, {}, {}, {}, {}, []
     origin_counts = {}
+    assistant_replays = _AssistantReplays(provider_id)
     previous_seq = 0
     for event, _offset in _bounded_records(
         events, events_stamp, max(0, events_stamp[2] - MAX_EVENTS_BYTES), events_stamp[2],
@@ -549,6 +696,7 @@ def _prove_recent_scheduled(session_id: str, provider_id: str, events: Path, roo
         previous_seq = seq
         if event.get("session_id") not in (None, "", session_id):
             continue
+        assistant_replays.event(event)
         run = event.get("run_id")
         if not isinstance(run, str) or not run:
             continue
@@ -589,7 +737,7 @@ def _prove_recent_scheduled(session_id: str, provider_id: str, events: Path, roo
         if (sum(map(len, (starts, ends, batches, terminals, rows))) > MAX_TARGETS
                 or len(candidates) > MAX_TARGETS):
             raise _Unproven()
-    if not batches or not candidates:
+    if not batches or not (candidates or assistant_replays.candidates):
         return empty
     eligible = {}
     for run, checkpoints in batches.items():
@@ -638,6 +786,7 @@ def _prove_recent_scheduled(session_id: str, provider_id: str, events: Path, roo
                 ranges.setdefault(key, []).append((run, start_time, end_time))
     source_matches, occurrence_counts, identity_counts, source_metadata = {}, {}, {}, {}
     for event, offset in _bounded_records(source, source_stamp, window_start, checkpoint_end):
+        assistant_replays.source(event, offset)
         if event.get("type") != "user" or event.get("sessionId") != provider_id:
             continue
         identity = (event.get("uuid"), provider_id, event.get("timestamp"))
@@ -685,7 +834,7 @@ def _prove_recent_scheduled(session_id: str, provider_id: str, events: Path, roo
             companions.add(("history_imported", eligible[run][0], run))
             companions.add(("turn_finished", eligible[run][1], run))
     return _Proof(provider_id, events_stamp, source, source_stamp, frozenset(targets),
-                  companions=frozenset(companions))
+                  companions=frozenset(companions), assistant_replays=assistant_replays.prove(eligible))
 
 
 class ClaudeMetadataRepairCache:
@@ -806,7 +955,13 @@ class ClaudeMetadataRepairCache:
         return projected
 
     def project_event(self, session_id: str, event: dict) -> dict | None:
-        """Memory-only correction of an exact interruption or its proven companions."""
+        """Memory-only correction of exact source-proven historical records."""
+        if event.get("session_id") in (None, "", session_id):
+            with self._lock:
+                proof = self._proofs.get(session_id)
+            if proof and proof.assistant_replays and _assistant_target(event) in proof.assistant_replays:
+                return {**event, "text": "", "metadata_only": True,
+                        "provider_history_repair": "source_proven_assistant_replay"}
         kind, seq, run = event.get("type"), event.get("seq"), event.get("run_id")
         if (
             kind in ("history_imported", "turn_finished") and type(seq) is int

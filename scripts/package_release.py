@@ -29,6 +29,7 @@ FILES = (
     "agentsdock_publish.py",
     "agentsdock_mail.py",
     "agentsdock_team.py",
+    "provider_commands.py",
     "claude_sdk_client.py",
     "claude_background_reconciliation.py",
     "codex_app_server.py",

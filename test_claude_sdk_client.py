@@ -20,6 +20,7 @@ from claude_sdk_client import (
     ClaudeSDKMCPServerNotFound,
     ClaudeSDKQueryError,
     ClaudeSDKRunActive,
+    ClaudeSDKSupervisorError,
     ClaudeSDKSupervisorClosed,
     ClaudeSDKSupervisorManager,
     ClaudeSDKUnavailable,
@@ -71,6 +72,20 @@ class FakeClaudeClient:
             {"name": "login", "status": "needs-auth"},
             {"name": "disabled", "status": "disabled"},
         ]
+        self.server_info: dict[str, Any] = {
+            "commands": [
+                {
+                    "name": "review",
+                    "description": "Review the current changes",
+                    "argumentHint": "[focus]",
+                }
+            ],
+            "account": {
+                "email": "private@example.test",
+                "organization": "Private Org",
+            },
+            "pid": 12345,
+        }
 
     def _record(self, *call: Any) -> None:
         loop = asyncio.get_running_loop()
@@ -121,6 +136,10 @@ class FakeClaudeClient:
     async def get_mcp_status(self) -> dict[str, Any]:
         self._record("get_mcp_status")
         return {"mcpServers": [dict(item) for item in self.mcp_servers]}
+
+    async def get_server_info(self) -> dict[str, Any]:
+        self._record("get_server_info")
+        return dict(self.server_info)
 
     async def reconnect_mcp_server(self, server_name: str) -> None:
         self._record("reconnect_mcp_server", server_name)
@@ -765,6 +784,197 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
                 result = {"type": "result", "result": "done"}
                 await client.emit(result)
                 await handle.wait_result()
+
+    async def test_validated_local_command_is_raw_and_streams_without_replay_ack(self) -> None:
+        await self.manager.close_all()
+        self.factory = FakeFactory()
+        self.factory.auto_ack = False
+        assistant = {"type": "assistant", "text": "command output"}
+        result = {
+            "type": "result",
+            "is_error": False,
+            "result": "done",
+            "terminal_reason": None,
+        }
+        self.factory.query_prefix_messages = [assistant, result]
+        self.manager = ClaudeSDKSupervisorManager(
+            client_factory=self.factory,
+            max_clients=4,
+            idle_ttl_seconds=None,
+            ack_timeout_seconds=0.01,
+        )
+        _info, generation = await self.manager.get_server_info(
+            "command-chat",
+            options={"cwd": "/tmp"},
+            configuration_key="config-a",
+        )
+
+        handle = await self.manager.start_run(
+            "command-chat",
+            "/review staged files",
+            run_id="run-command",
+            options={"cwd": "/tmp"},
+            configuration_key="config-a",
+            validated_provider_command_name="review",
+            expected_provider_command_generation=generation,
+        )
+
+        self.assertTrue(handle.accepted)
+        self.assertTrue(handle.acknowledged)
+        self.assertIn(
+            ("query", "/review staged files", {}),
+            self.factory.clients[0].calls,
+        )
+        self.assertEqual(
+            await asyncio.wait_for(collect(handle), 1),
+            [assistant, result],
+        )
+        self.assertEqual(await handle.wait_result(), result)
+        await asyncio.sleep(0.02)
+
+    async def test_validated_local_command_matches_reconciliation_hook_prompt(self) -> None:
+        options = {
+            "cwd": "/tmp",
+            "hooks": claude_background_tracking_hooks(),
+        }
+        _info, generation = await self.manager.get_server_info(
+            "command-reconciliation-chat",
+            options=options,
+            configuration_key="config-a",
+        )
+        handle = await self.manager.start_run(
+            "command-reconciliation-chat",
+            "/review staged files",
+            run_id="run-command-reconciliation",
+            options=options,
+            configuration_key="config-a",
+            validated_provider_command_name="review",
+            expected_provider_command_generation=generation,
+            background_task_reconciliation={
+                "tasks": [
+                    {
+                        "task_id": "prior-task",
+                        "task_type": "local_workflow",
+                        "owner_run_id": "prior-run",
+                        "status": "tracking_lost",
+                    }
+                ]
+            },
+        )
+        client = self.factory.clients[0]
+        hook = client.options["hooks"]["UserPromptSubmit"][0].hooks[0]
+        output = await hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "/review staged files",
+            },
+            None,
+            {},
+        )
+
+        self.assertIn(
+            '"status":"tracking_lost"',
+            output["hookSpecificOutput"]["additionalContext"],
+        )
+        await client.emit({"type": "result", "result": "done"})
+        await asyncio.wait_for(collect(handle), 1)
+
+    async def test_command_discovery_reconnects_an_idle_pending_hook(self) -> None:
+        options = {
+            "cwd": "/tmp",
+            "hooks": claude_background_tracking_hooks(),
+        }
+        _info, first_generation = await self.manager.get_server_info(
+            "pending-reconciliation-chat",
+            options=options,
+            configuration_key="config-a",
+        )
+        first = await self.manager.start_run(
+            "pending-reconciliation-chat",
+            "Check background work",
+            run_id="run-background-check",
+            options=options,
+            configuration_key="config-a",
+            background_task_reconciliation={
+                "tasks": [
+                    {
+                        "task_id": "prior-task",
+                        "task_type": "local_workflow",
+                        "owner_run_id": "prior-run",
+                        "status": "tracking_lost",
+                    }
+                ]
+            },
+        )
+        first_client = self.factory.clients[0]
+        await first_client.emit({"type": "result", "result": "done"})
+        await asyncio.wait_for(collect(first), 1)
+
+        _info, current_generation = await self.manager.get_server_info(
+            "pending-reconciliation-chat",
+            options=options,
+            configuration_key="config-a",
+        )
+        self.assertNotEqual(current_generation, first_generation)
+        self.assertEqual(len(self.factory.clients), 2)
+        second = await self.manager.start_run(
+            "pending-reconciliation-chat",
+            "/review staged files",
+            run_id="run-command-after-reconnect",
+            options=options,
+            configuration_key="config-a",
+            validated_provider_command_name="review",
+            expected_provider_command_generation=current_generation,
+        )
+        second_client = self.factory.clients[1]
+        self.assertIn(
+            ("query", "/review staged files", {}),
+            second_client.calls,
+        )
+        await second_client.emit({"type": "result", "result": "done"})
+        await asyncio.wait_for(collect(second), 1)
+
+    async def test_validated_local_command_rejects_changed_generation_before_query(self) -> None:
+        _info, generation = await self.manager.get_server_info(
+            "generation-chat",
+            options={"cwd": "/tmp"},
+            configuration_key="config-a",
+        )
+        client = self.factory.clients[0]
+
+        with self.assertRaises(ClaudeSDKGenerationChanged):
+            await self.manager.start_run(
+                "generation-chat",
+                "/review",
+                run_id="run-stale-generation",
+                options={"cwd": "/tmp"},
+                configuration_key="config-a",
+                validated_provider_command_name="review",
+                expected_provider_command_generation=generation + "-stale",
+            )
+
+        self.assertFalse(any(call[0] == "query" for call in client.calls))
+
+    async def test_validated_local_command_requires_exact_byte_zero_token(self) -> None:
+        for index, prompt in enumerate((
+            "/review-more",
+            " /review",
+            "\ufeff/review",
+            "/other",
+            "/review\vdetails",
+        )):
+            with self.subTest(prompt=prompt):
+                with self.assertRaises(ClaudeSDKSupervisorError):
+                    await self.manager.start_run(
+                        f"command-mismatch-{index}",
+                        prompt,
+                        run_id=f"run-mismatch-{index}",
+                        options={},
+                        configuration_key="config-a",
+                        validated_provider_command_name="review",
+                    )
+
+        self.assertFalse(self.factory.clients)
 
     async def test_delegated_task_keeps_run_open_until_followup_result(self) -> None:
         handle = await self.manager.start_run(
@@ -2019,11 +2229,75 @@ class ClaudeSDKMCPControlTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(version("claude-agent-sdk"), "0.2.130")
         for method in (
+            "get_server_info",
             "get_mcp_status",
             "reconnect_mcp_server",
             "toggle_mcp_server",
         ):
             self.assertTrue(callable(getattr(ClaudeSDKClient, method, None)))
+
+    async def test_server_info_projects_only_bounded_commands_and_keeps_active_run(self) -> None:
+        factory = FakeFactory()
+        manager = ClaudeSDKSupervisorManager(
+            client_factory=factory,
+            idle_ttl_seconds=None,
+        )
+        try:
+            handle = await manager.start_run(
+                "command-info-chat",
+                "Keep working",
+                run_id="run-active",
+                options={},
+                configuration_key="profile-a",
+            )
+            client = factory.clients[0]
+            client.server_info = {
+                "commands": [
+                    {
+                        "name": "_private-command",
+                        "description": "Useful command",
+                        "argumentHint": "[value]",
+                        "untrusted": {"path": "/Users/private/secret"},
+                    },
+                    {"name": "plugin:task", "description": "Plugin task"},
+                ],
+                "account": {"email": "private@example.test"},
+                "models": [{"id": "secret-model-metadata"}],
+                "pid": 999,
+            }
+
+            info, generation = await manager.get_server_info(
+                "command-info-chat",
+                options={},
+                configuration_key="profile-a",
+            )
+
+            self.assertTrue(generation.startswith("claudemcp_"))
+            self.assertEqual(
+                info,
+                {
+                    "commands": [
+                        {
+                            "name": "_private-command",
+                            "description": "Useful command",
+                            "argumentHint": "[value]",
+                        },
+                        {
+                            "name": "plugin:task",
+                            "description": "Plugin task",
+                        },
+                    ],
+                    "_agentsdock_provider_commands_truncated": False,
+                },
+            )
+            self.assertFalse(handle.done)
+            self.assertNotIn(("interrupt",), client.calls)
+
+            result = {"type": "result", "result": "done"}
+            await client.emit(result)
+            self.assertEqual(await handle.wait_result(), result)
+        finally:
+            await manager.close_all()
 
     async def test_status_is_lazy_and_mutations_return_same_opaque_generation(self) -> None:
         factory = FakeFactory()

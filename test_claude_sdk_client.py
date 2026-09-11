@@ -514,6 +514,82 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         await self.manager.close_all()
 
+    async def test_pending_mail_hint_is_exact_root_checkpoint_without_new_query(self) -> None:
+        calls = []
+        def notice() -> str | None:
+            calls.append("notice")
+            return "Pending replies are available in the inbox."
+        options = {"hooks": claude_background_tracking_hooks(), "resume": "provider"}
+        handle = await self.manager.start_run("mail-chat", "continue work", run_id="run-one",
+            options=options, configuration_key="same", pending_mail_hint=notice)
+        client = self.factory.clients[0]
+        hook = client.options["hooks"]["PostToolUse"][0].hooks[0]
+        self.assertIs(hook, client.options["hooks"]["PostToolUseFailure"][0].hooks[0])
+        tool = {"hook_event_name": "PostToolUse", "session_id": "provider", "tool_use_id": "tool-one",
+                "tool_name": "Read", "tool_input": {"private": "never copied"}, "tool_response": "never copied"}
+        self.assertEqual(await hook(tool, "tool-one", {}), {})
+        await client.emit({"type": "assistant", "session_id": "provider", "content": [
+            {"type": "tool_use", "id": "tool-one", "name": "Read", "input": {}}]})
+        await asyncio.wait_for(handle.__anext__(), 1)
+        for changed in ({"agent_id": "child"}, {"session_id": "other"}, {"tool_name": "Bash"},
+                        {"tool_use_id": "other"}, {"is_interrupt": True}):
+            self.assertEqual(await hook({**tool, **changed}, "tool-one", {}), {})
+        result = await hook(tool, "tool-one", {})
+        self.assertEqual(result, {"hookSpecificOutput": {"hookEventName": "PostToolUse",
+            "additionalContext": "Pending replies are available in the inbox."}})
+        self.assertEqual(await hook(tool, "tool-one", {}), {})
+        self.assertEqual(calls, ["notice"])
+        self.assertFalse(handle.done)
+        self.assertEqual([call[0] for call in client.calls if call[0] in {"query", "interrupt"}], ["query"])
+        self.assertIn(("query", "continue work", {}), client.calls)
+
+    async def test_pending_mail_hint_failure_bounds_and_retired_hook_fences(self) -> None:
+        calls = []
+        options = {"hooks": claude_background_tracking_hooks(), "resume": "provider"}
+        first = await self.manager.start_run("mail-chat", "first", run_id="run-one", options=options,
+            configuration_key="first", pending_mail_hint=lambda: calls.append("old") or "Old pending notice")
+        old_client = self.factory.clients[0]
+        old_hook = old_client.options["hooks"]["PostToolUse"][0].hooks[0]
+        await old_client.emit({"type": "assistant", "session_id": "provider", "content": [
+            {"type": "tool_use", "id": "old-tool", "name": "Read", "input": {}}]})
+        await asyncio.wait_for(first.__anext__(), 1)
+        await old_client.emit({"type": "result", "result": "finished"})
+        await asyncio.wait_for(collect(first), 1)
+        second = await self.manager.start_run("mail-chat", "second", run_id="run-two", options=options,
+            configuration_key="second", pending_mail_hint=lambda: calls.append("new") or "x" * 2049)
+        client = self.factory.clients[-1]
+        hook = client.options["hooks"]["PostToolUseFailure"][0].hooks[0]
+        old_input = {"hook_event_name": "PostToolUseFailure", "session_id": "provider",
+                     "tool_use_id": "old-tool", "tool_name": "Read", "error": "private"}
+        self.assertEqual(await old_hook(old_input, "old-tool", {}), {})
+        self.assertEqual(await hook(old_input, "old-tool", {}), {})
+        await client.emit({"type": "assistant", "session_id": "provider", "content": [
+            {"type": "tool_use", "id": "new-tool", "name": "Read", "input": {}}]})
+        await asyncio.wait_for(second.__anext__(), 1)
+        self.assertEqual(await hook({**old_input, "tool_use_id": "new-tool"}, "new-tool", {}), {})
+        self.assertEqual(calls, ["new"])
+        self.assertFalse(second.done)
+
+    async def test_pending_mail_hint_without_hook_or_before_ack_is_silent(self) -> None:
+        self.factory.auto_ack = False
+        calls = []
+        handle = await self.manager.start_run("mail-chat", "continue", run_id="one",
+            options={"hooks": claude_background_tracking_hooks(), "resume": "provider"},
+            configuration_key="first", pending_mail_hint=lambda: calls.append("hint") or "Pending replies")
+        client = self.factory.clients[0]
+        hook = client.options["hooks"]["PostToolUse"][0].hooks[0]
+        await client.emit({"type": "assistant", "session_id": "provider", "content": [
+            {"type": "tool_use", "id": "tool", "name": "Read", "input": {}}]})
+        await asyncio.sleep(0)
+        self.assertEqual(await hook({"hook_event_name": "PostToolUse", "session_id": "provider",
+            "tool_use_id": "tool", "tool_name": "Read"}, "tool", {}), {})
+        self.assertFalse(handle.acknowledged)
+        self.assertEqual(calls, [])
+        ordinary = await self.manager.start_run("no-hooks", "ordinary", run_id="two", options={},
+            configuration_key="none", pending_mail_hint=lambda: calls.append("missing") or "Pending replies")
+        self.assertTrue(ordinary.accepted)
+        self.assertEqual(calls, [])
+
     async def test_task_receipts_survive_interruption_without_inventing_cancellation(self) -> None:
         handle = await self.manager.start_run("chat-receipts", "Work", run_id="old-run",
                                               options={}, configuration_key="same")
@@ -2652,7 +2728,7 @@ class ClaudeSDKBackgroundTrackingHookTests(unittest.IsolatedAsyncioTestCase):
             {},
         )
         hooks = claude_background_tracking_hooks()
-        self.assertEqual(set(hooks), {"PreToolUse", "UserPromptSubmit"})
+        self.assertEqual(set(hooks), {"PreToolUse", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure"})
         matchers = hooks["PreToolUse"]
         self.assertEqual(
             [matcher.matcher for matcher in matchers],

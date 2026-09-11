@@ -24,6 +24,7 @@ FILES = (
     "secure_peer_delivery.py",
     "agentsdock_jobs.py",
     "agentsdock_chats.py",
+    "chat_mailbox.py",
     "agentsdock_emergency.py",
     "agentsdock_publish.py",
     "agentsdock_mail.py",

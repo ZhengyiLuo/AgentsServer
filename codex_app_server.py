@@ -1679,6 +1679,58 @@ class CodexAppServerClient:
             {"threadId": thread_id, "items": items},
         )
 
+    async def inject_items_guarded(
+        self,
+        thread_id: str,
+        items: list[dict[str, Any]],
+        *,
+        expected_generation: int,
+        before_send: Callable[[], bool],
+        timeout: float | None = None,
+    ) -> None:
+        """Append one runtime notice to an already-loaded, exact-owned thread.
+
+        Never starts/reconnects a provider or changes its turn. The caller owns
+        notice coalescing; a sent request with no definite acknowledgement (or
+        cancellation during delivery) must not be blindly replayed. A notice
+        write timeout must not retire the busy provider shared by other work.
+        """
+        thread_id = _require_nonempty_string(thread_id, "thread_id")
+        if type(expected_generation) is not int or expected_generation < 1 or not callable(before_send):
+            raise ValueError("exact generation and synchronous ownership guard are required")
+        if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+            raise ValueError("one generated developer notice is required")
+        item = items[0]
+        content = item.get("content")
+        if (item.get("type") != "message" or item.get("role") != "developer"
+                or not isinstance(content, list) or len(content) != 1 or not isinstance(content[0], dict)
+                or content[0].get("type") != "input_text" or not isinstance(content[0].get("text"), str)
+                or not content[0]["text"].strip()
+                or len(content[0]["text"].encode("utf-8", "surrogatepass")) > 2048):
+            raise ValueError("runtime notices require bounded generated developer input_text")
+        # Copy the only allowed fields before waiting for the shared writer.
+        notice = {"type": "message", "role": "developer", "content": [
+            {"type": "input_text", "text": content[0]["text"]},
+        ]}
+
+        def owns_loaded_thread() -> bool:
+            return (self.ready and self._generation == expected_generation
+                    and thread_id in self._loaded_threads)
+
+        if not owns_loaded_thread():
+            raise CodexAppServerProtocolError(
+                "runtime notice owner is unavailable", request_sent=False, safe_to_retry=True,
+            )
+        result = await self._request_connected(
+            "thread/inject_items", {"threadId": thread_id, "items": [notice]},
+            timeout=timeout, discard_on_send_timeout=False,
+            before_send=lambda: owns_loaded_thread() and before_send() is True,
+        )
+        if not isinstance(result, dict):
+            raise CodexAppServerProtocolError(
+                "runtime notice acknowledgement is invalid", request_sent=True, safe_to_retry=False,
+            )
+
     async def read_thread(
         self,
         thread_id: str,
@@ -2527,6 +2579,20 @@ class CodexAppServerManager:
         items: list[dict[str, Any]],
     ) -> None:
         await self.client.inject_items(thread_id, items)
+
+    async def inject_items_guarded(
+        self,
+        thread_id: str,
+        items: list[dict[str, Any]],
+        *,
+        expected_generation: int,
+        before_send: Callable[[], bool],
+        timeout: float | None = None,
+    ) -> None:
+        await self.client.inject_items_guarded(
+            thread_id, items, expected_generation=expected_generation,
+            before_send=before_send, timeout=timeout,
+        )
 
     async def read_thread(
         self,

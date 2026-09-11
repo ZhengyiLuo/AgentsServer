@@ -624,6 +624,39 @@ def list_routes(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def inbox(args: argparse.Namespace) -> dict[str, Any]:
+    """List body-free pending senders; never claim or start their messages."""
+    capability = authority(args.authority_file)
+    path = "/api/agent/cross-chat/inbox"
+    cursor = getattr(args, "cursor", None)
+    if cursor is not None:
+        if not isinstance(cursor, str) or not 1 <= len(cursor) <= 128:
+            raise ChatsCLIError("--cursor must be the previous inbox page's next_cursor")
+        path += "?" + urllib.parse.urlencode({"cursor": cursor})
+    return get_json(path, capability)
+
+
+def read_inbox(args: argparse.Namespace) -> dict[str, Any]:
+    """Explicitly claim one sender page using a caller-stable durable receipt."""
+    sender = str(args.sender or "").strip()
+    request_id = str(args.request_id or "").strip()
+    if not 1 <= len(sender) <= 128:
+        raise ChatsCLIError("--sender must contain 1 to 128 characters")
+    if not 8 <= len(request_id) <= 128:
+        raise ChatsCLIError("--request-id must contain 8 to 128 characters and be reused for retries")
+    capability = authority(args.authority_file)
+    return post_json("/api/agent/cross-chat/inbox/read", {
+        "source_session_id": sender, "request_id": request_id,
+        "after_seq": args.cursor, "limit": args.limit,
+    }, capability)
+
+
+def inbox_sequence(value: str) -> int:
+    if len(value) > 19 or re.fullmatch(r"0|[1-9][0-9]*", value) is None or int(value) > 2**63 - 1:
+        raise argparse.ArgumentTypeError("--cursor must be a nonnegative sequence from the previous response")
+    return int(value)
+
+
 def negotiated_route_mode(capability: str, route_id: str, requested: str = "") -> str:
     """Discover mode through a read before sending any state-changing request."""
 
@@ -669,12 +702,17 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
             args.async_response = grant_is_async
     destination = route if route else target
     requested_mode = str(getattr(args, "mode", None) or "")
+    reply_to = str(getattr(args, "reply_to", None) or "").strip()
+    if reply_to and (not route or re.fullmatch(r"handoff_[0-9a-f]{32}", reply_to) is None):
+        raise ChatsCLIError("--reply-to requires an exact asynchronous route and message ID from the inbox")
     if requested_mode and not route:
         raise ChatsCLIError("conversation mode requires an exact route")
-    discover_mode = bool(requested_mode) or (
+    discover_mode = bool(requested_mode or reply_to) or (
         _bounded_runtime_value("AGENTSDOCK_CROSS_CHAT_MODE") == "async_route_v1"
     )
     mode = negotiated_route_mode(capability, route, requested_mode) if route and discover_mode else ""
+    if reply_to and mode != "async_route_v1":
+        raise ChatsCLIError("--reply-to is not supported by legacy exchanges")
     if mode == "async_route_v1":
         # Ask is an explicitly sent question in this mode. Any response is a
         # separate message, so neither alias opens a legacy exchange or wait.
@@ -688,7 +726,7 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
         (
             f"{capability}\0{action}\0"
             f"{'route' if route else 'target'}\0{destination}\0"
-            f"{int(live_wait)}\0{message}"
+            f"{int(live_wait)}\0{message}" + (f"\0reply:{reply_to}" if reply_to else "")
         ).encode("utf-8")
     ).hexdigest()
     payload: dict[str, Any] = {
@@ -699,6 +737,8 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
     }
     if mode:
         payload["mode"] = mode
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
     if live_wait:
         heartbeat_seconds = live_response_heartbeat_seconds(
             int(getattr(
@@ -719,10 +759,15 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
         payload["target_session_id"] = target
     result = post_json(path, payload, capability)
     if mode == "async_route_v1":
-        if (set(result) != {"ok", "route_id", "action", "accepted", "mode", "message_id", "duplicate"}
+        receipt_fields = {"ok", "route_id", "action", "accepted", "mode", "message_id", "duplicate"}
+        mailbox_fields = {"delivery_mode", "state", "execution_started"}
+        if (set(result) not in (receipt_fields, receipt_fields | mailbox_fields)
                 or result.get("ok") is not True or result.get("accepted") is not True
                 or result.get("route_id") != route or result.get("action") != "instruction"
                 or result.get("mode") != mode or not isinstance(result.get("duplicate"), bool)
+                or ("delivery_mode" in result and (result.get("delivery_mode") != "mailbox"
+                    or result.get("state") not in {"unread", "read", "cancelled", "deleted"}
+                    or result.get("execution_started") is not False))
                 or re.fullmatch(r"handoff_[0-9a-f]{32}", str(result.get("message_id") or "")) is None):
             raise ChatsCLIError("AgentsServer returned an invalid asynchronous message receipt")
         return result
@@ -987,6 +1032,19 @@ def parser() -> argparse.ArgumentParser:
         help="continue listing with the previous response's non-null next_cursor",
     )
     list_command.set_defaults(handler=list_routes)
+    inbox_command = commands.add_parser(
+        "inbox", help="list pending senders without reading or running their messages", allow_abbrev=False,
+    )
+    inbox_command.add_argument("--cursor", help="opaque next_cursor from the previous sender page")
+    inbox_command.set_defaults(handler=inbox)
+    read_command = commands.add_parser(
+        "read", help="explicitly read and claim one sender's pending messages; never automatically reply", allow_abbrev=False,
+    )
+    read_command.add_argument("--sender", required=True)
+    read_command.add_argument("--request-id", required=True, help="stable 8 to 128 character receipt ID; reuse exactly on retry")
+    read_command.add_argument("--cursor", type=inbox_sequence, default=0)
+    read_command.add_argument("--limit", type=int, choices=range(1, 26), default=25)
+    read_command.set_defaults(handler=read_inbox)
     command = commands.add_parser(
         "send",
         help="send one authorized instruction",
@@ -999,6 +1057,7 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--message", required=True)
     command.add_argument("--idempotency-key")
     command.add_argument("--mode", choices=["async_route_v1"])
+    command.add_argument("--reply-to", help="exact received message ID; asynchronous routes only")
     command.set_defaults(handler=send)
     ask_command = commands.add_parser(
         "ask",
@@ -1012,6 +1071,7 @@ def parser() -> argparse.ArgumentParser:
     ask_command.add_argument("--message", required=True)
     ask_command.add_argument("--idempotency-key")
     ask_command.add_argument("--mode", choices=["async_route_v1"])
+    ask_command.add_argument("--reply-to", help="exact received message ID; asynchronous routes only")
     ask_command.add_argument(
         "--async-response",
         action="store_true",

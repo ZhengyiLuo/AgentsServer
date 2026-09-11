@@ -21,6 +21,7 @@ TREE = ast.parse(Path(__file__).with_name("agent_server.py").read_text())
 FUNCTIONS = {
     "is_async_route_message", "async_route_conversation_fields",
     "cross_chat_message_event_type", "cross_chat_lifecycle_fields",
+    "async_message_target_fields",
     "public_cross_chat_envelope", "reserve_async_provider_route_message",
     "submit_provider_route_handoff", "append_cross_chat_event_once",
     "append_cross_chat_lifecycle", "finish_cross_chat_delivery", "cross_chat_delivery_state",

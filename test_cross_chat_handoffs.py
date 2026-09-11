@@ -1374,19 +1374,22 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             ["delivery", "normal"],
         )
 
-    async def test_force_send_cannot_overtake_delivery(self) -> None:
+    async def test_force_send_overtakes_pending_delivery_without_removing_it(self) -> None:
         agent_server.QUEUED_TURNS["target"] = deque([
             {"queued_id": "delivery", "purpose": "cross_chat_handoff_delivery"},
-            {"queued_id": "normal", "purpose": None},
+            {"queued_id": "normal", "purpose": None, "prompt": "Send this now"},
         ])
-        with patch.object(agent_server, "managed_server_update_blocker", return_value=None):
-            with self.assertRaises(HTTPException) as raised:
-                await agent_server._run_queued_turn_now_once("target", "normal")
-        self.assertEqual(raised.exception.status_code, 409)
+        with patch.object(agent_server, "managed_server_update_admission_blocker", return_value=None), \
+                patch.object(agent_server, "stop_turn", new_callable=AsyncMock, return_value={"stopped": False}), \
+                patch.object(agent_server, "append_durable_event", new_callable=AsyncMock), \
+                patch.object(agent_server, "schedule_steered_turn_slot_waiter"):
+            result = await agent_server._run_queued_turn_now_once("target", "normal")
+        self.assertTrue(result["ok"])
         self.assertEqual(
             [item["queued_id"] for item in agent_server.QUEUED_TURNS["target"]],
-            ["delivery", "normal"],
+            ["delivery"],
         )
+        self.assertEqual(agent_server.RUN_NOW_TURNS["target"]["queued_id"], "normal")
 
     async def test_explicit_stop_never_hides_and_pauses_internal_delivery(self) -> None:
         delivery = {

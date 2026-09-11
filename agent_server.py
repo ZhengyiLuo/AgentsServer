@@ -6552,6 +6552,7 @@ class PublishArtifactsRequest(BaseModel):
 
 class UpdateQueuedTurnRequest(BaseModel):
     prompt: str | None = None
+    expected_message_revision: int | None = Field(default=None, ge=0, strict=True)
     file_ids: list[str] | None = None
     client_capabilities: list[str] | None = Field(default=None, max_length=16)
     chat_references: list[ChatReference] | None = Field(default=None, max_length=16)
@@ -13692,6 +13693,10 @@ class CrossChatStore:
                         "ALTER TABLE cross_chat_envelopes ADD COLUMN "
                         "source_user_instruction TEXT NOT NULL DEFAULT ''"
                     )
+                if "target_body" not in columns:
+                    connection.execute("ALTER TABLE cross_chat_envelopes ADD COLUMN target_body TEXT")
+                if "message_revision" not in columns:
+                    connection.execute("ALTER TABLE cross_chat_envelopes ADD COLUMN message_revision INTEGER NOT NULL DEFAULT 0")
                 exchange_columns = {
                     str(row["name"])
                     for row in connection.execute(
@@ -14051,6 +14056,29 @@ class CrossChatStore:
                     (run_id,),
                 ).fetchall()
             return [dict(row) for row in rows]
+        return await self._call(operation)
+
+    async def edit_exact_queued_message(
+        self, *, envelope_id: str, target_session_id: str, queued_id: str,
+        pair_id: str, expected_revision: int, body: str,
+    ) -> dict[str, Any] | None:
+        """Recipient override only; the sender's body and routing stay immutable."""
+        def operation() -> dict[str, Any] | None:
+            with self._transaction() as connection:
+                cursor = connection.execute(
+                    """UPDATE cross_chat_envelopes
+                       SET target_body=?, message_revision=message_revision+1, updated_at=?
+                       WHERE id=? AND target_session_id=? AND queued_id=?
+                         AND authorization_kind='configured_route' AND kind='instruction'
+                         AND authorization_pair_id=? AND status='queued'
+                         AND target_run_id IS NULL AND message_revision=?""",
+                    (body, now_iso(), envelope_id, target_session_id, queued_id, pair_id, expected_revision),
+                )
+                if cursor.rowcount != 1:
+                    return None
+                return self._row(connection.execute(
+                    "SELECT * FROM cross_chat_envelopes WHERE id=?", (envelope_id,),
+                ).fetchone())
         return await self._call(operation)
 
     async def rebind_source_run(
@@ -16264,6 +16292,14 @@ async def append_durable_event_batch_locked(
     HISTORY_SEARCH_DIRTY.add(session_id)
 
     async def deliver_committed_events() -> None:
+        if any(event.get("type") == "history_imported" and event.get("backend") == BACKEND_CLAUDE
+               and isinstance(event.get("_history_sync_checkpoint"), dict) for event in events):
+            # The complete immutable batch is now fsynced. Refresh once before
+            # its public projection; ordinary event delivery performs no reads.
+            try:
+                await asyncio.to_thread(prepare_claude_history_metadata_repair, session_id, refresh=True)
+            except Exception as exc:
+                logger.warning("history repair refresh failed (%s); committed events remain visible", type(exc).__name__)
         for event in events:
             try:
                 await update_session_event_metadata(session_id, event)
@@ -16613,6 +16649,9 @@ async def enqueue_turn(
                     or queued_delivery.get("source_session_id") != req.source_session_id):
                 raise HTTPException(status_code=410, detail="chat pair permission was revoked")
             conversation_fields = async_route_conversation_fields(queued_delivery)
+            conversation_fields.update(async_message_target_fields(queued_delivery))
+            display_prompt = conversation_fields["message_body"][:4096]
+            req.display_prompt = display_prompt
     async with QUEUE_LOCK:
         # A pending update fences execution, not durable intake. Messages that
         # arrive while existing work drains are persisted for the replacement
@@ -16729,6 +16768,7 @@ async def enqueue_turn(
             "queued_id": queued_id,
             "provider_team_mail_route_snapshot": team_mail_route_snapshot,
             **conversation_fields,
+            **({"_async_body_verified": True} if conversation_fields else {}),
             "prompt": req.prompt,
             "file_ids": list(req.file_ids),
             "backend": req.backend,
@@ -21193,6 +21233,12 @@ def parse_legacy_steering_lineage(
 def prepare_steered_turn(selected: dict[str, Any], interrupted: dict[str, Any] | None) -> dict[str, Any]:
     """Persist flat steering lineage while keeping the selected user text immutable."""
     turn = dict(selected)
+    if async_route_queue_fields(selected):
+        # An independent delivery retains its exact envelope and purpose. It
+        # is not a user steer and must never replay the interrupted prompt.
+        turn["steer_interrupted_run_id"] = (interrupted or {}).get("run_id")
+        turn["replays_interrupted_message"] = False
+        return turn
     steering_prompt = str(
         selected.get("steering_prompt")
         if selected.get("steering_prompt") is not None
@@ -21238,13 +21284,105 @@ def async_route_queue_fields(item: dict[str, Any]) -> dict[str, Any]:
             or item.get("cross_chat_exchange_id") or item.get("cross_chat_exchange_leg_id")
             or not PROVIDER_CROSS_CHAT_ROUTE_PAIR_ID_RE.fullmatch(str(item.get("conversation_id") or ""))):
         return {}
-    return {
+    fields = {
         "conversation_mode": "async_route_v1",
         "conversation_id": str(item["conversation_id"]),
         "message_id": str(item["message_id"]),
         "source_title": sanitized_provider_route_label(item.get("source_title")),
         "target_title": sanitized_provider_route_label(item.get("target_title")),
     }
+    body, revision = item.get("message_body"), item.get("message_revision")
+    if (isinstance(body, str) and len(body) <= CROSS_CHAT_HANDOFF_BODY_MAX_CHARS
+            and type(revision) is int and revision >= 0
+            and type(item.get("message_edited_by_user")) is bool):
+        fields.update(message_body=body, message_revision=revision,
+                      message_edited_by_user=item["message_edited_by_user"])
+    return fields
+
+
+async def async_queued_message_record(session_id: str, item: dict[str, Any], *, require_waiting: bool = True) -> dict[str, Any] | None:
+    """Resolve only the exact immutable local async envelope, never its text."""
+    if not async_route_queue_fields(item):
+        return None
+    record = await CROSS_CHAT.get(str(item["cross_chat_envelope_id"]))
+    if (not record or not is_async_route_message(record)
+            or record.get("id") != item.get("message_id")
+            or record.get("authorization_pair_id") != item.get("conversation_id")
+            or record.get("source_session_id") != item.get("source_session_id")
+            or record.get("target_session_id") != session_id or item.get("target_session_id") != session_id
+            or record.get("queued_id") != item.get("queued_id")):
+        raise HTTPException(status_code=409, detail="queued async message ownership changed; refresh the queue")
+    if require_waiting and (record.get("status") != "queued" or record.get("target_run_id")
+                            or not provider_cross_chat_delivery_pair_is_live(record)):
+        raise HTTPException(status_code=409, detail="queued async message is already starting or no longer authorized")
+    return record
+
+
+def async_queued_message_body_fields(item: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
+    # The ledger is authoritative even if a crash interrupted the queue-log
+    # append after the recipient edit committed.
+    return async_message_target_fields(record)
+
+
+async def update_async_queued_message(session_id: str, queued_id: str, req: UpdateQueuedTurnRequest) -> dict[str, Any] | None:
+    async with QUEUE_LOCK:
+        reject_promoted_queue_mutation(session_id, queued_id)
+        queue = QUEUED_TURNS.get(session_id) or ()
+        for position, item in enumerate(queue, 1):
+            if item.get("queued_id") != queued_id or not async_route_queue_fields(item):
+                continue
+            blocker = managed_server_update_blocker()
+            if blocker:
+                raise HTTPException(status_code=503, detail=blocker)
+            if item.get("_native_delivery_fenced") is True or item.get("_update_transitioning") is True:
+                raise HTTPException(status_code=409, detail="queued async message is already starting")
+            record = await async_queued_message_record(session_id, item)
+            assert record is not None
+            fields = async_queued_message_body_fields(item, record)
+            if req.expected_message_revision != fields["message_revision"]:
+                raise HTTPException(status_code=409, detail="queued async message changed; refresh before editing")
+            if (not isinstance(req.prompt, str) or not req.prompt.strip()
+                    or len(req.prompt) > CROSS_CHAT_HANDOFF_BODY_MAX_CHARS):
+                raise HTTPException(status_code=400, detail="queued async message body must contain 1 to 100000 characters")
+            if any(getattr(req, key, None) is not None for key in (
+                "file_ids", "client_capabilities", "chat_references", "team_references",
+            )):
+                raise HTTPException(status_code=400, detail="queued async edits change only message text; routing and runtime are immutable")
+            async def commit_edit() -> None:
+                changed = await CROSS_CHAT.edit_exact_queued_message(
+                    envelope_id=str(record["id"]), target_session_id=session_id, queued_id=queued_id,
+                    pair_id=str(record["authorization_pair_id"]), expected_revision=fields["message_revision"],
+                    body=req.prompt,
+                )
+                if changed is None:
+                    raise HTTPException(status_code=409, detail="queued async message changed or already started")
+                item.update(async_message_target_fields(changed))
+                item["display_prompt"] = req.prompt[:4096]
+                item["prompt"] = cross_chat_delivery_prompt(changed, str(item.get("source_title") or ""))
+                item["_async_body_verified"] = True
+                # Queue recovery rechecks this authoritative ledger once; it
+                # cannot restore the sender's original after a partial append.
+                await append_durable_event(session_id, "turn_queue_updated", {
+                    **async_route_queue_fields(item), "queued_id": queued_id,
+                    "purpose": item["purpose"], "source_session_id": item.get("source_session_id"),
+                    "target_session_id": session_id, "cross_chat_envelope_id": item["cross_chat_envelope_id"],
+                    "prompt": req.prompt[:4096], "display_prompt": req.prompt[:4096], "position": position,
+                })
+                await append_durable_event(session_id, "chat_conversation_message_queued", {
+                    **cross_chat_lifecycle_fields(changed, "queued", session_id=session_id),
+                    "message": "Queued message edited by the recipient user",
+                })
+            # Cancellation cannot release QUEUE_LOCK while a committed edit
+            # is still being reflected in its exact in-memory queue owner.
+            edit_task = asyncio.create_task(commit_edit())
+            try:
+                await asyncio.shield(edit_task)
+            except asyncio.CancelledError:
+                await join_task_despite_caller_cancellation(edit_task)
+                raise
+            return {"ok": True, "queued_id": queued_id,
+                    "item": public_queued_turn(session_id, item, position)}
+    return None
 
 
 def public_queued_turn(
@@ -21263,7 +21401,7 @@ def public_queued_turn(
     # waiting, but it must never expose the wrapper itself. Modern producers
     # persist a safe display label; recovered legacy rows use a generic one.
     if purpose == LOCAL_CROSS_CHAT_DELIVERY_PURPOSE:
-        public_prompt = str(display_prompt or "Incoming cross-chat message")
+        public_prompt = str(async_route_queue_fields(item).get("message_body", display_prompt or "Incoming cross-chat message"))[:4096]
         public_display_prompt: str | None = public_prompt
         public_file_ids = list(
             display_file_ids
@@ -21335,6 +21473,24 @@ async def queued_turns_snapshot(session_id: str) -> list[dict[str, Any]]:
     if run_now is not None:
         items.append((run_now, True))
     items.extend((item, False) for item in queue)
+    # Pre-upgrade queues saved only a generic display label. Resolve their
+    # exact body on this explicit queue read, never by parsing a relay wrapper.
+    projected_items = []
+    for item, promoted in items:
+        if async_route_queue_fields(item) and item.get("_async_body_verified") is not True:
+            try:
+                record = await async_queued_message_record(session_id, item, require_waiting=False)
+                if record:
+                    async with QUEUE_LOCK:
+                        # No await between this identity check and the copy.
+                        if ((any(candidate is item for candidate in (QUEUED_TURNS.get(session_id) or ()))
+                                or RUN_NOW_TURNS.get(session_id) is item)
+                                and int(item.get("message_revision") or 0) <= int(record.get("message_revision") or 0)):
+                            item.update(async_queued_message_body_fields(item, record))
+                            item["_async_body_verified"] = True
+            except HTTPException:
+                pass
+        projected_items.append((item, promoted))
     return [
         public_queued_turn(
             session_id,
@@ -21342,7 +21498,7 @@ async def queued_turns_snapshot(session_id: str) -> list[dict[str, Any]]:
             idx + 1,
             promoted=promoted,
         )
-        for idx, (item, promoted) in enumerate(items)
+        for idx, (item, promoted) in enumerate(projected_items)
         if str(item.get("queued_id") or "").strip()
     ]
 
@@ -21372,6 +21528,9 @@ async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedT
     await wait_for_queue_recovery_admission()
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
+    async_result = await update_async_queued_message(session_id, queued_id, req)
+    if async_result is not None:
+        return async_result
     validated_file_ids = (
         validate_session_file_ids(session_id, req.file_ids)
         if req.file_ids is not None
@@ -23025,7 +23184,13 @@ async def _run_queued_turn_now_once(
                             owner_queued_id=queued_id,
                         ),
                     )
-                if selected.get("purpose") in CROSS_CHAT_DELIVERY_PURPOSES:
+                selected_async = bool(async_route_queue_fields(selected))
+                if selected_async:
+                    selected_record = await async_queued_message_record(session_id, selected)
+                    selected.update(async_message_target_fields(selected_record))
+                    selected["display_prompt"] = selected["message_body"][:4096]
+                    selected["prompt"] = cross_chat_delivery_prompt(selected_record, str(selected.get("source_title") or ""))
+                if selected.get("purpose") in CROSS_CHAT_DELIVERY_PURPOSES | {"scheduled_job"} and not selected_async:
                     raise HTTPException(
                         status_code=409,
                         detail=force_send_conflict_detail(
@@ -23044,36 +23209,8 @@ async def _run_queued_turn_now_once(
                             owner_queued_id=queued_id,
                         ),
                     )
-                if any(
-                    item.get("purpose") in CROSS_CHAT_DELIVERY_PURPOSES
-                    for item in items[:selected_index]
-                ):
-                    raise HTTPException(
-                        status_code=409,
-                        detail=force_send_conflict_detail(
-                            session_id,
-                            queued_id,
-                            guard="prior_cross_chat_delivery",
-                            message=(
-                                "Force Send cannot overtake a queued "
-                                "cross-chat delivery."
-                            ),
-                            action=(
-                                "Run or skip the earlier delivery before "
-                                "forcing this message."
-                            ),
-                            retryable=True,
-                            owner_queued_id=next(
-                                (
-                                    str(item.get("queued_id") or "")
-                                    for item in items[:selected_index]
-                                    if item.get("purpose")
-                                    in CROSS_CHAT_DELIVERY_PURPOSES
-                                ),
-                                None,
-                            ),
-                        ),
-                    )
+                # Explicit Send now promotes only the selected pending row;
+                # every earlier row retains its relative order and content.
                 selected_was_paused = (
                     selected.get("_paused_after_stop") is True
                 )
@@ -23092,6 +23229,7 @@ async def _run_queued_turn_now_once(
                 )
                 native_steer = bool(
                     active_turn.get("provider_turn_ready")
+                    and not selected_async
                     and native_steer_queue is not None
                     and (
                         not goal_followup or (
@@ -23389,6 +23527,7 @@ async def _run_queued_turn_now_once(
             )
         await append_durable_event(session_id, "turn_queue_run_now", {
             "queued_id": queued_id,
+            **async_route_queue_fields(prepared),
             "backend": prepared.get("backend") or STORE.sessions[session_id].get("backend") or DEFAULT_BACKEND,
             "prompt": display_prompt,
             "request_prompt": prepared.get("prompt") or "",
@@ -23420,7 +23559,9 @@ async def _run_queued_turn_now_once(
                 )
             ),
             "message": (
-                "Steering message promoted; it will continue the confirmed native provider thread."
+                "Queued agent message promoted to run next."
+                if async_route_queue_fields(prepared)
+                else "Steering message promoted; it will continue the confirmed native provider thread."
                 if interrupted
                 else "Queued message promoted to run next."
             ),
@@ -30779,7 +30920,7 @@ def prepare_codex_goal_history_repair(session_id: str) -> None:
         HISTORY_SEARCH_DIRTY.add(session_id)
 
 
-def prepare_claude_history_metadata_repair(session_id: str) -> None:
+def prepare_claude_history_metadata_repair(session_id: str, *, refresh: bool = False) -> None:
     """Prove old metadata only for a requested chat, never during event egress.
 
     This bounded read is called once at history-read/cache-build boundaries.
@@ -30821,6 +30962,7 @@ def prepare_claude_history_metadata_repair(session_id: str) -> None:
         session_id, provider_id, events_path(session_id), CLAUDE_PROJECTS_ROOT,
         normalize_legacy_user,
         normalize_full_user=normalize_full_user,
+        refresh=refresh,
     )
     if changed and CLAUDE_METADATA_REPAIR_CACHE.signature(session_id):
         HISTORY_SEARCH_REPAIR_DIRTY.add(session_id)
@@ -35893,6 +36035,7 @@ def cross_chat_delivery_prompt(record: dict[str, Any], source_title: str) -> str
             record.get("authorization_route_id"),
         ),
     )
+    target_fields = async_message_target_fields(record) if is_async_route_message(record) else {}
     return (
         cross_chat_delivery_header(
             kind=record.get("kind"),
@@ -35902,9 +36045,11 @@ def cross_chat_delivery_prompt(record: dict[str, Any], source_title: str) -> str
             from_label=from_label,
             mode="async_route_v1" if is_async_route_message(record) else "",
         )
+        + ("[Server provenance: the recipient user edited this queued message; sender identity and routing permissions are unchanged.]\n"
+           if target_fields.get("message_edited_by_user") else "")
         + cross_chat_relay_content_prompt(
             record.get("source_user_instruction"),
-            record.get("body"),
+            target_fields.get("message_body", record.get("body")),
             delivery_kind=str(record.get("kind") or "message"),
         )
         + "[End delivery]"
@@ -36575,6 +36720,7 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
             "route_hint_mentions": True,
             "durable_route_grants": True,
             "async_route_v1": True,
+            "async_queued_message_controls": True,
             "agent_cross_chat_routes": True,
             "agent_ambient_local_handoffs": False,
             "configured_route_async_request_reply": True,
@@ -36863,10 +37009,23 @@ def cross_chat_message_event_type(record: dict[str, Any], event_type: str) -> st
     return event_type
 
 
-def cross_chat_lifecycle_fields(record: dict[str, Any], status: str) -> dict[str, Any]:
+def async_message_target_fields(record: dict[str, Any]) -> dict[str, Any]:
+    revision = record.get("message_revision")
+    edited = (is_async_route_message(record) and type(revision) is int and revision > 0
+              and isinstance(record.get("target_body"), str))
+    return {
+        "message_body": str(record["target_body"] if edited else record.get("body") or ""),
+        "message_revision": revision if edited else 0,
+        "message_edited_by_user": bool(edited),
+    }
+
+
+def cross_chat_lifecycle_fields(record: dict[str, Any], status: str, *, session_id: str | None = None) -> dict[str, Any]:
     source_session_id = str(record.get("source_session_id") or "")
     target_session_id = str(record.get("target_session_id") or "")
-    body = str(record.get("body") or "")
+    target_fields = (async_message_target_fields(record)
+                     if is_async_route_message(record) and session_id == target_session_id else {})
+    body = str(target_fields.get("message_body", record.get("body") or ""))
     preview_limit = 4096
     return {
         "handoff_id": record.get("id"),
@@ -36897,6 +37056,7 @@ def cross_chat_lifecycle_fields(record: dict[str, Any], status: str) -> dict[str
         "handoff_body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
         "handoff_body_truncated": len(body) > preview_limit,
         **async_route_conversation_fields(record),
+        **{key: value for key, value in target_fields.items() if key != "message_body"},
     }
 
 
@@ -36943,7 +37103,7 @@ async def append_cross_chat_lifecycle(
                 continue
             try:
                 await append_durable_event(session_id, event_type, {
-                    **cross_chat_lifecycle_fields(record, status),
+                    **cross_chat_lifecycle_fields(record, status, session_id=session_id),
                     "message": message,
                 })
                 remember_cross_chat_event_types(
@@ -36979,7 +37139,7 @@ async def append_cross_chat_event_once(
         ):
             return
         await append_durable_event(session_id, event_type, {
-            **cross_chat_lifecycle_fields(record, status),
+            **cross_chat_lifecycle_fields(record, status, session_id=session_id),
             **extra,
             "message": message,
         })
@@ -42664,6 +42824,11 @@ def public_cross_chat_envelope(
             "body_chars": len(body),
             "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
         })
+        if is_async_route_message(record):
+            target_fields = async_message_target_fields(record)
+            result.update(target_body=target_fields["message_body"],
+                          message_edited_by_user=target_fields["message_edited_by_user"],
+                          message_revision=target_fields["message_revision"])
     return result
 
 
@@ -62753,7 +62918,7 @@ async def run_cursor(
 
 def queued_turn_run_metadata(item: dict[str, Any]) -> dict[str, Any]:
     metadata = {
-        **async_route_queue_fields(item),
+        **{key: value for key, value in async_route_queue_fields(item).items() if key != "message_body"},
         "purpose": item.get("purpose"),
         "job_id": item.get("job_id"),
         "job_title": item.get("job_title"),
@@ -65358,6 +65523,12 @@ async def _start_turn_locked(
             provider_route_snapshot = async_route_delivery_snapshot(session_id, delivery_record)
             if not provider_route_snapshot:
                 raise HTTPException(status_code=410, detail="chat pair permission was revoked")
+            # Queue text is presentation state, not delivery authority. Rebuild
+            # from the exact ledger owner, including a committed recipient edit.
+            req.prompt = cross_chat_delivery_prompt(
+                delivery_record, str((STORE.sessions.get(req.source_session_id) or {}).get("title") or ""),
+            )
+            req.display_prompt = async_message_target_fields(delivery_record)["message_body"]
         reciprocal_route_grant = (
             await configured_route_reciprocal_grant_for_delivery(
                 session_id,
@@ -65640,6 +65811,8 @@ async def _start_turn_locked(
             CURRENT_TURNS[session_id] = {
                 "run_id": None,
                 **async_route_conversation_fields(delivery_record or {}),
+                **({key: value for key, value in async_message_target_fields(delivery_record).items() if key != "message_body"}
+                   if is_async_route_message(delivery_record or {}) else {}),
                 # Private per-admission identity for restart confirmation. A
                 # run id is assigned only after several awaited startup
                 # checks, so the blocker revision needs its own token to
@@ -66105,6 +66278,8 @@ async def _start_turn_locked(
                 route_grant_admission_id if team_mail_grant_mutation else None
             ),
             **async_route_conversation_fields(delivery_record or {}),
+            **({key: value for key, value in async_message_target_fields(delivery_record).items() if key != "message_body"}
+               if is_async_route_message(delivery_record or {}) else {}),
             "backend": backend,
             "prompt": display_prompt,
             "file_ids": display_file_ids if display_file_ids is not None else req.file_ids,
@@ -66146,6 +66321,8 @@ async def _start_turn_locked(
         run_metadata = {
             "purpose": req.purpose,
             **async_route_conversation_fields(delivery_record or {}),
+            **({key: value for key, value in async_message_target_fields(delivery_record).items() if key != "message_body"}
+               if is_async_route_message(delivery_record or {}) else {}),
             "job_id": req.job_id,
             "job_title": req.job_title,
             "job_scheduled_run_at": req.job_scheduled_run_at,

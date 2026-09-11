@@ -41,12 +41,14 @@ FUNCTIONS = {
     "deliver_cross_chat_live_response_locked", "reconcile_cross_chat_handoffs", "reconcile_cross_chat_exchange_leg",
     "async_route_delivery_snapshot", "is_async_route_message", "async_route_conversation_fields",
     "async_route_queue_fields", "public_queued_turn", "queued_turn_from_event", "queued_turn_run_metadata",
+    "async_message_target_fields",
     "sanitized_provider_route_label", "enqueue_turn",
     "provider_cross_chat_reciprocal_admission_fields",
     "join_task_despite_caller_cancellation",
     "stage_provider_team_mail_grants", "settle_provider_team_mail_grants",
 }
 CONSTANTS = {
+    "CROSS_CHAT_HANDOFF_BODY_MAX_CHARS",
     "PROVIDER_CROSS_CHAT_ROUTE_ID_RE", "PROVIDER_CROSS_CHAT_ROUTE_REVISION_RE",
     "PROVIDER_CROSS_CHAT_ROUTE_PAIR_ID_RE", "PROVIDER_CROSS_CHAT_ROUTE_ALIAS_RE",
     "PROVIDER_CROSS_CHAT_ROUTE_AUDIT_ID_RE", "PROVIDER_CROSS_CHAT_RECIPROCAL_EFFECT_ID_RE",
@@ -589,6 +591,7 @@ class ChatPairTests(unittest.IsolatedAsyncioTestCase):
         self.store.sessions["a"]["title"] = "Sender"
         self.store.sessions["b"]["title"] = "Recipient"
         message = self.delivery(self.routes("a")[0], status="submitting")
+        message["body"] = "The actual message from Sender"
         self.namespace.update({
             "CROSS_CHAT": SimpleNamespace(get=AsyncMock(return_value=message)),
             "wait_for_queue_recovery_admission": AsyncMock(),
@@ -625,7 +628,9 @@ class ChatPairTests(unittest.IsolatedAsyncioTestCase):
         recovered = self.call("queued_turn_from_event", result["event"], self.store.sessions["b"], 1)
         public = self.call("public_queued_turn", "b", recovered, 1)
         self.assertEqual((public["conversation_mode"], public["source_title"], public["message_id"]), ("async_route_v1", "Sender", "message"))
-        self.assertEqual(public["prompt"], "Message from Sender")
+        self.assertEqual(public["prompt"], message["body"])
+        self.assertEqual(public["message_body"], message["body"])
+        self.assertEqual(public["message_revision"], 0)
         self.assertEqual(recovered["client_capabilities"], ["backend-exact"])
         self.assertIsNone(recovered["backend"])
         self.assertEqual(self.call("queued_turn_run_metadata", recovered)["conversation_id"], message["authorization_pair_id"])

@@ -1,0 +1,1578 @@
+from pathlib import Path
+import os
+import tempfile
+import threading
+import unittest
+import uuid
+from unittest import mock
+
+from agentsdock_team_hub.secure_peer import (
+    PAIRING_STATUS_LIMIT,
+    SecurePeerError,
+    SecurePeerStore,
+)
+from agentsdock_team_hub.store import HubError, HubStore
+from secure_peer_runtime import SecurePeerRuntime
+
+
+class SecurePeerRuntimeTests(unittest.TestCase):
+    def test_agent_mail_receipt_rejects_remote_mismatch(self) -> None:
+        valid = {
+            "item": {
+                "id": "item_1",
+                "kind": "message",
+                "body": "prepared body",
+                "body_format": "markdown",
+                "to": {"kind": "server", "id": "node_1"},
+            },
+            "delivery": {"id": "delivery_1", "state": "available"},
+        }
+        accepted = SecurePeerRuntime._validated_agent_mail_receipt(
+            valid,
+            kind="message",
+            target_kind="server",
+            target_id="node_1",
+            message="prepared body",
+        )
+        self.assertEqual(accepted["item"]["id"], "item_1")
+        for mismatch in (
+            {},
+            {**valid, "delivery": {}},
+            {
+                **valid,
+                "item": {
+                    **valid["item"],
+                    "to": {"kind": "server", "id": "wrong_node"},
+                },
+            },
+            {**valid, "item": {**valid["item"], "body": "wrong body"}},
+        ):
+            with self.assertRaises(SecurePeerError):
+                SecurePeerRuntime._validated_agent_mail_receipt(
+                    mismatch,
+                    kind="message",
+                    target_kind="server",
+                    target_id="node_1",
+                    message="prepared body",
+                )
+
+    def test_agent_mail_send_rejects_stale_connection_certificate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="source_server",
+                server_instance_id="source_instance",
+                display_name="Source",
+            )
+            connection_id = str(uuid.uuid4())
+            profile = {
+                "realm": "secure_peer",
+                "connection_id": connection_id,
+                "team_id": "team_1",
+                "hub_id": "hub_1",
+                "host_server_identity": "host_1",
+                "certificate_fingerprint": "sha256:" + "a" * 64,
+                "destination_kind": "server",
+                "destination_id": "node_1",
+            }
+            active = {
+                "active": True,
+                "status": "connected",
+                "connection_id": connection_id,
+                "team_id": "team_1",
+                "hub_id": "hub_1",
+                "host_server_identity": "host_1",
+                "certificate_fingerprint": "sha256:" + "b" * 64,
+                "scopes": ["teamspace.read", "teamspace.write"],
+            }
+            with (
+                mock.patch.object(
+                    runtime.client, "list_connections", return_value=[active]
+                ),
+                mock.patch.object(runtime, "proxy") as proxy,
+            ):
+                with self.assertRaises(SecurePeerError):
+                    runtime.send_agent_mail(
+                        profile,
+                        kind="message",
+                        message="prepared body",
+                        idempotency_key="mail_stale_1",
+                    )
+            proxy.assert_not_called()
+            runtime.shutdown()
+
+    def test_agent_mail_host_listing_fails_closed_on_one_team_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="source_server",
+                server_instance_id="source_instance",
+                display_name="Source",
+            )
+
+            class FailingHost:
+                hub_id = "hub_1"
+
+                @staticmethod
+                def local_agent_mail_team_ids():
+                    return ["team_1", "team_2"]
+
+                @staticmethod
+                def local_agent_mail_claims(team_id):
+                    return {"team_id": team_id}
+
+                @staticmethod
+                def get_network(*_args, **_kwargs):
+                    raise HubError("unavailable", "private host detail", 409)
+
+            runtime._hub_store = FailingHost()
+            with mock.patch.object(runtime.client, "list_connections", return_value=[]):
+                with self.assertRaises(HubError):
+                    runtime.agent_mail_route_profiles()
+            runtime.shutdown()
+
+    @staticmethod
+    def incoming_pairing(status: str, created_at: int) -> dict:
+        return {
+            "pairing_id": str(uuid.uuid4()),
+            "peer_server_identity": f"peer_{created_at}",
+            "peer_display_name": f"Peer {created_at}",
+            "transcript_hash": f"transcript-{created_at}",
+            "sas_words": ["amber", "beacon", "cedar", "delta"],
+            "status": status,
+            "created_at": created_at,
+            "expires_at": 2_000_000_000,
+            "team_id": None,
+            "scopes": [],
+            "requested_scopes": ["teamspace.read"],
+            "source_ip": "192.0.2.10",
+            "source_endpoint": "192.0.2.10:50000",
+            "peer_public_key_fingerprint": "sha256:" + "b" * 64,
+        }
+
+    @staticmethod
+    def outgoing_pairing(created_at: int) -> dict:
+        return {
+            "connection_id": str(uuid.uuid4()),
+            "pairing_id": str(uuid.uuid4()),
+            "host_ip": "192.0.2.20",
+            "port": 7851,
+            "status": "connected",
+            "active": True,
+            "host_server_identity": "remote_server",
+            "host_display_name": "Remote server",
+            "host_ca_fingerprint": "sha256:" + "c" * 64,
+            "transcript_hash": "outgoing-transcript",
+            "sas_words": ["echo", "forest", "globe", "harbor"],
+            "requested_scopes": ["teamspace.read"],
+            "scopes": ["teamspace.read"],
+            "created_at": created_at,
+            "updated_at": created_at,
+        }
+
+    def test_disabled_host_status_does_not_advertise_live_certificate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+
+            class DormantHost:
+                ca_fingerprint = "sha256:" + "a" * 64
+                server_certificate_expires_at = 2_000_000_000
+
+                @staticmethod
+                def list_pairings(*, team_id=None, status=None):
+                    del team_id, status
+                    return []
+
+                @staticmethod
+                def list_peers(*, team_id=None):
+                    del team_id
+                    return []
+
+            runtime._host_store = DormantHost()
+            runtime._config = {
+                **runtime._config,
+                "enabled": False,
+                "advertised_host": None,
+            }
+            with mock.patch.object(
+                runtime, "remote_route_delivery_available", return_value=False
+            ):
+                status = runtime.status()
+
+            self.assertTrue(status["host"]["available"])
+            self.assertFalse(status["host"]["enabled"])
+            self.assertIsNone(status["host"]["pairing_link"])
+            self.assertIsNone(status["host"]["certificate_expires_at"])
+            runtime.mark_host_unavailable("Peer\nerror\x7fdetail")
+            projected = runtime.status()["host"]["error"]
+            self.assertNotIn("\n", projected)
+            self.assertNotIn("\x7f", projected)
+            self.assertEqual(
+                runtime.status()["host"]["error_code"],
+                "secure_peer_host_unavailable",
+            )
+            self.assertTrue(runtime.status()["host"]["action"])
+            runtime.shutdown()
+
+    def test_failed_host_attachment_is_retried_without_service_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = SecurePeerRuntime(
+                root / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            hub_store = HubStore(root / "hub")
+            attempts = 0
+
+            def construct(*args, **kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise OSError("transient database open failure")
+                return SecurePeerStore(*args, **kwargs)
+
+            with mock.patch(
+                "secure_peer_runtime.SecurePeerStore",
+                side_effect=construct,
+            ):
+                with self.assertRaises(OSError):
+                    runtime.attach_host_hub(
+                        hub_id=hub_store.hub_id,
+                        hub_data_dir=root / "hub",
+                        hub_store=hub_store,
+                    )
+                runtime.mark_host_unavailable(
+                    "The secure peer host could not finish recovery.",
+                    error_code="secure_peer_host_recovery_failed",
+                )
+                self.assertFalse(runtime.status()["host"]["available"])
+                self.assertTrue(runtime.retry_host_attachment())
+
+            self.assertEqual(attempts, 2)
+            self.assertIsNone(runtime._pending_host_attachment)
+            self.assertTrue(runtime.status()["host"]["available"])
+            self.assertIsNone(runtime.status()["host"]["error"])
+            runtime.shutdown()
+
+    def test_status_separates_durable_trust_from_transport_presence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            online = {
+                **self.outgoing_pairing(123),
+                "last_validated_at": 1_000,
+            }
+
+            class Client:
+                @staticmethod
+                def list_connections():
+                    return [online]
+
+            runtime.client = Client()
+            with (
+                mock.patch("secure_peer_runtime.time.time", return_value=1_040),
+                mock.patch.object(
+                    runtime, "remote_route_delivery_available", return_value=False
+                ),
+            ):
+                projected = runtime.status()["pairings"][0]
+            self.assertEqual(projected["trust_state"], "approved")
+            self.assertEqual(projected["transport_state"], "online")
+
+            runtime._client_failure_counts[online["connection_id"]] = 1
+            with (
+                mock.patch("secure_peer_runtime.time.time", return_value=1_040),
+                mock.patch.object(
+                    runtime, "remote_route_delivery_available", return_value=False
+                ),
+            ):
+                reconnecting = runtime.status()["pairings"][0]
+            self.assertEqual(reconnecting["trust_state"], "approved")
+            self.assertEqual(reconnecting["transport_state"], "reconnecting")
+
+            runtime._client_failure_counts[online["connection_id"]] = 3
+            with (
+                mock.patch("secure_peer_runtime.time.time", return_value=1_100),
+                mock.patch.object(
+                    runtime, "remote_route_delivery_available", return_value=False
+                ),
+            ):
+                offline = runtime.status()["pairings"][0]
+            self.assertEqual(offline["trust_state"], "approved")
+            self.assertEqual(offline["transport_state"], "offline")
+            runtime.shutdown()
+
+    def test_unknown_trust_state_fails_closed(self) -> None:
+        self.assertEqual(SecurePeerRuntime._trust_state("unexpected"), "error")
+        self.assertEqual(SecurePeerRuntime._trust_state(None), "error")
+
+    def test_status_preserves_511_pending_plus_one_outgoing_connection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            pending = [
+                self.incoming_pairing("pending", index + 1)
+                for index in range(PAIRING_STATUS_LIMIT - 1)
+            ]
+            outgoing = self.outgoing_pairing(PAIRING_STATUS_LIMIT + 1)
+
+            class Host:
+                ca_fingerprint = "sha256:" + "a" * 64
+                server_certificate_expires_at = 2_000_000_000
+                hub_id = "team-hub-test"
+
+                @staticmethod
+                def list_pairings(*, team_id=None, status=None):
+                    del team_id, status
+                    return pending
+
+                @staticmethod
+                def list_peers(*, team_id=None):
+                    del team_id
+                    return []
+
+            class Client:
+                @staticmethod
+                def list_connections():
+                    return [outgoing]
+
+            runtime._host_store = Host()
+            runtime.client = Client()
+            with mock.patch.object(
+                runtime, "remote_route_delivery_available", return_value=False
+            ):
+                status = runtime.status()
+            self.assertEqual(len(status["pairings"]), PAIRING_STATUS_LIMIT)
+            self.assertEqual(
+                sum(
+                    item["status"] == "pending_approval"
+                    for item in status["pairings"]
+                ),
+                PAIRING_STATUS_LIMIT - 1,
+            )
+            self.assertIn(
+                outgoing["pairing_id"],
+                {item["id"] for item in status["pairings"]},
+            )
+            runtime.shutdown()
+
+    def test_status_caps_terminal_history_after_preserving_actionable_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            pending = self.incoming_pairing("pending", 10_000)
+            terminal = [
+                self.incoming_pairing("rejected", index + 1)
+                for index in range(PAIRING_STATUS_LIMIT + 88)
+            ]
+            outgoing = self.outgoing_pairing(10_001)
+
+            class Host:
+                ca_fingerprint = "sha256:" + "a" * 64
+                server_certificate_expires_at = 2_000_000_000
+                hub_id = "team-hub-test"
+
+                @staticmethod
+                def list_pairings(*, team_id=None, status=None):
+                    del team_id, status
+                    return [pending, *terminal]
+
+                @staticmethod
+                def list_peers(*, team_id=None):
+                    del team_id
+                    return []
+
+            class Client:
+                @staticmethod
+                def list_connections():
+                    return [outgoing]
+
+            runtime._host_store = Host()
+            runtime.client = Client()
+            with mock.patch.object(
+                runtime, "remote_route_delivery_available", return_value=False
+            ):
+                status = runtime.status()
+            pairing_ids = {item["id"] for item in status["pairings"]}
+            self.assertEqual(len(status["pairings"]), PAIRING_STATUS_LIMIT)
+            self.assertIn(pending["pairing_id"], pairing_ids)
+            self.assertIn(outgoing["pairing_id"], pairing_ids)
+            self.assertIn(terminal[-1]["pairing_id"], pairing_ids)
+            self.assertNotIn(terminal[0]["pairing_id"], pairing_ids)
+            runtime.shutdown()
+
+    def test_maintenance_retires_only_exact_authenticated_peer_revocation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            active = {
+                **self.outgoing_pairing(123),
+                "hub_id": "hub-remote",
+                "certificate_fingerprint": "sha256:" + "d" * 64,
+            }
+            renewed = {
+                **active,
+                "certificate_fingerprint": "sha256:" + "e" * 64,
+            }
+            connection_id = active["connection_id"]
+            runtime._remote_routes_cache[connection_id] = [{"route_id": "stale"}]
+            runtime._remote_routes_refreshed_at[connection_id] = 123
+            with (
+                mock.patch.object(
+                    runtime.client,
+                    "recover_pairing_attempts",
+                    return_value={"remaining": 0},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "list_connections",
+                    side_effect=[[active], [renewed]],
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "flush_pending_route_revocations_for_connection",
+                    return_value=0,
+                ) as flush_routes,
+                mock.patch.object(
+                    runtime.client,
+                    "renew_if_due",
+                    return_value={"renewed": True, "connection": renewed},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "peer_health",
+                    side_effect=SecurePeerError(
+                        "peer_revoked",
+                        "Peer authentication is unavailable",
+                        401,
+                    ),
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "remote_revocation_status",
+                    return_value={"status": "revoked"},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "retire_remote_revoked_connection",
+                    return_value={"status": "revoked", "active": False},
+                ) as retire,
+            ):
+                result = runtime.maintenance_once()
+            flush_routes.assert_not_called()
+            retire.assert_called_once_with(
+                connection_id,
+                expected_host_server_identity="remote_server",
+                expected_hub_id="hub-remote",
+                expected_certificate_fingerprint="sha256:" + "e" * 64,
+            )
+            self.assertEqual(
+                result,
+                {
+                    "active": False,
+                    "renewed": False,
+                    "healthy": False,
+                    "revoked": True,
+                    "revoked_connection_id": connection_id,
+                    "error": "peer_revoked",
+                    "pairing_recovery": {"remaining": 0},
+                },
+            )
+            self.assertNotIn(connection_id, runtime._remote_routes_cache)
+            self.assertNotIn(connection_id, runtime._remote_routes_refreshed_at)
+            self.assertIsNone(runtime._client_error)
+            runtime.shutdown()
+
+    def test_maintenance_never_retires_transient_or_unpinned_errors(self) -> None:
+        failures = (
+            SecurePeerError("peer_revoked", "untrusted status", 503),
+            SecurePeerError("transport_failed", "peer is offline", 503),
+            SecurePeerError("rate_limited", "retry later", 429),
+            SecurePeerError("remote_invalid", "invalid response", 502),
+            TimeoutError("timed out"),
+        )
+        for failure in failures:
+            with self.subTest(failure=repr(failure)), tempfile.TemporaryDirectory() as temporary:
+                runtime = SecurePeerRuntime(
+                    Path(temporary) / "secure-peers",
+                    server_identity="server_identity_test",
+                    server_instance_id="server_instance_test",
+                    display_name="Test server",
+                )
+                active = {
+                    **self.outgoing_pairing(123),
+                    "hub_id": "hub-remote",
+                    "certificate_fingerprint": "sha256:" + "d" * 64,
+                }
+                with (
+                    mock.patch.object(
+                        runtime.client,
+                        "recover_pairing_attempts",
+                        return_value={"remaining": 0},
+                    ),
+                    mock.patch.object(
+                        runtime.client,
+                        "list_connections",
+                        return_value=[active],
+                    ),
+                    mock.patch.object(
+                        runtime.client,
+                        "flush_pending_route_revocations_for_connection",
+                        return_value=0,
+                    ),
+                    mock.patch.object(
+                        runtime.client,
+                        "renew_if_due",
+                        return_value={"renewed": False},
+                    ),
+                    mock.patch.object(
+                        runtime.client,
+                        "peer_health",
+                        side_effect=failure,
+                    ),
+                    mock.patch.object(
+                        runtime.client,
+                        "retire_remote_revoked_connection",
+                    ) as retire,
+                ):
+                    result = runtime.maintenance_once()
+                self.assertTrue(result["active"])
+                self.assertFalse(result["healthy"])
+                self.assertEqual(
+                    result["error"],
+                    failure.code
+                    if isinstance(failure, SecurePeerError)
+                    else "secure_peer_maintenance_failed",
+                )
+                retire.assert_not_called()
+                self.assertIsNotNone(runtime._client_error)
+                runtime.shutdown()
+
+    def test_maintenance_does_not_retire_superseded_credential_as_peer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            active = {
+                **self.outgoing_pairing(123),
+                "hub_id": "hub-remote",
+                "certificate_fingerprint": "sha256:" + "d" * 64,
+            }
+            terminal = SecurePeerError(
+                "peer_revoked",
+                "Peer authentication is unavailable",
+                401,
+            )
+            with (
+                mock.patch.object(
+                    runtime.client,
+                    "recover_pairing_attempts",
+                    return_value={"remaining": 0},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "list_connections",
+                    return_value=[active],
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "renew_if_due",
+                    return_value={"renewed": False},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "peer_health",
+                    side_effect=terminal,
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "remote_revocation_status",
+                    return_value={"status": "active"},
+                ) as status,
+                mock.patch.object(
+                    runtime.client,
+                    "retire_remote_revoked_connection",
+                ) as retire,
+            ):
+                result = runtime.maintenance_once()
+
+            status.assert_called_once_with(active["connection_id"])
+            retire.assert_not_called()
+            self.assertTrue(result["active"])
+            self.assertFalse(result["healthy"])
+            self.assertEqual(result["error"], "peer_revoked")
+            runtime.shutdown()
+
+    def test_ancillary_failures_do_not_suppress_heartbeat(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            active = {
+                **self.outgoing_pairing(123),
+                "scopes": ["teamspace.read", "cross_chat.instruction"],
+            }
+            connection_id = active["connection_id"]
+            calls: list[str] = []
+
+            def fail_renew(_connection_id):
+                calls.append("renew")
+                raise TimeoutError("renewal unavailable")
+
+            def heartbeat(_connection_id):
+                calls.append("heartbeat")
+                return {"hub_id": "hub-remote"}
+
+            def fail_flush(_connection_id, *, limit):
+                del limit
+                calls.append("flush")
+                raise SecurePeerError("route_retry", "route unavailable", 503)
+
+            def routes(_connection_id):
+                calls.append("routes")
+                return [{"route_id": "remote-route"}]
+
+            with (
+                mock.patch.object(
+                    runtime.client,
+                    "recover_pairing_attempts",
+                    return_value={"remaining": 0},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "list_connections",
+                    return_value=[active],
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "renew_if_due",
+                    side_effect=fail_renew,
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "peer_health",
+                    side_effect=heartbeat,
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "flush_pending_route_revocations_for_connection",
+                    side_effect=fail_flush,
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "list_remote_routes",
+                    side_effect=routes,
+                ),
+            ):
+                result = runtime.maintenance_once()
+
+            self.assertEqual(calls, ["renew", "heartbeat", "flush", "routes"])
+            self.assertTrue(result["healthy"])
+            self.assertEqual(result["error"], "secure_peer_maintenance_degraded")
+            self.assertNotIn(connection_id, runtime._client_failure_counts)
+            self.assertEqual(
+                runtime._remote_routes_cache[connection_id],
+                [{"route_id": "remote-route"}],
+            )
+            runtime.shutdown()
+
+    def test_revocation_replay_failure_does_not_block_other_peers_or_leases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            first_peer = str(uuid.uuid4())
+            second_peer = str(uuid.uuid4())
+            host_store = mock.Mock()
+            host_store.list_peers.return_value = [
+                {
+                    "peer_id": first_peer,
+                    "team_id": "team-test",
+                    "peer_server_identity": "peer-first",
+                    "status": "revoked",
+                },
+                {
+                    "peer_id": second_peer,
+                    "team_id": "team-test",
+                    "peer_server_identity": "peer-second",
+                    "status": "revoked",
+                },
+            ]
+            adapter = mock.Mock()
+            adapter.active_binding_peer_ids.side_effect = [
+                RuntimeError("corrupt first tombstone"),
+                {second_peer},
+            ]
+            runtime._host_store = host_store
+            runtime._adapter = adapter
+            with (
+                mock.patch.object(
+                    runtime.client,
+                    "recover_pairing_attempts",
+                    return_value={"remaining": 0},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "list_connections",
+                    return_value=[],
+                ),
+            ):
+                result = runtime.maintenance_once()
+
+            adapter.revoke_peer.assert_called_once_with(
+                peer_id=second_peer,
+                team_id="team-test",
+            )
+            adapter.expire_peer_leases.assert_called_once()
+            self.assertFalse(result["active"])
+            runtime.shutdown()
+
+    def test_teamspace_only_connection_skips_cross_chat_route_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            active = self.outgoing_pairing(123)
+            connection_id = active["connection_id"]
+            with (
+                mock.patch.object(
+                    runtime.client,
+                    "recover_pairing_attempts",
+                    return_value={"remaining": 0},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "list_connections",
+                    return_value=[active],
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "flush_pending_route_revocations_for_connection",
+                    return_value=0,
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "renew_if_due",
+                    return_value={"renewed": False},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "peer_health",
+                    return_value={"hub_id": "hub-remote"},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "list_remote_routes",
+                ) as list_remote_routes,
+            ):
+                result = runtime.maintenance_once()
+            list_remote_routes.assert_not_called()
+            self.assertTrue(result["healthy"])
+            self.assertEqual(runtime._remote_routes_cache[connection_id], [])
+            self.assertIsNone(runtime._client_error)
+            runtime.shutdown()
+
+    def test_cross_chat_connection_still_refreshes_remote_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            active = {
+                **self.outgoing_pairing(123),
+                "scopes": ["teamspace.read", "cross_chat.instruction"],
+            }
+            connection_id = active["connection_id"]
+            routes = [{"route_id": "remote-route"}]
+            with (
+                mock.patch.object(
+                    runtime.client,
+                    "recover_pairing_attempts",
+                    return_value={"remaining": 0},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "list_connections",
+                    return_value=[active],
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "flush_pending_route_revocations_for_connection",
+                    return_value=0,
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "renew_if_due",
+                    return_value={"renewed": False},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "peer_health",
+                    return_value={"hub_id": "hub-remote"},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "list_remote_routes",
+                    return_value=routes,
+                ) as list_remote_routes,
+            ):
+                result = runtime.maintenance_once()
+            list_remote_routes.assert_called_once_with(connection_id)
+            self.assertTrue(result["healthy"])
+            self.assertEqual(runtime._remote_routes_cache[connection_id], routes)
+            self.assertIsNone(runtime._client_error)
+            runtime.shutdown()
+
+    def test_revocation_retires_exact_deactivated_connection_not_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            observed = {
+                **self.outgoing_pairing(123),
+                "hub_id": "hub-remote",
+                "certificate_fingerprint": "sha256:" + "d" * 64,
+            }
+            deactivated = {
+                **observed,
+                "status": "deactivated",
+                "active": False,
+                "certificate_fingerprint": "sha256:" + "f" * 64,
+            }
+            replacement = {
+                **self.outgoing_pairing(124),
+                "hub_id": "hub-other",
+                "certificate_fingerprint": "sha256:" + "e" * 64,
+            }
+            with (
+                mock.patch.object(
+                    runtime.client,
+                    "recover_pairing_attempts",
+                    return_value={"remaining": 0},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "list_connections",
+                    side_effect=[[observed], [replacement, deactivated]],
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "flush_pending_route_revocations_for_connection",
+                    return_value=0,
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "renew_if_due",
+                    return_value={"renewed": False},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "peer_health",
+                    side_effect=SecurePeerError(
+                        "peer_revoked",
+                        "Peer authentication is unavailable",
+                        401,
+                    ),
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "remote_revocation_status",
+                    return_value={"status": "revoked"},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "retire_remote_revoked_connection",
+                    return_value={"status": "revoked", "active": False},
+                ) as retire,
+            ):
+                result = runtime.maintenance_once()
+            self.assertEqual(result["error"], "peer_revoked")
+            self.assertTrue(result["active"])
+            retire.assert_called_once_with(
+                observed["connection_id"],
+                expected_host_server_identity="remote_server",
+                expected_hub_id="hub-remote",
+                expected_certificate_fingerprint="sha256:" + "f" * 64,
+            )
+            self.assertNotEqual(
+                retire.call_args.args[0],
+                replacement["connection_id"],
+            )
+            runtime.shutdown()
+
+    def test_revocation_treats_forgotten_connection_as_terminal_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            observed = {
+                **self.outgoing_pairing(123),
+                "hub_id": "hub-remote",
+                "certificate_fingerprint": "sha256:" + "d" * 64,
+            }
+            replacement = {
+                **self.outgoing_pairing(124),
+                "hub_id": "hub-other",
+                "certificate_fingerprint": "sha256:" + "e" * 64,
+            }
+            with (
+                mock.patch.object(
+                    runtime.client,
+                    "list_connections",
+                    return_value=[replacement],
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "retire_remote_revoked_connection",
+                ) as retire,
+            ):
+                result = runtime._retire_remote_revoked_active_connection(
+                    observed,
+                    {"remaining": 0},
+                )
+            self.assertTrue(result["active"])
+            self.assertTrue(result["revoked"])
+            self.assertEqual(
+                result["revoked_connection_id"],
+                observed["connection_id"],
+            )
+            retire.assert_not_called()
+            runtime.shutdown()
+
+    def test_proxy_retires_exact_authenticated_revocation_before_propagating(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            active = {
+                **self.outgoing_pairing(123),
+                "hub_id": "hub-remote",
+                "certificate_fingerprint": "sha256:" + "d" * 64,
+            }
+            renewed = {
+                **active,
+                "certificate_fingerprint": "sha256:" + "e" * 64,
+            }
+            connection_id = active["connection_id"]
+            terminal = SecurePeerError(
+                "peer_revoked",
+                "Peer authentication is unavailable",
+                401,
+            )
+            runtime._remote_routes_cache[connection_id] = [{"route_id": "stale"}]
+            runtime._remote_routes_refreshed_at[connection_id] = 123
+            with (
+                mock.patch.object(
+                    runtime.client,
+                    "list_connections",
+                    side_effect=[[active], [renewed]],
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "proxy",
+                    side_effect=terminal,
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "remote_revocation_status",
+                    return_value={"status": "revoked"},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "retire_remote_revoked_connection",
+                    return_value={"status": "revoked", "active": False},
+                ) as retire,
+                self.assertRaises(SecurePeerError) as propagated,
+            ):
+                runtime.proxy(
+                    connection_id,
+                    "GET",
+                    "/v1/teams",
+                    query="",
+                    headers=None,
+                    body=None,
+                )
+            self.assertIs(propagated.exception, terminal)
+            retire.assert_called_once_with(
+                connection_id,
+                expected_host_server_identity="remote_server",
+                expected_hub_id="hub-remote",
+                expected_certificate_fingerprint="sha256:" + "e" * 64,
+            )
+            self.assertNotIn(connection_id, runtime._remote_routes_cache)
+            self.assertNotIn(connection_id, runtime._remote_routes_refreshed_at)
+            self.assertIsNone(runtime._client_error)
+            runtime.shutdown()
+
+    def test_proxy_never_retires_transient_or_other_unauthorized_errors(self) -> None:
+        failures = (
+            SecurePeerError("peer_revoked", "untrusted status", 503),
+            SecurePeerError("authorization_failed", "Denied", 401),
+            SecurePeerError("transport_failed", "Peer is offline", 502),
+        )
+        for failure in failures:
+            with self.subTest(failure=repr(failure)), tempfile.TemporaryDirectory() as temporary:
+                runtime = SecurePeerRuntime(
+                    Path(temporary) / "secure-peers",
+                    server_identity="server_identity_test",
+                    server_instance_id="server_instance_test",
+                    display_name="Test server",
+                )
+                active = {
+                    **self.outgoing_pairing(123),
+                    "hub_id": "hub-remote",
+                    "certificate_fingerprint": "sha256:" + "d" * 64,
+                }
+                with (
+                    mock.patch.object(
+                        runtime.client,
+                        "list_connections",
+                        return_value=[active],
+                    ),
+                    mock.patch.object(
+                        runtime.client,
+                        "proxy",
+                        side_effect=failure,
+                    ),
+                    mock.patch.object(
+                        runtime.client,
+                        "retire_remote_revoked_connection",
+                    ) as retire,
+                    self.assertRaises(SecurePeerError) as propagated,
+                ):
+                    runtime.proxy(
+                        active["connection_id"],
+                        "GET",
+                        "/v1/teams",
+                        query="",
+                        headers=None,
+                        body=None,
+                    )
+                self.assertIs(propagated.exception, failure)
+                retire.assert_not_called()
+                runtime.shutdown()
+
+    def test_proxy_keeps_local_trust_when_status_says_peer_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            active = {
+                **self.outgoing_pairing(123),
+                "hub_id": "hub-remote",
+                "certificate_fingerprint": "sha256:" + "d" * 64,
+            }
+            failure = SecurePeerError(
+                "peer_revoked",
+                "Peer authentication is unavailable",
+                401,
+            )
+            with (
+                mock.patch.object(
+                    runtime.client,
+                    "list_connections",
+                    return_value=[active],
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "proxy",
+                    side_effect=failure,
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "remote_revocation_status",
+                    return_value={"status": "active"},
+                ) as status,
+                mock.patch.object(
+                    runtime.client,
+                    "retire_remote_revoked_connection",
+                ) as retire,
+                self.assertRaises(SecurePeerError) as propagated,
+            ):
+                runtime.proxy(
+                    active["connection_id"],
+                    "GET",
+                    "/v1/teams",
+                    query="",
+                    headers=None,
+                    body=None,
+                )
+
+            self.assertIs(propagated.exception, failure)
+            status.assert_called_once_with(active["connection_id"])
+            retire.assert_not_called()
+            runtime.shutdown()
+
+    def test_client_submit_uses_atomic_local_route_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            self.assertTrue(runtime.state_available())
+            self.assertIsNone(runtime.state_error_code())
+            connection_id = str(uuid.uuid4())
+            source_route_id = str(uuid.uuid4())
+            target_route_id = str(uuid.uuid4())
+            request_id = str(uuid.uuid4())
+            revision = "rev_" + "a" * 32
+            expires_at = 2_000_000_000
+            calls: list[dict] = []
+
+            class Client:
+                def submit_envelope(self, *_args, **_kwargs):
+                    raise AssertionError("raw relay submit must not be used")
+
+                def submit_envelope_from_published_route(
+                    self, connection, **kwargs
+                ):
+                    calls.append({"connection": connection, **kwargs})
+                    return {
+                        "envelope_id": str(uuid.uuid4()),
+                        "exchange_id": str(uuid.uuid4()),
+                        "status": "queued",
+                        "used_legs": 1,
+                        "max_legs": 6,
+                        "expires_at": expires_at,
+                    }
+
+            runtime.client = Client()
+            snapshot = {
+                "role": "client",
+                "connection_id": connection_id,
+                "source_server_identity": "server_identity_test",
+                "source_chat_id": "chat-source",
+                "source_route_id": source_route_id,
+                "source_route_revision": revision,
+                "target_server_identity": "server_remote",
+                "target_route_id": target_route_id,
+                "target_route_revision": "rev_" + "b" * 32,
+                "action": "instruction",
+            }
+            published = {
+                "connection_id": connection_id,
+                "chat_id": "chat-source",
+                "route_id": source_route_id,
+                "revision": revision,
+                "status": "active",
+                "actions": ["instruction"],
+            }
+            with (
+                mock.patch.object(
+                    runtime, "remote_route_delivery_available", return_value=True
+                ),
+                mock.patch.object(runtime, "_client_delivery_ready", return_value=True),
+                mock.patch.object(
+                    runtime,
+                    "_client_connection",
+                    return_value={"connection_id": connection_id},
+                ),
+                mock.patch.object(
+                    runtime, "_published_routes", return_value=[published]
+                ),
+            ):
+                response = runtime.submit_remote_handoff(
+                    snapshot,
+                    body="hello",
+                    action="instruction",
+                    request_id=request_id,
+                    expires_at=expires_at,
+                    expected_used_legs=1,
+                )
+            self.assertEqual(response["used_legs"], 1)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["connection"], connection_id)
+            self.assertEqual(calls[0]["source_route_id"], source_route_id)
+            self.assertEqual(calls[0]["source_route_revision"], revision)
+            self.assertEqual(calls[0]["source_chat_id"], "chat-source")
+            self.assertEqual(calls[0]["action"], "instruction")
+            runtime.shutdown()
+
+    def test_corrupt_optional_state_is_quarantined_without_blocking_server(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "secure-peers"
+            root.mkdir(mode=0o700)
+            config = root / "host-config.json"
+            config.write_text("not-json", encoding="utf-8")
+            os.chmod(config, 0o600)
+
+            runtime = SecurePeerRuntime(
+                root,
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            status = runtime.status()
+            self.assertFalse(runtime.state_available())
+            self.assertEqual(
+                runtime.state_error_code(), "secure_peer_state_unavailable"
+            )
+            self.assertFalse(status["host"]["available"])
+            self.assertFalse(status["host"]["enabled"])
+            self.assertIsNone(status["active_connection_id"])
+            self.assertIn("safety validation", status["host"]["error"])
+            self.assertFalse(runtime.remote_route_delivery_available())
+            with self.assertRaises(SecurePeerError) as raised:
+                runtime.begin_pairing(
+                    host="192.0.2.10",
+                    port=7851,
+                    expected_ca_fingerprint=None,
+                    request_id="52e36f23-50ff-42c7-aec8-269e0419cb06",
+                    display_name="Peer",
+                    requested_scopes=["teamspace.read"],
+                )
+            self.assertEqual(raised.exception.code, "secure_peer_state_unavailable")
+            runtime.shutdown()
+
+    def test_pending_outbound_fences_route_chat_and_connection_retirement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            connection_id = str(uuid.uuid4())
+            route_id = str(uuid.uuid4())
+            revision = "rev_" + "a" * 32
+            snapshot = {
+                "version": 1,
+                "role": "client",
+                "connection_id": connection_id,
+                "source_server_identity": "server_identity_test",
+                "source_chat_id": "chat-source",
+                "source_route_id": route_id,
+                "source_route_revision": revision,
+                "target_server_identity": "server_remote",
+                "target_route_id": str(uuid.uuid4()),
+                "target_route_revision": "rev_" + "b" * 32,
+                "action": "instruction",
+            }
+            route = {
+                "connection_id": connection_id,
+                "chat_id": "chat-source",
+                "route_id": route_id,
+                "revision": revision,
+                "status": "active",
+                "actions": ["instruction"],
+            }
+            with mock.patch.object(runtime, "_published_routes", return_value=[route]):
+                runtime.prepare_outbound_handoff(
+                    request_id=str(uuid.uuid4()),
+                    source_session_id="chat-source",
+                    source_run_id="run-source",
+                    snapshot=snapshot,
+                    body="deliver me",
+                    action="instruction",
+                    expires_at=2_000_000_000,
+                )
+            with self.assertRaises(SecurePeerError) as chat_blocked:
+                runtime.revoke_routes_for_chat("chat-source")
+            self.assertEqual(chat_blocked.exception.code, "outbound_handoff_pending")
+            with self.assertRaises(SecurePeerError) as route_blocked:
+                runtime.revoke_route(
+                    route_id=route_id,
+                    expected_connection_id=connection_id,
+                    expected_revision=revision,
+                    idempotency_key=str(uuid.uuid4()),
+                )
+            self.assertEqual(route_blocked.exception.code, "outbound_handoff_pending")
+            with self.assertRaises(SecurePeerError) as connection_blocked:
+                runtime.deactivate_connection(
+                    connection_id,
+                    expected_host_server_identity="server_remote",
+                    expected_hub_id="hub_remote",
+                )
+            self.assertEqual(
+                connection_blocked.exception.code,
+                "connection_delivery_pending",
+            )
+            replacement_id = str(uuid.uuid4())
+            with (
+                mock.patch.object(
+                    runtime,
+                    "_outgoing_for_pairing",
+                    return_value={
+                        "connection_id": replacement_id,
+                        "host_server_identity": "server-replacement",
+                        "hub_id": "hub-replacement",
+                    },
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "list_connections",
+                    return_value=[
+                        {"connection_id": connection_id, "active": True}
+                    ],
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "set_active_connection",
+                ) as set_active,
+            ):
+                with self.assertRaises(SecurePeerError) as switch_blocked:
+                    runtime.activate_pairing(
+                        str(uuid.uuid4()),
+                        expected_connection_id=replacement_id,
+                        expected_host_server_identity="server-replacement",
+                        expected_hub_id="hub-replacement",
+                    )
+                self.assertEqual(
+                    switch_blocked.exception.code,
+                    "active_connection_conflict",
+                )
+                set_active.assert_not_called()
+            runtime.shutdown()
+
+    def test_begin_pairing_resumes_matching_persisted_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            outgoing = self.outgoing_pairing(123)
+            with mock.patch.object(
+                runtime.client,
+                "begin_pairing",
+                return_value=outgoing,
+            ) as begin:
+                result = runtime.begin_pairing(
+                    host="192.0.2.20",
+                    port=7851,
+                    expected_ca_fingerprint=None,
+                    request_id=str(uuid.uuid4()),
+                    display_name="Test server",
+                    requested_scopes=["teamspace.read"],
+                )
+            self.assertEqual(result["connection_id"], outgoing["connection_id"])
+            self.assertTrue(begin.call_args.kwargs["resume_matching"])
+            runtime.shutdown()
+
+    def test_publishing_route_can_be_resolved_for_cancel(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            connection_id = str(uuid.uuid4())
+            route_id = str(uuid.uuid4())
+            revision = "rev_" + "8" * 32
+            with mock.patch.object(
+                runtime,
+                "_published_routes",
+                return_value=[{
+                    "route_id": route_id,
+                    "connection_id": connection_id,
+                    "revision": revision,
+                    "chat_id": "chat-publishing",
+                    "status": "publishing",
+                }],
+            ):
+                self.assertEqual(
+                    runtime.route_local_chat(
+                        route_id=route_id,
+                        expected_connection_id=connection_id,
+                        expected_revision=revision,
+                    ),
+                    "chat-publishing",
+                )
+            runtime.shutdown()
+
+    def test_client_claim_prepare_linearizes_deactivate_and_forget(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            connection_id = str(uuid.uuid4())
+            entered = threading.Event()
+            release = threading.Event()
+            envelope = {
+                "envelope_id": str(uuid.uuid4()),
+                "request_id": str(uuid.uuid4()),
+                "team_id": str(uuid.uuid4()),
+                "source_peer_id": str(uuid.uuid4()),
+                "source_server_identity": "server_remote",
+                "source_route_id": str(uuid.uuid4()),
+                "source_route_revision": "rev_" + "1" * 32,
+                "target_peer_id": None,
+                "target_server_identity": "server_identity_test",
+                "target_route_id": str(uuid.uuid4()),
+                "target_route_revision": "rev_" + "2" * 32,
+                "action": "instruction",
+                "kind": "instruction",
+                "exchange_id": str(uuid.uuid4()),
+                "parent_envelope_id": None,
+                "parent_leg": None,
+                "used_legs": 1,
+                "max_legs": 6,
+                "expires_at": 2_000_000_000,
+                "body": {"message": "deliver"},
+            }
+
+            def claim(*_args, **_kwargs):
+                entered.set()
+                self.assertTrue(release.wait(5))
+                return {"lease_token": "lease-token", "envelopes": [envelope]}
+
+            claim_result: list[dict] = []
+            retirement_errors: list[BaseException] = []
+            with (
+                mock.patch.object(
+                    runtime, "remote_route_delivery_available", return_value=True
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "list_connections",
+                    return_value=[{"connection_id": connection_id, "active": True}],
+                ),
+                mock.patch.object(runtime.client, "claim_inbox", side_effect=claim),
+                mock.patch.object(
+                    runtime,
+                    "_resolve_claim_target",
+                    return_value=("target-chat", envelope["team_id"]),
+                ),
+            ):
+                claim_thread = threading.Thread(
+                    target=lambda: claim_result.extend(
+                        runtime.claim_deliveries_once(limit=1)
+                    )
+                )
+
+                def deactivate() -> None:
+                    try:
+                        runtime.deactivate_connection(
+                            connection_id,
+                            expected_host_server_identity="server_remote",
+                            expected_hub_id="hub_remote",
+                        )
+                    except BaseException as exc:
+                        retirement_errors.append(exc)
+
+                retirement_thread = threading.Thread(target=deactivate)
+                claim_thread.start()
+                self.assertTrue(entered.wait(5))
+                retirement_thread.start()
+                self.assertTrue(retirement_thread.is_alive())
+                release.set()
+                claim_thread.join(5)
+                retirement_thread.join(5)
+
+            self.assertEqual(len(claim_result), 1)
+            self.assertEqual(len(retirement_errors), 1)
+            self.assertIsInstance(retirement_errors[0], SecurePeerError)
+            self.assertEqual(
+                retirement_errors[0].code,
+                "connection_delivery_pending",
+            )
+            with self.assertRaises(SecurePeerError) as forgetting:
+                runtime.forget_connection(
+                    connection_id,
+                    expected_host_server_identity="server_remote",
+                    expected_hub_id="hub_remote",
+                    expected_certificate_fingerprint="sha256:" + "f" * 64,
+                )
+            self.assertEqual(forgetting.exception.code, "connection_delivery_pending")
+            runtime.shutdown()
+
+    def test_expired_prepared_delivery_is_terminalized_without_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            envelope_id = "env_expired_prepared"
+            runtime.delivery_ledger.prepare(
+                {
+                    "envelope_id": envelope_id,
+                    "request_id": str(uuid.uuid4()),
+                    "team_id": "team-test",
+                    "source_peer_id": str(uuid.uuid4()),
+                    "source_server_identity": "server-source",
+                    "source_route_id": str(uuid.uuid4()),
+                    "source_route_revision": "rev_" + "1" * 32,
+                    "target_peer_id": None,
+                    "target_server_identity": "server_identity_test",
+                    "target_route_id": str(uuid.uuid4()),
+                    "target_route_revision": "rev_" + "2" * 32,
+                    "action": "instruction",
+                    "kind": "instruction",
+                    "exchange_id": str(uuid.uuid4()),
+                    "parent_envelope_id": None,
+                    "parent_leg": None,
+                    "used_legs": 1,
+                    "max_legs": 6,
+                    "expires_at": 1,
+                    "body": {"message": "expired"},
+                },
+                transport_role="client",
+                connection_id=str(uuid.uuid4()),
+                lease_token="lease." + "a" * 43,
+                target_chat_id="chat-target",
+            )
+            self.assertEqual(runtime.recover_prepared_deliveries(), [])
+            self.assertEqual(runtime.delivery(envelope_id)["state"], "failed")
+            runtime.shutdown()
+
+
+if __name__ == "__main__":
+    unittest.main()

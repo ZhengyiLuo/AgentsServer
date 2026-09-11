@@ -219,7 +219,7 @@ class CodexHistoryMetadataTests(unittest.IsolatedAsyncioTestCase):
             imported = self.parse([assistant("Imported progress", phase="commentary")])
             self.assertEqual(self.ns["unsynced_history_items"]("chat", imported, timeline_through_seq=3), [])
             keys, _, _ = self.ns["history_timeline_message_keys"]("chat", timeline_after_seq=0, timeline_through_seq=3, tail=False, include_imported=False)
-            self.assertEqual(keys, [(1, ("assistant", "Public progress"))])
+        self.assertEqual(keys, [(1, self.ns["history_dedup_key"]("assistant", "Public progress"))])
 
     def test_persistence_preserves_aware_timestamp_instead_of_import_time(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -229,6 +229,31 @@ class CodexHistoryMetadataTests(unittest.IsolatedAsyncioTestCase):
                     ("reasoning_summary", {"phase": "commentary", "ts": STAMP, "imported": True, "text": "Progress"}),
                 ])
                 self.assertEqual(json.loads(path.read_text())["ts"], STAMP)
+
+    def test_native_public_progress_without_backend_does_not_reimport(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            self.ns["events_path"] = lambda chat: path
+            events = [
+                ("reasoning_summary", {"phase": "commentary", "text": "First update"}),
+                ("reasoning_summary", {"backend": None, "phase": "commentary", "text": "Second update"}),
+                ("reasoning_summary", {"text": "Private thinking"}),
+                ("reasoning_summary", {"backend": "unknown", "phase": "commentary", "text": "Foreign backend"}),
+                ("assistant_text", {"backend": "codex", "text": "Final response"}),
+            ]
+            self.ns["append_durable_event_batch_sync"](path, "chat", 1, events)
+            self.ns["last_event_seq_from_file"] = lambda _: len(events)
+            parsed = self.parse([
+                assistant("First update", phase="commentary"),
+                assistant("Second update", phase="commentary"),
+                assistant("Final response", phase="final_answer"),
+            ])
+            fresh, through = self.ns["reconcile_cursor_history_items"](
+                "chat", parsed, timeline_after_seq=0, timeline_through_seq=len(events))
+            self.assertEqual((fresh, through), ([], len(events)))
+            keys, _, _ = self.ns["history_timeline_message_keys"](
+                "chat", timeline_after_seq=0, timeline_through_seq=len(events), tail=False, include_imported=False)
+            self.assertEqual([seq for seq, _key in keys], [1, 2, 5])
 
 
 if __name__ == "__main__":

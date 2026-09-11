@@ -952,7 +952,10 @@ recipient starts a normal turn; a busy recipient receives a normal queued
 message. `respond-current` explicitly sends another message on the exact
 reverse pair. Ordinary final answers are never forwarded automatically, and
 there is no reply obligation, exchange leg budget, or one-use route permission.
-The existing message-size and rolling rate limits still apply.
+Saved routes and configured-route messages have no count or hourly quota;
+message-size bounds remain. Provider discovery uses bounded cursor pages, not
+a permission limit. The existing per-message reference input bound and legacy
+exchange budgets remain separate from permanent pair permission.
 
 The desktop receives `chat_conversation_message_*` lifecycle events keyed by
 the message envelope, shows the sender's card at acceptance, and shows an

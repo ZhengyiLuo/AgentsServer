@@ -409,10 +409,9 @@ sys.exit(10)
             host = next(server for server in projection["servers"] if server["is_host"])
             self.assertEqual(host["display_name"], "Sonic")
             self.assertEqual(host["recipient_display_name"], "Sonic")
-            self.assertEqual(
-                migrated.get_network_server(claims, team_id, host["id"])["server"],
-                host,
-            )
+            exact_server = migrated.get_network_server(claims, team_id, host["id"])["server"]
+            self.assertRegex(exact_server.pop("mail_route_lifecycle_id"), r"^[0-9a-f]{64}$")
+            self.assertEqual(exact_server, host)
 
             connection = migrated.connect()
             try:
@@ -734,6 +733,7 @@ sys.exit(10)
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             connection.execute("BEGIN IMMEDIATE")
             for trigger in (
+                "team_mail_arrival_on_server_recipient",
                 "team_message_revisions_are_immutable",
                 "team_message_revisions_cannot_be_deleted",
                 "network_agents_limit_per_server",
@@ -747,6 +747,8 @@ sys.exit(10)
             ):
                 connection.execute(f"DROP TRIGGER {trigger}")
             for index in (
+                "team_mail_server_arrival_lookup",
+                "team_messages_parent_order",
                 "team_message_revisions_by_message",
                 "team_message_revisions_by_team",
                 "device_sessions_human_created_id_idx",
@@ -756,6 +758,7 @@ sys.exit(10)
             ):
                 connection.execute(f"DROP INDEX {index}")
             for table in (
+                "team_mail_arrivals",
                 "team_message_revisions",
                 "network_content_deletions",
                 "human_admin_page_entries",
@@ -794,6 +797,7 @@ sys.exit(10)
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_insert")
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_update")
             for trigger in (
+                "team_mail_arrival_on_server_recipient",
                 "team_message_revisions_are_immutable",
                 "team_message_revisions_cannot_be_deleted",
                 "human_admin_page_device_session_insert",
@@ -804,6 +808,8 @@ sys.exit(10)
             ):
                 connection.execute(f"DROP TRIGGER {trigger}")
             for index in (
+                "team_mail_server_arrival_lookup",
+                "team_messages_parent_order",
                 "team_message_revisions_by_message",
                 "team_message_revisions_by_team",
                 "device_sessions_human_created_id_idx",
@@ -813,6 +819,7 @@ sys.exit(10)
             ):
                 connection.execute(f"DROP INDEX {index}")
             for table in (
+                "team_mail_arrivals",
                 "team_message_revisions",
                 "network_content_deletions",
                 "human_admin_page_entries",

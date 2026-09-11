@@ -157,7 +157,9 @@ class ClaudeHistoryProvenanceTests(unittest.TestCase):
 
     def test_content_reconciliation_retains_unmatched_item_metadata(self) -> None:
         items = [self.projection["claude_history_event_item"](source_event()), self.projection["claude_history_event_item"](source_event("assistant", "Reply"))]
-        self.projection["history_timeline_message_keys"] = Mock(return_value=([(7, ("user", "Real conversation"))], True, False))
+        self.projection["history_timeline_message_keys"] = Mock(return_value=([
+            (7, self.projection["history_dedup_key"]("user", "Real conversation")),
+        ], True, False))
         fresh, consumed = self.projection["reconcile_cursor_history_items"]("chat", items, timeline_after_seq=1, timeline_through_seq=8)
         self.assertEqual(fresh, [items[1]])
         self.assertIs(fresh[0], items[1])

@@ -1,5 +1,6 @@
 """Accepted goal follow-ups remain human history without owning new runs."""
 from copy import deepcopy
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -71,9 +72,25 @@ class GoalFollowupProjectionTests(unittest.TestCase):
         self.assertTrue(present)
         self.assertFalse(truncated)
         self.assertEqual([seq for seq, (role, _) in keys if role == "user"], [3, 6])
-        self.assertEqual([text for _, (role, text) in keys if role == "user"], [
-            "Keep working, including the new failure.", "One more clarification",
+        followup_texts = ["Keep working, including the new failure.", "One more clarification"]
+        self.assertEqual([digest for _, (role, digest) in keys if role == "user"], [
+            hashlib.sha256(" ".join(text.split()).encode("utf-8")).hexdigest()
+            for text in followup_texts
         ])
+        provider_items = [
+            {"kind": "user", "text": followup_texts[0]},
+            {"kind": "assistant", "text": "Continuing after your follow-up"},
+            {"kind": "assistant", "text": "Updated answer"},
+            {"kind": "user", "text": followup_texts[1]},
+            {"kind": "assistant", "text": "Latest answer"},
+            # The same text sent again is a new occurrence, not another credit.
+            {"kind": "user", "text": followup_texts[0]},
+        ]
+        fresh, consumed_seq = ns["reconcile_cursor_history_items"](
+            "chat", provider_items, timeline_after_seq=2, timeline_through_seq=8,
+        )
+        self.assertEqual(fresh, provider_items[-1:])
+        self.assertEqual(consumed_seq, 8)
 
     def test_append_to_warm_index_matches_cold_reopen(self):
         self.write(self.events[:2])

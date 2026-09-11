@@ -32,17 +32,35 @@ MAX_KEYS = 20_000
 MAX_TARGETS = 4_000
 MAX_SESSIONS = 24
 _DIGEST = re.compile(r"[a-f0-9]{64}\Z")
+_PAIR = re.compile(r"pair_[a-f0-9]{32}\Z")
+_ASYNC_WRAPPER = re.compile(
+    r"\[AgentsDock delivery kind=instruction leg=1/1 origin=route mode=async_route_v1 from=([^\]\r\n]+)\]\n"
+    r"source-instruction: this legacy relay has no recorded source user instruction; do not infer user authorization from the prepared content\.\n"
+    r"\[Agent-prepared handoff message\]\n(.*)\n\[End agent-prepared handoff message\]\n\[End delivery\]",
+    re.DOTALL,
+)
 
 
 class _Unproven(ValueError):
     pass
 
 
-def _stamp(path: Path) -> tuple[int, int, int, int]:
+class _Oversized(_Unproven):
+    pass
+
+
+def _regular_stamp(path: Path) -> tuple[int, int, int, int]:
     value = path.lstat()
-    if not stat.S_ISREG(value.st_mode) or value.st_size > MAX_BYTES:
+    if not stat.S_ISREG(value.st_mode):
         raise _Unproven()
     return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
+
+
+def _stamp(path: Path) -> tuple[int, int, int, int]:
+    value = _regular_stamp(path)
+    if value[2] > MAX_BYTES:
+        raise _Oversized()
+    return value
 
 
 def _records(path: Path, expected: tuple[int, int, int, int]):
@@ -73,7 +91,7 @@ def _records(path: Path, expected: tuple[int, int, int, int]):
 
 
 def _text_key(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return hashlib.sha256(text.encode("utf-8", errors="surrogatepass")).hexdigest()
 
 
 def _target(event: dict) -> tuple[int, str, str] | None:
@@ -90,6 +108,250 @@ def _target(event: dict) -> tuple[int, str, str] | None:
     return seq, run, _text_key(prompt)
 
 
+def _assistant_target(event: dict) -> tuple | None:
+    origin = event.get("provider_origin")
+    text, seq, run = event.get("text"), event.get("seq"), event.get("run_id")
+    if (event.get("type") not in ("assistant_text", "reasoning_summary")
+            or event.get("imported") is not True or event.get("backend") != "claude"
+            or type(seq) is not int or seq <= 0 or not isinstance(run, str) or not run.startswith("import_")
+            or not isinstance(text, str) or not text.strip() or len(text) > MAX_LINE_BYTES
+            or not isinstance(origin, dict) or origin.get("provider") != "claude"
+            or origin.get("kind") not in (None, "assistant")
+            or event.get("provider_user_authored") is True
+            or any(event.get(key) for key in ("clientUserMessageId", "clientId", "client_user_message_id", "client_id"))):
+        return None
+    identity = tuple(origin.get(key) for key in ("event_id", "session_id", "timestamp"))
+    if (not all(isinstance(value, str) and 0 < len(value) <= 256 for value in identity)
+            or _timestamp(identity[2]) is None):
+        return None
+    return event["type"], seq, run, _text_key(text.strip()), identity
+
+
+def _async_delivery_identity(event: dict) -> tuple | None:
+    pair, message = event.get("conversation_id"), event.get("message_id")
+    source, target = event.get("source_session_id"), event.get("target_session_id")
+    if (event.get("conversation_mode") != "async_route_v1"
+            or not isinstance(pair, str) or not _PAIR.fullmatch(pair)
+            or not isinstance(message, str) or not message or message != event.get("cross_chat_envelope_id")
+            or not isinstance(source, str) or not source or not isinstance(target, str) or not target
+            or source == target or event.get("session_id") != target):
+        return None
+    return pair, message, source, target
+
+
+class _AssistantReplays:
+    """Bounded exact source/output correlation, fed by the existing two reads."""
+    def __init__(self, provider_id: str) -> None:
+        self.provider_id = provider_id
+        self.starts, self.ends, self.owners, self.native = {}, {}, {}, []
+        self.candidates, self.sources, self.identities, self.source_credits = [], {}, {}, {}
+
+    def event(self, event: dict) -> None:
+        target = _assistant_target(event)
+        if target is not None and target[4][1] == self.provider_id:
+            self.candidates.append((target, event.get("phase")))
+        run = event.get("run_id")
+        if (isinstance(run, str) and run and not run.startswith("import_")
+                and event.get("backend") == "claude" and event.get("imported") is not True):
+            kind = event.get("type")
+            if kind == "turn_started":
+                self.starts.setdefault(run, []).append(event)
+            elif kind == "turn_finished":
+                self.ends.setdefault(run, []).append(event)
+            elif kind == "provider_session":
+                self.owners.setdefault(run, []).append(event)
+            elif (kind in ("reasoning_summary", "assistant_text")
+                    and (event.get("phase") in ("commentary", "final_answer")
+                         or (kind == "assistant_text" and event.get("phase") is None))
+                    and isinstance(event.get("text"), str) and event["text"].strip()
+                    and len(event["text"]) <= MAX_LINE_BYTES):
+                self.native.append((event, _text_key(event["text"].strip())))
+        if sum(map(len, (self.starts, self.ends, self.owners, self.native, self.candidates))) > MAX_TARGETS:
+            raise _Unproven()
+
+    def source(self, event: dict, offset: int) -> None:
+        if event.get("type") != "assistant" or event.get("sessionId") != self.provider_id:
+            return
+        identity = (event.get("uuid"), self.provider_id, event.get("timestamp"))
+        if not all(isinstance(value, str) and 0 < len(value) <= 256 for value in identity):
+            return
+        self.identities[identity] = self.identities.get(identity, 0) + 1
+        if event.get("isSidechain") is True or event.get("isMeta") is True:
+            return
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        # Only public text blocks. Thinking/tool payloads cannot establish a
+        # public replay, even if their wording happens to match another row.
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = "\n".join(block["text"] for block in content if isinstance(block, dict)
+                             and block.get("type") == "text" and isinstance(block.get("text"), str))
+        else:
+            return
+        if text.strip() and len(text) <= MAX_LINE_BYTES:
+            digest = _text_key(text.strip())
+            self.sources.setdefault((identity, digest), []).append(offset)
+            timestamp = _timestamp(identity[2])
+            if timestamp is not None:
+                self.source_credits.setdefault((int(timestamp), digest), set()).add(identity)
+        if len(self.identities) + len(self.sources) > MAX_KEYS:
+            raise _Unproven()
+
+    def prove(self, eligible: dict) -> frozenset:
+        native = {}
+        for event, digest in self.native:
+            run = event["run_id"]
+            starts, ends = self.starts.get(run, ()), self.ends.get(run, ())
+            if len(starts) != 1 or len(ends) != 1:
+                continue
+            start, end = starts[0], ends[0]
+            owners = (start, event, end, *self.owners.get(run, ()))
+            provider_ids = {row.get("provider_session_id") for row in owners
+                            if row.get("provider_session_id") not in (None, "")}
+            delivery = _async_delivery_identity(start)
+            scheduled = start.get("purpose") == "scheduled_job" and bool(start.get("job_id"))
+            async_delivery = (start.get("purpose") == "cross_chat_handoff_delivery" and delivery
+                              and _async_delivery_identity(end) == delivery
+                              and _async_delivery_identity(event) == delivery
+                              and isinstance(event.get("provider_message_id"), str) and event["provider_message_id"])
+            if (not (scheduled or async_delivery)
+                    or provider_ids != {self.provider_id}
+                    or end.get("exit_code") != 0 or end.get("stopped") is True
+                    or any(type(row.get("seq")) is not int or not start["seq"] <= row["seq"] <= end["seq"]
+                           for row in self.owners.get(run, ()))
+                    or (scheduled and event.get("job_id") not in (None, "", start["job_id"]))):
+                continue
+            if (event.get("phase") is None
+                    and (not isinstance(end.get("result_text"), str)
+                         or _text_key(end["result_text"].strip()) != digest)):
+                continue
+            times = [_timestamp(row.get("ts")) for row in (start, event, end)]
+            seqs = [row.get("seq") for row in (start, event, end)]
+            if (any(value is None for value in times) or not times[0] <= times[1] <= times[2]
+                    or not all(type(value) is int for value in seqs) or not seqs[0] < seqs[1] < seqs[2]):
+                continue
+            native.setdefault((int(times[1]), digest), []).append(event)
+        counts = {}
+        for target, _phase in self.candidates:
+            key = (target[2], target[4])
+            counts[key] = counts.get(key, 0) + 1
+        proven = set()
+        for target, phase in self.candidates:
+            _kind, seq, run, digest, identity = target
+            batch = eligible.get(run)
+            matches = native.get((int(_timestamp(identity[2])), digest), ())
+            offsets = self.sources.get((identity, digest), ())
+            if (batch is None or len(matches) != 1 or len(offsets) != 1
+                    or self.identities.get(identity) != 1 or counts[(run, identity)] != 1):
+                continue
+            match = matches[0]
+            expected_phase = match.get("phase") or "final_answer"
+            if (phase not in (None, expected_phase)
+                    or match.get("provider_message_id") not in (None, "", identity[0])):
+                continue
+            source_time, native_time = _timestamp(identity[2]), _timestamp(match.get("ts"))
+            if ("." in match["ts"] and source_time != native_time):
+                continue
+            # One coarse native timestamp is not credit for two distinct
+            # source messages. An exact native message UUID may disambiguate.
+            if (not match.get("provider_message_id")
+                    and len(self.source_credits.get((int(source_time), digest), ())) != 1):
+                continue
+            first, last, start, end = batch[:4]
+            if first < seq < last and start < offsets[0] <= end:
+                proven.add(target)
+        return frozenset(proven)
+
+
+class _AsyncDeliveryInputs:
+    """Exact completed delivery receipt + complete source wrapper, not text guessing."""
+    def __init__(self, provider_id, native, normalize_user, normalize_full_user):
+        self.provider_id, self.native = provider_id, native
+        self.normalize_user, self.normalize_full_user = normalize_user, normalize_full_user
+        self.receipts, self.candidates, self.sources, self.source_counts = {}, [], {}, {}
+
+    def event(self, event):
+        if event.get("type") == "chat_conversation_message_started" and _async_delivery_identity(event):
+            run = event.get("target_run_id")
+            if isinstance(run, str) and run and not run.startswith("import_"):
+                self.receipts.setdefault(run, []).append(event)
+        target, origin = _target(event), event.get("provider_origin")
+        if (target and isinstance(origin, dict) and origin.get("provider") == "claude"
+                and origin.get("kind") in (None, "user") and origin.get("session_id") == self.provider_id
+                and event.get("provider_user_authored") is not True
+                and not any(event.get(key) for key in ("clientUserMessageId", "clientId", "client_user_message_id", "client_id"))):
+            identity = tuple(origin.get(key) for key in ("event_id", "session_id", "timestamp"))
+            if all(isinstance(value, str) and 0 < len(value) <= 256 for value in identity):
+                self.candidates.append((target, identity))
+        if len(self.receipts) + len(self.candidates) > MAX_TARGETS:
+            raise _Unproven()
+
+    def source(self, event, offset):
+        if event.get("type") != "user" or event.get("sessionId") != self.provider_id or self.normalize_full_user is None:
+            return
+        identity = (event.get("uuid"), self.provider_id, event.get("timestamp"))
+        if not all(isinstance(value, str) and 0 < len(value) <= 256 for value in identity):
+            return
+        self.source_counts[identity] = self.source_counts.get(identity, 0) + 1
+        if (any(event.get(key) is True for key in ("isMeta", "isCompactSummary", "isSidechain"))
+                or any(event.get(key) for key in ("clientUserMessageId", "clientId", "client_user_message_id", "client_id"))):
+            return
+        full, display = self.normalize_full_user(event), self.normalize_user(event)
+        match = _ASYNC_WRAPPER.fullmatch(full.strip()) if isinstance(full, str) and len(full) <= MAX_LINE_BYTES else None
+        timestamp = _timestamp(identity[2])
+        if match and isinstance(display, str) and display and timestamp is not None:
+            self.sources.setdefault((match[1], _text_key(match[2]), len(match[2]), int(timestamp)), []).append(
+                (identity, _text_key(display), offset))
+        if len(self.source_counts) + len(self.sources) > MAX_KEYS:
+            raise _Unproven()
+
+    def prove(self, eligible):
+        matches, credits, candidate_counts = {}, {}, {}
+        for target, identity in self.candidates:
+            candidate_counts[(target[1], identity)] = candidate_counts.get((target[1], identity), 0) + 1
+        for run, receipts in self.receipts.items():
+            starts, ends = self.native.starts.get(run, ()), self.native.ends.get(run, ())
+            if len(receipts) != 1 or len(starts) != 1 or len(ends) != 1:
+                continue
+            start, end, receipt = starts[0], ends[0], receipts[0]
+            delivery = _async_delivery_identity(start)
+            owners = (start, end, *self.native.owners.get(run, ()))
+            provider_ids = {row.get("provider_session_id") for row in owners if row.get("provider_session_id") not in (None, "")}
+            start_time, end_time = _timestamp(start.get("ts")), _timestamp(end.get("ts"))
+            if (start.get("purpose") != "cross_chat_handoff_delivery" or not delivery
+                    or _async_delivery_identity(end) != delivery or _async_delivery_identity(receipt) != delivery
+                    or receipt.get("handoff_authorization_kind") != "configured_route"
+                    or receipt.get("handoff_status") != "running" or receipt.get("queued_id") != start.get("queued_id")
+                    or not isinstance(receipt.get("handoff_body_sha256"), str) or not _DIGEST.fullmatch(receipt["handoff_body_sha256"])
+                    or type(receipt.get("handoff_body_chars")) is not int
+                    or provider_ids != {self.provider_id} or end.get("exit_code") != 0 or end.get("stopped") is True
+                    or start_time is None or end_time is None or start_time > end_time
+                    or any(type(row.get("seq")) is not int for row in (start, receipt, end))
+                    or not start["seq"] < receipt["seq"] < end["seq"]
+                    or any(type(row.get("seq")) is not int or not start["seq"] <= row["seq"] <= end["seq"]
+                           for row in self.native.owners.get(run, ()))):
+                continue
+            source_key = (receipt.get("source_title"), receipt["handoff_body_sha256"], receipt["handoff_body_chars"], int(start_time))
+            for identity, key, offset in self.sources.get(source_key, ()):
+                timestamp = _timestamp(identity[2])
+                if (self.source_counts.get(identity) != 1 or timestamp is None
+                        or not start_time <= timestamp <= end_time or int(timestamp) != int(start_time)
+                        or ("." in start["ts"] and timestamp != start_time)):
+                    continue
+                matches.setdefault((identity, key), []).append((run, offset))
+                credits[run] = credits.get(run, 0) + 1
+        targets = set()
+        for target, identity in self.candidates:
+            seq, run, key = target
+            batch, matched = eligible.get(run), matches.get((identity, key), ())
+            if batch and len(matched) == 1 and candidate_counts[(run, identity)] == 1 and credits.get(matched[0][0]) == 1:
+                first, last, start, end = batch[:4]
+                if first < seq < last and start < matched[0][1] <= end:
+                    targets.add(target)
+        return targets
+
+
 @dataclass(frozen=True)
 class _Proof:
     provider_id: str
@@ -99,6 +361,7 @@ class _Proof:
     targets: frozenset[tuple[int, str, str]]
     interruptions: tuple[tuple[tuple[int, str, str], str], ...] = ()
     companions: frozenset[tuple[str, int, str]] = frozenset()
+    assistant_replays: frozenset[tuple] = frozenset()
     interruption_index: MappingProxyType = field(init=False, repr=False)
     cache_signature: frozenset = field(init=False, repr=False)
 
@@ -106,7 +369,8 @@ class _Proof:
         object.__setattr__(self, "interruption_index", MappingProxyType(dict(self.interruptions)))
         object.__setattr__(self, "cache_signature", self.targets | frozenset(
             ("interruption", key, origin) for key, origin in self.interruptions)
-            | frozenset(("companion", *key) for key in self.companions))
+            | frozenset(("companion", *key) for key in self.companions)
+            | frozenset(("assistant_replay", *key) for key in self.assistant_replays))
 
     def signature(self) -> frozenset:
         return self.cache_signature
@@ -130,7 +394,7 @@ def _steer_intervals(events: list[dict], provider_id: str) -> list[tuple[float, 
         if kind == "turn_queue_run_now":
             key = event.get("interrupted_run_id")
             destination = queues
-        elif kind == "turn_finished":
+        elif kind in ("turn_finished", "turn_stopped"):
             key = event.get("run_id")
             destination = finished
         else:
@@ -146,9 +410,17 @@ def _steer_intervals(events: list[dict], provider_id: str) -> list[tuple[float, 
         queue, terminal, start = queued[0], ended[0], following[0]
         queued_id = queue.get("queued_id")
         next_run = start.get("run_id")
+        terminal_proven = (
+            terminal.get("type") == "turn_finished"
+            and terminal.get("stopped") is True
+            and terminal.get("exit_code") is None
+        ) or (
+            terminal.get("type") == "turn_stopped"
+            and terminal.get("native_steer") is True
+            and terminal.get("superseded_by_run_id") == next_run
+        )
         if (
-            terminal.get("stopped") is not True
-            or terminal.get("exit_code") is not None
+            not terminal_proven
             or terminal.get("provider_session_id") != provider_id
             or not isinstance(queued_id, str) or not queued_id
             or start.get("queued_id") != queued_id
@@ -192,12 +464,13 @@ def _native_control(event: dict, session_id: str) -> dict | None:
     if not (
         event.get("session_id") == session_id and event.get("backend") == "claude"
         and event.get("imported") is not True
-        and event.get("type") in ("turn_queue_run_now", "turn_finished", "turn_started")
+        and event.get("type") in ("turn_queue_run_now", "turn_finished", "turn_stopped", "turn_started")
     ):
         return None
     return {key: event[key] for key in (
         "type", "ts", "run_id", "queued_id", "interrupted_run_id",
         "steer_interrupted_run_id", "provider_session_id", "stopped", "exit_code",
+        "native_steer", "superseded_by_run_id",
     ) if key in event}
 
 
@@ -232,7 +505,8 @@ def enrich_interruption_origins(events_path: Path, provider_id: str, origins: li
 
 
 def _prove(session_id: str, provider_id: str, events: Path, root: Path,
-           normalize_user: Callable[[dict], str | None], events_stamp) -> _Proof:
+           normalize_user: Callable[[dict], str | None], events_stamp,
+           normalize_full_user: Callable[[dict], str | None] | None = None) -> _Proof:
     empty = _Proof(provider_id, events_stamp, None, None, frozenset())
     batches = {}
     candidates = []
@@ -240,15 +514,34 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
     run_rows = {}
     terminal_counts = {}
     native_events = []
+    scheduled_starts, scheduled_ends, candidate_origins = {}, {}, {}
+    assistant_replays = _AssistantReplays(provider_id)
+    async_inputs = _AsyncDeliveryInputs(provider_id, assistant_replays, normalize_user, normalize_full_user)
     for event, _offset, _line in _records(events, events_stamp):
         if event.get("session_id") not in (None, "", session_id):
             continue
+        assistant_replays.event(event)
+        async_inputs.event(event)
         control = _native_control(event, session_id)
         if control is not None:
             native_events.append(control)
             if len(native_events) > MAX_TARGETS:
                 raise _Unproven()
         run = event.get("run_id")
+        if (
+            isinstance(run, str) and run and not run.startswith("import_")
+            and event.get("backend") == "claude" and event.get("imported") is not True
+        ):
+            if (event.get("type") == "turn_started"
+                    and event.get("purpose") == "scheduled_job" and event.get("job_id")
+                    and isinstance(event.get("prompt"), str)):
+                scheduled_starts.setdefault(run, []).append((
+                    _text_key(" ".join(event["prompt"].split())), _timestamp(event.get("ts")),
+                ))
+            elif event.get("type") == "turn_finished":
+                scheduled_ends.setdefault(run, []).append(_timestamp(event.get("ts")))
+            if len(scheduled_starts) + len(scheduled_ends) > MAX_TARGETS:
+                raise _Unproven()
         if not isinstance(run, str) or not run.startswith("import_"):
             continue
         run_rows[run] = run_rows.get(run, 0) + 1
@@ -278,9 +571,14 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
             target = _target(event)
             if target:
                 candidates.append(target)
+                origin = event.get("provider_origin")
+                if isinstance(origin, dict) and origin.get("provider") == "claude":
+                    candidate_origins[target] = (
+                        origin.get("event_id"), origin.get("session_id"), origin.get("timestamp"),
+                    )
         if max(len(batches), len(candidates), len(terminals)) > MAX_TARGETS:
             raise _Unproven()
-    if not batches or not candidates:
+    if not batches or not (candidates or assistant_replays.candidates):
         return empty
     paths = {batch[1]["cursor"].get("source_path") for batch in batches.values()}
     if len(paths) != 1:
@@ -331,11 +629,22 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
     interruption_count = 0
     tracker = ClaudeInterruptionTracker()
     steer_intervals = _steer_intervals(native_events, provider_id)
+    scheduled_ranges = {}
+    for run, starts in scheduled_starts.items():
+        ends = scheduled_ends.get(run, ())
+        if len(starts) == len(ends) == 1:
+            key, start_time = starts[0]
+            end_time = ends[0]
+            if start_time is not None and end_time is not None and start_time <= end_time:
+                scheduled_ranges.setdefault(key, []).append((run, start_time, end_time))
+    scheduled_sources, scheduled_counts = {}, {}
     for event, offset, line in _records(source, source_stamp):
         digest.update(line)
         for wanted in prefix_digests.get(offset, ()):
             if hmac.compare_digest(digest.hexdigest(), wanted):
                 verified.add((offset, wanted))
+        assistant_replays.source(event, offset)
+        async_inputs.source(event, offset)
         origin = tracker.consume(event)
         if event.get("type") != "user":
             continue
@@ -343,13 +652,27 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
         if not isinstance(text, str) or not text:
             continue
         key = _text_key(text)
+        if (normalize_full_user is not None and scheduled_ranges
+                and event.get("sessionId") == provider_id and event.get("isMeta") is not True
+                and event.get("isSidechain") is not True):
+            full_text = normalize_full_user(event)
+            source_time = _timestamp(event.get("timestamp"))
+            source_identity = (event.get("uuid"), provider_id, event.get("timestamp"))
+            if isinstance(full_text, str) and isinstance(source_identity[0], str) and source_time is not None:
+                matches = [run for run, start_time, end_time in scheduled_ranges.get(
+                    _text_key(" ".join(full_text.split())), (),
+                ) if start_time <= source_time <= end_time]
+                if len(matches) == 1:
+                    run = matches[0]
+                    scheduled_counts[run] = scheduled_counts.get(run, 0) + 1
+                    scheduled_sources.setdefault((source_identity, key), []).append((offset, run))
         origin = _interruption_origin(origin, provider_id, steer_intervals)
         if origin is not None:
             interruptions.setdefault(key, []).append((offset, origin))
             interruption_count += 1
             if interruption_count > MAX_TARGETS:
                 raise _Unproven()
-        if event.get("isMeta") is True:
+        if event.get("isMeta") is True or event.get("isCompactSummary") is True or event.get("isSidechain") is True:
             metadata.setdefault(key, []).append(offset)
         else:
             # Preserve the existing global ambiguity rule for isMeta repairs.
@@ -361,9 +684,13 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
     targets = set()
     corrected = []
     candidate_counts = {}
+    candidate_origin_counts = {}
     run_candidate_counts = {}
-    for _seq, run, key in candidates:
+    for candidate in candidates:
+        _seq, run, key = candidate
         candidate_counts[(run, key)] = candidate_counts.get((run, key), 0) + 1
+        origin_key = (run, candidate_origins.get(candidate))
+        candidate_origin_counts[origin_key] = candidate_origin_counts.get(origin_key, 0) + 1
         run_candidate_counts[run] = run_candidate_counts.get(run, 0) + 1
     for target in candidates:
         seq, run, key = target
@@ -376,6 +703,15 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
             and (end, expected) in verified
             and (start == 0 or (start, previous) in verified)
         ):
+            continue
+        # A scheduled wake is ordinary provider user input, not isMeta. Prove
+        # its complete text, native occurrence interval, exact source identity
+        # and original import checkpoint. A shared trimmed prefix is not proof.
+        scheduled = scheduled_sources.get((candidate_origins.get(target), key), ())
+        if (len(scheduled) == 1 and candidate_origin_counts[(run, candidate_origins.get(target))] == 1
+                and start < scheduled[0][0] <= end
+                and scheduled_counts.get(scheduled[0][1]) == 1):
+            targets.add(target)
             continue
         proven = [(offset, origin) for offset, origin in interruptions.get(key, ())
                   if start < offset <= end]
@@ -392,20 +728,243 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
         offsets = metadata.get(key, ())
         if key not in humans and bisect_right(offsets, end) - bisect_right(offsets, start) == 1:
             targets.add(target)
+    verified_batches = {run: batch for run, batch in eligible_batches.items()
+                        if (batch[3], batch[4]) in verified
+                        and (batch[2] == 0 or (batch[2], batch[5]) in verified)}
+    targets.update(async_inputs.prove(verified_batches))
+    proven_assistants = assistant_replays.prove(verified_batches)
     corrected_counts = {}
     for (_seq, run, _key), _origin in corrected:
+        corrected_counts[run] = corrected_counts.get(run, 0) + 1
+    for _seq, run, _key in targets:
+        corrected_counts[run] = corrected_counts.get(run, 0) + 1
+    for _kind, _seq, run, _digest, _identity in proven_assistants:
         corrected_counts[run] = corrected_counts.get(run, 0) + 1
     companions = set()
     for run, count in corrected_counts.items():
         # Only a complete marker-only batch is lifecycle-neutral. Any genuine
         # user, assistant/tool/unknown row, duplicate terminal or unproven target
         # leaves both import companions unchanged.
-        if (count == run_candidate_counts[run] and run_rows[run] == count + 2
+        if (run_rows[run] == count + 2
                 and terminal_counts.get(run) == 1):
             companions.add(("history_imported", eligible_batches[run][0], run))
             companions.add(("turn_finished", eligible_batches[run][1], run))
     return _Proof(provider_id, events_stamp, source, source_stamp, frozenset(targets),
-                  tuple(corrected), frozenset(companions))
+                  tuple(corrected), frozenset(companions), proven_assistants)
+
+
+def _bounded_records(path: Path, expected, start: int, end: int):
+    """Read complete records in one fixed window, never the oversized prefix."""
+    if not 0 <= start < end <= expected[2] or end - start > MAX_EVENTS_BYTES:
+        raise _Unproven()
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) != expected:
+            raise _Unproven()
+        stream.seek(start)
+        if start:
+            stream.seek(start - 1)
+            if stream.read(1) != b"\n":
+                skipped = stream.readline(min(MAX_LINE_BYTES + 1, end - start))
+                if len(skipped) > MAX_LINE_BYTES or not skipped.endswith(b"\n"):
+                    raise _Unproven()
+        count = 0
+        while stream.tell() < end:
+            offset = stream.tell()
+            line = stream.readline(min(MAX_LINE_BYTES + 1, end - offset))
+            if len(line) > MAX_LINE_BYTES or not line.endswith(b"\n"):
+                raise _Unproven()
+            count += 1
+            if count > MAX_RECORDS:
+                raise _Unproven()
+            event = json.loads(line)
+            if not isinstance(event, dict):
+                raise _Unproven()
+            yield event, stream.tell()
+        final = os.fstat(stream.fileno())
+        if (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns) != expected:
+            raise _Unproven()
+    if _regular_stamp(path) != expected:
+        raise _Unproven()
+
+
+def _prove_recent_scheduled(session_id: str, provider_id: str, events: Path, root: Path,
+                            normalize_user, events_stamp, normalize_full_user) -> _Proof:
+    """Exact-origin scheduled duplicates and provider metadata in recent history.
+
+    An oversized transcript cannot establish global metadata/interruption proof.
+    Scheduled input requires a complete native occurrence and full source-text
+    match. Metadata requires its explicit structured source flag. Both require
+    an exact, unique origin within the original checkpoint; wording is not proof.
+    Both reads are bounded to 32 MiB; source growth before preparation is allowed.
+    Any change during either read fails visible.
+    """
+    empty = _Proof(provider_id, events_stamp, None, None, frozenset())
+    if normalize_full_user is None or not events_stamp[2]:
+        return empty
+    starts, ends, batches, terminals, rows, candidates = {}, {}, {}, {}, {}, []
+    origin_counts = {}
+    assistant_replays = _AssistantReplays(provider_id)
+    async_inputs = _AsyncDeliveryInputs(provider_id, assistant_replays, normalize_user, normalize_full_user)
+    previous_seq = 0
+    for event, _offset in _bounded_records(
+        events, events_stamp, max(0, events_stamp[2] - MAX_EVENTS_BYTES), events_stamp[2],
+    ):
+        seq = event.get("seq")
+        if type(seq) is not int or seq <= previous_seq:
+            raise _Unproven()
+        previous_seq = seq
+        if event.get("session_id") not in (None, "", session_id):
+            continue
+        assistant_replays.event(event)
+        async_inputs.event(event)
+        run = event.get("run_id")
+        if not isinstance(run, str) or not run:
+            continue
+        if not run.startswith("import_"):
+            if (event.get("backend") != "claude" or event.get("imported") is True
+                    or event.get("provider_session_id") not in (None, "", provider_id)):
+                continue
+            if (event.get("type") == "turn_started" and event.get("purpose") == "scheduled_job"
+                    and event.get("job_id") and isinstance(event.get("prompt"), str)):
+                starts.setdefault(run, []).append((
+                    _text_key(" ".join(event["prompt"].split())), _timestamp(event.get("ts")),
+                ))
+            elif event.get("type") == "turn_finished":
+                ends.setdefault(run, []).append(_timestamp(event.get("ts")))
+        else:
+            rows[run] = rows.get(run, 0) + 1
+            if event.get("type") == "history_imported":
+                checkpoint = event.get("_history_sync_checkpoint")
+                cursor = checkpoint.get("cursor") if isinstance(checkpoint, dict) else None
+                if (event.get("backend") == "claude" and event.get("provider_session_id") == provider_id
+                        and isinstance(cursor, dict) and cursor.get("version") == 1
+                        and cursor.get("backend") == "claude" and cursor.get("provider_session_id") == provider_id
+                        and checkpoint.get("version") == 1 and event.get("source_path") == cursor.get("source_path")):
+                    batches.setdefault(run, []).append((seq, checkpoint))
+            elif (event.get("type") == "turn_finished" and event.get("imported") is True
+                    and event.get("backend") == "claude"):
+                terminals.setdefault(run, []).append(seq)
+            target = _target(event)
+            if target:
+                origin = event.get("provider_origin")
+                identity = (origin.get("event_id"), origin.get("session_id"), origin.get("timestamp")) if isinstance(origin, dict) else ()
+                if (isinstance(origin, dict) and origin.get("provider") == "claude"
+                        and len(identity) == 3 and all(isinstance(value, str) and value for value in identity)
+                        and identity[1] == provider_id and _timestamp(identity[2]) is not None):
+                    candidates.append((target, identity))
+                    origin_key = (run, identity)
+                    origin_counts[origin_key] = origin_counts.get(origin_key, 0) + 1
+        if (sum(map(len, (starts, ends, batches, terminals, rows))) > MAX_TARGETS
+                or len(candidates) > MAX_TARGETS):
+            raise _Unproven()
+    if not batches or not (candidates or assistant_replays.candidates):
+        return empty
+    eligible = {}
+    for run, checkpoints in batches.items():
+        finished = terminals.get(run, ())
+        if len(checkpoints) != 1 or len(finished) != 1:
+            continue
+        seq, checkpoint = checkpoints[0]
+        cursor = checkpoint["cursor"]
+        start, end = checkpoint.get("previous_source_offset"), cursor.get("source_offset")
+        previous, digest = checkpoint.get("previous_source_digest"), cursor.get("source_digest")
+        if (type(start) is int and type(end) is int and 0 <= start < end
+                and type(checkpoint.get("previous_present")) is bool
+                and ((start == 0 and previous == "") or
+                     (start > 0 and checkpoint["previous_present"] is True
+                      and isinstance(previous, str) and _DIGEST.fullmatch(previous)))
+                and isinstance(digest, str) and _DIGEST.fullmatch(digest) and seq < finished[0]):
+            eligible[run] = (seq, finished[0], start, end, cursor)
+    if not eligible:
+        return empty
+    paths = {batch[4].get("source_path") for batch in eligible.values()}
+    if len(paths) != 1:
+        raise _Unproven()
+    raw_path = paths.pop()
+    if not isinstance(raw_path, str):
+        raise _Unproven()
+    source = Path(raw_path)
+    if not source.is_absolute() or source.suffix != ".jsonl" or source.stem != provider_id or source.is_symlink():
+        raise _Unproven()
+    source = source.resolve(strict=True)
+    source.relative_to(root.resolve(strict=True))
+    source_stamp = _regular_stamp(source)
+    eligible = {run: batch for run, batch in eligible.items()
+                if (batch[4].get("source_dev"), batch[4].get("source_ino")) == source_stamp[:2]
+                and batch[3] <= source_stamp[2]}
+    if not eligible:
+        return empty
+    checkpoint_end = max(batch[3] for batch in eligible.values())
+    window_start = max(0, checkpoint_end - MAX_EVENTS_BYTES)
+    ranges = {}
+    for run, occurrences in starts.items():
+        finished = ends.get(run, ())
+        if len(occurrences) == len(finished) == 1:
+            key, start_time = occurrences[0]
+            end_time = finished[0]
+            if start_time is not None and end_time is not None and start_time <= end_time:
+                ranges.setdefault(key, []).append((run, start_time, end_time))
+    source_matches, occurrence_counts, identity_counts, source_metadata = {}, {}, {}, {}
+    for event, offset in _bounded_records(source, source_stamp, window_start, checkpoint_end):
+        assistant_replays.source(event, offset)
+        async_inputs.source(event, offset)
+        if event.get("type") != "user" or event.get("sessionId") != provider_id:
+            continue
+        identity = (event.get("uuid"), provider_id, event.get("timestamp"))
+        if not all(isinstance(value, str) and value for value in identity):
+            continue
+        identity_counts[identity] = identity_counts.get(identity, 0) + 1
+        display_text = normalize_user(event)
+        timestamp = _timestamp(identity[2])
+        if not isinstance(display_text, str) or not display_text or timestamp is None:
+            continue
+        if event.get("isMeta") is True or event.get("isCompactSummary") is True or event.get("isSidechain") is True:
+            source_metadata.setdefault((identity, _text_key(display_text)), []).append(offset)
+            if len(identity_counts) + len(source_metadata) > MAX_KEYS:
+                raise _Unproven()
+            continue
+        full_text = normalize_full_user(event)
+        if not isinstance(full_text, str) or not full_text:
+            continue
+        matches = [run for run, start, end in ranges.get(_text_key(" ".join(full_text.split())), ())
+                   if start <= timestamp <= end]
+        if len(matches) == 1:
+            occurrence = matches[0]
+            occurrence_counts[occurrence] = occurrence_counts.get(occurrence, 0) + 1
+            source_matches.setdefault((identity, _text_key(display_text)), []).append((offset, occurrence))
+        if len(identity_counts) + len(source_matches) > MAX_KEYS:
+            raise _Unproven()
+    targets, counts = set(), {}
+    for target, identity in candidates:
+        seq, run, key = target
+        batch, matched = eligible.get(run), source_matches.get((identity, key), ())
+        if (batch is None or origin_counts[(run, identity)] != 1
+                or identity_counts.get(identity) != 1):
+            continue
+        first, last, start, end, _cursor = batch
+        metadata = source_metadata.get((identity, key), ())
+        proven_metadata = len(metadata) == 1 and start < metadata[0] <= end
+        proven_scheduled = (len(matched) == 1 and occurrence_counts.get(matched[0][1]) == 1
+                            and start < matched[0][0] <= end)
+        if first < seq < last and (proven_metadata or proven_scheduled):
+            targets.add(target)
+            counts[run] = counts.get(run, 0) + 1
+    targets.update(async_inputs.prove(eligible))
+    proven_assistants = assistant_replays.prove(eligible)
+    counts = {}
+    for _seq, run, _key in targets:
+        counts[run] = counts.get(run, 0) + 1
+    for _kind, _seq, run, _digest, _identity in proven_assistants:
+        counts[run] = counts.get(run, 0) + 1
+    companions = set()
+    for run, count in counts.items():
+        if rows[run] == count + 2:
+            companions.add(("history_imported", eligible[run][0], run))
+            companions.add(("turn_finished", eligible[run][1], run))
+    return _Proof(provider_id, events_stamp, source, source_stamp, frozenset(targets),
+                  companions=frozenset(companions), assistant_replays=proven_assistants)
 
 
 class ClaudeMetadataRepairCache:
@@ -419,17 +978,19 @@ class ClaudeMetadataRepairCache:
         self._preparation_cancelled = False
 
     def prepare(self, session_id: str, provider_id: str, events: Path, root: Path,
-                normalize_user: Callable[[dict], str | None]) -> bool:
+                normalize_user: Callable[[dict], str | None], *,
+                normalize_full_user: Callable[[dict], str | None] | None = None,
+                refresh: bool = False) -> bool:
         """Prepare only this requested session; report a changed suppression map."""
         with self._lock:
             previous = self._proofs.get(session_id)
-            if previous and previous.provider_id == provider_id:
+            if previous and previous.provider_id == provider_id and not refresh:
                 self._proofs.move_to_end(session_id)
                 return False
         with self._prepare_lock:
             with self._lock:
                 previous = self._proofs.get(session_id)
-                if previous and previous.provider_id == provider_id:
+                if previous and previous.provider_id == provider_id and not refresh:
                     # A verified historical target remains a fact when either
                     # append-only log grows. Do not turn ordinary chat refreshes
                     # into repeated source scans. New imports already filter
@@ -439,16 +1000,62 @@ class ClaudeMetadataRepairCache:
                 self._preparing_session = session_id
                 self._preparation_cancelled = False
             try:
-                stamp = _stamp(events)
-                if stamp[2] > MAX_EVENTS_BYTES:
-                    raise _Unproven()
-                with self._lock:
-                    self._proofs.pop(session_id, None)
-                proof = _prove(session_id, provider_id, events, root, normalize_user, stamp)
+                try:
+                    stamp = _stamp(events)
+                except _Oversized:
+                    if normalize_full_user is None:
+                        raise
+                    stamp = _regular_stamp(events)
+                # During an explicit import refresh keep the old immutable
+                # proof available to memory-only event readers until replace.
+                if not refresh:
+                    with self._lock:
+                        self._proofs.pop(session_id, None)
+                try:
+                    if stamp[2] > MAX_EVENTS_BYTES:
+                        raise _Oversized()
+                    proof = _prove(session_id, provider_id, events, root, normalize_user, stamp,
+                                   normalize_full_user)
+                except _Oversized:
+                    if normalize_full_user is None:
+                        raise
+                    proof = _prove_recent_scheduled(session_id, provider_id, events, root,
+                                                     normalize_user, stamp, normalize_full_user)
             except (OSError, ValueError, TypeError, KeyError, RuntimeError):
                 # Fail visible, including incomplete or oversized files. A
                 # failed admission must not retry on every page/socket read.
                 proof = _Proof(provider_id, (0, 0, 0, 0), None, None, frozenset())
+            if (refresh and previous and previous.provider_id == provider_id
+                    and previous.source is not None and previous.source == proof.source
+                    and previous.source_stamp is not None and proof.source_stamp is not None
+                    and previous.events_stamp[:2] == proof.events_stamp[:2]
+                    and previous.source_stamp[:2] == proof.source_stamp[:2]
+                    and previous.events_stamp[2] <= proof.events_stamp[2]
+                    and previous.source_stamp[2] <= proof.source_stamp[2]
+                    and (previous.events_stamp[2] < proof.events_stamp[2] or previous.events_stamp == proof.events_stamp)
+                    and (previous.source_stamp[2] < proof.source_stamp[2] or previous.source_stamp == proof.source_stamp)):
+                # Exact file ownership and nondecreasing immutable-log prefixes
+                # retain older proofs outside the bounded recent read. A replaced,
+                # truncated, unavailable or different source never inherits them.
+                inputs = previous.targets | proof.targets
+                interruptions = {**dict(previous.interruptions), **dict(proof.interruptions)}
+                assistants = previous.assistant_replays | proof.assistant_replays
+                entries = ([(key[0], key[1], "input", key) for key in inputs]
+                           + [(key[0], key[1], "interruption", key) for key in interruptions]
+                           + [(key[1], key[2], "assistant", key) for key in assistants])
+                entries.sort(key=lambda entry: entry[0], reverse=True)
+                evicted_runs = {entry[1] for entry in entries[MAX_TARGETS:]}
+                retained = entries[:MAX_TARGETS]
+                companions = sorted((key for key in previous.companions | proof.companions
+                                     if key[2] not in evicted_runs), key=lambda key: key[1], reverse=True)[:MAX_TARGETS]
+                # One combined retained-repair budget, not a new allowance on
+                # every import. Evicted proof fails visible, including its
+                # batch companions; no partial batch becomes metadata-only.
+                proof = _Proof(provider_id, proof.events_stamp, proof.source, proof.source_stamp,
+                               frozenset(key for _, _, kind, key in retained if kind == "input"),
+                               tuple((key, interruptions[key]) for _, _, kind, key in retained if kind == "interruption"),
+                               frozenset(companions),
+                               frozenset(key for _, _, kind, key in retained if kind == "assistant"))
             with self._lock:
                 cancelled = self._preparation_cancelled
                 self._preparing_session = None
@@ -513,7 +1120,13 @@ class ClaudeMetadataRepairCache:
         return projected
 
     def project_event(self, session_id: str, event: dict) -> dict | None:
-        """Memory-only correction of an exact interruption or its proven companions."""
+        """Memory-only correction of exact source-proven historical records."""
+        if event.get("session_id") in (None, "", session_id):
+            with self._lock:
+                proof = self._proofs.get(session_id)
+            if proof and proof.assistant_replays and _assistant_target(event) in proof.assistant_replays:
+                return {**event, "text": "", "metadata_only": True,
+                        "provider_history_repair": "source_proven_assistant_replay"}
         kind, seq, run = event.get("type"), event.get("seq"), event.get("run_id")
         if (
             kind in ("history_imported", "turn_finished") and type(seq) is int

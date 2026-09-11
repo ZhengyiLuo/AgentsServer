@@ -32,6 +32,7 @@ FUNCTIONS = {
     "parse_claude_history_events",
     "claude_transcript_preview",
     "history_item_cursor_digest",
+    "history_dedup_key",
     "parse_provider_history_delta",
 }
 CONSTANTS = {
@@ -122,6 +123,19 @@ class ClaudeHistoryMetadataTests(unittest.TestCase):
             for metadata in ({}, {"isMeta": False}, {"isMeta": "true"}, {"isMeta": 1}, {"origin": {"kind": "human"}}):
                 with self.subTest(text=text, metadata=metadata):
                     self.assertEqual(self.item(user_event(text, **metadata)), {"kind": "user", "text": text})
+
+    def test_compact_summary_flag_not_summary_wording_decides_user_origin(self) -> None:
+        text = "This session is being continued from a previous conversation. Summary: a real user may quote this."
+        self.assertIsNone(self.item(user_event(text, isCompactSummary=True)))
+        for flag in (None, False, "true", 1):
+            self.assertEqual(self.item(user_event(text, isCompactSummary=flag)), {"kind": "user", "text": text})
+
+    def test_sidechain_scope_is_not_parent_user_input_but_marker_quotes_remain(self) -> None:
+        marker = "[Request interrupted by user for tool use]"
+        self.assertIsNone(self.item(user_event(marker, isSidechain=True)))
+        self.assertIsNone(self.item({"type": "assistant", "isSidechain": True, "message": {"content": "Child output"}}))
+        for flag in (None, False, "true", 1):
+            self.assertEqual(self.item(user_event(marker, isSidechain=flag)), {"kind": "user", "text": marker})
 
     def test_assistant_text_and_non_user_events_are_unchanged(self) -> None:
         self.assertEqual(self.item({

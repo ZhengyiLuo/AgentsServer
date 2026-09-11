@@ -42,6 +42,33 @@ hold and requires an explicit retry. Uncertain delivery is fenced against
 automatic replay. Consumer cleanup settles outstanding callers even when it
 is cancelled again during cleanup.
 
+## Goals activated during an ordinary reply
+
+Resuming or creating a goal while an ordinary reply is running must not end its
+local owner when that first provider turn completes. This was missing in beta.54:
+the ordinary runner finalized, and the ownerless-continuation guard later paused
+the otherwise active goal. Force Send-only verification did not cover this path.
+
+Ordinary chat runs now retain their existing thread notification stream from
+before `turn/start`. When a goal continues, the same supervised run consumes it
+inline, preserving its runtime authority, thread pin, manifest watcher and event
+identity. No synthetic user prompt, detached successor or new polling is added.
+The current native turn and matching control reservation support Stop, Delete
+and follow-up steering. Only the outer runner publishes the final terminal event
+and releases the run.
+
+The ordinary-to-goal transition and the eventual terminal decision serialize
+with goal controls under the existing chat lifecycle lock. An accepted Resume
+therefore keeps its owner; activation after terminal admission has closed is
+rejected for retry, rather than accepted without a consumer. Already-buffered
+continuation output is drained even if the provider completed the goal before
+the consumer caught up. Receive-order watermarks survive the handoff.
+
+Validation uses the actual extracted runner, native consumer and Stop handler,
+plus retained-stream transport checks. These are isolated protocol/lifecycle
+checks, not a claim of live-provider or production-UI acceptance. No live goal,
+saved transcript or running research task is modified by these checks.
+
 This is a local change. No live goal, server, saved history or provider transcript
 is changed by verification, and no deployment is performed. Handler regression
 tests extract only the relevant AST functions and use fake notifications,

@@ -1394,10 +1394,13 @@ exit 0
     def test_installer_and_release_archive_include_runtime_tools_and_uninstaller(self):
         installer_source = INSTALLER.read_text()
         packager_source = PACKAGER.read_text()
-        self.assertIn(
-            "RELEASE_FILES=(activation_transaction.py agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py claude_sdk_client.py codex_app_server.py cursor_agent_client.py cursor_process_guard.py",
-            installer_source,
-        )
+        release_files_match = re.search(r"(?m)^RELEASE_FILES=\(([^)]*)\)$", installer_source)
+        self.assertIsNotNone(release_files_match)
+        release_files = release_files_match.group(1).split()
+        for filename in (
+            "activation_transaction.py agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py claude_sdk_client.py claude_background_reconciliation.py codex_app_server.py cursor_agent_client.py cursor_process_guard.py"
+        ).split():
+            self.assertIn(filename, release_files)
         self.assertIn('"$STAGE_DIR/activation_transaction.py"', installer_source)
         self.assertIn('"$STAGE_DIR/agentsdock_team.py"', installer_source)
         self.assertIn("RELEASE_DIRECTORIES=(agentsdock_team_hub)", installer_source)
@@ -7120,6 +7123,7 @@ exit 0
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_insert")
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_update")
             for trigger in (
+                "team_mail_arrival_on_server_recipient",
                 "team_message_revisions_are_immutable",
                 "team_message_revisions_cannot_be_deleted",
                 "human_admin_page_device_session_insert",
@@ -7130,6 +7134,8 @@ exit 0
             ):
                 connection.execute(f"DROP TRIGGER {trigger}")
             for index in (
+                "team_mail_server_arrival_lookup",
+                "team_messages_parent_order",
                 "team_message_revisions_by_message",
                 "team_message_revisions_by_team",
                 "device_sessions_human_created_id_idx",
@@ -7139,6 +7145,8 @@ exit 0
             ):
                 connection.execute(f"DROP INDEX {index}")
             for table in (
+                # Migration 0020 (durable Mail arrival watermark).
+                "team_mail_arrivals",
                 # Migration 0013 (immutable Team Message revision journal).
                 "team_message_revisions",
                 # Migration 0012 (immutable network content deletion journal).

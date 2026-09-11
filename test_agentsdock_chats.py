@@ -1088,6 +1088,40 @@ class AgentsDockChatsCLITests(unittest.TestCase):
             "capability",
         )
 
+    def test_list_cursor_is_explicit_and_preserves_next_page(self) -> None:
+        cursor = "route_" + "a" * 32
+        following = "route_" + "b" * 32
+        args = agentsdock_chats.parser().parse_args(["list", "--cursor", cursor])
+        page = {"routes": [], "next_cursor": following, "max_handoffs_per_run": None}
+        with patch.object(agentsdock_chats, "authority", return_value="capability"), \
+                patch.object(agentsdock_chats, "get_json", return_value=page) as get:
+            self.assertEqual(args.handler(args), page)
+        get.assert_called_once_with(f"/api/agent/cross-chat/routes?cursor={cursor}", "capability")
+
+    def test_list_rejects_ignored_or_nonadvancing_cursor(self) -> None:
+        cursor = "route_" + "a" * 32
+        args = argparse.Namespace(authority_file=None, cursor=cursor)
+        for response in ({"routes": []}, {"routes": [], "next_cursor": cursor},
+                         {"routes": [], "next_cursor": "bad"}):
+            with self.subTest(response=response), \
+                    patch.object(agentsdock_chats, "authority", return_value="capability"), \
+                    patch.object(agentsdock_chats, "get_json", return_value=response), \
+                    self.assertRaises(agentsdock_chats.ChatsCLIError):
+                agentsdock_chats.list_routes(args)
+
+    def test_exact_mode_lookup_accepts_old_whole_list_and_new_exact_response(self) -> None:
+        route_id = "route_" + "b" * 32
+        target = {"route_id": route_id, "available": True, "mode": "async_route_v1"}
+        for response in ({"routes": [{"route_id": "unrelated"}, target]},
+                         {"routes": [target], "next_cursor": None}):
+            with self.subTest(response=response), \
+                    patch.object(agentsdock_chats, "get_json", return_value=response) as get:
+                self.assertEqual(agentsdock_chats.negotiated_route_mode("capability", route_id), "async_route_v1")
+            get.assert_called_once_with(f"/api/agent/cross-chat/routes?route_id={route_id}", "capability")
+        with patch.object(agentsdock_chats, "get_json", return_value={"routes": []}), \
+                self.assertRaisesRegex(agentsdock_chats.ChatsCLIError, "unavailable"):
+            agentsdock_chats.negotiated_route_mode("capability", route_id)
+
     def test_ask_uses_request_reply_wire_and_stable_retry_key(self) -> None:
         handle = "grant_" + "a" * 64
         args = argparse.Namespace(

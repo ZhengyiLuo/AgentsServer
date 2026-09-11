@@ -342,7 +342,7 @@ def _runtime_human_provenance(event: dict) -> bool:
 def _persisted_runtime_marker(event: dict, session_id: str) -> bool:
     origin = event.get("provider_origin")
     runtime_kind = event.get("provider_runtime_context")
-    if (runtime_kind not in ("subagent_notification", "turn_aborted")
+    if (runtime_kind not in ("subagent_notification", "turn_aborted", "provider_notice")
         or event.get("metadata_only") is not True or event.get("backend") != "codex"
         or event.get("imported") is not True or not isinstance(event.get("run_id"), str)
         or not event["run_id"].startswith("import_") or event.get("session_id") != session_id
@@ -518,7 +518,7 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
             continue
         origin = codex_public_item_origin(record, thread)
         runtime_kind = item.get("provider_runtime_context")
-        if (origin and runtime_kind in ("subagent_notification", "turn_aborted")
+        if (origin and runtime_kind in ("subagent_notification", "turn_aborted", "provider_notice")
                 and item.get("provider_user_authored") is not True
                 and (item.get("provider_origin") or {}).get("kind") == runtime_kind):
             origin = {**origin, "kind": runtime_kind}
@@ -551,7 +551,7 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
             # hash. Until one exists, the bounded preview cannot prove equality.
             continue
         source_origin = next(iter(source_ids.values()))
-        if source_origin.get("kind") in ("subagent_notification", "turn_aborted"):
+        if source_origin.get("kind") in ("subagent_notification", "turn_aborted", "provider_notice"):
             if kind == "user" and not _human:
                 proofs[target] = {**source_origin, "source_text_sha256": body_key}
                 if len(proofs) > MAX_TARGETS:
@@ -620,7 +620,7 @@ class CodexNativeHistoryRepairCache(CodexGoalHistoryRepairCache):
         origin = proof.targets.get(target) if target else None
         if origin is None:
             return None
-        if origin.get("kind") in ("subagent_notification", "turn_aborted"):
+        if origin.get("kind") in ("subagent_notification", "turn_aborted", "provider_notice"):
             return {**event, "prompt": "", "metadata_only": True,
                     "provider_runtime_context": origin["kind"], "provider_origin": origin,
                     "_agentsdock_imported_prompt_hidden": True}

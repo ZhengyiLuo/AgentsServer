@@ -52,6 +52,21 @@ provider identity, and no positive human/client provenance. Ordinary quotations
 and unknown or mixed kinds remain visible. Silent imported boundaries preserve
 following answers without creating a new human message or changing live state.
 
+Subagent notifications cover completed results (including null), errors,
+shutdown and not-found terminal states. The same provenance boundary also
+recognizes these exact infrastructure kinds as `provider_notice`:
+`compaction.summary`, `apply_patch.legacy_exec_command_warning`,
+`model_switch.legacy_mismatch_warning`, `unified_exec.legacy_process_limit_warning`,
+`guardian.node_repl_review_evidence`, `plugins.recommendations` and
+`agents_md.instructions`. Compaction and legacy warnings have no mandatory text
+wrapper; their explicit type is required. Delimited kinds require their complete
+envelope. No wildcard type or text-prefix rule identifies these notices.
+
+User-invoked shell commands, realtime user delegation and unsupported human media
+remain content. Unknown extension context types are not silently discarded.
+Positive human provenance preserves literal project/plugin instruction quotations
+through the existing bounded normalizer and generated-authority sanitizer.
+
 Older imported copies are projected only after checkpoint, source digest,
 message identity, original timestamp and complete text prove the same record.
 A forked transcript may contain its explicitly declared ancestor headers; an

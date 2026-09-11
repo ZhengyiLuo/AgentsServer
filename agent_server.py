@@ -44579,13 +44579,14 @@ def normalized_history_item(
     *,
     provider_origin: Any = None,
     source_text_sha256: Any = None,
+    allow_user_boilerplate: bool = False,
 ) -> dict[str, Any] | None:
     origin = normalized_history_provider_origin(provider_origin)
     if kind == "interruption" and (origin is None or origin.get("kind") != "interruption"):
         return None
     source_key = history_dedup_key(kind, text, source_text_sha256=source_text_sha256)[1]
     text = compact_import_text(text)
-    if not text or (kind == "user" and is_import_boilerplate(text)):
+    if not text or (kind == "user" and not allow_user_boilerplate and is_import_boilerplate(text)):
         return None
     item: dict[str, Any] = {"kind": kind, "text": text}
     if source_key != history_dedup_key(kind, text)[1]:
@@ -46041,13 +46042,31 @@ def codex_history_user_record(event: dict[str, Any]) -> tuple[dict[str, Any], st
 
 
 def codex_runtime_user_item_kind(item: dict[str, Any], text: str) -> str | None:
-    """Two explicitly typed provider inputs, never a text-only quotation filter."""
+    """Known explicitly typed provider inputs, never a text-only quotation filter."""
     if item.get("type") != "message" or item.get("role") != "user" or codex_user_item_has_human_provenance(item):
         return None
     metadata = item.get("internal_chat_message_metadata_passthrough")
     kinds = metadata.get("content_item_kinds") if isinstance(metadata, dict) else None
     if not isinstance(kinds, list) or not kinds:
         return None
+    pure_notices = {
+        "compaction.summary", "apply_patch.legacy_exec_command_warning",
+        "model_switch.legacy_mismatch_warning", "unified_exec.legacy_process_limit_warning",
+        "guardian.node_repl_review_evidence", "plugins.recommendations", "agents_md.instructions",
+    }
+    if isinstance(kinds[0], str) and kinds[0] in pure_notices and all(kind == kinds[0] for kind in kinds):
+        candidate = str(text or "").strip()
+        if not candidate:
+            return None
+        wrapper = {"guardian.node_repl_review_evidence": "node_repl_review_evidence",
+                   "plugins.recommendations": "recommended_plugins"}.get(kinds[0])
+        if wrapper and not re.fullmatch(r"<" + wrapper + r">\s*[\s\S]+?\s*</" + wrapper + r">", candidate):
+            return None
+        if kinds[0] == "agents_md.instructions" and not (
+                candidate.startswith("# AGENTS.md instructions")
+                and "\n<INSTRUCTIONS>" in candidate and candidate.endswith("</INSTRUCTIONS>")):
+            return None
+        return "provider_notice"
     if all(kind == "generic.turn_aborted" for kind in kinds):
         match = re.fullmatch(r"<turn_aborted>\s*([\s\S]*?)\s*</turn_aborted>", str(text or "").strip())
         return "turn_aborted" if match is not None and match.group(1).strip() else None
@@ -46063,9 +46082,15 @@ def codex_runtime_user_item_kind(item: dict[str, Any], text: str) -> str | None:
     if not isinstance(notification, dict) or set(notification) != {"agent_path", "status"}:
         return None
     path, status = notification["agent_path"], notification["status"]
+    terminal_status = (
+        isinstance(status, str) and status in {"shutdown", "not_found"}
+        or isinstance(status, dict) and (
+            set(status) == {"completed"} and (status["completed"] is None or isinstance(status["completed"], str))
+            or set(status) == {"errored"} and isinstance(status["errored"], str)
+        )
+    )
     return "subagent_notification" if (isinstance(path, str) and 0 < len(path.strip()) <= 256
-            and isinstance(status, dict) and set(status) == {"completed"}
-            and isinstance(status["completed"], str)) else None
+            and terminal_status) else None
 
 
 def is_codex_subagent_notification_user_item(item: dict[str, Any], text: str) -> bool:
@@ -46087,6 +46112,8 @@ def codex_history_user_item(
             expected_session_id=expected_session_id,
             provider_history=True,
         ),
+        allow_user_boilerplate=(codex_user_item_has_human_provenance(payload)
+                               or codex_runtime_user_item_kind(payload, text) == "provider_notice"),
     )
     if item is not None and codex_user_item_has_human_provenance(payload):
         item["provider_user_authored"] = True
@@ -46142,10 +46169,14 @@ def codex_history_user_event_item(
         origin = codex_public_item_origin(event)
         if origin is not None:
             runtime_kind = codex_runtime_user_item_kind(payload, text)
-            if (runtime_kind is not None
-                    and item.get("text") == text.strip() and item.get("source_text_sha256") is None):
+            if (runtime_kind is not None and (runtime_kind == "provider_notice"
+                    or item.get("text") == text.strip() and item.get("source_text_sha256") is None)):
+                full_source_hash = item.get("source_text_sha256")
+                runtime_hash = (full_source_hash if isinstance(full_source_hash, str)
+                                and re.fullmatch(r"[0-9a-f]{64}", full_source_hash)
+                                else hashlib.sha256(item["text"].encode("utf-8", errors="surrogatepass")).hexdigest())
                 origin = {**origin, "kind": runtime_kind,
-                    "source_text_sha256": hashlib.sha256(item["text"].encode("utf-8", errors="surrogatepass")).hexdigest()}
+                    "source_text_sha256": runtime_hash}
                 item["provider_runtime_context"] = runtime_kind
             item["provider_origin"] = origin
     return item
@@ -46358,7 +46389,7 @@ def codex_transcript_preview(path: Path) -> str | None:
             if index >= CODEX_TRANSCRIPT_SCAN_LINES:
                 break
             item = codex_history_event_item(event)
-            if item is not None and item.get("kind") == "user" and item.get("provider_runtime_context") not in ("subagent_notification", "turn_aborted"):
+            if item is not None and item.get("kind") == "user" and item.get("provider_runtime_context") not in ("subagent_notification", "turn_aborted", "provider_notice"):
                 return item["text"][:160]
     return None
 
@@ -46536,7 +46567,7 @@ def provider_history(sess: dict[str, Any], limit: int | None) -> tuple[Path | No
 def history_item_cursor_digest(item: dict[str, Any]) -> str:
     identity = [str(item.get("kind") or ""), str(item.get("text") or "").strip()]
     runtime_origin = item.get("provider_origin")
-    if (item.get("kind") == "user" and item.get("provider_runtime_context") in ("subagent_notification", "turn_aborted")
+    if (item.get("kind") == "user" and item.get("provider_runtime_context") in ("subagent_notification", "turn_aborted", "provider_notice")
         and item.get("provider_user_authored") is not True and isinstance(runtime_origin, dict)
         and runtime_origin.get("provider") == "codex" and runtime_origin.get("kind") == item["provider_runtime_context"]
         and all(isinstance(runtime_origin.get(key), str) and runtime_origin[key] for key in ("event_id", "turn_id"))):
@@ -47903,7 +47934,7 @@ async def append_imported_history(
         )
         provenance: dict[str, Any] = {"provider_origin": origin} if origin is not None else {}
         runtime_notification = (backend == BACKEND_CODEX and item.get("kind") == "user"
-            and item.get("provider_runtime_context") in ("subagent_notification", "turn_aborted")
+            and item.get("provider_runtime_context") in ("subagent_notification", "turn_aborted", "provider_notice")
             and item.get("provider_user_authored") is not True and origin is not None
             and origin.get("kind") == item["provider_runtime_context"])
         if runtime_notification:
@@ -48018,7 +48049,7 @@ async def append_staged_imported_history(
         )
         provenance: dict[str, Any] = {"provider_origin": origin} if origin is not None else {}
         runtime_notification = (backend == BACKEND_CODEX and item.get("kind") == "user"
-            and item.get("provider_runtime_context") in ("subagent_notification", "turn_aborted")
+            and item.get("provider_runtime_context") in ("subagent_notification", "turn_aborted", "provider_notice")
             and item.get("provider_user_authored") is not True and origin is not None
             and origin.get("kind") == item["provider_runtime_context"])
         if runtime_notification:

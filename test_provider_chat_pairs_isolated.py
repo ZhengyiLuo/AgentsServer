@@ -18,6 +18,7 @@ import unittest
 from unittest.mock import AsyncMock
 import uuid
 import unicodedata
+import team_mail_grants
 
 
 TREE = ast.parse(Path(__file__).with_name("agent_server.py").read_text())
@@ -34,22 +35,25 @@ FUNCTIONS = {
     "provider_cross_chat_route_snapshot_for_hints", "normalized_provider_cross_chat_route_snapshot",
     "provider_cross_chat_pair_is_live", "live_provider_cross_chat_route",
     "provider_cross_chat_route_availability", "pending_admission_provider_cross_chat_route",
-    "delete_agent_handoff_route", "reject_unavailable_route_target",
+    "list_agent_handoff_routes", "create_agent_handoff_route", "delete_agent_handoff_route", "reject_unavailable_route_target",
     "provider_cross_chat_delivery_pair_is_live", "admit_cross_chat_delivery_run",
     "provider_cross_chat_route_id_is_revoked", "retire_deleted_provider_cross_chat_pairs",
     "deliver_cross_chat_live_response_locked", "reconcile_cross_chat_handoffs", "reconcile_cross_chat_exchange_leg",
     "async_route_delivery_snapshot", "is_async_route_message", "async_route_conversation_fields",
     "async_route_queue_fields", "public_queued_turn", "queued_turn_from_event", "queued_turn_run_metadata",
+    "async_message_target_fields",
     "sanitized_provider_route_label", "enqueue_turn",
     "provider_cross_chat_reciprocal_admission_fields",
     "join_task_despite_caller_cancellation",
+    "stage_provider_team_mail_grants", "settle_provider_team_mail_grants",
 }
 CONSTANTS = {
+    "CROSS_CHAT_HANDOFF_BODY_MAX_CHARS",
     "PROVIDER_CROSS_CHAT_ROUTE_ID_RE", "PROVIDER_CROSS_CHAT_ROUTE_REVISION_RE",
     "PROVIDER_CROSS_CHAT_ROUTE_PAIR_ID_RE", "PROVIDER_CROSS_CHAT_ROUTE_ALIAS_RE",
     "PROVIDER_CROSS_CHAT_ROUTE_AUDIT_ID_RE", "PROVIDER_CROSS_CHAT_RECIPROCAL_EFFECT_ID_RE",
     "PROVIDER_CROSS_CHAT_GRANT_ADMISSION_ID_RE", "PENDING_PROVIDER_CROSS_CHAT_GRANT_KEY",
-    "PROVIDER_CROSS_CHAT_ROUTE_LIMIT", "PROVIDER_CROSS_CHAT_ROUTE_AUDIT_LIMIT",
+    "PROVIDER_CROSS_CHAT_ROUTE_LEGACY_CLIENT_HINT", "PROVIDER_CROSS_CHAT_ROUTE_AUDIT_LIMIT",
     "PROVIDER_CROSS_CHAT_ROUTE_ACTIONS", "PROVIDER_CROSS_CHAT_ROUTE_ACTION_SET", "PROVIDER_CROSS_CHAT_ROUTE_KIND_AMBIENT",
     "PROVIDER_CROSS_CHAT_ROUTE_KIND_REFERENCE",
 }
@@ -99,6 +103,7 @@ class ChatPairTests(unittest.IsolatedAsyncioTestCase):
         self.events = {}
         self.retired = AsyncMock()
         self.namespace = {
+            "team_mail_grants": team_mail_grants,
             "asyncio": asyncio, "datetime": datetime, "re": re, "uuid": uuid,
             "unicodedata": unicodedata, "deque": deque, "suppress": suppress,
             "HTTPException": HTTPException, "STORE": self.store,
@@ -157,6 +162,54 @@ class ChatPairTests(unittest.IsolatedAsyncioTestCase):
         self.accept(source, mutation)
         await self.call("commit_durable_provider_cross_chat_reference_grants", source, mutation)
         return mutation
+
+    def add_targets(self, count):
+        targets = [f"target_{index}" for index in range(count)]
+        for sid in targets:
+            self.store.sessions[sid] = {**deepcopy(self.store.sessions["b"]), "id": sid}
+        return targets
+
+    async def test_saved_pairs_exceed_old_count_and_audit_limits_without_truncation(self):
+        targets = self.add_targets(81)
+        for start in range(0, 80, 16):
+            await self.grant(targets=targets[start:start + 16])
+        self.store.sessions = deepcopy(self.store.sessions)  # Rebuild from persisted-shaped records.
+        routes = self.routes("a")
+        self.assertEqual(len(routes), 80)
+        self.assertEqual(len({route["alias"] for route in routes}), 80)
+        self.assertEqual(len(self.store.sessions["a"]["provider_cross_chat_route_audit"]), 64)
+        self.assertEqual(self.call("initial_provider_cross_chat_route_snapshot", "a",
+            SimpleNamespace(purpose=None, chat_references=[]), "chat"), routes)
+        current = await self.call("list_agent_handoff_routes", "a", unlimited_routes=True)
+        legacy = await self.call("list_agent_handoff_routes", "a")
+        self.assertIsNone(current["max_routes"])
+        self.assertEqual(legacy["max_routes"], 16)  # Compatibility metadata only.
+        self.assertEqual(current["routes"], legacy["routes"])
+        self.assertEqual(len(current["routes"]), 80)
+        added = await self.call("create_agent_handoff_route", "a",
+            SimpleNamespace(alias="manual81", target_session_id=targets[80], actions=["instruction"]))
+        self.assertEqual(added["route"]["target_session_id"], targets[80])
+        last = routes[-1]
+        await self.call("delete_agent_handoff_route", "a", last["route_id"], last["revision"])
+        self.assertEqual(len(self.routes("a")), 80)
+        self.assertEqual(self.routes(targets[79]), [])
+        self.assertIsNone(self.call("live_provider_cross_chat_route", "a", last))
+        self.assertTrue(self.call("provider_cross_chat_pair_is_live", "a", routes[0]))
+
+    async def test_seventeen_change_journal_recovers_acceptance_and_rollback_exactly(self):
+        targets = self.add_targets(17)
+        before = deepcopy(self.store.sessions)
+        await self.stage(targets=targets)
+        for sid in [*targets, "a"]:
+            self.call("reconcile_pending_provider_cross_chat_grant", sid, self.store.sessions[sid])
+        self.assertEqual(self.store.sessions, before)
+
+        mutation = await self.stage(targets=targets, event_type="turn_queued")
+        self.accept("a", mutation)
+        for sid in [*targets, "a"]:
+            self.assertTrue(self.call("reconcile_pending_provider_cross_chat_grant", sid, self.store.sessions[sid]))
+        self.assertEqual(len(self.routes("a")), 17)
+        self.assertTrue(all(self.call("provider_cross_chat_pair_is_live", "a", route) for route in self.routes("a")))
 
     async def test_both_directions_exist_before_any_send_but_stay_hidden_until_acceptance(self):
         mutation = await self.stage()
@@ -538,6 +591,7 @@ class ChatPairTests(unittest.IsolatedAsyncioTestCase):
         self.store.sessions["a"]["title"] = "Sender"
         self.store.sessions["b"]["title"] = "Recipient"
         message = self.delivery(self.routes("a")[0], status="submitting")
+        message["body"] = "The actual message from Sender"
         self.namespace.update({
             "CROSS_CHAT": SimpleNamespace(get=AsyncMock(return_value=message)),
             "wait_for_queue_recovery_admission": AsyncMock(),
@@ -574,7 +628,9 @@ class ChatPairTests(unittest.IsolatedAsyncioTestCase):
         recovered = self.call("queued_turn_from_event", result["event"], self.store.sessions["b"], 1)
         public = self.call("public_queued_turn", "b", recovered, 1)
         self.assertEqual((public["conversation_mode"], public["source_title"], public["message_id"]), ("async_route_v1", "Sender", "message"))
-        self.assertEqual(public["prompt"], "Message from Sender")
+        self.assertEqual(public["prompt"], message["body"])
+        self.assertEqual(public["message_body"], message["body"])
+        self.assertEqual(public["message_revision"], 0)
         self.assertEqual(recovered["client_capabilities"], ["backend-exact"])
         self.assertIsNone(recovered["backend"])
         self.assertEqual(self.call("queued_turn_run_metadata", recovered)["conversation_id"], message["authorization_pair_id"])
@@ -625,7 +681,6 @@ class PairLedgerMetadataTests(unittest.IsolatedAsyncioTestCase):
         ], type_ignores=[])), "<isolated-pair-ledger>", "exec"), namespace)
         self.ledger = namespace["Ledger"]()
         self.ledger._transaction = lambda: self.connection
-        self.ledger._charge_configured_route_rate = lambda *args, **kwargs: None
 
         async def call(operation):
             return operation()

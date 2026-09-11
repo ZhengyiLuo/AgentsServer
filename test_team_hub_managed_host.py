@@ -409,10 +409,9 @@ sys.exit(10)
             host = next(server for server in projection["servers"] if server["is_host"])
             self.assertEqual(host["display_name"], "Sonic")
             self.assertEqual(host["recipient_display_name"], "Sonic")
-            self.assertEqual(
-                migrated.get_network_server(claims, team_id, host["id"])["server"],
-                host,
-            )
+            exact_server = migrated.get_network_server(claims, team_id, host["id"])["server"]
+            self.assertRegex(exact_server.pop("mail_route_lifecycle_id"), r"^[0-9a-f]{64}$")
+            self.assertEqual(exact_server, host)
 
             connection = migrated.connect()
             try:

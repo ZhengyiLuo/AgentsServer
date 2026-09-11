@@ -36,6 +36,15 @@ before changing behavior. Only permanent pair routes in a negotiated run have
 Legacy invocations keep their legacy wire contract and do not perform an
 additional discovery request.
 
+Provider discovery is paginated rather than capped: `chats list` returns one
+64-slot issued-route page and `next_cursor`; use `chats list --cursor` with that
+cursor until it is null. This bounds each tool response, not saved permission
+count. Send/Ask mode negotiation looks up the exact `route_id`, so a route on a
+later page remains usable. Whole-list responses from older servers remain
+accepted. New desktop route snapshots request `unlimited_routes=true` and
+receive `max_routes:null`; the default numeric 16 is deprecated compatibility
+metadata for older pickers, never a server storage or admission limit.
+
 In this mode, both Chats `send --route` and `ask --route` post one instruction:
 
 ```json
@@ -63,13 +72,16 @@ Each message is a one-way `cross_chat_envelopes` instruction with immutable
 `authorization_kind: configured_route`, `authorization_route_id`, and
 `authorization_pair_id`. New messages do not create exchange rows, consume
 one-use per-route permission, or maintain in-memory reply counters. The
-existing 16,000-character/64-KiB body bounds and source/target rolling rate
-limits remain. Legacy `max_handoffs_per_run` and exchange-leg fields apply to
-legacy exchange modes only.
+existing 16,000-character/64-KiB body bounds remain. Saved routes and configured
+route messages have no count or hourly quota; new sends neither read nor write
+the deprecated rate table. Legacy `max_handoffs_per_run` and exchange-leg fields
+apply to legacy exchange modes only. Ordinary message reference batches retain
+their existing input bound; the bounded crash-recovery journal does not limit
+the accumulated number of permissions.
 
 The durable `(source_run_id, idempotency_key)` constraint compares message
 body, route, target, and pair identity. Retries reuse the same envelope and
-charge the rate limiter once. A new message requires a new key. The helper's
+cannot repeat delivery. A new message requires a new key. The helper's
 default key is stable for the same live authority, route, and body; use an
 explicit new key when intentionally repeating identical text in the same run.
 
@@ -115,7 +127,7 @@ retain their existing format and bounded exchange behavior.
 `test_async_route_transport_isolated.py` extracts selected server functions
 through AST and runs ledger effects against SQLite `:memory:`. Helper
 authority and transport are mocked. Tests cover repeated messages beyond
-legacy one-use counters, durable idempotency and rate charging, unavailable
+legacy one-use counters and former hourly quotas, durable idempotency, unavailable
 mode/run/pair, cancellation, lifecycle replay, exact reverse responses,
 legacy helper compatibility, successful empty completion, and native-control
 metadata isolation. Pair admission/queue/revoke tests live in

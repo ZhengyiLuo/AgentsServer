@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import re
 import time
+import team_mail_grants
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock
@@ -77,6 +78,7 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
             return [{"seq": index + 1} for index in range(len(specs))]
 
         self.ns = {
+            "team_mail_grants": team_mail_grants,
             "asyncio": asyncio, "deque": deque, "suppress": suppress, "json": json,
             "re": re, "time": time, "CodexAppServerError": CodexAppServerError,
             "CodexAppServerProtocolError": CodexAppServerProtocolError,

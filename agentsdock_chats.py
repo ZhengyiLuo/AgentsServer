@@ -600,19 +600,40 @@ def wait(args: argparse.Namespace) -> dict[str, Any]:
 
 def list_routes(args: argparse.Namespace) -> dict[str, Any]:
     capability = authority(args.authority_file)
-    result = get_json("/api/agent/cross-chat/routes", capability)
+    cursor = str(getattr(args, "cursor", None) or "")
+    if cursor and re.fullmatch(r"route_[0-9a-f]{32}", cursor) is None:
+        raise ChatsCLIError("--cursor must be the previous route page's next_cursor")
+    path = "/api/agent/cross-chat/routes"
+    if cursor:
+        path += "?" + urllib.parse.urlencode({"cursor": cursor})
+    result = get_json(path, capability)
     routes = result.get("routes")
     if not isinstance(routes, list) or any(
         not isinstance(route, dict) for route in routes
     ):
         raise ChatsCLIError("AgentsServer returned an invalid route list")
+    next_cursor = result.get("next_cursor")
+    if next_cursor is not None and (
+        not isinstance(next_cursor, str)
+        or re.fullmatch(r"route_[0-9a-f]{32}", next_cursor) is None
+        or next_cursor == cursor
+    ):
+        raise ChatsCLIError("AgentsServer returned an invalid route cursor")
+    if cursor and "next_cursor" not in result:
+        raise ChatsCLIError("this AgentsServer does not support paginated route discovery")
     return result
 
 
 def negotiated_route_mode(capability: str, route_id: str, requested: str = "") -> str:
     """Discover mode through a read before sending any state-changing request."""
 
-    response = get_json("/api/agent/cross-chat/routes", capability)
+    # Older servers ignore this additive query and return their complete route
+    # list; keep exact filtering for both contracts. New servers return only
+    # the requested live route, including routes beyond the first list page.
+    response = get_json(
+        "/api/agent/cross-chat/routes?" + urllib.parse.urlencode({"route_id": route_id}),
+        capability,
+    )
     routes = response.get("routes")
     if not isinstance(routes, list):
         raise ChatsCLIError("AgentsServer returned an invalid route list")
@@ -958,8 +979,12 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", required=True)
     list_command = commands.add_parser(
         "list",
-        help="list eligible same-server chats for this live run",
+        help="list one page of eligible same-server chats for this live run",
         allow_abbrev=False,
+    )
+    list_command.add_argument(
+        "--cursor",
+        help="continue listing with the previous response's non-null next_cursor",
     )
     list_command.set_defaults(handler=list_routes)
     command = commands.add_parser(

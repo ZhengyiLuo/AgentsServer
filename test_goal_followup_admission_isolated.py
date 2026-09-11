@@ -20,6 +20,7 @@ FUNCTIONS = {
     "codex_goal_followup_requires_native",
     "codex_goal_steer_selection_is_plain",
     "_run_queued_turn_now_once",
+    "async_route_queue_fields",
 }
 
 
@@ -52,6 +53,7 @@ def load_admission():
         "CLAUDE_TRANSPORT_AGENT_SDK": "agent_sdk",
         "CODEX_GOAL_STEER_CLIENT_CAPABILITY": "codex_goal_steer_v1",
         "CROSS_CHAT_DELIVERY_PURPOSES": {"local_delivery", "peer_delivery"},
+        "LOCAL_CROSS_CHAT_DELIVERY_PURPOSE": "local_delivery",
     }
     exec(compile(module, str(SOURCE), "exec"), namespace)
     return namespace
@@ -269,15 +271,12 @@ class GoalFollowupAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.selected["_native_delivery_fenced"] = True
         await self.assert_rejected(guard="delivery_uncertain")
 
-    async def test_delivery_authorization_and_order_guards_remain_stronger(self):
+    async def test_selecting_immutable_delivery_still_rejects(self):
         for purpose in ("local_delivery", "peer_delivery"):
             with self.subTest(purpose=purpose):
                 self.selected["purpose"] = purpose
                 await self.assert_rejected(guard="selected_cross_chat_delivery")
                 self.selected.pop("purpose")
-                self.queue[0]["purpose"] = purpose
-                await self.assert_rejected(guard="prior_cross_chat_delivery")
-                self.queue[0].pop("purpose")
 
     async def test_special_purpose_input_cannot_enter_plain_goal_steering(self):
         # Scheduler-specific queue precedence belongs to its separate change.

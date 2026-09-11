@@ -527,7 +527,7 @@ class StopTurnProviderReadinessTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(routes, {
                     "routes": [],
-                    "max_routes": agent_server.PROVIDER_CROSS_CHAT_ROUTE_LIMIT,
+                    "max_routes": agent_server.PROVIDER_CROSS_CHAT_ROUTE_LEGACY_CLIENT_HINT,
                 })
                 self.assertEqual(read["session"], agent_server.public_session(session))
                 self.assertTrue(queued["queued"])

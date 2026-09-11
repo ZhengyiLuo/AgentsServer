@@ -8649,6 +8649,7 @@ class TeamHubHostEnableRequest(BaseModel):
     confirmed: Literal[True]
     server_name: str = Field(min_length=1, max_length=160)
     network_name: str | None = Field(default=None, min_length=1, max_length=160)
+    require_existing_host: bool = Field(default=False, strict=True)
 
     @field_validator("request_id", mode="before")
     @classmethod
@@ -72047,6 +72048,7 @@ def team_hub_host_control_capability() -> dict[str, Any]:
         "can_enable": authenticated and not enabled,
         "can_disable": authenticated and enabled,
         "server_bootstrap": authenticated,
+        "rename_existing_host": authenticated,
         "required": False,
         "version": 1,
         "status_path": "/api/admin/team-hub/host",
@@ -72527,7 +72529,14 @@ async def enable_team_hub_host(
     request_id = str(body.request_id)
     async with TEAM_HUB_HOST_CONTROL_LOCK:
         require_team_hub_host_control_target(body)
+        if body.require_existing_host:
+            if body.network_name is not None:
+                raise TeamHubHostControlFailure("invalid_request", "Rename cannot change the Team Network name.", status_code=422)
+            if not TEAM_HUB_RUNTIME.designated_host:
+                raise TeamHubHostControlFailure("team_hub_host_changed", "This server is no longer the Team Network Host.", status_code=409)
         await reconcile_pending_team_hub_host_control()
+        if body.require_existing_host and not TEAM_HUB_RUNTIME.designated_host:
+            raise TeamHubHostControlFailure("team_hub_host_changed", "This server is no longer the Team Network Host.", status_code=409)
         prior = read_team_hub_host_control_status()
         if (
             str(prior.get("request_id") or "") == request_id
@@ -72685,7 +72694,7 @@ async def enable_team_hub_host(
 async def disable_team_hub_host(
     body: TeamHubHostEnableRequest,
 ) -> dict[str, Any]:
-    if body.network_name is not None:
+    if body.require_existing_host or body.network_name is not None:
         raise TeamHubHostControlFailure(
             "invalid_request", "Only a host can create a Team Network.",
             status_code=422, action="Select Host to create a network.",

@@ -705,7 +705,8 @@ EMERGENCY_AUTHORITY_DENIED_PURPOSES = {
 PROVIDER_CROSS_CHAT_ROUTE_DEFAULT_ACTIONS = ("instruction",)
 PROVIDER_CROSS_CHAT_ROUTE_KIND_AMBIENT = "ambient_local"
 PROVIDER_CROSS_CHAT_ROUTE_KIND_REFERENCE = "prompt_reference"
-PROVIDER_CROSS_CHAT_ROUTE_LIMIT = 16
+# Compatibility hint for older desktop pickers only; never a storage ceiling.
+PROVIDER_CROSS_CHAT_ROUTE_LEGACY_CLIENT_HINT = 16
 PROVIDER_CROSS_CHAT_ROUTE_HANDOFF_LIMIT = 4
 PROVIDER_CROSS_CHAT_ROUTE_BODY_MAX_CHARS = 16_000
 PROVIDER_CROSS_CHAT_ROUTE_BODY_MAX_BYTES = 64 * 1024
@@ -757,8 +758,7 @@ PROVIDER_CROSS_CHAT_LIVE_OBSERVER_GRACE_SECONDS = max(
     float(PROVIDER_CROSS_CHAT_LIVE_HEARTBEAT_SECONDS) + 30.0,
 )
 PROVIDER_CROSS_CHAT_ROUTE_AUDIT_LIMIT = 64
-PROVIDER_CROSS_CHAT_ROUTE_RATE_LIMIT = 12
-PROVIDER_CROSS_CHAT_ROUTE_RATE_WINDOW_SECONDS = 60 * 60
+PROVIDER_CROSS_CHAT_LEGACY_RATE_RETENTION_SECONDS = 60 * 60
 PROVIDER_CROSS_CHAT_ROUTE_ALIAS_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 PROVIDER_CROSS_CHAT_ROUTE_ID_RE = re.compile(r"^route_[0-9a-f]{32}$")
 PROVIDER_CROSS_CHAT_ROUTE_PAIR_ID_RE = re.compile(r"^pair_[0-9a-f]{32}$")
@@ -6997,7 +6997,7 @@ def normalized_provider_cross_chat_routes(value: Any) -> list[dict[str, Any]]:
     seen_ids: set[str] = set()
     seen_aliases: set[str] = set()
     seen_targets: set[str] = set()
-    for raw in value[:PROVIDER_CROSS_CHAT_ROUTE_LIMIT]:
+    for raw in value:
         if not isinstance(raw, dict):
             continue
         route_id = str(raw.get("route_id") or "")
@@ -7105,7 +7105,7 @@ def normalized_pending_provider_cross_chat_grant(
             )
         )
         or not isinstance(raw_changes, list)
-        or not 1 <= len(raw_changes) <= PROVIDER_CROSS_CHAT_ROUTE_LIMIT
+        or not 1 <= len(raw_changes) <= PROVIDER_CROSS_CHAT_ROUTE_AUDIT_LIMIT
         or not isinstance(raw_displaced_audit_entries, list)
         or not isinstance(audit_count_after_stage, int)
         or isinstance(audit_count_after_stage, bool)
@@ -7516,17 +7516,11 @@ def next_durable_provider_cross_chat_route_alias(
     """Allocate a private stable alias without trusting display metadata."""
 
     used = {str(route.get("alias") or "") for route in routes}
-    for index in range(1, PROVIDER_CROSS_CHAT_ROUTE_LIMIT + 1):
+    for index in range(1, len(used) + 2):
         alias = f"chat{index}"
         if alias not in used:
             return alias
-    raise HTTPException(
-        status_code=409,
-        detail=(
-            "this chat already has the maximum number of durable "
-            "cross-chat grants"
-        ),
-    )
+    raise RuntimeError("could not allocate a unique cross-chat route alias")
 
 
 def provider_cross_chat_route_snapshot_to_target(
@@ -7678,8 +7672,6 @@ async def persist_provider_cross_chat_pair_grants(
                 (target_session_id, source_session_id, reverse, reverse_id, forward_id, desired_reverse),
             ):
                 routes = routes_by_session[owner_id]
-                if current is None and len(routes) >= PROVIDER_CROSS_CHAT_ROUTE_LIMIT:
-                    raise HTTPException(status_code=409, detail="a chat already has the maximum number of durable cross-chat grants")
                 route = {
                     "route_id": route_id,
                     "revision": "rev_" + uuid.uuid4().hex,
@@ -7706,6 +7698,9 @@ async def persist_provider_cross_chat_pair_grants(
         for session_id, changes in changes_by_session.items():
             if not changes:
                 continue
+            # Bound one recovery journal, not the chat's accumulated grants.
+            if len(changes) > PROVIDER_CROSS_CHAT_ROUTE_AUDIT_LIMIT:
+                raise HTTPException(status_code=400, detail="too many cross-chat grant changes in one admission")
             session = sessions[session_id]
             previous[session_id] = {
                 key: session.get(key) for key in (
@@ -7889,14 +7884,6 @@ async def persist_durable_provider_cross_chat_reference_grants(
                     "before": dict(current),
                 })
                 continue
-            if len(routes) >= PROVIDER_CROSS_CHAT_ROUTE_LIMIT:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "this chat already has the maximum number of durable "
-                        "cross-chat grants"
-                    ),
-                )
             route_actions = (
                 [
                     action
@@ -7943,6 +7930,8 @@ async def persist_durable_provider_cross_chat_reference_grants(
                 "changes": [],
                 "reciprocal_effects": reciprocal_effects,
             }
+        if len(rollback_changes) > PROVIDER_CROSS_CHAT_ROUTE_AUDIT_LIMIT:
+            raise HTTPException(status_code=400, detail="too many cross-chat grant changes in one admission")
         previous_routes = source.get("provider_cross_chat_routes")
         previous_audit = source.get("provider_cross_chat_route_audit")
         previous_updated_at = source.get("updated_at")
@@ -13832,7 +13821,7 @@ class CrossChatStore:
                     "WHERE accepted_at_epoch < ?",
                     (
                         time.time()
-                        - PROVIDER_CROSS_CHAT_ROUTE_RATE_WINDOW_SECONDS,
+                        - PROVIDER_CROSS_CHAT_LEGACY_RATE_RETENTION_SECONDS,
                     ),
                 )
         await self._call(operation)
@@ -13841,77 +13830,6 @@ class CrossChatStore:
     @staticmethod
     def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
         return dict(row) if row is not None else None
-
-    @staticmethod
-    def _charge_configured_route_rate(
-        connection: sqlite3.Connection,
-        *,
-        effect_id: str,
-        source_session_id: str,
-        target_session_id: str,
-        accepted_at_epoch: float,
-    ) -> None:
-        existing = connection.execute(
-            "SELECT * FROM cross_chat_route_rate_events WHERE effect_id=?",
-            (effect_id,),
-        ).fetchone()
-        if existing is not None:
-            if (
-                existing["source_session_id"] != source_session_id
-                or existing["target_session_id"] != target_session_id
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="configured route effect id is already bound",
-                )
-            return
-        cutoff = (
-            accepted_at_epoch - PROVIDER_CROSS_CHAT_ROUTE_RATE_WINDOW_SECONDS
-        )
-        connection.execute(
-            "DELETE FROM cross_chat_route_rate_events WHERE accepted_at_epoch < ?",
-            (cutoff,),
-        )
-        source_count = int(connection.execute(
-            """
-            SELECT COUNT(*) FROM cross_chat_route_rate_events
-            WHERE source_session_id=? AND accepted_at_epoch>=?
-            """,
-            (source_session_id, cutoff),
-        ).fetchone()[0])
-        target_count = int(connection.execute(
-            """
-            SELECT COUNT(*) FROM cross_chat_route_rate_events
-            WHERE target_session_id=? AND accepted_at_epoch>=?
-            """,
-            (target_session_id, cutoff),
-        ).fetchone()[0])
-        if (
-            source_count >= PROVIDER_CROSS_CHAT_ROUTE_RATE_LIMIT
-            or target_count >= PROVIDER_CROSS_CHAT_ROUTE_RATE_LIMIT
-        ):
-            raise HTTPException(
-                status_code=429,
-                detail="agent cross-chat handoff rate limit exceeded",
-                headers={
-                    "Retry-After": str(
-                        PROVIDER_CROSS_CHAT_ROUTE_RATE_WINDOW_SECONDS
-                    )
-                },
-            )
-        connection.execute(
-            """
-            INSERT INTO cross_chat_route_rate_events
-            (effect_id, source_session_id, target_session_id, accepted_at_epoch)
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                effect_id,
-                source_session_id,
-                target_session_id,
-                accepted_at_epoch,
-            ),
-        )
 
     async def create_final_obligation(
         self,
@@ -14017,14 +13935,6 @@ class CrossChatStore:
                             detail="idempotency key was already used for a different handoff",
                         )
                     return record, False
-                if authorization_kind == "configured_route":
-                    self._charge_configured_route_rate(
-                        connection,
-                        effect_id=envelope_id,
-                        source_session_id=source_session_id,
-                        target_session_id=target_session_id,
-                        accepted_at_epoch=time.time(),
-                    )
                 connection.execute(
                     """
                     INSERT INTO cross_chat_envelopes
@@ -14352,14 +14262,6 @@ class CrossChatStore:
                             ),
                         )
                     return exchange, leg, False
-
-                self._charge_configured_route_rate(
-                    connection,
-                    effect_id=exchange_id,
-                    source_session_id=requester_session_id,
-                    target_session_id=responder_session_id,
-                    accepted_at_epoch=time.time(),
-                )
 
                 connection.execute(
                     """
@@ -18256,7 +18158,7 @@ def normalized_provider_cross_chat_route_snapshot(value: Any) -> list[dict[str, 
         for raw in value
     )
     if not ephemeral_requested:
-        # Legacy configured routes retain their persisted 16-route ceiling.
+        # Persisted routes keep their exact identity/revision validation.
         return normalized_provider_cross_chat_routes(value)
     routes: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
@@ -36718,11 +36620,9 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
             "request_reply_ttl_seconds": (
                 PROVIDER_CROSS_CHAT_ROUTE_EXCHANGE_TTL_SECONDS
             ),
-            "rate_window_seconds": (
-                PROVIDER_CROSS_CHAT_ROUTE_RATE_WINDOW_SECONDS
-            ),
-            "rate_limit_per_source": PROVIDER_CROSS_CHAT_ROUTE_RATE_LIMIT,
-            "rate_limit_per_target": PROVIDER_CROSS_CHAT_ROUTE_RATE_LIMIT,
+            "rate_window_seconds": None,
+            "rate_limit_per_source": None,
+            "rate_limit_per_target": None,
             "transcript_access": False,
         },
         "agent_routes": {
@@ -36732,7 +36632,7 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
             "durable": True,
             "directional": True,
             "revoke_requires_revision": True,
-            "max_routes_per_chat": PROVIDER_CROSS_CHAT_ROUTE_LIMIT,
+            "max_routes_per_chat": None,
             "max_handoffs_per_run": PROVIDER_CROSS_CHAT_ROUTE_HANDOFF_LIMIT,
             "actions": list(PROVIDER_CROSS_CHAT_ROUTE_ACTIONS),
             "default_actions": list(PROVIDER_CROSS_CHAT_ROUTE_DEFAULT_ACTIONS),
@@ -36744,11 +36644,9 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
             "request_reply_ttl_seconds": (
                 PROVIDER_CROSS_CHAT_ROUTE_EXCHANGE_TTL_SECONDS
             ),
-            "rate_window_seconds": (
-                PROVIDER_CROSS_CHAT_ROUTE_RATE_WINDOW_SECONDS
-            ),
-            "rate_limit_per_source": PROVIDER_CROSS_CHAT_ROUTE_RATE_LIMIT,
-            "rate_limit_per_target": PROVIDER_CROSS_CHAT_ROUTE_RATE_LIMIT,
+            "rate_window_seconds": None,
+            "rate_limit_per_source": None,
+            "rate_limit_per_target": None,
             "transcript_access": False,
             "async_route_v1": {
                 "available": available,
@@ -36756,6 +36654,9 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
                 "mode": "async_route_v1",
                 "delivery": "individual_messages",
                 "automatic_final_response": False,
+                "max_handoffs_per_run": None,
+                "rate_limit_per_source": None,
+                "rate_limit_per_target": None,
             },
         },
         "supported_target_backends": supported_backends,
@@ -42450,8 +42351,8 @@ async def reserve_async_provider_route_message(
 
     Unlike legacy route exchanges, independent messages never consume a
     per-route permission or create an in-memory reply counter. SQLite retains
-    the bounded-body message and charges the existing durable rate limiter
-    only for a newly accepted idempotency key.
+    the bounded-body message once for each newly accepted idempotency key,
+    without a saved-route count or hourly message quota.
     """
 
     capability = await authorize_provider_action(
@@ -81808,7 +81709,10 @@ def reject_unavailable_route_target(
 
 
 @app.get("/api/sessions/{source_session_id}/agent-handoff-routes")
-async def list_agent_handoff_routes(source_session_id: str) -> dict[str, Any]:
+async def list_agent_handoff_routes(
+    source_session_id: str,
+    unlimited_routes: bool = False,
+) -> dict[str, Any]:
     async with session_lifecycle_lock(source_session_id):
         ensure_session_not_deleting(source_session_id)
         source = STORE.sessions.get(source_session_id)
@@ -81818,7 +81722,12 @@ async def list_agent_handoff_routes(source_session_id: str) -> dict[str, Any]:
             admin_provider_cross_chat_route(source_session_id, route)
             for route in provider_cross_chat_routes(source)
         ]
-    return {"routes": routes, "max_routes": PROVIDER_CROSS_CHAT_ROUTE_LIMIT}
+    return {
+        "routes": routes,
+        # Old clients subtract this hint in their picker. New clients opt into
+        # explicit unlimited metadata; neither response limits stored grants.
+        "max_routes": None if unlimited_routes else PROVIDER_CROSS_CHAT_ROUTE_LEGACY_CLIENT_HINT,
+    }
 
 
 @app.post("/api/sessions/{source_session_id}/agent-handoff-routes")
@@ -81860,11 +81769,6 @@ async def create_agent_handoff_route(
                     )
                 }
             reject_unavailable_route_target(source_session_id, target_session_id)
-            if len(routes) >= PROVIDER_CROSS_CHAT_ROUTE_LIMIT:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"a chat can configure at most {PROVIDER_CROSS_CHAT_ROUTE_LIMIT} agent handoff routes",
-                )
             if any(route.get("alias") == alias for route in routes):
                 raise HTTPException(status_code=409, detail="route alias is already configured")
             if any(
@@ -82150,14 +82054,37 @@ async def list_provider_cross_chat_routes(request: Request) -> dict[str, Any]:
             session_id=source_session_id,
         )
         issued = capability.get("provider_route_grants") or {}
+        cursor = request.query_params.get("cursor", "")
+        route_id = request.query_params.get("route_id", "")
+        if (cursor and route_id) or any(
+            value and not PROVIDER_CROSS_CHAT_ROUTE_ID_RE.fullmatch(value)
+            for value in (cursor, route_id)
+        ):
+            raise HTTPException(status_code=400, detail="invalid route discovery query")
         routes: list[dict[str, Any]] = []
-        issued_routes = sorted(
-            (dict(route) for route in issued.values()),
-            key=lambda route: (
-                str(route.get("alias") or ""),
-                str(route.get("route_id") or ""),
-            ),
-        )
+        next_cursor = None
+        if route_id:
+            # Exact mode negotiation must not depend on the route's page. The
+            # issued snapshot and live intersection still authorize this read.
+            issued_routes = [issued[route_id]] if route_id in issued else []
+        else:
+            def discovery_order(route: dict[str, Any]) -> tuple[str, str]:
+                return str(route.get("alias") or ""), str(route.get("route_id") or "")
+
+            if cursor and cursor not in issued:
+                raise HTTPException(status_code=400, detail="invalid route discovery cursor; restart listing")
+            after = discovery_order(issued[cursor]) if cursor else None
+            ordered = sorted(
+                (route for route in issued.values()
+                 if after is None or discovery_order(route) > after),
+                key=discovery_order,
+            )
+            # Bound output below the provider tool's 128 KiB ceiling, not the
+            # number of permissions. Advance over revoked entries too, so a
+            # sparse/empty page can still lead to later authorized routes.
+            issued_routes = ordered[:64]
+            if len(ordered) > len(issued_routes):
+                next_cursor = str(issued_routes[-1]["route_id"])
         for issued_route in issued_routes:
             live = live_provider_cross_chat_route(
                 source_session_id,
@@ -82171,7 +82098,11 @@ async def list_provider_cross_chat_routes(request: Request) -> dict[str, Any]:
             routes.append(projection)
     return {
         "routes": routes,
-        "max_handoffs_per_run": PROVIDER_CROSS_CHAT_ROUTE_HANDOFF_LIMIT,
+        "next_cursor": next_cursor,
+        "max_handoffs_per_run": (
+            None if capability.get("async_route_v1") is True
+            else PROVIDER_CROSS_CHAT_ROUTE_HANDOFF_LIMIT
+        ),
     }
 
 

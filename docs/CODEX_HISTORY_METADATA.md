@@ -42,3 +42,20 @@ Validation uses `test_codex_history_metadata_isolated.py` and the existing Codex
 goal/Claude isolated suites. They compile explicitly allowlisted AST helpers,
 mock persistence or use temporary files, and never import/start the server or
 contact a provider.
+
+## Typed runtime inputs
+
+Provider user-role records explicitly typed `multi_agent.subagent_notification`
+or `generic.turn_aborted` are runtime metadata, not human input. Classification
+requires the exclusive provider kind, the complete matching wrapper, valid
+provider identity, and no positive human/client provenance. Ordinary quotations
+and unknown or mixed kinds remain visible. Silent imported boundaries preserve
+following answers without creating a new human message or changing live state.
+
+Older imported copies are projected only after checkpoint, source digest,
+message identity, original timestamp and complete text prove the same record.
+A forked transcript may contain its explicitly declared ancestor headers; an
+unrelated or ambiguous header fails proof. Original transcripts and stored
+events are not rewritten. The bounded repair cache is prepared on demand and
+does not add polling. Runtime cursor identities are distinct from human text,
+so a later identical human quotation cannot be consumed as a duplicate.

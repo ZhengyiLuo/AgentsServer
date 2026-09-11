@@ -1,4 +1,4 @@
-"""Read-only, checkpoint-proven repair of legacy Codex goal-context imports.
+"""Read-only, checkpoint-proven repair of Codex runtime and native replay imports.
 
 Preparation is explicit, bounded and once per requested chat/provider. Event
 projection is memory-only. Missing, changing or ambiguous evidence stays visible.
@@ -25,6 +25,7 @@ from claude_history_repair import (
 MAX_PRIOR_SOURCE_PATHS = 2
 MAX_AGGREGATE_SOURCE_BYTES = 96 * 1024 * 1024
 MAX_AGGREGATE_SOURCE_RECORDS = 100_000
+MAX_FORK_META_HEADERS = 32
 _PROVIDER_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 
 
@@ -328,6 +329,42 @@ def codex_public_item_origin(event: dict, provider_id: str | None = None) -> dic
     return origin
 
 
+def _runtime_human_provenance(event: dict) -> bool:
+    metadata = event.get("internal_chat_message_metadata_passthrough")
+    kinds = metadata.get("content_item_kinds") if isinstance(metadata, dict) else None
+    return event.get("provider_user_authored") is True or isinstance(kinds, list) and "user.text" in kinds or any(
+        isinstance(event.get(field), str) and event[field].strip()
+        for field in ("clientUserMessageId", "clientId", "client_user_message_id", "client_id")
+    ) or any(isinstance(origin, dict) and origin.get("kind") in ("human", "user", "user_input", "user-input")
+             for origin in (event.get("origin"), event.get("provider_origin")))
+
+
+def _persisted_runtime_marker(event: dict, session_id: str) -> bool:
+    origin = event.get("provider_origin")
+    runtime_kind = event.get("provider_runtime_context")
+    if (runtime_kind not in ("subagent_notification", "turn_aborted")
+        or event.get("metadata_only") is not True or event.get("backend") != "codex"
+        or event.get("imported") is not True or not isinstance(event.get("run_id"), str)
+        or not event["run_id"].startswith("import_") or event.get("session_id") != session_id
+        or not isinstance(event.get("id"), str) or not 0 < len(event["id"].strip()) <= 256
+        or type(event.get("seq")) is not int or event["seq"] <= 0
+        or event.get("type") != "turn_started" or event.get("prompt") != ""
+        or _runtime_human_provenance(event) or not isinstance(origin, dict)
+        or origin.get("provider") != "codex" or origin.get("kind") != runtime_kind
+        or not all(isinstance(origin.get(key), str) and 0 < len(origin[key].strip()) <= 256
+                   for key in ("event_id", "session_id", "turn_id"))
+        or not isinstance(origin.get("source_text_sha256"), str) or not _DIGEST.fullmatch(origin["source_text_sha256"])):
+        return False
+    timestamp = origin.get("timestamp")
+    if (not isinstance(timestamp, str) or timestamp != event.get("ts") or not re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)", timestamp)):
+        return False
+    try:
+        return datetime.fromisoformat(timestamp.replace("Z", "+00:00")).utcoffset() is not None
+    except ValueError:
+        return False
+
+
 def _replay_target(event: dict) -> tuple | None:
     kind = "user" if event.get("type") == "turn_started" else "assistant" if event.get("type") in ("assistant_text", "reasoning_summary") else None
     body = event.get("prompt") if kind == "user" else event.get("text")
@@ -342,7 +379,7 @@ def _replay_target(event: dict) -> tuple | None:
     # Human authorship does not make a duplicate a second human message.
     # Retain the original authorship flag; only this exact ledger copy is aliased.
     return (event["seq"], event["run_id"], event["id"], event["type"], kind, _text_key(body), event["ts"],
-            event.get("provider_user_authored") is True, event.get("source_text_sha256"))
+            _runtime_human_provenance(event), event.get("source_text_sha256"))
 
 
 @dataclass(frozen=True)
@@ -387,7 +424,7 @@ def _prove_native_replays(session_id: str, provider_id: str, events: Path, sourc
                 native.setdefault((run, kind, _text_key(body)), []).append(event)
         if len(candidates) + len(batches) + len(native) + len(owners) > MAX_KEYS:
             raise _Unproven()
-    if not candidates or not owners:
+    if not candidates:
         return _NativeProof(provider_id)
     groups = {}
     for run, batch in batches.items():
@@ -445,13 +482,29 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
         return {}
     budget.reserve(stamp[2])
     digest, verified, canonical, occurrences = hashlib.sha256(), set(), {}, {}
+    allowed_header_owners, header_parents = {thread}, {}
     context_turn = None
     for record, offset, line in _records(source, stamp):
         budget.consume_record()
         payload = record.get("payload")
         if offset == len(line) or record.get("type") == "session_meta":
-            if record.get("type") != "session_meta" or not isinstance(payload, dict) or payload.get("id") != thread:
+            if record.get("type") != "session_meta" or not isinstance(payload, dict):
                 raise _Unproven()
+            owner, parent = payload.get("id"), payload.get("forked_from_id")
+            if (not isinstance(owner, str) or owner not in allowed_header_owners
+                or offset == len(line) and owner != thread
+                or parent is not None and (not isinstance(parent, str) or not _PROVIDER_ID.fullmatch(parent))
+                or owner in header_parents and header_parents[owner] != parent
+                or owner not in header_parents and parent in header_parents):
+                raise _Unproven()
+            # Forked rollouts retain an ancestral session_meta immediately
+            # after their own header. Only the declared parent chain is valid;
+            # an unrelated embedded owner cannot relabel this source file.
+            header_parents[owner] = parent
+            if len(header_parents) > MAX_FORK_META_HEADERS:
+                raise _Unproven()
+            if parent is not None:
+                allowed_header_owners.add(parent)
         digest.update(line)
         for expected in wanted.get(offset, ()):
             if hmac.compare_digest(digest.hexdigest(), expected):
@@ -464,6 +517,11 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
         if not item or item.get("kind") not in ("user", "assistant") or not isinstance(item.get("text"), str):
             continue
         origin = codex_public_item_origin(record, thread)
+        runtime_kind = item.get("provider_runtime_context")
+        if (origin and runtime_kind in ("subagent_notification", "turn_aborted")
+                and item.get("provider_user_authored") is not True
+                and (item.get("provider_origin") or {}).get("kind") == runtime_kind):
+            origin = {**origin, "kind": runtime_kind}
         turn = origin["turn_id"] if origin else context_turn
         timestamp = record.get("timestamp")
         if not isinstance(turn, str) or not isinstance(timestamp, str):
@@ -488,9 +546,18 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
             continue
         key = next(iter(matches))
         source_ids, owned_runs = canonical.get(key, {}), owners.get((thread, key[0]), set())
-        if len(source_ids) != 1 or len(owned_runs) != 1 or source_hash is not None:
+        if len(source_ids) != 1 or source_hash is not None:
             # Truncated source hashes need a separately retained native full-body
             # hash. Until one exists, the bounded preview cannot prove equality.
+            continue
+        source_origin = next(iter(source_ids.values()))
+        if source_origin.get("kind") in ("subagent_notification", "turn_aborted"):
+            if kind == "user" and not _human:
+                proofs[target] = {**source_origin, "source_text_sha256": body_key}
+                if len(proofs) > MAX_TARGETS:
+                    raise _Unproven()
+            continue
+        if len(owned_runs) != 1:
             continue
         native_matches = native.get((next(iter(owned_runs)), kind, body_key), [])
         native_matches = [event for event in native_matches if type(event.get("seq")) is int and event["seq"] < first and isinstance(event.get("id"), str)]
@@ -535,6 +602,8 @@ class CodexNativeHistoryRepairCache(CodexGoalHistoryRepairCache):
     def project_event(self, session_id: str, event: dict) -> dict | None:
         if event.get("session_id") not in (None, "", session_id):
             return None
+        if _persisted_runtime_marker(event, session_id):
+            return {**event, "_agentsdock_imported_prompt_hidden": True}
         if (event.get("provider_history_repair") == "source_proven_native_replay"
             and event.get("metadata_only") is True and event.get("backend") == "codex"
             and event.get("imported") is True and str(event.get("run_id") or "").startswith("import_")
@@ -551,6 +620,10 @@ class CodexNativeHistoryRepairCache(CodexGoalHistoryRepairCache):
         origin = proof.targets.get(target) if target else None
         if origin is None:
             return None
+        if origin.get("kind") in ("subagent_notification", "turn_aborted"):
+            return {**event, "prompt": "", "metadata_only": True,
+                    "provider_runtime_context": origin["kind"], "provider_origin": origin,
+                    "_agentsdock_imported_prompt_hidden": True}
         return {**event, "prompt" if event["type"] == "turn_started" else "text": "",
                 "metadata_only": True, "provider_history_repair": "source_proven_native_replay", "provider_origin": origin,
                 **({"_agentsdock_imported_prompt_hidden": True} if event["type"] == "turn_started" else {})}

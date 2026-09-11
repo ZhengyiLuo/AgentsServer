@@ -25,6 +25,8 @@ FUNCTIONS = {
     "normalized_history_provider_origin", "normalized_history_item",
     "normalized_history_import_limit", "codex_user_item_has_human_provenance",
     "is_codex_goal_runtime_user_item", "codex_history_user_record",
+    "is_codex_subagent_notification_user_item",
+    "codex_runtime_user_item_kind",
     "codex_history_user_item", "codex_history_event_item", "append_codex_history_event",
     "codex_history_assistant_metadata", "codex_history_assistant_item", "merge_codex_history_duplicate",
     "codex_history_user_event_item",

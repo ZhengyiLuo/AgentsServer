@@ -5097,7 +5097,7 @@ ARTIFACT_PUBLICATION_LOCK_STRIPES = tuple(asyncio.Lock() for _ in range(64))
 TIMELINE_PIN_LOCK_STRIPES = tuple(asyncio.Lock() for _ in range(64))
 TIMELINE_INDEX_CACHE_MAX = int(agentsdock_setting("TIMELINE_INDEX_CACHE_MAX", "24"))
 TIMELINE_INDEX_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
-TIMELINE_INDEX_PROJECTION_VERSION = 5
+TIMELINE_INDEX_PROJECTION_VERSION = 6
 # Retained as a compatibility/testing surface; synchronization uses the fixed
 # stripe pool below so deleted-session churn cannot leak one lock per chat.
 TIMELINE_INDEX_LOCKS: dict[str, threading.Lock] = {}
@@ -5112,7 +5112,7 @@ FORK_INTERNAL_RUN_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 FORK_INTERNAL_RUN_LOCKS: dict[str, threading.Lock] = {}
 HISTORY_SEARCH_DB = STATE_DIR / "history_search.sqlite3"
 HISTORY_SEARCH_LOCK = threading.Lock()
-HISTORY_SEARCH_INDEX_VERSION = "7"
+HISTORY_SEARCH_INDEX_VERSION = "8"
 HISTORY_SEARCH_DIRTY: set[str] = set()
 HISTORY_SEARCH_REPAIR_DIRTY: set[str] = set()
 HISTORY_SEARCH_SYNC_INTERVAL_SECONDS = max(
@@ -46040,6 +46040,38 @@ def codex_history_user_record(event: dict[str, Any]) -> tuple[dict[str, Any], st
     return None
 
 
+def codex_runtime_user_item_kind(item: dict[str, Any], text: str) -> str | None:
+    """Two explicitly typed provider inputs, never a text-only quotation filter."""
+    if item.get("type") != "message" or item.get("role") != "user" or codex_user_item_has_human_provenance(item):
+        return None
+    metadata = item.get("internal_chat_message_metadata_passthrough")
+    kinds = metadata.get("content_item_kinds") if isinstance(metadata, dict) else None
+    if not isinstance(kinds, list) or not kinds:
+        return None
+    if all(kind == "generic.turn_aborted" for kind in kinds):
+        match = re.fullmatch(r"<turn_aborted>\s*([\s\S]*?)\s*</turn_aborted>", str(text or "").strip())
+        return "turn_aborted" if match is not None and match.group(1).strip() else None
+    if any(kind != "multi_agent.subagent_notification" for kind in kinds):
+        return None
+    match = re.fullmatch(r"<subagent_notification>\s*([\s\S]*?)\s*</subagent_notification>", str(text or "").strip())
+    if match is None:
+        return None
+    try:
+        notification = json.loads(match.group(1))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(notification, dict) or set(notification) != {"agent_path", "status"}:
+        return None
+    path, status = notification["agent_path"], notification["status"]
+    return "subagent_notification" if (isinstance(path, str) and 0 < len(path.strip()) <= 256
+            and isinstance(status, dict) and set(status) == {"completed"}
+            and isinstance(status["completed"], str)) else None
+
+
+def is_codex_subagent_notification_user_item(item: dict[str, Any], text: str) -> bool:
+    return codex_runtime_user_item_kind(item, text) == "subagent_notification"
+
+
 def codex_history_user_item(
     payload: dict[str, Any],
     text: str,
@@ -46109,6 +46141,12 @@ def codex_history_user_event_item(
         item.update(codex_history_assistant_metadata({"ts": event.get("timestamp")}))
         origin = codex_public_item_origin(event)
         if origin is not None:
+            runtime_kind = codex_runtime_user_item_kind(payload, text)
+            if (runtime_kind is not None
+                    and item.get("text") == text.strip() and item.get("source_text_sha256") is None):
+                origin = {**origin, "kind": runtime_kind,
+                    "source_text_sha256": hashlib.sha256(item["text"].encode("utf-8", errors="surrogatepass")).hexdigest()}
+                item["provider_runtime_context"] = runtime_kind
             item["provider_origin"] = origin
     return item
 
@@ -46116,6 +46154,8 @@ def codex_history_user_event_item(
 def merge_codex_history_duplicate(previous: dict[str, Any], item: dict[str, Any]) -> bool:
     """Enrich a retained duplicate, but never collapse known distinct phases."""
     old_origin, new_origin = previous.get("provider_origin"), item.get("provider_origin")
+    if previous.get("provider_runtime_context") != item.get("provider_runtime_context"):
+        return False
     if isinstance(old_origin, dict) and isinstance(new_origin, dict) and any(
         old_origin.get(key) != new_origin.get(key) for key in ("event_id", "turn_id")
     ):
@@ -46318,7 +46358,7 @@ def codex_transcript_preview(path: Path) -> str | None:
             if index >= CODEX_TRANSCRIPT_SCAN_LINES:
                 break
             item = codex_history_event_item(event)
-            if item is not None and item.get("kind") == "user":
+            if item is not None and item.get("kind") == "user" and item.get("provider_runtime_context") not in ("subagent_notification", "turn_aborted"):
                 return item["text"][:160]
     return None
 
@@ -46495,6 +46535,12 @@ def provider_history(sess: dict[str, Any], limit: int | None) -> tuple[Path | No
 
 def history_item_cursor_digest(item: dict[str, Any]) -> str:
     identity = [str(item.get("kind") or ""), str(item.get("text") or "").strip()]
+    runtime_origin = item.get("provider_origin")
+    if (item.get("kind") == "user" and item.get("provider_runtime_context") in ("subagent_notification", "turn_aborted")
+        and item.get("provider_user_authored") is not True and isinstance(runtime_origin, dict)
+        and runtime_origin.get("provider") == "codex" and runtime_origin.get("kind") == item["provider_runtime_context"]
+        and all(isinstance(runtime_origin.get(key), str) and runtime_origin[key] for key in ("event_id", "turn_id"))):
+        identity = [item["provider_runtime_context"], runtime_origin["event_id"], runtime_origin["turn_id"], identity[1]]
     if item.get("kind") == "interruption":
         origin = normalized_history_provider_origin(item.get("provider_origin"))
         if origin is not None and origin.get("kind") == "interruption":
@@ -47856,6 +47902,12 @@ async def append_imported_history(
             if backend == BACKEND_CODEX and isinstance(item.get("provider_origin"), dict) and item["provider_origin"].get("provider") == "codex" else None
         )
         provenance: dict[str, Any] = {"provider_origin": origin} if origin is not None else {}
+        runtime_notification = (backend == BACKEND_CODEX and item.get("kind") == "user"
+            and item.get("provider_runtime_context") in ("subagent_notification", "turn_aborted")
+            and item.get("provider_user_authored") is not True and origin is not None
+            and origin.get("kind") == item["provider_runtime_context"])
+        if runtime_notification:
+            provenance.update(metadata_only=True, provider_runtime_context=item["provider_runtime_context"])
         if backend == BACKEND_CODEX and item.get("provider_history_repair") == "source_proven_native_replay" and item.get("text") == "":
             provenance.update(metadata_only=True, provider_history_repair="source_proven_native_replay")
         source_sha256 = item.get("source_text_sha256")
@@ -47875,7 +47927,7 @@ async def append_imported_history(
             imported_events.append(("turn_started", {
                 "run_id": run_id,
                 "backend": backend,
-                "prompt": item["text"],
+                "prompt": "" if runtime_notification else item["text"],
                 "imported": True,
                 "provider_history_sanitized": True,
                 **provenance,
@@ -47965,6 +48017,12 @@ async def append_staged_imported_history(
             if backend == BACKEND_CODEX and isinstance(item.get("provider_origin"), dict) and item["provider_origin"].get("provider") == "codex" else None
         )
         provenance: dict[str, Any] = {"provider_origin": origin} if origin is not None else {}
+        runtime_notification = (backend == BACKEND_CODEX and item.get("kind") == "user"
+            and item.get("provider_runtime_context") in ("subagent_notification", "turn_aborted")
+            and item.get("provider_user_authored") is not True and origin is not None
+            and origin.get("kind") == item["provider_runtime_context"])
+        if runtime_notification:
+            provenance.update(metadata_only=True, provider_runtime_context=item["provider_runtime_context"])
         source_sha256 = item.get("source_text_sha256")
         if isinstance(source_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", source_sha256):
             provenance["source_text_sha256"] = source_sha256
@@ -47982,7 +48040,7 @@ async def append_staged_imported_history(
             imported_events.append(("turn_started", {
                 "run_id": run_id,
                 "backend": backend,
-                "prompt": item["text"],
+                "prompt": "" if runtime_notification else item["text"],
                 "imported": True,
                 "provider_history_sanitized": True,
                 **provenance,

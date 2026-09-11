@@ -28,6 +28,7 @@ from .store import (
     MAX_TEAM_MESSAGE_ATTACHMENTS,
     MAX_TEAM_MESSAGE_BODY_BYTES,
     MAX_TEAM_MESSAGE_RECIPIENTS,
+    MAX_TEAM_MAIL_THREAD_PAGE_ITEMS,
     MAX_TEAM_SKILL_TAGS,
     TEAM_ATTACHMENT_CHUNK_BYTES,
     AccessClaims,
@@ -1540,6 +1541,17 @@ def create_app(
             include_mail_subject=include_mail_subject,
             include_mailbox_state=include_mailbox_state,
         )
+
+    @app.get("/v1/teams/{team_id}/network/messages/{message_id}/thread")
+    def team_message_thread(
+        team_id: str,
+        message_id: str,
+        claims: Auth,
+        after_sequence: Annotated[int, Query(ge=0, le=9_223_372_036_854_775_807)] = 0,
+        limit: Annotated[int, Query(ge=1, le=MAX_TEAM_MAIL_THREAD_PAGE_ITEMS)] = 25,
+    ) -> dict[str, Any]:
+        return store.get_team_message_thread(claims, team_id, message_id,
+            after_sequence=after_sequence, limit=limit)
 
     @app.get("/v1/teams/{team_id}/network/messages/{message_id}/revisions")
     def team_message_revisions(

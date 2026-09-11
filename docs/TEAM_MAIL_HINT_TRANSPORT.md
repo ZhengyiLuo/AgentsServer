@@ -1,12 +1,11 @@
-# Team Mail hint transport — next-beta code, production disabled
+# Team Mail hint transport — locally accepted candidate
 
-This is not a shipped or accepted notification journey. The frozen beta54
-candidate is unchanged. `SecurePeerRuntime(mail_hints_enabled=False)` remains
-the default and AgentsServer does not opt in. Desktop production is likewise
-gated. No live service, provider, monolith import, deployment or release is part
-of this implementation. The isolated source transport chain now passes; the
-remaining cross-process/compiled desktop acceptance must complete before
-enabling either gate.
+This is not a shipped notification lane. Published beta58 is unchanged.
+`SecurePeerRuntime(mail_hints_enabled=False)` remains the reusable default;
+the app candidate explicitly opts in after the complete-path acceptance
+below. The desktop candidate still requires the exact authenticated capability.
+No live service, provider, monolith import, deployment or release is part of
+this acceptance or local enablement.
 
 ## Metadata contract
 
@@ -153,13 +152,27 @@ The unsent draft, focus, navigation and automatic request counts were unchanged.
 Evidence: desktop QA `mail-hints-journey-brwJgD/report.json` and seven inspected
 screenshots. Chat/topology DTOs remained controlled; input was synthetic CDP.
 
-The follow-up burst is not accepted: 50 additional commits reached sequence
+The earlier follow-up burst was not accepted: 50 additional commits reached sequence
 59, but the private fixture transmitted no burst hints after its authority/
 reconnect transition. Existing frames remained 0/7/9 and desktop projection
 became null. This is not evidence of successful burst delivery or notification
 performance. Both owned processes exited cleanly and the listener was removed.
 
+The new bounded complete-path run passed both the fresh/stale-page journey and
+the 50-commit burst. Actual transmitted frames reached 59; 45 synthetic input
+events overlapped those commits. Desktop seen stayed 9, the draft/focus were
+preserved, no automatic requests occurred, and the only new IPC was local
+draft persistence. Sampled input gaps were 22.3 ms median / 28 ms maximum,
+including explicit 10 ms driver pacing. The private fixture has no maintenance
+loop, so one explicit authenticated health refresh was performed before the
+run; the existing 120-second capability fence was not relaxed. Reports are
+desktop QA `mail-hints-journey-c6wigD/report.json` and
+`mail-hints-burst-9qu2II/report.json`; screenshots were inspected. The 24 guarded
+runtime/TLS/pipeline checks also passed with no monolith or live-state access.
+Both owned processes exited normally, and the private socket and local
+debugger listener were removed after acceptance.
+
 Pending: deployed TCP-host/mobile acceptance, physical long-chat input/scroll
 performance, and offline process restart/authority teardown across deployed
-processes. This private-socket acceptance does not claim release or production
-enablement, and neither gate has been enabled.
+processes. This private-socket acceptance permits a capability-gated local
+candidate; it does not claim release or production enablement.

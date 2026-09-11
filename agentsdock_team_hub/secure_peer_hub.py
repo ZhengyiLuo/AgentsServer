@@ -1100,6 +1100,17 @@ class SecurePeerHubAdapter:
                         claims, team_id, self._resource_id(pieces[3]),
                         version=int(values["version"]) if "version" in values else None,
                     )
+                elif (
+                    len(pieces) == 5
+                    and pieces[1:3] == [_NETWORK_CHILD, "messages"]
+                    and pieces[4] == "thread"
+                ):
+                    values = self._team_query(request, allowed={"after_sequence", "limit"})
+                    result = self.store.get_team_message_thread(
+                        claims, team_id, self._resource_id(pieces[3]),
+                        after_sequence=int(values.get("after_sequence", "0")),
+                        limit=int(values.get("limit", "25")),
+                    )
                 elif len(pieces) == 4 and pieces[1:3] == [_NETWORK_CHILD, "attachments"]:
                     result = self.store.get_team_attachment(
                         claims, team_id, self._resource_id(pieces[3])

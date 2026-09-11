@@ -358,7 +358,8 @@ class TeamMailArrivalStoreTests(unittest.TestCase):
             db.execute("DROP TRIGGER team_mail_arrival_on_server_recipient")
             db.execute("DROP TABLE team_mail_arrivals")
             db.execute("DROP INDEX team_mail_server_arrival_lookup")
-            for statement in _statements(MIGRATIONS[-1].source): db.execute(statement)
+            arrival_migration = next(migration for migration in MIGRATIONS if migration.version == 20)
+            for statement in _statements(arrival_migration.source): db.execute(statement)
             self.assertEqual(self.store._team_mail_arrival(db, self.team, self.address).arrival_id, last["id"])
             queries = (
                 ("SELECT through_sequence,arrival_id FROM team_mail_arrivals WHERE team_id=? AND recipient_node_id=?",
@@ -378,7 +379,7 @@ class TeamMailArrivalStoreTests(unittest.TestCase):
         with self.assertRaises(HubError) as unsafe: self.snapshot()
         self.assertEqual(unsafe.exception.code, "mail_cursor_unavailable")
 
-    def test_transport_requires_explicit_runtime_opt_in(self):
+    def test_application_opts_in_once_while_library_default_stays_disabled(self):
         capability = self.store.team_messages_capability()
         self.assertNotIn("mailbox_coverage", capability)
         self.assertNotIn("mail_hints", capability)
@@ -390,9 +391,21 @@ class TeamMailArrivalStoreTests(unittest.TestCase):
         server = ast.parse((ROOT / "agent_server.py").read_text())
         calls = [node for node in ast.walk(server) if isinstance(node, ast.Call)
                  and isinstance(node.func, ast.Name) and node.func.id == "SecurePeerRuntime"]
-        self.assertTrue(calls)
-        self.assertTrue(all("mail_hints_enabled" not in {keyword.arg for keyword in node.keywords} for node in calls))
+        self.assertEqual(len(calls), 1)
+        opt_ins = [keyword.value for keyword in calls[0].keywords if keyword.arg == "mail_hints_enabled"]
+        self.assertEqual(len(opt_ins), 1)
+        self.assertIsInstance(opt_ins[0], ast.Constant)
+        self.assertIs(opt_ins[0].value, True)
         ast.parse((ROOT / "agentsdock_team_hub/store.py").read_text())
+
+    def test_application_mail_thread_bridge_is_an_exact_read_only_route(self):
+        server = ast.parse((ROOT / "agent_server.py").read_text())
+        rules = next(node.value for node in server.body if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name) and node.target.id == "TEAM_HUB_SERVER_SESSION_ROUTE_RULES")
+        entries = [(ast.literal_eval(node.elts[0]), ast.literal_eval(node.elts[1].args[0]))
+            for node in rules.elts]
+        self.assertEqual([(method, pattern) for method, pattern in entries if "/thread" in pattern],
+            [("GET", r"^/v1/teams/[^/]+/network/messages/[^/]+/thread$")])
 
 
 if __name__ == "__main__":

@@ -100,6 +100,10 @@ MAX_TEAM_MESSAGE_ATTACHMENT_BYTES = 2 * 1024 * 1024 * 1024
 MAX_TEAM_MESSAGE_TITLE_CHARS = 160
 MAX_TEAM_MESSAGE_PREVIEW_CHARS = 280
 MAX_TEAM_MESSAGE_REVISIONS = 200
+MAX_TEAM_MAIL_THREAD_PAGE_ITEMS = 25
+MAX_TEAM_MAIL_THREAD_ITEMS = 2048
+MAX_TEAM_MAIL_THREAD_ANCESTORS = 128
+MAX_TEAM_MAIL_THREAD_RESPONSE_BYTES = 1_500_000
 TEAM_MESSAGE_PROVENANCE_KEYS = ("via", "backend", "chat_id", "run_id")
 DEFAULT_TEAM_ATTACHMENT_MAX_BYTES = 512 * 1024 * 1024
 DEFAULT_TEAM_ATTACHMENT_QUOTA_BYTES = 50 * 1024 * 1024 * 1024
@@ -3223,6 +3227,9 @@ class HubStore:
                         "max_subject_chars": MAX_TEAM_MESSAGE_TITLE_CHARS,
                     },
                     "team_mailbox_state_v1": {"available": True, "version": 1, "address_kinds": ["server"]},
+                    "team_mail_threads_v1": {"available": True, "version": 1,
+                        "max_page_items": MAX_TEAM_MAIL_THREAD_PAGE_ITEMS,
+                        "max_thread_items": MAX_TEAM_MAIL_THREAD_ITEMS},
                     "team_host_content_deletion_v1": {"available": True, "version": 1},
                 },
             }
@@ -13194,6 +13201,113 @@ class HubStore:
                     owned=owned,
                 )
             }
+            connection.execute("COMMIT")
+            return response
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def get_team_message_thread(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        message_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 25,
+    ) -> dict[str, Any]:
+        """Read a bounded, currently visible parent-linked conversation.
+
+        Traversal reads identity/ownership metadata only, using the parent
+        index. Unreadable/deleted parents and branches are not traversed. The
+        graph budget includes hidden child observations, so even a broadcast
+        with many private replies cannot cause an unbounded mailbox scan.
+        ``truncated`` is not a continuation cursor or a claim of completeness.
+        """
+        if type(limit) is not int or not 1 <= limit <= MAX_TEAM_MAIL_THREAD_PAGE_ITEMS:
+            raise HubError("invalid_request", "Thread page limit is invalid", 422)
+        if type(after_sequence) is not int or not 0 <= after_sequence <= MAX_SQLITE_SIGNED_INTEGER:
+            raise HubError("invalid_request", "Thread page cursor is invalid", 422)
+        metadata_select = """SELECT id,team_id,kind,queue_ordinal,in_reply_to_message_id,
+            sender_kind,sender_principal_id,sender_node_id FROM team_messages"""
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            membership = self._require_network_scope(connection, claims, team_id, write=False)
+            owned = self._team_owned_addresses(connection, claims, team_id, str(membership["role"]))
+
+            def ordinary_mail(row: sqlite3.Row) -> bool:
+                return row["kind"] == "message" and connection.execute("""
+                    SELECT 1 FROM team_message_recipients
+                    WHERE team_id=? AND message_id=? AND recipient_kind='all' LIMIT 1
+                    """, (team_id, row["id"])).fetchone() is None
+
+            def readable(identity: str) -> sqlite3.Row | None:
+                row = connection.execute(metadata_select + " WHERE team_id=? AND id=?",
+                    (team_id, identity)).fetchone()
+                return row if row is not None and ordinary_mail(row) and self._team_message_visible(connection, claims, row, owned) else None
+
+            root = readable(message_id)
+            if root is None:
+                raise HubError("not_found", "Resource not found", 404)
+            ancestors = {str(root["id"])}
+            truncated = False
+            while root["in_reply_to_message_id"] is not None:
+                parent_id = str(root["in_reply_to_message_id"])
+                if parent_id in ancestors or len(ancestors) >= MAX_TEAM_MAIL_THREAD_ANCESTORS:
+                    truncated = True
+                    break
+                parent = readable(parent_id)
+                if parent is None:
+                    truncated = True
+                    break
+                ancestors.add(parent_id)
+                root = parent
+
+            graph = [root]
+            seen = {str(root["id"])}
+            observed = 1
+            for parent in graph:
+                children = connection.execute(metadata_select + """
+                    WHERE team_id=? AND in_reply_to_message_id=?
+                    ORDER BY queue_ordinal ASC LIMIT ?""",
+                    (team_id, parent["id"], MAX_TEAM_MAIL_THREAD_ITEMS - observed + 1)).fetchall()
+                for child in children:
+                    if observed >= MAX_TEAM_MAIL_THREAD_ITEMS:
+                        truncated = True
+                        break
+                    observed += 1
+                    identity = str(child["id"])
+                    if identity in seen:
+                        truncated = True
+                        continue
+                    seen.add(identity)
+                    if ordinary_mail(child) and self._team_message_visible(connection, claims, child, owned):
+                        graph.append(child)
+                if observed >= MAX_TEAM_MAIL_THREAD_ITEMS and truncated:
+                    break
+            ordered = sorted((row for row in graph if int(row["queue_ordinal"]) > after_sequence),
+                key=lambda row: int(row["queue_ordinal"]))
+            page_ids = [str(row["id"]) for row in ordered[:limit]]
+            rows = connection.execute(self._team_message_select()
+                + " WHERE m.team_id=? AND m.id IN (" + ",".join("?" for _ in page_ids)
+                + ") ORDER BY m.queue_ordinal ASC", (team_id, *page_ids)).fetchall() if page_ids else []
+            messages = [self._team_message_public(connection, row, include_body=True,
+                include_revision=True, include_mail_subject=True, include_mailbox_state=True,
+                owned=owned) for row in rows]
+            response = {"team_id": team_id, "anchor_message_id": message_id,
+                "root_message_id": str(root["id"]), "messages": messages,
+                "next_after_sequence": messages[-1]["sequence"] if messages else after_sequence,
+                "has_more": len(ordered) > len(messages), "truncated": truncated}
+            while len(messages) > 1 and len(canonical_json(response)) > MAX_TEAM_MAIL_THREAD_RESPONSE_BYTES:
+                messages.pop()
+                response["next_after_sequence"] = messages[-1]["sequence"]
+                response["has_more"] = True
+            if len(canonical_json(response)) > MAX_TEAM_MAIL_THREAD_RESPONSE_BYTES:
+                raise HubError("invalid_request", "Thread message exceeds the response limit", 422)
             connection.execute("COMMIT")
             return response
         except BaseException:

@@ -69753,6 +69753,7 @@ SECURE_PEER_RUNTIME = SecurePeerRuntime(
     display_name=AGENTSDOCK_SERVER_DISPLAY_NAME,
     logger=logger,
     agent_relay_enabled=SECURE_PEER_AGENT_RELAY_ENABLED,
+    mail_hints_enabled=True,
 )
 TEAM_HUB_RUNTIME = ManagedTeamHubHost(
     mode=TEAM_HUB_MODE,
@@ -70785,6 +70786,7 @@ TEAM_HUB_SERVER_SESSION_ROUTE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("POST", re.compile(r"^/v1/teams/[^/]+/network/messages$")),
     ("GET", re.compile(r"^/v1/teams/[^/]+/network/deletions$")),
     ("GET", re.compile(r"^/v1/teams/[^/]+/network/messages/[^/]+$")),
+    ("GET", re.compile(r"^/v1/teams/[^/]+/network/messages/[^/]+/thread$")),
     ("DELETE", re.compile(r"^/v1/teams/[^/]+/network/messages/[^/]+$")),
     ("POST", re.compile(r"^/v1/teams/[^/]+/network/messages/[^/]+/receipts$")),
     ("POST", re.compile(r"^/v1/teams/[^/]+/network/messages/[^/]+/dismissals$")),

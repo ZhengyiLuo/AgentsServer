@@ -5083,6 +5083,15 @@ def sanitize_proxy_request(
                 route_allowed = True
                 allow_query = True
                 allowed_query_keys = {"version"} if normalized_method == "GET" else {"include_mail_subject"}
+            elif (
+                len(pieces) == 3
+                and pieces[0] == "messages"
+                and pieces[2] == "thread"
+                and normalized_method == "GET"
+            ):
+                route_allowed = True
+                allow_query = True
+                allowed_query_keys = {"after_sequence", "limit"}
             elif pieces == ["deletions"] and normalized_method == "GET":
                 route_allowed = True
                 allow_query = True
@@ -5166,6 +5175,8 @@ def sanitize_proxy_request(
             ):
                 raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         if "limit" in values and not 1 <= int(values["limit"]) <= 100:
+            raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
+        if path.endswith("/thread") and "limit" in values and int(values["limit"]) > 25:
             raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         if "version" in values and not 1 <= int(values["version"]) <= 200:
             raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)

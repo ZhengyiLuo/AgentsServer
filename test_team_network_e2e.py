@@ -494,10 +494,18 @@ class TeamNetworkE2EAcceptanceTests(unittest.TestCase):
             "target_id": host_node_id,
             "display_name_snapshot": "Sonic",
         }
-        self.assertEqual(
-            network.member.resolve_team_references([host_reference]),
-            [host_reference],
-        )
+        resolved_host = network.member.resolve_team_references([host_reference])
+        self.assertEqual(len(resolved_host), 1)
+        self.assertEqual({key: resolved_host[0][key] for key in host_reference}, host_reference)
+        binding = resolved_host[0]["durable_server_binding"]
+        self.assertEqual(binding, {
+            "version": 1, "team_id": network.team_id,
+            "hub_id": network.hub.hub_id,
+            "target_id": host_node_id, "server_identity": HOST_SERVER_IDENTITY,
+            "lifecycle_id": network.hub.get_network_server(
+                network.owner, network.team_id, host_node_id,
+            )["server"]["mail_route_lifecycle_id"],
+        })
         with self.assertRaises(SecurePeerError) as stale_alias:
             network.member.resolve_team_references([
                 {

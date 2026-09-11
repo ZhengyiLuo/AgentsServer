@@ -24,6 +24,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import selectors
 import socket
 import sqlite3
 import ssl
@@ -43,6 +44,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID, ObjectIdentifier
 
 from .security import canonical_json, create_secret_file, ensure_private_directory, read_secret_file
+from .mail_hints import MailArrival, MailHintClosed
 
 
 PROTOCOL_VERSION = 1
@@ -89,6 +91,7 @@ MAX_ATTACHMENT_BYTES = 512 * 1024 * 1024
 MAX_HEADERS = 48
 MAX_HEADER_VALUE_BYTES = 8192
 MAX_HEADER_BLOCK_BYTES = 32 * 1024
+MAX_MAIL_HINT_FRAME_BYTES = 4096
 PAIRING_TOKEN_HEADER = "X-AgentsDock-Pairing-Token"
 PEER_BINDING_OID = ObjectIdentifier("1.3.6.1.4.1.62177.1.1")
 SCOPES = frozenset(
@@ -209,6 +212,188 @@ class AttachmentFileLease:
         # awaiting coroutine disappeared. Normal response paths close eagerly.
         with suppress(Exception):
             self.close()
+
+
+def _mail_hint_frame(value: Any, *, hub_id: str, team_id: str,
+                     recipient_server_id: str | None = None) -> dict[str, Any]:
+    """Strict metadata only; the authenticated connection supplies its realm."""
+    if (not isinstance(value, dict) or set(value) != {"type", "hub_id", "cursor"}
+            or value["type"] not in {"snapshot", "hint"} or value["hub_id"] != hub_id):
+        raise SecurePeerError("remote_invalid", "Invalid Mail hint frame", 502)
+    try:
+        raw = value["cursor"]
+        cursor = MailArrival.from_dict(raw)
+        if ("reset" not in raw or cursor.team_id != team_id
+                or (recipient_server_id is not None and cursor.recipient_server_id != recipient_server_id)
+                or (value["type"] == "hint" and raw["reset"])):
+            raise ValueError("Mail hint scope changed")
+    except (TypeError, ValueError) as exc:
+        raise SecurePeerError("remote_invalid", "Invalid Mail hint cursor", 502) from exc
+    return {"type": value["type"], "hub_id": hub_id,
+            "cursor": cursor.as_dict(reset=raw["reset"])}
+
+
+class PeerMailHintStream:
+    """One bounded blocking reader, closed by its runtime's authority owner.
+
+    No timer, retry, database polling, request slot, or application callback
+    runs while idle. Shutdown on the socket interrupts a blocked readline.
+    """
+
+    def __init__(self, connection: Any, response: Any, sock: Any, *,
+                 hub_id: str, team_id: str, expires_at: int,
+                 revalidate: Callable[[], None], clock: Callable[[], float] = time.time) -> None:
+        self._connection, self._response, self._socket = connection, response, sock
+        self._hub_id, self._team_id = hub_id, team_id
+        self._expires_at, self._clock, self._revalidate = expires_at, clock, revalidate
+        self._guard = threading.Lock()
+        self._reader = threading.Lock()
+        self._closed = False
+        self._initialized = False
+        self._recipient: str | None = None
+
+    def read(self) -> dict[str, Any]:
+        if not self._reader.acquire(blocking=False):
+            raise SecurePeerError("stream_busy", "Mail hint stream already has a reader", 409)
+        try:
+            with self._guard:
+                if self._closed:
+                    raise MailHintClosed("Mail hint stream closed")
+                remaining = self._expires_at - self._clock()
+                if remaining <= 0:
+                    raise MailHintClosed("Mail hint credential expired")
+                # One expiry deadline, not periodic connection or mailbox reads.
+                self._socket.settimeout(remaining)
+            line = self._response.readline(MAX_MAIL_HINT_FRAME_BYTES + 1)
+            if not line:
+                raise MailHintClosed("Mail hint stream disconnected")
+            if len(line) > MAX_MAIL_HINT_FRAME_BYTES or not line.endswith(b"\n"):
+                raise SecurePeerError("remote_invalid", "Mail hint frame is oversized or truncated", 502)
+            try:
+                value = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise SecurePeerError("remote_invalid", "Mail hint frame is invalid", 502) from exc
+            self._revalidate()
+            with self._guard:
+                if self._closed or self._clock() >= self._expires_at:
+                    raise MailHintClosed("Mail hint authority expired")
+                frame = _mail_hint_frame(value, hub_id=self._hub_id, team_id=self._team_id,
+                                         recipient_server_id=self._recipient)
+                if (frame["type"] == "snapshot") == self._initialized:
+                    raise SecurePeerError("remote_invalid", "Mail hint snapshot order is invalid", 502)
+                self._initialized = True
+                self._recipient = frame["cursor"]["recipient_server_id"]
+                return frame
+        except BaseException:
+            self.close()
+            raise
+        finally:
+            self._reader.release()
+
+    def close(self) -> None:
+        with self._guard:
+            if self._closed:
+                return
+            self._closed = True
+        # shutdown first: closing HTTPResponse while another thread reads it
+        # can wait on its buffered reader lock indefinitely.
+        with suppress(OSError):
+            self._socket.shutdown(socket.SHUT_RDWR)
+        with suppress(Exception):
+            self._response.close()
+        with suppress(Exception):
+            self._connection.close()
+
+
+class _MailHintDisconnectWatcher:
+    """One event-driven watcher for at most 64 passive sockets; no idle timer.
+
+    The request body has already been consumed. No client commands are legal
+    afterwards, so readability means close without concurrent TLS recv/send.
+    Registrations are exact tokens, never fd identities that can be reused.
+    """
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._entries: dict[object, tuple[Any, Callable[[], None]]] = {}
+        self._closed = False
+        self._wake_read, self._wake_write = socket.socketpair()
+        self._wake_read.setblocking(False)
+        self._wake_write.setblocking(False)
+        self._thread = threading.Thread(target=self._run, name="agentsdock-mail-disconnect", daemon=True)
+        try:
+            self._thread.start()
+        except BaseException:
+            self._wake_read.close()
+            self._wake_write.close()
+            raise
+
+    def _wake(self) -> None:
+        with suppress(OSError):
+            self._wake_write.send(b"\0")
+
+    def add(self, token: object, sock: Any, abort: Callable[[], None]) -> None:
+        with self._guard:
+            if self._closed or len(self._entries) >= 64 or token in self._entries:
+                raise MailHintClosed("Mail disconnect watcher is unavailable")
+            self._entries[token] = (sock, abort)
+        self._wake()
+
+    def remove(self, token: object) -> None:
+        with self._guard:
+            self._entries.pop(token, None)
+        self._wake()
+
+    def _run(self) -> None:
+        while True:
+            with self._guard:
+                if self._closed:
+                    return
+                entries = tuple(self._entries.items())
+            try:
+                # kqueue/epoll also handles descriptor numbers above select's
+                # FD_SETSIZE. Rebuild only on admission/close wakeups, never on
+                # a timer or for an ordinary delivered Mail hint.
+                with selectors.DefaultSelector() as selector:
+                    selector.register(self._wake_read, selectors.EVENT_READ)
+                    for _, (sock, _) in entries:
+                        selector.register(sock, selectors.EVENT_READ)
+                    ready = [event.fileobj for event, _ in selector.select()]
+            except (OSError, ValueError):
+                # A removed socket may have closed after the snapshot. Retire
+                # invalid exact entries; do not spin on stale descriptors.
+                ready = [sock for _, (sock, _) in entries if sock.fileno() < 0]
+                if not ready:
+                    self.close()
+                    return
+            if self._wake_read in ready:
+                with suppress(BlockingIOError, OSError):
+                    while self._wake_read.recv(4096):
+                        pass
+            for token, entry in entries:
+                if entry[0] not in ready:
+                    continue
+                with self._guard:
+                    if self._entries.get(token) is not entry:
+                        continue
+                    self._entries.pop(token, None)
+                with suppress(Exception):
+                    entry[1]()  # nonblocking cancellation; owner drains writer
+
+    def close(self) -> None:
+        with self._guard:
+            if self._closed:
+                return
+            self._closed = True
+            entries, self._entries = tuple(self._entries.values()), {}
+        self._wake()
+        for _, abort in entries:
+            with suppress(Exception):
+                abort()
+        if self._thread is not threading.current_thread():
+            self._thread.join(timeout=5)
+        self._wake_read.close()
+        self._wake_write.close()
 
 
 def _now(value: int | float | None = None) -> int:
@@ -371,6 +556,7 @@ class SecurePeerStore:
         self._clock = clock
         self.cross_chat_enabled = cross_chat_enabled
         self._guard = threading.RLock()
+        self._mail_hint_revokers: set[Callable[[str], None]] = set()
         self._pairing_capacity_lock = pairing_capacity_lock or threading.RLock()
         self._external_actionable_pairing_count = (
             external_actionable_pairing_count
@@ -388,6 +574,24 @@ class SecurePeerStore:
 
     def _timestamp(self) -> int:
         return _now(self._clock())
+
+    def register_mail_hint_revoker(self, callback: Callable[[str], None]) -> Callable[[], None]:
+        with self._guard:
+            if len(self._mail_hint_revokers) >= 4 and callback not in self._mail_hint_revokers:
+                raise ValueError("Mail hint revocation listener capacity reached")
+            self._mail_hint_revokers.add(callback)
+        def unregister() -> None:
+            with self._guard:
+                self._mail_hint_revokers.discard(callback)
+        return unregister
+
+    def _notify_mail_hint_revoked(self, peer_id: str) -> None:
+        # Called only after the durable commit; no socket work in a write txn.
+        with self._guard:
+            callbacks = tuple(self._mail_hint_revokers)
+        for callback in callbacks:
+            with suppress(Exception):
+                callback(peer_id)
 
     @staticmethod
     def _actionable_pairing_count(connection: sqlite3.Connection) -> int:
@@ -2037,6 +2241,8 @@ class SecurePeerStore:
                 ON peers(team_id,peer_server_identity) WHERE status='active'"""
             )
             connection.execute("COMMIT")
+            for peer_id in superseded_peer_ids:
+                self._notify_mail_hint_revoked(peer_id)
             return {
                 "retained_peer_ids": retained_peer_ids,
                 "superseded_peer_ids": superseded_peer_ids,
@@ -2201,6 +2407,8 @@ class SecurePeerStore:
             self._record_operation(connection, "pairing-approve", idempotency_key, digest, response, timestamp)
             self._audit(connection, timestamp, canonical_actor, "pairing.approve", pairing_id, response)
             connection.execute("COMMIT")
+            for superseded_peer_id in superseded_peer_ids:
+                self._notify_mail_hint_revoked(superseded_peer_id)
             return response
         except BaseException:
             if connection.in_transaction:
@@ -2650,6 +2858,7 @@ class SecurePeerStore:
                 timestamp,
             )
             connection.execute("COMMIT")
+            self._notify_mail_hint_revoked(peer.peer_id)
             return response
         except BaseException:
             if connection.in_transaction:
@@ -2755,6 +2964,7 @@ class SecurePeerStore:
             response = {"peer_id": peer_id, "status": "revoked", "revoked_at": timestamp}
             self._record_operation(connection, "peer-revoke", idempotency_key, digest, response, timestamp)
             connection.execute("COMMIT")
+            self._notify_mail_hint_revoked(peer_id)
             return response
         except BaseException:
             if connection.in_transaction:
@@ -3003,6 +3213,7 @@ class SecurePeerStore:
             }
             self._audit(connection, timestamp, peer.peer_id, "peer.certificate.renew.activate", row["new_fingerprint"])
             connection.execute("COMMIT")
+            self._notify_mail_hint_revoked(peer.peer_id)
             return response
         except BaseException:
             if connection.in_transaction:
@@ -4852,6 +5063,8 @@ def sanitize_proxy_request(
                     "include_revision",
                     "include_mail_subject",
                     "include_mailbox_state",
+                    "include_mailbox_coverage",
+                    "after_arrival_id",
                 }
             elif (
                 len(pieces) == 2
@@ -4870,6 +5083,15 @@ def sanitize_proxy_request(
                 route_allowed = True
                 allow_query = True
                 allowed_query_keys = {"version"} if normalized_method == "GET" else {"include_mail_subject"}
+            elif (
+                len(pieces) == 3
+                and pieces[0] == "messages"
+                and pieces[2] == "thread"
+                and normalized_method == "GET"
+            ):
+                route_allowed = True
+                allow_query = True
+                allowed_query_keys = {"after_sequence", "limit"}
             elif pieces == ["deletions"] and normalized_method == "GET":
                 route_allowed = True
                 allow_query = True
@@ -4954,6 +5176,8 @@ def sanitize_proxy_request(
                 raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         if "limit" in values and not 1 <= int(values["limit"]) <= 100:
             raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
+        if path.endswith("/thread") and "limit" in values and int(values["limit"]) > 25:
+            raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         if "version" in values and not 1 <= int(values["version"]) <= 200:
             raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         if "cursor" in values:
@@ -4965,6 +5189,8 @@ def sanitize_proxy_request(
             values["after_sequence"]
         ) <= 9_223_372_036_854_775_807:
             raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
+        if "after_arrival_id" in values and re.fullmatch(r"tmsg_[0-9a-f]{32}", values["after_arrival_id"]) is None:
+            raise SecurePeerError("invalid_request", "Proxy arrival anchor is invalid", 422)
         if "after_server_id" in values and _ID_RE.fullmatch(
             values["after_server_id"]
         ) is None:
@@ -4989,7 +5215,7 @@ def sanitize_proxy_request(
                 raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         if "box" in values and values["box"] not in {"inbox", "feed", "sent"}:
             raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
-        for flag_key in ("unread", "include_archived", "include_revision", "include_mail_subject", "include_mailbox_state"):
+        for flag_key in ("unread", "include_archived", "include_revision", "include_mail_subject", "include_mailbox_state", "include_mailbox_coverage"):
             if flag_key in values and values[flag_key] not in {"0", "1", "true", "false"}:
                 raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         if "from_kind" in values and values["from_kind"] not in {"server", "human"}:
@@ -5161,6 +5387,22 @@ class _GatewayHTTPServer(http.server.ThreadingHTTPServer):
                 self._worker_guard.wait(timeout=remaining)
             return True
 
+    def release_worker(self, source: str) -> None:
+        """Finish finite HTTP accounting exactly once, including stream transfer."""
+        with self._worker_guard:
+            worker = threading.current_thread()
+            if worker not in self._workers:
+                return
+            with self._source_guard:
+                remaining = self._source_connections.get(source, 1) - 1
+                if remaining:
+                    self._source_connections[source] = remaining
+                else:
+                    self._source_connections.pop(source, None)
+            self._worker_slots.release()
+            self._workers.discard(worker)
+            self._worker_guard.notify_all()
+
     def _process_tls_request(
         self, request: socket.socket, client_address: tuple[str, int]
     ) -> None:
@@ -5191,17 +5433,7 @@ class _GatewayHTTPServer(http.server.ThreadingHTTPServer):
             except OSError:
                 pass
         finally:
-            source = str(client_address[0])
-            with self._source_guard:
-                remaining = self._source_connections.get(source, 1) - 1
-                if remaining:
-                    self._source_connections[source] = remaining
-                else:
-                    self._source_connections.pop(source, None)
-            self._worker_slots.release()
-            with self._worker_guard:
-                self._workers.discard(threading.current_thread())
-                self._worker_guard.notify_all()
+            self.release_worker(str(client_address[0]))
 
 
 class SecurePeerGateway:
@@ -5224,6 +5456,8 @@ class SecurePeerGateway:
         peer_heartbeat: Callable[[PeerAuthorization], None] | None = None,
         peer_revoker: Callable[[PeerAuthorization, str], Mapping[str, Any]]
         | None = None,
+        mail_hint_subscriber: Callable[[PeerAuthorization, Any], Any] | None = None,
+        mail_hint_snapshot: Callable[[PeerAuthorization, Any], Mapping[str, Any]] | None = None,
     ) -> None:
         self.store = store
         self.bind_ip = canonical_peer_ipv4(bind_ip)
@@ -5234,12 +5468,47 @@ class SecurePeerGateway:
         self.relay_enabled = relay_enabled
         self.peer_heartbeat = peer_heartbeat
         self.peer_revoker = peer_revoker
+        # Absent callbacks keep both endpoints unavailable. Streams have their
+        # own finite budget, separate from interactive request admission.
+        self.mail_hint_subscriber = mail_hint_subscriber
+        self.mail_hint_snapshot = mail_hint_snapshot
+        self._mail_guard = threading.Condition(threading.RLock())
+        self._mail_streams: dict[object, tuple[str, Callable[[], None]]] = {}
+        self._mail_hint_unsubscribe: Callable[[], None] | None = None
+        self._mail_watcher: _MailHintDisconnectWatcher | None = None
         self._server: _GatewayHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._stopping = False
         self._guard = threading.RLock()
         self._rate_guard = threading.Lock()
         self._pairing_rate: dict[str, tuple[int, int]] = {}
+
+    def close_mail_hint_streams(self, peer_id: str | None = None) -> None:
+        with self._mail_guard:
+            streams = [abort for owner, abort in self._mail_streams.values()
+                       if peer_id is None or owner == peer_id]
+        for abort in streams:
+            with suppress(Exception):
+                abort()
+
+    def _register_mail_hint_stream(self, peer_id: str, abort: Callable[[], None]) -> object:
+        with self._mail_guard:
+            if (self._stopping or len(self._mail_streams) >= 64
+                    or sum(owner == peer_id for owner, _ in self._mail_streams.values()) >= 2):
+                raise SecurePeerError("stream_capacity", "Mail hint stream capacity reached", 503)
+            key = object()
+            self._mail_streams[key] = (peer_id, abort)
+            return key
+
+    def _finish_mail_hint_stream(self, key: object) -> None:
+        watcher = self._mail_watcher
+        try:
+            if watcher is not None:
+                watcher.remove(key)
+        finally:
+            with self._mail_guard:
+                self._mail_streams.pop(key, None)
+                self._mail_guard.notify_all()
 
     def _relay_available(self) -> bool:
         try:
@@ -5329,6 +5598,7 @@ class SecurePeerGateway:
             "proxy": (600, 20_000),
             "attachment_read": (1_200, 40_000),
             "attachment_upload": (1_200, 40_000),
+            "mail_hint": (60, 2_000),
         }
         if action not in limits:
             raise ValueError("authenticated rate action is invalid")
@@ -5442,6 +5712,116 @@ class SecurePeerGateway:
                     if not isinstance(value, dict):
                         raise SecurePeerError("invalid_request", "Request body must be a JSON object", 422)
                     return value
+
+                def _mail_hints(self, *, stream: bool) -> None:
+                    callback = gateway.mail_hint_subscriber if stream else gateway.mail_hint_snapshot
+                    if callback is None:
+                        raise SecurePeerError("not_found", "Resource not found", 404)
+                    self._reject_browser_headers()
+                    peer = self._peer()
+                    self._peer_rate(peer, "mail_hint")
+                    if "teamspace.read" not in peer.scopes:
+                        raise SecurePeerError("forbidden", "Team Mail read authority is required", 403)
+                    value = _require_exact_keys(self._json_body(MAX_MAIL_HINT_FRAME_BYTES),
+                        {"version", "team_id", "previous_cursor"}, context="Mail hint subscription")
+                    if type(value["version"]) is not int or value["version"] != 1 or value["team_id"] != peer.team_id:
+                        raise SecurePeerError("forbidden", "Mail hint team does not match peer authority", 403)
+                    previous = value["previous_cursor"]
+                    if previous is not None:
+                        try:
+                            previous = MailArrival.from_dict(previous).as_dict()
+                            if previous["team_id"] != peer.team_id:
+                                raise ValueError("Mail hint team changed")
+                        except (TypeError, ValueError) as exc:
+                            raise SecurePeerError("invalid_request", "Invalid Mail hint cursor", 422) from exc
+                    if not stream:
+                        result = callback(peer, previous)
+                        if not isinstance(result, Mapping) or set(result) != {"hub_id", "cursor"}:
+                            raise SecurePeerError("hub_unavailable", "Invalid Mail hint snapshot", 503)
+                        frame = _mail_hint_frame({"type": "snapshot", **result},
+                            hub_id=gateway.store.hub_id, team_id=peer.team_id)
+                        self._json(200, {"hub_id": frame["hub_id"], "cursor": frame["cursor"]})
+                        return
+                    lease = callback(peer, previous)
+                    key = None
+                    headers_sent = False
+                    stopped = threading.Event()
+                    def abort_transport() -> None:
+                        stopped.set()
+                        with suppress(OSError):
+                            self.connection.shutdown(socket.SHUT_RDWR)
+                    def abort() -> None:
+                        abort_transport()
+                        watcher = gateway._mail_watcher
+                        try:
+                            if key is not None and watcher is not None:
+                                watcher.remove(key)
+                        finally:
+                            lease.cancel()
+                    try:
+                        lease.set_aborter(abort_transport)
+                        key = gateway._register_mail_hint_stream(peer.peer_id, abort)
+                        deadline = min(peer.certificate_expires_at, lease.expires_at or peer.certificate_expires_at)
+                        certificate = self.connection.getpeercert(binary_form=True)
+                        snapshot = _mail_hint_frame({"type": "snapshot", "hub_id": lease.hub_id,
+                            "cursor": lease.snapshot}, hub_id=gateway.store.hub_id,
+                            team_id=peer.team_id, recipient_server_id=lease.recipient_server_id)
+                        lease.revalidate()
+                        watcher = gateway._mail_watcher
+                        if watcher is None:
+                            raise SecurePeerError("unavailable", "Mail disconnect watcher is unavailable", 503)
+                        try:
+                            watcher.add(key, self.connection, abort)
+                        except MailHintClosed as exc:
+                            raise SecurePeerError("unavailable", "Mail disconnect watcher is stopping", 503) from exc
+                        self.connection.settimeout(5)
+                        self.send_response(200)
+                        headers_sent = True
+                        self.send_header("Content-Type", "application/x-ndjson")
+                        self.send_header("Cache-Control", "no-store")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        self.close_connection = True
+                        # The same bounded thread now belongs ONLY to the Mail
+                        # stream pool. It holds no HTTP/per-source drain slot.
+                        self.server.release_worker(str(self.client_address[0]))
+                        def write(kind: str, raw: dict[str, Any]) -> None:
+                            def send(cursor: dict[str, Any]) -> None:
+                                current = gateway.store.authenticate_peer(certificate)
+                                if stopped.is_set() or current != peer or gateway.store._timestamp() >= deadline:
+                                    raise MailHintClosed("Mail hint authority changed")
+                                packet = _mail_hint_frame({"type": kind, "hub_id": lease.hub_id, "cursor": cursor},
+                                    hub_id=gateway.store.hub_id, team_id=peer.team_id,
+                                    recipient_server_id=lease.recipient_server_id)
+                                wire = canonical_json(packet) + b"\n"
+                                if len(wire) > MAX_MAIL_HINT_FRAME_BYTES:
+                                    raise MailHintClosed("Mail hint frame exceeds bound")
+                                self.wfile.write(wire)
+                                self.wfile.flush()
+                            lease.write(send, raw)
+                        write("snapshot", snapshot["cursor"])
+                        while not stopped.is_set():
+                            remaining = deadline - gateway.store._timestamp()
+                            if remaining <= 0:
+                                break
+                            arrival = lease.take(timeout=remaining)
+                            if arrival is None:
+                                break
+                            write("hint", arrival.as_dict(reset=False))
+                    except BaseException as exc:
+                        if not headers_sent:
+                            if isinstance(exc, MailHintClosed):
+                                raise SecurePeerError("forbidden", "Mail hint authority was closed", 403) from exc
+                            raise
+                        # Once a status line was sent, close. Never append a
+                        # JSON error/status line to an established stream.
+                    finally:
+                        try:
+                            if key is not None:
+                                gateway._finish_mail_hint_stream(key)
+                        finally:
+                            lease.close()
+                            self.close_connection = True
 
                 def _attachment_body(self) -> bytes:
                     """Read one fixed-size binary chunk without entering JSON parsing."""
@@ -5598,6 +5978,9 @@ class SecurePeerGateway:
                                     "certificate_expires_at": peer.certificate_expires_at,
                                     "peer_display_name": peer.peer_display_name,
                                     "remote_route_delivery_available": gateway._peer_relay_available(peer),
+                                    "mail_hints_available": bool(gateway.mail_hint_subscriber is not None
+                                                                 and gateway.mail_hint_snapshot is not None
+                                                                 and "teamspace.read" in peer.scopes),
                                 },
                             )
                             return
@@ -5666,6 +6049,9 @@ class SecurePeerGateway:
                         self._validate_headers()
                         if query:
                             raise SecurePeerError("invalid_request", "Query is not accepted", 422)
+                        if path in {"/v1/mail-hints/stream", "/v1/mail-hints/snapshot"}:
+                            self._mail_hints(stream=path.endswith("/stream"))
+                            return
                         if path == "/v1/pairings":
                             self._reject_browser_headers()
                             source = str(self.client_address[0]) if self.client_address else "unknown"
@@ -5973,8 +6359,17 @@ class SecurePeerGateway:
             self._server = server
             self._thread = thread
             try:
+                if self.mail_hint_subscriber is not None:
+                    self._mail_watcher = _MailHintDisconnectWatcher()
+                    self._mail_hint_unsubscribe = self.store.register_mail_hint_revoker(self.close_mail_hint_streams)
                 thread.start()
             except BaseException:
+                if self._mail_watcher is not None:
+                    self._mail_watcher.close()
+                    self._mail_watcher = None
+                if self._mail_hint_unsubscribe is not None:
+                    self._mail_hint_unsubscribe()
+                    self._mail_hint_unsubscribe = None
                 # Binding/listening has already succeeded, but the runtime
                 # cannot retain this gateway until its serving thread starts.
                 # Release the listener here so a designated-host retry can
@@ -6004,6 +6399,7 @@ class SecurePeerGateway:
             if replacement is None:
                 return False
             server.install_tls_context(replacement)
+            self.close_mail_hint_streams()
             return True
 
     def stop(self, *, timeout_seconds: float = 15.0) -> None:
@@ -6011,6 +6407,10 @@ class SecurePeerGateway:
             server, thread = self._server, self._thread
             self._stopping = server is not None
         try:
+            self.close_mail_hint_streams()
+            if self._mail_watcher is not None:
+                self._mail_watcher.close()
+                self._mail_watcher = None
             if server is not None:
                 server.shutdown()
                 server.server_close()
@@ -6018,7 +6418,17 @@ class SecurePeerGateway:
                 thread.join(timeout=5)
             if server is not None and not server.wait_for_workers(timeout_seconds):
                 raise RuntimeError("secure peer gateway did not drain active requests")
+            deadline = time.monotonic() + max(0.0, timeout_seconds)
+            with self._mail_guard:
+                while self._mail_streams:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise RuntimeError("secure peer gateway did not close passive streams")
+                    self._mail_guard.wait(remaining)
         finally:
+            if self._mail_hint_unsubscribe is not None:
+                self._mail_hint_unsubscribe()
+                self._mail_hint_unsubscribe = None
             with self._guard:
                 if self._server is server:
                     self._server = None
@@ -6170,6 +6580,9 @@ class SecurePeerClient:
         self._clock = clock
         self.timeout_seconds = max(1.0, min(float(timeout_seconds), 30.0))
         self._route_guard = threading.RLock()
+        # One current authenticated capability receipt, not a per-peer cache
+        # or polling lane. Existing activation/heartbeat health fills this.
+        self._mail_hint_health: tuple[str, str, str, str, int, bool] | None = None
         self._pairing_request_guard = threading.RLock()
         self._pairing_capacity_lock = pairing_capacity_lock or threading.RLock()
         self._external_actionable_pairing_count = (
@@ -8123,6 +8536,7 @@ class SecurePeerClient:
             or value.get("certificate_fingerprint") != row["certificate_fingerprint"]
             or value.get("certificate_expires_at") != row["certificate_expires_at"]
             or type(value.get("remote_route_delivery_available")) is not bool
+            or ("mail_hints_available" in value and type(value["mail_hints_available"]) is not bool)
         ):
             raise SecurePeerError("host_identity_mismatch", "Connected peer health identity changed", 409)
         validated_at = self._timestamp()
@@ -8147,7 +8561,15 @@ class SecurePeerClient:
                 )
         finally:
             connection.close()
+        self._mail_hint_health = (connection_id, row["certificate_fingerprint"], row["hub_id"],
+                                  row["team_id"], validated_at, value.get("mail_hints_available") is True)
         return value
+
+    def mail_hint_capability(self, connection_id: str, certificate_fingerprint: str | None = None) -> bool:
+        receipt = self._mail_hint_health
+        return bool(receipt is not None and receipt[0] == connection_id
+                    and (certificate_fingerprint is None or receipt[1] == certificate_fingerprint)
+                    and receipt[4] >= self._timestamp() - 120 and receipt[5])
 
     def set_active_connection(
         self, connection_id: str, *, expected_current: str | None
@@ -8969,6 +9391,78 @@ class SecurePeerClient:
                 409,
             )
         return row
+
+    def _prepare_mail_hint_request(self, connection_id: str, previous_cursor: Any) -> tuple[Any, ssl.SSLContext, dict[str, Any]]:
+        with self._route_guard:
+            row = self._require_active_connection_locked(connection_id, relay_required=False)
+            scopes = json.loads(row["requested_scopes_json"])
+            if "teamspace.read" not in scopes:
+                raise SecurePeerError("forbidden", "Team Mail read authority is required", 403)
+            if previous_cursor is not None:
+                previous_cursor = MailArrival.from_dict(previous_cursor).as_dict()
+                if previous_cursor["team_id"] != row["team_id"]:
+                    raise SecurePeerError("forbidden", "Mail hint team changed", 403)
+            body = {"version": 1, "team_id": row["team_id"], "previous_cursor": previous_cursor}
+            return row, self._pinned_context(row, mutual_tls=True), body
+
+    def _revalidate_mail_hint_connection(self, connection_id: str, original: Any) -> None:
+        with self._route_guard:
+            current = self._require_active_connection_locked(connection_id, relay_required=False)
+            fields = ("host_ip", "port", "host_server_identity", "hub_id", "team_id",
+                      "peer_id", "host_ca_fingerprint", "certificate_fingerprint")
+            if any(current[key] != original[key] for key in fields):
+                raise MailHintClosed("Mail hint connection authority changed")
+
+    def team_mail_hint_snapshot(self, connection_id: str, previous_cursor: Any = None) -> dict[str, Any]:
+        row, context, body = self._prepare_mail_hint_request(connection_id, previous_cursor)
+        status, headers, raw, _leaf = self._request(row["host_ip"], int(row["port"]), "POST",
+            "/v1/mail-hints/snapshot", body=body, context=context, maximum_response=MAX_MAIL_HINT_FRAME_BYTES)
+        value = self._decode_json_response(status, headers, raw)
+        self._revalidate_mail_hint_connection(connection_id, row)
+        if set(value) != {"hub_id", "cursor"}:
+            raise SecurePeerError("remote_invalid", "Invalid Mail hint snapshot", 502)
+        frame = _mail_hint_frame({"type": "snapshot", **value}, hub_id=row["hub_id"], team_id=row["team_id"])
+        return {"hub_id": frame["hub_id"], "cursor": frame["cursor"]}
+
+    def open_mail_hint_stream(self, connection_id: str, previous_cursor: Any = None) -> PeerMailHintStream:
+        row, context, body = self._prepare_mail_hint_request(connection_id, previous_cursor)
+        # No client route lock is retained across handshake or lifetime reads.
+        connection = http.client.HTTPSConnection(row["host_ip"], int(row["port"]),
+            timeout=self.timeout_seconds, context=context)
+        response = None
+        try:
+            wire = canonical_json(body)
+            connection.request("POST", "/v1/mail-hints/stream", body=wire, headers={
+                "Content-Type": "application/json", "Content-Length": str(len(wire)),
+                "Accept": "application/x-ndjson", "Connection": "close"})
+            sock = connection.sock
+            if sock is None:
+                raise SecurePeerError("transport_failed", "Mail hint TLS connection closed", 502)
+            # getresponse may relinquish connection.sock for Connection:close;
+            # retain the actual authenticated socket to interrupt blocked reads.
+            response = connection.getresponse()
+            headers = response.getheaders()
+            if (len(headers) > MAX_HEADERS
+                    or sum(len(name) + len(value) + 4 for name, value in headers) > MAX_HEADER_BLOCK_BYTES
+                    or any(len(name) > 80 or len(value) > MAX_HEADER_VALUE_BYTES for name, value in headers)):
+                raise SecurePeerError("remote_invalid", "Invalid Mail hint response headers", 502)
+            if response.status != 200:
+                self._decode_json_response(response.status, headers, response.read(MAX_MAIL_HINT_FRAME_BYTES + 1))
+                raise SecurePeerError("remote_invalid", "Invalid Mail hint response status", 502)
+            types = [value for name, value in headers if name.lower() == "content-type"]
+            connections = [value.lower() for name, value in headers if name.lower() == "connection"]
+            if (types != ["application/x-ndjson"] or connections != ["close"]
+                    or any(name.lower() in {"transfer-encoding", "content-length"} for name, _ in headers)):
+                raise SecurePeerError("remote_invalid", "Invalid Mail hint stream framing", 502)
+            self._revalidate_mail_hint_connection(connection_id, row)
+            return PeerMailHintStream(connection, response, sock, hub_id=row["hub_id"], team_id=row["team_id"],
+                expires_at=int(row["certificate_expires_at"]), clock=self._clock,
+                revalidate=lambda: self._revalidate_mail_hint_connection(connection_id, row))
+        except BaseException:
+            if response is not None:
+                response.close()
+            connection.close()
+            raise
 
     def proxy(
         self,

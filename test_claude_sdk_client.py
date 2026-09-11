@@ -1,5 +1,6 @@
 import asyncio
 import gc
+import json
 import unittest
 from collections.abc import AsyncIterable, AsyncIterator
 from importlib.metadata import version
@@ -512,6 +513,127 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self) -> None:
         await self.manager.close_all()
+
+    async def test_task_receipts_survive_interruption_without_inventing_cancellation(self) -> None:
+        handle = await self.manager.start_run("chat-receipts", "Work", run_id="old-run",
+                                              options={}, configuration_key="same")
+        client = self.factory.clients[0]
+        for task in ("completed", "stopped", "pending"):
+            await client.emit({"type": "system", "subtype": "task_started", "task_id": task,
+                               "task_type": "local_workflow", "session_id": "provider-one",
+                               "tool_use_id": "tool-one", "description": "must not be retained"})
+        await client.emit({"type": "system", "subtype": "task_updated", "task_id": "completed",
+                           "patch": {"status": "completed", "result": "must not be retained"}})
+        await client.emit({"type": "system", "subtype": "task_notification", "task_id": "stopped", "status": "stopped"})
+        await client.emit({"type": "result", "terminal_reason": "aborted_tools", "is_error": False})
+        await asyncio.wait_for(collect(handle), 1)
+        receipts = handle.background_task_receipts
+        self.assertEqual([item["status"] for item in receipts], ["completed", "stopped", "tracking_lost"])
+        self.assertTrue(all(item["owner_run_id"] == "old-run" for item in receipts))
+        self.assertNotIn("must not be retained", repr(receipts))
+        with self.assertRaises(TypeError):
+            receipts[0]["status"] = "running"
+        self.assertEqual(handle.background_task_overflow_count, 0)
+
+    async def test_reconciliation_hook_is_query_scoped_and_old_generation_cannot_consume_it(self) -> None:
+        options = {"hooks": claude_background_tracking_hooks(), "resume": "provider-one"}
+        reconciliation = {"tasks": [{"task_id": "prior-task", "task_type": "local_workflow",
+                                     "owner_run_id": "prior-run", "status": "tracking_lost"}]}
+        first = await self.manager.start_run("chat-hooks", "same prompt", run_id="first",
+            options=options, configuration_key="same", background_task_reconciliation=reconciliation)
+        old_client = self.factory.clients[0]
+        old_hook = old_client.options["hooks"]["UserPromptSubmit"][0].hooks[0]
+        await first.interrupt()
+        hook_input = {"hook_event_name": "UserPromptSubmit", "prompt": "same prompt", "session_id": "provider-one"}
+        self.assertEqual(await old_hook(hook_input, None, {}), {})
+        self.assertFalse(first.background_task_reconciliation_consumed)
+        await old_client.emit({"type": "result", "terminal_reason": "aborted_tools"})
+        await asyncio.wait_for(collect(first), 1)
+        second = await self.manager.start_run("chat-hooks", "same prompt", run_id="second",
+            options=options, configuration_key="same", background_task_reconciliation=reconciliation)
+        new_client = self.factory.clients[-1]
+        self.assertIsNot(new_client, old_client)
+        hook = new_client.options["hooks"]["UserPromptSubmit"][0].hooks[0]
+        self.assertEqual(await old_hook(hook_input, None, {}), {})
+        for patch in ({"session_id": "other"}, {"agent_id": "child"}, {"prompt": "other"}):
+            self.assertEqual(await hook({**hook_input, **patch}, None, {}), {})
+        self.assertFalse(second.background_task_reconciliation_consumed)
+        result = await hook(hook_input, None, {})
+        self.assertIn('"status":"tracking_lost"', result["hookSpecificOutput"]["additionalContext"])
+        self.assertFalse(second.background_task_reconciliation_consumed)
+        await new_client.emit({"type": "assistant", "text": "Observed task status"})
+        await asyncio.wait_for(second.__anext__(), 1)
+        self.assertTrue(second.background_task_reconciliation_consumed)
+        self.assertEqual(second.background_task_receipts, ())
+        self.assertEqual(await hook(hook_input, None, {}), {})
+        self.assertIn(("query", "same prompt", {}), new_client.calls)
+        await new_client.emit({"type": "result", "result": "done"})
+        await asyncio.wait_for(collect(second), 1)
+        ordinary = await self.manager.start_run("chat-hooks", "same prompt", run_id="ordinary",
+                                               options=options, configuration_key="same")
+        self.assertEqual(await hook(hook_input, None, {}), {})
+        self.assertFalse(ordinary.background_task_reconciliation_consumed)
+
+    async def test_hook_emission_before_ack_then_abort_does_not_consume_reconciliation(self) -> None:
+        self.factory.auto_ack = False
+        handle = await self.manager.start_run("chat-pre-ack", "check", run_id="unacknowledged",
+            options={"hooks": claude_background_tracking_hooks()}, configuration_key="same",
+            background_task_reconciliation={"tasks": [{"task_id": "old-task", "task_type": "local_workflow",
+                                                       "owner_run_id": "old-run", "status": "tracking_lost"}]})
+        hook = self.factory.clients[0].options["hooks"]["UserPromptSubmit"][0].hooks[0]
+        result = await hook({"hook_event_name": "UserPromptSubmit", "prompt": "check"}, None, {})
+        self.assertIn("additionalContext", result["hookSpecificOutput"])
+        self.assertFalse(handle.background_task_reconciliation_consumed)
+        await handle.interrupt()
+        with self.assertRaises(ClaudeSDKQueryError):
+            await asyncio.wait_for(collect(handle), 1)
+        self.assertFalse(handle.background_task_reconciliation_consumed)
+
+    async def test_task_receipt_bound_keeps_later_active_work_over_old_terminals(self) -> None:
+        handle = await self.manager.start_run("chat-receipt-bound", "Work", run_id="old-run",
+                                              options={}, configuration_key="same")
+        client = self.factory.clients[0]
+        for index in range(64):
+            await client.emit({"type": "system", "subtype": "task_started", "task_id": str(index), "task_type": "local_agent"})
+            await client.emit({"type": "system", "subtype": "task_notification", "task_id": str(index), "status": "completed"})
+        await client.emit({"type": "system", "subtype": "task_started", "task_id": "later-workflow", "task_type": "local_workflow"})
+        await client.emit({"type": "result", "terminal_reason": "aborted_tools"})
+        await asyncio.wait_for(collect(handle), 1)
+        receipts = handle.background_task_receipts
+        self.assertEqual(len(receipts), 64)
+        self.assertEqual(handle.background_task_overflow_count, 1)
+        self.assertEqual(receipts[-1]["task_id"], "later-workflow")
+        self.assertEqual(receipts[-1]["status"], "tracking_lost")
+
+    async def test_reconciliation_is_bounded_and_missing_hook_does_not_deliver_query(self) -> None:
+        tasks = [{"task_id": str(index) + "x" * 250, "task_type": "local_workflow",
+                  "owner_run_id": "o" * 256, "provider_session_id": "p" * 256,
+                  "tool_use_id": "t" * 256, "status": "completed"} for index in range(66)]
+        tasks[63]["status"] = "tracking_lost"
+        with self.assertRaises(ClaudeSDKConfigurationConflict):
+            await self.manager.start_run("no-hook", "unchanged", run_id="missing", options={},
+                configuration_key="same", background_task_reconciliation={"tasks": tasks})
+        self.assertFalse(any(call[0] == "query" for call in self.factory.clients[0].calls))
+        prompt = "literal \ud800 text"
+        handle = await self.manager.start_run("bounded-hook", prompt, run_id="bounded",
+            options={"hooks": claude_background_tracking_hooks()}, configuration_key="same",
+            background_task_reconciliation={"tasks": tasks})
+        client = self.factory.clients[-1]
+        hook = client.options["hooks"]["UserPromptSubmit"][0].hooks[0]
+        output = await hook({"hook_event_name": "UserPromptSubmit", "prompt": prompt}, None, {})
+        context = output["hookSpecificOutput"]["additionalContext"]
+        self.assertLessEqual(len(context.encode("utf-8")), 8192)
+        payload = json.loads(context.rsplit("\n", 1)[1])
+        self.assertEqual(len(payload["tasks"]) + payload["overflow_count"], 66)
+        self.assertEqual(payload["tasks"][0]["status"], "tracking_lost")
+        for index in range(66):
+            await client.emit({"type": "system", "subtype": "task_started", "task_id": str(index), "task_type": "local_agent"})
+        await client.emit(RuntimeError("stream ended"))
+        with self.assertRaises(Exception):
+            await asyncio.wait_for(collect(handle), 1)
+        self.assertEqual(len(handle.background_task_receipts), 64)
+        self.assertEqual(handle.background_task_overflow_count, 2)
+        self.assertTrue(all(item["status"] == "tracking_lost" for item in handle.background_task_receipts))
 
     async def test_start_run_returns_only_after_query_and_streams_through_result(self) -> None:
         handle = await self.manager.start_run(
@@ -2530,7 +2652,7 @@ class ClaudeSDKBackgroundTrackingHookTests(unittest.IsolatedAsyncioTestCase):
             {},
         )
         hooks = claude_background_tracking_hooks()
-        self.assertEqual(set(hooks), {"PreToolUse"})
+        self.assertEqual(set(hooks), {"PreToolUse", "UserPromptSubmit"})
         matchers = hooks["PreToolUse"]
         self.assertEqual(
             [matcher.matcher for matcher in matchers],

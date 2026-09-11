@@ -37,6 +37,8 @@ def load_server_repair(cache):
         "CLAUDE_METADATA_REPAIR_CACHE": cache,
         "TIMELINE_IMPORTED_PROMPT_HIDDEN_FIELD": "_agentsdock_imported_prompt_hidden",
         "strip_all_legacy_agentsdock_provider_authority_suffixes": lambda text, **kwargs: text,
+        "HISTORY_SEARCH_REPAIR_DIRTY": set(),
+        "HISTORY_SEARCH_DIRTY": set(),
     })
     exec(compile(module, str(source), "exec"), namespace)
     return namespace
@@ -58,6 +60,8 @@ class ClaudeHistoryRepairTests(unittest.TestCase):
     def normalize(self, event):
         legacy = dict(event)
         legacy.pop("isMeta", None)
+        legacy.pop("isCompactSummary", None)
+        legacy.pop("isSidechain", None)
         item = self.helpers["claude_history_event_item"](legacy)
         return item["text"] if item else None
 
@@ -115,6 +119,15 @@ class ClaudeHistoryRepairTests(unittest.TestCase):
         self.assertFalse(self.cache.is_hidden("other-chat", self.wrapper))
         self.assertFalse(self.cache.is_hidden("chat-1", self.rows[3]))
 
+    def test_source_sidechain_scope_repairs_old_parent_import_without_text_guessing(self):
+        self.fixture([user_event("Generated wrapper", isSidechain=True), user_event("Real question")])
+        self.prepare()
+        self.assertTrue(self.cache.is_hidden("chat-1", self.wrapper))
+        self.cache = repair.ClaudeMetadataRepairCache()
+        self.fixture([user_event("Generated wrapper", isSidechain=True), user_event("Generated wrapper")])
+        self.prepare()
+        self.assertFalse(self.cache.is_hidden("chat-1", self.wrapper))
+
     def test_any_normalized_human_match_preserves_the_user_quote(self):
         for flag in ({}, {"isMeta": False}, {"isMeta": "true"}, {"isMeta": 1}):
             with self.subTest(flag=flag):
@@ -123,6 +136,17 @@ class ClaudeHistoryRepairTests(unittest.TestCase):
                               user_event(" \nGenerated wrapper\n", **flag)])
                 self.prepare()
                 self.assertFalse(self.cache.is_hidden("chat-1", self.wrapper))
+
+    def test_compaction_summary_requires_source_metadata_not_matching_wording(self):
+        self.fixture([user_event("Generated wrapper", isCompactSummary=True), user_event("Real question")])
+        self.assertTrue(self.prepare())
+        projected = load_server_repair(self.cache)["project_provider_history_event_for_egress"](self.wrapper, "chat-1")
+        self.assertEqual(projected["prompt"], "")
+        self.assertEqual(projected["provider_history_repair"], "source_proven_import")
+        self.cache = repair.ClaudeMetadataRepairCache()
+        self.fixture([user_event("Generated wrapper", isCompactSummary=True), user_event("Generated wrapper")])
+        self.prepare()
+        self.assertFalse(self.cache.is_hidden("chat-1", self.wrapper))
 
     def test_reused_metadata_is_unique_within_its_original_batch(self):
         self.fixture([user_event("Generated wrapper", isMeta=True),
@@ -549,6 +573,23 @@ class ClaudeInterruptionRepairTests(unittest.TestCase):
                 else:
                     native[index][field] = value
                 self.fixture(native=native)
+                self.prepare()
+                self.assertEqual(self.correction()["provider_origin"]["cause"], "unknown")
+
+    def test_sdk_native_stop_requires_exact_successor_and_provider(self):
+        native = self.native_steer()
+        native[1] = {**native[1], "type": "turn_stopped", "native_steer": True, "superseded_by_run_id": "run-next"}
+        native[1].pop("stopped")
+        native[1].pop("exit_code")
+        self.fixture(native=native)
+        self.prepare()
+        self.assertEqual(self.correction()["provider_origin"]["cause"], "steer")
+        for field, value in (("native_steer", False), ("superseded_by_run_id", "foreign"), ("provider_session_id", None)):
+            with self.subTest(field=field):
+                self.cache = repair.ClaudeMetadataRepairCache()
+                altered = [dict(event) for event in native]
+                altered[1][field] = value
+                self.fixture(native=altered)
                 self.prepare()
                 self.assertEqual(self.correction()["provider_origin"]["cause"], "unknown")
 

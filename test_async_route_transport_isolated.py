@@ -21,6 +21,7 @@ TREE = ast.parse(Path(__file__).with_name("agent_server.py").read_text())
 FUNCTIONS = {
     "is_async_route_message", "async_route_conversation_fields",
     "cross_chat_message_event_type", "cross_chat_lifecycle_fields",
+    "async_message_target_fields",
     "public_cross_chat_envelope", "reserve_async_provider_route_message",
     "submit_provider_route_handoff", "append_cross_chat_event_once",
     "append_cross_chat_lifecycle", "finish_cross_chat_delivery", "cross_chat_delivery_state",
@@ -250,12 +251,10 @@ class AsyncRouteAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         self.connection.executescript(schema)
         methods = ast.ClassDef(name="Ledger", bases=[], keywords=[], decorator_list=[], body=[
             deepcopy(node) for node in ledger.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name in {"create_instruction", "get", "_row", "_charge_configured_route_rate"}
+            and node.name in {"create_instruction", "get", "_row"}
         ])
         self.ns.update({"time": time, "now_iso": lambda: "2026-09-10T00:00:00Z",
-                        "validated_cross_chat_source_user_instruction": lambda value: value,
-                        "PROVIDER_CROSS_CHAT_ROUTE_RATE_WINDOW_SECONDS": 3600,
-                        "PROVIDER_CROSS_CHAT_ROUTE_RATE_LIMIT": 12})
+                        "validated_cross_chat_source_user_instruction": lambda value: value})
         exec(compile(ast.fix_missing_locations(ast.Module(body=[
             ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), methods,
         ], type_ignores=[])), "<isolated-async-ledger>", "exec"), self.ns)
@@ -300,12 +299,15 @@ class AsyncRouteAcceptanceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_same_key_replay_is_single_sqlite_effect_and_single_queue_admission(self):
         first = await self.send()
+        rate_records_before_replay = self.connection.execute(
+            "SELECT COUNT(*) FROM cross_chat_route_rate_events").fetchone()[0]
         duplicate = await self.send()
         self.assertEqual(first["message_id"], duplicate["message_id"])
         self.assertFalse(first["duplicate"])
         self.assertTrue(duplicate["duplicate"])
         self.ns["submit_cross_chat_delivery"].assert_awaited_once()
-        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM cross_chat_route_rate_events").fetchone()[0], 1)
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM cross_chat_route_rate_events").fetchone()[0],
+                         rate_records_before_replay)
         record = await self.ledger.get(first["message_id"])
         self.assertEqual(record["authorization_pair_id"], PAIR)
         self.assertEqual(record["source_user_instruction"], "")
@@ -336,13 +338,24 @@ class AsyncRouteAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             await self.send()
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM cross_chat_envelopes").fetchone()[0], 0)
 
-    async def test_durable_rate_limit_is_retained_but_replay_is_not_charged(self):
-        for index in range(12):
-            await self.send(f"message-key-{index}")
-        self.assertTrue((await self.send("message-key-0"))["duplicate"])
-        with self.assertRaises(HTTPException) as rejected:
-            await self.send("message-key-13")
-        self.assertEqual(rejected.exception.status_code, 429)
+    async def test_many_messages_have_no_hourly_cap_but_replay_and_revocation_stay_fenced(self):
+        receipts = [await self.send(f"message-key-{index}") for index in range(40)]
+        self.assertEqual(len({receipt["message_id"] for receipt in receipts}), 40)
+        duplicate = await self.send("message-key-0")
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(duplicate["message_id"], receipts[0]["message_id"])
+        self.assertEqual(self.ns["submit_cross_chat_delivery"].await_count, 40)
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM cross_chat_envelopes").fetchone()[0], 40)
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM cross_chat_route_rate_events").fetchone()[0], 0)
+
+        self.ns["live_provider_cross_chat_route"].side_effect = None
+        self.ns["live_provider_cross_chat_route"].return_value = None
+        for key in ("message-key-0", "message-key-after-revoke"):
+            with self.assertRaises(HTTPException) as rejected:
+                await self.send(key)
+            self.assertEqual(rejected.exception.status_code, 403)
+        self.assertEqual(self.ns["submit_cross_chat_delivery"].await_count, 40)
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM cross_chat_envelopes").fetchone()[0], 40)
 
     async def test_http_cancellation_joins_one_durable_send(self):
         entered, release = asyncio.Event(), asyncio.Event()

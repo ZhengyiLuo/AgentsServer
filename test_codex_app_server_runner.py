@@ -40,6 +40,10 @@ class FakeTurn:
         self.steer_calls: list[tuple[list[dict[str, object]], str | None]] = []
         self.interrupt_calls = 0
         self.close_calls = 0
+        self._subscription = Mock(
+            next_notification=self.next_notification,
+            next_notification_with_sequence=self.next_notification_with_sequence,
+        )
 
     async def next_notification(
         self,
@@ -170,6 +174,7 @@ class FakeManager:
         ] = []
         self.notification_barriers: list[tuple[object, str]] = []
         self.retire_generation_calls: list[int] = []
+        self.retained_stream_calls: list[bool] = []
 
     async def start(self) -> None:
         self.start_calls += 1
@@ -187,8 +192,10 @@ class FakeManager:
         input_items: list[dict[str, object]],
         *,
         overrides: dict[str, object] | None = None,
+        retain_thread_stream: bool = False,
     ) -> FakeTurn:
         self.turn_calls.append((thread_id, input_items, dict(overrides or {})))
+        self.retained_stream_calls.append(retain_thread_stream)
         if self.start_turn_error is not None:
             raise self.start_turn_error
         if self.turns:
@@ -292,6 +299,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.previous_run_now = agent_server.RUN_NOW_TURNS
         self.previous_steering = agent_server.STEERING_SESSIONS
         self.previous_active_lock = agent_server.ACTIVE_LOCK
+        self.previous_lifecycle_locks = agent_server.SESSION_LIFECYCLE_LOCKS
         self.previous_run_now_requests = agent_server.RUN_NOW_REQUESTS
         self.previous_run_now_completed = agent_server.RUN_NOW_COMPLETED_RESULTS
         self.previous_run_metadata = agent_server.RUN_METADATA
@@ -333,6 +341,9 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         # deliberately contends the production lock binds it to that loop, so
         # every case needs a fresh lock just like it gets fresh runtime maps.
         agent_server.ACTIVE_LOCK = asyncio.Lock()
+        # Goal handoff now deliberately contends a per-chat lifecycle lock.
+        # It must not retain a binding to a preceding test's event loop.
+        agent_server.SESSION_LIFECYCLE_LOCKS = {}
         agent_server.RUN_NOW_REQUESTS = {}
         agent_server.RUN_NOW_COMPLETED_RESULTS = OrderedDict()
         agent_server.RUN_METADATA = {}
@@ -355,6 +366,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         agent_server.RUN_NOW_TURNS = self.previous_run_now
         agent_server.STEERING_SESSIONS = self.previous_steering
         agent_server.ACTIVE_LOCK = self.previous_active_lock
+        agent_server.SESSION_LIFECYCLE_LOCKS = self.previous_lifecycle_locks
         agent_server.RUN_NOW_REQUESTS = self.previous_run_now_requests
         agent_server.RUN_NOW_COMPLETED_RESULTS = self.previous_run_now_completed
         agent_server.RUN_METADATA = self.previous_run_metadata
@@ -879,6 +891,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             input_items: list[dict[str, object]],
             *,
             overrides: dict[str, object] | None = None,
+            retain_thread_stream: bool = False,
         ) -> FakeTurn:
             manager.turn_calls.append(
                 (thread_id, input_items, dict(overrides or {}))
@@ -938,6 +951,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             input_items: list[dict[str, object]],
             *,
             overrides: dict[str, object] | None = None,
+            retain_thread_stream: bool = False,
         ) -> FakeTurn:
             manager.turn_calls.append(
                 (thread_id, input_items, dict(overrides or {}))
@@ -1007,6 +1021,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             input_items: list[dict[str, object]],
             *,
             overrides: dict[str, object] | None = None,
+            retain_thread_stream: bool = False,
         ) -> FakeTurn:
             manager.turn_calls.append(
                 (thread_id, input_items, dict(overrides or {}))
@@ -1074,6 +1089,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             input_items: list[dict[str, object]],
             *,
             overrides: dict[str, object] | None = None,
+            retain_thread_stream: bool = False,
         ) -> FakeTurn:
             manager.turn_calls.append(
                 (thread_id, input_items, dict(overrides or {}))
@@ -1295,7 +1311,9 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             manager.notification_barriers,
-            [(agent_server.project_codex_notification, "thread-native")],
+            # Drain before testing native goal ownership, then before final
+            # cleanup. Neither drain resends the user's prompt.
+            [(agent_server.project_codex_notification, "thread-native")] * 2,
         )
 
     async def test_scheduled_run_metadata_is_attached_to_live_reasoning_and_tools(
@@ -1760,6 +1778,298 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             finished.await_args.args[1]["result_text"],
             "Observed the accepted turn.",
         )
+
+    async def exercise_goal_handoff(self, *, stop: bool) -> None:
+        turn = FakeTurn()
+        manager = FakeManager(turn)
+        handoff_ready = asyncio.Event()
+        continuation_output = asyncio.Event()
+        interrupted = asyncio.Event()
+        stack, events, finished, exec_fallback = self.runner_patches(manager)
+
+        async def read_retained_notification(
+            timeout: float | None = None,
+        ) -> tuple[int, dict[str, object]]:
+            active = agent_server.ACTIVE["chat-native"]
+            self.assertEqual(active["run_id"], "run-original")
+            self.assertEqual(active["codex_native_operation_kind"], "goal_resume")
+            self.assertIn("chat-native", agent_server.BUSY_SESSIONS)
+            self.assertEqual(
+                agent_server.CURRENT_TURNS["chat-native"]["run_id"],
+                "run-original",
+            )
+            self.assertEqual(active["codex_control_reservation_id"], "run-original")
+            self.assertEqual(
+                agent_server.CURRENT_TURNS["chat-native"]["codex_control_reservation_id"],
+                "run-original",
+            )
+            self.assertIs(
+                agent_server.CODEX_NATIVE_ACTION_TASKS[("chat-native", "run-original")],
+                runner,
+            )
+            finished.assert_not_awaited()
+            agent_server.release_turn_slot.assert_not_awaited()
+            agent_server.unpin_codex_app_server_thread.assert_not_awaited()
+            handoff_ready.set()
+            return await turn.next_notification_with_sequence(timeout)
+
+        turn._subscription = Mock(  # type: ignore[attr-defined]
+            next_notification_with_sequence=read_retained_notification,
+            next_notification=turn.next_notification,
+        )
+
+        async def record_event(
+            session_id: str, event_type: str, payload: dict[str, object],
+        ) -> dict[str, object]:
+            if event_type == "assistant_text" and payload.get("text") == "Goal result":
+                self.assertEqual(payload["run_id"], "run-original")
+                continuation_output.set()
+            return {}
+
+        events.side_effect = record_event
+
+        async def finalize(
+            session_id: str, run_id: str, *, stopped: bool,
+            payload: dict[str, object],
+        ) -> bool:
+            self.assertEqual(run_id, "run-original")
+            self.assertIsNotNone(agent_server.ACTIVE.pop(session_id, None))
+            agent_server.CURRENT_TURNS.pop(session_id)
+            agent_server.BUSY_SESSIONS.remove(session_id)
+            await finished(session_id, payload)
+            return True
+
+        async def pause_goal(*_args: object, **_kwargs: object) -> tuple[bool, bool, None]:
+            self.session["codex_goal"]["status"] = "paused"
+            return True, True, None
+
+        async def interrupt_native(
+            method: str, params: dict[str, object], **_kwargs: object,
+        ) -> dict[str, object]:
+            self.assertEqual(method, "turn/interrupt")
+            self.assertEqual(params["turnId"], "turn-goal")
+            self.assertEqual(self.session["codex_goal"]["status"], "paused")
+            interrupted.set()
+            return {}
+
+        manager.request = AsyncMock(side_effect=interrupt_native)
+        stop_task = None
+        with stack, patch.object(
+            agent_server, "CODEX_GOALS_ENABLED", True,
+        ), patch.object(
+            agent_server, "finalize_owned_turn_finished", AsyncMock(side_effect=finalize),
+        ) as finalize_mock, patch.object(
+            agent_server, "pause_active_codex_goal_for_stop", AsyncMock(side_effect=pause_goal),
+        ), patch.object(
+            agent_server, "CODEX_APP_SERVER_MANAGER", manager,
+        ), patch.object(
+            agent_server, "schedule_codex_subagent_finalization", Mock(),
+        ):
+            runner = asyncio.create_task(agent_server.run_codex_app_server(
+                "chat-native", "run-original", "Original request", dict(self.session),
+                Path(self.cwd) / ".runner-test-manifest.json",
+                allow_exec_fallback=False,
+            ))
+            try:
+                await self.wait_for_native_provider_ready(runner)
+                # Resume the goal while an ordinary user reply still owns the turn.
+                self.session["codex_goal"] = {
+                    "id": "goal-native", "objective": "Finish the task", "status": "active",
+                }
+                turn.feed(agent_message("ordinary-final", "Ordinary reply", "final_answer"))
+                turn.feed(completed_notification())
+                await asyncio.wait_for(handoff_ready.wait(), timeout=2)
+                self.assertEqual(manager.retained_stream_calls, [True])
+                self.assertEqual(turn.close_calls, 0)
+                active = agent_server.ACTIVE["chat-native"]
+                # The native projector binds turn/started before this consumer sees it.
+                active["provider_turn_id"] = "turn-goal"
+                active["provider_turn_ready"] = True
+                turn.feed({
+                    "method": "turn/started",
+                    "params": {"threadId": "thread-native", "turn": {"id": "turn-goal"}},
+                })
+                message = agent_message("goal-final", "Goal result", "final_answer")
+                message["params"]["turnId"] = "turn-goal"
+                turn.feed(message)
+                await asyncio.wait_for(continuation_output.wait(), timeout=2)
+                if stop:
+                    stop_task = asyncio.create_task(agent_server.stop_turn(
+                        "chat-native", expected_run_id="run-original",
+                        cascade_codex_subagents=False, cascade_claude_subagents=False,
+                        pause_queued_turns_on_stop=False,
+                    ))
+                    await asyncio.wait_for(interrupted.wait(), timeout=2)
+                else:
+                    self.session["codex_goal"]["status"] = "complete"
+                completed = completed_notification("interrupted" if stop else "completed")
+                completed["params"]["turnId"] = "turn-goal"
+                completed["params"]["turn"]["id"] = "turn-goal"
+                turn.feed(completed)
+                await asyncio.wait_for(runner, timeout=2)
+                if stop_task is not None:
+                    result = await asyncio.wait_for(stop_task, timeout=2)
+                    self.assertTrue(result["stopped"])
+                    manager.request.assert_awaited_once()
+                else:
+                    manager.request.assert_not_awaited()
+                finalize_mock.assert_awaited_once()
+                finished.assert_awaited_once()
+                self.assertEqual(finished.await_args.args[1]["stopped"], stop)
+                self.assertEqual(finished.await_args.args[1]["result_text"], "Goal result")
+                self.assertFalse(any(
+                    call.args[1] == "turn_finished" for call in events.await_args_list
+                ))
+                agent_server.unpin_codex_app_server_thread.assert_awaited_once()
+                self.assertEqual(turn.close_calls, 1)
+                self.assertEqual(len(manager.turn_calls), 1)
+                exec_fallback.assert_not_awaited()
+            finally:
+                pending = [task for task in (runner, stop_task) if task is not None and not task.done()]
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+
+    async def test_goal_resumed_during_reply_retains_owner_until_goal_complete(self) -> None:
+        await self.exercise_goal_handoff(stop=False)
+
+    async def test_stop_during_retained_goal_interrupts_and_finalizes_once(self) -> None:
+        await self.exercise_goal_handoff(stop=True)
+
+    def prepare_goal_handoff(self, *, status: str = "active") -> tuple[FakeManager, FakeTurn]:
+        turn = FakeTurn()
+        manager = FakeManager(turn)
+        self.session["codex_goal"] = {
+            "id": "goal-native", "objective": "Finish the task", "status": status,
+        }
+        agent_server.ACTIVE["chat-native"] = {
+            "run_id": "run-original", "backend": agent_server.BACKEND_CODEX,
+            "transport": agent_server.CODEX_TRANSPORT_APP_SERVER,
+            "provider_thread_id": "thread-native", "provider_turn_id": "turn-native",
+            "provider_turn_ready": True, "codex_app_server_turn": turn,
+        }
+        return manager, turn
+
+    async def test_goal_handoff_waits_for_accepted_resume_lifecycle_update(self) -> None:
+        manager, turn = self.prepare_goal_handoff(status="paused")
+        projection_drained = asyncio.Event()
+
+        async def drain(*_args: object) -> None:
+            projection_drained.set()
+
+        manager.wait_for_notification_handler = AsyncMock(side_effect=drain)
+        with patch.object(agent_server, "CODEX_GOALS_ENABLED", True):
+            async with agent_server.session_lifecycle_lock("chat-native"):
+                handoff = asyncio.create_task(agent_server.retain_codex_goal_run_owner(
+                    "chat-native", "run-original", manager, "thread-native",
+                    subscription=turn._subscription,
+                ))
+                await asyncio.wait_for(projection_drained.wait(), timeout=1)
+                self.assertFalse(handoff.done())
+                self.assertNotIn("codex_goal_handoff_closed", agent_server.ACTIVE["chat-native"])
+                # An accepted goal/set persists its active response under this lock.
+                self.session["codex_goal"]["status"] = "active"
+            self.assertTrue(await asyncio.wait_for(handoff, timeout=1))
+        self.assertFalse(agent_server.ACTIVE["chat-native"]["codex_goal_handoff_closed"])
+        self.assertEqual(
+            agent_server.ACTIVE["chat-native"]["codex_control_reservation_id"],
+            agent_server.CURRENT_TURNS["chat-native"]["codex_control_reservation_id"],
+        )
+
+    async def test_completed_goal_with_unread_native_turn_retains_and_drains_stream(self) -> None:
+        manager, turn = self.prepare_goal_handoff(status="complete")
+        # The ordinary reply already consumed sequences 1 and 2. Projection
+        # reports complete before its retained continuation is rendered.
+        turn.notification_sequence = 2
+        turn.feed({
+            "method": "turn/started",
+            "params": {"threadId": "thread-native", "turn": {"id": "turn-goal"}},
+        })
+        message = agent_message("goal-final", "Fast goal result", "final_answer")
+        message["params"]["turnId"] = "turn-goal"
+        turn.feed(message)
+        completed = completed_notification()
+        completed["params"]["turnId"] = "turn-goal"
+        completed["params"]["turn"]["id"] = "turn-goal"
+        turn.feed(completed)
+        turn._subscription._last_enqueued_sequence = turn.notification_sequence
+        with patch.object(agent_server, "CODEX_GOALS_ENABLED", True), patch.object(
+            agent_server, "append_event", AsyncMock(return_value={}),
+        ) as events:
+            self.assertTrue(await agent_server.retain_codex_goal_run_owner(
+                "chat-native", "run-original", manager, "thread-native",
+                subscription=turn._subscription, handled_sequence=2,
+            ))
+            # Passive consumers must advance the same retained watermark even
+            # when no steering queue is attached.
+            agent_server.ACTIVE["chat-native"]["native_steer_queue"] = None
+            result = await asyncio.wait_for(agent_server.consume_codex_native_turn(
+                "chat-native", "run-original", "goal_resume", manager,
+                "thread-native", "run-original", turn._subscription,
+                finalize_operation=False, initial_sequence=2,
+            ), timeout=2)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["result_text"], "Fast goal result")
+        self.assertEqual([call.args[1] for call in events.await_args_list], ["assistant_text"])
+        self.assertTrue(agent_server.ACTIVE["chat-native"]["codex_goal_handoff_closed"])
+        self.assertIn("chat-native", agent_server.BUSY_SESSIONS)
+        turn._subscription.close.assert_called_once()
+
+    async def test_goal_consumer_rechecks_resume_then_seals_before_stream_close(self) -> None:
+        manager, turn = self.prepare_goal_handoff()
+        timed_out = asyncio.Event()
+        resumed_read = asyncio.Event()
+        reads = 0
+
+        async def read(timeout: float | None = None) -> tuple[int, dict[str, object]]:
+            nonlocal reads
+            reads += 1
+            if reads == 1:
+                timed_out.set()
+                raise asyncio.TimeoutError
+            if reads == 2:
+                self.assertEqual(self.session["codex_goal"]["status"], "active")
+                self.assertFalse(agent_server.ACTIVE["chat-native"]["codex_goal_handoff_closed"])
+                resumed_read.set()
+            return await turn.next_notification_with_sequence(timeout)
+
+        def close() -> None:
+            self.assertTrue(agent_server.ACTIVE["chat-native"]["codex_goal_handoff_closed"])
+            self.assertIn("chat-native", agent_server.BUSY_SESSIONS)
+
+        turn._subscription.next_notification_with_sequence = read
+        turn._subscription.close.side_effect = close
+        with patch.object(agent_server, "CODEX_GOALS_ENABLED", True):
+            self.assertTrue(await agent_server.retain_codex_goal_run_owner(
+                "chat-native", "run-original", manager, "thread-native",
+                subscription=turn._subscription,
+            ))
+            self.session["codex_goal"]["status"] = "complete"
+            async with agent_server.session_lifecycle_lock("chat-native"):
+                consumer = asyncio.create_task(agent_server.consume_codex_native_turn(
+                    "chat-native", "run-original", "goal_resume", manager,
+                    "thread-native", "run-original", turn._subscription,
+                    finalize_operation=False,
+                ))
+                await asyncio.wait_for(timed_out.wait(), timeout=1)
+                self.assertFalse(consumer.done())
+                self.session["codex_goal"]["status"] = "active"
+            try:
+                await asyncio.wait_for(resumed_read.wait(), timeout=1)
+                self.session["codex_goal"]["status"] = "complete"
+                turn.feed({
+                    "method": "turn/started",
+                    "params": {"threadId": "thread-native", "turn": {"id": "turn-native"}},
+                })
+                turn.feed(completed_notification())
+                turn._subscription._last_enqueued_sequence = turn.notification_sequence
+                result = await asyncio.wait_for(consumer, timeout=2)
+            finally:
+                if not consumer.done():
+                    consumer.cancel()
+                    await asyncio.gather(consumer, return_exceptions=True)
+        self.assertEqual(result["status"], "completed")
+        turn._subscription.close.assert_called_once()
 
     async def test_stop_interrupts_native_turn_without_killing_shared_process(self) -> None:
         turn = FakeTurn()
@@ -3561,7 +3871,10 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             run_now = await asyncio.wait_for(force_send, timeout=2)
             turn.feed(agent_message("final-after", "Done.", "final_answer"))
             turn.feed(completed_notification())
-            await asyncio.wait_for(runner, timeout=2)
+            # Forty authoritative events must all drain; the Linux debug-mode
+            # release runner can take longer than two seconds under load.
+            # This deadline is only a deadlock guard, not a throughput target.
+            await asyncio.wait_for(runner, timeout=10)
 
         traces = [
             call.args[2]
@@ -4048,6 +4361,7 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                 input_items: list[dict[str, object]],
                 *,
                 overrides: dict[str, object] | None = None,
+                retain_thread_stream: bool = False,
             ) -> FakeTurn:
                 self.turn_calls.append(
                     (thread_id, input_items, dict(overrides or {}))

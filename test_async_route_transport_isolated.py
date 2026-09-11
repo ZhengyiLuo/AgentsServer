@@ -1,4 +1,4 @@
-"""Independent pair messages: AST-only server, memory SQLite, mocked CLI I/O."""
+"""Mailbox sends and historical pair projection: AST server, SQLite, mocked I/O."""
 from __future__ import annotations
 
 import ast
@@ -9,12 +9,14 @@ import hashlib
 from pathlib import Path
 import re
 import sqlite3
+import tempfile
 import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 import agentsdock_chats as cli
+import chat_mailbox
 
 
 TREE = ast.parse(Path(__file__).with_name("agent_server.py").read_text())
@@ -234,34 +236,33 @@ class AsyncRouteAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             "provider_cross_chat_route_body_exceeds_limit": lambda body: len(body) > 16000,
             "prime_cross_chat_event_cache": Mock(),
             "append_cross_chat_event_once": AsyncMock(),
-            "submit_cross_chat_delivery": AsyncMock(side_effect=self.deliver),
+            "submit_cross_chat_delivery": AsyncMock(side_effect=AssertionError("mailbox must not execute recipient")),
+            "publish_chat_mailbox_message": AsyncMock(return_value="unread"),
             "generic_provider_route_delivery_error": lambda: HTTPException(409, "delivery failed"),
             "join_task_despite_caller_cancellation": lambda task: task,
             "reserve_provider_route_handoff": AsyncMock(side_effect=AssertionError("legacy reservation called")),
         })
         ledger = next(node for node in TREE.body if isinstance(node, ast.ClassDef) and node.name == "CrossChatStore")
-        schema = next(node.args[0].value for node in ast.walk(ledger)
-                      if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                      and node.func.attr == "executescript" and node.args
-                      and isinstance(node.args[0], ast.Constant)
-                      and "CREATE TABLE IF NOT EXISTS cross_chat_envelopes" in str(node.args[0].value))
         self.connection = sqlite3.connect(":memory:")
         self.connection.row_factory = sqlite3.Row
         self.addCleanup(self.connection.close)
-        self.connection.executescript(schema)
+        temporary = tempfile.TemporaryDirectory(prefix="async-route-schema-")
+        self.addCleanup(temporary.cleanup)
         methods = ast.ClassDef(name="Ledger", bases=[], keywords=[], decorator_list=[], body=[
             deepcopy(node) for node in ledger.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name in {"create_instruction", "get", "_row"}
+            and node.name in {"initialize", "create_instruction", "get", "_row"}
         ])
         self.ns.update({"time": time, "now_iso": lambda: "2026-09-10T00:00:00Z",
+                        "chat_mailbox": chat_mailbox, "PROVIDER_CROSS_CHAT_LEGACY_RATE_RETENTION_SECONDS": 86400,
                         "validated_cross_chat_source_user_instruction": lambda value: value})
         exec(compile(ast.fix_missing_locations(ast.Module(body=[
             ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), methods,
         ], type_ignores=[])), "<isolated-async-ledger>", "exec"), self.ns)
         self.ledger = self.ns["Ledger"]()
+        self.ledger.path = Path(temporary.name) / "memory-ledger.sqlite3"
         self.ledger._transaction = lambda: self.connection
         self.ledger._call = self.call_operation
-        self.ledger._initialized = True
+        await self.ledger.initialize()
         self.ledger.create_route_exchange_request = AsyncMock(side_effect=AssertionError("exchange created"))
         self.ns["CROSS_CHAT"] = self.ledger
 
@@ -273,15 +274,10 @@ class AsyncRouteAcceptanceTests(unittest.IsolatedAsyncioTestCase):
     async def lock(self, *_args):
         yield
 
-    async def deliver(self, record):
-        self.connection.execute("UPDATE cross_chat_envelopes SET status='queued' WHERE id=?", (record["id"],))
-        self.connection.commit()
-        return {**record, "status": "queued"}
-
     def request(self, key="message-key-one", **extra):
         return SimpleNamespace(mode="async_route_v1", action="instruction", artifact_grants=[],
                                body="Prepared message", idempotency_key=key, wait_for_response=False,
-                               response_timeout_seconds=None, **extra)
+                               response_timeout_seconds=None, **{"reply_to_message_id": None, **extra})
 
     async def send(self, key="message-key-one", body="Prepared message"):
         request = self.request(key)
@@ -294,10 +290,12 @@ class AsyncRouteAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len({receipt["message_id"] for receipt in receipts}), 6)
         self.assertEqual(self.capability, before)
         self.assertTrue(all(receipt["mode"] == "async_route_v1" for receipt in receipts))
+        self.assertTrue(all(receipt["delivery_mode"] == "mailbox" and receipt["execution_started"] is False for receipt in receipts))
         self.ledger.create_route_exchange_request.assert_not_awaited()
         self.ns["reserve_provider_route_handoff"].assert_not_awaited()
+        self.ns["submit_cross_chat_delivery"].assert_not_awaited()
 
-    async def test_same_key_replay_is_single_sqlite_effect_and_single_queue_admission(self):
+    async def test_same_key_replay_is_single_mailbox_effect_and_zero_execution(self):
         first = await self.send()
         rate_records_before_replay = self.connection.execute(
             "SELECT COUNT(*) FROM cross_chat_route_rate_events").fetchone()[0]
@@ -305,12 +303,14 @@ class AsyncRouteAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["message_id"], duplicate["message_id"])
         self.assertFalse(first["duplicate"])
         self.assertTrue(duplicate["duplicate"])
-        self.ns["submit_cross_chat_delivery"].assert_awaited_once()
+        self.ns["submit_cross_chat_delivery"].assert_not_awaited()
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM chat_mailbox_messages").fetchone()[0], 1)
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM cross_chat_route_rate_events").fetchone()[0],
                          rate_records_before_replay)
         record = await self.ledger.get(first["message_id"])
         self.assertEqual(record["authorization_pair_id"], PAIR)
         self.assertEqual(record["source_user_instruction"], "")
+        self.assertEqual((record["status"], record["queued_id"], record["target_run_id"]), ("stored", None, None))
 
     async def test_same_key_changed_body_or_pair_cannot_rebind_message(self):
         await self.send()
@@ -344,8 +344,9 @@ class AsyncRouteAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         duplicate = await self.send("message-key-0")
         self.assertTrue(duplicate["duplicate"])
         self.assertEqual(duplicate["message_id"], receipts[0]["message_id"])
-        self.assertEqual(self.ns["submit_cross_chat_delivery"].await_count, 40)
+        self.ns["submit_cross_chat_delivery"].assert_not_awaited()
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM cross_chat_envelopes").fetchone()[0], 40)
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM chat_mailbox_messages").fetchone()[0], 40)
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM cross_chat_route_rate_events").fetchone()[0], 0)
 
         self.ns["live_provider_cross_chat_route"].side_effect = None
@@ -354,27 +355,32 @@ class AsyncRouteAcceptanceTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(HTTPException) as rejected:
                 await self.send(key)
             self.assertEqual(rejected.exception.status_code, 403)
-        self.assertEqual(self.ns["submit_cross_chat_delivery"].await_count, 40)
+        self.ns["submit_cross_chat_delivery"].assert_not_awaited()
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM cross_chat_envelopes").fetchone()[0], 40)
 
-    async def test_http_cancellation_joins_one_durable_send(self):
+    async def test_http_cancellation_before_commit_joins_one_durable_mailbox_send(self):
         entered, release = asyncio.Event(), asyncio.Event()
-        original = self.deliver
+        original = self.ledger.create_instruction
 
-        async def delayed(record):
+        async def delayed(**kwargs):
             entered.set()
             await release.wait()
-            return await original(record)
+            return await original(**kwargs)
 
-        self.ns["submit_cross_chat_delivery"].side_effect = delayed
+        self.ledger.create_instruction = AsyncMock(side_effect=delayed)
         task = asyncio.create_task(self.send())
-        await entered.wait()
-        task.cancel()
-        release.set()
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM cross_chat_envelopes").fetchone()[0], 0)
+            task.cancel()
+        finally:
+            release.set()
         with self.assertRaises(asyncio.CancelledError):
-            await task
+            await asyncio.wait_for(task, timeout=1)
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM chat_mailbox_messages").fetchone()[0], 1)
         self.assertTrue((await self.send())["duplicate"])
-        self.ns["submit_cross_chat_delivery"].assert_awaited_once()
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM chat_mailbox_messages").fetchone()[0], 1)
+        self.ns["submit_cross_chat_delivery"].assert_not_awaited()
 
     async def test_cancelled_message_retry_does_not_restart_delivery(self):
         receipt = await self.send()
@@ -382,7 +388,7 @@ class AsyncRouteAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         self.connection.commit()
         with self.assertRaises(HTTPException):
             await self.send()
-        self.ns["submit_cross_chat_delivery"].assert_awaited_once()
+        self.ns["submit_cross_chat_delivery"].assert_not_awaited()
 
     async def test_successful_empty_final_only_completes_message_and_never_sends_reply(self):
         record = envelope(status="running")
@@ -403,7 +409,8 @@ class AsyncRouteHelperTests(unittest.TestCase):
             "routes": [{"route_id": ROUTE, "mode": "async_route_v1", "available": True}],
         }))
         self.receipt = {"ok": True, "route_id": ROUTE, "action": "instruction", "accepted": True,
-                        "mode": "async_route_v1", "message_id": MESSAGE, "duplicate": False}
+                        "mode": "async_route_v1", "message_id": MESSAGE, "duplicate": False,
+                        "delivery_mode": "mailbox", "state": "unread", "execution_started": False}
         self.post = self.enterContext(patch.object(cli, "post_json", return_value=self.receipt))
         self.wait = self.enterContext(patch.object(cli, "await_live_response", side_effect=AssertionError("async send waited")))
 

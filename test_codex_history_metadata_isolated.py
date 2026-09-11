@@ -86,7 +86,8 @@ class CodexHistoryMetadataTests(unittest.IsolatedAsyncioTestCase):
         user = source_user("A genuine quote", kinds=("user.text",))
         user.update(timestamp=STAMP)
         user["payload"]["phase"] = "commentary"
-        self.assertEqual(self.parse([user]), [{"kind": "user", "text": "A genuine quote", "provider_user_authored": True, "ts": STAMP}])
+        self.assertEqual(self.parse([user]), [{"kind": "user", "text": "A genuine quote", "provider_user_authored": True, "ts": STAMP,
+            "provider_origin": self.ns["codex_public_item_origin"](user)}])
         self.assertEqual(self.parse([{"type": "response_item", "timestamp": STAMP, "payload": {
             "type": "reasoning", "phase": "commentary", "summary": [{"text": "private"}],
         }}]), [])
@@ -194,7 +195,8 @@ class CodexHistoryMetadataTests(unittest.IsolatedAsyncioTestCase):
         richer = source_user("Real request", kinds=("user.text",))
         richer["timestamp"] = STAMP
         items = self.parse([missing, richer])
-        self.assertEqual(items, [{"kind": "user", "text": "Real request", "provider_user_authored": True, "ts": STAMP}])
+        self.assertEqual(items, [{"kind": "user", "text": "Real request", "provider_user_authored": True, "ts": STAMP,
+            "provider_origin": self.ns["codex_public_item_origin"](richer)}])
         self.ns["append_imported_events"] = AsyncMock(side_effect=lambda chat, batch: len(batch))
         await self.ns["append_staged_imported_history"](
             {"id": "chat", "backend": "codex", "codex_thread_id": "thread"}, Path("unused"), self.parse([missing, assistant()]),

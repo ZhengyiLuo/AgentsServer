@@ -31,6 +31,7 @@ MAX_RECORDS = 100_000
 MAX_KEYS = 20_000
 MAX_TARGETS = 4_000
 MAX_SESSIONS = 24
+MAX_WINDOWS = 48
 _DIGEST = re.compile(r"[a-f0-9]{64}\Z")
 _PAIR = re.compile(r"pair_[a-f0-9]{32}\Z")
 _ASYNC_WRAPPER = re.compile(
@@ -790,7 +791,8 @@ def _bounded_records(path: Path, expected, start: int, end: int):
 
 
 def _prove_recent_scheduled(session_id: str, provider_id: str, events: Path, root: Path,
-                            normalize_user, events_stamp, normalize_full_user) -> _Proof:
+                            normalize_user, events_stamp, normalize_full_user, *,
+                            event_window_end: int | None = None) -> _Proof:
     """Exact-origin scheduled duplicates and provider metadata in recent history.
 
     An oversized transcript cannot establish global metadata/interruption proof.
@@ -803,13 +805,16 @@ def _prove_recent_scheduled(session_id: str, provider_id: str, events: Path, roo
     empty = _Proof(provider_id, events_stamp, None, None, frozenset())
     if normalize_full_user is None or not events_stamp[2]:
         return empty
+    window_end = events_stamp[2] if event_window_end is None else event_window_end
+    if type(window_end) is not int or not 0 < window_end <= events_stamp[2]:
+        raise _Unproven()
     starts, ends, batches, terminals, rows, candidates = {}, {}, {}, {}, {}, []
     origin_counts = {}
     assistant_replays = _AssistantReplays(provider_id)
     async_inputs = _AsyncDeliveryInputs(provider_id, assistant_replays, normalize_user, normalize_full_user)
     previous_seq = 0
     for event, _offset in _bounded_records(
-        events, events_stamp, max(0, events_stamp[2] - MAX_EVENTS_BYTES), events_stamp[2],
+        events, events_stamp, max(0, window_end - MAX_EVENTS_BYTES), window_end,
     ):
         seq = event.get("seq")
         if type(seq) is not int or seq <= previous_seq:
@@ -967,6 +972,52 @@ def _prove_recent_scheduled(session_id: str, provider_id: str, events: Path, roo
                   companions=frozenset(companions), assistant_replays=proven_assistants)
 
 
+@dataclass(frozen=True)
+class ClaudeMetadataRepairWindow:
+    """Immutable page-owned proof; lookups never read files or change the main index."""
+
+    session_id: str
+    _proof: _Proof = field(repr=False)
+
+    def is_hidden(self, event: dict) -> bool:
+        if event.get("session_id") not in (None, "", self.session_id):
+            return False
+        try:
+            return _target(event) in self._proof.targets
+        except (ValueError, TypeError):
+            return False
+
+    def project_event(self, event: dict) -> dict | None:
+        return _project_proof_event(self.session_id, event, self._proof)
+
+
+def _project_proof_event(session_id: str, event: dict, proof: _Proof | None) -> dict | None:
+    if proof is None or event.get("session_id") not in (None, "", session_id):
+        return None
+    if proof.assistant_replays and _assistant_target(event) in proof.assistant_replays:
+        return {**event, "text": "", "metadata_only": True,
+                "provider_history_repair": "source_proven_assistant_replay"}
+    kind, seq, run = event.get("type"), event.get("seq"), event.get("run_id")
+    if (kind in ("history_imported", "turn_finished") and type(seq) is int
+            and isinstance(run, str) and event.get("backend") == "claude"
+            and (kind == "history_imported" or event.get("imported") is True)
+            and (kind, seq, run) in proof.companions
+            and event.get("provider_session_id") in (None, "", proof.provider_id)):
+        return {**event, "imported": True, "metadata_only": True}
+    try:
+        encoded_origin = proof.interruption_index.get(_target(event))
+    except (ValueError, TypeError):
+        return None
+    if encoded_origin is None:
+        return None
+    origin = json.loads(encoded_origin)
+    projected = dict(event)
+    for key in ("prompt", "text", "_agentsdock_imported_prompt_hidden"):
+        projected.pop(key, None)
+    return {**projected, "type": "provider_interruption", "imported": True,
+            "ts": origin["timestamp"], "provider_origin": origin}
+
+
 class ClaudeMetadataRepairCache:
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -974,8 +1025,72 @@ class ClaudeMetadataRepairCache:
         # (which can execute on the event loop) behind any filesystem work.
         self._prepare_lock = threading.Lock()
         self._proofs: OrderedDict[str, _Proof] = OrderedDict()
+        self._windows: OrderedDict[tuple, ClaudeMetadataRepairWindow] = OrderedDict()
         self._preparing_session: str | None = None
         self._preparation_cancelled = False
+
+    def prepare_window(self, session_id: str, provider_id: str, events: Path, root: Path,
+                       normalize_user: Callable[[dict], str | None], *, event_window_end: int,
+                       normalize_full_user: Callable[[dict], str | None] | None = None) -> ClaudeMetadataRepairWindow:
+        """Prove one explicitly requested historical page, never the entire ledger.
+
+        Unchanged positive and negative windows are cached. Any observed log
+        change, including append growth, requires fresh bounded proof; inode
+        equality alone cannot certify that an old prefix was not rewritten.
+        This cache never contributes to the global timeline-index signature.
+        """
+        try:
+            stamp = _regular_stamp(events)
+        except (OSError, ValueError):
+            stamp = (0, 0, 0, 0)
+        empty = ClaudeMetadataRepairWindow(session_id, _Proof(provider_id, stamp, None, None, frozenset()))
+        if type(event_window_end) is not int or not 0 < event_window_end <= stamp[2]:
+            return empty
+        key = (session_id, provider_id, str(events.absolute()), str(root.absolute()), stamp,
+               max(0, event_window_end - MAX_EVENTS_BYTES), event_window_end)
+
+        def cached_window() -> ClaudeMetadataRepairWindow | None:
+            with self._lock:
+                cached = self._windows.get(key)
+            if cached is not None and cached._proof.source is not None:
+                try:
+                    if _regular_stamp(cached._proof.source) != cached._proof.source_stamp:
+                        return None
+                except (OSError, ValueError):
+                    return None
+            with self._lock:
+                if cached is not None and self._windows.get(key) is cached:
+                    self._windows.move_to_end(key)
+                    return cached
+            return None
+
+        cached = cached_window()
+        if cached is not None:
+            return cached
+        with self._prepare_lock:
+            cached = cached_window()
+            if cached is not None:
+                return cached
+            with self._lock:
+                self._preparing_session = session_id
+                self._preparation_cancelled = False
+            try:
+                proof = _prove_recent_scheduled(session_id, provider_id, events, root,
+                                                normalize_user, stamp, normalize_full_user,
+                                                event_window_end=event_window_end)
+                window = ClaudeMetadataRepairWindow(session_id, proof)
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+                window = empty
+            with self._lock:
+                cancelled = self._preparation_cancelled
+                self._preparing_session = None
+                if cancelled:
+                    return empty
+                self._windows[key] = window
+                self._windows.move_to_end(key)
+                while len(self._windows) > MAX_WINDOWS:
+                    self._windows.popitem(last=False)
+            return window
 
     def prepare(self, session_id: str, provider_id: str, events: Path, root: Path,
                 normalize_user: Callable[[dict], str | None], *,
@@ -1077,6 +1192,9 @@ class ClaudeMetadataRepairCache:
     def forget(self, session_id: str) -> None:
         with self._lock:
             self._proofs.pop(session_id, None)
+            for key in tuple(self._windows):
+                if key[0] == session_id:
+                    self._windows.pop(key, None)
             if self._preparing_session == session_id:
                 self._preparation_cancelled = True
 
@@ -1121,22 +1239,6 @@ class ClaudeMetadataRepairCache:
 
     def project_event(self, session_id: str, event: dict) -> dict | None:
         """Memory-only correction of exact source-proven historical records."""
-        if event.get("session_id") in (None, "", session_id):
-            with self._lock:
-                proof = self._proofs.get(session_id)
-            if proof and proof.assistant_replays and _assistant_target(event) in proof.assistant_replays:
-                return {**event, "text": "", "metadata_only": True,
-                        "provider_history_repair": "source_proven_assistant_replay"}
-        kind, seq, run = event.get("type"), event.get("seq"), event.get("run_id")
-        if (
-            kind in ("history_imported", "turn_finished") and type(seq) is int
-            and isinstance(run, str) and event.get("backend") == "claude"
-            and event.get("session_id") in (None, "", session_id)
-            and (kind == "history_imported" or event.get("imported") is True)
-        ):
-            with self._lock:
-                proof = self._proofs.get(session_id)
-            if (proof and (kind, seq, run) in proof.companions
-                    and event.get("provider_session_id") in (None, "", proof.provider_id)):
-                return {**event, "imported": True, "metadata_only": True}
-        return self.project_interruption(session_id, event)
+        with self._lock:
+            proof = self._proofs.get(session_id)
+        return _project_proof_event(session_id, event, proof)

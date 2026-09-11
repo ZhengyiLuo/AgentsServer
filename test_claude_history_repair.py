@@ -35,6 +35,7 @@ def load_server_repair(cache):
     namespace = load_projection()
     namespace.update({
         "CLAUDE_METADATA_REPAIR_CACHE": cache,
+        "CODEX_NATIVE_HISTORY_REPAIR_CACHE": SimpleNamespace(project_event=lambda *_: None),
         "TIMELINE_IMPORTED_PROMPT_HIDDEN_FIELD": "_agentsdock_imported_prompt_hidden",
         "strip_all_legacy_agentsdock_provider_authority_suffixes": lambda text, **kwargs: text,
         "HISTORY_SEARCH_REPAIR_DIRTY": set(),

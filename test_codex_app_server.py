@@ -138,6 +138,94 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
             **kwargs,
         )
 
+    async def test_guarded_notice_is_connected_only_and_preserves_active_turn(self) -> None:
+        factory = FakeProcessFactory()
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+        items = [{"type": "message", "role": "developer", "content": [
+            {"type": "input_text", "text": "Pending replies are available in the inbox."}]}]
+        with self.assertRaises(CodexAppServerProtocolError) as raised:
+            await client.inject_items_guarded("thread", items, expected_generation=1, before_send=lambda: True)
+        self.assertFalse(raised.exception.request_sent)
+        self.assertEqual(factory.calls, [])
+        factory.process.responders.update({
+            "thread/start": lambda _: {"thread": {"id": "thread"}},
+            "turn/start": lambda _: {"turn": {"id": "turn"}},
+            "thread/inject_items": lambda _: {},
+        })
+        await client.start_thread({})
+        turn = await client.start_turn("thread", [{"type": "text", "text": "Continue work"}])
+        count = len(factory.process.messages)
+        await client.inject_items_guarded("thread", items,
+            expected_generation=client.generation, before_send=lambda: True)
+        self.assertEqual([message["method"] for message in factory.process.messages[count:]], ["thread/inject_items"])
+        self.assertEqual(factory.process.messages[-1]["params"], {"threadId": "thread", "items": items})
+        self.assertIs(client.active_turn("thread"), turn)
+        self.assertFalse(turn._subscription._closed)
+
+    async def test_guarded_notice_rechecks_owner_generation_and_load_under_writer_lock(self) -> None:
+        for change in ("owner", "generation", "loaded"):
+            with self.subTest(change=change):
+                factory = FakeProcessFactory()
+                client = self.make_client(factory)
+                self.addAsyncCleanup(client.close)
+                await client.start()
+                client._loaded_threads.add("thread")
+                owner = True
+                await client._write_lock.acquire()
+                pending = asyncio.create_task(client.inject_items_guarded("thread", [{
+                    "type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Pending replies."}],
+                }], expected_generation=client.generation, before_send=lambda: owner))
+                await wait_until(lambda: bool(client._pending))
+                if change == "owner":
+                    owner = False
+                elif change == "generation":
+                    client._generation += 1
+                else:
+                    client._loaded_threads.clear()
+                client._write_lock.release()
+                with self.assertRaises(CodexAppServerProtocolError) as raised:
+                    await pending
+                self.assertFalse(raised.exception.request_sent)
+                self.assertFalse(any(message.get("method") == "thread/inject_items" for message in factory.process.messages))
+                self.assertTrue(client.ready)
+
+    async def test_guarded_notice_unknown_ack_and_drain_timeout_never_retire_or_retry(self) -> None:
+        for outcome in ("no_ack", "drain", "invalid_ack"):
+            with self.subTest(outcome=outcome):
+                factory = FakeProcessFactory()
+                client = self.make_client(factory)
+                self.addAsyncCleanup(client.close)
+                await client.start()
+                client._loaded_threads.add("thread")
+                if outcome == "drain":
+                    async def blocked_drain() -> None:
+                        await asyncio.Event().wait()
+                    factory.process.stdin.drain = blocked_drain
+                elif outcome == "invalid_ack":
+                    factory.process.responders["thread/inject_items"] = lambda _: None
+                with self.assertRaises((CodexAppServerTimeout, CodexAppServerProtocolError)) as raised:
+                    await client.inject_items_guarded("thread", [{
+                        "type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Pending replies."}],
+                    }], expected_generation=client.generation, before_send=lambda: True, timeout=0.01)
+                self.assertTrue(raised.exception.request_sent)
+                self.assertFalse(raised.exception.safe_to_retry)
+                self.assertTrue(client.ready)
+                self.assertIs(client.process, factory.process)
+                self.assertIsNone(factory.process.returncode)
+                self.assertEqual(sum(message.get("method") == "thread/inject_items" for message in factory.process.messages), 1)
+
+    async def test_guarded_notice_rejects_user_input_and_oversized_context(self) -> None:
+        factory = FakeProcessFactory()
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+        for role, text in (("user", "hello"), ("developer", "x" * 2049)):
+            with self.assertRaises(ValueError):
+                await client.inject_items_guarded("thread", [{"type": "message", "role": role,
+                    "content": [{"type": "input_text", "text": text}]}],
+                    expected_generation=1, before_send=lambda: True)
+        self.assertEqual(factory.calls, [])
+
     async def test_async_notification_handler_preserves_wire_order(self) -> None:
         factory = FakeProcessFactory()
         client = self.make_client(factory)

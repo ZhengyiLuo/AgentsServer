@@ -13,6 +13,96 @@ import agentsdock_chats
 
 
 class AgentsDockChatsCLITests(unittest.TestCase):
+    def test_inbox_lists_one_page_without_claim_or_send(self) -> None:
+        args = agentsdock_chats.parser().parse_args(["inbox", "--cursor", "synthetic-previous-sender"])
+        page = {"senders": [{"source_session_id": "synthetic-sender", "pending_count": 2}], "next_cursor": None}
+        with patch.object(agentsdock_chats, "authority", return_value="capability"), \
+                patch.object(agentsdock_chats, "get_json", return_value=page) as get, \
+                patch.object(agentsdock_chats, "post_json") as post:
+            self.assertEqual(args.handler(args), page)
+        get.assert_called_once_with("/api/agent/cross-chat/inbox?cursor=synthetic-previous-sender", "capability")
+        post.assert_not_called()
+
+    def test_read_sends_exact_stable_receipt_and_preserves_returned_messages(self) -> None:
+        args = agentsdock_chats.parser().parse_args([
+            "read", "--sender", "synthetic-sender", "--request-id", "stable-read-request", "--cursor", "42",
+        ])
+        response = {"messages": [{"message_id": "synthetic-message", "body": "Exact received body"}],
+                    "return_route": {"route_id": "synthetic-route"}, "next_cursor": None}
+        with patch.object(agentsdock_chats, "authority", return_value="capability"), \
+                patch.object(agentsdock_chats, "post_json", return_value=response) as post, \
+                patch.object(agentsdock_chats, "get_json") as get:
+            self.assertEqual(args.handler(args), response)
+            self.assertEqual(args.handler(args), response)
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(post.call_args_list[0], post.call_args_list[1])
+        self.assertEqual(post.call_args.args, ("/api/agent/cross-chat/inbox/read", {
+            "source_session_id": "synthetic-sender", "request_id": "stable-read-request", "after_seq": 42, "limit": 25,
+        }, "capability"))
+        get.assert_not_called()
+
+    def test_inbox_read_parser_and_identity_bounds(self) -> None:
+        from contextlib import redirect_stderr
+        for arguments in (["read", "--sender", "synthetic"],
+                          ["read", "--sender", "synthetic", "--request-id", "stable-request", "--cursor", "-1"],
+                          ["read", "--sender", "synthetic", "--request-id", "stable-request", "--limit", "26"]):
+            with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                agentsdock_chats.parser().parse_args(arguments)
+        for sender, request_id in (("", "stable-request"), ("x" * 129, "stable-request"), ("synthetic", "short")):
+            args = argparse.Namespace(sender=sender, request_id=request_id, cursor=0, limit=25, authority_file=None)
+            with patch.object(agentsdock_chats, "authority") as auth, self.assertRaises(agentsdock_chats.ChatsCLIError):
+                agentsdock_chats.read_inbox(args)
+            auth.assert_not_called()
+
+    def test_async_reply_parent_is_explicit_and_part_of_default_idempotency(self) -> None:
+        route = "route_" + "a" * 32
+        parents = ["handoff_" + "b" * 32, "handoff_" + "c" * 32]
+        receipt = {"ok": True, "route_id": route, "action": "instruction", "accepted": True,
+                   "mode": "async_route_v1", "message_id": "handoff_" + "d" * 32, "duplicate": False}
+        for verb in ("send", "ask"):
+            with self.subTest(verb=verb), \
+                    patch.object(agentsdock_chats, "authority", return_value="capability"), \
+                    patch.object(agentsdock_chats, "get_json", return_value={"routes": [
+                        {"route_id": route, "mode": "async_route_v1", "available": True}]}) as get, \
+                    patch.object(agentsdock_chats, "post_json", return_value=receipt) as post:
+                for parent in [parents[0], parents[1], parents[0]]:
+                    args = agentsdock_chats.parser().parse_args([verb, "--route", route, "--message", "Same response", "--reply-to", parent])
+                    self.assertEqual(args.handler(args), receipt)
+                payloads = [call.args[1] for call in post.call_args_list]
+                self.assertEqual([payload["reply_to_message_id"] for payload in payloads], [parents[0], parents[1], parents[0]])
+                self.assertNotEqual(payloads[0]["idempotency_key"], payloads[1]["idempotency_key"])
+                self.assertEqual(payloads[0]["idempotency_key"], payloads[2]["idempotency_key"])
+                self.assertTrue(all("wait_for_response" not in payload for payload in payloads))
+                self.assertEqual(get.call_count, 3)
+
+    def test_reply_parent_rejects_legacy_before_post(self) -> None:
+        route = "route_" + "a" * 32
+        args = agentsdock_chats.parser().parse_args(["send", "--route", route, "--message", "Reply",
+                                                    "--reply-to", "handoff_" + "b" * 32])
+        with patch.object(agentsdock_chats, "authority", return_value="capability"), \
+                patch.object(agentsdock_chats, "get_json", return_value={"routes": [{"route_id": route, "available": True}]}), \
+                patch.object(agentsdock_chats, "post_json") as post, self.assertRaisesRegex(agentsdock_chats.ChatsCLIError, "legacy"):
+            args.handler(args)
+        post.assert_not_called()
+
+    def test_async_mailbox_receipt_is_additive_and_never_claims_execution_started(self) -> None:
+        route = "route_" + "a" * 32
+        base = {"ok": True, "route_id": route, "action": "instruction", "accepted": True,
+                "mode": "async_route_v1", "message_id": "handoff_" + "b" * 32, "duplicate": False}
+        args = agentsdock_chats.parser().parse_args(["send", "--route", route, "--message", "Hello", "--mode", "async_route_v1"])
+        mailbox = {**base, "delivery_mode": "mailbox", "state": "unread", "execution_started": False}
+        with patch.object(agentsdock_chats, "authority", return_value="capability"), \
+                patch.object(agentsdock_chats, "get_json", return_value={"routes": [
+                    {"route_id": route, "available": True, "mode": "async_route_v1"}]}):
+            for receipt in (base, mailbox, *[{**mailbox, "state": state, "duplicate": True}
+                                           for state in ("read", "cancelled", "deleted")]):
+                with patch.object(agentsdock_chats, "post_json", return_value=receipt):
+                    self.assertEqual(args.handler(args), receipt)
+            for receipt in ({**mailbox, "execution_started": True}, {**base, "delivery_mode": "mailbox"},
+                            {**mailbox, "state": "running"}):
+                with patch.object(agentsdock_chats, "post_json", return_value=receipt), self.assertRaises(agentsdock_chats.ChatsCLIError):
+                    args.handler(args)
+
     def test_helper_uses_only_the_canonical_provider_capability_header(self) -> None:
         self.assertEqual(
             agentsdock_chats.provider_headers("live-capability"),

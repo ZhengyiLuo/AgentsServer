@@ -398,6 +398,112 @@ def _connection_background_hook(options: Any) -> tuple[Any, _BackgroundReconcili
     return cloned, installed
 
 
+class _PendingMailHintHook:
+    """Quiet, connection-owned context only after an observed root tool call."""
+
+    def __init__(self) -> None:
+        self.pending: tuple[Any, Callable[[], str | None], Callable[[], bool]] | None = None
+        self.provider_id: str | None = None
+        self.tools: OrderedDict[str, str] = OrderedDict()
+
+    def bind(self, handle: Any, callback: Callable[[], str | None],
+             provider_id: str | None, owns_query: Callable[[], bool]) -> None:
+        self.retire()
+        self.pending = (handle, callback, owns_query)
+        self.provider_id = provider_id
+
+    def retire(self) -> None:
+        self.pending = None
+        self.provider_id = None
+        self.tools.clear()
+
+    def observe(self, message: Any) -> None:
+        if self.pending is None or _message_field(message, "parent_tool_use_id"):
+            return
+        if _message_type(message) not in {"assistant", "assistantmessage"}:
+            return
+        provider_id = _receipt_field(_message_field(message, "session_id"))
+        if provider_id is not None:
+            if self.provider_id is not None and provider_id != self.provider_id:
+                return
+            self.provider_id = provider_id
+        blocks = _message_field(message, "content")
+        if blocks is None:
+            blocks = _message_field(_message_field(message, "message", {}), "content")
+        if not isinstance(blocks, list):
+            return
+        for block in blocks[:128]:
+            kind = _message_field(block, "type")
+            if kind != "tool_use" and type(block).__name__ != "ToolUseBlock":
+                continue
+            tool_id = _receipt_field(_message_field(block, "id"))
+            tool_name = _receipt_field(_message_field(block, "name"))
+            if tool_id is not None and tool_name is not None:
+                self.tools[tool_id] = tool_name
+                while len(self.tools) > 128:
+                    self.tools.popitem(last=False)
+
+    async def __call__(self, hook_input: dict[str, Any], tool_use_id: str | None,
+                       _context: dict[str, Any]) -> dict[str, Any]:
+        pending = self.pending
+        if pending is None or not isinstance(hook_input, dict):
+            return {}
+        handle, callback, owns_query = pending
+        kind = hook_input.get("hook_event_name")
+        exact_tool = _receipt_field(hook_input.get("tool_use_id"))
+        if (kind not in {"PostToolUse", "PostToolUseFailure"} or handle.done or not handle.acknowledged
+                or handle._background_reconciliation_aborted or not owns_query()
+                or hook_input.get("agent_id") or hook_input.get("parent_tool_use_id")
+                or hook_input.get("is_interrupt") is True or self.provider_id is None
+                or hook_input.get("session_id") != self.provider_id or exact_tool is None
+                or (tool_use_id is not None and tool_use_id != exact_tool)
+                or self.tools.get(exact_tool) != hook_input.get("tool_name")):
+            return {}
+        # One checkpoint has one chance. No retry on duplicate callbacks or
+        # unknown downstream acknowledgement; caller owns pending fingerprints.
+        self.tools.pop(exact_tool, None)
+        try:
+            text = callback()
+        except Exception:
+            return {}
+        if (not isinstance(text, str) or not text.strip()
+                or len(text.encode("utf-8", "surrogatepass")) > 2048):
+            return {}
+        # Deliberately no await between the owner fence, generated notice,
+        # and return. Never copy peer bodies, tool inputs/outputs, or authority.
+        return {"hookSpecificOutput": {"hookEventName": kind, "additionalContext": text}}
+
+
+def _connection_mail_hint_hook(options: Any) -> tuple[Any, _PendingMailHintHook | None]:
+    hooks = options.get("hooks") if isinstance(options, dict) else getattr(options, "hooks", None)
+    if not isinstance(hooks, dict):
+        return options, None
+    installed = None
+    cloned_hooks = dict(hooks)
+    for event in ("PostToolUse", "PostToolUseFailure"):
+        matchers = []
+        for matcher in hooks.get(event, []):
+            callbacks = []
+            for callback in getattr(matcher, "hooks", []):
+                if isinstance(callback, _PendingMailHintHook):
+                    if installed is None:
+                        installed = _PendingMailHintHook()
+                    callbacks.append(installed)
+                else:
+                    callbacks.append(callback)
+            matchers.append(ClaudeSDKHookMatcher(getattr(matcher, "matcher", None), callbacks,
+                                                getattr(matcher, "timeout", None)))
+        cloned_hooks[event] = matchers
+    if installed is None:
+        return options, None
+    cloned = copy.copy(options)
+    if isinstance(cloned, dict):
+        cloned["hooks"] = cloned_hooks
+    else:
+        cloned.hooks = cloned_hooks
+    return cloned, installed
+
+
 def _task_lifecycle_fields(message: Any) -> tuple[str, str, str, str]:
     """Return the bounded task fields needed to identify a run boundary.
 
@@ -828,7 +934,10 @@ async def reject_subagent_provider_tool_hook(
 def claude_background_tracking_hooks() -> dict[str, list[ClaudeSDKHookMatcher]]:
     """Return SDK hooks for shell detachment and non-durable schedulers."""
 
+    mail_hint = _PendingMailHintHook()
     return {
+        "PostToolUse": [ClaudeSDKHookMatcher(matcher=None, hooks=[mail_hint], timeout=5.0)],
+        "PostToolUseFailure": [ClaudeSDKHookMatcher(matcher=None, hooks=[mail_hint], timeout=5.0)],
         "UserPromptSubmit": [ClaudeSDKHookMatcher(
             matcher=None, hooks=[_BackgroundReconciliationHook()], timeout=5.0,
         )],
@@ -1115,6 +1224,7 @@ class _StartRun:
     on_supervisor_ready: SupervisorReadyCallback | None
     response: asyncio.Future[ClaudeSDKRunHandle]
     background_task_reconciliation: dict[str, Any] | None = None
+    pending_mail_hint: Callable[[], str | None] | None = None
 
 
 @dataclass
@@ -1227,6 +1337,7 @@ class ClaudeSDKSupervisor:
         self._active_run: ClaudeSDKRunHandle | None = None
         self._inflight_tasks: set[str] = set()
         self._background_reconciliation_hook: _BackgroundReconciliationHook | None = None
+        self._pending_mail_hint_hook: _PendingMailHintHook | None = None
         self._generation = 0
         self._closed = False
         self._connected = False
@@ -1319,6 +1430,7 @@ class ClaudeSDKSupervisor:
         expected_provider_command_generation: str | None = None,
         on_supervisor_ready: SupervisorReadyCallback | None = None,
         background_task_reconciliation: dict[str, Any] | None = None,
+        pending_mail_hint: Callable[[], str | None] | None = None,
     ) -> ClaudeSDKRunHandle:
         """Submit one prompt and return after the SDK accepts ``query()``."""
 
@@ -1349,6 +1461,7 @@ class ClaudeSDKSupervisor:
                 on_supervisor_ready=on_supervisor_ready,
                 response=response,
                 background_task_reconciliation=_normalized_task_reconciliation(background_task_reconciliation),
+                pending_mail_hint=pending_mail_hint,
             )
         )
         return await asyncio.shield(response)
@@ -1596,6 +1709,7 @@ class ClaudeSDKSupervisor:
         try:
             client_options, background_hook = _connection_background_hook(self.options)
             self._background_reconciliation_hook = background_hook
+            client_options, self._pending_mail_hint_hook = _connection_mail_hint_hook(client_options)
             candidate = self._client_factory(client_options)
             client = await candidate if inspect.isawaitable(candidate) else candidate
             self._connecting_client = client
@@ -1677,6 +1791,9 @@ class ClaudeSDKSupervisor:
 
     async def _disconnect_current_client(self) -> None:
         self._cancel_ack_timeout()
+        if self._pending_mail_hint_hook is not None:
+            self._pending_mail_hint_hook.retire()
+            self._pending_mail_hint_hook = None
         if self._background_reconciliation_hook is not None:
             self._background_reconciliation_hook.retire()
             self._background_reconciliation_hook = None
@@ -1699,6 +1816,8 @@ class ClaudeSDKSupervisor:
         self._inflight_tasks.clear()
         if self._background_reconciliation_hook is not None:
             self._background_reconciliation_hook.retire()
+        if self._pending_mail_hint_hook is not None:
+            self._pending_mail_hint_hook.retire()
         if active is not None:
             active._fail(error)
 
@@ -1863,6 +1982,19 @@ class ClaudeSDKSupervisor:
             command.run_id,
         )
         background_hook = self._background_reconciliation_hook
+        mail_hook = self._pending_mail_hint_hook
+        if mail_hook is not None:
+            mail_hook.retire()
+            if callable(command.pending_mail_hint):
+                provider_id = command.query_session_id
+                if provider_id is None or provider_id == "default":
+                    provider_id = self.options.get("resume") if isinstance(self.options, dict) else getattr(self.options, "resume", None)
+                generation = self._generation
+                mail_hook.bind(
+                    handle, command.pending_mail_hint, _receipt_field(provider_id),
+                    lambda: self._active_run is handle and not self._closed and self._client is client
+                    and self._generation == generation and self._pending_mail_hint_hook is mail_hook,
+                )
         if background_hook is not None and command.background_task_reconciliation is not None:
             provider_id = command.query_session_id
             if provider_id is None or provider_id == "default":
@@ -2385,6 +2517,8 @@ class ClaudeSDKSupervisor:
             return
 
         active._observe_reconciliation_progress(command.message)
+        if self._pending_mail_hint_hook is not None:
+            self._pending_mail_hint_hook.observe(command.message)
         if self._is_result_message(command.message):
             # A Claude Result ends one model turn, not necessarily the logical
             # run. Delegated local agents/workflows can outlive that Result;
@@ -2399,6 +2533,8 @@ class ClaudeSDKSupervisor:
             active._deliver(command.message)
             self._cancel_ack_timeout()
             active._finish(command.message)
+            if self._pending_mail_hint_hook is not None:
+                self._pending_mail_hint_hook.retire()
             self._active_run = None
             bind_provider_tool_owner(self.options, "", "")
             self._inflight_tasks.clear()
@@ -2733,6 +2869,7 @@ class ClaudeSDKSupervisorManager:
         expected_provider_command_generation: str | None = None,
         on_supervisor_ready: SupervisorReadyCallback | None = None,
         background_task_reconciliation: dict[str, Any] | None = None,
+        pending_mail_hint: Callable[[], str | None] | None = None,
     ) -> ClaudeSDKRunHandle:
         """Pin a chat through query acceptance, then return its run handle."""
 
@@ -2764,6 +2901,7 @@ class ClaudeSDKSupervisorManager:
                 ),
                 on_supervisor_ready=on_supervisor_ready,
                 background_task_reconciliation=background_task_reconciliation,
+                pending_mail_hint=pending_mail_hint,
             )
         except (ClaudeSDKUnavailable, asyncio.CancelledError):
             # A cold-connect failure or a Stop that cancels start_run before

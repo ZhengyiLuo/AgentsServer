@@ -733,6 +733,7 @@ sys.exit(10)
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             connection.execute("BEGIN IMMEDIATE")
             for trigger in (
+                "team_mail_arrival_on_server_recipient",
                 "team_message_revisions_are_immutable",
                 "team_message_revisions_cannot_be_deleted",
                 "network_agents_limit_per_server",
@@ -746,6 +747,8 @@ sys.exit(10)
             ):
                 connection.execute(f"DROP TRIGGER {trigger}")
             for index in (
+                "team_mail_server_arrival_lookup",
+                "team_messages_parent_order",
                 "team_message_revisions_by_message",
                 "team_message_revisions_by_team",
                 "device_sessions_human_created_id_idx",
@@ -755,6 +758,7 @@ sys.exit(10)
             ):
                 connection.execute(f"DROP INDEX {index}")
             for table in (
+                "team_mail_arrivals",
                 "team_message_revisions",
                 "network_content_deletions",
                 "human_admin_page_entries",
@@ -793,6 +797,7 @@ sys.exit(10)
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_insert")
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_update")
             for trigger in (
+                "team_mail_arrival_on_server_recipient",
                 "team_message_revisions_are_immutable",
                 "team_message_revisions_cannot_be_deleted",
                 "human_admin_page_device_session_insert",
@@ -803,6 +808,8 @@ sys.exit(10)
             ):
                 connection.execute(f"DROP TRIGGER {trigger}")
             for index in (
+                "team_mail_server_arrival_lookup",
+                "team_messages_parent_order",
                 "team_message_revisions_by_message",
                 "team_message_revisions_by_team",
                 "device_sessions_human_created_id_idx",
@@ -812,6 +819,7 @@ sys.exit(10)
             ):
                 connection.execute(f"DROP INDEX {index}")
             for table in (
+                "team_mail_arrivals",
                 "team_message_revisions",
                 "network_content_deletions",
                 "human_admin_page_entries",

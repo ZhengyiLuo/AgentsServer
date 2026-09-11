@@ -5351,7 +5351,7 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             capability["agent_routes"]["client_capability"],
             agent_server.AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY,
         )
-        self.assertEqual(capability["agent_routes"]["max_routes_per_chat"], 16)
+        self.assertIsNone(capability["agent_routes"]["max_routes_per_chat"])
         self.assertFalse(capability["agent_routes"]["transcript_access"])
         self.assertEqual(capability["agent_routes"]["policy"], "default_deny")
         self.assertTrue(capability["agent_routes"]["same_server_only"])

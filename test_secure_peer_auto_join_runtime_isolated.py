@@ -13,6 +13,7 @@ import uuid
 from unittest import mock
 
 from pydantic import BaseModel, Field, field_validator
+from team_mail_runtime import RuntimeMailHints
 
 
 REPO = Path(__file__).resolve().parent
@@ -122,6 +123,7 @@ def runtime_fixture():
     runtime._outbound_guard = threading.RLock()
     runtime._completion_waiters = {}
     runtime._completion_closing = False
+    runtime._mail_hints = RuntimeMailHints(runtime, enabled=False)
     runtime._host_role_active = False
     runtime._initialization_error = None
     runtime._adapter = runtime._host_store = runtime._gateway = None
@@ -194,6 +196,7 @@ class AutoJoinRuntimeTests(unittest.IsolatedAsyncioTestCase):
         receipt = await asyncio.wait_for(task, 1)
         self.assertEqual(receipt["completion_state"], "completed")
         self.assertEqual(runtime._completion_waiters, {})
+        self.assertEqual(runtime._mail_hints._generation, 1)
 
     async def test_observer_cancellation_keeps_durable_join_pending(self):
         runtime = runtime_fixture()

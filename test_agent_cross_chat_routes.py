@@ -1557,7 +1557,7 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             [],
         )
 
-    async def test_admin_create_rejects_self_duplicate_alias_target_and_limit(self) -> None:
+    async def test_admin_create_rejects_self_duplicates_but_allows_more_than_16_routes(self) -> None:
         with self.native_transports(), patch.object(
             agent_server.STORE, "save", AsyncMock()
         ), patch.object(agent_server, "append_durable_event", AsyncMock()):
@@ -1612,14 +1612,19 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             agent_server.STORE.sessions["target3"] = {
                 "id": "target3", "title": "Third", "backend": "codex"
             }
-            with self.assertRaises(HTTPException) as maximum:
-                await agent_server.create_agent_handoff_route(
-                    "source",
-                    agent_server.AgentHandoffRouteCreateRequest(
-                        alias="overflow", target_session_id="target3"
-                    ),
-                )
-            self.assertEqual(maximum.exception.status_code, 409)
+            added = await agent_server.create_agent_handoff_route(
+                "source",
+                agent_server.AgentHandoffRouteCreateRequest(
+                    alias="overflow", target_session_id="target3"
+                ),
+            )
+            self.assertEqual(added["route"]["alias"], "overflow")
+            current = await agent_server.list_agent_handoff_routes("source", unlimited_routes=True)
+            legacy = await agent_server.list_agent_handoff_routes("source")
+            self.assertEqual(len(current["routes"]), 17)
+            self.assertEqual(current["routes"], legacy["routes"])
+            self.assertIsNone(current["max_routes"])
+            self.assertEqual(legacy["max_routes"], 16)  # Compatibility hint, not a ceiling.
 
     async def test_route_journal_is_atomic_private_and_survives_timeline_failure(self) -> None:
         with (

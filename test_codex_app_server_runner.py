@@ -3692,6 +3692,8 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         }])
         stack, events, _finished, _exec_fallback = self.runner_patches(manager)
         with stack:
+            released = agent_server.release_turn_slot
+            released.return_value = True
             runner = asyncio.create_task(
                 agent_server.run_codex_app_server(
                     "chat-native",
@@ -3736,7 +3738,10 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                 "final_answer",
             ))
             turn.feed(completed_notification())
-            await asyncio.wait_for(runner, timeout=2)
+            # This checks trace ownership, not a two-second cleanup SLA.
+            # Keep completion bounded without cancelling a valid finalizer
+            # when the full CI suite delays the event loop.
+            await asyncio.wait_for(runner, timeout=10)
 
         trace_payloads = [
             call.args[2]
@@ -3773,6 +3778,12 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(final_payloads), 1)
         self.assertEqual(final_payloads[0]["item_id"], "final-after")
         self.assertEqual(final_payloads[0]["text"], "One final answer.")
+        released.assert_awaited_once_with(
+            "chat-native", expected_run_id=run_now["run_id"]
+        )
+        _finished.assert_awaited_once()
+        self.assertEqual(_finished.await_args.args[1]["run_id"], run_now["run_id"])
+        self.assertFalse(_finished.await_args.args[1]["stopped"])
 
     async def test_app_server_never_persists_raw_reasoning_text(self) -> None:
         turn = FakeTurn([

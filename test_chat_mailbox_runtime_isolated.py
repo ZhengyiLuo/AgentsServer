@@ -76,6 +76,25 @@ def isolated_source():
 
 
 class ChatMailboxRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    def test_mailbox_routes_have_exact_bounded_provider_header_entry_points(self):
+        names = {"agent_helper_route_body_limit", "is_agent_helper_route"}
+        nodes = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
+        nodes.extend(deepcopy(node) for node in TREE.body if
+            isinstance(node, ast.FunctionDef) and node.name in names or
+            isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+            and node.target.id == "AGENT_HELPER_ROUTE_RULES")
+        namespace = {"re": re}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])),
+                     "<isolated-mailbox-entry-points>", "exec"), namespace)
+        limit = namespace["agent_helper_route_body_limit"]
+        self.assertEqual(limit("GET", "/api/agent/cross-chat/inbox"), 0)
+        self.assertEqual(limit("POST", "/api/agent/cross-chat/inbox/read"), 16 * 1024)
+        for method, path in (("POST", "/api/agent/cross-chat/inbox"),
+                             ("GET", "/api/agent/cross-chat/inbox/read"),
+                             ("POST", "/api/agent/cross-chat/inbox/read/extra"),
+                             ("POST", "/api/agent/cross-chat/future")):
+            self.assertIsNone(limit(method, path))
+
     async def asyncSetUp(self):
         self.ns = isolated_source()
         temporary = tempfile.TemporaryDirectory(prefix="isolated-mailbox-")

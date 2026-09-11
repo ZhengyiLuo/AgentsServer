@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 from collections import defaultdict, deque
 from datetime import datetime
 import io
@@ -12,11 +13,13 @@ import json
 from pathlib import Path
 import re
 import stat
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock
 import uuid
 from claude_history_provenance import ClaudeInterruptionTracker, normalize_claude_interruption_context
+from codex_history_repair import CodexNativeHistoryRepairCache, filter_native_codex_history_items
 
 
 SOURCE = Path(__file__).with_name("agent_server.py")
@@ -74,7 +77,9 @@ def load_projection() -> dict:
         *selected,
     ], type_ignores=[]))
     namespace = {
-        "re": re, "datetime": datetime, "json": json, "uuid": uuid,
+        "re": re, "datetime": datetime, "json": json, "uuid": uuid, "asyncio": asyncio,
+        "filter_native_codex_history_items": filter_native_codex_history_items,
+        "CODEX_NATIVE_HISTORY_REPAIR_CACHE": CodexNativeHistoryRepairCache(),
         "hashlib": hashlib, "hmac": hmac, "deque": deque, "defaultdict": defaultdict,
         "ClaudeInterruptionTracker": ClaudeInterruptionTracker,
         "normalize_claude_interruption_context": normalize_claude_interruption_context,
@@ -356,6 +361,9 @@ class ClaudeHistoryProvenanceTests(unittest.TestCase):
 class ImportedHistoryProvenanceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.projection = load_projection()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.projection["events_path"] = lambda _session_id: Path(temporary.name) / "events.jsonl"
         self.session = {"id": "app-chat", "backend": "claude", "claude_session_id": SESSION_ID}
 
         async def durable(_session_id, specifications):

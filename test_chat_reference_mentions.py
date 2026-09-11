@@ -603,6 +603,9 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
         submit = AsyncMock()
         update = AsyncMock(side_effect=[failed, running])
         with (
+            patch.object(agent_server, "CHAT_MAILBOX_PENDING", set()),
+            patch.object(agent_server.CROSS_CHAT, "mailbox_call", AsyncMock(return_value=[])),
+            patch.object(agent_server.CROSS_CHAT, "mailbox_envelopes", AsyncMock(return_value=[])),
             patch.object(agent_server.CROSS_CHAT, "pending_terminal_lifecycle", AsyncMock(return_value=[])),
             patch.object(agent_server.CROSS_CHAT, "recoverable", AsyncMock(return_value=[ready, running])),
             patch.object(agent_server.CROSS_CHAT, "update", update),

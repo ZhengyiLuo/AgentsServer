@@ -493,7 +493,9 @@ class ChatPairTests(unittest.IsolatedAsyncioTestCase):
         message = self.delivery(route)
         await self.call("delete_agent_handoff_route", "a", route["route_id"], route["revision"])
         self.retired.reset_mock()
+        self.namespace["CHAT_MAILBOX_PENDING"] = set()
         self.namespace["CROSS_CHAT"] = SimpleNamespace(
+            mailbox_call=AsyncMock(return_value=[]), mailbox_envelopes=AsyncMock(return_value=[]),
             pending_terminal_lifecycle=AsyncMock(return_value=[]), recoverable=AsyncMock(return_value=[message]),
             get_exchange_leg=AsyncMock(return_value={"id": "leg", "exchange_id": "exchange", "kind": "request", "status": "queued"}),
             get_exchange=AsyncMock(return_value={"id": "exchange", "authorization_kind": "configured_route",
@@ -619,7 +621,7 @@ class ChatPairTests(unittest.IsolatedAsyncioTestCase):
             file_ids=[], chat_references=[], team_references=[], source_session_id="a", target_session_id="b",
             cross_chat_envelope_id="message", cross_chat_exchange_id=None, cross_chat_exchange_leg_id=None,
             cross_chat_exchange_status=False, secure_peer_envelope_id=None, backend=None, model=None, effort=None,
-            digest_job_id=None, digest_detail=None, client_capabilities=["backend-exact"],
+            digest_job_id=None, digest_detail=None, client_capabilities=["backend-exact"], skill_selection=None,
         )
         result = await self.call("enqueue_turn", "b", request, self.store.sessions["b"], provider_route_snapshot=self.routes("b"))
         self.assertTrue(result["queued"])

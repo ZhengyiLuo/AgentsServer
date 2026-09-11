@@ -8,7 +8,7 @@ import unittest
 from collections import OrderedDict, deque
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException
@@ -196,6 +196,7 @@ class FakeClaudeManager:
         configuration_key: str,
         query_session_id: str | None = None,
         on_supervisor_ready: object | None = None,
+        pending_mail_hint: Callable[[], str | None] | None = None,
     ) -> FakeClaudeRun:
         self.start_calls.append(
             (
@@ -271,6 +272,7 @@ class FakeClaudeManagerFailingAfterOwnership(FakeClaudeManager):
         configuration_key: str,
         query_session_id: str | None = None,
         on_supervisor_ready: object | None = None,
+        pending_mail_hint: Callable[[], str | None] | None = None,
     ) -> FakeClaudeRun:
         self.start_calls.append(
             (chat_id, prompt, run_id, options, configuration_key, query_session_id)
@@ -296,6 +298,7 @@ class SequencedClaudeManager(FakeClaudeManager):
         configuration_key: str,
         query_session_id: str | None = None,
         on_supervisor_ready: object | None = None,
+        pending_mail_hint: Callable[[], str | None] | None = None,
     ) -> FakeClaudeRun:
         self.start_calls.append(
             (
@@ -342,6 +345,7 @@ class PermissionDuringStartManager(SequencedClaudeManager):
         configuration_key: str,
         query_session_id: str | None = None,
         on_supervisor_ready: object | None = None,
+        pending_mail_hint: Callable[[], str | None] | None = None,
     ) -> FakeClaudeRun:
         call_number = len(self.start_calls) + 1
         self.start_calls.append(
@@ -424,6 +428,7 @@ class BlockingCandidateStartManager(SequencedClaudeManager):
         configuration_key: str,
         query_session_id: str | None = None,
         on_supervisor_ready: object | None = None,
+        pending_mail_hint: Callable[[], str | None] | None = None,
     ) -> FakeClaudeRun:
         call_number = len(self.start_calls) + 1
         self.start_calls.append(
@@ -462,6 +467,7 @@ class SafeFailingCandidateStartManager(SequencedClaudeManager):
         configuration_key: str,
         query_session_id: str | None = None,
         on_supervisor_ready: object | None = None,
+        pending_mail_hint: Callable[[], str | None] | None = None,
     ) -> FakeClaudeRun:
         call_number = len(self.start_calls) + 1
         self.start_calls.append((

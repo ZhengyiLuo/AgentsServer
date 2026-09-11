@@ -21,17 +21,26 @@ STAMP = "2026-09-11T20:33:38.446Z"
 ABORT_TEXT = ("<turn_aborted>The user interrupted the previous turn on purpose. "
               "Any running unified exec processes may still be running in the background. "
               "If any tools/commands were aborted, they may have partially executed.</turn_aborted>")
+PURE_NOTICES = {
+    "compaction.summary": "Synthetic provider compaction summary.",
+    "apply_patch.legacy_exec_command_warning": "Synthetic provider apply-patch warning.",
+    "model_switch.legacy_mismatch_warning": "Synthetic provider model warning.",
+    "unified_exec.legacy_process_limit_warning": "Synthetic provider process-limit warning.",
+    "guardian.node_repl_review_evidence": "<node_repl_review_evidence>Provider context.</node_repl_review_evidence>",
+    "plugins.recommendations": "<recommended_plugins>Provider plugin context.</recommended_plugins>",
+    "agents_md.instructions": "# AGENTS.md instructions for /example\n\n<INSTRUCTIONS>\nProvider project context.\n</INSTRUCTIONS>",
+}
 
 
 def source(**fields):
     return {**source_user(TEXT, kinds=(KIND,), **fields), "timestamp": STAMP}
 
 
-def historical_fixture(runtime_kind="subagent_notification"):
+def historical_fixture(runtime_kind="subagent_notification", *, source_record=None):
     case = native_fixture.CodexNativeHistoryRepairTests()
     case.setUp()
     case.native = []  # Typed runtime provenance does not invent a native user turn.
-    case.raw = [source() if runtime_kind == "subagent_notification" else {
+    case.raw = [source_record if source_record is not None else source() if runtime_kind == "subagent_notification" else {
         **source_user(ABORT_TEXT, kinds=("generic.turn_aborted",)), "timestamp": STAMP}]
     case.fixture()
     case.imports[0].pop("provider_user_authored", None)
@@ -95,6 +104,86 @@ class CodexSubagentNotificationHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(projected["ts"], STAMP)
         self.assertNotIn("stopped", projected)
         self.assertEqual(projected["prompt"], "")
+
+    def test_provider_terminal_status_variants_share_runtime_role_but_unknowns_and_quotes_do_not(self):
+        parse = self.ns["codex_history_event_item"]
+        for status in ({"completed": "Public result"}, {"completed": None},
+                       {"errored": "Public failure"}, "shutdown", "not_found"):
+            with self.subTest(status=status):
+                raw = source()
+                text = "<subagent_notification>" + json.dumps({"agent_path": "example-child", "status": status}) + "</subagent_notification>"
+                raw["payload"]["content"][0]["text"] = text
+                item = parse(raw)
+                self.assertEqual(item["provider_runtime_context"], "subagent_notification")
+                self.assertEqual(item["provider_origin"]["source_text_sha256"], hashlib.sha256(text.encode()).hexdigest())
+                for extra in ({"provider_user_authored": True}, {"clientUserMessageId": "human-input"}):
+                    quote = copy.deepcopy(raw); quote["payload"].update(extra)
+                    self.assertNotIn("provider_runtime_context", parse(quote))
+                mixed = copy.deepcopy(raw)
+                mixed["payload"]["internal_chat_message_metadata_passthrough"]["content_item_kinds"] = [KIND, "user.text"]
+                self.assertNotIn("provider_runtime_context", parse(mixed))
+        for status in ("running", "interrupted", "pending_init", "unknown", "", None,
+                       [], {}, {"completed": False}, {"completed": []}, {"errored": None},
+                       {"completed": "ok", "errored": "bad"}, {"unknown": "value"}):
+            raw = source()
+            raw["payload"]["content"][0]["text"] = "<subagent_notification>" + json.dumps({"agent_path": "example-child", "status": status}) + "</subagent_notification>"
+            self.assertNotIn("provider_runtime_context", parse(raw))
+
+    async def test_exact_pure_provider_kinds_keep_bounded_proof_and_never_emit_raw_prompt(self):
+        parse = self.ns["codex_history_event_item"]
+        for kind, text in PURE_NOTICES.items():
+            with self.subTest(kind=kind):
+                raw = {**source_user(text, kinds=(kind,)), "timestamp": STAMP}
+                before = copy.deepcopy(raw)
+                item = parse(raw)
+                self.assertEqual(item["provider_runtime_context"], "provider_notice")
+                self.assertEqual(item["provider_origin"]["kind"], "provider_notice")
+                self.assertEqual(item["provider_origin"]["source_text_sha256"], hashlib.sha256(text.encode()).hexdigest())
+                self.assertEqual(raw, before)
+                for extra in ({"provider_user_authored": True}, {"clientId": "human"}):
+                    quoted = copy.deepcopy(raw); quoted["payload"].update(extra)
+                    human = parse(quoted)
+                    self.assertEqual(human["text"], text)
+                    self.assertNotIn("provider_runtime_context", human)
+                mixed = {**source_user(text, kinds=(kind, "user.text")), "timestamp": STAMP}
+                self.assertEqual(parse(mixed)["text"], text)
+                self.assertNotIn("provider_runtime_context", parse(mixed))
+                mixed_unknown = {**source_user("Plain runtime context", kinds=(kind, "unknown")), "timestamp": STAMP}
+                self.assertNotIn("provider_runtime_context", parse(mixed_unknown))
+        for kind in ("shell.user_command", "realtime_conversation.delegation", "images.unsupported", "audio.unsupported", "extension.internal_context", "unknown"):
+            item = parse({**source_user("User or unknown content remains.", kinds=(kind,)), "timestamp": STAMP})
+            self.assertEqual(item["text"], "User or unknown content remains.")
+            self.assertNotIn("provider_runtime_context", item)
+        for kinds in ([{}], [[]], ["compaction.summary", {}], ["compaction.summary", []]):
+            malformed = {**source_user("Malformed metadata remains visible.", kinds=kinds), "timestamp": STAMP}
+            self.assertNotIn("provider_runtime_context", parse(malformed))
+        for kind in ("guardian.node_repl_review_evidence", "plugins.recommendations", "agents_md.instructions"):
+            self.assertIsNone(self.ns["codex_runtime_user_item_kind"](source_user(PURE_NOTICES[kind], kinds=(kind,))["payload"], PURE_NOTICES[kind][:-2]))
+        raw = {**source_user("Large provider context. " * 50, kinds=("compaction.summary",)), "timestamp": STAMP}
+        self.ns["MAX_IMPORTED_TEXT_CHARS"] = 64
+        item = parse(raw)
+        self.assertLess(len(item["text"]), 100)
+        self.assertIn("source_text_sha256", item)
+        self.assertEqual(item["provider_origin"]["source_text_sha256"], item["source_text_sha256"])
+        self.ns["append_durable_event_batch"] = AsyncMock(side_effect=lambda _session, specs: [{"seq": n + 1, **value} for n, (_kind, value) in enumerate(specs)])
+        await self.ns["append_imported_history"]({"id": "chat", "backend": "codex", "codex_thread_id": PROVIDER}, Path("unused"), [item])
+        rows = self.ns["append_durable_event_batch"].await_args.args[1]
+        self.assertEqual(rows[1][1]["prompt"], "")
+        self.assertEqual(rows[1][1]["provider_runtime_context"], "provider_notice")
+
+    def test_historical_compaction_and_warning_require_exact_source_checkpoint(self):
+        for kind in ("compaction.summary", "unified_exec.legacy_process_limit_warning"):
+            raw = {**source_user(PURE_NOTICES[kind], kinds=(kind,)), "timestamp": STAMP}
+            case = historical_fixture(source_record=raw); self.addCleanup(case.doCleanups)
+            before = case.events.read_bytes(), case.source.read_bytes()
+            case.prepare()
+            projected = case.cache.project_event("chat", case.imports[0])
+            self.assertEqual(projected["provider_runtime_context"], "provider_notice")
+            self.assertEqual(projected["prompt"], "")
+            self.assertEqual(projected["ts"], STAMP)
+            self.assertEqual(before, (case.events.read_bytes(), case.source.read_bytes()))
+            self.assertIsNone(case.cache.project_event("chat", {**case.imports[0], "provider_user_authored": True}))
+            self.assertIsNone(case.cache.project_event("chat", {**case.imports[0], "prompt": PURE_NOTICES[kind] + " quote"}))
 
     async def test_both_import_paths_keep_silent_boundary_timestamp_and_following_answer(self):
         item = self.ns["codex_history_event_item"](source())

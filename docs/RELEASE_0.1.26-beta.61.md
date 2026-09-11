@@ -19,8 +19,10 @@ published desktop beta.33 binary.
   native turn ownership, message identity, timestamp and full text prove the
   replay. Preserve original human messages and scheduled reports. Retain source
   identity on new imports and prevent known native messages becoming new input.
-- Keep explicitly typed Codex subagent notifications and interruption notices
-  out of user-message bubbles. Correct older imports only with exact native
+- Keep explicitly typed Codex subagent notifications, interruption notices,
+  compaction summaries and infrastructure notices out of user-message bubbles.
+  Cover all supported terminal subagent states, not just successful results.
+  Correct older imports only with exact native
   source proof, including declared fork ancestry. Preserve genuine quotations,
   original timestamps, answers and live lifecycle state; no transcript rewrite
   or additional background polling is involved.

@@ -71800,6 +71800,8 @@ def is_team_hub_server_session_route_allowed(method: str, path: str) -> bool:
 AGENT_HELPER_ROUTE_RULES: tuple[tuple[str, re.Pattern[str], int], ...] = (
     ("POST", re.compile(r"^/api/agent/cross-chat/handoffs$"), 2 * 1024 * 1024),
     ("GET", re.compile(r"^/api/agent/cross-chat/routes$"), 0),
+    ("GET", re.compile(r"^/api/agent/cross-chat/inbox$"), 0),
+    ("POST", re.compile(r"^/api/agent/cross-chat/inbox/read$"), 16 * 1024),
     (
         "POST",
         re.compile(r"^/api/agent/cross-chat/routes/route_[0-9a-f]{32}/handoffs$"),

@@ -18,6 +18,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock
 
+import chat_mailbox
+
 from test_async_route_transport_isolated import HTTPException, envelope, PAIR
 
 
@@ -44,6 +46,7 @@ def namespace():
     ns = {
         "asyncio": asyncio, "deque": deque, "contextmanager": contextmanager, "suppress": suppress,
         "hashlib": hashlib, "sqlite3": sqlite3, "threading": threading, "time": time,
+        "chat_mailbox": chat_mailbox,
         "HTTPException": HTTPException, "now_iso": lambda: "2026-09-10T20:00:00Z",
         "PROVIDER_CROSS_CHAT_LEGACY_RATE_RETENTION_SECONDS": 3600,
         "PROVIDER_CROSS_CHAT_ROUTE_PAIR_ID_RE": re.compile(r"pair_[0-9a-f]{32}"),

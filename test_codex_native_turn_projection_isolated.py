@@ -24,6 +24,7 @@ _FUNCTIONS = {
     "codex_reasoning_text",
     "codex_app_server_reasoning_summary",
     "session_lifecycle_lock",
+    "maybe_notify_chat_mailbox_codex",
 }
 _TREE = ast.parse(_SOURCE.read_text(encoding="utf-8"), filename=str(_SOURCE))
 _SELECTED = [node for node in _TREE.body if isinstance(
@@ -96,6 +97,7 @@ class NativeTurnProjectionTests(unittest.IsolatedAsyncioTestCase):
             "suppress": suppress,
             "STORE": store, "ACTIVE_LOCK": asyncio.Lock(),
             "SESSION_LIFECYCLE_LOCKS": {},
+            "CHAT_MAILBOX_PENDING": set(),
             "ACTIVE": {"chat": {"run_id": "operation"}},
             "STOPPED_RUNS": {"unrelated"} | ({"operation"} if stopped or interrupted_before_start else set()),
             "BACKEND_CODEX": "codex",

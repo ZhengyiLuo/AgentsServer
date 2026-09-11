@@ -148,6 +148,11 @@ class AsyncQueuedMessageTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as raised:
             await ns["update_async_queued_message"]("b", "queued_message", req)
         self.assertEqual(raised.exception.status_code, 400)
+        req = request(revision=1)
+        req.skill_selection = {"id": "opaque", "revision": "opaque"}
+        with self.assertRaises(HTTPException) as raised:
+            await ns["update_async_queued_message"]("b", "queued_message", req)
+        self.assertEqual(raised.exception.status_code, 400)
         events = ns["append_durable_event"].await_args_list
         self.assertEqual([call.args[1] for call in events], ["turn_queue_updated", "chat_conversation_message_queued"])
         self.assertTrue(all(call.args[0] == "b" for call in events))

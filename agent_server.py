@@ -97,6 +97,14 @@ from claude_sdk_client import (
     create_claude_agent_options,
     create_claude_sdk_mcp_server,
 )
+from provider_commands import (
+    MAX_PROVIDER_COMMANDS,
+    ProviderCommandInventory,
+    ProviderCommandRecord,
+    claude_provider_command_inventory,
+    codex_provider_command_inventory,
+    empty_provider_command_inventory,
+)
 from update_runner import atomic_json as atomic_update_json
 from update_runner import (
     ReleaseUnavailableError,
@@ -4117,6 +4125,20 @@ def server_identity() -> str:
         return identity
 
 
+# Provider command selectors are deliberately scoped to one server process.
+# The native path remains opaque even to an authenticated inventory client.
+# A restart rotates this key; durable queued selections then fail visibly and
+# are terminally removed without blocking later FIFO rows.
+PROVIDER_COMMAND_SELECTOR_SECRET = secrets.token_hex(32)
+PROVIDER_COMMAND_EMPTY_FALLBACK_SECRET = secrets.token_hex(32)
+
+
+def provider_command_selector_secret() -> str:
+    """Return this process's private HMAC key for opaque native selectors."""
+
+    return PROVIDER_COMMAND_SELECTOR_SECRET
+
+
 def ensure_dirs(session_id: str | None = None) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     FILES_ROOT.mkdir(parents=True, exist_ok=True)
@@ -6411,12 +6433,36 @@ def routed_references_match_visible_prompt(
     )
 
 
+class SkillSelection(BaseModel):
+    """Opaque selection of one server-discovered provider command."""
+
+    model_config = {"extra": "forbid"}
+
+    id: str = Field(pattern=r"^pcmd_[0-9a-f]{32}$")
+    revision: str = Field(pattern=r"^pcmdrev_[0-9a-f]{32}$")
+
+
+class ProviderCommandSelectionInvalid(HTTPException):
+    """A selected provider inventory entry must be chosen again."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(status_code=409, detail=detail)
+
+
+class ProviderCommandSelectionUnavailable(HTTPException):
+    """A selected provider command could not be revalidated right now."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(status_code=503, detail=detail)
+
+
 class TurnRequest(BaseModel):
     prompt: str
     file_ids: list[str] = Field(default_factory=list)
     backend: str | None = None
     model: str | None = None
     effort: str | None = None
+    skill_selection: SkillSelection | None = None
     display_prompt: str | None = None
     purpose: str | None = None
     job_id: str | None = None
@@ -6557,6 +6603,7 @@ class UpdateQueuedTurnRequest(BaseModel):
     client_capabilities: list[str] | None = Field(default=None, max_length=16)
     chat_references: list[ChatReference] | None = Field(default=None, max_length=16)
     team_references: list[TeamReference] | None = Field(default=None, max_length=16)
+    skill_selection: SkillSelection | None = None
 
 
 class MoveQueuedTurnRequest(BaseModel):
@@ -16774,6 +16821,11 @@ async def enqueue_turn(
             "backend": req.backend,
             "model": req.model,
             "effort": req.effort,
+            "skill_selection": (
+                req.skill_selection.model_dump()
+                if req.skill_selection is not None
+                else None
+            ),
             "display_prompt": req.display_prompt,
             "purpose": req.purpose,
             "digest_job_id": req.digest_job_id,
@@ -16857,6 +16909,11 @@ async def enqueue_turn(
                 "backend": req.backend or sess.get("backend") or DEFAULT_BACKEND,
                 "model": req.model,
                 "effort": req.effort,
+                "skill_selection": (
+                    req.skill_selection.model_dump()
+                    if req.skill_selection is not None
+                    else None
+                ),
                 "prompt": display_prompt,
                 "request_prompt": req.prompt,
                 "display_prompt": req.display_prompt,
@@ -21345,7 +21402,8 @@ async def update_async_queued_message(session_id: str, queued_id: str, req: Upda
                     or len(req.prompt) > CROSS_CHAT_HANDOFF_BODY_MAX_CHARS):
                 raise HTTPException(status_code=400, detail="queued async message body must contain 1 to 100000 characters")
             if any(getattr(req, key, None) is not None for key in (
-                "file_ids", "client_capabilities", "chat_references", "team_references",
+                "file_ids", "client_capabilities", "chat_references",
+                "team_references", "skill_selection",
             )):
                 raise HTTPException(status_code=400, detail="queued async edits change only message text; routing and runtime are immutable")
             async def commit_edit() -> None:
@@ -21437,6 +21495,9 @@ def public_queued_turn(
         "backend": None if secure_peer_barrier else item.get("backend"),
         "model": None if secure_peer_barrier else item.get("model"),
         "effort": None if secure_peer_barrier else item.get("effort"),
+        "skill_selection": (
+            None if secure_peer_barrier else item.get("skill_selection")
+        ),
         "display_prompt": public_display_prompt,
         "purpose": purpose,
         **async_route_queue_fields(item),
@@ -21536,6 +21597,7 @@ async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedT
         if req.file_ids is not None
         else None
     )
+    update_fields_set = request_fields_set(req)
 
     updated: dict[str, Any] | None = None
     replaced_obligation_ids: list[str] = []
@@ -21605,6 +21667,13 @@ async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedT
                         if not prompt.strip():
                             raise HTTPException(status_code=400, detail="prompt is empty")
                         candidate["prompt"] = prompt
+                        if "skill_selection" not in update_fields_set:
+                            old_token = provider_command_invocation_token(
+                                original.get("prompt")
+                            )
+                            new_token = provider_command_invocation_token(prompt)
+                            if old_token is None or new_token != old_token:
+                                candidate["skill_selection"] = None
                         # A steered/requeued turn can carry separate raw,
                         # display, and lineage copies of the user's latest
                         # message.  Editing only ``prompt`` makes the PATCH
@@ -21624,6 +21693,12 @@ async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedT
                                 "prompt": prompt,
                             }
                             candidate["steering_lineage"] = steering_lineage
+                    if "skill_selection" in update_fields_set:
+                        candidate["skill_selection"] = (
+                            req.skill_selection.model_dump()
+                            if req.skill_selection is not None
+                            else None
+                        )
                     if req.file_ids is not None:
                         candidate["file_ids"] = list(validated_file_ids or [])
                     if req.client_capabilities is not None:
@@ -21867,6 +21942,7 @@ async def update_queued_turn(session_id: str, queued_id: str, req: UpdateQueuedT
                 "cross_chat_obligation_ids": list(updated.get("cross_chat_obligation_ids") or []),
                 "cross_chat_exchange_ids": list(updated.get("cross_chat_exchange_ids") or []),
                 "client_capabilities": list(updated.get("client_capabilities") or []),
+                "skill_selection": updated.get("skill_selection"),
                 "provider_cross_chat_route_snapshot": [
                     dict(route)
                     for route in normalized_provider_cross_chat_route_snapshot(
@@ -23244,6 +23320,8 @@ async def _run_queued_turn_now_once(
                     and not selected.get("team_references")
                     and not selected.get("cross_chat_obligation_ids")
                     and not selected.get("cross_chat_exchange_ids")
+                    and selected.get("skill_selection") is None
+                    and interrupted_turn.get("skill_selection") is None
                     and interrupted_turn.get("purpose")
                     not in CROSS_CHAT_DELIVERY_PURPOSES
                     and not interrupted_turn.get("chat_references")
@@ -23547,6 +23625,7 @@ async def _run_queued_turn_now_once(
             "target_session_id": prepared.get("target_session_id"),
             "chat_references": list(prepared.get("chat_references") or []),
             "team_references": list(prepared.get("team_references") or []),
+            "skill_selection": prepared.get("skill_selection"),
             "cross_chat_envelope_id": prepared.get("cross_chat_envelope_id"),
             "cross_chat_exchange_id": prepared.get("cross_chat_exchange_id"),
             "cross_chat_exchange_leg_id": prepared.get("cross_chat_exchange_leg_id"),
@@ -24297,6 +24376,7 @@ async def _start_next_queued_turn_locked(
             backend=item.get("backend"),
             model=item.get("model"),
             effort=item.get("effort"),
+            skill_selection=item.get("skill_selection"),
             display_prompt=item.get("display_prompt"),
             purpose=item.get("purpose"),
             digest_job_id=item.get("digest_job_id"),
@@ -24386,6 +24466,27 @@ async def _start_next_queued_turn_locked(
                 session_id,
                 item,
                 "saved Team target configuration is invalid",
+            )
+            return
+        if (
+            isinstance(
+                e,
+                (
+                    ProviderCommandSelectionInvalid,
+                    ProviderCommandSelectionUnavailable,
+                ),
+            )
+            and item.get("skill_selection")
+        ):
+            # A stale selector cannot become valid without user re-selection,
+            # while a transient native discovery failure has no safe retry
+            # identity beyond this snapshot. Remove either exact durable row
+            # visibly so it cannot pin every later queued user message.
+            await terminally_discard_queued_turn(
+                session_id,
+                item,
+                "saved provider command could not be revalidated; choose it "
+                "again and resend the message",
             )
             return
         terminal_session_state = (
@@ -24587,6 +24688,9 @@ def queued_turn_from_event(event: dict[str, Any], sess: dict[str, Any], position
             if delivery_row
             else event.get("effort") if event.get("effort") is not None else sess.get("effort")
         ),
+        "skill_selection": (
+            None if delivery_row else event.get("skill_selection")
+        ),
         "display_prompt": event.get("display_prompt"),
         "purpose": event.get("purpose"),
         **async_route_queue_fields(event),
@@ -24735,6 +24839,10 @@ def scan_queued_turns_from_events(
                 if event.get("client_capabilities") is not None:
                     pending[queued_id]["client_capabilities"] = list(
                         event.get("client_capabilities") or []
+                    )
+                if "skill_selection" in event:
+                    pending[queued_id]["skill_selection"] = event.get(
+                        "skill_selection"
                     )
                 if event.get("provider_cross_chat_route_snapshot") is not None:
                     pending[queued_id]["provider_cross_chat_route_snapshot"] = (
@@ -56576,6 +56684,292 @@ def build_claude_sdk_options(
     )
 
 
+def provider_command_support(
+    available: bool,
+    mode: str,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    support: dict[str, Any] = {
+        "available": bool(available),
+        "mode": str(mode),
+    }
+    if reason:
+        support["reason"] = str(reason)
+    return support
+
+
+def provider_command_snapshot(
+    inventory: ProviderCommandInventory,
+    support: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "backend": inventory.backend,
+        "revision": inventory.revision,
+        "support": support,
+        "commands": inventory.commands,
+    }
+
+
+async def discover_session_provider_commands(
+    session_id: str,
+    session: dict[str, Any],
+    *,
+    refresh: bool = False,
+) -> tuple[dict[str, Any], ProviderCommandInventory]:
+    """Read one backend's native inventory without exposing provider metadata."""
+
+    backend = str(session.get("backend") or DEFAULT_BACKEND).strip().lower()
+    cwd = existing_cwd(str(session.get("cwd") or DEFAULT_CWD))
+    fallback_empty = empty_provider_command_inventory(
+        backend,
+        cwd=cwd,
+        selector_secret=PROVIDER_COMMAND_EMPTY_FALLBACK_SECRET,
+        binding_context=session_id,
+    )
+    if backend == BACKEND_CURSOR:
+        support = provider_command_support(
+            False,
+            "unsupported",
+            "Cursor does not currently expose local commands to AgentsDock.",
+        )
+        return provider_command_snapshot(fallback_empty, support), fallback_empty
+    if backend == BACKEND_CODEX:
+        if CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC:
+            support = provider_command_support(
+                False,
+                "unavailable",
+                "Local skills require the Codex app-server transport.",
+            )
+            return (
+                provider_command_snapshot(fallback_empty, support),
+                fallback_empty,
+            )
+    elif backend == BACKEND_CLAUDE:
+        if CLAUDE_TRANSPORT == CLAUDE_TRANSPORT_PRINT:
+            support = provider_command_support(
+                False,
+                "unavailable",
+                "Local commands require the Claude Agent SDK transport.",
+            )
+            return (
+                provider_command_snapshot(fallback_empty, support),
+                fallback_empty,
+            )
+    else:
+        support = provider_command_support(
+            False,
+            "unsupported",
+            "This backend does not expose local commands to AgentsDock.",
+        )
+        return provider_command_snapshot(fallback_empty, support), fallback_empty
+
+    try:
+        identity = provider_command_selector_secret()
+    except Exception:
+        support = provider_command_support(
+            False,
+            "unavailable",
+            "Local provider commands are temporarily unavailable.",
+        )
+        return provider_command_snapshot(fallback_empty, support), fallback_empty
+    empty = empty_provider_command_inventory(
+        backend,
+        cwd=cwd,
+        selector_secret=identity,
+        binding_context=session_id,
+    )
+
+    if backend == BACKEND_CODEX:
+        try:
+            manager = await codex_app_server_manager()
+            raw = await manager.request(
+                "skills/list",
+                {"cwds": [cwd], "forceReload": bool(refresh)},
+            )
+            inventory = codex_provider_command_inventory(
+                raw,
+                cwd=cwd,
+                selector_secret=identity,
+                binding_context=session_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            support = provider_command_support(
+                False,
+                "unavailable",
+                "Codex local skills are temporarily unavailable.",
+            )
+            return provider_command_snapshot(empty, support), empty
+        support = provider_command_support(True, "native")
+        if inventory.truncated:
+            support["reason"] = (
+                f"Showing the first {MAX_PROVIDER_COMMANDS} provider skills."
+            )
+        return provider_command_snapshot(inventory, support), inventory
+    if backend == BACKEND_CLAUDE:
+        try:
+            manager = await claude_sdk_manager()
+            if refresh:
+                # This is deliberately non-forcing. A refresh may replace an
+                # idle cached connection but never interrupts a live turn.
+                await manager.evict(session_id, force=False)
+            options, configuration_key, _cli_path = build_claude_sdk_options(
+                session_id,
+                session,
+                cwd,
+                codex_manifest_path(session_id),
+            )
+            raw, generation = await manager.get_server_info(
+                session_id,
+                options=options,
+                configuration_key=configuration_key,
+            )
+            inventory = claude_provider_command_inventory(
+                raw,
+                cwd=cwd,
+                selector_secret=identity,
+                binding_context=session_id,
+                control_generation=generation,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            support = provider_command_support(
+                False,
+                "unavailable",
+                "Claude local commands are temporarily unavailable.",
+            )
+            return provider_command_snapshot(empty, support), empty
+        support = provider_command_support(True, "native")
+        if inventory.truncated:
+            support["reason"] = (
+                f"Showing the first {MAX_PROVIDER_COMMANDS} provider commands."
+            )
+        return provider_command_snapshot(inventory, support), inventory
+    raise AssertionError(f"unhandled provider-command backend: {backend}")
+
+
+def provider_command_prompt_matches(prompt: str, invocation: str) -> bool:
+    """Require an exact byte-zero slash token and ordinary argument boundary."""
+
+    return prompt == invocation or (
+        prompt.startswith(invocation)
+        and len(prompt) > len(invocation)
+        and prompt[len(invocation)] in {" ", "\t", "\r", "\n"}
+    )
+
+
+def provider_command_invocation_token(prompt: Any) -> str | None:
+    if not isinstance(prompt, str):
+        return None
+    match = re.match(
+        r"^/[A-Za-z0-9_][A-Za-z0-9_.:-]{0,127}(?=$|[ \t\r\n])",
+        prompt,
+    )
+    return match.group(0) if match is not None else None
+
+
+async def resolve_provider_command_selection(
+    session_id: str,
+    session: dict[str, Any],
+    selection: SkillSelection | None,
+    *,
+    prompt: str,
+    purpose: str | None,
+    provider_context_mode: str,
+    client_capabilities: list[str],
+    refresh_native: bool = False,
+) -> ProviderCommandRecord | None:
+    """Revalidate an opaque provider command at every actual admission."""
+
+    if selection is None:
+        return None
+    if purpose is not None or provider_context_mode != "chat":
+        raise HTTPException(
+            status_code=400,
+            detail="provider commands are available only for ordinary chat turns",
+        )
+    backend = str(session.get("backend") or DEFAULT_BACKEND).strip().lower()
+    required_capability = (
+        CODEX_INTERACTIVE_CLIENT_CAPABILITY
+        if backend == BACKEND_CODEX
+        else CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY
+        if backend == BACKEND_CLAUDE
+        else None
+    )
+    if required_capability is None:
+        raise HTTPException(
+            status_code=400,
+            detail="the selected backend does not support provider commands",
+        )
+    if required_capability not in set(client_capabilities):
+        raise HTTPException(
+            status_code=400,
+            detail="this client cannot safely run the selected provider command",
+        )
+    snapshot, inventory = await discover_session_provider_commands(
+        session_id,
+        session,
+        # Revalidate against the exact current provider generation. Do not
+        # evict it here: Claude command inventories can vary across connects.
+        refresh=bool(refresh_native and backend == BACKEND_CODEX),
+    )
+    if snapshot["support"].get("available") is not True:
+        deterministic_transport_mismatch = (
+            backend == BACKEND_CODEX
+            and CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC
+        ) or (
+            backend == BACKEND_CLAUDE
+            and CLAUDE_TRANSPORT == CLAUDE_TRANSPORT_PRINT
+        )
+        if (
+            snapshot["support"].get("mode") == "unsupported"
+            or deterministic_transport_mismatch
+        ):
+            raise ProviderCommandSelectionInvalid(
+                detail="the selected backend cannot run provider commands",
+            )
+        raise ProviderCommandSelectionUnavailable(
+            detail="provider command discovery is temporarily unavailable",
+        )
+    if selection.revision != inventory.revision:
+        raise ProviderCommandSelectionInvalid(
+            detail="the provider command list changed; choose the command again",
+        )
+    record = inventory.resolve(selection.id)
+    if record is None:
+        raise ProviderCommandSelectionInvalid(
+            detail="the selected provider command is no longer available",
+        )
+    invocation = str(record.public.get("invocation") or "")
+    if not provider_command_prompt_matches(prompt, invocation):
+        raise ProviderCommandSelectionInvalid(
+            detail="the selected provider command does not match the message",
+        )
+    return record
+
+
+def codex_provider_command_turn_input(
+    prompt: str,
+    command: ProviderCommandRecord | None,
+) -> list[dict[str, Any]]:
+    """Translate the slash palette token into Codex native structured input."""
+
+    if command is None:
+        return [{"type": "text", "text": prompt, "text_elements": []}]
+    name = str(command.native.get("name") or "")
+    path = str(command.native.get("path") or "")
+    invocation = str(command.public.get("invocation") or "")
+    if not name or not path or not provider_command_prompt_matches(prompt, invocation):
+        raise ValueError("invalid validated Codex skill selection")
+    suffix = prompt[len(invocation):]
+    return [
+        {"type": "text", "text": f"${name}{suffix}", "text_elements": []},
+        {"type": "skill", "name": name, "path": path},
+    ]
+
+
 def redacted_provider_argv(cmd: list[str], backend: str) -> list[str]:
     """Keep generated provider context and user prompts out of stored diagnostics."""
     redacted = list(cmd)
@@ -59396,6 +59790,7 @@ async def run_claude_sdk(
     sess: dict[str, Any],
     manifest_path: Path,
     *,
+    provider_command: ProviderCommandRecord | None = None,
     provider_runtime_env: dict[str, str] | None = None,
 ) -> None:
     """Run Claude on one persistent, chat-owned Agent SDK process."""
@@ -59464,7 +59859,9 @@ async def run_claude_sdk(
         # Force Send therefore follows Stop -> queued start for those runs;
         # retain the legacy native path only for callers without authority.
         "native_steer_queue": (
-            None if provider_runtime_env else native_steer_queue
+            None
+            if provider_runtime_env or provider_command is not None
+            else native_steer_queue
         ),
         "interactive_agent_sdk": True,
         "provider_model": str(sess.get("model") or ""),
@@ -59532,6 +59929,18 @@ async def run_claude_sdk(
         provider_session_id=str(resume_provider_id or ""),
     )
     try:
+        provider_command_start_options = (
+            {
+                "validated_provider_command_name": str(
+                    provider_command.native.get("name") or ""
+                ),
+                "expected_provider_command_generation": str(
+                    provider_command.native.get("control_generation") or ""
+                ),
+            }
+            if provider_command is not None
+            else {}
+        )
         handle = await manager.start_run(
             session_id,
             prompt,
@@ -59539,6 +59948,7 @@ async def run_claude_sdk(
             options=options,
             configuration_key=configuration_key,
             on_supervisor_ready=activate_initial_supervisor,
+            **provider_command_start_options,
             **({"background_task_reconciliation": reconciliation_envelope(initial_reconciliation_batches)}
                if initial_reconciliation_batches else {}),
         )
@@ -60665,6 +61075,7 @@ async def run_claude_sdk(
                             "display_prompt": display_prompt,
                             "file_ids": list(selected.get("file_ids") or []),
                             "queued_id": selected.get("queued_id"),
+                            "skill_selection": selected.get("skill_selection"),
                             "steering_lineage": lineage,
                             "provider_cross_chat_route_snapshot": [
                                 dict(route)
@@ -61115,6 +61526,7 @@ async def run_claude(
     *,
     interactive_agent_sdk: bool = False,
     standalone_provider_context: bool = False,
+    provider_command: ProviderCommandRecord | None = None,
     provider_runtime_env: dict[str, str] | None = None,
 ) -> None:
     use_sdk = bool(
@@ -61123,6 +61535,13 @@ async def run_claude(
         and CLAUDE_TRANSPORT != CLAUDE_TRANSPORT_PRINT
     )
     if not use_sdk:
+        if provider_command is not None:
+            await finish_claude_sdk_start_failure(
+                session_id,
+                run_id,
+                "Claude provider commands require the interactive Agent SDK transport.",
+            )
+            return
         # A compatibility print turn advances the same provider conversation
         # outside the in-memory SDK client. Retire an idle supervisor first so
         # a later desktop SDK turn reconnects from the newly persisted ID
@@ -61164,6 +61583,11 @@ async def run_claude(
             sess,
             manifest_path,
             provider_runtime_env=provider_runtime_env,
+            **(
+                {"provider_command": provider_command}
+                if provider_command is not None
+                else {}
+            ),
         )
     except ClaudeSDKUnavailable as exc:
         # Interactive desktop clients opted into approval/question semantics.
@@ -63019,6 +63443,7 @@ async def run_codex_app_server(
     allow_resume_rollover: bool = True,
     diff_baseline: dict[str, Any] | None = None,
     standalone_provider_context: bool = False,
+    provider_command: ProviderCommandRecord | None = None,
     provider_runtime_env: dict[str, str] | None = None,
 ) -> None:
     runtime_env = validate_provider_runtime_env(provider_runtime_env)
@@ -63855,6 +64280,7 @@ async def run_codex_app_server(
                     "display_prompt": display_prompt,
                     "file_ids": list(selected.get("file_ids") or []),
                     "queued_id": selected.get("queued_id"),
+                    "skill_selection": selected.get("skill_selection"),
                     "steering_lineage": lineage,
                     "provider_cross_chat_route_snapshot": [
                         dict(route)
@@ -64400,7 +64826,9 @@ async def run_codex_app_server(
                 # Stop -> queued fresh-start lifecycle; the thread remains
                 # loaded. Preserve native steer for no-authority callers.
                 "native_steer_queue": (
-                    None if runtime_env else steer_queue
+                    None
+                    if runtime_env or provider_command is not None
+                    else steer_queue
                 ),
                 "stdout_tail": deque(maxlen=LIVE_STDOUT_MAX_LINES),
                 "stdout_total_lines": 0,
@@ -64538,7 +64966,10 @@ async def run_codex_app_server(
                 try:
                     turn = await manager.start_turn(
                         provider_id,
-                        [{"type": "text", "text": prompt, "text_elements": []}],
+                        codex_provider_command_turn_input(
+                            prompt,
+                            provider_command,
+                        ),
                         overrides=overrides,
                         retain_thread_stream=not standalone_provider_context,
                     )
@@ -64888,6 +65319,7 @@ async def run_codex_app_server(
             thread_pinned = False
         can_fallback = (
             allow_exec_fallback
+            and provider_command is None
             and not stop_requested
             and (
                 not turn_start_attempted
@@ -65062,6 +65494,15 @@ async def run_codex_app_server(
                 allow_resume_rollover=False,
                 diff_baseline=current_diff_baseline,
                 standalone_provider_context=standalone_provider_context,
+                provider_command=(
+                    provider_command
+                    if provider_command is not None
+                    and provider_command_prompt_matches(
+                        current_provider_prompt,
+                        str(provider_command.public.get("invocation") or ""),
+                    )
+                    else None
+                ),
                 provider_runtime_env=runtime_env,
             )
             return
@@ -65205,10 +65646,15 @@ async def run_codex(
     *,
     interactive_app_server: bool = False,
     standalone_provider_context: bool = False,
+    provider_command: ProviderCommandRecord | None = None,
     provider_runtime_env: dict[str, str] | None = None,
 ) -> None:
     runtime_env = validate_provider_runtime_env(provider_runtime_env)
     if CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC:
+        if provider_command is not None:
+            raise RuntimeError(
+                "Codex provider skills require the app-server transport"
+            )
         if not standalone_provider_context:
             await mark_codex_exec_context_usage_unavailable(session_id)
         await run_codex_exec(
@@ -65236,9 +65682,15 @@ async def run_codex(
         allow_exec_fallback=(
             CODEX_TRANSPORT == CODEX_TRANSPORT_AUTO
             and not interactive_app_server
+            and provider_command is None
         ),
         interactive_app_server=interactive_app_server,
         provider_runtime_env=runtime_env,
+        **(
+            {"provider_command": provider_command}
+            if provider_command is not None
+            else {}
+        ),
         **(
             {"standalone_provider_context": True}
             if standalone_provider_context
@@ -65707,13 +66159,22 @@ async def _start_turn_locked(
     # Validate user-selected runtime changes before a busy chat durably accepts
     # the message into its queue. Promotion must not be the first place an
     # invalid backend/model/effort or a locked backend switch is discovered.
-    preview_session_runtime_update(
+    runtime_preview_session = preview_session_runtime_update(
         (
             standalone_provider_session(sess)
             if provider_context_mode == "standalone"
             else sess
         ),
         runtime_validation_patch,
+    )
+    resolved_provider_command = await resolve_provider_command_selection(
+        session_id,
+        runtime_preview_session,
+        req.skill_selection,
+        prompt=req.prompt,
+        purpose=req.purpose,
+        provider_context_mode=provider_context_mode,
+        client_capabilities=list(req.client_capabilities),
     )
     if provider_context_goal_is_exhausted(sess, provider_context_mode):
         raise HTTPException(
@@ -65828,6 +66289,11 @@ async def _start_turn_locked(
                 "client_capabilities": list(req.client_capabilities),
                 "chat_references": chat_reference_dicts(req.chat_references),
                 "team_references": team_reference_dicts(req.team_references),
+                "skill_selection": (
+                    req.skill_selection.model_dump()
+                    if req.skill_selection is not None
+                    else None
+                ),
                 "provider_cross_chat_route_snapshot": [
                     dict(route) for route in provider_route_snapshot
                 ],
@@ -66270,6 +66736,22 @@ async def _start_turn_locked(
             # provider exposes an out-of-band per-turn instruction surface.
             provider_prompt += provider_turn_payload.runtime_context
 
+        if req.skill_selection is not None:
+            # Close the gap between the early queue/admission check and the
+            # durable provider-start boundary. Codex force-reloads its native
+            # skill list here; Claude re-reads the exact connected SDK
+            # generation without replacing that supervisor.
+            resolved_provider_command = await resolve_provider_command_selection(
+                session_id,
+                sess,
+                req.skill_selection,
+                prompt=req.prompt,
+                purpose=req.purpose,
+                provider_context_mode=provider_context_mode,
+                client_capabilities=list(req.client_capabilities),
+                refresh_native=backend == BACKEND_CODEX,
+            )
+
         display_prompt = req.display_prompt if req.display_prompt is not None else req.prompt
         started_payload = {
             "run_id": run_id,
@@ -66530,6 +67012,7 @@ async def _start_turn_locked(
                 dict(sess),
                 manifest_path,
                 interactive_app_server=interactive_app_server,
+                provider_command=resolved_provider_command,
                 provider_runtime_env=provider_turn_payload.runtime_env,
                 **(
                     {"standalone_provider_context": True}
@@ -66562,6 +67045,7 @@ async def _start_turn_locked(
                 dict(sess),
                 manifest_path,
                 interactive_agent_sdk=interactive_agent_sdk,
+                provider_command=resolved_provider_command,
                 provider_runtime_env=provider_turn_payload.runtime_env,
                 **(
                     {"standalone_provider_context": True}
@@ -74047,6 +74531,18 @@ async def health() -> dict[str, Any]:
                 "supported_backends": [BACKEND_CLAUDE, BACKEND_CODEX],
             },
             "automatic_pairing_completion_v1": secure_peer_automatic_completion_capability(),
+            "local_provider_commands_v1": {
+                "available": True,
+                "required": False,
+                "version": 1,
+                "endpoint": "/api/sessions/{session_id}/provider-commands",
+                "supported_backends": [BACKEND_CODEX, BACKEND_CLAUDE],
+                "max_items": MAX_PROVIDER_COMMANDS,
+                "message": (
+                    "Session-scoped provider skills and commands are available."
+                ),
+                "action": None,
+            },
             "secure_peer_v1": {
                 "available": bool(AGENT_TOKEN),
                 "state_available": SECURE_PEER_RUNTIME.state_available(),
@@ -78855,6 +79351,24 @@ async def reload_session_provider(session_id: str) -> dict[str, Any]:
 @app.post("/api/sessions/{session_id}/provider/reload")
 async def post_session_provider_reload(session_id: str) -> dict[str, Any]:
     return await reload_session_provider(session_id)
+
+
+@app.get("/api/sessions/{session_id}/provider-commands")
+async def get_session_provider_commands(
+    session_id: str,
+    refresh: bool = Query(default=False),
+) -> dict[str, Any]:
+    """Return one sanitized, session-scoped native command inventory."""
+
+    session = STORE.sessions.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    snapshot, _inventory = await discover_session_provider_commands(
+        session_id,
+        dict(session),
+        refresh=bool(refresh),
+    )
+    return snapshot
 
 
 @app.get("/api/sessions/{session_id}/codex/runtime")

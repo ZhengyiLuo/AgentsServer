@@ -1316,6 +1316,52 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             [(agent_server.project_codex_notification, "thread-native")] * 2,
         )
 
+    async def test_selected_skill_uses_native_text_and_structured_input(self) -> None:
+        turn = FakeTurn([
+            agent_message("msg-final", "Reviewed.", "final_answer"),
+            completed_notification(),
+        ])
+        manager = FakeManager(turn)
+        command = agent_server.ProviderCommandRecord(
+            public={"invocation": "/review"},
+            native={
+                "name": "review",
+                "path": "/private/provider/skills/review/SKILL.md",
+            },
+        )
+        stack, _events, _finished, exec_fallback = self.runner_patches(manager)
+        with stack:
+            await asyncio.wait_for(
+                agent_server.run_codex_app_server(
+                    "chat-native",
+                    "run-original",
+                    "/review focus on authentication",
+                    dict(self.session),
+                    Path(self.cwd) / ".runner-test-manifest.json",
+                    allow_exec_fallback=False,
+                    provider_command=command,
+                ),
+                timeout=2,
+            )
+
+        self.assertEqual(len(manager.turn_calls), 1)
+        self.assertEqual(
+            manager.turn_calls[0][1],
+            [
+                {
+                    "type": "text",
+                    "text": "$review focus on authentication",
+                    "text_elements": [],
+                },
+                {
+                    "type": "skill",
+                    "name": "review",
+                    "path": "/private/provider/skills/review/SKILL.md",
+                },
+            ],
+        )
+        exec_fallback.assert_not_awaited()
+
     async def test_scheduled_run_metadata_is_attached_to_live_reasoning_and_tools(
         self,
     ) -> None:
@@ -5515,6 +5561,12 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             {"cross_chat_envelope_id": "handoff_delivery"},
             {"cross_chat_exchange_id": "exchange_delivery"},
             {"cross_chat_exchange_leg_id": "leg_delivery"},
+            {
+                "skill_selection": {
+                    "id": "pcmd_" + "a" * 32,
+                    "revision": "pcmdrev_" + "b" * 32,
+                }
+            },
             {"provider_cross_chat_route_snapshot": [route]},
         )
 

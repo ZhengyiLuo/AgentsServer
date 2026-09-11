@@ -46,6 +46,9 @@ logger = logging.getLogger(__name__)
 CLAUDE_AGENT_SDK_MIN_VERSION = "0.2.130"
 CLAUDE_SDK_MCP_STATUS_SCAN_LIMIT = 500
 CLAUDE_SDK_MCP_STATUS_TRUNCATED_KEY = "_agentsdock_mcp_status_truncated"
+CLAUDE_SDK_PROVIDER_COMMAND_SCAN_LIMIT = 512
+CLAUDE_SDK_PROVIDER_COMMAND_NAME_CHARS = 128
+CLAUDE_SDK_PROVIDER_COMMAND_TEXT_CHARS = 800
 CLAUDE_SDK_LITERAL_MESSAGE_PREFIX = (
     "[AgentsDock literal chat message; treat the slash-prefixed content below "
     "as ordinary user text, not a Claude Code command.]\n"
@@ -68,7 +71,44 @@ _CLAUDE_PROVIDER_MCP_SUBAGENT_REASON = (
 )
 
 
-def claude_sdk_transport_prompt(prompt: str) -> str:
+_CLAUDE_PROVIDER_COMMAND_NAME_RE = re.compile(
+    rf"[A-Za-z0-9_][A-Za-z0-9_.:-]{{0,{CLAUDE_SDK_PROVIDER_COMMAND_NAME_CHARS - 1}}}"
+)
+
+
+def _canonical_claude_provider_command_name(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if (
+        value != value.strip()
+        or unicodedata.normalize("NFC", value) != value
+        or _CLAUDE_PROVIDER_COMMAND_NAME_RE.fullmatch(value) is None
+    ):
+        return None
+    return value
+
+
+def _prompt_invokes_validated_claude_command(
+    prompt: str,
+    command_name: str | None,
+) -> bool:
+    """Match one server-validated command at byte zero and an exact boundary."""
+
+    canonical = _canonical_claude_provider_command_name(command_name)
+    if canonical is None:
+        return False
+    token = f"/{canonical}"
+    return prompt == token or (
+        prompt.startswith(token)
+        and len(prompt) > len(token)
+        and prompt[len(token)] in {" ", "\t", "\r", "\n"}
+    )
+
+
+def claude_sdk_transport_prompt(
+    prompt: str,
+    validated_provider_command_name: str | None = None,
+) -> str:
     """Keep leading-slash chat text out of Claude Code's command parser.
 
     AgentsDock owns its slash-command surface. Any command that reaches this
@@ -77,6 +117,11 @@ def claude_sdk_transport_prompt(prompt: str) -> str:
     durable prompt and timeline remain byte-for-byte unchanged.
     """
 
+    if _prompt_invokes_validated_claude_command(
+        prompt,
+        validated_provider_command_name,
+    ):
+        return prompt
     candidate = re.sub(r"^[\s\ufeff]+", "", prompt)
     if not candidate.startswith("/"):
         return prompt
@@ -180,6 +225,8 @@ class ClaudeSDKClientProtocol(Protocol):
     async def get_context_usage(self) -> dict[str, Any]: ...
 
     async def get_mcp_status(self) -> dict[str, Any]: ...
+
+    async def get_server_info(self) -> dict[str, Any]: ...
 
     async def reconnect_mcp_server(self, server_name: str) -> None: ...
 
@@ -405,6 +452,7 @@ def _is_matching_replay_ack(message: Any, correlation_id: str) -> bool:
 async def _query_message_stream(
     prompt: str,
     correlation_id: str,
+    validated_provider_command_name: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Yield the single UUID-bearing SDK stdin frame for one logical turn."""
 
@@ -412,7 +460,10 @@ async def _query_message_stream(
         "type": "user",
         "message": {
             "role": "user",
-            "content": claude_sdk_transport_prompt(prompt),
+            "content": claude_sdk_transport_prompt(
+                prompt,
+                validated_provider_command_name,
+            ),
         },
         "parent_tool_use_id": None,
         "uuid": correlation_id,
@@ -967,7 +1018,7 @@ class ClaudeSDKRunHandle:
         return await asyncio.shield(self._terminal)
 
     async def wait_acknowledged(self) -> None:
-        """Wait until the CLI replays this query's exact UUID-bearing frame."""
+        """Wait for replay ownership, or validated command acceptance."""
 
         self._check_loop()
         await self._acknowledged_event.wait()
@@ -1008,6 +1059,20 @@ class ClaudeSDKRunHandle:
         self._acknowledged_event.set()
         return True
 
+    def _mark_acknowledged_without_replay(self) -> None:
+        """Open the stream gate for a validated local slash command.
+
+        Claude Code local commands bypass the ordinary query replay loop and
+        therefore do not emit the UUID-bearing ``UserMessage`` used as the
+        ownership fence for normal prompts. The actor calls this only after a
+        server-validated raw command has been accepted by ``client.query``.
+        """
+
+        if self._acknowledged:
+            return
+        self._acknowledged = True
+        self._acknowledged_event.set()
+
     def _finish(self, terminal: Any) -> None:
         if self.done:
             return
@@ -1045,6 +1110,8 @@ class _StartRun:
     prompt: str
     run_id: str
     query_session_id: str | None
+    validated_provider_command_name: str | None
+    expected_provider_command_generation: str | None
     on_supervisor_ready: SupervisorReadyCallback | None
     response: asyncio.Future[ClaudeSDKRunHandle]
     background_task_reconciliation: dict[str, Any] | None = None
@@ -1063,6 +1130,12 @@ class _GetContextUsage:
 
 @dataclass
 class _GetMCPStatus:
+    response: asyncio.Future[tuple[dict[str, Any], str]]
+    cancelled: bool = False
+
+
+@dataclass
+class _GetServerInfo:
     response: asyncio.Future[tuple[dict[str, Any], str]]
     cancelled: bool = False
 
@@ -1242,6 +1315,8 @@ class ClaudeSDKSupervisor:
         *,
         run_id: str,
         query_session_id: str | None = None,
+        validated_provider_command_name: str | None = None,
+        expected_provider_command_generation: str | None = None,
         on_supervisor_ready: SupervisorReadyCallback | None = None,
         background_task_reconciliation: dict[str, Any] | None = None,
     ) -> ClaudeSDKRunHandle:
@@ -1259,6 +1334,16 @@ class ClaudeSDKSupervisor:
                 query_session_id=(
                     str(query_session_id)
                     if query_session_id is not None
+                    else None
+                ),
+                validated_provider_command_name=(
+                    str(validated_provider_command_name)
+                    if validated_provider_command_name is not None
+                    else None
+                ),
+                expected_provider_command_generation=(
+                    str(expected_provider_command_generation)
+                    if expected_provider_command_generation is not None
                     else None
                 ),
                 on_supervisor_ready=on_supervisor_ready,
@@ -1300,6 +1385,21 @@ class ClaudeSDKSupervisor:
             # The manager retires this exact supervisor before allowing a
             # replacement. Marking the queued command also prevents a control
             # that has not started yet from running after its HTTP caller left.
+            command.cancelled = True
+            response.cancel()
+            raise
+
+    async def get_server_info(self) -> tuple[dict[str, Any], str]:
+        """Return a bounded command projection from cached SDK initialization."""
+
+        loop = self._ensure_actor()
+        response: asyncio.Future[tuple[dict[str, Any], str]] = loop.create_future()
+        command = _GetServerInfo(response=response)
+        assert self._commands is not None
+        await self._commands.put(command)
+        try:
+            return await asyncio.shield(response)
+        except asyncio.CancelledError:
             command.cancelled = True
             response.cancel()
             raise
@@ -1677,6 +1777,18 @@ class ClaudeSDKSupervisor:
                 )
             return
         self._active_run = None
+        raw_provider_command = command.validated_provider_command_name is not None
+        if raw_provider_command and not _prompt_invokes_validated_claude_command(
+            command.prompt,
+            command.validated_provider_command_name,
+        ):
+            if not command.response.done():
+                command.response.set_exception(
+                    ClaudeSDKSupervisorError(
+                        "validated Claude provider command does not match the prompt"
+                    )
+                )
+            return
         if self._background_reconciliation_hook is not None and self._background_reconciliation_hook.pending is not None:
             # UserPromptSubmit has no query UUID. If a prior submission never
             # reached its hook, reconnect instead of rebinding a late callback
@@ -1687,6 +1799,18 @@ class ClaudeSDKSupervisor:
         except Exception as exc:
             if not command.response.done():
                 command.response.set_exception(exc)
+            return
+        expected_generation = command.expected_provider_command_generation
+        if (
+            expected_generation is not None
+            and self.control_generation != expected_generation
+        ):
+            if not command.response.done():
+                command.response.set_exception(
+                    ClaudeSDKGenerationChanged(
+                        "Claude SDK provider-command generation changed before launch"
+                    )
+                )
             return
 
         if command.background_task_reconciliation is not None and self._background_reconciliation_hook is None:
@@ -1744,7 +1868,12 @@ class ClaudeSDKSupervisor:
             if provider_id is None or provider_id == "default":
                 provider_id = self.options.get("resume") if isinstance(self.options, dict) else getattr(self.options, "resume", None)
             background_hook.bind(
-                handle, claude_sdk_transport_prompt(command.prompt), _receipt_field(provider_id),
+                handle,
+                claude_sdk_transport_prompt(
+                    command.prompt,
+                    command.validated_provider_command_name,
+                ),
+                _receipt_field(provider_id),
                 lambda: self._active_run is handle and not self._closed
                 and self._background_reconciliation_hook is background_hook,
             )
@@ -1756,14 +1885,22 @@ class ClaudeSDKSupervisor:
             if command.query_session_id is None:
                 await self._deliver_query_bounded(
                     client.query(
-                        _query_message_stream(command.prompt, correlation_id)
+                        _query_message_stream(
+                            command.prompt,
+                            correlation_id,
+                            command.validated_provider_command_name,
+                        )
                     ),
                     run_id=command.run_id,
                 )
             else:
                 await self._deliver_query_bounded(
                     client.query(
-                        _query_message_stream(command.prompt, correlation_id),
+                        _query_message_stream(
+                            command.prompt,
+                            correlation_id,
+                            command.validated_provider_command_name,
+                        ),
                         session_id=command.query_session_id,
                     ),
                     run_id=command.run_id,
@@ -1790,8 +1927,15 @@ class ClaudeSDKSupervisor:
             # session through a fresh client.
             await self._disconnect_current_client()
             return
+        if raw_provider_command:
+            # Claude local slash commands do not replay the submitted UUID.
+            # Open the receive gate only after query delivery succeeds; any
+            # messages queued by the receiver are actor-serialized behind this
+            # point and will then belong to this exact accepted command.
+            handle._mark_acknowledged_without_replay()
         handle._mark_accepted()
-        self._schedule_ack_timeout(handle)
+        if not raw_provider_command:
+            self._schedule_ack_timeout(handle)
         if not command.response.done():
             command.response.set_result(handle)
 
@@ -1859,6 +2003,113 @@ class ClaudeSDKSupervisor:
         self._last_used_at = time.monotonic()
         if not command.response.done():
             command.response.set_result(dict(value) if isinstance(value, dict) else None)
+
+    @staticmethod
+    def _provider_commands_from_server_info(value: Any) -> dict[str, Any]:
+        """Project only bounded command fields from SDK initialization data.
+
+        The raw object also contains account, organization, process, model and
+        agent metadata. Keeping the allowlist inside the owning actor prevents
+        that data from crossing the SDK boundary accidentally.
+        """
+
+        if not isinstance(value, dict):
+            raise ClaudeSDKSupervisorError(
+                "Claude SDK returned invalid server information"
+            )
+        raw_commands = value.get("commands")
+        if not isinstance(raw_commands, list):
+            raise ClaudeSDKUnavailable(
+                "installed claude-agent-sdk does not expose provider commands"
+            )
+        projected: list[dict[str, str]] = []
+        scan_count = min(
+            len(raw_commands),
+            CLAUDE_SDK_PROVIDER_COMMAND_SCAN_LIMIT,
+        )
+        for item in raw_commands[:scan_count]:
+            if not isinstance(item, dict):
+                continue
+            name = _canonical_claude_provider_command_name(item.get("name"))
+            if name is None:
+                continue
+            command: dict[str, str] = {"name": name}
+            for source_key in ("description", "argumentHint"):
+                raw_text = item.get(source_key)
+                if not isinstance(raw_text, str):
+                    continue
+                normalized = unicodedata.normalize("NFC", raw_text)
+                bounded = "".join(
+                    character
+                    for character in normalized
+                    if character in {"\n", "\r", "\t"}
+                    or unicodedata.category(character)
+                    not in {"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"}
+                )
+                bounded = " ".join(bounded.split())[
+                    :CLAUDE_SDK_PROVIDER_COMMAND_TEXT_CHARS
+                ]
+                if bounded:
+                    command[source_key] = bounded
+            projected.append(command)
+        return {
+            "commands": projected,
+            "_agentsdock_provider_commands_truncated": bool(
+                len(raw_commands) > scan_count or len(projected) < scan_count
+            ),
+        }
+
+    async def _server_info_operation(self) -> tuple[dict[str, Any], str]:
+        background_hook = self._background_reconciliation_hook
+        if (
+            not self.is_active
+            and background_hook is not None
+            and background_hook.pending is not None
+        ):
+            await self._disconnect_current_client()
+        client = await self._ensure_client()
+        getter = getattr(client, "get_server_info", None)
+        if not callable(getter):
+            raise ClaudeSDKUnavailable(
+                "installed claude-agent-sdk does not support provider commands"
+            )
+        raw_value = await getter()
+        value = self._provider_commands_from_server_info(raw_value)
+        generation = self.control_generation
+        if generation is None:
+            raise ClaudeSDKSupervisorError(
+                f"Claude SDK client for {self.chat_id} changed during server info"
+            )
+        return value, generation
+
+    async def _handle_get_server_info(self, command: _GetServerInfo) -> None:
+        if command.cancelled:
+            if not command.response.done():
+                command.response.cancel()
+            return
+        try:
+            value, generation = await self._mcp_control_bounded(
+                self._server_info_operation(),
+                label="provider-commands",
+                # A cached initialization read must never interrupt a live run.
+                retire_on_timeout=not self.is_active,
+            )
+        except (ClaudeSDKUnavailable, ClaudeSDKControlTimeout) as exc:
+            if not command.response.done():
+                command.response.set_exception(exc)
+            return
+        except Exception as exc:
+            if not command.response.done():
+                command.response.set_exception(
+                    ClaudeSDKSupervisorError(
+                        f"Claude SDK provider command discovery failed for "
+                        f"{self.chat_id}: {exc}"
+                    )
+                )
+            return
+        self._last_used_at = time.monotonic()
+        if not command.response.done():
+            command.response.set_result((value, generation))
 
     async def _mcp_control_bounded(
         self,
@@ -2247,6 +2498,8 @@ class ClaudeSDKSupervisor:
                     await self._handle_get_context_usage(command)
                 elif isinstance(command, _GetMCPStatus):
                     await self._handle_get_mcp_status(command)
+                elif isinstance(command, _GetServerInfo):
+                    await self._handle_get_server_info(command)
                 elif isinstance(command, _MutateMCPServer):
                     await self._handle_mutate_mcp_server(command)
                 elif isinstance(command, _ReceivedMessage):
@@ -2476,6 +2729,8 @@ class ClaudeSDKSupervisorManager:
         options: Any,
         configuration_key: str,
         query_session_id: str | None = None,
+        validated_provider_command_name: str | None = None,
+        expected_provider_command_generation: str | None = None,
         on_supervisor_ready: SupervisorReadyCallback | None = None,
         background_task_reconciliation: dict[str, Any] | None = None,
     ) -> ClaudeSDKRunHandle:
@@ -2503,6 +2758,10 @@ class ClaudeSDKSupervisorManager:
                 prompt,
                 run_id=run_id,
                 query_session_id=query_session_id,
+                validated_provider_command_name=validated_provider_command_name,
+                expected_provider_command_generation=(
+                    expected_provider_command_generation
+                ),
                 on_supervisor_ready=on_supervisor_ready,
                 background_task_reconciliation=background_task_reconciliation,
             )
@@ -2739,6 +2998,54 @@ class ClaudeSDKSupervisorManager:
                 await self._retire_exact_supervisor(
                     clean_chat_id,
                     supervisor,
+                )
+            await self._unpin_mcp_supervisor(clean_chat_id, supervisor)
+
+    async def get_server_info(
+        self,
+        chat_id: str,
+        *,
+        options: Any,
+        configuration_key: str,
+    ) -> tuple[dict[str, Any], str]:
+        """Read a bounded provider-command snapshot from an exact owner."""
+
+        clean_chat_id = str(chat_id)
+        supervisor = await self._pin_mcp_supervisor(
+            clean_chat_id,
+            options=options,
+            configuration_key=configuration_key,
+        )
+        retire = False
+        try:
+            try:
+                info, generation = await supervisor.get_server_info()
+            except ClaudeSDKControlTimeout:
+                # Never retire or interrupt a supervisor that owns a live run.
+                retire = not supervisor.is_active
+                raise
+            except asyncio.CancelledError:
+                retire = not supervisor.is_active
+                raise
+            assert self._lock is not None
+            async with self._lock:
+                if (
+                    self._supervisors.get(clean_chat_id) is not supervisor
+                    or supervisor.closed
+                    or supervisor.control_generation != generation
+                ):
+                    raise ClaudeSDKGenerationChanged(
+                        "Claude SDK provider-command generation changed for chat "
+                        f"{clean_chat_id}"
+                    )
+                self._supervisors.move_to_end(clean_chat_id)
+            return dict(info), str(generation)
+        finally:
+            if retire:
+                await self._retire_exact_supervisor(
+                    clean_chat_id,
+                    supervisor,
+                    task_name_prefix="claude-sdk-provider-command-retire",
                 )
             await self._unpin_mcp_supervisor(clean_chat_id, supervisor)
 

@@ -1375,6 +1375,74 @@ class QueuedTurnEditTests(unittest.IsolatedAsyncioTestCase):
             agent_server.STORE.sessions = original_sessions
             agent_server.QUEUED_TURNS = original_queue
 
+    async def test_edit_keeps_selection_for_same_token_and_clears_changed_token(self) -> None:
+        original_sessions = agent_server.STORE.sessions
+        original_queue = agent_server.QUEUED_TURNS
+        selection = {
+            "id": "pcmd_" + "a" * 32,
+            "revision": "pcmdrev_" + "b" * 32,
+        }
+        item = {
+            "queued_id": "queued-provider-command-edit",
+            "prompt": "/review first focus",
+            "display_prompt": "/review first focus",
+            "file_ids": [],
+            "backend": "codex",
+            "skill_selection": dict(selection),
+            "chat_references": [],
+            "team_references": [],
+            "client_capabilities": [],
+            "provider_cross_chat_route_snapshot": [],
+            "secure_peer_route_snapshots": [],
+            "cross_chat_obligation_ids": [],
+            "cross_chat_exchange_ids": [],
+        }
+        append = AsyncMock(return_value={})
+        try:
+            agent_server.STORE.sessions = {
+                "chat-edit": {
+                    "id": "chat-edit",
+                    "title": "Edit",
+                    "backend": "codex",
+                }
+            }
+            agent_server.QUEUED_TURNS = {"chat-edit": deque([item])}
+            with (
+                patch.object(
+                    agent_server,
+                    "managed_server_update_blocker",
+                    return_value=None,
+                ),
+                patch.object(agent_server, "append_durable_event", append),
+            ):
+                kept = await agent_server.update_queued_turn(
+                    "chat-edit",
+                    "queued-provider-command-edit",
+                    agent_server.UpdateQueuedTurnRequest(
+                        prompt="/review different focus"
+                    ),
+                )
+                cleared = await agent_server.update_queued_turn(
+                    "chat-edit",
+                    "queued-provider-command-edit",
+                    agent_server.UpdateQueuedTurnRequest(
+                        prompt="/other different focus"
+                    ),
+                )
+
+            self.assertEqual(kept["item"]["skill_selection"], selection)
+            self.assertIsNone(cleared["item"]["skill_selection"])
+            self.assertEqual(
+                append.await_args_list[0].args[2]["skill_selection"],
+                selection,
+            )
+            self.assertIsNone(
+                append.await_args_list[1].args[2]["skill_selection"]
+            )
+        finally:
+            agent_server.STORE.sessions = original_sessions
+            agent_server.QUEUED_TURNS = original_queue
+
 
 class ProviderTurnTaskRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_delayed_provider_bind_cannot_replace_successor_for_any_transport(
@@ -2816,6 +2884,147 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
             "saved Team target configuration is invalid",
         )
         self.assertNotIn("chat-1", agent_server.QUEUED_TURNS)
+
+    async def test_stale_provider_selection_is_unqueued_and_next_fifo_item_runs(self) -> None:
+        agent_server.CURRENT_TURNS.clear()
+        stale = {
+            "queued_id": "queued-stale-provider-command",
+            "prompt": "/review staged files",
+            "file_ids": [],
+            "backend": "codex",
+            "skill_selection": {
+                "id": "pcmd_" + "a" * 32,
+                "revision": "pcmdrev_" + "b" * 32,
+            },
+        }
+        successor = {
+            "queued_id": "queued-successor",
+            "prompt": "Continue with the next task",
+            "file_ids": [],
+            "backend": "codex",
+        }
+        agent_server.QUEUED_TURNS["chat-1"] = deque([stale, successor])
+        start = AsyncMock(side_effect=[
+            agent_server.ProviderCommandSelectionInvalid(
+                "the provider command list changed; choose the command again"
+            ),
+            {"run_id": "run-successor", "queued": False},
+        ])
+        durable = AsyncMock(return_value={})
+        visible = AsyncMock(return_value={})
+        scheduled: list[asyncio.Task[None]] = []
+
+        def schedule(session_id: str) -> None:
+            scheduled.append(asyncio.create_task(start_next_queued_turn(session_id)))
+
+        with (
+            patch.object(
+                agent_server,
+                "wait_for_queue_recovery_admission",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "reconcile_idle_queue_session",
+                AsyncMock(return_value=False),
+            ),
+            patch.object(agent_server, "_start_turn_locked", start),
+            patch.object(agent_server, "append_durable_event", durable),
+            patch.object(agent_server, "append_event", visible),
+            patch.object(agent_server, "schedule_next_queued_turn", schedule),
+        ):
+            await asyncio.create_task(start_next_queued_turn("chat-1"))
+            self.assertEqual(len(scheduled), 1)
+            await asyncio.gather(*scheduled)
+
+        self.assertEqual(start.await_count, 2)
+        self.assertIsNotNone(start.await_args_list[0].args[1].skill_selection)
+        self.assertIsNone(start.await_args_list[1].args[1].skill_selection)
+        self.assertNotIn("chat-1", agent_server.QUEUED_TURNS)
+        unqueued = [
+            call
+            for call in durable.await_args_list
+            if call.args[1] == "turn_unqueued"
+        ]
+        self.assertEqual(len(unqueued), 1)
+        self.assertEqual(
+            unqueued[0].args[2]["queued_id"],
+            "queued-stale-provider-command",
+        )
+        self.assertTrue(any(
+            call.args[1] == "error"
+            and "choose it again" in str(call.args[2].get("message") or "")
+            for call in visible.await_args_list
+        ))
+
+    async def test_unavailable_provider_selection_cannot_pin_fifo(self) -> None:
+        agent_server.CURRENT_TURNS.clear()
+        unavailable = {
+            "queued_id": "queued-unavailable-provider-command",
+            "prompt": "/review staged files",
+            "file_ids": [],
+            "backend": "codex",
+            "skill_selection": {
+                "id": "pcmd_" + "a" * 32,
+                "revision": "pcmdrev_" + "b" * 32,
+            },
+        }
+        successor = {
+            "queued_id": "queued-successor",
+            "prompt": "Continue with the next task",
+            "file_ids": [],
+            "backend": "codex",
+        }
+        agent_server.QUEUED_TURNS["chat-1"] = deque([
+            unavailable,
+            successor,
+        ])
+        start = AsyncMock(side_effect=[
+            agent_server.ProviderCommandSelectionUnavailable(
+                "provider command discovery is temporarily unavailable"
+            ),
+            {"run_id": "run-successor", "queued": False},
+        ])
+        durable = AsyncMock(return_value={})
+        scheduled: list[asyncio.Task[None]] = []
+
+        def schedule(session_id: str) -> None:
+            scheduled.append(asyncio.create_task(start_next_queued_turn(session_id)))
+
+        with (
+            patch.object(
+                agent_server,
+                "wait_for_queue_recovery_admission",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "reconcile_idle_queue_session",
+                AsyncMock(return_value=False),
+            ),
+            patch.object(agent_server, "_start_turn_locked", start),
+            patch.object(agent_server, "append_durable_event", durable),
+            patch.object(agent_server, "append_event", AsyncMock(return_value={})),
+            patch.object(agent_server, "schedule_next_queued_turn", schedule),
+        ):
+            await asyncio.create_task(start_next_queued_turn("chat-1"))
+            self.assertEqual(len(scheduled), 1)
+            await asyncio.gather(*scheduled)
+
+        self.assertEqual(start.await_count, 2)
+        self.assertIsNotNone(start.await_args_list[0].args[1].skill_selection)
+        self.assertIsNone(start.await_args_list[1].args[1].skill_selection)
+        self.assertNotIn("chat-1", agent_server.QUEUED_TURNS)
+        unqueued = [
+            call
+            for call in durable.await_args_list
+            if call.args[1] == "turn_unqueued"
+        ]
+        self.assertEqual(len(unqueued), 1)
+        self.assertEqual(
+            unqueued[0].args[2]["queued_id"],
+            "queued-unavailable-provider-command",
+        )
 
     async def test_scheduler_discards_routed_turn_with_hidden_display_prompt(self) -> None:
         agent_server.CURRENT_TURNS.clear()

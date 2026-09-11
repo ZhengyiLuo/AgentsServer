@@ -120,6 +120,27 @@ class AssistantReplayRepairTests(unittest.TestCase):
         self.cache.forget("chat-one")
         self.assertTrue(self.prepare())
 
+    def test_historical_page_repairs_assistant_without_changing_global_signature(self):
+        self.prepare(oversized=True)
+        end = self.events.stat().st_size
+        with self.events.open("ab") as stream:
+            stream.write(encode([{"seq": 200 + index, "type": "raw_event", "raw": "x" * 1000}
+                                 for index in range(24)]))
+        self.cache.forget("chat-one")
+        with patch.object(repair, "MAX_EVENTS_BYTES", 8192):
+            window = self.cache.prepare_window("chat-one", "provider-one", self.events, self.root,
+                                                lambda row: None, event_window_end=end,
+                                                normalize_full_user=lambda row: None)
+        result = window.project_event(self.imported)
+        self.assertEqual(result["provider_history_repair"], "source_proven_assistant_replay")
+        self.assertEqual(result["text"], "")
+        self.assertEqual(self.imported["text"], "Full public report ending.")
+        self.assertEqual(self.cache.signature("chat-one"), frozenset())
+        for row in self.rows:
+            if row is not self.imported:
+                self.assertIsNone(window.project_event(row))
+        self.assertIsNone(window.project_event({**self.imported, "session_id": "other-chat"}))
+
 
 if __name__ == "__main__":
     unittest.main()

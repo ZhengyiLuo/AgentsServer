@@ -59,6 +59,7 @@ def load_index(path: Path):
         "STORE": SimpleNamespace(sessions={"recipient": {"backend": "codex"}, "sender": {"backend": "claude"}}),
         "events_path": lambda _session_id: path,
         "prepare_provider_history_metadata_repair": lambda _session_id: None,
+        "prepare_claude_history_metadata_repair": lambda _session_id, **_kwargs: None,
         "CLAUDE_METADATA_REPAIR_CACHE": SimpleNamespace(signature=lambda _session_id: ()),
         "CODEX_GOAL_HISTORY_REPAIR_CACHE": SimpleNamespace(signature=lambda _session_id: ()),
         "session_codex_thread_id": lambda _session: "",

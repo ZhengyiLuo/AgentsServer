@@ -30920,7 +30920,9 @@ def prepare_codex_goal_history_repair(session_id: str) -> None:
         HISTORY_SEARCH_DIRTY.add(session_id)
 
 
-def prepare_claude_history_metadata_repair(session_id: str, *, refresh: bool = False) -> None:
+def prepare_claude_history_metadata_repair(
+    session_id: str, *, refresh: bool = False, event_window_end: int | None = None,
+):
     """Prove old metadata only for a requested chat, never during event egress.
 
     This bounded read is called once at history-read/cache-build boundaries.
@@ -30956,6 +30958,15 @@ def prepare_claude_history_metadata_repair(session_id: str, *, refresh: bool = F
         return strip_agentsdock_generated_user_text(
             message_text(source_event.get("message"), compact=False),
             expected_session_id=session_id, provider_history=True,
+        )
+
+    if event_window_end is not None:
+        # Page-local proof must not change the global index signature: learning
+        # about an older import is not a reason to rebuild the entire transcript.
+        return CLAUDE_METADATA_REPAIR_CACHE.prepare_window(
+            session_id, provider_id, events_path(session_id), CLAUDE_PROJECTS_ROOT,
+            normalize_legacy_user, event_window_end=event_window_end,
+            normalize_full_user=normalize_full_user,
         )
 
     changed = CLAUDE_METADATA_REPAIR_CACHE.prepare(
@@ -33435,6 +33446,7 @@ def collect_semantic_timeline_events(
     fork_internal_run_ids: set[str],
     internal_status_run_ids: set[str],
     event_limit: int,
+    history_repair_window=None,
 ) -> list[dict[str, Any]]:
     if not selected:
         return []
@@ -33451,6 +33463,7 @@ def collect_semantic_timeline_events(
     events_by_key: dict[str, list[dict[str, Any]]] = {
         key: [] for key in selected_by_key if key not in selected_jobs
     }
+    page_repairs: list[dict[str, Any]] = []
     native_steer_retired_keys: set[str] = set()
     stopped_turn_keys: set[str] = set()
     current_turn_by_run: dict[str, str] = {}
@@ -33488,6 +33501,19 @@ def collect_semantic_timeline_events(
                 continue
             if not is_client_visible_event(event):
                 continue
+            page_repaired = False
+            if history_repair_window is not None:
+                repaired = history_repair_window.project_event(event)
+                if repaired is not None:
+                    event = repaired
+                    page_repaired = True
+                elif history_repair_window.is_hidden(event):
+                    event = {
+                        **event, "prompt": "",
+                        "provider_history_repair": "source_proven_import",
+                        TIMELINE_IMPORTED_PROMPT_HIDDEN_FIELD: True,
+                    }
+                    page_repaired = True
             event = project_legacy_imported_provider_event(event, session_id)
             hidden_imported_prompt = bool(
                 event.get(TIMELINE_IMPORTED_PROMPT_HIDDEN_FIELD)
@@ -33655,6 +33681,10 @@ def collect_semantic_timeline_events(
 
             if not key or key not in selected_by_key:
                 continue
+            if page_repaired:
+                # Same-ID empty records replace already-cached bogus bubbles.
+                # Simply omitting these rows leaves older desktop caches dirty.
+                page_repairs.append(client_safe_event(event))
             if hidden_imported_prompt:
                 # The event already updated logical-turn routing above. Its
                 # provider-only prompt is not part of the semantic response.
@@ -33872,6 +33902,9 @@ def collect_semantic_timeline_events(
         deduplicated[identity] = event
         return True
 
+    for event in page_repairs:
+        append_with_limit(event, event_limit)
+
     # Every selected semantic item gets one representative before any item
     # receives detail. The page-size clamp in read_semantic_timeline_page()
     # guarantees that this baseline always fits.
@@ -34041,9 +34074,22 @@ def read_semantic_timeline_page(
             if tail or len(selected_landmarks) < limit:
                 selected_landmarks.append(landmark)
         selected = []
+        import_window_ends = []
+        run_history_records = cached.get("run_history_records") or {}
+        run_history_keys = cached.get("run_history_keys_by_run_id") or {}
         for landmark in selected_landmarks:
             key = str(landmark.get("key") or "")
             record = records_by_key.get(key) or {}
+            if key.startswith("turn:import_"):
+                # Repeated user rows in a single import share one run. Its last
+                # indexed occurrence includes the terminal after the checkpoint.
+                # Reuse those byte bounds; never scan from the start to find it.
+                run_id = key.removeprefix("turn:").split(":start-", 1)[0]
+                for history_key in (run_history_keys.get(run_id) or [])[-1:]:
+                    history = run_history_records.get(history_key) or {}
+                    end_offset = history.get("end_offset")
+                    if type(end_offset) is int and end_offset > 0:
+                        import_window_ends.append(end_offset)
             selected.append({
                 **dict(landmark),
                 "_semantic_original_start_seq": int(
@@ -34064,6 +34110,14 @@ def read_semantic_timeline_page(
             omitted_after = max(0, eligible_count - len(selected))
     with TIMELINE_INDEX_CACHE_LOCK:
         evict_timeline_index_cache_locked()
+    # One bounded, cached proof on an explicit older-page read. No timer,
+    # background poll, full-log repair pass, or provider-history mutation.
+    history_repair_window = (
+        prepare_claude_history_metadata_repair(
+            session_id, event_window_end=max(import_window_ends),
+        )
+        if import_window_ends else None
+    )
     events = collect_semantic_timeline_events(
         session_id,
         selected,
@@ -34080,6 +34134,7 @@ def read_semantic_timeline_page(
         ),
         fork_internal_run_ids=fork_internal_run_ids,
         internal_status_run_ids=internal_status_run_ids,
+        history_repair_window=history_repair_window,
         event_limit=min(
             MAX_EVENT_RESPONSE_LIMIT,
             sum(

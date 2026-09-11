@@ -197,6 +197,93 @@ class RecentScheduledRepairTests(unittest.TestCase):
             self.assertTrue(self.prepare())
             self.assertTrue(self.cache.is_hidden("chat-one", self.imported[0]))
 
+    def prepare_window(self, end):
+        return self.cache.prepare_window("chat-one", "provider-one", self.events, self.root,
+                                         lambda row: row.get("text", "")[:48], event_window_end=end,
+                                         normalize_full_user=lambda row: row.get("text"))
+
+    def test_old_page_window_preserves_tail_cache_and_same_prefix_human(self):
+        self.fixture(human=True, extra_row=True)
+        end = self.events.stat().st_size
+        with self.events.open("ab") as stream:
+            stream.write(encode([{"seq": 100 + index, "type": "raw_event", "raw": "x" * 1000}
+                                 for index in range(24)]))
+        with self.source.open("ab") as stream:
+            stream.write(encode([{"type": "progress", "data": "x" * 1000}] * 24))
+        self.assertFalse(self.prepare())
+        signature = self.cache.signature("chat-one")
+        reads = []
+        original = repair._bounded_records
+        def records(path, stamp, start, stop):
+            reads.append((path, start, stop))
+            yield from original(path, stamp, start, stop)
+        with patch.object(repair, "_bounded_records", side_effect=records):
+            window = self.prepare_window(end)
+        self.assertEqual(len(reads), 2)
+        self.assertTrue(all(stop - start <= 8192 for _, start, stop in reads))
+        self.assertEqual(reads[0][2], end)
+        self.assertTrue(window.is_hidden(self.imported[0]))
+        self.assertFalse(window.is_hidden(self.imported[1]))
+        self.assertFalse(window.is_hidden({**self.imported[0], "session_id": "other-chat"}))
+        self.assertIsNone(window.project_event(self.terminal))
+        self.assertFalse(self.cache.is_hidden("chat-one", self.imported[0]))
+        self.assertEqual(self.cache.signature("chat-one"), signature)
+        with patch.object(repair, "_bounded_records", side_effect=AssertionError("Repeated page scan")):
+            self.assertIs(self.prepare_window(end), window)
+        with patch.object(repair, "_regular_stamp", side_effect=AssertionError("Per-event I/O")):
+            self.assertTrue(window.is_hidden(self.imported[0]))
+            self.assertIsNone(window.project_event(self.terminal))
+
+    def test_page_window_negative_cache_forget_and_lru(self):
+        self.fixture()
+        self.imported[0].pop("provider_origin")
+        self.events.write_bytes(encode(self.rows))
+        end = self.events.stat().st_size
+        missing = self.prepare_window(end)
+        self.assertFalse(missing.is_hidden(self.imported[0]))
+        with patch.object(repair, "_bounded_records", side_effect=AssertionError("Repeated negative scan")):
+            self.assertIs(self.prepare_window(end), missing)
+        with patch.object(repair, "MAX_WINDOWS", 2):
+            self.prepare_window(end - 1)
+            self.prepare_window(end - 2)
+        self.assertEqual(len(self.cache._windows), 2)
+        self.cache.forget("chat-one")
+        self.assertEqual(len(self.cache._windows), 0)
+        self.assertIsNot(self.prepare_window(end), missing)
+
+    def test_page_window_reproves_growth_and_source_or_event_rewrites(self):
+        self.fixture()
+        end = self.events.stat().st_size
+        first = self.prepare_window(end)
+        self.assertTrue(first.is_hidden(self.imported[0]))
+        with self.events.open("ab") as stream:
+            stream.write(encode([{"seq": 100, "type": "raw_event"}]))
+        grown = self.prepare_window(end)
+        self.assertIsNot(grown, first)
+        self.assertTrue(grown.is_hidden(self.imported[0]))
+        with self.source.open("ab") as stream:
+            stream.write(encode([{"type": "progress"}]))
+        source_grown = self.prepare_window(end)
+        self.assertIsNot(source_grown, grown)
+        self.assertTrue(source_grown.is_hidden(self.imported[0]))
+        original_source = self.source.read_bytes()
+        self.source.write_bytes(original_source.replace(b"scheduled ending", b"different ending"))
+        self.assertFalse(self.prepare_window(end).is_hidden(self.imported[0]))
+        self.source.write_bytes(original_source)
+        self.cache.forget("chat-one")
+        self.assertTrue(self.prepare_window(end).is_hidden(self.imported[0]))
+        raw = self.events.read_bytes().replace(b'"purpose": "scheduled_job"', b'"purpose": "ordinary_chat"')
+        self.events.write_bytes(raw)
+        self.assertFalse(self.prepare_window(end).is_hidden(self.imported[0]))
+
+    def test_historical_window_requires_complete_boundaries(self):
+        self.fixture()
+        end = self.events.stat().st_size
+        for boundary in (end - 1, end + 1, 0, True):
+            self.assertFalse(self.prepare_window(boundary).is_hidden(self.imported[0]))
+        with patch.object(repair, "MAX_EVENTS_BYTES", 1700):
+            self.assertFalse(self.prepare_window(end).is_hidden(self.imported[0]))
+
 
 if __name__ == "__main__":
     unittest.main()

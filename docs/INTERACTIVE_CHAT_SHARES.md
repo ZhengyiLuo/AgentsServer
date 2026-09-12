@@ -36,6 +36,11 @@ token to `/redeem`. The ledger atomically permits one redemption and issues a
 separate browser capability in a Secure, HttpOnly, SameSite=Strict, share-path
 cookie. Only token hashes are persisted. Lost cookies require a new invitation;
 redeemed invitation tokens cannot recreate access.
+Reloading an already redeemed URL resumes through the existing browser cookie:
+the viewer reads authenticated state and opens a new scoped stream without
+redeeming again. A new invitation still requires the explicit Open action.
+Browser back/forward-cache restoration reloads instead of reusing a closed
+connection. Expired or revoked browser access cannot be restored this way.
 
 All guest routes remain below `/interactive-chat/{id}`. `/state` returns the
 sanitized native DTO for that one chat: session, timeline events, queue, activity,
@@ -52,7 +57,8 @@ deny subsequent access; an idle stream closes on its next access check.
 POST requests require the exact configured origin and browser CSRF header. Prompt
 fields are only `prompt`, `upload_ids`, and stable `request_id`. Native model,
 backend, references, purpose, force-send, filesystem, and other-chat options are
-not accepted. Uploads are raw bytes with `X-Chat-Filename` and a content type;
+not accepted by the prompt endpoint; the approved same-chat controls use the
+separate action allowlist below. Uploads are raw bytes with `X-Chat-Filename` and a content type;
 responses contain only share-owned upload IDs/name/type/size. Private native file
 references remain in the ledger. Another share, even for the same chat, cannot
 attach those uploads.
@@ -64,8 +70,16 @@ Control receipts use the same durable request ledger as prompts, with an
 operation-specific fingerprint so a prompt receipt cannot authorize a control.
 Fixed read actions are `timeline.older`, `timeline.around`, `timeline.trace`,
 `timeline.index`, `jobs.runs`, and `runtime.catalog`; none accepts a URL or HTTP
-method. They do not create mutation receipts. Runtime discovery is cached and
-demand-driven. Mutations return their sanitized native result in the saved
+method. `handoffs.get` additionally accepts only `{id: envelope_id}` to expand an
+existing cross-chat message. The server checks exact source/target membership
+before its native detail read, then rechecks the returned envelope and participant
+identities. The recipient can receive the revisioned recipient-edited body; a
+sender-only viewer receives the original body without recipient-edit fields.
+Body hashes and conversation/message IDs remain available for the renderer's
+correlation checks. Route-authority fields are removed. This read grants no
+routes, sends no message, marks nothing read, and exposes no other chat's API or
+files. These read actions do not create mutation receipts. Runtime discovery is
+cached and demand-driven. Mutations return their sanitized native result in the saved
 receipt. A typed prevalidation rejection is a durable known denial; arbitrary
 callback exceptions remain indeterminate because a native write may have occurred.
 
@@ -80,12 +94,21 @@ inspect the chat before choosing another request. In-process disconnects shield
 the accepted callback/receipt commit. Failed or indeterminate uploads retain their
 byte reservation because a file might already exist; disconnect does not refund
 quota or create an untracked capability.
+The browser also checks action/request identity in prompt/control acknowledgments.
+A write transport failure, indeterminate receipt, or malformed acknowledgment stops further writes
+from that page, even if live state later arrives. It does not automatically resend
+the action under a new request ID: reopen and inspect the chat before deciding
+what to do next. If acceptance was confirmed but the following state refresh
+fails, the accepted action is still reported as accepted, not offered as a retry.
 
 Bounds are 64 KiB prompt text, four attachments per prompt, 8 MiB per upload,
 64 MiB total uploaded bytes per share, and 2 MiB projected JSON per state/read
 response. Native history uses explicitly bounded pages. Admission bounds are four upload reads, eight ledger workers/submissions,
 and 32 SSE connections. These are resource protections, not automatic processing
 or background jobs. No attachment download or general file viewer is exposed.
+An SSE admission slot belongs to the whole response lifecycle and is released
+on completion or disconnect, including a disconnect while sending headers before
+the stream body begins. Constructing a response alone reserves no slot.
 
 Validation uses synthetic isolated stores/routes, including AST-loaded native
 adapters without importing or starting the server process. The compiled native
@@ -93,7 +116,8 @@ browser components were exercised for queue/edit/reorder/send-now/stop, goal
 pause/resume, settings/permissions/model selection, schedules and approvals.
 Browser checks also verified used-invitation denial, live revocation and disabled
 controls with no subsequent accepted write or new content after revocation.
-These are isolated browser checks, not claims of a production provider run.
+These are isolated browser checks, not certification of real provider runs or
+public ingress configuration.
 Creating a real invitation, configuring ingress, and deployment are separate
 explicit actions.
 

@@ -91,6 +91,8 @@ Validation uses synthetic isolated stores/routes, including AST-loaded native
 adapters without importing or starting the server process. The compiled native
 browser components were exercised for queue/edit/reorder/send-now/stop, goal
 pause/resume, settings/permissions/model selection, schedules and approvals.
+Browser checks also verified used-invitation denial, live revocation and disabled
+controls with no subsequent accepted write or new content after revocation.
 These are isolated browser checks, not claims of a production provider run.
 Creating a real invitation, configuring ingress, and deployment are separate
 explicit actions.

@@ -76407,6 +76407,11 @@ async def interactive_chat_native_snapshot(session_id: str) -> dict[str, Any]:
             "codex_controls": {"available": codex_available},
             "claude_controls": {"available": claude_available,
                                 "interactive_client_capability": CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY},
+            "provider_jobs_access_control_v1": {
+                "available": bool(AGENT_TOKEN), "version": 1,
+                "modes": list(PROVIDER_JOBS_ACCESS_MODES),
+                "default": PROVIDER_JOBS_ACCESS_DEFAULT,
+            },
             "workspace_files": {"available": False},
         }},
         "runtime_catalog": {"backends": {backend: {

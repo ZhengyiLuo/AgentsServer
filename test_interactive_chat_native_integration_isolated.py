@@ -55,6 +55,9 @@ class InteractiveChatNativeGlueTests(unittest.IsolatedAsyncioTestCase):
             "CLAUDE_TRANSPORT": "sdk", "CLAUDE_TRANSPORT_PRINT": "print",
             "CODEX_INTERACTIVE_CLIENT_CAPABILITY": "codex-test", "CLAUDE_SDK_INTERACTIVE_CLIENT_CAPABILITY": "claude-test",
             "CODEX_GOALS_ENABLED": True, "CODEX_DEFAULT_APPROVAL_POLICY": "on-request",
+            "AGENT_TOKEN": "synthetic-native-admin",
+            "PROVIDER_JOBS_ACCESS_MODES": ("full", "read_only", "blocked"),
+            "PROVIDER_JOBS_ACCESS_DEFAULT": "full",
             "CODEX_DEFAULT_SANDBOX_MODE": "workspace-write", "CODEX_DEFAULT_PERMISSION_PROFILE": None,
             "CODEX_DEFAULT_APPROVALS_REVIEWER": "user", "CLAUDE_PERMISSION_MODE_OPTIONS": ("default",),
             "CLAUDE_STOP_FENCE_SESSIONS": set(), "effective_claude_permission_mode": lambda _: "default",
@@ -95,6 +98,22 @@ class InteractiveChatNativeGlueTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["health"]["capabilities"]["workspace_files"]["available"])
         self.native["runtime_catalog"].assert_not_awaited()
         self.native["list_session_jobs"].assert_awaited_once_with("chat-one")
+
+    async def test_native_snapshot_preserves_jobs_policy_and_actual_capability(self):
+        for policy in ("full", "read_only", "blocked"):
+            with self.subTest(policy=policy):
+                self.native["STORE"].sessions["chat-one"]["provider_jobs_access"] = policy
+                result = await self.native["interactive_chat_native_snapshot"]("chat-one")
+                self.assertEqual(result["session"]["provider_jobs_access"], policy)
+                self.assertEqual(result["health"]["capabilities"]["provider_jobs_access_control_v1"], {
+                    "available": True, "version": 1, "modes": ["full", "read_only", "blocked"], "default": "full",
+                })
+        self.native.update(AGENT_TOKEN="", PROVIDER_JOBS_ACCESS_DEFAULT="blocked")
+        result = await self.native["interactive_chat_native_snapshot"]("chat-one")
+        capability = result["health"]["capabilities"]["provider_jobs_access_control_v1"]
+        self.assertFalse(capability["available"])
+        self.assertEqual(capability["default"], "blocked")
+        self.native["runtime_catalog"].assert_not_awaited()
 
     async def test_control_uses_exact_native_model_and_rejects_paths_before_mutation(self):
         self.native["patch_queued_turn"].return_value = {"ok": True, "file_ids": ["private"]}

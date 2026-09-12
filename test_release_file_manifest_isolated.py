@@ -18,6 +18,9 @@ NEW_MODULES = {
     "team_mail_grants.py",
     "claude_history_repair.py", "claude_history_provenance.py", "codex_history_repair.py", "public_chat_shares.py",
     "public_chat_transcript.py", "public_chat_share_routes.py",
+    "interactive_chat_shares.py", "interactive_chat_share_routes.py",
+    "interactive_chat_share_web.py", "interactive_chat_projection.py", "interactive_chat_runtime.py",
+    "interactive_chat_native.py", "interactive_chat_controls.py",
 }
 NEW_MIGRATION = "migrations/0020_team_mail_arrivals.sql"
 THREAD_MIGRATION = "migrations/0021_team_mail_threads.sql"

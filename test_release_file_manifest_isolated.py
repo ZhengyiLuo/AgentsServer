@@ -14,6 +14,7 @@ ROOT = Path(__file__).parent
 NEW_MODULES = {
     "chat_mailbox.py",
     "claude_background_reconciliation.py",
+    "opencode_agent_client.py",
     "team_mail_runtime.py", "team_mail_websocket.py",
     "team_mail_grants.py",
     "claude_history_repair.py", "claude_history_provenance.py", "codex_history_repair.py", "public_chat_shares.py",
@@ -104,6 +105,13 @@ class ReleaseFileManifestTests(unittest.TestCase):
                 self.assertIn(f'"$STAGE_DIR/{name}"', self.installer)
                 self.assertIn(f"'$REMOTE_SERVER_DIR/{name}'", self.deployer)
                 self.assertIn(name.removesuffix(".py"), self.installer.split("PYTHONPATH=\"$STAGE_DIR\"")[-1])
+
+    def test_opencode_translation_layer_is_import_smoked_before_activation(self):
+        module = "opencode_agent_client"
+        installer_smoke = self.installer.split('PYTHONPATH="$STAGE_DIR"')[-1]
+        deploy_smoke = self.deployer.split("PYTHONPATH='$REMOTE_SERVER_DIR'")[-1]
+        self.assertRegex(installer_smoke, rf"\bimport [^'\n;]*\b{module}\b")
+        self.assertRegex(deploy_smoke, rf"\bimport [^'\n;]*\b{module}\b")
 
     def test_frozen_hub_manifest_includes_new_migration_and_current_hashes(self):
         tree = ast.parse((ROOT / "test_team_hub_host.py").read_text())

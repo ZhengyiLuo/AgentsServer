@@ -110,6 +110,7 @@ class ChatPairTests(unittest.IsolatedAsyncioTestCase):
             "now_iso": lambda: "2026-09-10T00:00:00Z", "logger": logging.getLogger(__name__),
             "DELETING_SESSIONS": set(), "DELETED_SESSION_TOMBSTONES": set(),
             "DEFAULT_BACKEND": "codex", "VALID_BACKENDS": {"codex"},
+            "BACKEND_OPENCODE": "opencode",
             "cross_chat_target_backend_supported": lambda backend: backend == "codex",
             "cross_chat_delivery_client_capabilities": lambda target: ["supported"],
             "AGENT_TOKEN": "isolated-only", "AGENT_AMBIENT_LOCAL_HANDOFFS_ENABLED": False,

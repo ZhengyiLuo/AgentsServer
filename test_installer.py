@@ -747,6 +747,7 @@ exit 0
         self.assertIn('"$SCRIPT_DIR/claude_sdk_client.py"', source)
         self.assertIn('"$SCRIPT_DIR/codex_app_server.py"', source)
         self.assertIn('"$SCRIPT_DIR/cursor_agent_client.py"', source)
+        self.assertIn('"$SCRIPT_DIR/opencode_agent_client.py"', source)
         self.assertIn('"$SCRIPT_DIR/team_hub_host.py"', source)
         self.assertIn('"$SCRIPT_DIR/agentsdock_team_hub/"', source)
         self.assertIn("import claude_agent_sdk, croniter, cryptography, dateutil, tzdata", source)
@@ -758,6 +759,7 @@ exit 0
         self.assertIn("'$REMOTE_SERVER_DIR/claude_sdk_client.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/codex_app_server.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/cursor_agent_client.py'", source)
+        self.assertIn("'$REMOTE_SERVER_DIR/opencode_agent_client.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/team_hub_host.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/secure_peer_runtime.py'", source)
         self.assertIn("'$REMOTE_SERVER_DIR/secure_peer_delivery.py'", source)
@@ -1398,7 +1400,7 @@ exit 0
         self.assertIsNotNone(release_files_match)
         release_files = release_files_match.group(1).split()
         for filename in (
-            "activation_transaction.py agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py chat_mailbox.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py claude_sdk_client.py claude_background_reconciliation.py codex_app_server.py cursor_agent_client.py cursor_process_guard.py"
+            "activation_transaction.py agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py chat_mailbox.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py claude_sdk_client.py claude_background_reconciliation.py codex_app_server.py cursor_agent_client.py opencode_agent_client.py cursor_process_guard.py"
         ).split():
             self.assertIn(filename, release_files)
         self.assertIn('"$STAGE_DIR/activation_transaction.py"', installer_source)
@@ -1411,6 +1413,7 @@ exit 0
         self.assertIn('"$STAGE_DIR/claude_sdk_client.py"', installer_source)
         self.assertIn('"$STAGE_DIR/codex_app_server.py"', installer_source)
         self.assertIn('"$STAGE_DIR/cursor_agent_client.py"', installer_source)
+        self.assertIn('"$STAGE_DIR/opencode_agent_client.py"', installer_source)
         self.assertIn(
             "import agentsdock_team_hub, cursor_agent_client, cursor_process_guard, secure_peer_delivery",
             installer_source,
@@ -1419,7 +1422,7 @@ exit 0
             "agentsdock_team, claude_history_repair",
             installer_source,
         )
-        self.assertIn("chat_mailbox, provider_commands;", installer_source)
+        self.assertIn("chat_mailbox, provider_commands, opencode_agent_client;", installer_source)
         self.assertIn('"$STAGE_DIR/secure_peer_runtime.py"', installer_source)
         self.assertIn('"$STAGE_DIR/secure_peer_delivery.py"', installer_source)
         self.assertIn('"$STAGE_DIR/uninstall.sh"', installer_source)
@@ -1433,6 +1436,7 @@ exit 0
         self.assertIn('"claude_sdk_client.py"', packager_source)
         self.assertIn('"codex_app_server.py"', packager_source)
         self.assertIn('"cursor_agent_client.py"', packager_source)
+        self.assertIn('"opencode_agent_client.py"', packager_source)
         self.assertIn('"cursor_process_guard.py"', packager_source)
         self.assertIn('"secure_peer_runtime.py"', packager_source)
         self.assertIn('"secure_peer_delivery.py"', packager_source)
@@ -1500,6 +1504,10 @@ exit 0
             )
             self.assertIn(
                 f"agents-server-{version}/cursor_agent_client.py",
+                members,
+            )
+            self.assertIn(
+                f"agents-server-{version}/opencode_agent_client.py",
                 members,
             )
             self.assertIn(

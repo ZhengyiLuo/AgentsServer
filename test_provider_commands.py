@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import tempfile
 import unittest
@@ -9,11 +10,184 @@ from provider_commands import (
     canonical_provider_command_name,
     claude_provider_command_inventory,
     codex_provider_command_inventory,
+    opencode_provider_skill_inventory,
     sanitize_provider_command_text,
+    validate_opencode_provider_skill_record,
 )
 
 
 class ProviderCommandInventoryTests(unittest.TestCase):
+    @staticmethod
+    def _write_skill(root: Path, name: str, description: str = "Run safely") -> Path:
+        path = root / name / "SKILL.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"---\nname: {name}\ndescription: {description}\n---\nBody\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def test_opencode_scans_only_documented_roots_and_keeps_native_paths_private(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            project = base / "project"
+            cwd = project / "nested"
+            cwd.mkdir(parents=True)
+            (project / ".git").mkdir()
+            home = base / "home"
+            home.mkdir()
+            project_path = self._write_skill(
+                project / ".opencode" / "skills", "review", "Review /secret/path"
+            )
+            self._write_skill(home / ".config" / "opencode" / "skills", "global-skill")
+            self._write_skill(home / ".opencode" / "skills", "undocumented")
+
+            inventory = opencode_provider_skill_inventory(
+                cwd=str(cwd),
+                home=str(home),
+                xdg_config_home=None,
+                selector_secret="a" * 64,
+                binding_context="chat-a",
+            )
+
+            self.assertEqual(
+                [record.public["name"] for record in inventory.records],
+                ["global-skill", "review"],
+            )
+            review = next(
+                record for record in inventory.records
+                if record.public["name"] == "review"
+            )
+            self.assertEqual(review.public["source"], "opencode")
+            self.assertEqual(review.public["kind"], "skill")
+            self.assertEqual(review.public["scope"], "project")
+            self.assertEqual(review.public["description"], "Review <path>")
+            self.assertEqual(review.native["path"], str(project_path.resolve()))
+            self.assertNotIn(str(project_path), json.dumps(inventory.commands))
+            self.assertNotIn("undocumented", json.dumps(inventory.commands))
+
+    def test_opencode_omits_duplicates_invalid_metadata_and_symlinked_skills(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            project = base / "project"
+            project.mkdir()
+            (project / ".git").mkdir()
+            home = base / "home"
+            home.mkdir()
+            self._write_skill(project / ".opencode" / "skills", "duplicate")
+            self._write_skill(home / ".agents" / "skills", "duplicate")
+            mismatch = self._write_skill(
+                project / ".agents" / "skills", "wrong-directory"
+            )
+            mismatch.rename(mismatch.parent / "renamed.md")
+            invalid = project / ".claude" / "skills" / "Bad_Name" / "SKILL.md"
+            invalid.parent.mkdir(parents=True)
+            invalid.write_text(
+                "---\nname: Bad_Name\ndescription: no\n---\n",
+                encoding="utf-8",
+            )
+            outside = self._write_skill(base / "outside", "linked")
+            link_parent = project / ".claude" / "skills" / "linked"
+            link_parent.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(outside.parent, link_parent)
+
+            inventory = opencode_provider_skill_inventory(
+                cwd=str(project),
+                home=str(home),
+                xdg_config_home=None,
+                selector_secret="a" * 64,
+                binding_context="chat-a",
+            )
+
+            self.assertEqual(inventory.records, ())
+
+    def test_opencode_revision_binds_content_and_validation_rejects_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            project = base / "project"
+            project.mkdir()
+            (project / ".git").mkdir()
+            home = base / "home"
+            home.mkdir()
+            skill = self._write_skill(project / ".opencode" / "skills", "review")
+            kwargs = {
+                "cwd": str(project),
+                "home": str(home),
+                "xdg_config_home": None,
+                "selector_secret": "a" * 64,
+                "binding_context": "chat-a",
+            }
+            first = opencode_provider_skill_inventory(**kwargs)
+            _name, _directory, content = validate_opencode_provider_skill_record(
+                first.records[0]
+            )
+            self.assertEqual(content, "Body")
+            skill.write_text(
+                "---\nname: review\ndescription: Changed\n---\nBody\n",
+                encoding="utf-8",
+            )
+            second = opencode_provider_skill_inventory(**kwargs)
+
+            self.assertNotEqual(first.revision, second.revision)
+            self.assertNotEqual(first.commands[0]["id"], second.commands[0]["id"])
+            with self.assertRaisesRegex(Exception, "changed before launch"):
+                validate_opencode_provider_skill_record(first.records[0])
+
+    def test_opencode_resolves_an_admitted_symlinked_cwd_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            project = base / "real-project"
+            project.mkdir()
+            (project / ".git").mkdir()
+            home = base / "home"
+            home.mkdir()
+            self._write_skill(project / ".opencode" / "skills", "review")
+            alias = base / "project-alias"
+            os.symlink(project, alias)
+
+            inventory = opencode_provider_skill_inventory(
+                cwd=str(alias),
+                home=str(home),
+                xdg_config_home=None,
+                selector_secret="a" * 64,
+                binding_context="chat-a",
+            )
+
+            self.assertEqual([item["name"] for item in inventory.commands], ["review"])
+
+    def test_opencode_accepts_bounded_yaml_block_descriptions(self) -> None:
+        for indicator in ("|", "|-", "|+", ">", ">-", ">+"):
+            with self.subTest(indicator=indicator), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                project = base / "project"
+                skill = project / ".opencode" / "skills" / "review" / "SKILL.md"
+                skill.parent.mkdir(parents=True)
+                (project / ".git").mkdir()
+                home = base / "home"
+                home.mkdir()
+                skill.write_text(
+                    "---\nname: review\n"
+                    f"description: {indicator}\n"
+                    "  Review the current changes.\n"
+                    "  Keep findings concise.\n"
+                    "---\nBody\n",
+                    encoding="utf-8",
+                )
+
+                inventory = opencode_provider_skill_inventory(
+                    cwd=str(project),
+                    home=str(home),
+                    xdg_config_home=None,
+                    selector_secret="a" * 64,
+                    binding_context="chat-a",
+                )
+
+                self.assertEqual(len(inventory.records), 1)
+                self.assertEqual(
+                    inventory.commands[0]["description"],
+                    "Review the current changes. Keep findings concise.",
+                )
+
     def test_canonical_names_accept_provider_syntax_but_reject_ambiguous_text(self) -> None:
         for value in ("review", "_private", "plugin:skill", "a.b-c_d"):
             with self.subTest(value=value):

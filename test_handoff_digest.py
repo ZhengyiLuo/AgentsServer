@@ -1,8 +1,9 @@
+import asyncio
 import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import agent_server
 from agent_server import (
@@ -355,6 +356,39 @@ class DigestDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "status": "created",
         }
 
+    async def test_send_rejects_opencode_target_before_job_event_or_turn(self) -> None:
+        agent_server.STORE.sessions["target-1"]["backend"] = (
+            agent_server.BACKEND_OPENCODE
+        )
+        create_job = AsyncMock()
+        append_event = AsyncMock()
+        run_send = AsyncMock()
+        with patch.object(
+            agent_server,
+            "create_handoff_digest_job",
+            create_job,
+        ), patch.object(
+            agent_server,
+            "append_event",
+            append_event,
+        ), patch.object(
+            agent_server,
+            "run_handoff_digest_send",
+            run_send,
+        ):
+            with self.assertRaises(agent_server.HTTPException) as raised:
+                await agent_server.send_handoff_digest_background(
+                    "source-1",
+                    self.request(),
+                )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("opencode", str(raised.exception.detail))
+        create_job.assert_not_awaited()
+        append_event.assert_not_awaited()
+        run_send.assert_not_awaited()
+        self.assertEqual(agent_server.HANDOFF_DIGEST_JOBS, {})
+
     async def test_submission_only_starts_or_queues_the_source_turn(self) -> None:
         agent_server.HANDOFF_DIGEST_JOBS["digest-1"] = self.job()
         with patch.object(agent_server, "start_turn_durably", new_callable=AsyncMock) as start_turn, \
@@ -433,6 +467,168 @@ class DigestDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(event_type == "handoff_digest_sent" for _, event_type, _ in emitted), 1)
         received = next(payload for session, event_type, payload in emitted if session == "target-1" and event_type == "handoff_digest_received")
         self.assertEqual(received["digest"], digest)
+
+    async def test_backend_switch_before_admission_writes_no_target_digest(self) -> None:
+        digest = "# AgentsDock Context Digest\n\nPrivate source context."
+        job = self.job()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def pause_before_submission(*_args: object) -> bool:
+            entered.set()
+            await release.wait()
+            return False
+
+        append_event = AsyncMock()
+        digest_exists = Mock(return_value=False)
+        with patch.object(
+            agent_server,
+            "digest_delivery_event_state",
+            return_value=None,
+        ), patch.object(
+            agent_server,
+            "digest_job_is_active",
+            side_effect=pause_before_submission,
+        ), patch.object(
+            agent_server,
+            "digest_job_is_queued",
+            new_callable=AsyncMock,
+            return_value=False,
+        ), patch.object(
+            agent_server,
+            "wait_for_queue_recovery_admission",
+            new_callable=AsyncMock,
+        ), patch.object(
+            agent_server,
+            "reconcile_idle_queue_session",
+            new_callable=AsyncMock,
+        ), patch.object(
+            agent_server,
+            "digest_event_exists",
+            digest_exists,
+        ), patch.object(
+            agent_server,
+            "append_event",
+            append_event,
+        ), patch.object(
+            agent_server,
+            "append_handoff_digest_sent_once",
+            new_callable=AsyncMock,
+        ) as append_sent, patch.object(
+            agent_server,
+            "update_handoff_digest_job",
+            new_callable=AsyncMock,
+        ) as update_job:
+            delivery = asyncio.create_task(deliver_handoff_digest(job, digest))
+            await entered.wait()
+            agent_server.STORE.sessions["target-1"]["backend"] = (
+                agent_server.BACKEND_OPENCODE
+            )
+            release.set()
+            with self.assertRaises(agent_server.HTTPException) as raised:
+                await delivery
+
+        self.assertEqual(raised.exception.status_code, 410)
+        self.assertIn("runtime changed", str(raised.exception.detail))
+        digest_exists.assert_not_called()
+        append_event.assert_not_awaited()
+        append_sent.assert_not_awaited()
+        update_job.assert_not_awaited()
+        self.assertNotIn("target-1", agent_server.BUSY_SESSIONS)
+        self.assertNotIn("target-1", agent_server.CURRENT_TURNS)
+
+    async def test_supported_backend_switch_invalidates_digest_capabilities(self) -> None:
+        request = agent_server.TurnRequest(
+            prompt="digest",
+            purpose="handoff_digest_delivery",
+            digest_job_id="digest-1",
+            source_session_id="source-1",
+            target_session_id="target-1",
+            client_capabilities=(
+                agent_server.handoff_digest_target_client_capabilities(
+                    agent_server.STORE.sessions["target-1"]
+                )
+            ),
+        )
+        agent_server.STORE.sessions["target-1"]["backend"] = (
+            agent_server.BACKEND_CODEX
+        )
+
+        with self.assertRaises(agent_server.HTTPException) as raised:
+            agent_server.validate_handoff_digest_delivery_admission(
+                "target-1",
+                request,
+                agent_server.STORE.sessions["target-1"],
+                provider_context_mode="chat",
+            )
+
+        self.assertEqual(raised.exception.status_code, 410)
+        self.assertIn("runtime changed", str(raised.exception.detail))
+
+    async def test_digest_delivery_cannot_override_the_target_runtime(self) -> None:
+        request = agent_server.TurnRequest(
+            prompt="digest",
+            backend=agent_server.BACKEND_OPENCODE,
+            purpose="handoff_digest_delivery",
+            digest_job_id="digest-1",
+            source_session_id="source-1",
+            target_session_id="target-1",
+            client_capabilities=(
+                agent_server.handoff_digest_target_client_capabilities(
+                    agent_server.STORE.sessions["target-1"]
+                )
+            ),
+        )
+
+        with self.assertRaises(agent_server.HTTPException) as raised:
+            agent_server.validate_handoff_digest_delivery_admission(
+                "target-1",
+                request,
+                agent_server.STORE.sessions["target-1"],
+                provider_context_mode="chat",
+            )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("immutable", str(raised.exception.detail))
+
+    async def test_update_fallback_revalidates_before_queuing_digest(self) -> None:
+        request = agent_server.TurnRequest(
+            prompt="digest",
+            purpose="handoff_digest_delivery",
+            digest_job_id="digest-1",
+            source_session_id="source-1",
+            target_session_id="target-1",
+            client_capabilities=(
+                agent_server.handoff_digest_target_client_capabilities(
+                    agent_server.STORE.sessions["target-1"]
+                )
+            ),
+        )
+
+        async def update_wins_before_fallback(*_args: object, **_kwargs: object) -> None:
+            agent_server.STORE.sessions["target-1"]["backend"] = (
+                agent_server.BACKEND_OPENCODE
+            )
+            raise agent_server.ManagedServerUpdatePendingError()
+
+        with patch.object(
+            agent_server,
+            "start_turn",
+            side_effect=update_wins_before_fallback,
+        ), patch.object(
+            agent_server,
+            "managed_server_update_is_pending",
+            return_value=True,
+        ), patch.object(
+            agent_server,
+            "enqueue_turn",
+            new_callable=AsyncMock,
+        ) as enqueue:
+            with self.assertRaises(agent_server.HTTPException) as raised:
+                await agent_server.start_turn_durably("target-1", request)
+
+        self.assertEqual(raised.exception.status_code, 410)
+        enqueue.assert_not_awaited()
 
     async def test_logical_cursor_failure_never_delivers_digest(self) -> None:
         agent_server.HANDOFF_DIGEST_JOBS["digest-1"] = self.job()

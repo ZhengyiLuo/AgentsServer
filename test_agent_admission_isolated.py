@@ -9,7 +9,6 @@ import unittest
 
 
 SOURCE = Path(__file__).with_name("agent_server.py")
-TREE = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
 FUNCTIONS = {
     "env_setting", "agentsdock_setting", "turn_start_blocker", "scheduled_job_blocker",
 }
@@ -19,14 +18,24 @@ SETTINGS = {
 }
 
 
-def load_admission(env=None):
-    selected = [node for node in TREE.body if (
+def compile_admission():
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
+    selected = [node for node in tree.body if (
         isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in FUNCTIONS
     ) or (
         isinstance(node, ast.Assign)
         and any(isinstance(target, ast.Name) and target.id in SETTINGS for target in node.targets)
     )]
     assert len(selected) == len(FUNCTIONS) + len(SETTINGS)
+    # Retain only the compiled allowlist, not the entire server AST throughout
+    # the suite: a large live syntax tree adds unrelated GC work to async tests.
+    return compile(ast.Module(body=selected, type_ignores=[]), str(SOURCE), "exec")
+
+
+ADMISSION_CODE = compile_admission()
+
+
+def load_admission(env=None):
     ns = {
         "os": SimpleNamespace(environ=dict(env or {})),
         "ACTIVE_LOCK": asyncio.Lock(),
@@ -40,8 +49,7 @@ def load_admission(env=None):
         "SERVER_MAINTENANCE_SESSIONS": set(), "CLAUDE_STOP_FENCE_SESSIONS": set(),
         "stop_cleanup_in_progress": lambda _: False,
     }
-    module = ast.Module(body=selected, type_ignores=[])
-    exec(compile(module, str(SOURCE), "exec"), ns)
+    exec(ADMISSION_CODE, ns)
     return ns
 
 

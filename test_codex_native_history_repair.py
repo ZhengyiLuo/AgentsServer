@@ -1,11 +1,13 @@
 """Checkpoint/native ownership proof using temporary files and AST public parsers only."""
+import ast
 import hashlib
 import json
 from pathlib import Path
+import re
 import tempfile
 import unittest
 
-from codex_history_repair import CodexNativeHistoryRepairCache, filter_native_codex_history_items
+from codex_history_repair import CodexNativeHistoryRepairCache, filter_native_codex_history_items, _native_assistant_text
 from test_codex_goal_history_isolated import load_projection
 
 PROVIDER = "11111111-2222-3333-4444-555555555555"
@@ -98,6 +100,58 @@ class CodexNativeHistoryRepairTests(unittest.TestCase):
         self.cache.forget("chat")
         self.prepare()
         self.assertEqual(len(self.cache.signature("chat")), 4)
+
+    def test_assistant_normalization_matches_actual_native_cleaner(self):
+        tree = ast.parse(Path(__file__).with_name("agent_server.py").read_text())
+        selected = [node for node in tree.body if (
+            isinstance(node, ast.FunctionDef) and node.name == "clean_assistant_text"
+        ) or (isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "LEADING_DECORATION_RE" for target in node.targets
+        ))]
+        self.assertEqual(len(selected), 2)
+        namespace = {"re": re}
+        exec(compile(ast.Module(body=selected, type_ignores=[]), "native-cleaner", "exec"), namespace)
+        for text in ("✅ Scheduled report", "  :white_check_mark: Report\n⚠️ Detail", "  Unchanged text  ", "Text ✅ remains", "✅"):
+            self.assertEqual(_native_assistant_text(text), namespace["clean_assistant_text"](text))
+
+    def test_same_item_decorated_scheduled_assistant_repair_and_import_filter(self):
+        self.raw[3]["payload"]["content"][0]["text"] = "✅ Scheduled report"
+        self.native[4]["item_id"] = self.raw[3]["payload"]["id"]
+        self.fixture()
+        before = self.events.read_bytes(), self.source.read_bytes()
+        self.prepare()
+        projected = self.cache.project_event("chat", self.imports[3])
+        self.assertEqual(projected["text"], "")
+        self.assertEqual(projected["provider_origin"]["native_event_id"], self.native[4]["id"])
+        self.assertEqual(projected["provider_origin"]["source_text_sha256"], hashlib.sha256("✅ Scheduled report".encode()).hexdigest())
+        self.assertEqual(projected["ts"], self.imports[3]["ts"])
+        items = [self.parse(row) for row in self.raw]
+        self.assertEqual(len(filter_native_codex_history_items("chat", PROVIDER, self.events, items)), 2)
+        self.assertTrue(all(self.cache.project_event("chat", row) is None for row in self.native))
+        self.assertEqual(before, (self.events.read_bytes(), self.source.read_bytes()))
+
+    def test_decorated_assistant_requires_same_public_item_and_complete_body(self):
+        self.raw[3]["payload"]["content"][0]["text"] = "✅ Scheduled report"
+        for item_id, event_type, text in (
+            (None, "assistant_text", "Scheduled report"),
+            ("different-item", "assistant_text", "Scheduled report"),
+            ("item-2-assistant", "reasoning_summary", "Scheduled report"),
+            ("item-2-assistant", "assistant_text", "Scheduled report changed"),
+        ):
+            with self.subTest(item_id=item_id, event_type=event_type, text=text):
+                self.native[4].update(item_id=item_id, type=event_type, text=text)
+                self.fixture(); self.cache.forget("chat"); self.prepare()
+                self.assertIsNone(self.cache.project_event("chat", self.imports[3]))
+                item = self.parse(self.raw[3])
+                self.assertEqual(filter_native_codex_history_items("chat", PROVIDER, self.events, [item]), [item])
+
+    def test_user_decorations_are_not_assistant_normalization_credits(self):
+        self.raw[2]["payload"]["content"][0]["text"] = "✅ Scheduled input"
+        self.native[3]["item_id"] = self.raw[2]["payload"]["id"]
+        self.fixture(); self.prepare()
+        self.assertIsNone(self.cache.project_event("chat", self.imports[2]))
+        item = self.parse(self.raw[2])
+        self.assertEqual(filter_native_codex_history_items("chat", PROVIDER, self.events, [item]), [item])
 
 
 if __name__ == "__main__":

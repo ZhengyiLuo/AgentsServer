@@ -27,6 +27,22 @@ MAX_AGGREGATE_SOURCE_BYTES = 96 * 1024 * 1024
 MAX_AGGREGATE_SOURCE_RECORDS = 100_000
 MAX_FORK_META_HEADERS = 32
 _PROVIDER_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+_NATIVE_LEADING_DECORATION_RE = re.compile(
+    r"(?m)^[ \t]*(?:(?::[A-Za-z0-9_+\-]+:|[\U0001F300-\U0001FAFF\u2600-\u27BF]\ufe0f?)[ \t]*)+"
+)
+
+
+def _native_assistant_text(text: str) -> str:
+    """Mirror native clean_assistant_text; never normalize source proof keys."""
+    return _NATIVE_LEADING_DECORATION_RE.sub("", str(text or "")).strip()
+
+
+def _public_assistant_item_id(event: dict) -> str | None:
+    item_id = event.get("item_id")
+    public = event.get("type") == "assistant_text" or (
+        event.get("type") == "reasoning_summary" and event.get("phase") == "commentary"
+    )
+    return item_id if public and isinstance(item_id, str) and 0 < len(item_id) <= 256 else None
 
 
 @dataclass
@@ -482,6 +498,7 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
         return {}
     budget.reserve(stamp[2])
     digest, verified, canonical, occurrences = hashlib.sha256(), set(), {}, {}
+    assistant_native_keys = {}
     allowed_header_owners, header_parents = {thread}, {}
     context_turn = None
     for record, offset, line in _records(source, stamp):
@@ -527,6 +544,10 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
         if not isinstance(turn, str) or not isinstance(timestamp, str):
             continue
         key = (turn, item["kind"], _text_key(item["text"]), item.get("source_text_sha256"))
+        if item["kind"] == "assistant":
+            cleaned = _native_assistant_text(item["text"])
+            if cleaned:
+                assistant_native_keys[key] = _text_key(cleaned)
         if origin:
             canonical.setdefault(key, {})[origin["event_id"]] = origin
         occurrences.setdefault((item["kind"], key[2], timestamp, key[3]), []).append((offset, key))
@@ -559,7 +580,16 @@ def _prove_native_source(thread: str, source: Path, root: Path, batches: dict, c
             continue
         if len(owned_runs) != 1:
             continue
-        native_matches = native.get((next(iter(owned_runs)), kind, body_key), [])
+        native_run = next(iter(owned_runs))
+        native_matches = native.get((native_run, kind, body_key), [])
+        if not native_matches and kind == "assistant":
+            # Native delivery removes line-leading decorations. Only the same
+            # public provider item may use that normalization; a similar body
+            # in another item/turn is not replay evidence.
+            native_key = assistant_native_keys.get(key)
+            if native_key and native_key != body_key:
+                native_matches = [event for event in native.get((native_run, kind, native_key), [])
+                                  if _public_assistant_item_id(event) == source_origin["event_id"]]
         native_matches = [event for event in native_matches if type(event.get("seq")) is int and event["seq"] < first and isinstance(event.get("id"), str)]
         if not native_matches:
             continue
@@ -641,7 +671,7 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
         stamp = _stamp(events)
         if stamp[2] > MAX_EVENTS_BYTES:
             return items
-        owners, native, native_count = {}, {}, 0
+        owners, native, assistant_items, native_count = {}, {}, {}, 0
         for event, _offset, _line in _records(events, stamp):
             run = event.get("run_id")
             if (event.get("session_id") not in (None, "", session_id) or event.get("imported") is True
@@ -659,17 +689,23 @@ def filter_native_codex_history_items(session_id: str, provider_id: str, events:
                 native_count += key not in keys
                 if isinstance(event.get("id"), str):
                     keys.setdefault(key, event["id"])
-            if native_count + len(owners) > MAX_KEYS:
+                    item_id = _public_assistant_item_id(event)
+                    if item_id is not None:
+                        assistant_items[(run, item_id, key[1])] = event["id"]
+            if native_count + len(owners) + len(assistant_items) > MAX_KEYS:
                 return items
         result = []
         for item in items:
             origin = item.get("provider_origin")
             runs = owners.get(origin.get("turn_id"), set()) if isinstance(origin, dict) else set()
-            known = (isinstance(origin, dict) and origin.get("provider") == "codex"
+            owned = (isinstance(origin, dict) and origin.get("provider") == "codex"
                      and origin.get("kind") == item.get("kind") and isinstance(origin.get("event_id"), str)
                      and origin.get("session_id", provider_id) == provider_id and len(runs) == 1
-                     and item.get("source_text_sha256") is None and isinstance(item.get("text"), str)
-                     and (item["kind"], _text_key(item["text"])) in native.get(next(iter(runs)), {}))
+                     and item.get("source_text_sha256") is None and isinstance(item.get("text"), str))
+            known = owned and (item["kind"], _text_key(item["text"])) in native.get(next(iter(runs)), {})
+            if owned and not known and item["kind"] == "assistant":
+                cleaned = _native_assistant_text(item["text"])
+                known = bool(cleaned and (next(iter(runs)), origin["event_id"], _text_key(cleaned)) in assistant_items)
             if not known:
                 result.append(item)
             elif item["kind"] == "user":

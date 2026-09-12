@@ -74,3 +74,19 @@ unrelated or ambiguous header fails proof. Original transcripts and stored
 events are not rewritten. The bounded repair cache is prepared on demand and
 does not add polling. Runtime cursor identities are distinct from human text,
 so a later identical human quotation cannot be consumed as a duplicate.
+
+## Native assistant replay equivalence
+
+Native Codex delivery removes leading emoji and shortcode decorations from
+assistant lines. The history source retains those decorations. A replay may
+therefore match the native-cleaned assistant body only when the exact public
+provider item ID also matches, within the already-proven provider thread and
+completed native turn. This applies both before importing new history and when
+projecting an already-imported duplicate.
+
+The original source digest, complete body, timestamps and checkpoint remain the
+proof boundary. No user text is normalized, and missing or conflicting item IDs,
+substantive body changes, private reasoning and truncated records do not gain
+this fallback. The original native event retains its scheduled-job ownership;
+only its proven imported replay is suppressed. Stored transcripts are unchanged,
+and this adds no polling or per-event filesystem reads.

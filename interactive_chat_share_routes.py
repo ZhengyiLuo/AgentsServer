@@ -63,6 +63,19 @@ def create_interactive_chat_share_router(*, storage_root, authorize, session_exi
     active_submissions = 0
     active_uploads = 0
 
+    class SharedChatStreamResponse(StreamingResponse):
+        async def __call__(self, scope, receive, send):
+            nonlocal streams
+            if streams >= 32:
+                raise HTTPException(503, "Too many shared conversation streams")
+            streams += 1
+            try:
+                # Header delivery can disconnect before the body generator
+                # starts, so its finally block cannot own this lease.
+                await super().__call__(scope, receive, send)
+            finally:
+                streams -= 1
+
     def share_lock(share_id):
         lock = locks.get(share_id)
         if lock is None:
@@ -461,13 +474,8 @@ def create_interactive_chat_share_router(*, storage_root, authorize, session_exi
 
     @router.get("/interactive-chat/{share_id}/events", include_in_schema=False)
     async def events(share_id: str, request: Request):
-        nonlocal streams
         grant, _ = await auth(request, share_id)
-        if streams >= 32:
-            raise HTTPException(503, "Too many shared conversation streams")
-        streams += 1
         async def stream():
-            nonlocal streams
             try:
                 value = await snapshot(grant)
                 await auth(request, share_id)
@@ -487,8 +495,6 @@ def create_interactive_chat_share_router(*, storage_root, authorize, session_exi
                     yield "event: state\ndata: " + json.dumps(value, ensure_ascii=False) + "\n\n"
             except (Unavailable, HTTPException):
                 yield "event: unavailable\ndata: {}\n\n"
-            finally:
-                streams -= 1
-        return StreamingResponse(stream(), media_type="text/event-stream", headers={**HEADERS, "X-Accel-Buffering": "no"})
+        return SharedChatStreamResponse(stream(), media_type="text/event-stream", headers={**HEADERS, "X-Accel-Buffering": "no"})
 
     return router

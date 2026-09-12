@@ -1,5 +1,6 @@
 """In-process synthetic HTTP/stream checks; no monolith, provider or live data."""
 import asyncio
+import inspect
 import json
 from pathlib import Path
 import tempfile
@@ -9,6 +10,7 @@ from unittest import mock
 
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
+from starlette.requests import ClientDisconnect
 
 from interactive_chat_share_routes import create_interactive_chat_share_router, COOKIE
 from interactive_chat_shares import InteractiveChatShareStore, csrf_token
@@ -167,6 +169,30 @@ class InteractiveShareRouteTests(unittest.TestCase):
             self.assertEqual(self.load.await_count, 2)
             await iterator.aclose()
         asyncio.run(consume())
+
+    def test_stream_disconnect_before_body_starts_releases_admission(self):
+        share = self.create()
+        self.redeem(share)
+        cookie = next(cookie.value for cookie in self.client.cookies.jar if cookie.name == COOKIE)
+        request = SimpleNamespace(base_url=self.origin + "/", url=SimpleNamespace(query=""),
+            headers={"cookie": COOKIE + "=" + cookie}, is_disconnected=mock.AsyncMock(return_value=False))
+        endpoint = next(route.endpoint for route in self.router.routes if route.path.endswith("/{share_id}/events"))
+        async def disconnect():
+            response = await endpoint(share["id"], request)
+            def leases():
+                return inspect.getclosurevars(type(response).__call__).nonlocals["streams"]
+            self.assertEqual(leases(), 0)  # Merely creating a response owns no slot.
+            async def send(message):
+                self.assertEqual(message["type"], "http.response.start")
+                self.assertEqual(leases(), 1)
+                raise OSError("Synthetic connection closed before response headers")
+            with self.assertRaises(ClientDisconnect):
+                await response({"type": "http", "asgi": {"spec_version": "2.4"}}, mock.AsyncMock(), send)
+            self.assertEqual(leases(), 0)
+            await response.body_iterator.aclose()
+        asyncio.run(disconnect())
+        self.load.assert_not_awaited()
+        self.wait.assert_not_awaited()
 
     def test_upload_disconnect_joins_committed_save_and_retains_accounting(self):
         share = self.create()

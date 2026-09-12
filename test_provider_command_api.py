@@ -12,6 +12,72 @@ from provider_commands import ProviderCommandRecord, codex_provider_command_inve
 
 
 class ProviderCommandAPIContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_opencode_default_root_skill_requires_its_exact_client_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            project = base / "project"
+            skill = project / ".opencode" / "skills" / "review" / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            (project / ".git").mkdir()
+            skill.write_text(
+                "---\nname: review\n"
+                "description: Review /private/frontmatter-only\n"
+                "---\nPRIVATE BODY\n",
+                encoding="utf-8",
+            )
+            home = base / "home"
+            home.mkdir()
+            session = {"id": "open-chat", "backend": "opencode", "cwd": str(project)}
+            with patch.object(
+                agent_server,
+                "PROVIDER_COMMAND_SELECTOR_SECRET",
+                "a" * 64,
+            ), patch.object(
+                agent_server,
+                "runner_env",
+                return_value={"HOME": str(home), "PATH": "/usr/bin"},
+            ):
+                snapshot, inventory = await agent_server.discover_session_provider_commands(
+                    "open-chat", session
+                )
+                selection = agent_server.SkillSelection(
+                    id=snapshot["commands"][0]["id"],
+                    revision=snapshot["revision"],
+                )
+                resolved = await agent_server.resolve_provider_command_selection(
+                    "open-chat",
+                    session,
+                    selection,
+                    prompt="/review auth",
+                    purpose=None,
+                    provider_context_mode="chat",
+                    client_capabilities=[
+                        agent_server.OPENCODE_PROVIDER_COMMANDS_CLIENT_CAPABILITY
+                    ],
+                )
+                with self.assertRaises(HTTPException) as missing_capability:
+                    await agent_server.resolve_provider_command_selection(
+                        "open-chat",
+                        session,
+                        selection,
+                        prompt="/review auth",
+                        purpose=None,
+                        provider_context_mode="chat",
+                        client_capabilities=[],
+                    )
+
+        self.assertTrue(snapshot["support"]["available"])
+        self.assertEqual(
+            snapshot["support"]["mode"],
+            "server_validated_config_instructions",
+        )
+        self.assertEqual(snapshot["commands"][0]["kind"], "skill")
+        self.assertNotIn(str(skill), json.dumps(snapshot))
+        self.assertNotIn("PRIVATE BODY", json.dumps(snapshot))
+        self.assertEqual(resolved.native["content"], "PRIVATE BODY")
+        self.assertNotIn("frontmatter-only", resolved.native["content"])
+        self.assertEqual(missing_capability.exception.status_code, 400)
+
     async def test_cursor_snapshot_is_explicitly_unsupported_and_session_scoped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             sessions = {

@@ -34,6 +34,7 @@ FILES = (
     "claude_background_reconciliation.py",
     "codex_app_server.py",
     "cursor_agent_client.py",
+    "opencode_agent_client.py",
     "cursor_process_guard.py",
     "claude_history_repair.py",
     "claude_history_provenance.py",

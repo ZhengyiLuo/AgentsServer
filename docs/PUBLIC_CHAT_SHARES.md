@@ -1,4 +1,4 @@
-# Public read-only chat snapshots (AgentsServer 0.1.26-beta.63+)
+# Public read-only chat snapshots (AgentsServer 0.1.26-beta.64+)
 
 This optional API creates a fixed, explicitly reviewed text snapshot. Nothing is
 shared automatically. It does not open a listener, configure ingress, publish an

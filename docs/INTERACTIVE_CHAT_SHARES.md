@@ -1,6 +1,6 @@
 # Trusted interactive chat sharing
 
-Available starting with AgentsServer `0.1.26-beta.63` and a compatible desktop
+Available starting with AgentsServer `0.1.26-beta.64` and a compatible desktop
 sharing interface. The server release includes the scoped browser renderer.
 
 This opt-in feature shares control of one live chat with one browser. It does not configure

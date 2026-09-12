@@ -30,6 +30,8 @@ FUNCTIONS = {
     "normalized_history_import_limit", "claude_history_event_item", "append_claude_history_event",
     "parse_claude_history_events", "parse_provider_history_delta", "history_item_cursor_digest",
     "history_dedup_key", "reconcile_cursor_history_items", "unsynced_history_items",
+    "history_message_match_details", "history_messages_match", "history_message_match_tokens",
+    "clean_assistant_text",
     "append_imported_history", "append_staged_imported_history", "imported_history_terminal_event",
     "seed_claude_interruption_context", "normalized_history_sync_cursor", "load_provider_history_with_cursor",
     "should_bump_session_updated_at", "is_agent_visible_event",
@@ -72,8 +74,13 @@ def load_projection() -> dict:
     selected = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in FUNCTIONS]
     if {node.name for node in selected} != FUNCTIONS:
         raise AssertionError("Isolated provenance helper allowlist is incomplete")
+    constants = [node for node in tree.body if isinstance(node, ast.Assign)
+                 and any(isinstance(target, ast.Name) and target.id == "LEADING_DECORATION_RE" for target in node.targets)]
+    if len(constants) != 1:
+        raise AssertionError("Assistant cleaning constant is missing or ambiguous")
     module = ast.fix_missing_locations(ast.Module(body=[
         ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+        *constants,
         *selected,
     ], type_ignores=[]))
     namespace = {
@@ -131,11 +138,44 @@ class ClaudeHistoryProvenanceTests(unittest.TestCase):
         normalize = self.projection["normalized_history_item"]
         self.assertEqual(normalize("user", "  Plain text  "), {"kind": "user", "text": "Plain text"})
         items = []
-        self.projection["add_history_item"](items, "assistant", "Reply", provider_origin=origin())
-        self.projection["add_history_item"](items, "assistant", "Reply", provider_origin=origin(event_id=PARENT_ID))
-        self.assertEqual(items, [{"kind": "assistant", "text": "Reply", "provider_origin": origin()}])
+        self.projection["add_history_item"](items, "assistant", "Reply")
+        self.projection["add_history_item"](items, "assistant", "Reply")
+        self.assertEqual(items, [{"kind": "assistant", "text": "Reply"}])
         digest = self.projection["history_item_cursor_digest"]
-        self.assertEqual(digest(items[0]), digest({"kind": "assistant", "text": "Reply"}))
+        self.assertEqual(digest(items[0]), hashlib.sha256(b'["assistant","Reply"]').hexdigest())
+        self.assertEqual(digest(normalize("user", "Reply", provider_origin=origin())), digest({"kind": "user", "text": "Reply"}))
+        self.assertEqual(digest({**items[0], "provider_origin": {"provider": "codex", "event_id": EVENT_ID, "session_id": SESSION_ID}}), digest(items[0]))
+
+    def test_distinct_assistant_identities_survive_adjacent_dedup(self) -> None:
+        items = []
+        identities = (origin(), origin(event_id=PARENT_ID), origin(session_id=PROMPT_ID))
+        for identity in identities:
+            for text in ("Reply", "A changed rendering of the same provider message"):
+                self.projection["add_history_item"](items, "assistant", text, provider_origin=identity)
+            upper_identity = {**identity, **{field: identity[field].upper() for field in ("event_id", "session_id")}}
+            self.projection["add_history_item"](items, "assistant", "Reply", provider_origin=upper_identity)
+        self.assertEqual(items, [{"kind": "assistant", "text": "Reply", "provider_origin": identity} for identity in identities])
+        digest = self.projection["history_item_cursor_digest"]
+        self.assertEqual(len({digest(item) for item in items}), 3)
+        self.assertEqual(digest(items[0]), digest({**items[0], "text": "Another rendering"}))
+        self.assertEqual(digest(items[-1]), digest({**items[-1], "provider_origin": upper_identity}))
+
+    def test_identityless_adjacent_assistant_cannot_consume_identified_occurrence(self) -> None:
+        for identities in ((None, origin()), (origin(), None), (origin(), origin(event_id="invalid"))):
+            with self.subTest(identities=identities):
+                items = []
+                for identity in identities:
+                    self.projection["add_history_item"](items, "assistant", "Reply", provider_origin=identity)
+                self.assertEqual(len(items), 2)
+        digest = self.projection["history_item_cursor_digest"]
+        legacy = {"kind": "assistant", "text": "Reply"}
+        for identity in (origin(event_id="invalid"), origin(session_id="invalid")):
+            self.assertEqual(digest({**legacy, "provider_origin": identity}), digest(legacy))
+
+    def test_full_parser_retains_adjacent_identical_text_from_distinct_assistant_ids(self) -> None:
+        events = [source_event("assistant", "Reply"), source_event("assistant", "Reply", uuid=PARENT_ID)]
+        items = self.projection["parse_claude_history_events"](events, 2)
+        self.assertEqual([item["provider_origin"]["event_id"] for item in items], [EVENT_ID, PARENT_ID])
 
     def test_full_parser_retains_first_duplicate_provenance(self) -> None:
         events = [source_event(), source_event(uuid=PARENT_ID), source_event("assistant", "Reply", uuid=PROMPT_ID)]
@@ -144,7 +184,7 @@ class ClaudeHistoryProvenanceTests(unittest.TestCase):
         self.assertEqual(items[0]["provider_origin"], origin())
         self.assertEqual(items[1]["provider_origin"]["event_id"], PROMPT_ID)
 
-    def test_delta_retains_provenance_and_keeps_kind_text_cursor_dedup(self) -> None:
+    def test_delta_retains_provenance_and_keeps_user_kind_text_cursor_dedup(self) -> None:
         first = self.projection["claude_history_event_item"](source_event())
         self.projection["bounded_jsonl_records_range"] = Mock(return_value=iter([
             (source_event(uuid=PARENT_ID), 10),
@@ -158,7 +198,36 @@ class ClaudeHistoryProvenanceTests(unittest.TestCase):
         self.assertEqual(items[0]["provider_origin"]["event_id"], PROMPT_ID)
         self.assertEqual(offset, 20)
         self.assertFalse(blocked)
-        self.assertEqual(digest, self.projection["history_item_cursor_digest"]({"kind": "assistant", "text": "Reply"}))
+        self.assertEqual(digest, self.projection["history_item_cursor_digest"](items[0]))
+
+    def test_delta_distinguishes_same_text_assistant_occurrences_across_cursor(self) -> None:
+        first = self.projection["claude_history_event_item"](source_event("assistant", "Reply"))
+        following = source_event("assistant", "Reply", uuid=PARENT_ID)
+        self.projection["bounded_jsonl_records_range"] = Mock(return_value=iter([
+            (source_event("assistant", "Reply"), 10), (following, 20), (following, 30),
+        ]))
+        items, offset, digest, blocked = self.projection["parse_provider_history_delta"](
+            Path("unused.jsonl"), "claude", 0, 30, limit=2, expected_stat={},
+            previous_last_item_digest=self.projection["history_item_cursor_digest"](first),
+        )
+        self.assertEqual([item["provider_origin"]["event_id"] for item in items], [PARENT_ID])
+        self.assertEqual(offset, 30)
+        self.assertFalse(blocked)
+        self.assertEqual(digest, self.projection["history_item_cursor_digest"](items[0]))
+
+    def test_legacy_text_cursor_conservatively_retains_identified_boundary_reply(self) -> None:
+        self.projection["bounded_jsonl_records_range"] = Mock(return_value=iter([
+            (source_event("assistant", "Reply"), 10),
+        ]))
+        legacy_digest = hashlib.sha256(b'["assistant","Reply"]').hexdigest()
+        items, offset, digest, blocked = self.projection["parse_provider_history_delta"](
+            Path("unused.jsonl"), "claude", 0, 10, limit=2, expected_stat={},
+            previous_last_item_digest=legacy_digest,
+        )
+        self.assertEqual(len(items), 1)
+        self.assertEqual(offset, 10)
+        self.assertFalse(blocked)
+        self.assertNotEqual(digest, legacy_digest)
 
     def test_content_reconciliation_retains_unmatched_item_metadata(self) -> None:
         items = [self.projection["claude_history_event_item"](source_event()), self.projection["claude_history_event_item"](source_event("assistant", "Reply"))]

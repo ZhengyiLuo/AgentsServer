@@ -45070,7 +45070,8 @@ def message_text(message: Any, *, compact: bool = True) -> str:
 def normalized_history_provider_origin(value: Any) -> dict[str, str] | None:
     """Keep only validated Claude identifiers and the original aware timestamp.
 
-    This metadata is descriptive, never authority or a message-matching key.
+    This metadata is descriptive, never authority. Assistant reconciliation
+    can correlate its validated message identity with this chat's live events.
     Validate fields independently so one malformed timestamp cannot erase a
     valid source identity, and never copy transcript paths or context fields.
     """
@@ -45147,6 +45148,22 @@ def add_history_item(
             previous_origin = normalized_history_provider_origin(items[-1].get("provider_origin"))
             origin = item["provider_origin"]
             if previous_origin is not None and all(previous_origin.get(field) == origin.get(field) for field in ("event_id", "session_id")):
+                return
+        elif item["kind"] == "assistant" and any(
+            origin is not None and all(origin.get(field) for field in ("event_id", "session_id"))
+            for origin in (
+                normalized_history_provider_origin(items[-1].get("provider_origin")),
+                normalized_history_provider_origin(item.get("provider_origin")),
+            )
+        ):
+            previous_origin = normalized_history_provider_origin(items[-1].get("provider_origin"))
+            origin = normalized_history_provider_origin(item.get("provider_origin"))
+            # A distinct provider message remains a real occurrence even if
+            # its text repeats. An identityless row cannot consume its credit.
+            if previous_origin is not None and origin is not None and all(
+                previous_origin.get(field, "").lower() == origin.get(field, "").lower()
+                for field in ("event_id", "session_id")
+            ):
                 return
         elif items[-1]["text"].strip() == item["text"].strip() and history_dedup_key(
             kind, items[-1]["text"], source_text_sha256=items[-1].get("source_text_sha256"),
@@ -47131,6 +47148,12 @@ def provider_history(sess: dict[str, Any], limit: int | None) -> tuple[Path | No
 def history_item_cursor_digest(item: dict[str, Any]) -> str:
     identity = [str(item.get("kind") or ""), str(item.get("text") or "").strip()]
     runtime_origin = item.get("provider_origin")
+    if item.get("kind") == "assistant":
+        origin = normalized_history_provider_origin(runtime_origin)
+        if origin is not None and all(origin.get(field) for field in ("event_id", "session_id")):
+            # Legacy text-only cursors safely mismatch the first identified
+            # boundary row; never discard a newly appended repeated reply.
+            identity = ["assistant", "claude", origin["session_id"].lower(), origin["event_id"].lower()]
     if (item.get("kind") == "user" and item.get("provider_runtime_context") in ("subagent_notification", "turn_aborted", "provider_notice")
         and item.get("provider_user_authored") is not True and isinstance(runtime_origin, dict)
         and runtime_origin.get("provider") == "codex" and runtime_origin.get("kind") == item["provider_runtime_context"]
@@ -47832,6 +47855,72 @@ def history_dedup_key(
     return str(kind or ""), hashlib.sha256(normalized.encode("utf-8", errors="surrogatepass")).hexdigest() if normalized else ""
 
 
+def history_message_match_details(
+    kind: str, text: Any, metadata: dict[str, Any], *, provider_item: bool = False,
+) -> dict[str, Any]:
+    """Keep exact text and Claude ownership separate from display cleaning."""
+    key = history_dedup_key(kind, text, source_text_sha256=metadata.get("source_text_sha256"))
+    details: dict[str, Any] = {"key": key, "backend": str(metadata.get("backend") or ""), "provider_item": provider_item}
+    if kind != "assistant":
+        return details
+    raw_origin = metadata.get("provider_origin")
+    if not details["backend"] and isinstance(raw_origin, dict):
+        details["backend"] = str(raw_origin.get("provider") or "")
+    if details["backend"] not in ("", BACKEND_CLAUDE):
+        return details
+    origin = normalized_history_provider_origin(metadata.get("provider_origin")) or {}
+    if origin or details["backend"] == BACKEND_CLAUDE:
+        details["backend"] = BACKEND_CLAUDE
+        identity = normalized_history_provider_origin({
+            "provider": "claude",
+            "event_id": origin.get("event_id") or metadata.get("provider_message_id"),
+            "session_id": origin.get("session_id") or metadata.get("provider_session_id"),
+        }) or {}
+        details["message_id"] = str(identity.get("event_id") or "").lower()
+        details["provider_session_id"] = str(identity.get("session_id") or "").lower()
+    # Never derive a fallback from a truncated display prefix. Its complete
+    # source hash cannot be transformed back into a cleaned-text hash.
+    if details["backend"] in ("", BACKEND_CLAUDE) and key == history_dedup_key(kind, text):
+        details["canonical_key"] = history_dedup_key(kind, clean_assistant_text(text))
+    return details
+
+
+def history_messages_match(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    if left["key"][0] != right["key"][0]:
+        return False
+    claude = BACKEND_CLAUDE in (left.get("backend"), right.get("backend"))
+    if claude and left["key"][0] == "assistant":
+        if any(side.get("backend") not in (None, "", BACKEND_CLAUDE) for side in (left, right)):
+            return False
+        sessions = [side.get("provider_session_id") for side in (left, right)]
+        if all(sessions) and sessions[0] != sessions[1]:
+            return False
+        identities = [side.get("message_id") for side in (left, right)]
+        if all(identities):
+            # A distinct UUID is a distinct occurrence even if text is equal.
+            return identities[0] == identities[1]
+        if any(identities) and any(side.get("provider_item") and not side.get("message_id") for side in (left, right)):
+            # An unidentified source row cannot consume a known live UUID.
+            # The fallback is for legacy live projections missing identity.
+            return False
+    if left["key"] == right["key"]:
+        return True
+    return bool(
+        claude and left.get("canonical_key", ("", ""))[1]
+        and left.get("canonical_key") == right.get("canonical_key")
+    )
+
+
+def history_message_match_tokens(details: dict[str, Any]) -> list[tuple[str, ...]]:
+    kind, digest = details["key"]
+    tokens = [(kind, "text", digest)]
+    if details.get("message_id"):
+        tokens.insert(0, (kind, "claude_id", details["message_id"]))
+    if details.get("canonical_key", ("", ""))[1]:
+        tokens.append((kind, "claude_clean", details["canonical_key"][1]))
+    return tokens
+
+
 def history_timeline_message_keys(
     session_id: str,
     *,
@@ -47839,6 +47928,7 @@ def history_timeline_message_keys(
     timeline_through_seq: int,
     tail: bool,
     include_imported: bool,
+    message_details: dict[int, dict[str, Any]] | None = None,
 ) -> tuple[list[tuple[int, tuple[str, str]]], bool, bool]:
     """Scan a fixed timeline boundary while bounding message credits only.
 
@@ -47859,10 +47949,10 @@ def history_timeline_message_keys(
     except FileNotFoundError:
         raise ValueError("timeline disappeared during history reconciliation")
     maximum = max(1, int(HISTORY_SYNC_EVENT_SCAN_LIMIT))
-    selected: list[tuple[int, tuple[str, str]]] | deque[
-        tuple[int, tuple[str, str]]
-    ]
+    selected: list[dict[str, Any]] | deque[dict[str, Any]]
     selected = deque(maxlen=maximum) if tail else []
+    provider_runs: dict[str, str] = {}
+    prior_message: dict[str, Any] | None = None
     timeline_has_messages = False
     front_window_truncated = False
     last_seq = 0
@@ -47916,13 +48006,17 @@ def history_timeline_message_keys(
                     "timeline event sequence is invalid during history sync"
                 )
             last_seq = raw_seq
-            if raw_seq <= after_seq:
-                continue
             if raw_seq > through_seq:
                 break
             if not event_files_belong_to_session(event, session_id):
                 continue
             event_type = event.get("type")
+            run_id = str(event.get("run_id") or "")
+            if run_id and event_type == "provider_session" and event.get("backend") == BACKEND_CLAUDE:
+                provider_runs[run_id] = str(event.get("provider_session_id") or "")
+                if len(provider_runs) > maximum:
+                    provider_runs.pop(next(iter(provider_runs)))
+            before_window = raw_seq <= after_seq
             if event_type == "turn_started" or is_native_goal_steer_event(event):
                 key = history_dedup_key("user", event.get("prompt"), source_text_sha256=event.get("source_text_sha256"))
             elif event_type == "assistant_text":
@@ -47955,12 +48049,61 @@ def history_timeline_message_keys(
                 key = history_dedup_key("assistant", result_text, source_text_sha256=event.get("source_text_sha256"))
             else:
                 continue
-            timeline_has_messages = True
+            if not before_window:
+                timeline_has_messages = True
             if not include_imported and event.get("imported") is True:
                 # Messages written by an earlier history-import batch are not
                 # evidence that AgentsDock authored matching provider input.
                 # Its exact source checkpoint, not content, makes crash replay
                 # idempotent.
+                continue
+            text = event.get("prompt") if key[0] == "user" else event.get(
+                "result_text" if event_type in {"turn_finished", "job_summary"} else "text"
+            )
+            metadata = {**event}
+            if run_id in provider_runs and not event.get("imported"):
+                metadata["backend"] = metadata.get("backend") or BACKEND_CLAUDE
+                metadata["provider_session_id"] = metadata.get("provider_session_id") or provider_runs[run_id]
+            details = history_message_match_details(key[0], text, metadata)
+            details.update(seq=raw_seq, run_id=run_id)
+            if details.get("message_id") and details.get("canonical_key"):
+                # Hash block joins incrementally: retaining complete text for
+                # every ownership credit would undo the scanner's memory cap.
+                details["_block_hashes"] = [hashlib.sha256(value.encode("utf-8", errors="surrogatepass")) for value in (
+                    " ".join(str(text or "").split()), " ".join(clean_assistant_text(text).split()),
+                )]
+            previous = (selected[-1] if selected else prior_message) if not front_window_truncated else None
+            if previous and run_id and previous.get("run_id") == run_id and key[0] == "assistant":
+                same_identity = bool(
+                    details.get("message_id") and previous.get("message_id")
+                    and history_messages_match(previous, details)
+                )
+                final_alias = bool(
+                    event_type in {"assistant_text", "turn_finished", "job_summary"}
+                    and previous.get("backend") == BACKEND_CLAUDE
+                    and history_messages_match(previous, details)
+                )
+                if same_identity or final_alias:
+                    # SDK TextBlocks and its terminal echo are projections of
+                    # one provider message, not extra occurrence credits.
+                    if same_identity and event_type == "reasoning_summary":
+                        hashes = previous.get("_block_hashes")
+                        if hashes and details.get("_block_hashes"):
+                            for digest, value in zip(hashes, (
+                                " ".join(str(text or "").split()), " ".join(clean_assistant_text(text).split()),
+                            )):
+                                digest.update((" " + value).encode("utf-8", errors="surrogatepass"))
+                            previous["key"] = ("assistant", hashes[0].hexdigest())
+                            previous["canonical_key"] = ("assistant", hashes[1].hexdigest())
+                        else:
+                            previous["key"] = ("assistant", "")
+                            previous.pop("canonical_key", None)
+                    previous["seq"] = raw_seq
+                    continue
+            if before_window:
+                # A later terminal echo of this already-consumed projection
+                # must not create a new ownership credit after the watermark.
+                prior_message = details
                 continue
             if not tail and len(selected) >= maximum:
                 # A valid cursor consumes ownership credits from the front.
@@ -47970,10 +48113,12 @@ def history_timeline_message_keys(
                 # byte cursor instead of wedging forever at this boundary.
                 front_window_truncated = True
                 continue
-            selected.append((raw_seq, key))
+            selected.append(details)
     if last_seq < through_seq:
         raise ValueError("timeline changed during bounded history reconciliation")
-    return list(selected), timeline_has_messages, front_window_truncated
+    if message_details is not None:
+        message_details.update((entry["seq"], {key: value for key, value in entry.items() if not key.startswith("_")}) for entry in selected)
+    return [(entry["seq"], entry["key"]) for entry in selected], timeline_has_messages, front_window_truncated
 
 
 def reconcile_cursor_history_items(
@@ -47995,6 +48140,7 @@ def reconcile_cursor_history_items(
 
     after_seq = max(0, int(timeline_after_seq))
     through_seq = max(after_seq, int(timeline_through_seq))
+    message_details: dict[int, dict[str, Any]] = {}
     (
         timeline_messages,
         _timeline_has_messages,
@@ -48005,19 +48151,19 @@ def reconcile_cursor_history_items(
         timeline_through_seq=through_seq,
         tail=False,
         include_imported=False,
+        message_details=message_details,
     )
 
     fresh: list[dict[str, str]] = []
     timeline_index = 0
     consumed_seq = after_seq
     for item in items:
-        item_key = history_dedup_key(
-            item.get("kind", ""), item.get("text", ""),
-            source_text_sha256=item.get("source_text_sha256"),
-        )
+        item_details = history_message_match_details(item.get("kind", ""), item.get("text", ""), item, provider_item=True)
         if (
             timeline_index < len(timeline_messages)
-            and item_key == timeline_messages[timeline_index][1]
+            and history_messages_match(item_details, message_details.get(
+                timeline_messages[timeline_index][0], {"key": timeline_messages[timeline_index][1]},
+            ))
         ):
             consumed_seq = timeline_messages[timeline_index][0]
             timeline_index += 1
@@ -48074,6 +48220,7 @@ def unsynced_history_items(
         if timeline_through_seq is not None
         else last_event_seq_from_file(events_path(session_id))
     )
+    message_details: dict[int, dict[str, Any]] = {}
     (
         timeline_messages,
         timeline_has_messages,
@@ -48087,14 +48234,12 @@ def unsynced_history_items(
         # silently tail-truncating those credits can hide a later duplicate.
         tail=True,
         include_imported=True,
+        message_details=message_details,
     )
-    timeline_keys = [key for _seq, key in timeline_messages]
+    timeline_details = [message_details.get(seq, {"key": key}) for seq, key in timeline_messages]
 
-    transcript_keys = [
-        history_dedup_key(
-            item.get("kind", ""), item.get("text", ""),
-            source_text_sha256=item.get("source_text_sha256"),
-        )
+    transcript_details = [
+        history_message_match_details(item.get("kind", ""), item.get("text", ""), item, provider_item=True)
         for item in items
     ]
     # Content alone cannot distinguish an original ``A, B`` prefix from the
@@ -48105,11 +48250,11 @@ def unsynced_history_items(
     # newest-backward alignment below so an older repeated answer is not
     # imported ahead of the already-shown current turn.
     if (
-        timeline_keys
-        and len(timeline_keys) <= len(transcript_keys)
-        and transcript_keys[:len(timeline_keys)] == timeline_keys
+        timeline_details
+        and len(timeline_details) <= len(transcript_details)
+        and all(history_messages_match(native, source) for native, source in zip(timeline_details, transcript_details))
     ):
-        return items[len(timeline_keys):]
+        return items[len(timeline_details):]
 
     last_matched = -1
     # Align the newest bounded timeline tail to the transcript in reverse
@@ -48118,19 +48263,29 @@ def unsynced_history_items(
     # still-unseen repeated ``A`` in ``A, B, A``.  Greedily selecting the
     # newest occurrence that remains before the prior match handles repeated
     # text without letting an old duplicate consume the current-tail anchor.
-    transcript_positions: dict[tuple[str, str], list[int]] = defaultdict(list)
-    for index, key in enumerate(transcript_keys):
-        transcript_positions[key].append(index)
+    transcript_positions: dict[tuple[str, ...], list[int]] = defaultdict(list)
+    for index, details in enumerate(transcript_details):
+        for token in history_message_match_tokens(details):
+            transcript_positions[token].append(index)
     transcript_index = len(items) - 1
-    for timeline_key in reversed(timeline_keys):
-        candidates = transcript_positions.get(timeline_key)
-        if not candidates:
+    for details in reversed(timeline_details):
+        candidates: set[int] = set()
+        matched_index = -1
+        for token in history_message_match_tokens(details):
+            positions = transcript_positions.get(token, [])
+            while positions and positions[-1] > transcript_index:
+                positions.pop()
+            if token[1] == "claude_id":
+                matched_index = next((index for index in reversed(positions)
+                    if history_messages_match(details, transcript_details[index])), -1)
+                if matched_index >= 0:
+                    break
+            candidates.update(positions)
+        if matched_index < 0:
+            matched_index = next((index for index in sorted(candidates, reverse=True)
+                if history_messages_match(details, transcript_details[index])), -1)
+        if matched_index < 0:
             continue
-        while candidates and candidates[-1] > transcript_index:
-            candidates.pop()
-        if not candidates:
-            continue
-        matched_index = candidates.pop()
         last_matched = max(last_matched, matched_index)
         transcript_index = matched_index - 1
     if last_matched == -1 and timeline_has_messages and items:

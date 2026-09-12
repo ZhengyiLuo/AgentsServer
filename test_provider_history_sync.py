@@ -117,6 +117,7 @@ def fake_history_timeline_scan(events: list[dict]):
         timeline_through_seq,
         tail,
         include_imported,
+        message_details=None,
     ):
         selected = []
         has_messages = False
@@ -149,6 +150,11 @@ def fake_history_timeline_scan(events: list[dict]):
             has_messages = True
             if not include_imported and event.get("imported") is True:
                 continue
+            if message_details is not None:
+                text = event.get("prompt") if key[0] == "user" else event.get(
+                    "result_text" if event_type in {"turn_finished", "job_summary"} else "text"
+                )
+                message_details[seq] = agent_server.history_message_match_details(key[0], text, event)
             selected.append((seq, key))
         maximum = max(1, int(agent_server.HISTORY_SYNC_EVENT_SCAN_LIMIT))
         if tail:
@@ -1026,6 +1032,147 @@ class UnsyncedHistoryItemsTests(unittest.TestCase):
 
         self.assertEqual(unchanged, [])
         self.assertEqual(fresh, appended)
+
+
+class ClaudeHistoryMessageIdentityTests(unittest.TestCase):
+    provider_id = "11111111-1111-4111-8111-111111111111"
+    message_id = "22222222-2222-4222-8222-222222222222"
+    later_id = "33333333-3333-4333-8333-333333333333"
+    raw_text = "✅ **上线了**\n\nThe server is ready."
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory(prefix="claude-history-identity-")
+        self.addCleanup(folder.cleanup)
+        self.event_path = Path(folder.name) / "events.jsonl"
+        patcher = patch.object(agent_server, "events_path", return_value=self.event_path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write(self, events):
+        self.events = [{"seq": index, "run_id": "run_live", **event} for index, event in enumerate(events, 1)]
+        self.event_path.write_text("".join(json.dumps(event) + "\n" for event in self.events), encoding="utf-8")
+
+    def source(self, text=None, message_id=None, provider_id=None):
+        return agent_server.claude_history_event_item({
+            "type": "assistant", "uuid": message_id or self.message_id,
+            "sessionId": provider_id or self.provider_id,
+            "message": {"content": [{"type": "text", "text": text or self.raw_text}]},
+        })
+
+    def live(self, *, identity=True, blocks=None):
+        text = agent_server.clean_assistant_text(self.raw_text)
+        parts = blocks or [text]
+        self.write([
+            {"type": "turn_started", "backend": "claude", "prompt": "Publish it"},
+            {"type": "provider_session", "backend": "claude", "provider_session_id": self.provider_id},
+            *[{"type": "reasoning_summary", "backend": "claude", "phase": "commentary", "text": part,
+               **({"provider_message_id": self.message_id} if identity else {})} for part in parts],
+            {"type": "tool_finished"},
+            {"type": "assistant_text", "text": "\n\n".join(parts)},
+            {"type": "turn_finished", "backend": "claude", "result_text": "\n\n".join(parts),
+             "provider_session_id": self.provider_id},
+        ])
+
+    def cursor(self, items, after=1):
+        return agent_server.reconcile_cursor_history_items(
+            "test-chat", items, timeline_after_seq=after, timeline_through_seq=len(self.events),
+        )
+
+    def initial(self, items):
+        return agent_server.unsynced_history_items("test-chat", items, timeline_through_seq=len(self.events))
+
+    def test_decorated_reply_is_owned_in_initial_and_cursor_sync(self):
+        self.live()
+        item = self.source()
+        self.assertEqual(self.initial([user("Publish it"), item]), [])
+        self.assertEqual(self.cursor([item]), ([], len(self.events)))
+        self.assertEqual(item["text"], self.raw_text)  # matching never rewrites presentation
+
+    def test_same_uuid_wins_over_rendering_and_preserves_later_distinct_reply(self):
+        self.live()
+        owned = self.source("Provider rendering differs beyond decorations")
+        external = self.source(message_id=self.later_id)
+        self.assertEqual(self.cursor([owned, external]), ([external], len(self.events)))
+        self.assertEqual(self.initial([user("Publish it"), owned, external]), [external])
+
+    def test_reverse_anchor_prefers_uuid_and_not_newer_same_text(self):
+        self.live()
+        owned = self.source()
+        external = self.source(message_id=self.later_id)
+        self.assertEqual(self.initial([user("Older unmatched question"), owned, external]), [external])
+
+    def test_conflicting_message_or_provider_identity_never_uses_text_fallback(self):
+        self.live()
+        for external in (self.source(message_id=self.later_id), self.source(provider_id=self.later_id)):
+            with self.subTest(origin=external["provider_origin"]):
+                self.assertEqual(self.cursor([external]), ([external], 1))
+                self.assertEqual(self.initial([user("Publish it"), external]), [external])
+
+    def test_legacy_cleaning_fallback_consumes_only_one_occurrence(self):
+        self.live(identity=False)
+        first, later = self.source(), self.source(message_id=self.later_id)
+        self.assertEqual(self.cursor([first, later]), ([later], len(self.events)))
+        self.assertEqual(self.initial([user("Publish it"), first, later]), [later])
+
+    def test_identityless_source_cannot_consume_known_live_message_credit(self):
+        self.live()
+        unknown = assistant(self.raw_text)
+        owned = self.source()
+        self.assertEqual(self.cursor([unknown, owned]), ([unknown], len(self.events)))
+
+    def test_multiple_text_blocks_and_final_echo_are_one_identity_credit(self):
+        self.live(blocks=["First block", "Second block"])
+        first = self.source("✅ First block\nSecond block")
+        later = self.source("✅ First block\nSecond block", message_id=self.later_id)
+        self.assertEqual(self.cursor([first, later]), ([later], len(self.events)))
+        self.assertEqual(self.initial([user("Publish it"), first, later]), [later])
+        self.assertEqual(self.initial([user("Unmatched older question"), first, later]), [later])
+
+    def test_terminal_echo_after_cursor_watermark_is_not_a_new_credit(self):
+        self.live()
+        later = self.source(message_id=self.later_id)
+        self.assertEqual(self.cursor([], after=3), ([], len(self.events)))
+        self.assertEqual(self.cursor([later], after=3), ([later], len(self.events)))
+
+    def test_front_scan_cap_keeps_next_distinct_identity_for_next_window(self):
+        self.live()
+        self.write([*self.events,
+            {"type": "reasoning_summary", "backend": "claude", "phase": "commentary", "text": "Another reply",
+             "provider_message_id": self.later_id, "run_id": "run_next"},
+        ])
+        with patch.object(agent_server, "HISTORY_SYNC_EVENT_SCAN_LIMIT", 1):
+            fresh, consumed = self.cursor([self.source()])
+            self.assertEqual(fresh, [])
+            self.assertEqual(consumed, 5)
+            self.assertEqual(self.cursor([self.source("Another reply", message_id=self.later_id)], after=consumed), ([], len(self.events)))
+
+    def test_compacted_display_prefix_is_not_canonical_fallback_proof(self):
+        self.live(identity=False)
+        external = {**self.source(), "source_text_sha256": agent_server.history_dedup_key("assistant", self.raw_text + " unseen suffix")[1]}
+        self.assertEqual(self.cursor([external]), ([external], 1))
+
+    def test_other_backend_and_user_text_do_not_gain_decoration_equivalence(self):
+        self.write([{"type": "assistant_text", "backend": "codex", "text": "Ready"}])
+        external = self.source("✅ Ready")
+        self.assertEqual(self.cursor([external], after=0), ([external], 0))
+        self.write([{"type": "turn_started", "backend": "claude", "prompt": "Ready"}])
+        self.assertEqual(self.cursor([user("✅ Ready")], after=0), ([user("✅ Ready")], 0))
+        self.write([{"type": "assistant_text", "backend": "codex", "text": "Ready",
+                     "provider_origin": self.source()["provider_origin"]}])
+        self.assertEqual(self.cursor([external], after=0), ([external], 0))
+
+    def test_existing_prune_does_not_recognize_emoji_copy_and_dry_run_is_read_only(self):
+        self.live()
+        self.write([*self.events,
+            {"type": "history_imported", "run_id": "import_fixture", "backend": "claude"},
+            {"type": "assistant_text", "run_id": "import_fixture", "backend": "claude", "imported": True,
+             "text": self.raw_text, "provider_origin": self.source()["provider_origin"]},
+            {"type": "turn_finished", "run_id": "import_fixture", "backend": "claude", "imported": True},
+        ])
+        before = self.event_path.read_bytes()
+        summary = agent_server.prune_duplicate_imported_history_sync("test-chat", dry_run=True)
+        self.assertEqual(summary["removed_events"], 0)
+        self.assertEqual(self.event_path.read_bytes(), before)
 
 
 class SyncProviderHistoryTests(unittest.IsolatedAsyncioTestCase):

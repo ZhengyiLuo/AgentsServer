@@ -63943,6 +63943,13 @@ async def run_codex_app_server(
     })
 
     manager = await codex_app_server_manager()
+    # A sign-in that happened after this app-server started is invisible to it:
+    # it would keep refreshing the credentials it loaded at launch and fail the
+    # turn by asking the user to sign in again, which they already did. Retiring
+    # the idle process here lets the lazy restart below read the new
+    # credentials, so a completed sign-in takes effect with no user action.
+    with suppress(Exception):
+        await manager.retire_replaced_credentials()
     provider_id = str(session_provider_id(sess) or "")
     resumed_provider_id = provider_id or None
     model, effort, service_tier = codex_runtime_settings(sess)

@@ -900,7 +900,7 @@ CLAUDE_PROVIDER_SECRET_ENV_NAMES = (
 JOB_SCHEDULER_INTERVAL_SECONDS = float(agentsdock_setting("JOB_SCHEDULER_INTERVAL_SECONDS", "5"))
 JOB_BUSY_RETRY_SECONDS = int(agentsdock_setting("JOB_BUSY_RETRY_SECONDS", "60"))
 # Zero means scheduled jobs have no scheduler-specific concurrency ceiling.
-# The global agent-run guard and low-memory check still protect the machine.
+# The optional global cap and low-memory check still apply.
 JOB_MAX_ACTIVE_RUNS = int(agentsdock_setting("JOB_MAX_ACTIVE_RUNS", "0"))
 JOB_MIN_AVAILABLE_MEM_MB = int(agentsdock_setting("JOB_MIN_AVAILABLE_MEM_MB", "4096"))
 JOB_DEFER_EVENT_MIN_SECONDS = int(agentsdock_setting("JOB_DEFER_EVENT_MIN_SECONDS", "300"))
@@ -908,7 +908,9 @@ JOB_DEFER_EVENT_MIN_SECONDS = int(agentsdock_setting("JOB_DEFER_EVENT_MIN_SECOND
 # but an occurrence must not be parked forever.  Keep the small retry budget on
 # the durable job row so a restart cannot reset it into an infinite loop.
 JOB_RUNTIME_UNAVAILABLE_MAX_DEFERS = 3
-MAX_ACTIVE_AGENT_RUNS = int(agentsdock_setting("MAX_ACTIVE_AGENT_RUNS", "10"))
+# No server-wide chat-run ceiling by default. Operators can explicitly set a
+# positive cap; launch memory and managed-update guards remain independent.
+MAX_ACTIVE_AGENT_RUNS = int(agentsdock_setting("MAX_ACTIVE_AGENT_RUNS", "0"))
 MIN_START_AVAILABLE_MEM_MB = int(agentsdock_setting("MIN_START_AVAILABLE_MEM_MB", "2048"))
 HOST_MONITOR_INTERVAL_SECONDS = float(agentsdock_setting("HOST_MONITOR_INTERVAL_SECONDS", "15"))
 HOST_HEALTH_MAX_BYTES = int(agentsdock_setting("HOST_HEALTH_MAX_BYTES", str(20 * 1024 * 1024)))

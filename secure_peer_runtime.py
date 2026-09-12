@@ -6723,14 +6723,18 @@ class SecurePeerRuntime:
                 limit=int(query.get("limit", "50")),
             )
         if method == "GET" and len(pieces) == 2 and pieces[0] == "messages":
+            revision_options = {"include_revision": True} if flag("include_revision") else {}
             return store.get_team_message(
                 claims, team_id, pieces[1],
                 include_mail_subject=flag("include_mail_subject"),
+                **revision_options,
             )
         if method == "POST" and pieces == ["messages"]:
             return store.create_team_message(claims, team_id, dict(body or {}))
         if method == "POST" and len(pieces) == 3 and pieces[0] == "messages" and pieces[2] == "receipts":
             return store.record_team_message_receipt(claims, team_id, pieces[1], dict(body or {}))
+        if method == "POST" and len(pieces) == 3 and pieces[0] == "messages" and pieces[2] == "revisions":
+            return store.revise_team_message(claims, team_id, pieces[1], dict(body or {}))
         if method == "DELETE" and len(pieces) == 2 and pieces[0] == "messages":
             return store.delete_team_message(
                 claims,
@@ -6794,14 +6798,20 @@ class SecurePeerRuntime:
         *,
         team_id: str | None = None,
         include_mail_subject: bool = False,
+        include_revision: bool = False,
     ) -> dict[str, Any]:
         if type(include_mail_subject) is not bool:
             raise SecurePeerError("invalid_request", "Mail subject projection flag is invalid", 422)
+        if type(include_revision) is not bool:
+            raise SecurePeerError("invalid_request", "Message revision projection flag is invalid", 422)
         realm = self.team_realm(team_id)
+        query = {"include_mail_subject": include_mail_subject}
+        if include_revision:
+            query["include_revision"] = True
         result = self._team_hub_get(
             realm,
             f"/v1/teams/{quote(realm['team_id'], safe='')}/network/messages/{quote(message_id, safe='')}",
-            {"include_mail_subject": include_mail_subject},
+            query,
         )
         result["team_id"] = realm["team_id"]
         return result
@@ -6898,7 +6908,7 @@ class SecurePeerRuntime:
         idempotency_key: str,
         provenance: Mapping[str, str],
     ) -> dict[str, Any]:
-        """Create one team message for a frozen @@ reference, with attachments."""
+        """Create or explicitly revise a message using a frozen @@ reference."""
 
         if "durable_server_binding" in reference:
             # Provider callers hold team_authorized_write's generation fence;
@@ -6914,6 +6924,38 @@ class SecurePeerRuntime:
             )
         team_path = f"/v1/teams/{quote(realm['team_id'], safe='')}/network"
         kind = str(payload.get("kind") or "message")
+        if kind == "bulletin_edit":
+            if not (
+                reference.get("kind") == "recipient"
+                and reference.get("recipient_kind") == "all"
+            ):
+                raise SecurePeerError(
+                    "team_reference_invalid", "Editing a Bulletin message requires a Bulletin route", 409
+                )
+            if (
+                attachment_paths or payload.get("attachments") or payload.get("attachment_ids")
+                or any(payload.get(field) is not None for field in (
+                    "title", "skill", "in_reply_to_message_id",
+                ))
+            ):
+                raise SecurePeerError(
+                    "invalid_request", "Bulletin edits replace only the body; title, attachments, and skill data are preserved", 422
+                )
+            message_id = payload.get("message_id")
+            expected_version = payload.get("expected_version")
+            if not isinstance(message_id, str) or re.fullmatch(r"[A-Za-z0-9_-]{8,240}", message_id) is None:
+                raise SecurePeerError("invalid_request", "An exact Bulletin message ID is required", 422)
+            if type(expected_version) is not int or expected_version < 1:
+                raise SecurePeerError("invalid_request", "expected_version must be a positive integer", 422)
+            return self._team_hub_post(
+                realm, f"{team_path}/messages/{quote(message_id, safe='')}/revisions",
+                {
+                    "body": str(payload.get("body") or ""),
+                    "body_format": str(payload.get("body_format") or "markdown"),
+                    "expected_version": expected_version,
+                    "idempotency_key": idempotency_key,
+                },
+            )
         if (
             (kind == "skill" or payload.get("skill") is not None)
             and reference.get("kind") != "skill"

@@ -2,7 +2,7 @@
 """Capability-scoped Team Network helper for AgentsDock agents.
 
 Read commands (inbox, feed, sent, read, skills, skill get) are available on
-every ordinary turn.  ``routes``, ``send``, and ``reply`` exist only when the user
+every ordinary turn.  ``routes``, ``send``, ``reply``, and ``edit`` exist only when the user
 mentioned Team Network recipients with ``@@`` on this turn; the server freezes
 those recipients into opaque per-run routes.  Message bodies arrive on stdin so
 they never appear in process arguments.
@@ -291,6 +291,7 @@ def read(args: argparse.Namespace) -> dict[str, Any]:
         + _query({
             "download": bool(args.download), "team": getattr(args, "team", None),
             "include_mail_subject": getattr(args, "include_mail_subject", False),
+            "include_revision": getattr(args, "include_revision", False),
         }),
         capability,
         timeout=600.0 if args.download else 60.0,
@@ -459,6 +460,50 @@ def send(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def edit(args: argparse.Namespace) -> dict[str, Any]:
+    """Revise one exact Bulletin message; never fall back to creating a post."""
+    capability, _session_id = _provider_authority(args.authority_file)
+    route_id = str(args.route or "").strip()
+    if not route_id:
+        raise TeamCLIError("--route is required; run `routes` first")
+    message_id = args.message_id
+    if not isinstance(message_id, str) or re.fullmatch(r"[A-Za-z0-9_-]{8,240}", message_id) is None:
+        raise TeamCLIError("MESSAGE_ID must contain 8 to 240 ASCII letters, digits, underscores, or hyphens")
+    expected_version = args.expected_version
+    if type(expected_version) is not int or expected_version < 1:
+        raise TeamCLIError("--expected-version must be a positive integer; read --include-revision first")
+    payload: dict[str, Any] = {
+        "kind": "bulletin_edit",
+        "message_id": message_id,
+        "expected_version": expected_version,
+        "body": _read_body(),
+        "body_format": "markdown",
+    }
+    stable_key = "team_cli_" + hashlib.sha256(json.dumps(
+        [capability, route_id, payload], sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")).hexdigest()
+    payload["idempotency_key"] = args.idempotency_key or stable_key
+    result = _request_json(
+        "POST", f"/api/agent/team/routes/{urllib.parse.quote(route_id, safe='')}",
+        capability, payload, timeout=900.0,
+    )
+    if (
+        result.get("ok") is not True
+        or result.get("route_id") != route_id
+        or result.get("message_id") != message_id
+        or result.get("kind") != "bulletin_edit"
+        or result.get("accepted") is not True
+        or type(result.get("duplicate")) is not bool
+        or type(result.get("attachments")) is not int
+        or result["attachments"] < 0
+        or result.get("edited") is not True
+        or type(result.get("version")) is not int
+        or result["version"] != expected_version + 1
+    ):
+        raise TeamCLIError("AgentsServer returned an invalid Team Network edit receipt")
+    return result
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
         description="Read Team Network mail and skills, and send to @@-mentioned recipients.",
@@ -499,6 +544,7 @@ def parser() -> argparse.ArgumentParser:
     read_command.add_argument("--download", action="store_true", help="fetch attachments into the local team cache and print their paths")
     read_command.add_argument("--team", default=None)
     read_command.add_argument("--include-mail-subject", action="store_true", help="request the mail subject from a compatible Team Hub")
+    read_command.add_argument("--include-revision", action="store_true", help="request the current Bulletin revision version before editing")
     read_command.set_defaults(handler=read)
 
     skills_command = commands.add_parser(
@@ -566,6 +612,16 @@ def parser() -> argparse.ArgumentParser:
         handler=send, kind="message", skill_slug=None, summary=None, tags=None,
         change_note=None, expected_version=None,
     )
+    edit_command = commands.add_parser(
+        "edit", help="edit the body of one existing Bulletin message by exact ID and version",
+        description="Read MESSAGE_ID --include-revision first, then edit that exact Bulletin message through an authorized Bulletin route. The replacement Markdown body is read from stdin. Title, attachments, and skill data are preserved. Unsupported servers and stale versions fail without creating a new post.",
+        allow_abbrev=False,
+    )
+    edit_command.add_argument("message_id", metavar="MESSAGE_ID")
+    edit_command.add_argument("--route", required=True)
+    edit_command.add_argument("--expected-version", type=int, required=True)
+    edit_command.add_argument("--idempotency-key", help=argparse.SUPPRESS)
+    edit_command.set_defaults(handler=edit)
     return root
 
 

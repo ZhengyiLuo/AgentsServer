@@ -84062,9 +84062,11 @@ TEAM_CONTENT_NOTICE = (
 
 
 class AgentTeamSendRequest(BaseModel):
-    kind: Literal["message", "skill"] = "message"
+    kind: Literal["message", "skill", "bulletin_edit"] = "message"
     title: str | None = Field(default=None, min_length=1, max_length=160)
     in_reply_to_message_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{8,240}$")
+    message_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{8,240}$")
+    expected_version: int | None = Field(default=None, ge=1, strict=True)
     body: str = Field(min_length=1, max_length=PROVIDER_TEAM_BODY_MAX_BYTES)
     body_format: Literal["plain", "markdown"] = "markdown"
     attachments: list[str] = Field(
@@ -84072,6 +84074,17 @@ class AgentTeamSendRequest(BaseModel):
     )
     skill: dict[str, Any] | None = None
     idempotency_key: str = Field(min_length=8, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_bulletin_edit(self):
+        if self.kind == "bulletin_edit":
+            if self.message_id is None or self.expected_version is None:
+                raise ValueError("Bulletin editing requires message_id and expected_version")
+            if self.title is not None or self.attachments or self.skill is not None or self.in_reply_to_message_id is not None:
+                raise ValueError("Bulletin editing changes only the body; existing attachments and title are preserved")
+        elif self.message_id is not None or self.expected_version is not None:
+            raise ValueError("message_id and expected_version require bulletin_edit")
+        return self
 
     @model_validator(mode="before")
     @classmethod
@@ -84147,6 +84160,7 @@ def provider_team_route_projection(route_id: str, reference: dict[str, Any]) -> 
             fallback=fallback,
         ),
         "allows_skill": kind == "skill" or recipient_kind == "all",
+        "allows_bulletin_edit": kind == "recipient" and recipient_kind == "all",
     }
 
 
@@ -84363,6 +84377,7 @@ async def get_provider_team_message(
     download: bool = False,
     team: str | None = None,
     include_mail_subject: bool = False,
+    include_revision: bool = False,
 ) -> dict[str, Any]:
     _token_hash, _source_session_id, capability = await provider_team_capability(
         request, "team_read"
@@ -84378,6 +84393,7 @@ async def get_provider_team_message(
             message_id,
             team_id=team or None,
             include_mail_subject=bool(include_mail_subject),
+            **({"include_revision": True} if include_revision else {}),
         )
         if download:
             await provider_team_local_attachments(
@@ -84510,6 +84526,10 @@ async def send_provider_team_message(
     reference = (capability.get("team_routes") or {}).get(route_id)
     if not isinstance(reference, dict):
         raise HTTPException(status_code=404, detail="Team Network route was not found")
+    if req.kind == "bulletin_edit" and not (
+        reference.get("kind") == "recipient" and reference.get("recipient_kind") == "all"
+    ):
+        raise HTTPException(status_code=409, detail="Editing a Bulletin post requires this chat's Bulletin route")
     if reference.get("kind") == "skill" and req.kind != "skill":
         raise HTTPException(
             status_code=409,
@@ -84660,6 +84680,12 @@ async def send_provider_team_message(
     message = result.get("message") if isinstance(result, dict) else None
     if not isinstance(message, dict) or not message.get("id"):
         raise HTTPException(status_code=502, detail="Team Hub returned an invalid message")
+    if req.kind == "bulletin_edit":
+        revision = message.get("revision")
+        if not (message["id"] == req.message_id and message.get("kind") == "message"
+                and isinstance(revision, dict) and type(revision.get("version")) is int
+                and revision["version"] == req.expected_version + 1):
+            raise HTTPException(status_code=502, detail="Team Hub returned an invalid Bulletin revision")
     skill = message.get("skill") if isinstance(message.get("skill"), dict) else None
     receipt = {
         "ok": True,
@@ -84672,6 +84698,8 @@ async def send_provider_team_message(
         "skill_slug": skill.get("slug") if skill else None,
         "skill_version": skill.get("version") if skill else None,
     }
+    if req.kind == "bulletin_edit":
+        receipt.update(edited=True, version=message["revision"]["version"])
     async with CROSS_CHAT_CAPABILITY_LOCK:
         current = CROSS_CHAT_CAPABILITIES.get(token_hash)
         if current is not None:
@@ -84679,22 +84707,25 @@ async def send_provider_team_message(
             if isinstance(reservation, dict):
                 reservation["accepted"] = True
                 reservation["receipt"] = dict(receipt)
-    await record_team_message_sent_event(
-        source_session_id,
-        source_run_id,
-        receipt,
-        team_id=str(reference["team_id"]),
-        recipients=[
-            {
-                "kind": str(item.get("kind") or ""),
-                "display_name": str(item.get("display_name") or ""),
-            }
-            for item in (message.get("recipients") or [])
-            if isinstance(item, dict)
-        ],
-        title=message.get("title"),
-        destination=message.get("destination"),
-    )
+    if req.kind != "bulletin_edit":
+        # A revision has its own Hub audit/history. It is not another sent mail
+        # or a new timeline message; the provider tool returns the exact receipt.
+        await record_team_message_sent_event(
+            source_session_id,
+            source_run_id,
+            receipt,
+            team_id=str(reference["team_id"]),
+            recipients=[
+                {
+                    "kind": str(item.get("kind") or ""),
+                    "display_name": str(item.get("display_name") or ""),
+                }
+                for item in (message.get("recipients") or [])
+                if isinstance(item, dict)
+            ],
+            title=message.get("title"),
+            destination=message.get("destination"),
+        )
     logger.info(
         "team message send accepted source_session=%s source_run=%s route=%s kind=%s attachments=%d",
         source_session_id,

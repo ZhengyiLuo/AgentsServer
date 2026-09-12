@@ -56,10 +56,22 @@ Each link uses a cryptographically random 256-bit token; only its SHA-256 hash
 is persisted. Save the returned link if needed: listing cannot recover it.
 Snapshot and revocation records are append-only. Public views, including cold
 views after restart, open an existing database read-only and never create state.
+The first authenticated creation upgrades an older snapshot database transactionally
+to remove its former message-count constraint. Existing snapshots, token hashes,
+revocations, and immutability triggers are preserved; an interrupted or failed
+upgrade rolls back. Anonymous views can read the old schema without migrating it.
 
-Bounds: 64 MiB source log, 1 MiB record, 100,000 records, 1,000 public messages,
-256 KiB per message, 2 MiB serialized snapshot, 256-character title, and 16 MiB
-rendered page. Limits fail explicitly rather than publishing a truncated chat.
+There is no raw-history byte ceiling or public-message-count ceiling. The reader
+streams a fixed durable prefix one record at a time, including tool-noise bytes
+in its confirmation digest without accumulating them as messages. A large raw
+history can therefore produce a complete, much smaller readable snapshot.
+Resource bounds remain: a 30-second scan deadline, 1 MiB JSONL record,
+256 KiB per public message, 2 MiB actual serialized snapshot (including JSON
+escaping and metadata), 256-character title, and 16 MiB rendered page. Retained
+internal-run filtering metadata is also bounded. Limits fail explicitly rather
+than publishing a truncated chat. A single oversized record or more than 2 MiB
+of readable snapshot data still needs a separate bounded/paged export design;
+this API never silently drops the remaining conversation to fit.
 The projection keeps readable user/assistant text and visible commentary;
 tools, hidden reasoning, artifacts, internal digest/status runs, and structurally
 proven imported delivery-control segments are excluded. Existing provenance-
@@ -67,4 +79,6 @@ aware user-context projection is applied; ambiguous quotations are preserved.
 Previewing/sharing reads only the local durable chat log, not provider logs.
 
 This implementation has only been exercised with synthetic isolated test state;
-no actual user conversation has been shared or deployed by this change.
+checks include more than 64 MiB of raw tool noise, over 2,000 public messages,
+stable preview cutoffs, and migration rollback. No actual user conversation has
+been shared or deployed by these tests.

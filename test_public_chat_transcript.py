@@ -134,19 +134,46 @@ class PublicChatTranscriptTests(unittest.TestCase):
         with self.assertRaises(transcript.PublicTranscriptError):
             self.read()
 
-    def test_record_line_message_total_and_log_limits_fail_explicitly(self):
+    def test_record_message_output_and_work_limits_fail_explicitly(self):
         self.write_events({"type": "turn_started", "prompt": "中文"}, {"type": "assistant_text", "text": "answer"})
-        for constant, limit in (("MAX_LOG_BYTES", 1), ("MAX_LINE_BYTES", 8), ("MAX_RECORDS", 1),
-                                ("MAX_MESSAGES", 1), ("MAX_TEXT_BYTES", 6), ("MAX_MESSAGE_BYTES", 5)):
+        for constant, limit in (("MAX_LINE_BYTES", 8), ("MAX_SCAN_SECONDS", 0),
+                                ("MAX_TEXT_BYTES", 6), ("MAX_MESSAGE_BYTES", 5)):
             with self.subTest(limit=constant), mock.patch.object(transcript, constant, limit):
                 with self.assertRaises(transcript.PublicTranscriptError):
                     self.read()
 
     def test_invalid_boundaries_and_truncated_prefixes_are_rejected(self):
         content = self.write_events({"type": "turn_started", "prompt": "Public"})
-        for boundary in (True, 0, -1, 1.5, "1", transcript.MAX_LOG_BYTES + 1, len(content) + 1):
+        for boundary in (True, 0, -1, 1.5, "1", transcript.MAX_SNAPSHOT_BOUNDARY + 1, len(content) + 1):
             with self.subTest(boundary=boundary), self.assertRaises(transcript.PublicTranscriptError):
                 self.read(through_bytes=boundary)
+
+    def test_large_raw_noise_and_many_readable_messages_keep_the_complete_prefix(self):
+        expected = [{"role": "user" if index % 2 == 0 else "assistant",
+                     "text": f"Synthetic message {index}: " + "readable text " * 20} for index in range(2504)]
+        noise = json.dumps({"type": "tool_finished", "text": "x" * (128 * 1024)}).encode() + b"\n"
+        with self.path.open("wb") as stream:
+            for index, message in enumerate(expected):
+                if index == 1252:
+                    for _ in range(513):
+                        stream.write(noise)
+                field = "prompt" if message["role"] == "user" else "text"
+                kind = "turn_started" if message["role"] == "user" else "assistant_text"
+                stream.write(json.dumps({"type": kind, "run_id": str(index // 2), field: message["text"]}).encode() + b"\n")
+        boundary = self.path.stat().st_size
+        self.assertGreater(boundary, 64 * 1024 * 1024)
+        preview = self.read()
+        self.assertEqual(preview["messages"], expected)
+        self.assertEqual(preview["through_bytes"], boundary)
+        with self.path.open("ab") as stream:
+            stream.write(b'{"type":"assistant_text","text":"Not part of the reviewed prefix"}\n')
+        self.assertEqual(self.read(through_bytes=boundary), preview)
+
+    def test_actual_json_escaping_and_metadata_count_toward_output_budget(self):
+        self.write_events({"type": "turn_started", "prompt": "\x01" * 20})
+        with mock.patch.object(transcript, "MAX_TEXT_BYTES", 100):
+            with self.assertRaisesRegex(transcript.PublicTranscriptError, "2 MiB"):
+                self.read()
 
     def test_empty_or_private_only_chat_is_not_publishable(self):
         for events in ([], [{"type": "tool_finished", "text": "Private"}], [{"type": "assistant_text", "text": "  "}]):

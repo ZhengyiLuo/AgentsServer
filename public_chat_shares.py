@@ -26,7 +26,6 @@ import time
 from typing import Any, Callable, Iterator
 
 
-MAX_MESSAGES = 1000
 MAX_MESSAGE_TEXT_BYTES = 256 * 1024
 MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024
 MAX_RENDER_BYTES = 16 * 1024 * 1024
@@ -87,8 +86,10 @@ def _snapshot(messages: Any, title: Any, created_at: Any) -> tuple[dict[str, Any
         raise PublicChatShareValidationError("title must contain 1 to 256 characters.")
     total_bytes = _utf8_size(title, "title", MAX_TITLE_CHARACTERS * 4)
     _timestamp(created_at, "created_at")
-    if not isinstance(messages, list) or not 1 <= len(messages) <= MAX_MESSAGES:
-        raise PublicChatShareValidationError(f"messages must contain 1 to {MAX_MESSAGES} items.")
+    if not isinstance(messages, list) or not messages:
+        raise PublicChatShareValidationError("messages must contain at least one item.")
+    serialized_bytes = len(json.dumps({"title": title, "created_at": created_at, "messages": []},
+        ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8"))
     projected: list[dict[str, Any]] = []
     for message in messages:
         if not isinstance(message, dict) or set(message) - {"role", "text", "timestamp"}:
@@ -103,6 +104,10 @@ def _snapshot(messages: Any, title: Any, created_at: Any) -> tuple[dict[str, Any
         item = {"role": role, "text": text}
         if "timestamp" in message:
             item["timestamp"] = _timestamp(message["timestamp"], "message timestamp")
+        serialized_bytes += len(json.dumps(item, ensure_ascii=False, separators=(",", ":"),
+            allow_nan=False).encode("utf-8")) + bool(projected)
+        if serialized_bytes > MAX_SNAPSHOT_BYTES:
+            raise PublicChatShareValidationError("Snapshot is too large.")
         projected.append(item)
     snapshot = {"title": title, "created_at": created_at, "messages": projected}
     encoded = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
@@ -143,39 +148,57 @@ class PublicChatShareStore:
                 os.close(descriptor)
         with self._connection(write=True) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1):
-                raise OSError("Unsupported public chat share database version.")
-            connection.execute(
-                """CREATE TABLE IF NOT EXISTS public_chat_shares (
+            self._ensure_schema(connection)
+
+    @staticmethod
+    def _create_tables(connection, suffix=""):
+        connection.execute(
+                f"""CREATE TABLE IF NOT EXISTS public_chat_shares{suffix} (
                     share_id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
                     token_hash BLOB NOT NULL UNIQUE CHECK(length(token_hash) = 32),
                     title TEXT NOT NULL,
                     created_at REAL NOT NULL,
                     expires_at REAL,
-                    message_count INTEGER NOT NULL CHECK(message_count BETWEEN 1 AND 1000),
+                    message_count INTEGER NOT NULL CHECK(message_count >= 1),
                     snapshot_json BLOB NOT NULL CHECK(length(snapshot_json) <= 2097152),
                     snapshot_sha256 BLOB NOT NULL CHECK(length(snapshot_sha256) = 32)
                 )"""
             )
-            connection.execute(
-                """CREATE TABLE IF NOT EXISTS public_chat_share_revocations (
-                    share_id TEXT PRIMARY KEY REFERENCES public_chat_shares(share_id),
+        connection.execute(
+                f"""CREATE TABLE IF NOT EXISTS public_chat_share_revocations{suffix} (
+                    share_id TEXT PRIMARY KEY REFERENCES public_chat_shares{suffix}(share_id),
                     revoked_at REAL NOT NULL
                 )"""
             )
-            connection.execute(
+
+    @classmethod
+    def _ensure_schema(cls, connection):
+        """Authenticated-write-only, atomic preservation of immutable v1 rows."""
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version not in (0, 1, 2):
+            raise OSError("Unsupported public chat share database version.")
+        if version == 1:
+            cls._create_tables(connection, "_v2")
+            connection.execute("INSERT INTO public_chat_shares_v2 SELECT * FROM public_chat_shares")
+            connection.execute("INSERT INTO public_chat_share_revocations_v2 SELECT * FROM public_chat_share_revocations")
+            connection.execute("DROP TABLE public_chat_share_revocations")
+            connection.execute("DROP TABLE public_chat_shares")
+            connection.execute("ALTER TABLE public_chat_shares_v2 RENAME TO public_chat_shares")
+            connection.execute("ALTER TABLE public_chat_share_revocations_v2 RENAME TO public_chat_share_revocations")
+        else:
+            cls._create_tables(connection)
+        connection.execute(
                 "CREATE INDEX IF NOT EXISTS public_chat_shares_session ON public_chat_shares(session_id, created_at DESC)"
             )
-            for table in ("public_chat_shares", "public_chat_share_revocations"):
-                for operation in ("UPDATE", "DELETE"):
-                    connection.execute(
-                        f"CREATE TRIGGER IF NOT EXISTS {table}_no_{operation.lower()} "
-                        f"BEFORE {operation} ON {table} BEGIN "
-                        "SELECT RAISE(ABORT, 'Public chat shares are immutable'); END"
-                    )
-            connection.execute("PRAGMA user_version = 1")
+        for table in ("public_chat_shares", "public_chat_share_revocations"):
+            for operation in ("UPDATE", "DELETE"):
+                connection.execute(
+                    f"CREATE TRIGGER IF NOT EXISTS {table}_no_{operation.lower()} "
+                    f"BEFORE {operation} ON {table} BEGIN "
+                    "SELECT RAISE(ABORT, 'Public chat shares are immutable'); END"
+                )
+        connection.execute("PRAGMA user_version = 2")
 
     @classmethod
     def open_existing(
@@ -195,7 +218,7 @@ class PublicChatShareStore:
         instance.database_path = root / "snapshots.sqlite3"
         instance._now = now
         with instance._connection() as connection:
-            if connection.execute("PRAGMA user_version").fetchone()[0] != 1:
+            if connection.execute("PRAGMA user_version").fetchone()[0] not in (1, 2):
                 raise OSError("Unsupported public chat share database version.")
         return instance
 
@@ -256,6 +279,9 @@ class PublicChatShareStore:
         share_id = "share_" + secrets.token_hex(16)
         token_hash = hashlib.sha256(token.encode("ascii")).digest()
         with self._connection(write=True) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            # An anonymous view may already have cached a read-only v1 store.
+            self._ensure_schema(connection)
             connection.execute(
                 """INSERT INTO public_chat_shares
                     (share_id, session_id, token_hash, title, created_at, expires_at,

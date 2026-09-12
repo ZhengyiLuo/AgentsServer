@@ -13,12 +13,16 @@ import os
 from pathlib import Path
 import re
 import stat
+import time
 from typing import Callable
 
+# Retained for the legacy incremental text-view adapter, not full snapshots.
 MAX_LOG_BYTES = 64 * 1024 * 1024
 MAX_LINE_BYTES = 1024 * 1024
 MAX_RECORDS = 100_000
 MAX_MESSAGES = 1_000
+MAX_SCAN_SECONDS = 30
+MAX_SNAPSHOT_BOUNDARY = (1 << 53) - 1
 MAX_TEXT_BYTES = 2 * 1024 * 1024
 MAX_MESSAGE_BYTES = 256 * 1024
 MAX_UNIX_TIMESTAMP = 253402300799
@@ -144,6 +148,8 @@ def make_public_event_projector(
         run = event.get("run_id") or ""
         if not isinstance(run, str):
             raise PublicTranscriptError("Chat history has an invalid run identity")
+        if len(run) > 1024:
+            raise PublicTranscriptError("Chat history has an oversized run identity")
         if kind == "turn_started" or _is_goal_followup(event):
             private_segments.discard(run)
         purpose = event.get("purpose")
@@ -156,6 +162,8 @@ def make_public_event_projector(
         )
         if internal:
             (private_runs if run else private_segments).add(run)
+            if len(private_runs) + len(private_segments) > MAX_RECORDS:
+                raise PublicTranscriptError("Chat history metadata exceeds the snapshot processing limit")
         if run in private_runs or run in private_segments or not event_is_visible(event):
             return None
         projected = project_provider_event(event, session_id)
@@ -174,6 +182,8 @@ def make_public_event_projector(
             and _complete_imported_delivery_envelope(prompt)
         ):
             private_segments.add(run)
+            if len(private_runs) + len(private_segments) > MAX_RECORDS:
+                raise PublicTranscriptError("Chat history metadata exceeds the snapshot processing limit")
             prompt = ""
         return {**projected, "prompt": prompt}
 
@@ -195,12 +205,13 @@ def read_public_transcript(
     records and limits fail explicitly instead of publishing a truncated log.
     """
     if through_bytes is not None and (
-        type(through_bytes) is not int or not 0 < through_bytes <= MAX_LOG_BYTES
+        type(through_bytes) is not int or not 0 < through_bytes <= MAX_SNAPSHOT_BOUNDARY
     ):
         raise PublicTranscriptError("Invalid snapshot boundary")
     messages: list[dict] = []
     outputs: dict[str, list[str]] = {}
-    total_text = 0
+    serialized_bytes = 2  # The JSON array delimiters; include every message's metadata/escaping.
+    deadline = time.monotonic() + MAX_SCAN_SECONDS
     digest = hashlib.sha256()
     consumed = 0
     try:
@@ -211,12 +222,13 @@ def read_public_transcript(
             if not stat.S_ISREG(initial.st_mode):
                 raise PublicTranscriptError("Chat history is unavailable")
             boundary = initial.st_size if through_bytes is None else through_bytes
-            if boundary > MAX_LOG_BYTES:
-                raise PublicTranscriptError("Chat exceeds the 64 MiB sharing limit")
+            if boundary > MAX_SNAPSHOT_BOUNDARY:
+                raise PublicTranscriptError("Chat history exceeds the supported snapshot boundary")
             if boundary > initial.st_size:
                 raise PublicTranscriptError("Chat changed; preview it again")
-            records = 0
             while consumed < boundary:
+                if time.monotonic() >= deadline:
+                    raise PublicTranscriptError("Chat snapshot processing timed out; no partial snapshot was created")
                 line = stream.readline(min(MAX_LINE_BYTES + 1, boundary - consumed))
                 if len(line) > MAX_LINE_BYTES:
                     raise PublicTranscriptError("A chat record exceeds the sharing limit")
@@ -226,9 +238,6 @@ def read_public_transcript(
                     break
                 consumed += len(line)
                 digest.update(line)
-                records += 1
-                if records > MAX_RECORDS:
-                    raise PublicTranscriptError("Chat exceeds the sharing record limit")
                 try:
                     raw = json.loads(line)
                 except (ValueError, UnicodeError, RecursionError) as exc:
@@ -249,8 +258,10 @@ def read_public_transcript(
                 if not isinstance(event, dict):
                     raise PublicTranscriptError("Chat history projection is invalid")
                 run = str(event.get("run_id") or "")
+                if len(run) > 1024:
+                    raise PublicTranscriptError("Chat history has an oversized run identity")
                 if kind == "turn_started" or _is_goal_followup(event):
-                    outputs[run] = []
+                    outputs.pop(run, None)
                     role, text = "user", event.get("prompt")
                 else:
                     role = "assistant"
@@ -266,7 +277,7 @@ def read_public_transcript(
                 if size > MAX_MESSAGE_BYTES:
                     raise PublicTranscriptError("A message exceeds the 256 KiB sharing limit")
                 normalized = " ".join(text.split())
-                previous = outputs.setdefault(run, [])
+                previous = outputs.get(run, [])
                 if kind == "turn_finished" and (
                     normalized in previous or normalized == " ".join(previous)
                 ):
@@ -274,14 +285,18 @@ def read_public_transcript(
                 if kind == "assistant_text":
                     # Result receipts often repeat these complete text events.
                     previous.append(normalized)
-                total_text += size
-                if total_text > MAX_TEXT_BYTES or len(messages) >= MAX_MESSAGES:
-                    raise PublicTranscriptError("Chat exceeds the 1,000-message / 2 MiB sharing limit")
+                    outputs[run] = previous
                 message = {"role": role, "text": text}
                 timestamp = _public_timestamp(event.get("ts"))
                 if timestamp is not None:
                     message["timestamp"] = timestamp
+                serialized_bytes += len(json.dumps(message, ensure_ascii=False, separators=(",", ":"),
+                    allow_nan=False).encode("utf-8")) + bool(messages)
+                if serialized_bytes > MAX_TEXT_BYTES:
+                    raise PublicTranscriptError("Readable chat snapshot exceeds the 2 MiB sharing limit")
                 messages.append(message)
+            if time.monotonic() >= deadline:
+                raise PublicTranscriptError("Chat snapshot processing timed out; no partial snapshot was created")
             final = os.fstat(stream.fileno())
             # Appends are allowed, rewrites/truncation of the prefix are not.
             if final.st_size < initial.st_size or (

@@ -1,6 +1,7 @@
 """Pure store/view tests: no server imports, transcript discovery, or home access."""
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, contextmanager
 import base64
 import hashlib
 from html.parser import HTMLParser
@@ -13,7 +14,6 @@ import unittest
 from unittest.mock import patch
 
 from public_chat_shares import (
-    MAX_MESSAGES,
     MAX_MESSAGE_TEXT_BYTES,
     MAX_SNAPSHOT_BYTES,
     PublicChatShareStore,
@@ -170,7 +170,7 @@ class PublicChatShareTests(unittest.TestCase):
 
     def test_message_and_snapshot_bounds_include_utf8_and_json_escaping(self):
         for messages in (
-            [{"role": "user", "text": ""}] * (MAX_MESSAGES + 1),
+            [{"role": "user", "text": ""}] * (MAX_SNAPSHOT_BYTES // 20),
             [{"role": "user", "text": "x" * (MAX_MESSAGE_TEXT_BYTES + 1)}],
             [{"role": "user", "text": "😀" * (MAX_MESSAGE_TEXT_BYTES // 4 + 1)}],
             [{"role": "user", "text": "x" * MAX_MESSAGE_TEXT_BYTES}] * 9,
@@ -182,6 +182,57 @@ class PublicChatShareTests(unittest.TestCase):
         snapshot = self.store.get_snapshot(near_max["token"])
         self.assertLess(len(json.dumps(snapshot).encode()), MAX_SNAPSHOT_BYTES)
         self.assertGreater(len(render_public_chat_html(snapshot)), MAX_SNAPSHOT_BYTES)
+
+    def test_v1_upgrade_preserves_snapshots_revocations_and_rolls_back_failure(self):
+        active = self.create()
+        revoked = self.create()
+        self.store.revoke_share(revoked["share_id"], session_id="private-session-123")
+        with self.store._connection() as db:
+            legacy_sql = "\n".join(db.iterdump()).replace(
+                "CHECK(message_count >= 1)", "CHECK(message_count BETWEEN 1 AND 1000)")
+        legacy_root = Path(self.temporary.name) / "legacy"
+        legacy_root.mkdir(mode=0o700)
+        legacy_path = legacy_root / "snapshots.sqlite3"
+        legacy_path.touch(mode=0o600)
+        with closing(sqlite3.connect(legacy_path)) as db, db:
+            db.executescript(legacy_sql)
+            db.execute("PRAGMA user_version=1")
+        before = legacy_path.read_bytes()
+        old = PublicChatShareStore.open_existing(legacy_root, now=lambda: self.clock)
+        self.assertEqual(old.get_snapshot(active["token"])["messages"], self.messages)
+        self.assertEqual(legacy_path.read_bytes(), before)  # Anonymous cold read never migrates.
+        messages = [{"role": "assistant", "text": f"Synthetic result {index}"} for index in range(2504)]
+        connect = old._connection
+        @contextmanager
+        def interrupted_connection(*, write=False):
+            with connect(write=write) as db:
+                class Interrupted:
+                    def execute(self, sql, *args):
+                        if sql.startswith("ALTER TABLE public_chat_shares_v2"):
+                            raise sqlite3.OperationalError("database or disk is full")
+                        return db.execute(sql, *args)
+                yield Interrupted()
+        with patch.object(old, "_connection", interrupted_connection):
+            with self.assertRaises(sqlite3.OperationalError):
+                old.create_share("session", messages)
+        with old._connection() as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual("\n".join(db.iterdump()), legacy_sql)
+        self.assertEqual(old.get_snapshot(active["token"])["messages"], self.messages)
+        with self.assertRaises(PublicChatShareUnavailable):
+            old.get_snapshot(revoked["token"])
+        large = old.create_share("session", messages)  # Cached v1 instance upgrades on this authenticated write.
+        self.assertEqual(large["message_count"], 2504)
+        self.assertEqual(old.get_snapshot(large["token"])["messages"], messages)
+        self.assertEqual(old.get_snapshot(active["token"])["messages"], self.messages)
+        with self.assertRaises(PublicChatShareUnavailable):
+            old.get_snapshot(revoked["token"])
+        with old._connection() as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+            self.assertEqual(db.execute("SELECT count(*) FROM sqlite_master WHERE type='trigger'").fetchone()[0], 4)
+        with self.assertRaises(sqlite3.IntegrityError), old._connection(write=True) as db:
+            db.execute("DELETE FROM public_chat_shares WHERE share_id=?", (active["share_id"],))
 
     def test_html_escapes_plaintext_and_has_no_interactive_or_remote_content(self):
         literal = '<script>alert(1)</script>\n<img src="https://example.invalid/a" onerror="x()">\n[link](https://example.invalid/)\n```html\n<b>code</b>\n```\n  spaces\tand & < > "quotes"'

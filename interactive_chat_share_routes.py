@@ -35,7 +35,7 @@ CONTROL_ACTIONS = frozenset({
     "settings.update", "goal.set", "goal.resume", "goal.pause", "goal.delete", "job.create", "job.update",
     "job.delete", "job.toggle", "job.run", "approval.respond",
 })
-CONTROL_READ_ACTIONS = frozenset({"timeline.older", "timeline.around", "timeline.trace", "timeline.index", "jobs.runs", "runtime.catalog"})
+CONTROL_READ_ACTIONS = frozenset({"timeline.older", "timeline.around", "timeline.trace", "timeline.index", "jobs.runs", "runtime.catalog", "handoffs.get"})
 NATIVE_STATE_FIELDS = frozenset({"revision", "session", "events", "queue", "active", "goal", "jobs",
     "codex_runtime", "claude_runtime", "health", "runtime_catalog", "hasMoreEvents", "nextTimelineBefore", "eventsTotal"})
 COOKIE = "__Secure-AgentsDock-Chat"

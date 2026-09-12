@@ -2,11 +2,13 @@
 import ast
 import asyncio
 from contextlib import asynccontextmanager
+import hashlib
 import json
+import re
 import time
 from types import MethodType, SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException
 from fastapi.responses import Response
@@ -19,13 +21,17 @@ from test_interactive_chat_integration_isolated import load_glue
 def load_native_glue():
     namespace, tree = load_glue()
     names = {"interactive_chat_native_page", "interactive_chat_native_snapshot",
-             "steer_interactive_chat_prompt", "run_interactive_chat_job", "control_interactive_chat"}
-    nodes = [node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name in names]
+             "steer_interactive_chat_prompt", "run_interactive_chat_job", "control_interactive_chat",
+             "get_cross_chat_handoff", "public_cross_chat_envelope", "is_async_route_message",
+             "async_route_conversation_fields", "async_message_target_fields"}
+    nodes = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
     assert {node.name for node in nodes} == names
+    for node in nodes:
+        node.decorator_list = []
     job_store = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "JobStore")
     manual = next(node for node in job_store.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "request_manual_run")
     namespace.update(native_models())
-    namespace.update(asyncio=asyncio, time=time, json=json, Response=Response,
+    namespace.update(asyncio=asyncio, time=time, json=json, hashlib=hashlib, Response=Response,
         shared_events=shared_events, shared_native_value=shared_native_value, shared_session=shared_session,
         ChatControlError=ChatControlError, InteractiveChatControls=InteractiveChatControls)
     exec(compile(ast.fix_missing_locations(ast.Module(body=[*nodes, manual], type_ignores=[])), "<isolated-native-chat-adapters>", "exec"), namespace)
@@ -58,6 +64,8 @@ class InteractiveChatNativeGlueTests(unittest.IsolatedAsyncioTestCase):
             "AGENT_TOKEN": "synthetic-native-admin",
             "PROVIDER_JOBS_ACCESS_MODES": ("full", "read_only", "blocked"),
             "PROVIDER_JOBS_ACCESS_DEFAULT": "full",
+            "PROVIDER_CROSS_CHAT_ROUTE_PAIR_ID_RE": re.compile(r"^pair_[0-9a-f]{32}$"),
+            "sanitized_provider_route_label": lambda value: str(value or ""),
             "CODEX_DEFAULT_SANDBOX_MODE": "workspace-write", "CODEX_DEFAULT_PERMISSION_PROFILE": None,
             "CODEX_DEFAULT_APPROVALS_REVIEWER": "user", "CLAUDE_PERMISSION_MODE_OPTIONS": ("default",),
             "CLAUDE_STOP_FENCE_SESSIONS": set(), "effective_claude_permission_mode": lambda _: "default",
@@ -114,6 +122,62 @@ class InteractiveChatNativeGlueTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(capability["available"])
         self.assertEqual(capability["default"], "blocked")
         self.native["runtime_catalog"].assert_not_awaited()
+
+    async def test_handoff_read_uses_native_body_revision_and_participant_visibility(self):
+        original = "Original synthetic message.\n" * 180
+        edited = "Recipient-edited synthetic message.\n" * 160
+        for source, target in (("chat-one", "chat-two"), ("chat-two", "chat-one")):
+            with self.subTest(source=source, target=target):
+                record = {"id": "handoff-synthetic", "kind": "instruction", "source_session_id": source,
+                    "target_session_id": target, "body": original, "target_body": edited, "message_revision": 2,
+                    "authorization_kind": "configured_route", "authorization_route_id": "route-not-for-guest",
+                    "authorization_pair_id": "pair_" + "a" * 32, "delivery_mode": "mailbox", "status": "stored"}
+                ledger = SimpleNamespace(get=AsyncMock(return_value=record),
+                    mailbox_envelopes=AsyncMock(return_value=[{**record, "read_at": "2026-09-12T12:00:00Z"}]))
+                self.native["CROSS_CHAT"] = ledger
+                result = await self.native["control_interactive_chat"]("chat-one", "handoffs.get", {"id": record["id"]})
+                handoff = result["handoff"]
+                self.assertEqual(handoff["id"], record["id"])
+                self.assertEqual(handoff["message_id"], record["id"])
+                self.assertEqual(handoff["conversation_id"], record["authorization_pair_id"])
+                self.assertEqual(handoff["body"], original)
+                self.assertEqual(handoff["body_sha256"], hashlib.sha256(original.encode()).hexdigest())
+                self.assertEqual(handoff["inbox_state"], "read")
+                for key in ("authorization_kind", "authorization_route_id"):
+                    self.assertNotIn(key, handoff)
+                if target == "chat-one":
+                    self.assertEqual(handoff["target_body"], edited)
+                    self.assertEqual(handoff["message_revision"], 2)
+                    self.assertTrue(handoff["message_edited_by_user"])
+                else:
+                    for key in ("target_body", "message_revision", "message_edited_by_user"):
+                        self.assertNotIn(key, handoff)
+                self.assertEqual(ledger.get.await_count, 2)
+                ledger.mailbox_envelopes.assert_awaited_once_with(message_id=record["id"])
+                self.native["post_turn"].assert_not_awaited()
+                self.native["INTERACTIVE_CHAT_LIVE"].notify.assert_not_called()
+
+    async def test_handoff_read_denies_missing_foreign_or_changed_identity(self):
+        owned = {"id": "handoff-synthetic", "source_session_id": "chat-one", "target_session_id": "chat-two"}
+        for record in (None, {**owned, "source_session_id": "chat-three"}, {**owned, "id": "wrong-envelope"}):
+            with self.subTest(record=record):
+                self.native["CROSS_CHAT"] = SimpleNamespace(get=AsyncMock(return_value=record))
+                projection = AsyncMock()
+                with patch.dict(self.native, get_cross_chat_handoff=projection):
+                    with self.assertRaises(ChatControlError) as denied:
+                        await self.native["control_interactive_chat"]("chat-one", "handoffs.get", {"id": owned["id"]})
+                self.assertEqual(denied.exception.code, "forbidden")
+                projection.assert_not_awaited()
+        self.native["CROSS_CHAT"] = SimpleNamespace(get=AsyncMock(return_value=owned))
+        projection = AsyncMock(return_value={"handoff": {**owned, "target_session_id": "chat-three", "body": "not returned"}})
+        with patch.dict(self.native, get_cross_chat_handoff=projection):
+            with self.assertRaises(ChatControlError):
+                await self.native["control_interactive_chat"]("chat-one", "handoffs.get", {"id": owned["id"]})
+        for payload in ({}, {"id": owned["id"], "session_id": "chat-two"}, {"id": [owned["id"]]}):
+            self.native["CROSS_CHAT"].get.reset_mock()
+            with self.assertRaises(ChatControlError):
+                await self.native["control_interactive_chat"]("chat-one", "handoffs.get", payload)
+            self.native["CROSS_CHAT"].get.assert_not_awaited()
 
     async def test_control_uses_exact_native_model_and_rejects_paths_before_mutation(self):
         self.native["patch_queued_turn"].return_value = {"ok": True, "file_ids": ["private"]}

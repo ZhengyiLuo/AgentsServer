@@ -76464,6 +76464,7 @@ async def control_interactive_chat(session_id: str, action: str, payload: dict[s
         "timeline.older": {"before", "limit"}, "timeline.around": {"anchor_seq", "limit"},
         "timeline.trace": {"run_id", "anchor_seq", "after", "limit"}, "timeline.index": set(),
         "jobs.runs": {"id", "before_seq", "limit", "timeline_group_id"}, "runtime.catalog": set(),
+        "handoffs.get": {"id"},
     }
     if action in reads:
         if not isinstance(payload, dict) or set(payload) - reads[action]:
@@ -76476,7 +76477,31 @@ async def control_interactive_chat(session_id: str, action: str, payload: dict[s
                     not isinstance(payload[key], str) or not 1 <= len(payload[key]) <= 320):
                 raise ChatControlError()
         limit = min(max(payload.get("limit") or 60, 1), 160)
-        if action in {"timeline.older", "timeline.around"}:
+        if action == "handoffs.get":
+            envelope_id = payload.get("id")
+            if not envelope_id:
+                raise ChatControlError()
+            record = await CROSS_CHAT.get(envelope_id)
+            participants = ((record.get("source_session_id"), record.get("target_session_id"))
+                            if record is not None else ())
+            if not record or record.get("id") != envelope_id or session_id not in participants:
+                raise ChatControlError("forbidden")
+            # Reuse the native body/revision/mailbox projection only after
+            # establishing membership; recheck its result before guest egress.
+            detail = await get_cross_chat_handoff(envelope_id)
+            handoff = detail.get("handoff") if isinstance(detail, dict) else None
+            if (not isinstance(handoff, dict) or handoff.get("id") != envelope_id
+                    or (handoff.get("source_session_id"), handoff.get("target_session_id")) != participants):
+                raise ChatControlError("forbidden")
+            handoff = dict(handoff)
+            for key in ("authorization_kind", "authorization_route_id"):
+                handoff.pop(key, None)
+            if session_id != participants[1]:
+                # Recipient-only edits are not part of the sender's message.
+                for key in ("target_body", "message_edited_by_user", "message_revision"):
+                    handoff.pop(key, None)
+            value = {"handoff": handoff}
+        elif action in {"timeline.older", "timeline.around"}:
             if action == "timeline.older":
                 value = await interactive_chat_native_page(session_id, semantic_before=payload.get("before"), limit=limit)
             else:

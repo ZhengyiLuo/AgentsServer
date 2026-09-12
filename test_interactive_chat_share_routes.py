@@ -277,9 +277,9 @@ class InteractiveShareRouteTests(unittest.TestCase):
     def test_explicit_native_reads_have_no_write_ledger_or_file_proxy(self):
         path, headers = self.redeem(self.create())
         self.control.return_value = {"events": [], "has_more": False}
-        for action in ("timeline.older", "timeline.around", "timeline.trace", "timeline.index", "jobs.runs", "runtime.catalog"):
+        for action in ("timeline.older", "timeline.around", "timeline.trace", "timeline.index", "jobs.runs", "runtime.catalog", "handoffs.get"):
             response = self.client.post(path + "/controls", headers=headers,
-                json={"action": action, "payload": {}, "request_id": "read_request_0001"})
+                json={"action": action, "payload": {"id": "handoff-synthetic"} if action == "handoffs.get" else {}, "request_id": "read_request_0001"})
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["result"], self.control.return_value)
             self.assertEqual(self.control.call_args.kwargs, {})

@@ -87,8 +87,11 @@ response. Native history uses explicitly bounded pages. Admission bounds are fou
 and 32 SSE connections. These are resource protections, not automatic processing
 or background jobs. No attachment download or general file viewer is exposed.
 
-Validation uses synthetic isolated stores/routes; native-component browser
-acceptance is recorded separately for the final generated asset bundle.
+Validation uses synthetic isolated stores/routes, including AST-loaded native
+adapters without importing or starting the server process. The compiled native
+browser components were exercised for queue/edit/reorder/send-now/stop, goal
+pause/resume, settings/permissions/model selection, schedules and approvals.
+These are isolated browser checks, not claims of a production provider run.
 Creating a real invitation, configuring ingress, and deployment are separate
 explicit actions.
 

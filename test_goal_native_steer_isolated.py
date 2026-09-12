@@ -34,6 +34,9 @@ assert {node.name for node in NODES} == NAMES
 CODE = compile(ast.fix_missing_locations(ast.Module(body=[ast.ImportFrom(
     module="__future__", names=[ast.alias(name="annotations")], level=0,
 ), *NODES], type_ignores=[])), str(SOURCE), "exec")
+# The compiled allowlist is sufficient; do not retain the full server AST
+# throughout the suite and add unrelated GC work to asynchronous tests.
+del TREE, NODES
 
 
 class Subscription:
@@ -229,7 +232,9 @@ class NativeGoalSteerTests(unittest.IsolatedAsyncioTestCase):
         request = self.request()
         self.queue.put_nowait(request)
         task = self.consumer()
-        await asyncio.wait_for(asyncio.shield(request["future"]), 1)
+        # Ordering below proves fairness; this timeout is only a deadlock guard,
+        # not a one-second latency requirement on a shared CI runner.
+        await asyncio.wait_for(asyncio.shield(request["future"]), 5)
         self.assertLess(observed[0], 60)
         self.assertEqual(sum(kind == "reasoning_summary" for kind, _ in self.events), 60)
         await self.finish(task)

@@ -46905,8 +46905,21 @@ def normalized_local_session_cwd(value: Any) -> str | None:
 
 
 def local_session_label(value: Any, fallback: str) -> str:
-    clean = compact_import_text(str(value or "")).strip()
-    return (clean or fallback)[:MAX_LOCAL_SESSION_LABEL_CHARS]
+    # Labels are display metadata, not raw transcript text. Keep tab/LF/CR,
+    # replace other whitespace controls with word breaks, and drop unsafe
+    # C0/DEL characters (including ANSI ESC) from both title and fallback.
+    for candidate in (value, fallback):
+        text = re.sub(
+            r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]",
+            lambda match: " " if match[0].isspace() else "",
+            str(candidate or ""),
+        )
+        clean = compact_import_text(text).strip()
+        if clean:
+            return clean[:MAX_LOCAL_SESSION_LABEL_CHARS]
+    # The Codex index probe uses an empty fallback to mean "no title" so a
+    # transcript preview can win. Actual candidate fallbacks must be nonempty.
+    return "Local chat" if fallback else ""
 
 
 def local_claude_session_candidates(known_provider_ids: set[str]) -> list[dict[str, Any]]:

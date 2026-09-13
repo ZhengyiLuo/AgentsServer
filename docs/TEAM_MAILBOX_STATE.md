@@ -48,8 +48,8 @@ attention version. Uncertain retries retain their exact key until a new state
 is observed. No polling, notification subscription, global refresh, or automatic
 inbox request is added. Notification transport remains separate work.
 
-Validation: `test_team_mailbox_state_isolated.py` uses temporary Hub stores,
+Validation: `tests/test_team_mailbox_state_isolated.py` uses temporary Hub stores,
 mocked secure transport, and AST-extracted service forwarding/allowlists;
-`test_release_file_manifest_isolated.py` checks migration and frozen hashes.
+`tests/test_release_file_manifest_isolated.py` checks migration and frozen hashes.
 Run only with the approved QA safe runner and repository virtual environment,
 not by importing or starting `agent_server`.

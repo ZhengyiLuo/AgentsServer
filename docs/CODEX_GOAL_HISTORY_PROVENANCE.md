@@ -48,5 +48,5 @@ Verification uses isolated AST-selected server helpers, fake notifications and
 temporary source/checkpoint fixtures. It never imports or starts `agent_server`:
 
 ```sh
-python3 -m unittest -q test_codex_goal_history_isolated test_codex_history_repair test_codex_native_turn_projection_isolated test_release_file_manifest_isolated
+python3 -m unittest -q tests.test_codex_goal_history_isolated tests.test_codex_history_repair tests.test_codex_native_turn_projection_isolated tests.test_release_file_manifest_isolated
 ```

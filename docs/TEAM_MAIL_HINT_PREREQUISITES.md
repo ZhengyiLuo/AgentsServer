@@ -112,7 +112,7 @@ socket receipt, cached rows, opening Mail, and unread snapshots are not proof.
 
 ## Validation boundary
 
-`test_team_mail_hints_isolated.py` runs through the guarded QA runner, with
+`tests/test_team_mail_hints_isolated.py` runs through the guarded QA runner, with
 temporary Hub databases and no monolith import, provider, socket, subprocess,
 or production state access. It covers commit/rollback/replay, frozen recipients,
 human/feed/skill exclusions, cursor restoration/reuse, query plans, snapshot

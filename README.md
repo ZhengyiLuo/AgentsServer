@@ -9,12 +9,15 @@ machine that owns your workspaces, Claude Code installation, and Codex CLI.
 Together they provide persistent agent chats without routing private project
 files through a third-party chat service.
 
+The desktop and mobile client source is publicly available at
+[ZhengyiLuo/AgentsDock](https://github.com/ZhengyiLuo/AgentsDock).
+
 AgentsServer exposes an authenticated HTTP/WebSocket API and streams normalized
 Claude/Codex events, files, videos, uploads, scheduled jobs, process inspection,
 and persistent tmux terminals to AgentsDock clients.
 
 ```text
-AgentsDock (Mac, iPhone, iPad, Linux)
+AgentsDock (macOS, Linux, Windows, iPhone, iPad, Android)
         |
         | private HTTP/WebSocket connection
         v
@@ -115,6 +118,15 @@ Get the client and current installation instructions from
 [agentsdock.net](https://agentsdock.net). The macOS desktop app is available
 as a Developer ID-signed and Apple-notarized build; Apple-platform test
 builds are also distributed through TestFlight.
+
+To build or contribute to the client, see its
+[desktop build guide](https://github.com/ZhengyiLuo/AgentsDock/blob/main/electron/README.md),
+[mobile development guide](https://github.com/ZhengyiLuo/AgentsDock/blob/main/mobile-react/README.md),
+and [contribution guidelines](https://github.com/ZhengyiLuo/AgentsDock/blob/main/CONTRIBUTING.md).
+
+This repository contains the maintained, deployable AgentsServer backend. The
+client repository's `server/` directory contains frozen compatibility fixtures
+for cross-stack tests; use this repository to run or develop the server.
 
 ## Guided Setup
 
@@ -1363,6 +1375,29 @@ native filesystem paths cannot be inferred from them. After a server restart,
 clients must fetch a fresh inventory. A previously queued selection is
 visibly removed as stale during promotion, and later queue entries continue in
 FIFO order.
+
+## Development and Tests
+
+The Python test suite lives in `tests/`; deployable server modules remain at
+the repository root. Run tests from the repository root using Python 3.13,
+matching the release workflow:
+
+```bash
+uv sync --locked --python 3.13
+ulimit -s "$(ulimit -Hs)"
+PYTHONDONTWRITEBYTECODE=1 uv run --python 3.13 python -m unittest discover -s tests -t . -v
+```
+
+Run an individual module with its package name:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 uv run --python 3.13 python -m unittest tests.test_provider_history_sync -v
+```
+
+The `tests` package also supports plain `python -m unittest discover` from
+the repository root. Tests are not included in server release archives.
+Client development instructions live in the separate
+[AgentsDock repository](https://github.com/ZhengyiLuo/AgentsDock#develop-from-source).
 
 ## Repository Hygiene
 

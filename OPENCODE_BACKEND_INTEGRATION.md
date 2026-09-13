@@ -29,12 +29,12 @@ current verification, packaging fixes, and the client-facing support boundary.
 Files:
 
 - `opencode_agent_client.py` — pure translation layer, no server imports
-- `test_opencode_agent_client.py` — 55 tests, real captured fixtures
+- `tests/test_opencode_agent_client.py` — 55 tests, real captured fixtures
 - `agent_server.py` — detection, catalog, `run_opencode`, session fields
-- `test_run_opencode.py` — 40 subprocess-level tests through real pipes
-- `test_opencode_api_contract.py` — 20 HTTP tests against the real ASGI app
-- `test_opencode_runtime_resolution.py` — service-manager executable discovery
-- `test_opencode_session_lifecycle.py` — resume identity and fork regressions
+- `tests/test_run_opencode.py` — 40 subprocess-level tests through real pipes
+- `tests/test_opencode_api_contract.py` — 20 HTTP tests against the real ASGI app
+- `tests/test_opencode_runtime_resolution.py` — service-manager executable discovery
+- `tests/test_opencode_session_lifecycle.py` — resume identity and fork regressions
 
 End-to-end verified against the real binary, not just the fake CLIs: driving
 `run_opencode` with the real `opencode` produced `tool_started` / `tool_finished`
@@ -258,7 +258,7 @@ opencode run --format json --dir /tmp/oc -s ses_doesnotexist "hi"    # exit 1, s
 Tests:
 
 ```bash
-.venv/bin/python -m unittest test_opencode_agent_client test_run_opencode
+.venv/bin/python -m unittest tests.test_opencode_agent_client tests.test_run_opencode
 ```
 
 ---

@@ -124,15 +124,15 @@ retain their existing format and bounded exchange behavior.
 
 ## Isolated validation
 
-`test_async_route_transport_isolated.py` extracts selected server functions
+`tests/test_async_route_transport_isolated.py` extracts selected server functions
 through AST and runs ledger effects against SQLite `:memory:`. Helper
 authority and transport are mocked. Tests cover repeated messages beyond
 legacy one-use counters and former hourly quotas, durable idempotency, unavailable
 mode/run/pair, cancellation, lifecycle replay, exact reverse responses,
 legacy helper compatibility, successful empty completion, and native-control
 metadata isolation. Pair admission/queue/revoke tests live in
-`test_provider_chat_pairs_isolated.py` and
-`test_provider_pair_revoke_cleanup_isolated.py`.
+`tests/test_provider_chat_pairs_isolated.py` and
+`tests/test_provider_pair_revoke_cleanup_isolated.py`.
 
 Run these through the guarded QA runner used for this change. It blocks
 server imports, external processes/network, and production state access.

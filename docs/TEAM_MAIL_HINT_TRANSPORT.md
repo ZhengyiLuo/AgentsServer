@@ -114,7 +114,7 @@ Socket receipt, cached rows, opening Mail and unread state are not coverage.
 
 ## Validation and remaining acceptance
 
-`test_team_mail_stream_runtime_isolated.py` uses real Store, adapter, lease,
+`tests/test_team_mail_stream_runtime_isolated.py` uses real Store, adapter, lease,
 runtime coordinator, actual Host SecurePeerRuntime and local ASGI handler.
 Its Member peer stream is an explicit in-memory adapter-backed replacement;
 it does not test TLS or network framing. Cases cover single-upstream fanout,
@@ -123,12 +123,12 @@ ABA, revoke/expiry, coalescing, actual writer drain, cancellation-resistant
 ASGI and cancel-before-coroutine-entry. Existing cursor/page and invitation
 regressions run through the guarded QA runner as well.
 
-`test_peer_mail_hint_tls_isolated.py` now passes real pinned mTLS, HTTP framing,
+`tests/test_peer_mail_hint_tls_isolated.py` now passes real pinned mTLS, HTTP framing,
 idle close/reopen, wrong CA/missing client certificate rejection, and actual
 backpressured writer teardown. It replaces listener creation and TCP dialing
 with private AF_UNIX socket pairs; no network port is opened.
 
-`test_team_mail_pipeline_tls_isolated.py` composes the actual HubStore commit,
+`tests/test_team_mail_pipeline_tls_isolated.py` composes the actual HubStore commit,
 adapter lease, that real TLS gateway/client, actual Member SecurePeerRuntime,
 and local ASGI handler. It seeds one approved client descriptor from an
 actually issued credential, then executes real health validation, activation

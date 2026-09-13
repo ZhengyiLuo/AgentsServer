@@ -38,7 +38,7 @@ phase can initialize missing cursor phase for subsequent raw records without
 changing the old row. No filesystem work was added to
 event projection or request hot paths.
 
-Validation uses `test_codex_history_metadata_isolated.py` and the existing Codex
+Validation uses `tests/test_codex_history_metadata_isolated.py` and the existing Codex
 goal/Claude isolated suites. They compile explicitly allowlisted AST helpers,
 mock persistence or use temporary files, and never import/start the server or
 contact a provider.

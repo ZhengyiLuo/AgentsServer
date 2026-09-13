@@ -106,6 +106,32 @@ def canonical_cursor_call_id(value: Any) -> str:
     return value
 
 
+def _cursor_tool_call_id(
+    event: dict[str, Any],
+    body: dict[str, Any],
+) -> str:
+    """Return Cursor's tool correlation key with one narrow compatibility fallback.
+
+    Cursor documents the correlation key at the top-level ``call_id`` field,
+    but current tool payloads also repeat it as ``args.toolCallId``. Some CLI
+    events have emitted an invalid top-level value while retaining the valid
+    nested copy. Prefer the documented field and consult only that exact
+    nested location when top-level validation fails; all candidates still use
+    the same bounded, control-free validation.
+    """
+
+    try:
+        return canonical_cursor_call_id(event.get("call_id"))
+    except CursorEventParseError as top_level_error:
+        args = body.get("args")
+        if not isinstance(args, dict) or "toolCallId" not in args:
+            raise
+        try:
+            return canonical_cursor_call_id(args.get("toolCallId"))
+        except CursorEventParseError:
+            raise top_level_error from None
+
+
 def _cursor_lifecycle_session_id(event: dict[str, Any], event_name: str) -> str:
     session_id = canonical_cursor_session_id(event.get("session_id"))
     if not session_id:
@@ -334,7 +360,7 @@ def normalize_cursor_stream_event(raw_line: str) -> dict[str, Any] | None:
         if not isinstance(tool_call, dict):
             raise CursorEventParseError("tool_call event missing tool_call payload")
         name, body = _tool_call_name_and_body(tool_call)
-        call_id = canonical_cursor_call_id(event.get("call_id"))
+        call_id = _cursor_tool_call_id(event, body)
         if subtype == "started":
             return {
                 "kind": "tool_started",

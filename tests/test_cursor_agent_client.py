@@ -501,6 +501,74 @@ class NormalizeCursorStreamEventTests(unittest.TestCase):
             ):
                 normalize_cursor_stream_event(json.dumps(payload))
 
+    def test_tool_events_recover_valid_nested_id_when_top_level_is_invalid(
+        self,
+    ) -> None:
+        nested_call_id = "Shell_0_mailbox-wake"
+        started = {
+            "type": "tool_call",
+            "subtype": "started",
+            "call_id": "",
+            "tool_call": {
+                "shellToolCall": {
+                    "args": {
+                        "command": "agentsdock-chats inbox",
+                        "toolCallId": nested_call_id,
+                    },
+                },
+            },
+            "session_id": SESSION_ID,
+        }
+        completed = {
+            "type": "tool_call",
+            "subtype": "completed",
+            "call_id": " invalid-leading-space",
+            "tool_call": {
+                "shellToolCall": {
+                    "args": {
+                        "command": "agentsdock-chats inbox",
+                        "toolCallId": nested_call_id,
+                    },
+                    "result": {
+                        "success": {
+                            "exitCode": 0,
+                            "stdout": "{}",
+                            "stderr": "",
+                        },
+                    },
+                },
+            },
+            "session_id": SESSION_ID,
+        }
+
+        started_event = normalize_cursor_stream_event(json.dumps(started))
+        completed_event = normalize_cursor_stream_event(json.dumps(completed))
+
+        self.assertEqual(started_event["call_id"], nested_call_id)
+        self.assertEqual(completed_event["call_id"], nested_call_id)
+        self.assertEqual(completed_event["kind"], "tool_finished")
+
+    def test_invalid_nested_tool_id_does_not_bypass_validation(self) -> None:
+        for nested_call_id in ("", " leading", "x" * 241, 123):
+            payload = {
+                "type": "tool_call",
+                "subtype": "started",
+                "call_id": "",
+                "tool_call": {
+                    "shellToolCall": {
+                        "args": {
+                            "command": "agentsdock-chats inbox",
+                            "toolCallId": nested_call_id,
+                        },
+                    },
+                },
+                "session_id": SESSION_ID,
+            }
+            with self.subTest(nested_call_id=nested_call_id), self.assertRaises(
+                CursorEventParseError
+            ):
+                normalize_cursor_stream_event(json.dumps(payload))
+
     def test_non_object_rejection_payload_is_schema_error(self) -> None:
         with self.assertRaises(CursorEventParseError):
             normalize_cursor_stream_event(

@@ -1,11 +1,43 @@
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
+import httpx
+
 import agent_server
+
+
+class LocalSessionLabelTests(unittest.TestCase):
+    def test_removes_unsafe_ascii_controls_and_preserves_word_breaks(self) -> None:
+        for codepoint in [*range(32), 127]:
+            character = chr(codepoint)
+            with self.subTest(codepoint=codepoint):
+                replacement = character if character in "\t\n\r" else " " if character.isspace() else ""
+                self.assertEqual(
+                    agent_server.local_session_label(f"before{character}after", "Fallback"),
+                    f"before{replacement}after",
+                )
+
+    def test_preserves_punctuation_unicode_and_existing_whitespace_policy(self) -> None:
+        label = "  - fix: café / 中文 — 👩🏽‍💻\tpart two\r\nnext\n\n\nlast  "
+        self.assertEqual(agent_server.local_session_label(label, "Fallback"), agent_server.compact_import_text(label))
+
+    def test_sanitizes_fallback_and_preserves_empty_index_title_sentinel(self) -> None:
+        self.assertEqual(agent_server.local_session_label("\x1b\x00", "\x07Fallback\x7f"), "Fallback")
+        self.assertEqual(agent_server.local_session_label("\x1b", "\x07"), "Local chat")
+        for value in (None, "", " \t\n", "\x1b\x00\x7f"):
+            with self.subTest(value=value):
+                self.assertEqual(agent_server.local_session_label(value, ""), "")
+
+    def test_value_and_fallback_remain_within_existing_bound(self) -> None:
+        text = "\x1b\x00" + "文🙂" * 200 + "\x7f"
+        expected = ("文🙂" * 200)[:agent_server.MAX_LOCAL_SESSION_LABEL_CHARS]
+        self.assertEqual(agent_server.local_session_label(text, "Fallback"), expected)
+        self.assertEqual(agent_server.local_session_label("", text), expected)
 
 
 def write_claude_transcript(path: Path, *, cwd: str | None, first_user_text: str) -> None:
@@ -301,6 +333,71 @@ class LocalSessionCandidatesDedupAgainstStoreTests(unittest.TestCase):
                 candidates = agent_server.local_session_candidates(limit=200)
 
         self.assertEqual(candidates, [])
+
+
+class LocalSessionLabelsEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def test_http_list_sanitizes_every_label_source_without_changing_candidates(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="local-session-labels-") as temporary:
+            root = Path(temporary)
+            projects = root / "claude-projects"
+            codex = root / "codex-sessions"
+            indexed = "thread-indexed"
+            empty_indexed = "thread-empty-title"
+            preview = "thread-preview"
+            claude_prompt = projects / "widget" / "claude-prompt.jsonl"
+            claude_fallback = projects / "\x1b\x07" / "claude-fallback.jsonl"
+            normal = projects / "normal" / "claude-normal.jsonl"
+            write_claude_transcript(claude_prompt, cwd="/work/widget", first_user_text="\x1b[31mFix\x1b[0m A\x00B\t中文\nnext")
+            write_claude_transcript(claude_fallback, cwd=None, first_user_text="")
+            write_claude_transcript(normal, cwd="/work/normal", first_user_text="- café — 中文 👩🏽‍💻")
+            for provider_id in (indexed, empty_indexed, preview):
+                write_codex_transcript(
+                    codex / f"{provider_id}.jsonl", session_id=provider_id, cwd="/work/codex",
+                    first_user_text="From\x1b preview\x7f\vnext",
+                )
+            index = root / "session_index.jsonl"
+            index.write_text("".join(json.dumps(entry) + "\n" for entry in (
+                {"id": indexed, "thread_name": "\x1bNamed\x7f — café 中文"},
+                {"id": empty_indexed, "thread_name": "\x1b\x00"},
+            )), encoding="utf-8")
+            paths = [claude_prompt, claude_fallback, normal, *(codex / f"{provider_id}.jsonl" for provider_id in (indexed, empty_indexed, preview))]
+            for offset, path in enumerate(paths):
+                os.utime(path, (1_700_000_000 + offset, 1_700_000_000 + offset))
+            original_bytes = {path: path.read_bytes() for path in [*paths, index]}
+            with patch.object(agent_server, "CLAUDE_PROJECTS_ROOT", projects), patch.object(
+                agent_server, "CODEX_SESSIONS_ROOT", codex,
+            ), patch.object(agent_server, "CODEX_SESSION_INDEX_PATH", index), patch.object(
+                agent_server.STORE, "sessions", {},
+            ), patch.object(agent_server.STORE, "_lock", asyncio.Lock()), patch.object(
+                agent_server, "AGENT_TOKEN", "label-test-token",
+            ):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=agent_server.app), base_url="http://test",
+                    headers={"x-agentsdock-token": "label-test-token"},
+                ) as client:
+                    response = await client.get("/api/local-sessions", params={"limit": 200})
+            self.assertEqual(response.status_code, 200, response.text)
+            candidates = response.json()["sessions"]
+            self.assertEqual([candidate["provider_session_id"] for candidate in candidates], [path.stem for path in reversed(paths)])
+            by_id = {candidate["provider_session_id"]: candidate for candidate in candidates}
+            for candidate in candidates:
+                label = candidate["label"]
+                self.assertIsInstance(label, str)
+                self.assertTrue(label.strip())
+                self.assertLessEqual(len(label), agent_server.MAX_LOCAL_SESSION_LABEL_CHARS)
+                self.assertNotRegex(label, r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+                self.assertEqual(candidate["backend"], "claude" if candidate["provider_session_id"].startswith("claude-") else "codex")
+            self.assertEqual(by_id["claude-prompt"]["label"], "widget: [31mFix[0m AB\t中文\nnext")
+            self.assertEqual(by_id["claude-prompt"]["cwd"], "/work/widget")
+            self.assertEqual(by_id["claude-fallback"]["label"], "Local chat")
+            self.assertIsNone(by_id["claude-fallback"]["cwd"])
+            self.assertEqual(by_id["claude-normal"]["label"], "normal: - café — 中文 👩🏽‍💻")
+            self.assertEqual(by_id[indexed]["label"], "Named — café 中文")
+            for provider_id in (empty_indexed, preview):
+                self.assertEqual(by_id[provider_id]["label"], "codex: From preview next")
+                self.assertEqual(by_id[provider_id]["cwd"], "/work/codex")
+            for path, original in original_bytes.items():
+                self.assertEqual(path.read_bytes(), original)
 
 
 class BulkImportSessionsEndpointTests(unittest.IsolatedAsyncioTestCase):

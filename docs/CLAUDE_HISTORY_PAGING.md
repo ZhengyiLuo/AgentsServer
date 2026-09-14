@@ -54,7 +54,7 @@ timeline credit. Proven replay imports become blank, metadata-only records
 before publication; a wholly metadata-only batch has neutral boundary events.
 No native answer or existing append-only event is rewritten or deleted.
 
-Validation on `87eb7ca` (`1.0.0-beta.5` base):
+Initial validation on `87eb7ca` (`1.0.0-beta.5` base):
 
 - The reported native/import pair was checked read-only against the real
   transcripts: native seq 2137 remains unchanged; imported seq 2145 becomes
@@ -68,7 +68,17 @@ Validation on `87eb7ca` (`1.0.0-beta.5` base):
   All nine also reproduce from a clean archive of unchanged `87eb7ca`: eight
   durable-cursor fixtures in `test_provider_history_sync` and the source-scan
   deadline fixture in `test_codex_native_history_repair`. No Codex-specific
-  parser or repair module was changed. Hosted CI was not run.
+  parser or repair module was changed. Hosted CI was not run at that stage.
+
+Before opening the PR, the branch was updated without conflicts to beta.6
+(`090223e`), which corrects those eight durable-cursor fixtures. The remaining
+deadline fixture compares a resolved source path with its temporary path;
+macOS's symlinked temporary directory prevents the injected expiry from firing.
+That fixture passes with canonical `TMPDIR=/private/tmp`, without changing
+either the fixture or production code. The PR adds the existing main-branch
+test-only CI workflow, adapted to this release line's root-level test layout.
+It runs the full suite on Linux and cannot build or publish a release; final
+validation results are recorded on the PR.
 
 No Electron fallback is required for this case once the server fix is active;
 existing metadata-only and same-ID page replacements are the client contract.

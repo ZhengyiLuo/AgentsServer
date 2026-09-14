@@ -1,5 +1,10 @@
 # AgentsServer 1.0.0-beta.5
 
+This candidate was not published: the full release gate rejected legacy
+history-cursor test fixtures that did not provide valid provider identities or
+a durable event ledger. Its source tag remains unchanged. Beta.6 carries the
+same runtime corrections with realistic cursor fixtures.
+
 ## History and cross-chat display corrections
 
 - Repair large native histories without re-importing scheduled runs, internal

@@ -1,0 +1,34 @@
+name: Server CI
+
+on:
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: server-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+      - name: Lock and test
+        run: |
+          uv lock --check
+          ulimit -s 65536
+          for source in tests/test_*.py; do
+            echo "Compiling $source"
+            PYTHONFAULTHANDLER=1 uv run --python 3.13 python -X faulthandler -m py_compile "$source"
+          done
+          PYTHONFAULTHANDLER=1 uv run --python 3.13 python -X faulthandler -m unittest discover -s tests -t . -v -p 'test_*.py'

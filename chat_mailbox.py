@@ -95,12 +95,13 @@ _VALID = """m.excluded_at IS NULL AND e.status='stored' AND e.delivery_mode='mai
     AND e.kind='instruction' AND e.authorization_kind='configured_route'
     AND e.source_session_id=m.source_session_id AND e.target_session_id=m.target_session_id
     AND e.authorization_pair_id=m.pair_id"""
-_COLUMNS = """m.*, e.body AS original_body, e.target_body, e.message_revision, e.created_at"""
+_COLUMNS = """m.*, e.body AS original_body, e.target_body, e.message_revision, e.created_at,
+    e.source_run_id, e.source_user_instruction, e.source_user_delegation_action"""
 
 
 def _message(row: sqlite3.Row) -> dict:
     edited = row["message_revision"] > 0 and isinstance(row["target_body"], str)
-    return {
+    message = {
         "message_id": row["message_id"], "mailbox_seq": row["mailbox_seq"],
         "source_session_id": row["source_session_id"], "target_session_id": row["target_session_id"],
         "conversation_id": row["pair_id"],
@@ -111,6 +112,21 @@ def _message(row: sqlite3.Row) -> dict:
         "message_revision": row["message_revision"] if edited else 0,
         "message_edited_by_user": edited,
     }
+    if (row["source_user_delegation_action"] in ("route", "instruction", "request_reply")
+            and isinstance(row["source_user_instruction"], str) and row["source_user_instruction"].strip()
+            and row["message_revision"] == 0):
+        # Only the server's immutable admission marker can attest user origin.
+        # An edited body is no longer the originally delegated handoff. Keep
+        # it readable, but do not let it inherit the original attestation.
+        message["user_delegation"] = {
+            "version": 1,
+            "source_session_id": row["source_session_id"],
+            "source_run_id": row["source_run_id"],
+            "target_session_id": row["target_session_id"],
+            "reference_action": row["source_user_delegation_action"],
+            "source_user_instruction": row["source_user_instruction"],
+        }
+    return message
 
 
 def store_message(connection: sqlite3.Connection, message_id: str, *, now: str,
@@ -148,7 +164,19 @@ def store_message(connection: sqlite3.Connection, message_id: str, *, now: str,
             or row["pair_id"] != record["authorization_pair_id"]
             or row["in_reply_to_message_id"] != parent):
         raise MailboxConflict("Stored mailbox identity changed")
-    return _message(row)
+    message = _message(row)
+    if "user_delegation" in message:
+        # Reject before the caller commits, rather than accepting a delegated
+        # message that cannot be read. Preserve the full source constraints;
+        # never truncate them or silently downgrade the message to peer mail.
+        projected = {**message, "read_id": "x" * 240, "read_at": "x" * 64}
+        try:
+            size = len(json.dumps(projected, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise MailboxConflict("User delegation must be valid UTF-8") from exc
+        if size + 8192 > MAX_PAGE_BYTES:
+            raise MailboxConflict("User delegation exceeds the bounded mailbox response; shorten the source instruction or message")
+    return message
 
 
 def _scope(target: str, source: str | None, pairs: Iterable[str]) -> tuple[str, list]:

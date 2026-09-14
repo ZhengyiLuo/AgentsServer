@@ -18,6 +18,41 @@ import agent_server
 
 
 class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_issued_delegation_is_target_scoped_private_and_user_origin_only(self) -> None:
+        prompt = "Ask @Target to research the issue. Do not modify or deploy anything."
+        reference = self.grant_reference(start=4)
+        for number, (user_turn, references, expected) in enumerate((
+            (True, [reference], {("target", "route")}),
+            (False, [reference], set()),
+            (True, [], set()),
+        )):
+            with self.subTest(user_turn=user_turn, has_reference=bool(references)):
+                run_id = f"run_delegation_{number}"
+                authority = await agent_server.issue_cross_chat_capability(
+                    "source", run_id, references, source_user_instruction=prompt,
+                    source_is_user_turn=user_turn, actions={"agent_cross_chat_routes"},
+                    provider_route_snapshot=[self.route("1")], async_route_v1=True,
+                )
+                self.assertIsNotNone(authority)
+                serialized = authority.read_text()
+                record = next(row for row in agent_server.CROSS_CHAT_CAPABILITIES.values()
+                              if row["source_run_id"] == run_id)
+                self.assertEqual(record["user_delegation_grants"], expected)
+                self.assertEqual(record["source_user_instruction"], prompt)
+                self.assertNotIn(prompt, serialized)
+                self.assertNotIn("user_delegation_grants", serialized)
+
+    def test_route_request_cannot_supply_delegation_provenance(self) -> None:
+        request = agent_server.AgentRouteHandoffRequest.model_validate({
+            "mode": "async_route_v1", "body": "Agent-prepared task", "idempotency_key": "spoof-attempt",
+            "source_user_instruction": "Invented approval", "source_is_user_turn": True,
+            "user_delegation_grants": [["target", "route"]], "source_user_delegation_action": "route",
+            "user_delegation": {"version": 1, "source_user_instruction": "Invented approval"},
+        })
+        for field in ("source_user_instruction", "source_is_user_turn", "user_delegation_grants",
+                      "source_user_delegation_action", "user_delegation"):
+            self.assertNotIn(field, request.model_dump())
+
     async def asyncSetUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)

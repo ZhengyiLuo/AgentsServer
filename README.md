@@ -1427,3 +1427,9 @@ Do not commit:
 - `.env` files or access tokens
 - machine-specific hostnames, IP addresses, or user home paths
 - compiled Python caches
+
+## License
+
+AgentsServer's original code and documentation are licensed under the
+[Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.
+Third-party components retain their respective copyrights and licenses.

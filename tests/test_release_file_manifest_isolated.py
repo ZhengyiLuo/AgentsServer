@@ -85,6 +85,31 @@ class ReleaseFileManifestTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, re.escape(NEW_MIGRATION)):
                 self.manifest["validate_release_directory"](staged)
 
+    def test_license_and_notice_are_required_in_every_distribution_manifest(self):
+        legal_files = {"LICENSE", "NOTICE"}
+        manifests = {
+            "package": set(self.manifest["FILES"]),
+            "installer": set(shell_array(self.installer, "RELEASE_FILES")),
+            "deployer": {
+                name.removeprefix("$SCRIPT_DIR/")
+                for name in shell_array(self.deployer, "RUNTIME_FILES")
+            },
+        }
+        for name, files in manifests.items():
+            with self.subTest(manifest=name):
+                self.assertTrue(legal_files <= files)
+
+        with tempfile.TemporaryDirectory(prefix="release-license-manifest-") as temporary:
+            root = Path(temporary)
+            for name in self.manifest["FILES"]:
+                (root / name).write_text("synthetic release member\n")
+            for name in sorted(legal_files):
+                selected = root / name
+                selected.unlink()
+                with self.subTest(name=name), self.assertRaisesRegex(SystemExit, name):
+                    self.manifest["validate_release_files"](root)
+                selected.write_text("synthetic release member\n")
+
     def test_each_new_module_is_required_before_packaging(self):
         with tempfile.TemporaryDirectory(prefix="release-manifest-") as temporary:
             root = Path(temporary)

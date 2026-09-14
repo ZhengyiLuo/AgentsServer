@@ -1390,6 +1390,10 @@ The Python test suite lives in `tests/`; deployable server modules remain at
 the repository root. Run tests from the repository root using Python 3.13,
 matching the release workflow:
 
+Pull requests to `main` run the lock check, test-file compilation, and full
+Python suite in the test-only **Server CI** workflow. It can also be started
+manually and does not build or publish releases.
+
 ```bash
 uv sync --locked --python 3.13
 ulimit -s "$(ulimit -Hs)"

@@ -1258,6 +1258,14 @@ is unavailable for archived chats.
 
 ## Imported provider history
 
+The Import Chat list shows local main conversations across projects. It excludes
+Claude sidechains and subagent directories, Codex subagent conversations and
+the native `archived_sessions` directory, and sessions already imported into
+AgentsDock (including archived AgentsDock chats). Older or stopped main chats,
+headless main sessions, and user-created forks remain eligible. These discovery
+filters do not delete transcripts or change existing chats or direct session-ID
+lookup.
+
 Opening a chat catches its timeline up with messages added to the provider
 transcript outside AgentsDock. The sync anchors on the newest timeline
 messages, skips the parse when the transcript file is unchanged, refuses to

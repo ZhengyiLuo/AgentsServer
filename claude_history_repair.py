@@ -157,10 +157,19 @@ def _mailbox_wake_identity(event: dict) -> tuple | None:
 
 class _AssistantReplays:
     """Bounded exact source/output correlation, fed by the existing two reads."""
-    def __init__(self, provider_id: str) -> None:
+    def __init__(self, provider_id: str, normalize_assistant: Callable[[str], str] | None = None) -> None:
         self.provider_id = provider_id
+        self.normalize_assistant = normalize_assistant
         self.starts, self.ends, self.owners, self.native = {}, {}, {}, []
         self.candidates, self.sources, self.identities, self.source_credits = [], {}, {}, {}
+        self.source_display, self.source_message_counts = {}, {}
+
+    def display_key(self, text: str) -> str | None:
+        if self.normalize_assistant is None:
+            return None
+        display = self.normalize_assistant(text)
+        return (_text_key(display) if isinstance(display, str) and display.strip()
+                and len(display) <= MAX_LINE_BYTES else None)
 
     def event(self, event: dict) -> None:
         target = _assistant_target(event)
@@ -192,6 +201,7 @@ class _AssistantReplays:
         if not all(isinstance(value, str) and 0 < len(value) <= 256 for value in identity):
             return
         self.identities[identity] = self.identities.get(identity, 0) + 1
+        self.source_message_counts[identity[0]] = self.source_message_counts.get(identity[0], 0) + 1
         if event.get("isSidechain") is True or event.get("isMeta") is True:
             return
         message = event.get("message")
@@ -208,6 +218,7 @@ class _AssistantReplays:
         if text.strip() and len(text) <= MAX_LINE_BYTES:
             digest = _text_key(text.strip())
             self.sources.setdefault((identity, digest), []).append(offset)
+            self.source_display[(identity, digest)] = self.display_key(text)
             timestamp = _timestamp(identity[2])
             if timestamp is not None:
                 self.source_credits.setdefault((int(timestamp), digest), set()).add(identity)
@@ -215,7 +226,7 @@ class _AssistantReplays:
             raise _Unproven()
 
     def prove(self, eligible: dict) -> frozenset:
-        native = {}
+        native, identified = {}, {}
         for event, digest in self.native:
             run = event["run_id"]
             starts, ends = self.starts.get(run, ()), self.ends.get(run, ())
@@ -250,6 +261,9 @@ class _AssistantReplays:
                     or not all(type(value) is int for value in seqs) or not seqs[0] < seqs[1] < seqs[2]):
                 continue
             native.setdefault((int(times[1]), digest), []).append(event)
+            message_id = event.get("provider_message_id")
+            if isinstance(message_id, str) and 0 < len(message_id) <= 256:
+                identified.setdefault(message_id, []).append((event, digest))
         counts = {}
         for target, _phase in self.candidates:
             key = (target[2], target[4])
@@ -260,6 +274,21 @@ class _AssistantReplays:
             batch = eligible.get(run)
             matches = native.get((int(_timestamp(identity[2])), digest), ())
             offsets = self.sources.get((identity, digest), ())
+            owned = identified.get(identity[0], ())
+            if owned:
+                # Prefer the immutable message owner over text/time buckets.
+                # A normalized match is permitted ONLY for one native UUID
+                # and one exact raw source record. The imported raw digest,
+                # checkpoint, phase and timestamp checks remain authoritative.
+                # Never use decoration equivalence for identityless messages.
+                matches = ()
+                if len(owned) == 1 and self.source_message_counts.get(identity[0]) == 1:
+                    event, native_digest = owned[0]
+                    canonical = self.source_display.get((identity, digest))
+                    if (int(_timestamp(event.get("ts"))) == int(_timestamp(identity[2]))
+                            and (native_digest == digest or
+                                 (canonical and canonical == self.display_key(event["text"])))):
+                        matches = (event,)
             if (batch is None or len(matches) != 1 or len(offsets) != 1
                     or self.identities.get(identity) != 1 or counts[(run, identity)] != 1):
                 continue
@@ -448,8 +477,9 @@ def filter_native_claude_mailbox_wake_items(
     session_id: str, provider_id: str, events: Path, items: list[dict], *,
     sync_checkpoint: dict, root: Path, normalize_user: Callable,
     normalize_full_user: Callable, source_path: Path | None = None,
+    normalize_assistant: Callable[[str], str] | None = None,
 ) -> list[dict]:
-    """First-import wake proof, before publication; never a text-only filter.
+    """First-import wake input/output proof; never a text-only filter.
 
     Parsed items omit human/client flags and may collapse repeated text, so the
     exact checkpoint source is required to prove unique nonhuman ownership.
@@ -459,7 +489,7 @@ def filter_native_claude_mailbox_wake_items(
         if not items or len(items) > MAX_TARGETS:
             return items
         stamp = _regular_stamp(events)
-        native = _AssistantReplays(provider_id)
+        native = _AssistantReplays(provider_id, normalize_assistant)
         for event, _offset in _bounded_records(events, stamp, max(0, stamp[2] - MAX_EVENTS_BYTES), stamp[2]):
             if (event.get("session_id") in (None, "", session_id)
                     and (event.get("run_id") in native.starts or _mailbox_wake_identity(event))):
@@ -495,10 +525,16 @@ def filter_native_claude_mailbox_wake_items(
         proof = _MailboxWakeInputs(provider_id, native, normalize_user, normalize_full_user)
         # Temporary proof coordinates only; no synthetic event is persisted.
         batch = "import_mailbox_wake_filter"
+        assistant_targets = {}
         for index, item in enumerate(items, 1):
             if item.get("kind") == "user" and item.get("source_text_sha256") is None:
                 proof.event({**item, "seq": index, "run_id": batch, "type": "turn_started",
                              "backend": "claude", "imported": True, "prompt": item.get("text")})
+            elif item.get("kind") == "assistant":
+                candidate = {**item, "seq": index, "run_id": batch, "type": "assistant_text",
+                             "backend": "claude", "imported": True}
+                native.event(candidate)
+                assistant_targets[index] = _assistant_target(candidate)
         if source_stamp[2] <= MAX_EVENTS_BYTES:
             digest, verified = hashlib.sha256(), set()
             for event, offset, line in _records(source, source_stamp):
@@ -509,6 +545,7 @@ def filter_native_claude_mailbox_wake_items(
                     verified.add(end)
                 if offset <= end:
                     proof.source(event, offset)
+                    native.source(event, offset)
             if end not in verified or start and start not in verified:
                 return items
         else:
@@ -520,11 +557,17 @@ def filter_native_claude_mailbox_wake_items(
                 return items
             for event, offset in _bounded_records(source, source_stamp, window_start, end):
                 proof.source(event, offset)
-        targets = proof.prove({batch: (0, len(items) + 1, start, end)})
-        return [{**item, "text": "", "metadata_only": True,
-                 "provider_history_repair": "source_proven_import"}
-                if (index, batch, _text_key(item.get("text", ""))) in targets else item
-                for index, item in enumerate(items, 1)]
+                native.source(event, offset)
+        eligible = {batch: (0, len(items) + 1, start, end)}
+        targets, assistant_replays = proof.prove(eligible), native.prove(eligible)
+        projected = []
+        for index, item in enumerate(items, 1):
+            reason = ("source_proven_import" if (index, batch, _text_key(item.get("text", ""))) in targets
+                      else "source_proven_assistant_replay" if assistant_targets.get(index) in assistant_replays
+                      else None)
+            projected.append({**item, "text": "", "metadata_only": True,
+                              "provider_history_repair": reason} if reason else item)
+        return projected
     except (OSError, ValueError, TypeError, KeyError, RuntimeError):
         return items
 
@@ -683,7 +726,8 @@ def enrich_interruption_origins(events_path: Path, provider_id: str, origins: li
 
 def _prove(session_id: str, provider_id: str, events: Path, root: Path,
            normalize_user: Callable[[dict], str | None], events_stamp,
-           normalize_full_user: Callable[[dict], str | None] | None = None) -> _Proof:
+           normalize_full_user: Callable[[dict], str | None] | None = None,
+           normalize_assistant: Callable[[str], str] | None = None) -> _Proof:
     empty = _Proof(provider_id, events_stamp, None, None, frozenset())
     batches = {}
     candidates = []
@@ -692,7 +736,7 @@ def _prove(session_id: str, provider_id: str, events: Path, root: Path,
     terminal_counts = {}
     native_events = []
     scheduled_starts, scheduled_ends, candidate_origins = {}, {}, {}
-    assistant_replays = _AssistantReplays(provider_id)
+    assistant_replays = _AssistantReplays(provider_id, normalize_assistant)
     async_inputs = _AsyncDeliveryInputs(provider_id, assistant_replays, normalize_user, normalize_full_user)
     wake_inputs = _MailboxWakeInputs(provider_id, assistant_replays, normalize_user, normalize_full_user)
     for event, _offset, _line in _records(events, events_stamp):
@@ -972,6 +1016,7 @@ def _bounded_records(path: Path, expected, start: int, end: int):
 
 def _prove_recent_scheduled(session_id: str, provider_id: str, events: Path, root: Path,
                             normalize_user, events_stamp, normalize_full_user, *,
+                            normalize_assistant: Callable[[str], str] | None = None,
                             event_window_end: int | None = None) -> _Proof:
     """Exact-origin scheduled duplicates and provider metadata in recent history.
 
@@ -990,7 +1035,7 @@ def _prove_recent_scheduled(session_id: str, provider_id: str, events: Path, roo
         raise _Unproven()
     starts, ends, batches, terminals, rows, candidates = {}, {}, {}, {}, {}, []
     origin_counts = {}
-    assistant_replays = _AssistantReplays(provider_id)
+    assistant_replays = _AssistantReplays(provider_id, normalize_assistant)
     async_inputs = _AsyncDeliveryInputs(provider_id, assistant_replays, normalize_user, normalize_full_user)
     wake_inputs = _MailboxWakeInputs(provider_id, assistant_replays, normalize_user, normalize_full_user)
     previous_seq = 0
@@ -1215,7 +1260,8 @@ class ClaudeMetadataRepairCache:
 
     def prepare_window(self, session_id: str, provider_id: str, events: Path, root: Path,
                        normalize_user: Callable[[dict], str | None], *, event_window_end: int,
-                       normalize_full_user: Callable[[dict], str | None] | None = None) -> ClaudeMetadataRepairWindow:
+                       normalize_full_user: Callable[[dict], str | None] | None = None,
+                       normalize_assistant: Callable[[str], str] | None = None) -> ClaudeMetadataRepairWindow:
         """Prove one explicitly requested historical page, never the entire ledger.
 
         Unchanged positive and negative windows are cached. Any observed log
@@ -1261,6 +1307,7 @@ class ClaudeMetadataRepairCache:
             try:
                 proof = _prove_recent_scheduled(session_id, provider_id, events, root,
                                                 normalize_user, stamp, normalize_full_user,
+                                                normalize_assistant=normalize_assistant,
                                                 event_window_end=event_window_end)
                 window = ClaudeMetadataRepairWindow(session_id, proof)
             except (OSError, ValueError, TypeError, KeyError, RuntimeError):
@@ -1279,6 +1326,7 @@ class ClaudeMetadataRepairCache:
     def prepare(self, session_id: str, provider_id: str, events: Path, root: Path,
                 normalize_user: Callable[[dict], str | None], *,
                 normalize_full_user: Callable[[dict], str | None] | None = None,
+                normalize_assistant: Callable[[str], str] | None = None,
                 refresh: bool = False) -> bool:
         """Prepare only this requested session; report a changed suppression map."""
         with self._lock:
@@ -1314,12 +1362,13 @@ class ClaudeMetadataRepairCache:
                     if stamp[2] > MAX_EVENTS_BYTES:
                         raise _Oversized()
                     proof = _prove(session_id, provider_id, events, root, normalize_user, stamp,
-                                   normalize_full_user)
+                                   normalize_full_user, normalize_assistant)
                 except _Oversized:
                     if normalize_full_user is None:
                         raise
                     proof = _prove_recent_scheduled(session_id, provider_id, events, root,
-                                                     normalize_user, stamp, normalize_full_user)
+                                                     normalize_user, stamp, normalize_full_user,
+                                                     normalize_assistant=normalize_assistant)
             except (OSError, ValueError, TypeError, KeyError, RuntimeError):
                 # Fail visible, including incomplete or oversized files. A
                 # failed admission must not retry on every page/socket read.

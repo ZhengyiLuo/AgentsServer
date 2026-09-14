@@ -53,7 +53,8 @@ class AsyncDeliveryRepairTests(unittest.TestCase):
             return value if row.get("type") == "user" and isinstance(value, str) else None
         with patch.object(repair, "MAX_EVENTS_BYTES", 8192 if oversized else repair.MAX_EVENTS_BYTES):
             return self.cache.prepare("chat-one", "provider-one", self.events, self.root, normalize,
-                                      normalize_full_user=normalize)
+                                      normalize_full_user=normalize,
+                                      normalize_assistant=fixtures.CLEAN_ASSISTANT_TEXT)
 
     def test_completed_async_input_and_exact_assistant_replay_preserve_other_same_batch_rows(self):
         for oversized in (False, True):
@@ -168,6 +169,23 @@ class MailboxWakeRepairTests(unittest.TestCase):
                     self.assertTrue(self.cache.is_hidden("chat-one", self.input))
                     self.assertFalse(self.cache.prepare("chat-one", "provider-one", self.events, self.root, lambda row: None))
 
+    def test_reported_decorated_mailbox_reply_has_one_visible_assistant(self):
+        # Same shape as native seq 2137 / imported seq 2145: public commentary,
+        # exact provider UUID, second-resolution native vs precise source time.
+        for oversized in (False, True):
+            with self.subTest(oversized=oversized):
+                self.setUp()
+                self.native.update(text="收到并回复了。", provider_message_id="12345678-1234-4234-8234-123456789abc")
+                self.source_rows[1].update(uuid=self.native["provider_message_id"])
+                self.source_rows[1]["message"]["content"][0]["text"] = "✅ 收到并回复了。"
+                self.imported["text"] = "✅ 收到并回复了。"
+                self.imported["provider_origin"]["event_id"] = self.native["provider_message_id"]
+                self.prepare(oversized=oversized)
+                self.assertIsNone(self.cache.project_event("chat-one", self.native))
+                self.assertTrue(self.cache.project_event("chat-one", self.imported)["metadata_only"])
+                self.assertEqual(self.native["text"], "收到并回复了。")
+                self.assertEqual(self.imported["text"], "✅ 收到并回复了。")
+
     def test_wake_requires_exact_hash_unique_owned_occurrence_and_nonhuman_input(self):
         mutations = [lambda: self.rows[0].update(provider_input_sha256="0" * 64),
                      lambda: self.rows[0].pop("provider_generated"),
@@ -204,7 +222,7 @@ class MailboxWakeRepairTests(unittest.TestCase):
             self.prepare(oversized=oversized)
             self.assertTrue(self.cache.is_hidden("chat-one", self.input))
 
-    def forward(self, *, large=False):
+    def forward(self, *, large=False, items=None):
         self.prepare()
         if large:
             prefix = encode([{"type": "progress", "data": "x" * 1000}] * 20)
@@ -216,16 +234,48 @@ class MailboxWakeRepairTests(unittest.TestCase):
             self.checkpoint["cursor"].update(source_offset=len(raw), source_digest=hashlib.sha256(raw).hexdigest(),
                                              source_dev=stat.st_dev, source_ino=stat.st_ino)
         self.events.write_bytes(encode(self.rows[:4]))  # No import has been persisted yet.
-        items = [{"kind": "user", "text": self.prompt, "provider_origin": self.input.get("provider_origin")},
-                 {"kind": "assistant", "text": "The native result remains visible."}]
+        if items is None:
+            items = [{"kind": "user", "text": self.prompt, "provider_origin": self.input.get("provider_origin")},
+                     {"kind": "assistant", "text": "The native result remains visible."}]
         def normalize(row):
             value = (row.get("message") or {}).get("content")
             return value if row.get("type") == "user" and isinstance(value, str) else None
         with patch.object(repair, "MAX_EVENTS_BYTES", 8192 if large else repair.MAX_EVENTS_BYTES):
             result = repair.filter_native_claude_mailbox_wake_items(
                 "chat-one", "provider-one", self.events, items, sync_checkpoint=self.checkpoint,
-                root=self.root, normalize_user=normalize, normalize_full_user=normalize)
+                root=self.root, normalize_user=normalize, normalize_full_user=normalize,
+                normalize_assistant=fixtures.CLEAN_ASSISTANT_TEXT)
         return items, result
+
+    def test_first_import_silences_exact_decorated_wake_reply_before_publication(self):
+        for large in (False, True):
+            with self.subTest(large=large):
+                self.setUp()
+                self.source_rows[1]["message"]["content"][0]["text"] = "✅ " + self.native["text"]
+                item = {"kind": "assistant", "text": "✅ " + self.native["text"],
+                        "provider_origin": self.imported["provider_origin"]}
+                other = {**item, "provider_origin": {**item["provider_origin"], "event_id": "distinct-reply"}}
+                before, result = self.forward(large=large, items=[item, other])
+                self.assertEqual(result[0]["provider_history_repair"], "source_proven_assistant_replay")
+                self.assertTrue(result[0]["metadata_only"])
+                self.assertEqual(result[0]["text"], "")
+                self.assertEqual(result[1], other)
+                self.assertEqual(before[0]["text"], "✅ " + self.native["text"])
+                self.assertEqual(self.events.read_bytes(), encode(self.rows[:4]))
+
+    def test_first_import_decorated_reply_preserves_ambiguous_and_changed_content(self):
+        for mutate in (lambda: self.native.pop("provider_message_id"),
+                       lambda: self.native.update(provider_message_id="other-reply"),
+                       lambda: self.native.update(text="Changed public output"),
+                       lambda: self.rows[3].update(stopped=True)):
+            with self.subTest(mutation=mutate):
+                self.setUp()
+                raw = "✅ " + self.native["text"]
+                self.source_rows[1]["message"]["content"][0]["text"] = raw
+                item = {"kind": "assistant", "text": raw, "provider_origin": self.imported["provider_origin"]}
+                mutate()
+                before, result = self.forward(items=[item])
+                self.assertEqual(result, before)
 
     def test_first_import_silences_only_exact_wake_in_small_and_large_source(self):
         self.rows[0]["ts"] = "2026-09-10T11:59:58.500Z"

@@ -6,7 +6,10 @@ import unittest
 from unittest.mock import patch
 
 import claude_history_repair as repair
+from test_claude_history_provenance_isolated import load_projection
 from test_recent_scheduled_history_repair import encode
+
+CLEAN_ASSISTANT_TEXT = load_projection()["clean_assistant_text"]
 
 
 class AssistantReplayRepairTests(unittest.TestCase):
@@ -45,7 +48,7 @@ class AssistantReplayRepairTests(unittest.TestCase):
             {**common, "seq": 110, "run_id": "import_shared", "type": "turn_finished", "imported": True},
         ]
 
-    def prepare(self, *, oversized=False):
+    def prepare(self, *, oversized=False, normalize_assistant=None):
         prefix = encode([{"type": "progress", "data": "x" * 1000}] * 20) if oversized else b""
         raw = prefix + encode(self.source_rows)
         self.source.write_bytes(raw)
@@ -56,7 +59,77 @@ class AssistantReplayRepairTests(unittest.TestCase):
         self.events.write_bytes(encode(event_prefix + self.rows))
         with patch.object(repair, "MAX_EVENTS_BYTES", 8192 if oversized else repair.MAX_EVENTS_BYTES):
             return self.cache.prepare("chat-one", "provider-one", self.events, self.root, lambda row: None,
-                                      normalize_full_user=lambda row: None)
+                                      normalize_full_user=lambda row: None, normalize_assistant=normalize_assistant)
+
+    def decorate(self, prefix="✅ "):
+        self.native["provider_message_id"] = "source-one"
+        text = prefix + self.native["text"]
+        self.source_rows[0]["message"]["content"][0]["text"] = text
+        self.imported["text"] = text
+
+    def test_decorated_exact_uuid_repairs_small_recent_and_historical_page_without_writes(self):
+        for prefix in ("✅ ", "🎉 ", "👉 ", ":white_check_mark: "):
+            for oversized in (False, True):
+                with self.subTest(prefix=prefix, oversized=oversized):
+                    self.setUp()
+                    self.decorate(prefix)
+                    self.assertTrue(self.prepare(oversized=oversized, normalize_assistant=CLEAN_ASSISTANT_TEXT))
+                    before = (self.events.read_bytes(), self.source.read_bytes())
+                    projected = self.cache.project_event("chat-one", self.imported)
+                    self.assertTrue(projected["metadata_only"])
+                    self.assertEqual(projected["text"], "")
+                    self.assertIsNone(self.cache.project_event("chat-one", self.native))
+                    signature = self.cache.signature("chat-one")
+                    window = self.cache.prepare_window(
+                        "chat-one", "provider-one", self.events, self.root, lambda row: None,
+                        event_window_end=self.events.stat().st_size, normalize_full_user=lambda row: None,
+                        normalize_assistant=CLEAN_ASSISTANT_TEXT)
+                    self.assertTrue(window.project_event(self.imported)["metadata_only"])
+                    self.assertEqual(self.cache.signature("chat-one"), signature)
+                    self.assertEqual((self.events.read_bytes(), self.source.read_bytes()), before)
+
+    def test_decorated_repair_fails_visible_without_complete_unambiguous_identity_and_text(self):
+        mutations = [lambda: self.native.pop("provider_message_id"),
+                     lambda: self.native.update(provider_message_id="different-native"),
+                     lambda: self.imported["provider_origin"].update(session_id="other-provider"),
+                     lambda: self.imported["provider_origin"].update(timestamp="2026-09-10T12:00:02.322Z"),
+                     lambda: self.imported.update(text="✅ Different public reply"),
+                     lambda: self.native.update(text="Full public report different ending."),
+                     lambda: self.rows.insert(2, {**self.native, "text": "🎉 " + self.native["text"]}),
+                     lambda: self.source_rows.append({**self.source_rows[0], "timestamp": "2026-09-10T12:00:02.322Z"}),
+                     lambda: self.rows[3].update(exit_code=1),
+                     lambda: self.imported.update(provider_user_authored=True)]
+        for oversized in (False, True):
+            for mutate in mutations:
+                with self.subTest(oversized=oversized, mutation=mutate):
+                    self.setUp()
+                    self.decorate()
+                    mutate()
+                    self.prepare(oversized=oversized, normalize_assistant=CLEAN_ASSISTANT_TEXT)
+                    self.assertIsNone(self.cache.project_event("chat-one", self.imported))
+
+    def test_distinct_uuid_with_same_cleaned_text_is_still_a_separate_reply(self):
+        self.decorate()
+        other_source = {**self.source_rows[0], "uuid": "source-two"}
+        other_import = {**self.imported, "seq": 109,
+                        "provider_origin": {**self.imported["provider_origin"], "event_id": "source-two"}}
+        self.source_rows.append(other_source)
+        self.rows[-2] = other_import
+        self.prepare(normalize_assistant=CLEAN_ASSISTANT_TEXT)
+        self.assertIsNotNone(self.cache.project_event("chat-one", self.imported))
+        self.assertIsNone(self.cache.project_event("chat-one", other_import))
+
+    def test_normalization_is_opt_in_nonempty_and_cannot_repair_modified_target(self):
+        self.decorate()
+        self.prepare()
+        self.assertIsNone(self.cache.project_event("chat-one", self.imported))
+        self.cache.forget("chat-one")
+        self.prepare(normalize_assistant=lambda text: "")
+        self.assertIsNone(self.cache.project_event("chat-one", self.imported))
+        self.cache.forget("chat-one")
+        self.prepare(normalize_assistant=CLEAN_ASSISTANT_TEXT)
+        self.assertIsNotNone(self.cache.project_event("chat-one", self.imported))
+        self.assertIsNone(self.cache.project_event("chat-one", {**self.imported, "text": "🎉 Full public report ending."}))
 
     def test_small_and_recent_exact_public_source_repairs_only_one_event(self):
         for oversized in (False, True):

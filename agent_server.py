@@ -48,7 +48,9 @@ import time
 import unicodedata
 import uuid
 from collections import Counter, OrderedDict, defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager, suppress
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -879,6 +881,12 @@ CODEX_APP_SERVER_MAX_LOADED_THREADS = max(
 )
 CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS = int(agentsdock_setting("CODEX_RESUME_ACTIVITY_TIMEOUT_SECONDS", "120"))
 RUNTIME_CATALOG_TIMEOUT_SECONDS = float(agentsdock_setting("RUNTIME_CATALOG_TIMEOUT_SECONDS", "6"))
+CLAUDE_AUTH_PROBE_TIMEOUT_SECONDS = float(agentsdock_setting("CLAUDE_AUTH_PROBE_TIMEOUT_SECONDS", "15"))
+# Leave room for HTTP/JSON overhead before desktop and mobile's 30s deadline.
+RUNTIME_CATALOG_BUDGET_SECONDS = 25.0
+RUNTIME_CATALOG_DEADLINE: ContextVar[float | None] = ContextVar(
+    "runtime_catalog_deadline", default=None,
+)
 RUNTIME_DIAGNOSTIC_TTL_SECONDS = float(agentsdock_setting("RUNTIME_DIAGNOSTIC_TTL_SECONDS", "60"))
 # Claude Code only promises the family aliases in ``--help``; account-scoped
 # pinned models come from Anthropic's Models API when an API key is available.
@@ -55670,15 +55678,7 @@ def unique_runtime_options(options: list[dict[str, Any]], default_label: str | N
 
 
 def run_catalog_command(cmd: list[str]) -> str:
-    result = subprocess.run(
-        cmd,
-        cwd=DEFAULT_CWD if Path(DEFAULT_CWD).exists() else str(Path.home()),
-        env=runner_env(),
-        text=True,
-        capture_output=True,
-        timeout=RUNTIME_CATALOG_TIMEOUT_SECONDS,
-        check=False,
-    )
+    result = runtime_command(cmd)
     if result.returncode != 0:
         stderr = result.stderr.strip()[:500]
         raise RuntimeError(f"{cmd[0]} exited {result.returncode}: {stderr}")
@@ -55690,15 +55690,7 @@ def claude_supports_effort(effort: str) -> bool:
     if not clean:
         return False
     try:
-        result = subprocess.run(
-            [CLAUDE_BIN, "--effort", clean, "--version"],
-            cwd=DEFAULT_CWD if Path(DEFAULT_CWD).exists() else str(Path.home()),
-            env=runner_env(),
-            text=True,
-            capture_output=True,
-            timeout=RUNTIME_CATALOG_TIMEOUT_SECONDS,
-            check=False,
-        )
+        result = runtime_command([CLAUDE_BIN, "--effort", clean, "--version"])
     except Exception as exc:
         logger.debug("claude effort probe failed effort=%s: %s", clean, exc)
         return False
@@ -56007,7 +55999,7 @@ def runtime_action(
     *,
     executable: str | None = None,
 ) -> str | None:
-    if status == "ready":
+    if status in {"ready", "unknown"}:
         return None
     executable = executable or runtime_executable(backend)
     public_executable = (
@@ -56107,16 +56099,45 @@ def safe_runtime_version(output: str) -> str | None:
     return clean[:120] or None
 
 
-def runtime_command(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        cmd,
-        cwd=DEFAULT_CWD if Path(DEFAULT_CWD).exists() else str(Path.home()),
-        env=runner_env(),
-        text=True,
-        capture_output=True,
-        timeout=RUNTIME_CATALOG_TIMEOUT_SECONDS,
-        check=False,
+class RuntimeCatalogBudgetExpired(RuntimeError):
+    """A refresh ran out of time; this is not evidence of a broken runtime."""
+
+
+def runtime_catalog_budget_expired() -> bool:
+    deadline = RUNTIME_CATALOG_DEADLINE.get()
+    return deadline is not None and time.monotonic() >= deadline
+
+
+def runtime_probe_timeout(timeout_seconds: float) -> float:
+    deadline = RUNTIME_CATALOG_DEADLINE.get()
+    if deadline is None:
+        return timeout_seconds
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeCatalogBudgetExpired("Runtime catalog refresh budget expired")
+    return min(timeout_seconds, remaining)
+
+
+def runtime_command(
+    cmd: list[str], *, timeout_seconds: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    timeout = runtime_probe_timeout(
+        RUNTIME_CATALOG_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
     )
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=DEFAULT_CWD if Path(DEFAULT_CWD).exists() else str(Path.home()),
+            env=runner_env(),
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        if runtime_catalog_budget_expired():
+            raise RuntimeCatalogBudgetExpired("Runtime catalog refresh budget expired") from None
+        raise
 
 
 def auth_failure_text(value: str) -> bool:
@@ -56368,7 +56389,25 @@ def probe_runtime(backend: str) -> dict[str, Any]:
     else:
         auth_cmd = [resolved, "login", "status"]
     try:
-        auth_result = runtime_command(auth_cmd)
+        auth_result = (
+            runtime_command(auth_cmd, timeout_seconds=CLAUDE_AUTH_PROBE_TIMEOUT_SECONDS)
+            if backend == BACKEND_CLAUDE
+            else runtime_command(auth_cmd)
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("%s authentication check timed out", backend)
+        return runtime_diagnostic_payload(
+            backend,
+            "error",
+            installed=True,
+            authenticated=None,
+            version=version,
+            message=(
+                f"{runtime_display_name(backend)} authentication check timed out. "
+                "Authentication could not be confirmed; this does not mean you are signed out. "
+                "Try Re-check again."
+            ),
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("%s auth probe failed: %s", backend, type(exc).__name__)
         return runtime_diagnostic_payload(
@@ -56419,7 +56458,25 @@ def runtime_diagnostic(backend: str, *, force: bool = False) -> dict[str, Any]:
     checked_at = cached.get("checked_at_epoch")
     if not force and isinstance(checked_at, (int, float)) and time.time() - checked_at < RUNTIME_DIAGNOSTIC_TTL_SECONDS:
         return cached
-    probed = probe_runtime(backend)
+    try:
+        if runtime_catalog_budget_expired():
+            raise RuntimeCatalogBudgetExpired()
+        probed = probe_runtime(backend)
+    except RuntimeCatalogBudgetExpired:
+        # Do not cache an incomplete check or make old evidence look fresh.
+        # In particular, budget starvation must not mark another provider
+        # missing, incompatible, or signed out for the diagnostic cache TTL.
+        with RUNTIME_DIAGNOSTICS_LOCK:
+            current = dict(RUNTIME_DIAGNOSTICS.get(backend) or {})
+        if current:
+            return current
+        return runtime_diagnostic_payload(
+            backend, "unknown", installed=None, authenticated=None,
+            message=(
+                f"{runtime_display_name(backend)} check did not finish before the "
+                "runtime refresh deadline. Try Re-check again."
+            ),
+        )
     with RUNTIME_DIAGNOSTICS_LOCK:
         if RUNTIME_DIAGNOSTIC_GENERATIONS.get(backend, 0) != generation:
             current = dict(RUNTIME_DIAGNOSTICS.get(backend) or {})
@@ -56908,8 +56965,10 @@ def discover_claude_provider_models(
     if not curl_bin:
         logger.warning("claude provider model discovery skipped: curl unavailable")
         return [], "unavailable"
-    timeout_seconds = max(0.5, min(RUNTIME_CATALOG_TIMEOUT_SECONDS, 6.0))
     try:
+        timeout_seconds = runtime_probe_timeout(
+            max(0.5, min(RUNTIME_CATALOG_TIMEOUT_SECONDS, 6.0))
+        )
         # Keep the key out of argv, the child environment, and disk by feeding
         # curl's header-file syntax through stdin. curl's total-time limit is
         # resistant to a peer that trickles bytes forever; subprocess.run's
@@ -56952,7 +57011,7 @@ def discover_claude_provider_models(
             input=header_bytes,
             text=False,
             capture_output=True,
-            timeout=timeout_seconds + 1.0,
+            timeout=runtime_probe_timeout(timeout_seconds + 1.0),
             check=False,
         )
         if result.returncode != 0:
@@ -57146,11 +57205,12 @@ def discover_cursor_catalog(*, executable: str | None = None) -> dict[str, Any]:
         parse_cursor_models_list,
     )
 
-    executable = executable or resolve_cursor_executable()
-    if executable is None:
-        raise RuntimeError("no compatible Cursor executable is available")
-    model_source = f"{Path(executable).name} --list-models"
+    model_source = f"{Path(executable or CURSOR_BIN).name} --list-models"
     try:
+        executable = executable or resolve_cursor_executable()
+        if executable is None:
+            raise RuntimeError("no compatible Cursor executable is available")
+        model_source = f"{Path(executable).name} --list-models"
         output = run_catalog_command([executable, "--list-models"])
         parsed = parse_cursor_models_list(output)
     except Exception as exc:
@@ -57163,8 +57223,9 @@ def discover_cursor_catalog(*, executable: str | None = None) -> dict[str, Any]:
 
     is_free_tier = False
     try:
-        about_output = run_catalog_command([executable, "about"])
-        is_free_tier = cursor_account_is_free_tier(parse_cursor_account_tier(about_output))
+        if executable and not runtime_catalog_budget_expired():
+            about_output = run_catalog_command([executable, "about"])
+            is_free_tier = cursor_account_is_free_tier(parse_cursor_account_tier(about_output))
     except Exception as exc:
         logger.warning(
             "cursor account tier detection failed error_type=%s",
@@ -57203,69 +57264,71 @@ def discover_cursor_catalog(*, executable: str | None = None) -> dict[str, Any]:
 
 
 def discover_runtime_catalog(*, force_runtime_probe: bool = False) -> dict[str, Any]:
-    diagnostics = refresh_runtime_diagnostics(force=force_runtime_probe)
-    cursor_ready = (
-        diagnostics.get(BACKEND_CURSOR, {}).get("status") == "ready"
+    deadline = time.monotonic() + RUNTIME_CATALOG_BUDGET_SECONDS
+    existing_deadline = RUNTIME_CATALOG_DEADLINE.get()
+    token = RUNTIME_CATALOG_DEADLINE.set(
+        min(deadline, existing_deadline) if existing_deadline is not None else deadline
     )
-    cursor_catalog = (
-        discover_cursor_catalog(
-            executable=str(
-                diagnostics.get(BACKEND_CURSOR, {}).get("_executable") or ""
+    try:
+        return discover_runtime_catalog_within_budget(force_runtime_probe=force_runtime_probe)
+    finally:
+        RUNTIME_CATALOG_DEADLINE.reset(token)
+
+
+def discover_runtime_catalog_within_budget(*, force_runtime_probe: bool = False) -> dict[str, Any]:
+    # Run each provider's entire pipeline independently: waiting for all
+    # diagnostics first could starve a healthy provider's model discovery.
+    # Each worker inherits the same deadline in its own context. The bounded
+    # subprocess calls kill/reap children before the pool joins its workers.
+    backends = sorted(VALID_BACKENDS)
+    with ThreadPoolExecutor(max_workers=len(backends), thread_name_prefix="runtime-probe") as pool:
+        pending = {
+            backend: pool.submit(
+                copy_context().run, discover_runtime_backend_catalog, backend,
+                force_runtime_probe=force_runtime_probe,
             )
-            or None
-        )
-        if cursor_ready
-        else {
+            for backend in backends
+        }
+        catalogs = {backend: future.result() for backend, future in pending.items()}
+    return {"generated_at": now_iso(), "backends": catalogs}
+
+
+def discover_runtime_backend_catalog(backend: str, *, force_runtime_probe: bool = False) -> dict[str, Any]:
+    diagnostic = runtime_diagnostic(backend, force=force_runtime_probe)
+    ready = diagnostic.get("status") == "ready"
+    executable = str(diagnostic.get("_executable") or "") or None
+    if backend == BACKEND_CLAUDE:
+        catalog = parse_claude_help_catalog()
+    elif backend == BACKEND_CODEX:
+        catalog = discover_codex_catalog()
+    elif backend == BACKEND_CURSOR:
+        catalog = discover_cursor_catalog(executable=executable) if ready and not runtime_catalog_budget_expired() else {
             "models": [runtime_option("auto", "Auto")],
             "efforts": [],
-            "model_source": "Cursor runtime unavailable",
+            "model_source": "Runtime refresh deadline" if ready else "Cursor runtime unavailable",
             "effort_source": "none",
             "default_model": "auto",
             "default_effort": None,
         }
-    )
-    opencode_ready = (
-        diagnostics.get(BACKEND_OPENCODE, {}).get("status") == "ready"
-    )
-    opencode_catalog = (
-        discover_opencode_catalog(
-            executable=str(
-                diagnostics.get(BACKEND_OPENCODE, {}).get("_executable") or ""
-            )
-            or None
-        )
-        if opencode_ready
-        else {
+        catalog.update({
+            "permission_modes": list(CURSOR_PERMISSION_MODES),
+            "default_permission_mode": CURSOR_DEFAULT_PERMISSION_MODE,
+        })
+    else:
+        catalog = discover_opencode_catalog(executable=executable) if ready and not runtime_catalog_budget_expired() else {
             "models": [],
             "efforts": [],
-            "model_source": "OpenCode runtime unavailable",
+            "model_source": "Runtime refresh deadline" if ready else "OpenCode runtime unavailable",
             "effort_source": "none",
             "default_model": "",
             "default_effort": None,
         }
-    )
-    catalog = {
-        "generated_at": now_iso(),
-        "backends": {
-            BACKEND_CLAUDE: parse_claude_help_catalog(),
-            BACKEND_CODEX: discover_codex_catalog(),
-            BACKEND_CURSOR: cursor_catalog,
-            BACKEND_OPENCODE: opencode_catalog,
-        },
-    }
-    for backend, diagnostic in diagnostics.items():
-        catalog["backends"][backend]["diagnostic"] = public_runtime_diagnostic(diagnostic)
-        catalog["backends"][backend]["available"] = (
-            diagnostic.get("status") == "ready"
-        )
-    catalog["backends"][BACKEND_CURSOR].update({
-        "permission_modes": list(CURSOR_PERMISSION_MODES),
-        "default_permission_mode": CURSOR_DEFAULT_PERMISSION_MODE,
-    })
-    catalog["backends"][BACKEND_OPENCODE].update({
-        "permission_modes": list(OPENCODE_PERMISSION_MODES),
-        "default_permission_mode": OPENCODE_DEFAULT_PERMISSION_MODE,
-    })
+        catalog.update({
+            "permission_modes": list(OPENCODE_PERMISSION_MODES),
+            "default_permission_mode": OPENCODE_DEFAULT_PERMISSION_MODE,
+        })
+    catalog["diagnostic"] = public_runtime_diagnostic(diagnostic)
+    catalog["available"] = ready
     return catalog
 
 

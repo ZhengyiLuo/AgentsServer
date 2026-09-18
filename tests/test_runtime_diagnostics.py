@@ -478,7 +478,9 @@ class RuntimeDiagnosticTests(unittest.TestCase):
             "default_effort": None,
         }
         with patch.object(
-            agent_server, "refresh_runtime_diagnostics", return_value=diagnostics
+            agent_server, "runtime_diagnostic", side_effect=lambda backend, **_kwargs: diagnostics.get(
+                backend, {"backend": backend, "status": "unknown"},
+            )
         ), patch.object(
             agent_server, "parse_claude_help_catalog", return_value=dict(static)
         ), patch.object(

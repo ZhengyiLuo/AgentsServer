@@ -18,6 +18,7 @@ from pathlib import Path
 import plistlib
 import re
 import shlex
+import shutil
 import socket
 import stat
 import subprocess
@@ -344,6 +345,97 @@ def candidate_addresses(bind: str, port: int) -> list[str]:
     return urls
 
 
+def tailscale_status(*, home: Path | None = None, platform: str | None = None) -> dict[str, str]:
+    """Inspect existing Tailscale only; never launch the GUI, install or log in.
+
+    macOS app variants bundle the CLI without necessarily adding it to PATH.
+    Keep failures distinct from absence, and do not publish stale logged-out IPs.
+    """
+    home = home or Path.home()
+    platform = platform or sys.platform
+    candidates = [shutil.which("tailscale"), "/usr/local/bin/tailscale", "/usr/bin/tailscale"]
+    app_roots = []
+    if platform == "darwin":
+        candidates.append("/opt/homebrew/bin/tailscale")
+        app_roots = [Path("/Applications/Tailscale.app"), home / "Applications/Tailscale.app"]
+        candidates.extend(str(root / "Contents/MacOS/Tailscale") for root in app_roots)
+    result = {"status": "unavailable" if any(root.is_dir() for root in app_roots) else "not-installed", "ipv4": ""}
+    inspected = set()
+    deadline = time.monotonic() + 5
+    environment = {key: value for key, value in os.environ.items()
+                   if key in {"HOME", "PATH", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR"}}
+    environment["TAILSCALE_BE_CLI"] = "1"
+    for candidate in candidates:
+        if not candidate or not Path(candidate).is_file() or not os.access(candidate, os.X_OK):
+            continue
+        resolved = str(Path(candidate).resolve())
+        if resolved in inspected:
+            continue
+        inspected.add(resolved)
+        if result["status"] == "not-installed":
+            result["status"] = "unavailable"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            response = subprocess.run(
+                [candidate, "status", "--json"], stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, check=False, timeout=min(3, remaining), env=environment,
+            )
+            if response.returncode or len(response.stdout) > 4 * 1024 * 1024:
+                continue
+            status = json.loads(response.stdout)
+            if not isinstance(status, dict) or not isinstance(status.get("BackendState"), str):
+                continue
+            if status["BackendState"] != "Running":
+                result = {"status": "disconnected", "ipv4": ""}
+                continue
+            self_status = status.get("Self")
+            if isinstance(self_status, dict) and self_status.get("Online") is False:
+                result = {"status": "disconnected", "ipv4": ""}
+                continue
+            addresses = status.get("TailscaleIPs")
+            if not isinstance(addresses, list):
+                continue
+            for value in addresses:
+                if not isinstance(value, str):
+                    continue
+                try:
+                    address = ipaddress.ip_address(value)
+                except ValueError:
+                    continue
+                if (address.version == 4 and not address.is_unspecified
+                        and not address.is_loopback and not address.is_multicast
+                        and not address.is_link_local and str(address) == value):
+                    return {"status": "connected", "ipv4": value}
+            result = {"status": "connected", "ipv4": ""}
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            continue  # Do not echo peer details or CLI errors into setup output.
+    return result
+
+
+def setup_network_bindings(bind: str, port: int) -> str:
+    """Shell-quoted, fixed-key installer summary. No credentials or mutations."""
+    if not 1 <= port <= 65535:
+        raise ValueError("Invalid port.")
+    address = ipaddress.ip_address("127.0.0.1" if bind == "localhost" else bind.strip("[]"))
+    loopback = address.is_loopback
+    host = "127.0.0.1" if bind == "localhost" or str(address) == "0.0.0.0" else "::1" if address.is_unspecified else str(address)
+    local_url = f"http://{'[' + host + ']' if ':' in host else host}:{port}"
+    tailscale = tailscale_status()
+    ip = tailscale["ipv4"]
+    tail_binding = bool(ip and (str(address) == "0.0.0.0" or str(address) == ip))
+    server_url = f"http://{ip}:{port}" if tail_binding else local_url
+    candidates = [url.split(" ", 1)[0] for url in candidate_addresses(bind, port)]
+    values = {
+        "TAILSCALE_STATUS": tailscale["status"], "TAILSCALE_IP": ip,
+        "TAILSCALE_BIND_MATCH": "true" if tail_binding else "false",
+        "SERVER_LOCAL_ONLY": "true" if loopback else "false", "SERVER_URL": server_url,
+        "NETWORK_URLS": "\n".join(url for url in candidates if url != server_url),
+    }
+    return "\n".join(f"{key}={shlex.quote(value)}" for key, value in values.items())
+
+
 def describe(instance: Instance) -> dict:
     env = read_config(instance)
     port = int(env.get("AGENTSDOCK_AGENT_PORT", "7850")) if env else None
@@ -440,6 +532,9 @@ def parser() -> argparse.ArgumentParser:
     # Internal shared bindings; pure read-only output, safely shell-quoted.
     bindings = commands.add_parser("_bindings", help=argparse.SUPPRESS)
     bindings.add_argument("name", type=instance_name)
+    network = commands.add_parser("_setup-network", help=argparse.SUPPRESS)
+    network.add_argument("--bind", required=True)
+    network.add_argument("--port", type=int, required=True)
     return result
 
 
@@ -447,6 +542,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     registry = Registry()
     try:
+        if args.command == "_setup-network":
+            print(setup_network_bindings(args.bind, args.port))
+            return 0
         if args.command == "_bindings":
             instance = Instance(args.name, registry.home)
             validate_binding(instance)

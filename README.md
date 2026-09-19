@@ -594,6 +594,14 @@ without it, so `install.sh` only prints a reminder with the download link
 at the end of a successful run when Tailscale isn't already on the host —
 it never blocks setup or is installed automatically.
 
+Setup detects both the `tailscale` command and the macOS Tailscale app's bundled
+CLI, even when it is not on `PATH`. It only reads connection status: it does not
+install, sign in, start, or reconfigure Tailscale. A connected address is used
+in the setup URL only when the server's bind allows it. Installed-but-disconnected
+and unavailable-status cases are reported separately, without suggesting a
+reinstall. Local/network addresses are also listed; none bypass firewall or
+tailnet access rules. A localhost-only server is explicitly marked as such.
+
 On the agent host:
 
 ```bash
@@ -702,6 +710,10 @@ registered but stopped server keeps its port reserved. An occupied explicit
 port fails instead of stopping another process. New names cannot overwrite
 existing files or reuse preserved history. Creation failures remain visible
 in the registry so they can be diagnosed or explicitly removed.
+
+Each release prepares a private Python environment, reusing uv's package cache
+where available. The installer hides the per-package list but still reports
+errors. It does not reinstall the existing Claude Code, Codex, or tmux programs.
 
 | Item | Default | Named `work` |
 | --- | --- | --- |

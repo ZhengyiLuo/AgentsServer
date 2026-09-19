@@ -3058,6 +3058,7 @@ sync_release_dependencies() (
       --project "$STAGE_DIR" \
       --python '>=3.10' \
       --no-dev \
+      --quiet \
       --frozen
 )
 
@@ -3387,7 +3388,9 @@ done
 chmod 755 "$STAGE_DIR/agent_server.py" "$STAGE_DIR/agentsdock_jobs.py" "$STAGE_DIR/agentsdock_chats.py" "$STAGE_DIR/agentsdock_emergency.py" "$STAGE_DIR/agentsdock_publish.py" "$STAGE_DIR/agentsdock_mail.py" "$STAGE_DIR/agentsdock_team.py" "$STAGE_DIR/install.sh" "$STAGE_DIR/uninstall.sh" "$STAGE_DIR/update_runner.py"
 chmod 755 "$STAGE_DIR/instances.sh"
 
-echo "[2/7] Resolving the release dependencies with uv"
+echo "[2/7] Preparing private Python dependencies for instance $INSTANCE_NAME"
+echo "      Reusing uv's package cache where available; errors will still be shown."
+echo "      This does not reinstall Claude Code, Codex, or tmux."
 if run_timed_stage \
   "dependency resolution" \
   "$DEPENDENCY_SYNC_TIMEOUT_SECONDS" \
@@ -6247,18 +6250,61 @@ if [[ "$CLAUDE_READY" == "false" && "$CODEX_READY" == "false" ]]; then
   echo "      Sign in to at least one before starting a chat."
 fi
 
-TAILSCALE_IP=""
-if command -v tailscale >/dev/null 2>&1; then
-  TAILSCALE_IP="$(tailscale ip -4 2>/dev/null | head -n 1 || true)"
-fi
-SERVER_URL="$(health_origin "$PORT")"
-if [[ "$BIND_ADDRESS" == "0.0.0.0" && -n "$TAILSCALE_IP" ]]; then
-  SERVER_URL="http://$TAILSCALE_IP:$PORT"
-fi
+setup_network_summary() {
+  TAILSCALE_IP=""
+  TAILSCALE_STATUS="unknown"
+  TAILSCALE_BIND_MATCH="false"
+  SERVER_LOCAL_ONLY="false"
+  NETWORK_URLS=""
+  SERVER_URL="$(health_origin "$PORT")"
+  local network_bindings=""
+  # The shipped helper emits only fixed keys and shell-quoted validated values.
+  # Optional network diagnostics must not fail an already healthy installation.
+  if network_bindings="$("$CURRENT_LINK/.venv/bin/python" \
+      "$CURRENT_LINK/server_instances.py" _setup-network \
+      --bind "$BIND_ADDRESS" --port "$PORT" 2>/dev/null)" \
+      && [[ -n "$network_bindings" ]]; then
+    eval "$network_bindings"
+  fi
+}
+
+print_tailscale_summary() {
+  case "$TAILSCALE_STATUS" in
+    connected)
+      if [[ "$TAILSCALE_BIND_MATCH" == "true" ]]; then
+        echo "  $CHECK_MARK Tailscale already connected: http://$TAILSCALE_IP:$PORT (tailnet access rules still apply)"
+      elif [[ "$SERVER_LOCAL_ONLY" == "true" ]]; then
+        echo "  $DOT_MARK Tailscale already connected; this server is bound to localhost only, so phones cannot connect directly."
+      else
+        echo "  $DOT_MARK Tailscale already connected; its IPv4 address is not available on this server's configured bind."
+      fi
+      ;;
+    disconnected)
+      echo "  $DOT_MARK Tailscale already installed but not connected; no installation or configuration changes made."
+      ;;
+    not-installed)
+      echo "  $DOT_MARK optional: Tailscale was not found; use your LAN address on the same network, or see https://tailscale.com/download"
+      ;;
+    unavailable)
+      echo "  $DOT_MARK Tailscale already installed; connection status could not be checked. No setup changes made."
+      ;;
+    *)
+      echo "  $DOT_MARK Tailscale connection status could not be checked; no installation or configuration changes made."
+      ;;
+  esac
+}
+
+setup_network_summary
 
 echo "[7/7] AgentsServer $RELEASE_VERSION is ready"
 echo
 echo "  ${COLOR_BOLD}Server URL${COLOR_RESET}    $SERVER_URL"
+if [[ -n "$NETWORK_URLS" ]]; then
+  echo "  Other local/network addresses (reachability depends on network/firewall):"
+  while IFS= read -r network_url; do
+    [[ -z "$network_url" ]] || echo "    $network_url"
+  done <<< "$NETWORK_URLS"
+fi
 echo
 echo "  ${COLOR_BOLD}Next steps${COLOR_RESET}"
 if [[ "$PORT_AUTO_SELECTED" == "true" ]]; then
@@ -6272,11 +6318,7 @@ if [[ -n "$TMUX_WARNING" ]]; then
 else
   echo "  $CHECK_MARK tmux available"
 fi
-if [[ -n "$TAILSCALE_IP" ]]; then
-  echo "  $CHECK_MARK reachable via Tailscale at $TAILSCALE_IP"
-else
-  echo "  $DOT_MARK optional: install and connect Tailscale to reach this server from another device or WiFi network: https://tailscale.com/download"
-fi
+print_tailscale_summary
 if [[ "$TEAM_HUB_MODE" == "host" ]]; then
   echo
   if [[ "$TEAM_HUB_TRANSPORT" == "tailscale_serve" ]]; then

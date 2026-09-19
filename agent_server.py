@@ -70,6 +70,7 @@ import uvicorn
 import websockets
 import team_mail_grants
 import chat_mailbox
+import server_instances
 
 from codex_app_server import (
     CodexAppServerDisconnected,
@@ -236,6 +237,8 @@ def canonical_server_display_name(
     return normalized
 
 
+# Fail before reading another instance's config or resolving/migrating state.
+server_instances.validate_runtime_environment(os.environ, Path.home())
 CONFIG_ENV_FILE = (
     Path(
         os.environ.get("AGENTS_SERVER_CONFIG_DIR")
@@ -344,6 +347,15 @@ def resolve_state_dir() -> Path:
 
 
 STATE_DIR = resolve_state_dir()
+SERVER_INSTANCE_NAME = server_instances.instance_name(os.environ.get("AGENTS_SERVER_INSTANCE", "default"))
+TMUX_INSTANCE_ARGS = () if SERVER_INSTANCE_NAME == "default" else ("-L", f"agents-server-{SERVER_INSTANCE_NAME}")
+# Claim state before identity/database initialization in the supported CLI.
+# Imports remain usable by helpers/tests; ASGI startup also claims state.
+SERVER_STATE_PROCESS_LOCK = (
+    server_instances.acquire_state_lock(STATE_DIR)
+    if __name__ == "__main__" and not {"-h", "--help"}.intersection(sys.argv[1:])
+    else None
+)
 SERVER_ROOT = Path(__file__).resolve().parent
 SERVER_VERSION_FILE = SERVER_ROOT / "VERSION"
 try:
@@ -26893,13 +26905,14 @@ def tmux_capability(*, use_cache: bool = False) -> dict[str, Any]:
 
 def terminal_session_name(session_id: str) -> str:
     clean = re.sub(r"[^A-Za-z0-9_]", "_", session_id).strip("_") or "session"
-    return f"zd_{clean[:80]}"
+    prefix = "zd_" if SERVER_INSTANCE_NAME == "default" else f"zdi_{SERVER_INSTANCE_NAME}_"
+    return f"{prefix}{clean[:80]}"
 
 
 def run_tmux(args: list[str], *, check: bool = True, timeout: float = TMUX_COMMAND_TIMEOUT_SECONDS) -> subprocess.CompletedProcess[str]:
     try:
         result = subprocess.run(
-            [tmux_bin(), *args],
+            [tmux_bin(), *TMUX_INSTANCE_ARGS, *args],
             text=True,
             capture_output=True,
             timeout=timeout,
@@ -26921,7 +26934,7 @@ def tmux_session_exists(name: str) -> bool:
     return run_tmux(["has-session", "-t", name], check=False).returncode == 0
 
 
-AGENTS_SERVER_SYSTEMD_UNIT = "agents-server.service"
+AGENTS_SERVER_SYSTEMD_UNIT = server_instances.service_name(SERVER_INSTANCE_NAME) + ".service"
 
 
 def process_cgroup_paths(pid: int) -> tuple[str, ...]:
@@ -27155,7 +27168,7 @@ def server_restart_tmux_cgroup_state() -> dict[str, Any]:
     )).hexdigest()
     state["_tmux_server_probe_revision"] = probe_fingerprint
     if probe.returncode != 0:
-        socket_path = Path("/tmp") / f"tmux-{os.getuid()}" / "default"
+        socket_path = Path(os.environ.get("TMUX_TMPDIR", "/tmp")) / f"tmux-{os.getuid()}" / (TMUX_INSTANCE_ARGS[-1] if TMUX_INSTANCE_ARGS else "default")
         try:
             socket_present = stat.S_ISSOCK(socket_path.lstat().st_mode)
         except OSError:
@@ -27230,6 +27243,7 @@ def bootstrap_isolated_tmux_server() -> bool:
                 "--collect",
                 f"--unit={unit}",
                 tmux,
+                *TMUX_INSTANCE_ARGS,
                 "new-session",
                 "-d",
                 "-s",
@@ -27571,7 +27585,7 @@ def spawn_terminal_client(
     try:
         set_pty_dimensions(slave_fd, columns, rows)
         process = subprocess.Popen(
-            [tmux_bin(), "attach-session", "-t", name],
+            [tmux_bin(), *TMUX_INSTANCE_ARGS, "attach-session", "-t", name],
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
@@ -71243,7 +71257,7 @@ def macos_launchd_owns_current_process() -> bool | None:
             [
                 "/bin/launchctl",
                 "print",
-                f"gui/{os.getuid()}/com.agentsdock.server",
+                f"gui/{os.getuid()}/{server_instances.launchd_label(SERVER_INSTANCE_NAME)}",
             ],
             stdin=subprocess.DEVNULL,
             text=True,
@@ -73242,16 +73256,22 @@ async def reconcile_server_update_status_after_startup() -> dict[str, Any]:
 
 def server_update_runner_environment() -> dict[str, str]:
     """Preserve Linux's user-service bus when the detached tmux server is stale."""
+    result = {
+        "AGENTS_SERVER_INSTANCE": SERVER_INSTANCE_NAME,
+        "AGENTS_SERVER_CONFIG_DIR": str(CONFIG_ENV_FILE.parent),
+        "AGENTSDOCK_STATE_DIR": str(STATE_DIR),
+        "AGENTS_SERVER_INSTALL_DIR": str(os.environ.get("AGENTS_SERVER_INSTALL_DIR") or ""),
+    }
     if not sys.platform.startswith("linux"):
-        return {}
+        return result
     runtime_dir = str(os.environ.get("XDG_RUNTIME_DIR") or "").strip()
     if not runtime_dir:
         candidate = Path("/run/user") / str(os.getuid())
         if candidate.is_dir():
             runtime_dir = str(candidate)
     if not runtime_dir:
-        return {}
-    result = {"XDG_RUNTIME_DIR": runtime_dir}
+        return result
+    result["XDG_RUNTIME_DIR"] = runtime_dir
     bus_address = str(os.environ.get("DBUS_SESSION_BUS_ADDRESS") or "").strip()
     if not bus_address and (Path(runtime_dir) / "bus").exists():
         bus_address = f"unix:path={Path(runtime_dir) / 'bus'}"
@@ -74419,6 +74439,9 @@ async def bounded_shutdown_phase(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global SERVER_STATE_PROCESS_LOCK
+    if SERVER_STATE_PROCESS_LOCK is None:
+        SERVER_STATE_PROCESS_LOCK = server_instances.acquire_state_lock(STATE_DIR)
     global SERVER_SHUTTING_DOWN, QUEUE_RECOVERY_TASK
     SERVER_SHUTTING_DOWN = False
     await STORE.load()
@@ -81115,7 +81138,7 @@ async def _start_server_update(
             if auth_token_file is not None:
                 atomic_update_json(auth_token_file, {"token": AGENT_TOKEN})
             runner_shell_command = (
-                f"{shlex.quote(tmux_bin())} set-option -w remain-on-exit off "
+                f"{shlex.join([tmux_bin(), *TMUX_INSTANCE_ARGS])} set-option -w remain-on-exit off "
                 f">/dev/null 2>&1 && exec {shlex.join(command)}"
             )
             launch_task = asyncio.create_task(

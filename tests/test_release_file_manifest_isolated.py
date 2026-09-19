@@ -12,6 +12,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 NEW_MODULES = {
+    "server_instances.py",
     "chat_mailbox.py",
     "claude_background_reconciliation.py",
     "opencode_agent_client.py",

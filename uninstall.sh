@@ -1,6 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+UNINSTALL_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# Bare uninstall now previews ALL instances and requires an exact count. Keep
+# legacy explicit --yes automation default-scoped; --all opts into bulk removal.
+if (($# == 0)); then
+  exec bash "$UNINSTALL_SCRIPT_DIR/instances.sh" remove --all
+fi
+for uninstall_option in "$@"; do
+  if [[ "$uninstall_option" == "--all" || "$uninstall_option" == "--instance" ]]; then
+    exec bash "$UNINSTALL_SCRIPT_DIR/instances.sh" remove "$@"
+  fi
+done
+INSTANCE_NAME="${AGENTS_SERVER_INSTANCE:-default}"
+if [[ "$1" == "--managed-instance" ]]; then
+  INSTANCE_NAME="${2:?missing instance name}"
+  shift 2
+fi
+if [[ ! "$INSTANCE_NAME" =~ ^[a-z][a-z0-9-]{0,31}$ ]]; then
+  echo "Invalid instance name." >&2
+  exit 2
+fi
+
 INSTALL_ROOT="${AGENTS_SERVER_INSTALL_DIR:-$HOME/.local/share/agents-server}"
 CONFIG_ROOT="${AGENTS_SERVER_CONFIG_DIR:-$HOME/.config/agents-server}"
 LEGACY_STATE_ROOT="$HOME/.zenithbot-agent"
@@ -14,6 +35,12 @@ else
   STATE_ROOT="$HOME/.agentsdock"
 fi
 SERVICE_NAME="agents-server"
+LABEL="com.agentsdock.server"
+INSTANCE_LOG_DIR="$HOME/Library/Logs/AgentsServer"
+if [[ "$INSTANCE_NAME" != "default" ]]; then
+  instance_bindings="$(bash "$UNINSTALL_SCRIPT_DIR/instances.sh" _bindings "$INSTANCE_NAME")" || exit 2
+  eval "$instance_bindings"
+fi
 OS_NAME="$(uname -s)"
 
 ASSUME_YES="false"
@@ -96,6 +123,12 @@ fi
 usage() {
   cat <<USAGE
 Usage: ./uninstall.sh [--yes] [--purge-state]
+
+With no arguments: show all current-user instances and confirm their count.
+  --instance NAME   Remove only NAME (preview + confirmation).
+  --all             Remove all instances (preview + confirmation).
+  --all --exclude default   Keep the original/default server untouched.
+Legacy --yes without --all remains default-scoped for compatibility.
 
 Stops and removes the AgentsServer user service, versioned release runtime,
 and generated configuration (including the access token). Chat history, jobs,
@@ -213,7 +246,7 @@ fi
 
 case "$OS_NAME" in
   Darwin)
-    LABEL="com.agentsdock.server"
+    LABEL="${LABEL:-com.agentsdock.server}"
     PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
     SERVICE_TARGET="gui/$(id -u)/$LABEL"
     if launchctl print "$SERVICE_TARGET" >/dev/null 2>&1; then
@@ -240,7 +273,7 @@ case "$OS_NAME" in
       echo "Removing $PLIST"
       rm -f "$PLIST"
     fi
-    LOG_DIR="$HOME/Library/Logs/AgentsServer"
+    LOG_DIR="$INSTANCE_LOG_DIR"
     if [[ -d "$LOG_DIR" ]]; then
       echo "Removing $LOG_DIR"
       rm -rf "$LOG_DIR"
@@ -300,7 +333,9 @@ fi
 
 if [[ "$PURGE_STATE" == "true" ]]; then
   if [[ -e "$STATE_ROOT" || -L "$LEGACY_STATE_ROOT" ]]; then
-    [[ ! -L "$LEGACY_STATE_ROOT" ]] || rm -f "$LEGACY_STATE_ROOT"
+    if [[ "$INSTANCE_NAME" == "default" ]]; then
+      [[ ! -L "$LEGACY_STATE_ROOT" ]] || rm -f "$LEGACY_STATE_ROOT"
+    fi
     [[ ! -e "$STATE_ROOT" ]] || rm -rf "$STATE_ROOT"
     echo "Deleted $STATE_ROOT"
   fi

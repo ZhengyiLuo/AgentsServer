@@ -670,15 +670,92 @@ closes new-work admission. A pending reservation survives a manual restart and
 is re-armed after startup. (Releases before 0.1.26-beta.31 parked every new
 turn behind the reservation; that global operator lockout remains gone.)
 
+## Multiple independent servers on one machine
+
+The original `./install.sh` still installs/updates **default**, normally on port
+7850, without migrating its history. The instance manager adds independent
+servers for the same OS user:
+
+```bash
+./instances.sh                          # List names, status, IP addresses and ports
+./instances.sh new                      # instance-1, next available port from 7851
+./instances.sh new --name work          # Choose a name, allocate the port
+./instances.sh new --name work --port 7900
+./instances.sh info work                # URLs, version, service and storage paths
+./instances.sh stop work
+./instances.sh start work
+./instances.sh restart work
+./instances.sh update work              # Install the checkout/release containing this command
+./instances.sh update --all --exclude default
+```
+
+Run these commands from a source checkout or an installed release directory.
+Listing and `info` are read-only and never print access tokens. Connection URLs
+are candidates, not a firewall/reachability guarantee; loopback bindings are
+marked “This machine only.” Add each server's URL and its own token as a separate
+connection in AgentsDock. `./install.sh --instance work --show-token` retrieves
+that instance's token explicitly. No client changes are required.
+
+Each named instance has its own access token, server identity, chats, jobs,
+mailboxes, files, configuration, logs, releases/rollback and tmux socket. A
+registered but stopped server keeps its port reserved. An occupied explicit
+port fails instead of stopping another process. New names cannot overwrite
+existing files or reuse preserved history. Creation failures remain visible
+in the registry so they can be diagnosed or explicitly removed.
+
+| Item | Default | Named `work` |
+| --- | --- | --- |
+| Runtime | `~/.local/share/agents-server` | `~/.local/share/agents-server-instances/work` |
+| Configuration | `~/.config/agents-server` | `~/.config/agents-server-instances/work` |
+| History/state | `~/.agentsdock` | `~/.agentsdock-instances/work` |
+| macOS service | `com.agentsdock.server` | `com.agentsdock.server.work` |
+| Linux user unit | `agents-server.service` | `agents-server-work.service` |
+| tmux socket | `default` | `agents-server-work` |
+
+The private registry is `~/.config/agents-server-manager/instances.json`. It
+contains only names and lifecycle status, never credentials or deletion paths.
+Existing standard installations are discovered without moving their files.
+Nonstandard/custom-root default installations remain supported by the original
+installer; the manager refuses mismatched bindings instead of guessing paths.
+
+For bulk creation, `./instances.sh install --manifest instances.json` accepts
+a JSON array such as `[{"name":"work","port":7851},{"name":"personal"}]`.
+The entire plan is checked first; each installation then reports its own result.
+Previously successful instances are not removed when another installation fails.
+In-app updates keep their exact instance binding and refuse old signed releases
+that lack named-instance support. The development `deploy.sh` is default-only.
+
+These instances do not automatically pair, synchronize or exchange messages.
+They are **not OS-level security sandboxes**: CLI installations, provider logins,
+native provider history, filesystem permissions and working directories may
+still be shared by the same OS user. Importing the same native provider session
+into two instances can still encounter the provider's own session lock. Use
+separate OS users/containers when that stronger isolation is required.
+Optional Team Network hosting remains disabled on new instances. If enabled
+later, its separate secure-peer listener also needs an unused port; its legacy
+default is 7851. The instance manager allocates the main HTTP port, not an
+additional automatically enabled peer listener.
+
 ## Uninstalling AgentsServer
 
 ```bash
 ./uninstall.sh
+# Or select exactly one:
+./uninstall.sh --instance work
+# Remove added instances while keeping the original server:
+./uninstall.sh --all --exclude default
 ```
 
-This stops and removes the user service, the versioned release runtime, and
-generated configuration (including the access token). It prompts before
-making changes unless `--yes` is passed. Chat history, jobs, files, and
+With no arguments, uninstall previews **all** current-user instances: their
+count, names, ports and exact paths. A red warning (on color-capable terminals)
+requires typing `UNINSTALL N` with the matching count before any service is
+removed. Cancellation or non-interactive input makes no service changes.
+`--yes` can skip this service-removal confirmation only when explicitly supplied.
+For compatibility, legacy `./uninstall.sh --yes` remains default-only; bulk
+automation must explicitly use `--all --yes`.
+
+Uninstall removes selected user services, versioned release runtimes, logs, and
+generated configuration (including access tokens). Chat history, jobs, files, and
 terminals under the state directory (`~/.agentsdock` by default) are kept by
 default, so a later `./install.sh` picks the same ordinary AgentsServer history
 back up. Preserved Team Hub state is intentionally not auto-reactivated in this
@@ -690,8 +767,13 @@ interactive exact-path confirmation that `--yes` cannot bypass. Before any
 change, the uninstaller rejects root, home, broad system/user directories,
 path traversal, and overlapping install/configuration/state roots. Like
 `install.sh`, it never invokes a package manager or `sudo`. Persistent chat
-terminal tmux sessions (named `zd_*`) are left running; list them with `tmux
-ls` and remove them yourself if you no longer need them.
+terminal tmux sessions are left running; list default sessions with `tmux ls`
+or named sessions with `tmux -L agents-server-work ls`. Reinstall a preserved
+named history explicitly with `./install.sh --instance work --port 7851`.
+For bulk permanent deletion use `./uninstall.sh --all --purge-state`; it shows
+an irreversible-deletion warning, requires `DELETE HISTORY N`, and then requires
+each exact state path. **There is no undo for purged history.** `--yes` never
+bypasses these checks.
 
 ## Development Deployment Helper
 

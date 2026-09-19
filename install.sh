@@ -65,6 +65,10 @@ else
   STATE_ROOT="$HOME/.agentsdock"
 fi
 SERVICE_NAME="agents-server"
+INSTANCE_NAME="${AGENTS_SERVER_INSTANCE:-default}"
+INSTANCE_EXPLICIT="false"
+LABEL="com.agentsdock.server"
+INSTANCE_LOG_DIR="$HOME/Library/Logs/AgentsServer"
 LEGACY_SERVICE_NAME="zenithbot-agent"
 # AgentsServer's cooperative shutdown has 17 independently bounded cleanup
 # phases in addition to uvicorn's graceful window.  Five seconds was shorter
@@ -142,6 +146,9 @@ usage() {
   cat <<'USAGE'
 Usage: ./install.sh [--port PORT] [--bind ADDRESS] [--release-version VERSION] [--team-hub-host|--reactivate-team-hub-host|--no-team-hub-host] [--team-hub-tailscale-serve-url URL] [--team-hub-direct-ip-url URL] [--non-interactive] [--allow-port-fallback|--no-port-fallback]
 
+--instance NAME updates a named instance (use ./instances.sh new to create one
+with an automatically selected name/port). No arguments retain default setup.
+
 Installs or updates AgentsServer for the current user. Releases and Python
 runtimes are versioned, the previous healthy release is retained for rollback,
 and existing chat state and generated tokens are preserved. No sudo privileges
@@ -185,6 +192,7 @@ SHOW_TOKEN="false"
 
 while (($#)); do
   case "$1" in
+    --instance) INSTANCE_NAME="${2:?--instance requires a name}"; INSTANCE_EXPLICIT="true"; shift 2 ;;
     --port) PORT="${2:-}"; PORT_EXPLICIT="true"; shift 2 ;;
     --bind) BIND_ADDRESS="${2:-}"; BIND_EXPLICIT="true"; shift 2 ;;
     --release-version) RELEASE_VERSION="${2:-}"; shift 2 ;;
@@ -291,6 +299,27 @@ while (($#)); do
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+if [[ ! "$INSTANCE_NAME" =~ ^[a-z][a-z0-9-]{0,31}$ ]]; then
+  echo "Invalid instance name." >&2
+  exit 2
+fi
+if [[ "$INSTANCE_NAME" != "default" || ( "$INSTANCE_EXPLICIT" == "true" && "${AGENTS_SERVER_INSTANCE:-default}" != "default" ) ]]; then
+  INSTANCE_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  instance_bindings="$(bash "$INSTANCE_SCRIPT_DIR/instances.sh" _bindings "$INSTANCE_NAME")" || exit 2
+  eval "$instance_bindings"
+  # Never inherit the default instance's token, Hub designation or history.
+  unset AGENTSDOCK_AGENT_TOKEN ZENITHDOCK_AGENT_TOKEN ZENITHBOT_AGENT_TOKEN
+  export AGENTS_SERVER_INSTANCE="$INSTANCE_NAME"
+  export AGENTS_SERVER_INSTALL_DIR="$INSTALL_ROOT" AGENTS_SERVER_CONFIG_DIR="$CONFIG_ROOT" AGENTSDOCK_STATE_DIR="$STATE_ROOT"
+  [[ -n "${AGENTSDOCK_SERVER_NAME:-}" ]] || export AGENTSDOCK_SERVER_NAME="$INSTANCE_NAME"
+  PORT_FALLBACK="false"
+fi
+export AGENTS_SERVER_INSTANCE="$INSTANCE_NAME"
+if [[ "$INSTANCE_NAME" != "default" && ! -f "$CONFIG_ROOT/env" && "$PORT_EXPLICIT" != "true" && "$SHOW_TOKEN" != "true" ]]; then
+  echo "A new named instance needs --port; use ./instances.sh new for automatic allocation." >&2
+  exit 2
+fi
 
 if [[ "$PORT_FALLBACK" == "auto" ]]; then
   if [[ "$PORT_EXPLICIT" == "true" ]]; then
@@ -1157,7 +1186,7 @@ canonical_team_hub_direct_ipv4_url() {
 
 LEGACY_ENV_FILE=""
 LEGACY_SERVICE_CONTENTS=""
-if [[ -e "$LEGACY_SERVICE_FILE" || -L "$LEGACY_SERVICE_FILE" ]]; then
+if [[ "$INSTANCE_NAME" == "default" && ( -e "$LEGACY_SERVICE_FILE" || -L "$LEGACY_SERVICE_FILE" ) ]]; then
   if ! LEGACY_SERVICE_CONTENTS="$(read_owned_config_file "$LEGACY_SERVICE_FILE")"; then
     echo "$LEGACY_SERVICE_FILE is not a safe regular legacy service file." >&2
     exit 1
@@ -1174,7 +1203,7 @@ if [[ -e "$LEGACY_SERVICE_FILE" || -L "$LEGACY_SERVICE_FILE" ]]; then
     exit 1
   fi
 fi
-if [[ -z "$LEGACY_ENV_FILE" \
+if [[ "$INSTANCE_NAME" == "default" && -z "$LEGACY_ENV_FILE" \
   && ( -e "$HOME/Zenithbot/.env" || -L "$HOME/Zenithbot/.env" ) ]]; then
   LEGACY_ENV_FILE="$HOME/Zenithbot/.env"
 fi
@@ -1224,7 +1253,7 @@ fi
 
 OS_NAME="$(uname -s)"
 SYSTEMD_SERVICE_FILE="$HOME/.config/systemd/user/$SERVICE_NAME.service"
-LABEL="com.agentsdock.server"
+LABEL="${LABEL:-com.agentsdock.server}"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 SERVER_PATH=""
 append_server_path() {
@@ -1525,7 +1554,7 @@ if [[ "$TEAM_HUB_MODE" == "host" && "$TEAM_HUB_OPERATION_PENDING" != "true" ]]; 
   fi
 fi
 
-RELEASE_FILES=(activation_transaction.py agent_server.py team_hub_host.py secure_peer_runtime.py team_mail_runtime.py team_mail_websocket.py team_mail_grants.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py chat_mailbox.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py claude_sdk_client.py claude_background_reconciliation.py codex_app_server.py cursor_agent_client.py opencode_agent_client.py cursor_process_guard.py claude_history_repair.py claude_history_provenance.py codex_history_repair.py public_chat_shares.py public_chat_transcript.py public_chat_share_routes.py install.sh uninstall.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem LICENSE NOTICE)
+RELEASE_FILES=(activation_transaction.py agent_server.py team_hub_host.py secure_peer_runtime.py team_mail_runtime.py team_mail_websocket.py team_mail_grants.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py chat_mailbox.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py claude_sdk_client.py claude_background_reconciliation.py codex_app_server.py cursor_agent_client.py opencode_agent_client.py cursor_process_guard.py claude_history_repair.py claude_history_provenance.py codex_history_repair.py public_chat_shares.py public_chat_transcript.py public_chat_share_routes.py install.sh uninstall.sh instances.sh server_instances.py update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem LICENSE NOTICE)
 RELEASE_DIRECTORIES=(agentsdock_team_hub)
 TEAM_HUB_RELEASE_FILES=(
   __init__.py
@@ -2116,7 +2145,7 @@ backup_runtime_configuration() {
     current_snapshot="${current_snapshot#*|}"
     PRIOR_SERVICE_ENABLED="${current_snapshot%%|*}"
   fi
-  if [[ "$OS_NAME" == "Linux" ]]; then
+  if [[ "$OS_NAME" == "Linux" && "${INSTANCE_NAME:-default}" == "default" ]]; then
     local legacy_exists="false"
     local legacy_snapshot=""
     if [[ -e "$LEGACY_SERVICE_FILE" || -L "$LEGACY_SERVICE_FILE" ]]; then
@@ -3067,8 +3096,9 @@ validate_staged_release_runtime() (
     "$STAGE_DIR/public_chat_transcript.py" \
     "$STAGE_DIR/public_chat_share_routes.py" \
     "$STAGE_DIR/update_runner.py"
+  "$STAGE_DIR/.venv/bin/python" -m py_compile "$STAGE_DIR/server_instances.py"
   "$STAGE_DIR/.venv/bin/python" -m compileall -q "$STAGE_DIR/agentsdock_team_hub"
-  PYTHONPATH="$STAGE_DIR" "$STAGE_DIR/.venv/bin/python" -c 'import agentsdock_team_hub, cursor_agent_client, cursor_process_guard, secure_peer_delivery, secure_peer_runtime, team_mail_runtime, team_mail_websocket, team_mail_grants, team_hub_host, agentsdock_mail, agentsdock_team, claude_history_repair, claude_history_provenance, claude_background_reconciliation, codex_history_repair, public_chat_shares, public_chat_transcript, public_chat_share_routes, chat_mailbox, provider_commands, opencode_agent_client; from agentsdock_team_hub import secure_peer, secure_peer_hub' >/dev/null
+  PYTHONPATH="$STAGE_DIR" "$STAGE_DIR/.venv/bin/python" -c 'import agentsdock_team_hub, cursor_agent_client, cursor_process_guard, secure_peer_delivery, secure_peer_runtime, team_mail_runtime, team_mail_websocket, team_mail_grants, team_hub_host, agentsdock_mail, agentsdock_team, claude_history_repair, claude_history_provenance, claude_background_reconciliation, codex_history_repair, public_chat_shares, public_chat_transcript, public_chat_share_routes, chat_mailbox, provider_commands, opencode_agent_client; import server_instances; from agentsdock_team_hub import secure_peer, secure_peer_hub' >/dev/null
 )
 
 abort_unclaimed_team_hub_reactivation() {
@@ -3355,6 +3385,7 @@ for name in "${TEAM_HUB_RELEASE_FILES[@]}"; do
     "$STAGE_DIR/agentsdock_team_hub/$name"
 done
 chmod 755 "$STAGE_DIR/agent_server.py" "$STAGE_DIR/agentsdock_jobs.py" "$STAGE_DIR/agentsdock_chats.py" "$STAGE_DIR/agentsdock_emergency.py" "$STAGE_DIR/agentsdock_publish.py" "$STAGE_DIR/agentsdock_mail.py" "$STAGE_DIR/agentsdock_team.py" "$STAGE_DIR/install.sh" "$STAGE_DIR/uninstall.sh" "$STAGE_DIR/update_runner.py"
+chmod 755 "$STAGE_DIR/instances.sh"
 
 echo "[2/7] Resolving the release dependencies with uv"
 if run_timed_stage \
@@ -3408,7 +3439,7 @@ write_runtime_env() {
     local filter_status=0
     preserved_contents="$(read_owned_config_file "$PRESERVE_SOURCE")" || return 1
     if printf '%s\n' "$preserved_contents" \
-      | grep -Ev '^(AGENTSDOCK_(STATE_DIR|AGENT_CWD|AGENT_BIND|AGENT_PORT|AGENT_TOKEN|SERVER_NAME|TEAM_HUB_MODE|TEAM_HUB_TRANSPORT|TEAM_HUB_URL|TEAM_HUB_DIRECT_IP_URL|TEAM_HUB_REACTIVATION_HUB_ID|TEAM_HUB_REACTIVATION_OPERATION_ID|TEAM_HUB_REACTIVATION_SNAPSHOT|TEAM_HUB_UPDATE_HUB_ID|TEAM_HUB_UPDATE_OPERATION_ID|TEAM_HUB_UPDATE_SNAPSHOT)|AGENTS_SERVER_(STATE_DIR|INSTALL_DIR)|ZENITHBOT_AGENT_(DIR|CWD|BIND|PORT|TOKEN)|ZENITHDOCK_AGENT_TOKEN|PATH)=' \
+      | grep -Ev '^(AGENTSDOCK_(STATE_DIR|AGENT_CWD|AGENT_BIND|AGENT_PORT|AGENT_TOKEN|SERVER_NAME|TEAM_HUB_MODE|TEAM_HUB_TRANSPORT|TEAM_HUB_URL|TEAM_HUB_DIRECT_IP_URL|TEAM_HUB_REACTIVATION_HUB_ID|TEAM_HUB_REACTIVATION_OPERATION_ID|TEAM_HUB_REACTIVATION_SNAPSHOT|TEAM_HUB_UPDATE_HUB_ID|TEAM_HUB_UPDATE_OPERATION_ID|TEAM_HUB_UPDATE_SNAPSHOT)|AGENTS_SERVER_(STATE_DIR|INSTALL_DIR|CONFIG_DIR|INSTANCE)|ZENITHBOT_AGENT_(DIR|CWD|BIND|PORT|TOKEN)|ZENITHDOCK_AGENT_TOKEN|PATH)=' \
       > "$env_temp"; then
       :
     else
@@ -3434,6 +3465,8 @@ AGENTSDOCK_TEAM_HUB_TRANSPORT=$TEAM_HUB_TRANSPORT
 AGENTSDOCK_TEAM_HUB_URL=$TEAM_HUB_URL
 AGENTSDOCK_TEAM_HUB_DIRECT_IP_URL=$TEAM_HUB_DIRECT_IP_URL
 AGENTS_SERVER_INSTALL_DIR=$INSTALL_ROOT
+AGENTS_SERVER_CONFIG_DIR=$CONFIG_ROOT
+AGENTS_SERVER_INSTANCE=${INSTANCE_NAME:-default}
 PATH=$SERVER_PATH
 EOF
   if ! replace_activation_config env "$env_temp" 600; then
@@ -3582,21 +3615,23 @@ restart_managed_systemd_service_bounded() {
 
 restart_service() {
   if [[ "$OS_NAME" == "Linux" ]]; then
-    local legacy_exists="false"
-    local legacy_snapshot=""
-    [[ -f "$LEGACY_SERVICE_FILE" && ! -L "$LEGACY_SERVICE_FILE" ]] \
-      && legacy_exists="true"
-    if [[ "$PRIOR_LEGACY_SERVICE_STATE" == "absent" ]]; then
-      legacy_snapshot="$(systemd_unit_snapshot \
-        "$LEGACY_SERVICE_NAME.service" "$legacy_exists")" || return 1
-      [[ "${legacy_snapshot%%|*}" == "absent" ]] || return 1
-    else
-      systemctl --user disable --now "$LEGACY_SERVICE_NAME.service" \
-        >/dev/null || return 1
-      legacy_snapshot="$(systemd_unit_snapshot \
-        "$LEGACY_SERVICE_NAME.service" "$legacy_exists")" || return 1
-      [[ "${legacy_snapshot%%|*}" == "stopped" \
-        && "${legacy_snapshot#*|}" == "false|"* ]] || return 1
+    if [[ "${INSTANCE_NAME:-default}" == "default" ]]; then
+      local legacy_exists="false"
+      local legacy_snapshot=""
+      [[ -f "$LEGACY_SERVICE_FILE" && ! -L "$LEGACY_SERVICE_FILE" ]] \
+        && legacy_exists="true"
+      if [[ "$PRIOR_LEGACY_SERVICE_STATE" == "absent" ]]; then
+        legacy_snapshot="$(systemd_unit_snapshot \
+          "$LEGACY_SERVICE_NAME.service" "$legacy_exists")" || return 1
+        [[ "${legacy_snapshot%%|*}" == "absent" ]] || return 1
+      else
+        systemctl --user disable --now "$LEGACY_SERVICE_NAME.service" \
+          >/dev/null || return 1
+        legacy_snapshot="$(systemd_unit_snapshot \
+          "$LEGACY_SERVICE_NAME.service" "$legacy_exists")" || return 1
+        [[ "${legacy_snapshot%%|*}" == "stopped" \
+          && "${legacy_snapshot#*|}" == "false|"* ]] || return 1
+      fi
     fi
     systemctl --user daemon-reload || return
     systemctl --user enable "$SERVICE_NAME.service" >/dev/null || return
@@ -3879,19 +3914,21 @@ restore_prior_service_state() {
         [[ "$PRIOR_SERVICE_STATE" == "absent" ]] || return 1
       }
     fi
-    if [[ "$PRIOR_LEGACY_SERVICE_ENABLED" == "true" ]]; then
-      systemctl --user enable "$LEGACY_SERVICE_NAME.service" >/dev/null || return 1
-    elif [[ "$PRIOR_LEGACY_SERVICE_STATE" == "absent" ]]; then
-      systemctl --user disable "$LEGACY_SERVICE_NAME.service" >/dev/null 2>&1 || true
-    else
-      systemctl --user disable "$LEGACY_SERVICE_NAME.service" >/dev/null || return 1
-    fi
-    if [[ "$PRIOR_LEGACY_SERVICE_STATE" == "running" ]]; then
-      systemctl --user start "$LEGACY_SERVICE_NAME.service" || return 1
-    else
-      systemctl --user stop "$LEGACY_SERVICE_NAME.service" >/dev/null 2>&1 || {
-        [[ "$PRIOR_LEGACY_SERVICE_STATE" == "absent" ]] || return 1
-      }
+    if [[ "${INSTANCE_NAME:-default}" == "default" ]]; then
+      if [[ "$PRIOR_LEGACY_SERVICE_ENABLED" == "true" ]]; then
+        systemctl --user enable "$LEGACY_SERVICE_NAME.service" >/dev/null || return 1
+      elif [[ "$PRIOR_LEGACY_SERVICE_STATE" == "absent" ]]; then
+        systemctl --user disable "$LEGACY_SERVICE_NAME.service" >/dev/null 2>&1 || true
+      else
+        systemctl --user disable "$LEGACY_SERVICE_NAME.service" >/dev/null || return 1
+      fi
+      if [[ "$PRIOR_LEGACY_SERVICE_STATE" == "running" ]]; then
+        systemctl --user start "$LEGACY_SERVICE_NAME.service" || return 1
+      else
+        systemctl --user stop "$LEGACY_SERVICE_NAME.service" >/dev/null 2>&1 || {
+          [[ "$PRIOR_LEGACY_SERVICE_STATE" == "absent" ]] || return 1
+        }
+      fi
     fi
     local current_exists="false"
     local legacy_exists="false"
@@ -3907,7 +3944,7 @@ restore_prior_service_state() {
         && "${observed_snapshot#*|}" == "$PRIOR_SERVICE_ENABLED|"* ]] \
         || return 1
     fi
-    if [[ "$PRIOR_LEGACY_SERVICE_STATE" != "running" ]]; then
+    if [[ "${INSTANCE_NAME:-default}" == "default" && "$PRIOR_LEGACY_SERVICE_STATE" != "running" ]]; then
       observed_snapshot="$(systemd_unit_snapshot \
         "$LEGACY_SERVICE_NAME.service" "$legacy_exists")" || return 1
       [[ "${observed_snapshot%%|*}" == "$PRIOR_LEGACY_SERVICE_STATE" \
@@ -4062,7 +4099,7 @@ write_service_files() {
   if [[ "$OS_NAME" == "Linux" ]]; then
     USER_SERVICE_DIR="$HOME/.config/systemd/user"
     mkdir -p "$USER_SERVICE_DIR"
-    service_temp="$USER_SERVICE_DIR/.agents-server.service.activation-$ACTIVATION_TRANSACTION_ID-service.source"
+    service_temp="$USER_SERVICE_DIR/.$SERVICE_NAME.service.activation-$ACTIVATION_TRANSACTION_ID-service.source"
     (umask 077; set -o noclobber; : > "$service_temp") 2>/dev/null || return 1
     chmod 600 "$service_temp" || return 1
     cat > "$service_temp" <<EOF
@@ -4096,8 +4133,9 @@ EOF
     SERVICE_KIND="systemd-user"
   elif [[ "$OS_NAME" == "Darwin" ]]; then
     LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
-    mkdir -p "$LAUNCH_AGENTS" "$HOME/Library/Logs/AgentsServer"
-    service_temp="$LAUNCH_AGENTS/.com.agentsdock.server.plist.activation-$ACTIVATION_TRANSACTION_ID-service.source"
+    local instance_log_dir="${INSTANCE_LOG_DIR:-$HOME/Library/Logs/AgentsServer}"
+    mkdir -p "$LAUNCH_AGENTS" "$instance_log_dir"
+    service_temp="$LAUNCH_AGENTS/.$LABEL.plist.activation-$ACTIVATION_TRANSACTION_ID-service.source"
     (umask 077; set -o noclobber; : > "$service_temp") 2>/dev/null || return 1
     chmod 600 "$service_temp" || return 1
     local launchd_server_name_entry=""
@@ -4130,11 +4168,13 @@ $launchd_server_name_entry
     <key>AGENTSDOCK_TEAM_HUB_URL</key><string>$TEAM_HUB_URL</string>
     <key>AGENTSDOCK_TEAM_HUB_DIRECT_IP_URL</key><string>$TEAM_HUB_DIRECT_IP_URL</string>
     <key>AGENTS_SERVER_INSTALL_DIR</key><string>$INSTALL_ROOT</string>
+    <key>AGENTS_SERVER_CONFIG_DIR</key><string>$CONFIG_ROOT</string>
+    <key>AGENTS_SERVER_INSTANCE</key><string>${INSTANCE_NAME:-default}</string>
     <key>PATH</key><string>$SERVER_PATH</string>
   </dict>
   <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>$HOME/Library/Logs/AgentsServer/server.log</string>
-  <key>StandardErrorPath</key><string>$HOME/Library/Logs/AgentsServer/server-error.log</string>
+  <key>StandardOutPath</key><string>$instance_log_dir/server.log</string>
+  <key>StandardErrorPath</key><string>$instance_log_dir/server-error.log</string>
 </dict></plist>
 EOF
     if ! replace_activation_config service "$service_temp" 600; then
@@ -4267,7 +4307,8 @@ service_manager_owns_listener() {
   if [[ "$OS_NAME" == "Darwin" ]]; then
     services=("$LABEL")
   else
-    services=("$SERVICE_NAME" "${LEGACY_SERVICE_NAME:-}")
+    services=("$SERVICE_NAME")
+    [[ "${INSTANCE_NAME:-default}" != "default" ]] || services+=("${LEGACY_SERVICE_NAME:-}")
   fi
   for service in "${services[@]}"; do
     [[ -n "$service" ]] || continue
@@ -4305,7 +4346,8 @@ pinned_managed_http_get() {
   if [[ "$OS_NAME" == "Darwin" ]]; then
     services=("$LABEL")
   else
-    services=("$SERVICE_NAME" "${LEGACY_SERVICE_NAME:-}")
+    services=("$SERVICE_NAME")
+    [[ "${INSTANCE_NAME:-default}" != "default" ]] || services+=("${LEGACY_SERVICE_NAME:-}")
   fi
   for service in "${services[@]}"; do
     [[ -n "$service" ]] || continue

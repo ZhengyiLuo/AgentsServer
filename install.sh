@@ -154,8 +154,8 @@ runtimes are versioned, the previous healthy release is retained for rollback,
 and existing chat state and generated tokens are preserved. No sudo privileges
 are required.
 
---non-interactive skips the optional tmux install prompt on macOS instead of
-asking; use it for unattended/SSH-driven runs.
+--non-interactive skips optional prompts (including clipboard copy); use it for
+unattended/SSH-driven runs.
 
 --port pins the exact requested port unless --allow-port-fallback is also set.
 Without --port, setup may select one of the next 5 ports when the default is
@@ -184,7 +184,8 @@ never silently reactivates preserved state. Without an explicit host option, an
 existing host/disabled setting is preserved; new installs default to disabled.
 
 --show-token prints the current access token for an already-installed
-AgentsServer and exits immediately; it makes no other changes.
+AgentsServer without reinstalling or restarting. Interactive terminals offer
+optional clipboard copy; redirected output remains just the raw token.
 USAGE
 }
 
@@ -1242,9 +1243,55 @@ find_existing_token() {
   return 1
 }
 
+interactive_token_output() {
+  [[ "$NON_INTERACTIVE" != "true" && -t 0 && -t 1 && -z "$EXPECTED_SERVER_IDENTITY" ]]
+}
+
+print_token_for_copy() {
+  local access_token="$1"
+  local copy_reply=""
+  local clipboard_command=()
+  printf '\nAccess token (%s):\n%s\n\n' "$INSTANCE_NAME" "$access_token"
+  # A remote clipboard is not the user's local clipboard. Do not emit OSC 52
+  # sequences or attempt to modify a remote desktop's clipboard over SSH.
+  if [[ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}${SSH_TTY:-}" ]]; then
+    printf '%s\n' 'Clipboard copy is unavailable over SSH; copy the token line above manually.'
+    return 0
+  fi
+  if [[ "$(uname -s)" == "Darwin" ]] && command -v pbcopy >/dev/null 2>&1; then
+    clipboard_command=(pbcopy)
+  elif [[ -n "${WAYLAND_DISPLAY:-}" ]] && command -v wl-copy >/dev/null 2>&1; then
+    clipboard_command=(wl-copy)
+  elif [[ -n "${DISPLAY:-}" ]] && command -v xclip >/dev/null 2>&1; then
+    clipboard_command=(xclip -selection clipboard)
+  elif [[ -n "${DISPLAY:-}" ]] && command -v xsel >/dev/null 2>&1; then
+    clipboard_command=(xsel --clipboard --input)
+  fi
+  if ((${#clipboard_command[@]} == 0)); then
+    printf '%s\n' 'Clipboard copy is unavailable here; copy the token line above manually.'
+    return 0
+  fi
+  read -r -p "Copy token to this machine's clipboard? [y/N] " copy_reply || return 0
+  case "$copy_reply" in
+    y|Y|[yY][eE][sS]) ;;
+    *) return 0 ;;
+  esac
+  # Pass the credential via stdin, never an external process's argv. Optional
+  # clipboard failures must not turn a successful installation into a failure.
+  if printf '%s' "$access_token" | "${clipboard_command[@]}" >/dev/null 2>&1; then
+    printf '%s\n' 'Copied to your clipboard.'
+  else
+    printf '%s\n' 'Could not copy to the clipboard; copy the token line above manually.'
+  fi
+}
+
 if [[ "$SHOW_TOKEN" == "true" ]]; then
   if TOKEN_TO_SHOW="$(find_existing_token)"; then
-    printf '%s\n' "$TOKEN_TO_SHOW"
+    if interactive_token_output; then
+      print_token_for_copy "$TOKEN_TO_SHOW"
+    else
+      printf '%s\n' "$TOKEN_TO_SHOW"
+    fi
     exit 0
   fi
   echo "No AgentsServer access token found at $ENV_FILE. Run install.sh first." >&2
@@ -6347,4 +6394,7 @@ echo
 if [[ -z "$EXPECTED_SERVER_IDENTITY" ]]; then
   printf 'AGENTSDOCK_SETUP_RESULT={"server_url":"%s","access_token":"%s","service":"%s","tailscale_ip":"%s","server_version":"%s"}\n' \
     "$SERVER_URL" "$TOKEN" "$SERVICE_KIND" "$TAILSCALE_IP" "$RELEASE_VERSION"
+  if interactive_token_output; then
+    print_token_for_copy "$TOKEN"
+  fi
 fi

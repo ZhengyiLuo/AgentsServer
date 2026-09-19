@@ -556,7 +556,11 @@ def confirm_removal(instances: list[Instance], purge: bool, yes: bool) -> None:
 def install_instance(instance: Instance, port: int, bind: str):
     validate_binding(instance)
     command = ["/bin/bash", str(ROOT / "install.sh"), "--instance", instance.name,
-               "--non-interactive", "--no-port-fallback", "--port", str(port), "--bind", bind]
+               "--no-port-fallback", "--port", str(port), "--bind", bind]
+    # Local terminal users get the installer's optional token-copy prompt;
+    # redirected/app-driven installs retain the unattended contract.
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        command.append("--non-interactive")
     run(command, env=clean_environment(instance), cwd=ROOT)
 
 

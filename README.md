@@ -493,14 +493,22 @@ or `X-AgentsDock-Token`. The legacy `X-ZenithDock-Token` header remains
 accepted for existing clients.
 Leave the variable unset only for trusted local development.
 
-`install.sh` prints the generated token once, at the end of setup. To see it
-again later without reinstalling anything:
+`install.sh` includes the token in its setup result for app integration. In an
+interactive terminal it also prints an `Access token (instance-name):` label,
+then the complete token on its own line, and offers to copy it to the clipboard
+after you answer `yes` (default: no). To see it again without reinstalling:
 
 ```bash
 ./install.sh --show-token
 ```
 
-This only reads the existing configuration and exits; it makes no changes.
+This reads the existing configuration; it does not install, restart, or change
+the server. Clipboard contents change only if you explicitly accept the prompt.
+macOS uses `pbcopy`; Linux uses an already available `wl-copy`, `xclip`, or `xsel`
+with a desktop session. Nothing is installed for clipboard support. Over SSH,
+copy the displayed line manually; a server cannot directly copy to your phone
+or laptop clipboard. `--non-interactive` skips prompts, and redirected
+`--show-token` output remains just the raw token for scripts.
 
 ## Managed server restart
 

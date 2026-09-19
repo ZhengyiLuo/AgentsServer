@@ -737,11 +737,30 @@ Previously successful instances are not removed when another installation fails.
 In-app updates keep their exact instance binding and refuse old signed releases
 that lack named-instance support. The development `deploy.sh` is default-only.
 
+Import Chat hides Claude/Codex conversations already used by any installed
+AgentsServer instance for the same OS user on this machine, including the
+original/default server and stopped instances. Archived AgentsDock chats and
+parked provider IDs still count as in use; removed instances with only preserved
+history do not. Filtering happens before the result limit and is refreshed on
+each scan. This is a read-only check of saved session indexes, not transcript
+sharing or a connection to another server. An unreadable/unsafe index blocks
+import discovery with a retryable error rather than silently allowing duplicates.
+
+Bulk import and manual Resume by session ID recheck other instances before
+creating a chat. Updated servers serialize imports until their index writes
+finish; an overlapping import returns a retryable busy error. All participating
+servers need this version for two-way filtering and simultaneous-import
+protection. An updated server can still read an older server's saved index
+without updating or restarting it. Existing duplicate chats are not removed.
+Unregistered custom servers, other OS users and remote machines are outside this
+check; managed custom default state paths must remain within the user's home.
+
 These instances do not automatically pair, synchronize or exchange messages.
 They are **not OS-level security sandboxes**: CLI installations, provider logins,
 native provider history, filesystem permissions and working directories may
-still be shared by the same OS user. Importing the same native provider session
-into two instances can still encounter the provider's own session lock. Use
+still be shared by the same OS user. Existing duplicate imports or using a native
+provider session concurrently in a terminal can still encounter that provider's
+own session lock. The import check is not a provider-runtime lock. Use
 separate OS users/containers when that stronger isolation is required.
 Optional Team Network hosting remains disabled on new instances. If enabled
 later, its separate secure-peer listener also needs an unused port; its legacy

@@ -28,6 +28,27 @@ still work. `./instances.sh update local-test` reinstalls the code from the
 checkout containing that command; it does not fetch a newer release. The normal
 in-app signed updater is still the route for published-version upgrades.
 
+## Import exclusion across instances
+
+Open Import Chat in the new instance. Conversations already present in another
+installed instance on this machine should be absent, including archived chats
+and chats in stopped services. No other instance's transcripts, configuration,
+or history are modified. A fresh chat without a provider ID needs no cross-
+instance scan. This only covers installed/discoverable instances for this OS user.
+
+For a safe two-way test, use two disposable named instances running this branch,
+not the default server. Import one unused provider conversation into test A,
+then refresh Import Chat on test B: that conversation should disappear. A stale
+selection or manually pasting its ID on B must be rejected as already in use.
+Restart or stop A: its conversation must remain excluded on B. Delete the test
+wrapper on A (not its native transcript) or uninstall A while preserving history:
+the conversation becomes available after refreshing B.
+
+The old default server does not need restarting for a new server to exclude its
+saved chats. However, an old server's own picker will not gain the new behavior
+until updated. Simultaneous-import protection requires both servers to run the
+new code. Existing duplicates are left untouched.
+
 To remove **only the new test service**, preserving its history:
 
 ```bash
@@ -57,9 +78,14 @@ release-manifest and terminal suites provide backward-compatibility checks.
 The complete existing installer suite includes longer Team Hub recovery cases;
 passing the focused tests is not a claim that the entire repository suite ran.
 
+`tests/test_cross_instance_import.py` covers ownership filtering, stale/manual
+imports, parked IDs, stopped/removed instances, unsafe indexes and cancellation
+using synthetic homes only.
+
 An opt-in real-process smoke test starts two servers with temporary HOME/config/
 state and ephemeral loopback ports. It verifies distinct identities, token
-rejection across servers, state-lock rejection, and independent shutdown:
+rejection across servers, state-lock rejection, independent shutdown, two-way
+import exclusion and concurrent imports committing to only one server:
 
 ```bash
 AGENTSDOCK_RUN_INSTANCE_SMOKE=1 PYTHONDONTWRITEBYTECODE=1 \

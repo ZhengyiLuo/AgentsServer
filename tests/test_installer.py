@@ -2707,6 +2707,7 @@ FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
 
             self.assertNotEqual(result.returncode, 0)
             self.assertNotIn("Selecting port", result.stderr)
+            self.assertNotIn("Your new service is up!", result.stdout)
             self.assertTrue((install_root / "current" / "runtime-marker").is_file())
 
     def test_team_hub_mode_is_persisted_and_exact_health_is_required(self):
@@ -5926,6 +5927,9 @@ chmod 755 "$project/.venv/bin/python"
             self.assertEqual(peer_identity.read_text(), "preserve-secure-peer-identity\n")
             self.assertIn("Preserved chat history", result.stdout)
             self.assertIn("secure-peer credentials", result.stdout)
+            self.assertNotIn("\033[", result.stdout)
+            self.assertTrue(result.stdout.endswith("\n\nSuccessful!\n"))
+            self.assertEqual(result.stdout.count("Successful!"), 1)
 
     def test_uninstall_purge_state_requires_interactive_exact_confirmation(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -5950,6 +5954,18 @@ chmod 755 "$project/.venv/bin/python"
                 self.snapshot_trees(install_root, config_root, state_root, service_file),
                 before,
             )
+
+    def test_internal_name_release_flag_cannot_target_default_or_standalone(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            _, _, install_root, config_root, state_root, service_file, environment = self.fake_linux_uninstall_environment(root)
+            before = self.snapshot_trees(install_root, config_root, state_root, service_file)
+            for args in (["--yes", "--managed-release-name"], ["--managed-instance", "default", "--yes", "--managed-release-name"]):
+                with self.subTest(args=args):
+                    result = subprocess.run(["/bin/bash", str(UNINSTALLER), *args], env=environment, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("only for a confirmed named-instance", result.stderr)
+                    self.assertEqual(self.snapshot_trees(install_root, config_root, state_root, service_file), before)
 
     def test_uninstall_refuses_broad_and_overlapping_managed_roots(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -6047,6 +6063,7 @@ chmod 755 "$project/.venv/bin/python"
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Could not stop agents-server.service; no files were removed", result.stderr)
+            self.assertNotIn("Successful!", result.stdout)
             self.assertEqual(
                 self.snapshot_trees(install_root, config_root, state_root, service_file),
                 before,

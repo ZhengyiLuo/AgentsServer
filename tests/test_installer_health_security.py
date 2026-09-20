@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -66,7 +67,7 @@ class InstallerHealthSecurityTests(unittest.TestCase):
         cls.installer_source = source
         cls.advertised_url_fragment = _between(
             source,
-            'TAILSCALE_IP=""',
+            "setup_network_summary() {",
             'echo "[7/7] AgentsServer',
         )
 
@@ -585,7 +586,9 @@ health_check_once 7850
     def test_advertised_server_url_is_reachable_from_the_selected_bind(self) -> None:
         cases = (
             ("127.0.0.1", "http://127.0.0.1:7850"),
+            ("localhost", "http://127.0.0.1:7850"),
             ("192.0.2.50", "http://192.0.2.50:7850"),
+            ("100.64.0.9", "http://100.64.0.9:7850"),
             ("0.0.0.0", "http://100.64.0.9:7850"),
         )
         for bind_address, expected in cases:
@@ -593,27 +596,40 @@ health_check_once 7850
                 root = Path(temporary)
                 fake_bin = root / "bin"
                 fake_bin.mkdir()
+                runtime = root / "current"
+                (runtime / ".venv" / "bin").mkdir(parents=True)
+                (runtime / ".venv" / "bin" / "python").symlink_to(sys.executable)
+                (runtime / "server_instances.py").symlink_to(ROOT / "server_instances.py")
+                # Exercise the shipped helper with fake network-status commands.
+                _write_executable(fake_bin / "hostname", "#!/bin/sh\nexit 0\n")
+                _write_executable(fake_bin / "ifconfig", "#!/bin/sh\nexit 0\n")
                 _write_executable(
                     fake_bin / "tailscale",
                     """#!/bin/sh
-if [ "${1:-}" = ip ] && [ "${2:-}" = -4 ]; then
-  printf '%s\\n' 100.64.0.9
-fi
+[ "${1:-}" = status ] && [ "${2:-}" = --json ] || exit 1
+printf '%s\\n' '{"BackendState":"Running","Self":{"Online":true},"TailscaleIPs":["100.64.0.9"]}'
 """,
                 )
                 script = f"""
+set -eu
 BIND_ADDRESS={bind_address}
 PORT=7850
+CURRENT_LINK={shlex.quote(str(runtime))}
 {self.address_functions}
 {self.advertised_url_fragment}
 printf '%s\\n' "$SERVER_URL"
 """
                 result = subprocess.run(
                     ["/bin/bash", "-c", script],
-                    env={**os.environ, "PATH": f"{fake_bin}:/usr/bin:/bin"},
+                    env={
+                        "HOME": str(root),
+                        "PATH": f"{fake_bin}:/usr/bin:/bin",
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                    },
                     capture_output=True,
                     text=True,
                     check=False,
+                    timeout=10,
                 )
 
                 self.assertEqual(result.returncode, 0, result.stderr)

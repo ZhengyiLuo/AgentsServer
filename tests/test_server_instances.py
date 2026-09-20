@@ -476,6 +476,75 @@ class InstanceTests(unittest.TestCase):
         self.assertEqual(output.count("Successful!"), 1)
         self.assertTrue(output.endswith("\n\nSuccessful!\n"))
 
+    def test_uninstall_release_question_defaults_to_keep_and_accepts_only_yes(self):
+        for answer, expected in (("y", True), ("YES", True), (" Yes ", True), ("", False), ("n", False), ("no", False), ("yep", False), (EOFError(), False)):
+            with self.subTest(answer=answer), contextlib.redirect_stdout(io.StringIO()) as output, patch("sys.stdin.isatty", return_value=True), patch("builtins.input", **({"side_effect": answer} if isinstance(answer, EOFError) else {"return_value": answer})):
+                self.assertEqual(instances.confirm_uninstalled_name_release(self.work), expected)
+                self.assertIn("cannot be undone", output.getvalue())
+                self.assertIn(str(self.work.state), output.getvalue())
+                self.assertIn("earlier backups", output.getvalue())
+        with patch("sys.stdin.isatty", return_value=False), patch("builtins.input") as prompt:
+            self.assertFalse(instances.confirm_uninstalled_name_release(self.work))
+        prompt.assert_not_called()
+
+    def test_uninstall_yes_automation_does_not_authorize_name_release(self):
+        self.configured(self.work)
+        with patch("sys.stdin.isatty", return_value=True):
+            code, _, errors, mocks = self.cli("remove", "work", "--yes", run={}, confirm_uninstalled_name_release={}, purge_uninstalled_name={})
+        self.assertEqual(code, 0, errors)
+        mocks["confirm_uninstalled_name_release"].assert_not_called()
+        mocks["purge_uninstalled_name"].assert_not_called()
+
+    def test_failed_uninstall_never_offers_name_release(self):
+        self.configured(self.work)
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="uninstall work"):
+            code, output, _, mocks = self.cli("remove", "work", run={"side_effect": ValueError("cannot stop")}, confirm_uninstalled_name_release={}, purge_uninstalled_name={})
+        self.assertEqual(code, 1)
+        mocks["confirm_uninstalled_name_release"].assert_not_called()
+        mocks["purge_uninstalled_name"].assert_not_called()
+        self.assertNotIn("Successful!", output)
+
+    def test_bulk_uninstall_release_is_per_name_and_never_offered_for_default(self):
+        self.configured(self.default)
+        self.configured(self.work)
+        other = instances.Instance("other", self.home)
+        self.configured(other, 7853)
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="uninstall default other work"):
+            code, _, errors, mocks = self.cli("remove", "--all", run={}, confirm_uninstalled_name_release={"side_effect": [True, False]}, purge_uninstalled_name={})
+        self.assertEqual(code, 0, errors)
+        self.assertEqual([call.args[0].name for call in mocks["confirm_uninstalled_name_release"].call_args_list], ["other", "work"])
+        mocks["purge_uninstalled_name"].assert_called_once_with(other, self.registry)
+
+    def test_name_release_refuses_active_state_and_keeps_registry(self):
+        self.removed_history()
+        with self.registry.locked(), instances.exclusive_lock(self.work.state / ".server-process.lock"), patch.object(instances, "service_status", return_value="stopped"):
+            with self.assertRaisesRegex(ValueError, "Another process owns"):
+                instances.purge_uninstalled_name(self.work, self.registry)
+        self.assertEqual((self.work.state / "sessions.json").read_text(), "old imported chat index")
+        self.assertEqual(self.registry.records()["work"]["status"], "removed")
+
+    def test_name_release_refuses_default_installed_or_symlink_state(self):
+        self.configured(self.default, 7850)
+        self.configured(self.work)
+        before = self.snapshot(self.default)
+        with self.registry.locked(), patch.object(instances, "service_status", return_value="stopped"):
+            for item in (self.default, self.work):
+                with self.subTest(name=item.name), self.assertRaises(ValueError):
+                    instances.purge_uninstalled_name(item, self.registry)
+            unsafe = instances.Instance("unsafe", self.home)
+            unsafe.state.symlink_to(self.default.state)
+            with self.assertRaisesRegex(ValueError, "Unsafe managed path"):
+                instances.purge_uninstalled_name(unsafe, self.registry)
+        self.assertEqual(self.snapshot(self.default), before)
+
+    def test_name_release_delete_failure_keeps_name_reserved(self):
+        self.removed_history()
+        with self.registry.locked(), patch.object(instances, "service_status", return_value="stopped"), patch.object(instances.shutil, "rmtree", side_effect=OSError("fixture failure")):
+            with self.assertRaises(OSError):
+                instances.purge_uninstalled_name(self.work, self.registry)
+        self.assertIn("work", self.registry.records())
+        self.assertTrue((self.work.state / "sessions.json").exists())
+
     def test_bulk_remove_requires_interactive_confirmation(self):
         self.configured(self.work)
         with patch("sys.stdin.isatty", return_value=False):
@@ -590,7 +659,28 @@ class InstanceTests(unittest.TestCase):
         self.assertNotIn("\033[", output)
         self.assertTrue(output.endswith("\n\nSuccessful!\n"))
 
-    def check_named_uninstaller_output(self, *, terminal=False, extra_env=None):
+    def test_uninstall_release_yes_deletes_only_named_state_and_frees_name(self):
+        output = self.check_named_uninstaller_output(release_answer="y")
+        self.assertIn("Released name 'work'", output)
+        self.assertFalse(self.work.state.exists())
+        self.assertNotIn("work", self.registry.records())
+        with patch("builtins.input") as prompt:
+            code, _, errors, _ = self.cli("new", "--name", "work", "--port", "7851", install_instance={}, port_available={"return_value": True})
+        self.assertEqual(code, 0, errors)
+        prompt.assert_not_called()
+
+    def test_uninstall_release_no_keeps_named_history_and_name(self):
+        output = self.check_named_uninstaller_output(release_answer="n")
+        self.assertIn("Kept name 'work' and its saved data.", output)
+        self.assertTrue((self.work.state / "sessions.json").exists())
+        self.assertEqual(self.registry.records()["work"]["status"], "removed")
+
+    def test_uninstall_release_enter_keeps_named_history_and_name(self):
+        output = self.check_named_uninstaller_output(release_answer="")
+        self.assertIn("Kept name 'work' and its saved data.", output)
+        self.assertTrue((self.work.state / "sessions.json").exists())
+
+    def check_named_uninstaller_output(self, *, terminal=False, extra_env=None, release_answer=None):
         # All destructive commands target this test's temporary home; launchd
         # is stubbed. Run the actual manager + child to check color propagation
         # and ensure they do not both emit a success footer.
@@ -600,6 +690,13 @@ class InstanceTests(unittest.TestCase):
         (self.default.logs / "server.log").write_text("default log stays")
         self.work.logs.mkdir(parents=True)
         (self.work.logs / "server.log").write_text("named log")
+        native = self.home / ".claude/projects/synthetic.jsonl"
+        native.parent.mkdir(parents=True)
+        native.write_text("keep provider transcript")
+        (self.work.state / "native-link").symlink_to(native)
+        backup = self.registry.root / "history-backups/work-earlier/state/upload.txt"
+        backup.parent.mkdir(parents=True)
+        backup.write_text("keep earlier backup")
         legacy = self.home / ".zenithbot-agent"
         legacy.symlink_to(self.default.state)
         fake_bin = self.home / "bin"
@@ -616,7 +713,28 @@ class InstanceTests(unittest.TestCase):
         env.pop("NO_COLOR", None)
         env.update(extra_env or {})
         command = ["/bin/bash", str(ROOT / "uninstall.sh"), "--instance", "work", "--yes"]
-        if terminal:
+        if release_answer is not None:
+            child_output = []
+
+            def run_child(command, **kwargs):
+                result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=30, **kwargs)
+                child_output.append(result.stdout)
+                return result
+
+            def answer(prompt):
+                if prompt.startswith("Type "):
+                    return "uninstall work"
+                self.assertFalse(self.work.service_file("darwin").exists())
+                self.assertFalse(self.work.runtime.exists())
+                self.assertFalse(self.work.config.exists())
+                self.assertEqual(prompt, "Release 'work' and delete its saved data? [y/N] ")
+                return release_answer
+
+            with patch.dict(os.environ, env, clear=True), patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=answer):
+                code, output, errors, _ = self.cli("remove", "work", run={"side_effect": run_child})
+            self.assertEqual(code, 0, errors)
+            output = "".join(child_output) + output
+        elif terminal:
             from tests.test_installer_token_output import TokenOutputTests
             output = TokenOutputTests().run_terminal("exec " + shlex.join(command), environment=env)
         else:
@@ -627,7 +745,9 @@ class InstanceTests(unittest.TestCase):
         self.assertEqual(self.default.service_file("darwin").read_bytes(), service_before)
         self.assertEqual((self.default.logs / "server.log").read_text(), "default log stays")
         self.assertTrue(legacy.is_symlink())
-        self.assertTrue((self.work.state / "sessions.json").exists())
+        self.assertEqual((self.work.state / "sessions.json").exists(), release_answer != "y")
+        self.assertEqual(native.read_text(), "keep provider transcript")
+        self.assertEqual(backup.read_text(), "keep earlier backup")
         self.assertFalse(self.work.runtime.exists())
         self.assertFalse(self.work.config.exists())
         self.assertFalse(self.work.service_file("darwin").exists())

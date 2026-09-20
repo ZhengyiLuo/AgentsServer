@@ -221,6 +221,14 @@ class Registry:
                 raise ValueError("Invalid saved instance port.")
             record["port"] = port
         records[instance.name] = record
+        self._write(records)
+
+    def forget(self, instance: Instance):
+        records = self.records()
+        records.pop(instance.name, None)
+        self._write(records)
+
+    def _write(self, records: dict):
         fd, name = tempfile.mkstemp(prefix=".instances-", dir=self.root)
         try:
             with os.fdopen(fd, "w") as handle:
@@ -559,6 +567,8 @@ def confirm_removal(instances: list[Instance], purge: bool, yes: bool) -> None:
         print(terminal_color("PERMANENT HISTORY DELETION CANNOT BE UNDONE. --yes cannot bypass confirmation.", "1;31"))
     else:
         print("Chat history and files are preserved. Service removal is reinstallable; deleted configuration is not restored automatically.")
+        if not yes and any(instance.name != "default" for instance in instances):
+            print("After uninstall, each named instance offers a separate choice to release its name and delete its saved data.")
     target_names = " ".join(instance.name for instance in instances)
     expected = f"{'delete history' if purge else 'uninstall'} {target_names}"
     if purge or not yes:
@@ -620,6 +630,32 @@ def release_instance_name(instance: Instance, registry: Registry) -> Path | None
         instance.state.rename(destination)
     print(terminal_color(f"Preserved old instance data in: {destination}", "32"), flush=True)
     return destination
+
+
+def confirm_uninstalled_name_release(instance: Instance) -> bool:
+    if not sys.stdin.isatty():
+        return False
+    print(f"\nService {instance.name!r} has been uninstalled. Do you want to release the name as well?")
+    print(terminal_color(f"This permanently deletes this instance's AgentsDock history, uploads, jobs and credentials at {instance.state}, and frees its name.", "31"))
+    print("Original provider chats, project files, earlier backups and independent terminal sessions are kept.")
+    print(terminal_color("This deletion cannot be undone. Enter keeps the name and saved data.", "1;31"))
+    try:
+        return input(f"Release {instance.name!r} and delete its saved data? [y/N] ").strip().lower() in {"y", "yes"}
+    except EOFError:
+        return False
+
+
+def purge_uninstalled_name(instance: Instance, registry: Registry) -> None:
+    # Called only after a successful uninstall and separate affirmative answer.
+    # Derive the exact root from the validated name, never a registry path.
+    validate_released_instance(instance)
+    if instance.state.exists():
+        with exclusive_lock(instance.state / ".server-process.lock"):
+            validate_released_instance(instance)
+            shutil.rmtree(instance.state)  # Does not follow child symlinks.
+        print(terminal_color(f"Deleted {instance.state}", "31"), flush=True)
+    registry.forget(instance)
+    print(terminal_color(f"Released name {instance.name!r}; it can be used for a new instance.", "32"), flush=True)
 
 
 def control(instance: Instance, action: str, platform: str = sys.platform):
@@ -797,6 +833,13 @@ def main(argv: list[str] | None = None) -> int:
                             command.append("--purge-state")  # Still asks for each exact state path.
                         run(command, env=clean_environment(item), cwd=ROOT)
                         registry.save(item, "removed", int(old_port) if old_port else None)
+                        if args.purge_state and item.name != "default" and not item.state.exists():
+                            registry.forget(item)
+                        elif not args.purge_state and not args.yes and item.name != "default":
+                            if confirm_uninstalled_name_release(item):
+                                purge_uninstalled_name(item, registry)
+                            else:
+                                print(f"Kept name {item.name!r} and its saved data.", flush=True)
                     elif args.command == "update":
                         env = read_config(item)
                         install_instance(item, int(env["AGENTSDOCK_AGENT_PORT"]), env["AGENTSDOCK_AGENT_BIND"])

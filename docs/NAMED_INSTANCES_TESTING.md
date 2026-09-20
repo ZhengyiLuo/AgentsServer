@@ -56,6 +56,10 @@ To remove **only the new test service**, preserving its history:
 ```
 
 The preview must name only `local-test`; type `uninstall local-test` only if it does.
+After the service is removed, answer **No/Enter** to the release-name question to
+keep its history. Answer **Yes** only if you want to permanently delete that
+instance's saved AgentsDock data and free its name. The default instance, original
+provider chats, project files and earlier backups must remain untouched.
 Do not approve the bare `./uninstall.sh` or `--all` preview during this trial:
 those intentionally include the default instance. For bulk management without
 the original server, use `--all --exclude default`.

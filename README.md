@@ -806,6 +806,16 @@ output, `TERM=dumb`, and `NO_COLOR` remain color-free.
 For compatibility, legacy `./uninstall.sh --yes` remains default-only; bulk
 automation must explicitly use `--all --yes`.
 
+After each named service is successfully uninstalled, interactive removal asks:
+`Release 'work' and delete its saved data? [y/N]`. A short warning lists the exact
+state directory and explains that deletion is permanent. `y` or `yes` deletes
+that instance's AgentsDock history, uploads, jobs and credentials, and frees its
+name for a new instance. Enter, `n`, `no`, or EOF keeps its data and reserves the
+name for later reuse. Original provider chats, project files, earlier backups and
+independent terminal sessions are not deleted. Each named instance gets its own
+choice in bulk removal; the fixed `default` name does not offer this shortcut.
+`--yes` automation never authorizes this extra deletion or asks this question.
+
 Uninstall removes selected user services, versioned release runtimes, logs, and
 generated configuration (including access tokens). Chat history, jobs, files, and
 terminals under the state directory (`~/.agentsdock` by default) are kept by
@@ -822,7 +832,8 @@ path traversal, and overlapping install/configuration/state roots. Like
 terminal tmux sessions are left running; list default sessions with `tmux ls`
 or named sessions with `tmux -L agents-server-work ls`. Reinstall a preserved
 named history explicitly with `./install.sh --instance work --port 7851`.
-To start fresh under a removed name, use `./instances.sh new --name work --port 7851`.
+If you kept its data during uninstall, you can still start fresh later with
+`./instances.sh new --name work --port 7851`.
 The manager asks whether to release the name with a `[y/N]` prompt. Type `y` or
 `yes` to confirm (case-insensitive); Enter, `n`, or `no` cancels.
 It moves the old instance's complete state to a private backup under

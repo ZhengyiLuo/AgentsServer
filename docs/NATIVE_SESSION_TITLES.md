@@ -8,7 +8,7 @@ independent background request for a short summarized title.
 This is server-side metadata: no extra user/assistant bubbles, no changes to
 the main provider conversation, and no client changes are needed. Manual
 renames always win. Old chats without explicit title-ownership metadata,
-imported chats, forks, and child agents are not retroactively renamed.
+explicitly named imports, forks, and child agents are not retroactively renamed.
 
 ## Background generation: Cursor and Codex
 

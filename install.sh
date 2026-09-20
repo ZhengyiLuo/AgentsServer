@@ -125,7 +125,7 @@ SYSTEMD_MANAGED_STOP_ATTEMPTS=50
 SYSTEMD_MANAGED_STOP_DELAY=0.1
 SYSTEMD_MANAGED_KILL_ATTEMPTS=20
 
-if [[ -t 1 ]] && [[ "${TERM:-}" != "dumb" ]] && [[ -z "${NO_COLOR:-}" ]]; then
+if [[ -t 1 ]] && [[ "${TERM:-}" != "dumb" ]] && [[ -z "${NO_COLOR+x}" ]]; then
   COLOR_GREEN=$'\033[32m'
   COLOR_RED=$'\033[31m'
   COLOR_YELLOW=$'\033[33m'
@@ -6347,6 +6347,12 @@ print_tailscale_summary() {
 setup_network_summary
 
 echo "[7/7] AgentsServer $RELEASE_VERSION is ready"
+if [[ "$PRIOR_SERVICE_STATE" == "absent" && "$PRIOR_LEGACY_SERVICE_STATE" == "absent" && -z "$EXPECTED_SERVER_IDENTITY" ]]; then
+  printf '\n%s%s\n%s\n%s%s\n' \
+    "$COLOR_GREEN" '================================' \
+    'Your new service is up!' \
+    '================================' "$COLOR_RESET"
+fi
 echo
 echo "  ${COLOR_BOLD}Server URL${COLOR_RESET}    $SERVER_URL"
 if [[ -n "$NETWORK_URLS" ]]; then

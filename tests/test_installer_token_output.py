@@ -208,6 +208,42 @@ exec /bin/bash {shlex.quote(str(ROOT / 'install.sh'))} --show-token
         show_start = self.source.index('if [[ "$SHOW_TOKEN" == "true" ]]')
         self.assertIn('print_token_for_copy "$TOKEN_TO_SHOW"', self.source[show_start:show_start + 400])
 
+    def ready_banner_script(self, *, previous="absent", legacy="absent", managed=False):
+        color_start = self.source.index('if [[ -t 1 ]] && [[ "${TERM:-}" != "dumb" ]]')
+        color_end = self.source.index('CHECK_MARK=', color_start)
+        ready_start = self.source.index('echo "[7/7] AgentsServer')
+        ready_end = self.source.index('echo "  ${COLOR_BOLD}Server URL', ready_start)
+        return (
+            "set -eu\nRELEASE_VERSION=test\n"
+            f"PRIOR_SERVICE_STATE={shlex.quote(previous)}\n"
+            f"PRIOR_LEGACY_SERVICE_STATE={shlex.quote(legacy)}\n"
+            f"EXPECTED_SERVER_IDENTITY={'synthetic-server' if managed else ''}\n"
+            + self.source[color_start:color_end] + self.source[ready_start:ready_end]
+        )
+
+    def test_new_service_banner_is_green_with_dividers_and_blank_lines(self):
+        output = self.run_terminal(self.ready_banner_script(), environment={"TERM": "xterm", "PATH": "/usr/bin:/bin"})
+        self.assertEqual(output, "[7/7] AgentsServer test is ready\n\n\033[32m================================\nYour new service is up!\n================================\033[0m\n\n")
+
+    def test_new_service_banner_redirected_output_is_plain(self):
+        result = subprocess.run(["/bin/bash", "-c", self.ready_banner_script()], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("\n\n================================\nYour new service is up!\n================================\n\n", result.stdout)
+        self.assertNotIn("\033[", result.stdout)
+
+    def test_new_service_banner_respects_no_color_and_dumb_terminal(self):
+        for settings in ({"TERM": "dumb"}, {"TERM": "xterm", "NO_COLOR": ""}, {"TERM": "xterm", "NO_COLOR": "1"}):
+            with self.subTest(settings=settings):
+                output = self.run_terminal(self.ready_banner_script(), environment={"PATH": "/usr/bin:/bin", **settings})
+                self.assertIn("Your new service is up!", output)
+                self.assertNotIn("\033[", output)
+
+    def test_updates_and_legacy_migrations_do_not_claim_a_new_service(self):
+        for flags in ({"previous": "running"}, {"previous": "stopped"}, {"legacy": "running"}, {"managed": True}):
+            with self.subTest(flags=flags):
+                output = self.run_terminal(self.ready_banner_script(**flags))
+                self.assertEqual(output, "[7/7] AgentsServer test is ready\n\n")
+
     def test_instance_manager_preserves_terminal_interaction_only_when_both_streams_are_tty(self):
         with tempfile.TemporaryDirectory() as temporary:
             instance = instances.Instance("test", Path(temporary))

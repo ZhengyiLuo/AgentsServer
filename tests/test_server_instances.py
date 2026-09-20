@@ -756,6 +756,10 @@ exit 2
         else:
             result = subprocess.run(["/bin/bash", str(ROOT / "install.sh"), "--instance", "work", "--port", "17851", "--non-interactive"], env=env, capture_output=True, text=True, timeout=180)
         self.assertEqual(result.returncode, 0, result.stderr[-6000:])
+        if not release:
+            self.assertEqual(result.stdout.count("Your new service is up!"), 1)
+            self.assertLess(result.stdout.index("Your new service is up!"), result.stdout.index("Server URL"))
+            self.assertLess(result.stdout.index("Your new service is up!"), result.stdout.index("AGENTSDOCK_SETUP_RESULT="))
         self.assertEqual(self.snapshot(self.default), before)
         self.assertEqual(self.default.service_file("darwin").read_bytes(), default_service)
         self.assertNotIn("/com.agentsdock.server\n", calls.read_text())

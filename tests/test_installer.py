@@ -2707,6 +2707,7 @@ FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
 
             self.assertNotEqual(result.returncode, 0)
             self.assertNotIn("Selecting port", result.stderr)
+            self.assertNotIn("Your new service is up!", result.stdout)
             self.assertTrue((install_root / "current" / "runtime-marker").is_file())
 
     def test_team_hub_mode_is_persisted_and_exact_health_is_required(self):

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import shutil
 import tempfile
 import threading
@@ -8,6 +9,22 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import agent_server
+
+
+# validated_fork_cwd() requires an absolute, existing directory; "/tmp" is POSIX-only.
+FORK_TMP_CWD = "/tmp" if os.name != "nt" else tempfile.gettempdir()
+
+
+def _symlinks_available() -> bool:
+    if os.name != "nt":
+        return True
+    try:
+        with tempfile.TemporaryDirectory() as temporary:
+            link = Path(temporary) / "link"
+            link.symlink_to(temporary, target_is_directory=True)
+            return link.is_symlink()
+    except OSError:
+        return False
 
 
 class ForkHistoryCloneTests(unittest.IsolatedAsyncioTestCase):
@@ -182,6 +199,7 @@ class ForkHistoryCloneTests(unittest.IsolatedAsyncioTestCase):
                     (files_root / upload["id"] / "meta.json").read_text()
                 )["session_id"], parent_id)
 
+    @unittest.skipUnless(_symlinks_available(), "Windows symlink creation privilege unavailable")
     def test_fork_source_rejects_registry_entry_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             files_root = Path(temporary) / "files"
@@ -459,7 +477,7 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
         child = {
             "id": child_id,
             "title": "Fork of Parent",
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
             "backend": agent_server.BACKEND_CODEX,
             "_fork_initializing": True,
         }
@@ -486,14 +504,14 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
             "id": parent_id,
             "title": "Parent",
             "folder": "General",
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
             "backend": agent_server.BACKEND_CLAUDE,
         }
         child = {
             "id": child_id,
             "title": "Fork of Parent",
             "folder": "General",
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
             "backend": agent_server.BACKEND_CLAUDE,
             "_fork_initializing": True,
         }
@@ -562,14 +580,14 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
             "id": parent_id,
             "title": "Parent",
             "folder": "General",
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
             "backend": agent_server.BACKEND_CLAUDE,
         }
         child = {
             "id": child_id,
             "title": "Fork of Parent",
             "folder": "General",
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
             "backend": agent_server.BACKEND_CLAUDE,
             "_fork_initializing": True,
         }
@@ -640,14 +658,14 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
             "id": parent_id,
             "title": "Parent",
             "folder": "General",
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
             "backend": agent_server.BACKEND_CLAUDE,
         }
         child = {
             "id": child_id,
             "title": "Fork of Parent",
             "folder": "General",
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
             "backend": agent_server.BACKEND_CLAUDE,
             "_fork_initializing": True,
         }
@@ -714,14 +732,14 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
         parent = {
             "id": parent_id,
             "title": "Parent",
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
             "backend": agent_server.BACKEND_CODEX,
             "codex_thread_id": "thread-parent",
         }
         child = {
             "id": child_id,
             "title": "Fork of Parent",
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
             "backend": agent_server.BACKEND_CODEX,
             "session_id": None,
             "codex_thread_id": None,
@@ -845,14 +863,14 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
         parent = {
             "id": parent_id,
             "title": "Parent",
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
             "backend": agent_server.BACKEND_CODEX,
             "codex_thread_id": "thread-parent",
         }
         child = {
             "id": child_id,
             "title": "Fork of Parent",
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
             "backend": agent_server.BACKEND_CODEX,
             "session_id": None,
             "codex_thread_id": None,
@@ -966,13 +984,13 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
                 "normal": {
                     "id": "normal",
                     "title": "Normal",
-                    "cwd": "/tmp",
+                    "cwd": FORK_TMP_CWD,
                     "backend": agent_server.BACKEND_CODEX,
                 },
                 "staged": {
                     "id": "staged",
                     "title": "Incomplete fork",
-                    "cwd": "/tmp",
+                    "cwd": FORK_TMP_CWD,
                     "backend": agent_server.BACKEND_CODEX,
                     "codex_thread_id": "thread-staged",
                     "_fork_initializing": True,
@@ -1201,7 +1219,7 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
             sessions_file.write_text(json.dumps({
                 "staged": {
                     "id": "staged",
-                    "cwd": "/tmp",
+                    "cwd": FORK_TMP_CWD,
                     "backend": agent_server.BACKEND_CODEX,
                     "codex_thread_id": "thread-staged",
                     "_fork_initializing": True,
@@ -1247,7 +1265,7 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
             "id": parent_id,
             "title": "Parent",
             "folder": "General",
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
             "backend": agent_server.BACKEND_CODEX,
             "codex_thread_id": "thread-parent",
         }
@@ -1334,7 +1352,7 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
                 await store.create(
                     agent_server.CreateSessionRequest(
                         title="Failed child",
-                        cwd="/tmp",
+                        cwd=FORK_TMP_CWD,
                         backend=agent_server.BACKEND_CODEX,
                     )
                 )
@@ -1355,7 +1373,7 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
             "id": parent_id,
             "title": "Parent",
             "folder": "General",
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
             "backend": agent_server.BACKEND_CODEX,
             "codex_thread_id": "thread-parent",
         }
@@ -1363,7 +1381,7 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
             "id": child_id,
             "title": "Fork of Parent",
             "folder": "General",
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
             "backend": agent_server.BACKEND_CODEX,
             "_fork_initializing": True,
         }
@@ -1577,7 +1595,7 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
             "id": parent_id,
             "title": "Parent",
             "folder": "General",
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
             "backend": agent_server.BACKEND_CODEX,
             "codex_thread_id": "thread-parent",
         }
@@ -1585,7 +1603,7 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
             "id": child_id,
             "title": "Fork of Parent",
             "folder": "General",
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
             "backend": agent_server.BACKEND_CODEX,
             "session_id": None,
             "codex_thread_id": None,
@@ -1741,7 +1759,7 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
             "id": parent_id,
             "title": "Parent",
             "folder": "General",
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
             "backend": agent_server.BACKEND_CODEX,
             "codex_thread_id": None,
             "session_id": None,
@@ -1752,7 +1770,7 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
             "id": child_id,
             "title": "Fork of Parent",
             "folder": "General",
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
             "backend": agent_server.BACKEND_CODEX,
             "codex_thread_id": None,
             "session_id": None,
@@ -1833,7 +1851,7 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
         parent = {
             "id": parent_id,
             "title": "Busy",
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
             "backend": agent_server.BACKEND_CODEX,
             "codex_thread_id": "thread-parent",
         }
@@ -1883,7 +1901,7 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
         parent = {
             "id": parent_id,
             "title": "Parent",
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
             "backend": agent_server.BACKEND_CODEX,
             "codex_thread_id": "thread-parent",
         }
@@ -1931,7 +1949,7 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
         parent = {
             "id": parent_id,
             "title": "Parent",
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
             "backend": agent_server.BACKEND_CODEX,
             "codex_thread_id": "thread-parent",
         }
@@ -2008,7 +2026,7 @@ class NativeCodexForkSafetyTests(unittest.IsolatedAsyncioTestCase):
         manager.read_thread = AsyncMock(return_value={
             "id": "thread-child",
             "forkedFromId": "thread-parent",
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
         })
         manager.delete_thread = AsyncMock()
         with patch.object(
@@ -2023,7 +2041,7 @@ class NativeCodexForkSafetyTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await agent_server.fork_codex_thread(
                 "thread-parent",
-                {"cwd": "/tmp", "backend": agent_server.BACKEND_CODEX},
+                {"cwd": FORK_TMP_CWD, "backend": agent_server.BACKEND_CODEX},
             )
 
         self.assertEqual(result, "thread-child")
@@ -2052,7 +2070,7 @@ class NativeCodexForkSafetyTests(unittest.IsolatedAsyncioTestCase):
             return {
                 "id": "thread-child",
                 "forkedFromId": "thread-parent",
-                "cwd": "/tmp",
+                "cwd": FORK_TMP_CWD,
             }
 
         manager.read_thread = AsyncMock(side_effect=read_thread)
@@ -2079,7 +2097,7 @@ class NativeCodexForkSafetyTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await agent_server.fork_codex_thread(
                 "thread-parent",
-                {"cwd": "/tmp", "backend": agent_server.BACKEND_CODEX},
+                {"cwd": FORK_TMP_CWD, "backend": agent_server.BACKEND_CODEX},
             )
 
         self.assertEqual(result, "thread-child")
@@ -2111,7 +2129,7 @@ class NativeCodexForkSafetyTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.TimeoutError) as raised:
                 await agent_server.fork_codex_thread(
                     "thread-parent",
-                    {"cwd": "/tmp", "backend": agent_server.BACKEND_CODEX},
+                    {"cwd": FORK_TMP_CWD, "backend": agent_server.BACKEND_CODEX},
                 )
 
         self.assertIs(raised.exception, timeout)
@@ -2140,7 +2158,7 @@ class NativeCodexForkSafetyTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError) as raised:
                 await agent_server.fork_codex_thread(
                     "thread-parent",
-                    {"cwd": "/tmp", "backend": agent_server.BACKEND_CODEX},
+                    {"cwd": FORK_TMP_CWD, "backend": agent_server.BACKEND_CODEX},
                 )
 
         self.assertIs(raised.exception, cancellation)
@@ -2171,7 +2189,7 @@ class NativeCodexForkSafetyTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(agent_server.CodexForkCleanupError) as raised:
                 await agent_server.fork_codex_thread(
                     "thread-parent",
-                    {"cwd": "/tmp", "backend": agent_server.BACKEND_CODEX},
+                    {"cwd": FORK_TMP_CWD, "backend": agent_server.BACKEND_CODEX},
                 )
 
         self.assertEqual(raised.exception.thread_id, "thread-late")
@@ -2201,7 +2219,7 @@ class NativeCodexForkSafetyTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(agent_server.CodexForkCleanupError) as raised:
                 await agent_server.fork_codex_thread(
                     "thread-parent",
-                    {"cwd": "/tmp", "backend": agent_server.BACKEND_CODEX},
+                    {"cwd": FORK_TMP_CWD, "backend": agent_server.BACKEND_CODEX},
                 )
 
         self.assertEqual(raised.exception.thread_id, "thread-child")
@@ -2232,7 +2250,7 @@ class NativeCodexForkSafetyTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(agent_server.CodexForkCleanupError) as raised:
                 await agent_server.fork_codex_thread(
                     "thread-parent",
-                    {"cwd": "/tmp", "backend": agent_server.BACKEND_CODEX},
+                    {"cwd": FORK_TMP_CWD, "backend": agent_server.BACKEND_CODEX},
                 )
 
         self.assertEqual(raised.exception.thread_id, "thread-child")
@@ -2268,7 +2286,7 @@ class NativeCodexForkSafetyTests(unittest.IsolatedAsyncioTestCase):
         ):
             task = asyncio.create_task(agent_server.fork_codex_thread(
                 "thread-parent",
-                {"cwd": "/tmp", "backend": agent_server.BACKEND_CODEX},
+                {"cwd": FORK_TMP_CWD, "backend": agent_server.BACKEND_CODEX},
             ))
             await asyncio.wait_for(journal_started.wait(), timeout=1)
             task.cancel()
@@ -2311,7 +2329,7 @@ class NativeCodexForkSafetyTests(unittest.IsolatedAsyncioTestCase):
         ) as cleanup:
             task = asyncio.create_task(agent_server.fork_codex_thread(
                 "thread-parent",
-                {"cwd": "/tmp", "backend": agent_server.BACKEND_CODEX},
+                {"cwd": FORK_TMP_CWD, "backend": agent_server.BACKEND_CODEX},
             ))
             await asyncio.wait_for(journal_started.wait(), timeout=1)
             task.cancel()
@@ -2331,7 +2349,7 @@ class NativeCodexForkSafetyTests(unittest.IsolatedAsyncioTestCase):
         manager.read_thread = AsyncMock(return_value={
             "id": "thread-child",
             "forkedFromId": None,
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
         })
         manager.delete_thread = AsyncMock()
         manager.is_thread_loaded.return_value = True
@@ -2345,7 +2363,7 @@ class NativeCodexForkSafetyTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(agent_server.CodexAppServerProtocolError):
                 await agent_server.fork_codex_thread(
                     "thread-parent",
-                    {"cwd": "/tmp", "backend": agent_server.BACKEND_CODEX},
+                    {"cwd": FORK_TMP_CWD, "backend": agent_server.BACKEND_CODEX},
                 )
 
         manager.delete_thread.assert_awaited_once_with("thread-child")
@@ -2373,7 +2391,7 @@ class NativeCodexForkSafetyTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(agent_server.CodexAppServerProtocolError):
                         await agent_server.fork_codex_thread(
                             "thread-parent",
-                            {"cwd": "/tmp", "backend": agent_server.BACKEND_CODEX},
+                            {"cwd": FORK_TMP_CWD, "backend": agent_server.BACKEND_CODEX},
                         )
 
                 manager.delete_thread.assert_awaited_once_with("thread-child")
@@ -2383,7 +2401,7 @@ class NativeCodexForkSafetyTests(unittest.IsolatedAsyncioTestCase):
         thread_id = "thread-child"
         child = {
             "id": session_id,
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
             "backend": agent_server.BACKEND_CODEX,
             "session_id": None,
             "codex_thread_id": None,
@@ -2485,7 +2503,7 @@ class NativeCodexForkSafetyTests(unittest.IsolatedAsyncioTestCase):
         thread_id = "thread-child"
         child = {
             "id": session_id,
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
             "backend": agent_server.BACKEND_CODEX,
             "session_id": None,
             "codex_thread_id": None,
@@ -2678,7 +2696,7 @@ class ForkMemoryTests(unittest.TestCase):
         parent = {
             "id": parent_id,
             "title": "Parent",
-            "cwd": "/tmp",
+            "cwd": FORK_TMP_CWD,
             "backend": agent_server.BACKEND_CODEX,
         }
 

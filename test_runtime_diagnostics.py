@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -24,6 +25,7 @@ class RuntimeDiagnosticTests(unittest.TestCase):
         self.assertFalse(diagnostic["available"])
         self.assertIn("Install Claude Code", diagnostic["action"])
 
+    @unittest.skipIf(os.name == "nt", "tmux probe machinery is POSIX-only; on Windows tmux_capability reports ConPTY availability, covered by test_terminal_windows")
     def test_broken_tmux_is_reported_unavailable_but_optional(self) -> None:
         with patch.object(agent_server.shutil, "which", return_value="/usr/local/bin/tmux"), patch.object(
             agent_server.subprocess,
@@ -57,6 +59,7 @@ class RuntimeDiagnosticTests(unittest.TestCase):
 
         run.assert_called_once()
 
+    @unittest.skipIf(os.name == "nt", "tmux probe machinery is POSIX-only; on Windows tmux_capability reports ConPTY availability, covered by test_terminal_windows")
     def test_missing_tmux_is_reported_unavailable_but_optional(self) -> None:
         with patch.object(agent_server.shutil, "which", return_value=None), patch.object(
             agent_server.subprocess,

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import time
 import unittest
 from collections.abc import Callable
@@ -229,7 +230,7 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args, ("codex", "app-server", "--listen", "stdio://"))
         self.assertEqual(kwargs["cwd"], "/tmp")
         self.assertEqual(kwargs["env"], {"PATH": "/usr/bin"})
-        self.assertTrue(kwargs["start_new_session"])
+        self.assertEqual(kwargs["start_new_session"], os.name != "nt")
         self.assertEqual(client.generation, 1)
         self.assertEqual(
             client.initialize_result,

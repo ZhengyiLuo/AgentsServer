@@ -1,3 +1,4 @@
+import os
 import subprocess
 import unittest
 from types import SimpleNamespace
@@ -6,6 +7,10 @@ from unittest.mock import patch
 import agent_server
 
 
+@unittest.skipIf(
+    os.name == "nt",
+    "POSIX-only: mocks the pwd module and tmux, which do not exist on Windows",
+)
 class TerminalShellInitializationTests(unittest.TestCase):
     def test_shell_validation_rejects_disabled_relative_directory_and_null_paths(self) -> None:
         self.assertIsNone(agent_server.valid_terminal_login_shell("/usr/sbin/nologin"))

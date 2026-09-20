@@ -7,7 +7,20 @@ from unittest.mock import patch
 import agent_server
 
 
+def _symlinks_available() -> bool:
+    if os.name != "nt":
+        return True
+    try:
+        with tempfile.TemporaryDirectory() as temporary:
+            link = Path(temporary) / "link"
+            link.symlink_to(temporary, target_is_directory=True)
+            return link.is_symlink()
+    except OSError:
+        return False
+
+
 class StateMigrationTests(unittest.TestCase):
+    @unittest.skipUnless(_symlinks_available(), "Windows symlink creation privilege unavailable")
     def test_default_legacy_directory_moves_to_agentsdock(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)

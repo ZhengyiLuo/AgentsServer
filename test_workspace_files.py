@@ -14,6 +14,23 @@ from unittest.mock import patch
 from fastapi import HTTPException, Request
 
 import agent_server
+import winfs
+
+
+def _symlinks_available() -> bool:
+    if os.name != "nt":
+        return True
+    try:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "target.txt"
+            target.write_text("x")
+            (Path(temporary) / "link.txt").symlink_to(target)
+            return True
+    except OSError:
+        return False
+
+
+_SYMLINKS_AVAILABLE = _symlinks_available()
 
 
 class WorkspaceFilesTests(unittest.TestCase):
@@ -71,6 +88,7 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(raised.exception.detail["code"], "workspace_unavailable")
 
+    @unittest.skipUnless(_SYMLINKS_AVAILABLE, "symlink creation requires a privilege unavailable on this host")
     def test_lists_one_directory_with_pagination_and_symlink_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -149,6 +167,7 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertEqual(file_bytes, b"")
         self.assertTrue(directory_is_empty)
 
+    @unittest.skipUnless(_SYMLINKS_AVAILABLE, "symlink creation requires a privilege unavailable on this host")
     def test_create_never_overwrites_files_directories_or_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -183,6 +202,7 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertEqual(outside_content, "outside\n")
         self.assertEqual(link_target, outside)
 
+    @unittest.skipUnless(_SYMLINKS_AVAILABLE, "symlink creation requires a privilege unavailable on this host")
     def test_create_rejects_unsafe_missing_symlinked_archived_and_denied_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -249,6 +269,7 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertEqual([entry.name for entry in entries], ["shared.txt"])
         self.assertEqual(content, b"")
 
+    @unittest.skipIf(os.name == "nt", "exercises the POSIX dir_fd/os.* syscall path that winfs replaces on Windows")
     def test_create_post_create_failures_report_partial_success_without_deleting(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -293,6 +314,7 @@ class WorkspaceFilesTests(unittest.TestCase):
         )
         self.assertEqual(remaining, ["fstat-failure.txt", "fsync-failure.txt"])
 
+    @unittest.skipIf(os.name == "nt", "exercises the POSIX dir_fd/os.* syscall path that winfs replaces on Windows")
     def test_create_directory_validation_failure_reports_partial_success_without_deleting(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -318,6 +340,7 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertEqual(failed.exception.detail["code"], "workspace_create_partial_success")
         self.assertEqual(remaining, ["drafts"])
 
+    @unittest.skipIf(os.name == "nt", "exercises the POSIX dir_fd/os.* syscall path that winfs replaces on Windows")
     def test_create_rollback_never_removes_a_raced_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -346,6 +369,7 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertEqual(failed.exception.detail["code"], "workspace_create_partial_success")
         self.assertEqual(content, "replacement\n")
 
+    @unittest.skipIf(os.name == "nt", "exercises the POSIX dir_fd/os.* syscall path that winfs replaces on Windows")
     def test_create_failure_never_attempts_automatic_deletion(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -394,8 +418,8 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertEqual(result["file"]["content"], "")
 
     @unittest.skipUnless(
-        sys.platform == "darwin" or sys.platform.startswith("linux"),
-        "atomic no-replace rename is supported on macOS and Linux",
+        agent_server.WORKSPACE_MUTATIONS_AVAILABLE,
+        "atomic no-replace rename is required (renameat2 on POSIX, winfs on Windows)",
     )
     def test_rename_is_same_parent_atomic_and_never_overwrites(self) -> None:
         self.assertTrue(agent_server.WORKSPACE_MUTATIONS_AVAILABLE)
@@ -434,7 +458,8 @@ class WorkspaceFilesTests(unittest.TestCase):
 
     @unittest.skipUnless(
         sys.platform == "darwin" or sys.platform.startswith("linux"),
-        "atomic no-replace rename is supported on macOS and Linux",
+        "mocks the POSIX renameat2 seam (atomic_rename_workspace_entry); winfs.rename is an atomic "
+        "no-replace rename tested at the winfs level (test_winfs.py) and by the Windows rollback test below",
     )
     def test_rename_rolls_back_when_source_is_replaced_after_revision_check(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -483,8 +508,8 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertFalse(destination_exists)
 
     @unittest.skipUnless(
-        sys.platform == "darwin" or sys.platform.startswith("linux"),
-        "atomic no-replace rename is supported on macOS and Linux",
+        agent_server.WORKSPACE_MUTATIONS_AVAILABLE,
+        "atomic no-replace rename is required (renameat2 on POSIX, winfs on Windows)",
     )
     def test_rename_rejects_stale_revisions_invalid_names_and_archived_chats(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -522,9 +547,77 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertEqual(stale.exception.detail["code"], "workspace_entry_conflict")
         self.assertEqual(archived.exception.detail["code"], "workspace_read_only")
 
+
+    @unittest.skipUnless(agent_server.WORKSPACE_WINFS, "exercises the winfs handle-based rename path (Windows)")
+    def test_rename_winfs_revision_conflict_and_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
+                def revisions() -> dict[str, str]:
+                    return {
+                        entry["path"]: entry["revision"]
+                        for entry in agent_server.list_workspace_entries_sync("session-1", "", 0, 20)["entries"]
+                    }
+
+                # (a) A correct source revision succeeds; the response carries the renamed
+                # entry's opaque revision, which matches a fresh listing of that entry.
+                (root / "alpha.txt").write_text("alpha\n")
+                source_revision = revisions()["alpha.txt"]
+                renamed = agent_server.rename_workspace_entry_sync(
+                    "session-1", "alpha.txt", "alpha-renamed.txt", source_revision
+                )
+                self.assertEqual(renamed["entry"]["path"], "alpha-renamed.txt")
+                self.assertRegex(renamed["entry"]["revision"], r"^[0-9a-f]{64}$")
+                self.assertEqual(renamed["entry"]["revision"], revisions()["alpha-renamed.txt"])
+                self.assertFalse((root / "alpha.txt").exists())
+                self.assertEqual((root / "alpha-renamed.txt").read_text(), "alpha\n")
+
+                # (b) A stale source revision fails with the same 409 the POSIX path returns.
+                (root / "beta.txt").write_text("beta\n")
+                stale_revision = revisions()["beta.txt"]
+                (root / "beta.txt").write_text("beta changed\n")
+                with self.assertRaises(HTTPException) as stale:
+                    agent_server.rename_workspace_entry_sync(
+                        "session-1", "beta.txt", "beta-renamed.txt", stale_revision
+                    )
+                self.assertEqual(stale.exception.status_code, 409)
+                self.assertEqual(stale.exception.detail["code"], "workspace_entry_conflict")
+                self.assertTrue((root / "beta.txt").exists())
+
+                # (c) Rollback: get the source replaced between the pre-check and the
+                # post-rename identity check by wrapping the real winfs no-replace rename
+                # (the same seam the POSIX rollback test wraps renameat2 through). This
+                # exercises the production drift check + rollback, not a re-implementation.
+                (root / "gamma.txt").write_text("original\n")
+                real_rename = winfs.WinDir.rename
+                swapped = False
+
+                def swap_source_then_rename(dir_handle, old, new, *, replace=False):
+                    nonlocal swapped
+                    if not swapped and not replace:
+                        swapped = True
+                        real_rename(dir_handle, old, "gamma-displaced.txt", replace=False)
+                        dir_handle.create_file(old, b"replacement\n")
+                    return real_rename(dir_handle, old, new, replace=replace)
+
+                gamma_revision = revisions()["gamma.txt"]
+                with patch.object(winfs.WinDir, "rename", swap_source_then_rename):
+                    with self.assertRaises(HTTPException) as rolled_back:
+                        agent_server.rename_workspace_entry_sync(
+                            "session-1", "gamma.txt", "gamma-renamed.txt", gamma_revision
+                        )
+                self.assertEqual(rolled_back.exception.status_code, 409)
+                self.assertEqual(rolled_back.exception.detail["code"], "workspace_entry_conflict")
+                # The original name is restored holding the raced replacement, the displaced
+                # original is preserved, and no partial destination entry is left behind.
+                self.assertEqual((root / "gamma.txt").read_text(), "replacement\n")
+                self.assertEqual((root / "gamma-displaced.txt").read_text(), "original\n")
+                self.assertFalse((root / "gamma-renamed.txt").exists())
+
     @unittest.skipUnless(
         sys.platform == "darwin" or sys.platform.startswith("linux"),
-        "atomic no-replace rename is supported on macOS and Linux",
+        "POSIX-only: renames symlinks (needs symlink privilege, unavailable here); winfs deliberately "
+        "rejects reparse operands with ELOOP - reparse handling is covered in test_winfs.py",
     )
     def test_rename_moves_directories_and_symlinks_without_following_links(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -560,6 +653,7 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertEqual(link_target, outside)
         self.assertEqual(outside_content, "outside\n")
 
+    @unittest.skipUnless(_SYMLINKS_AVAILABLE, "symlink creation requires a privilege unavailable on this host")
     def test_rejects_absolute_parent_and_symlink_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -622,6 +716,7 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertEqual(result["revision"], agent_server.workspace_revision(data))
         self.assertEqual(result["size"], len(data))
 
+    @unittest.skipUnless(_SYMLINKS_AVAILABLE, "symlink creation requires a privilege unavailable on this host")
     def test_explicit_absolute_read_is_canonical_nofollow_and_does_not_expand_workspace_mutations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()
@@ -688,6 +783,7 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertEqual(mutation.exception.detail["code"], "invalid_workspace_path")
         self.assertEqual(unchanged, "# outside\n")
 
+    @unittest.skipUnless(_SYMLINKS_AVAILABLE, "symlink creation requires a privilege unavailable on this host")
     def test_explicit_absolute_write_is_revision_checked_atomic_and_nofollow(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()
@@ -730,6 +826,7 @@ class WorkspaceFilesTests(unittest.TestCase):
             self.assertEqual(symlink.exception.detail["code"], "workspace_symlink_blocked")
             self.assertEqual(list(base.glob(".*.agentsdock-*.tmp")), [])
 
+    @unittest.skipUnless(_SYMLINKS_AVAILABLE, "symlink creation requires a privilege unavailable on this host")
     def test_explicit_absolute_write_respects_archived_and_file_read_only_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()
@@ -825,6 +922,7 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertEqual(head_response.headers["content-length"], "4")
         self.assertEqual(head_response.body, b"")
 
+    @unittest.skipUnless(_SYMLINKS_AVAILABLE, "symlink creation requires a privilege unavailable on this host")
     def test_preview_rejects_unsupported_oversized_nonregular_and_escaping_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "workspace"
@@ -887,6 +985,7 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertEqual(head_response.headers["content-length"], str(len(data)))
         self.assertEqual(head_response.body, b"")
 
+    @unittest.skipUnless(_SYMLINKS_AVAILABLE, "symlink creation requires a privilege unavailable on this host")
     def test_download_rejects_directories_symlinks_and_escaping_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "workspace"
@@ -951,7 +1050,8 @@ class WorkspaceFilesTests(unittest.TestCase):
                     )
 
             self.assertEqual(path.read_text(), "#!/bin/sh\necho new\n")
-            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o750)
+            if os.name != "nt":  # POSIX mode bits are not settable/meaningful on Windows
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o750)
             self.assertEqual(updated["revision"], agent_server.workspace_revision(path.read_bytes()))
             self.assertEqual(conflict.exception.status_code, 409)
             self.assertEqual(conflict.exception.detail["code"], "workspace_file_conflict")
@@ -993,6 +1093,7 @@ class WorkspaceFilesTests(unittest.TestCase):
             self.assertEqual(replacement_path.read_text(), "original\n")
             self.assertEqual(updated["root"], str(original_root.resolve()))
 
+    @unittest.skipIf(os.name == "nt", "exercises the POSIX dir_fd/os.* syscall path that winfs replaces on Windows")
     def test_atomic_save_does_not_overwrite_a_concurrent_permission_change(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1109,6 +1210,7 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(raised.exception.detail["code"], "workspace_read_only")
 
+    @unittest.skipUnless(_SYMLINKS_AVAILABLE, "symlink creation requires a privilege unavailable on this host")
     def test_delete_removes_files_symlinks_and_empty_directories_without_following_links(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -1146,8 +1248,8 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertEqual(outside_content, "keep\n")
 
     @unittest.skipUnless(
-        sys.platform == "darwin" or sys.platform.startswith("linux"),
-        "atomic no-replace rename is supported on macOS and Linux",
+        agent_server.WORKSPACE_MUTATIONS_AVAILABLE,
+        "atomic no-replace rename is required (renameat2 on POSIX, winfs on Windows)",
     )
     def test_patch_and_delete_route_contracts_return_v2_mutation_shapes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1182,6 +1284,7 @@ class WorkspaceFilesTests(unittest.TestCase):
             "removed": True,
         })
 
+    @unittest.skipUnless(_SYMLINKS_AVAILABLE, "symlink creation requires a privilege unavailable on this host")
     def test_recursive_delete_requires_recursive_confirmation_and_does_not_follow_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -1250,6 +1353,7 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertEqual(stale.exception.detail["code"], "workspace_entry_conflict")
         self.assertEqual(archived.exception.detail["code"], "workspace_read_only")
 
+    @unittest.skipIf(os.name == "nt", "exercises the POSIX dir_fd/os.* syscall path that winfs replaces on Windows")
     def test_recursive_delete_rejects_a_nested_mounted_filesystem_before_removing_entries(self) -> None:
         class CrossDeviceStat:
             def __init__(self, original: os.stat_result):
@@ -1333,8 +1437,9 @@ class WorkspaceFilesTests(unittest.TestCase):
             root = Path(temporary)
             for index in range(3):
                 (root / f"file-{index}.txt").write_text(str(index))
-            unusual = root / "literal\\name.txt"
-            unusual.write_text("backslash\n")
+            if os.name != "nt":  # a backslash is a path separator on Windows, not a filename char
+                unusual = root / "literal\\name.txt"
+                unusual.write_text("backslash\n")
             with patch.object(agent_server.STORE, "sessions", {"session-1": self.session(root)}):
                 result = agent_server.search_workspace_files_sync("session-1", "", 2)
                 if os.name != "nt":

@@ -24,7 +24,9 @@ class AgentTerminalContextTests(unittest.TestCase):
         self.assertEqual(env["AGENTSDOCK_TMUX_SESSION"], "zd_sess_ab_cd")
         self.assertEqual(
             env["AGENTSDOCK_MANIFEST_PATH"],
-            str(agent_server.codex_manifest_path("sess-ab/cd")),
+            # Injected paths are normalized to POSIX separators on every
+            # platform so agent-facing text is stable.
+            agent_server.codex_manifest_path("sess-ab/cd").as_posix(),
         )
         self.assertTrue(env["AGENTSDOCK_MANIFEST_PATH"].endswith("/manifests/current.json"))
         self.assertEqual(

@@ -1,12 +1,14 @@
 import asyncio
+import json
 import os
 import tempfile
 import threading
 import unittest
 from collections import deque
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 import agent_server
 from fastapi import HTTPException
@@ -39,10 +41,16 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                 response = await agent_server.health()
 
         capability = response["capabilities"]["tmux"]
-        self.assertEqual(capability["available"], False)
-        self.assertEqual(capability["required"], False)
-        self.assertIn("not found", capability["message"])
-        self.assertIn("Install tmux", capability["action"])
+        if os.name == "nt":
+            # On Windows the chat terminal reports ConPTY truth (pywinpty),
+            # independent of tmux; managed updates stay disabled because the
+            # decoy release key cannot verify signatures.
+            self.assertTrue(capability["available"])
+        else:
+            self.assertEqual(capability["available"], False)
+            self.assertEqual(capability["required"], False)
+            self.assertIn("not found", capability["message"])
+            self.assertIn("Install tmux", capability["action"])
         self.assertFalse(response["managed_updates"])
 
     async def test_health_reports_available_tmux_and_managed_updates(self):
@@ -58,12 +66,19 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                 response = await agent_server.health()
 
         capability = response["capabilities"]["tmux"]
-        self.assertEqual(capability, {
-            "available": True,
-            "required": False,
-            "message": "tmux is available.",
-            "action": None,
-        })
+        if os.name == "nt":
+            # tmux availability still gates the (tmux) updater path, but the
+            # capability payload itself reports ConPTY terminal truth here.
+            self.assertTrue(capability["available"])
+            self.assertIsNone(capability["action"])
+            self.assertIn("ConPTY", capability["message"])
+        else:
+            self.assertEqual(capability, {
+                "available": True,
+                "required": False,
+                "message": "tmux is available.",
+                "action": None,
+            })
         self.assertTrue(response["managed_updates"])
         self.assertEqual(
             response["capabilities"]["server_updates"]["tracks"],
@@ -337,7 +352,15 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_start_newer_version_without_tmux_returns_actionable_503(self):
         manifest = AsyncMock(side_effect=AssertionError("/start must not perform release discovery"))
-        with tempfile.TemporaryDirectory() as temporary, \
+        # On Windows the native winupdate helper would take over here (this
+        # host really has one); simulate it being unavailable to exercise the
+        # 503 path exactly as a POSIX host without tmux would.
+        native_gate = (
+            patch.object(agent_server, "windows_native_updates_available", return_value=False)
+            if os.name == "nt"
+            else nullcontext()
+        )
+        with tempfile.TemporaryDirectory() as temporary, native_gate, \
              patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
              patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", Path(temporary) / "status.json"), \
              patch.object(agent_server, "server_update_is_active", return_value=False), \
@@ -855,6 +878,230 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["phase"], "current")
         self.assertFalse(status["update_available"])
         run_tmux.assert_not_called()
+
+
+def write_real_ed25519_key(path: Path) -> None:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    private = Ed25519PrivateKey.generate()
+    path.write_bytes(
+        private.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+
+
+@unittest.skipUnless(os.name == "nt", "native Windows update path")
+class WindowsNativeUpdateTests(unittest.IsolatedAsyncioTestCase):
+    """The winupdate-based update path selected when tmux is absent on Windows."""
+
+    def _install_fixtures(self, root: Path, *, real_key: bool) -> tuple[Path, Path]:
+        runner = root / "update_runner.py"
+        runner.write_text("# runner\n")
+        key = root / "release-public-key.pem"
+        if real_key:
+            write_real_ed25519_key(key)
+        else:
+            key.write_text("public key\n")
+        return runner, key
+
+    async def test_health_reports_native_windows_updates_when_helper_ready(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner, key = self._install_fixtures(root, real_key=True)
+            with patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server, "working_tmux_bin", return_value=None):
+                self.assertTrue(agent_server.windows_native_updates_available())
+                response = await agent_server.health()
+
+        self.assertTrue(response["managed_updates"])
+        capability = response["capabilities"]["server_updates"]
+        self.assertTrue(capability["available"])
+        self.assertIn("supervise", str(capability["action"]))
+
+    def test_update_is_active_tracks_the_detached_helper_pid(self):
+        self.assertTrue(
+            agent_server.server_update_is_active(
+                {"phase": "starting", "update_id": "u", "update_pid": os.getpid()}
+            )
+        )
+        self.assertFalse(
+            agent_server.server_update_is_active(
+                {"phase": "starting", "update_id": "u", "update_pid": 4_194_000}
+            )
+        )
+        self.assertFalse(
+            agent_server.server_update_is_active({"phase": "starting", "update_id": "u"})
+        )
+        self.assertFalse(
+            agent_server.server_update_is_active(
+                {"phase": "complete", "update_id": "u", "update_pid": os.getpid()}
+            )
+        )
+
+    async def test_start_spawns_detached_native_helper_and_schedules_self_exit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner, key = self._install_fixtures(root, real_key=True)
+            log_file = root / "server-update.log"
+            fake_process = SimpleNamespace(pid=4242)
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", root / "status.json"), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server, "SERVER_UPDATE_LOG_FILE", log_file), \
+                 patch.object(agent_server, "working_tmux_bin", return_value=None), \
+                 patch.object(agent_server, "AGENT_TOKEN", "synthetic-token"), \
+                 patch.object(agent_server, "BUSY_SESSIONS", set()), \
+                 patch.object(agent_server, "QUEUED_TURNS", {}), \
+                 patch.object(agent_server, "RUN_NOW_TURNS", {}), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server.subprocess, "Popen", return_value=fake_process) as popen, \
+                 patch.object(agent_server, "schedule_windows_update_self_exit") as self_exit, \
+                 patch.object(agent_server, "run_tmux") as run_tmux:
+                status = await agent_server.start_server_update(
+                    agent_server.ServerUpdateRequest(version="1.1.0")
+                )
+                persisted = agent_server.read_server_update_status()
+                token_files = list(root.glob(".server-update-*.auth.json"))
+
+            self.assertEqual(status["phase"], "starting")
+            self.assertEqual(persisted["update_pid"], 4242)
+            self.assertEqual(len(token_files), 1)
+            self.assertEqual(
+                json.loads(token_files[0].read_text())["token"], "synthetic-token"
+            )
+            popen.assert_called_once()
+            argv = popen.call_args.args[0]
+            self.assertEqual(Path(argv[1]), agent_server.windows_update_helper_path())
+            for flag, value in (
+                ("--expected-version", "1.1.0"),
+                ("--current-version", "1.0.0"),
+                ("--track", "stable"),
+                ("--live-dir", str(agent_server.SERVER_ROOT)),
+                ("--state-dir", str(agent_server.STATE_DIR)),
+                ("--auth-token-file", str(token_files[0])),
+            ):
+                self.assertIn(flag, argv)
+                self.assertEqual(argv[argv.index(flag) + 1], value)
+            self.assertIn("--staging-root", argv)
+            kwargs = popen.call_args.kwargs
+            self.assertTrue(
+                kwargs["creationflags"] & agent_server.subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+            self.assertTrue(kwargs["creationflags"] & agent_server.subprocess.CREATE_NO_WINDOW)
+            self.assertEqual(kwargs["cwd"], str(agent_server.STATE_DIR))
+            self_exit.assert_called_once_with()
+            run_tmux.assert_not_called()
+
+    async def test_start_native_unavailable_returns_actionable_503(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner, key = self._install_fixtures(root, real_key=False)
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", root / "status.json"), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server, "working_tmux_bin", return_value=None), \
+                 patch.object(agent_server.subprocess, "Popen") as popen, \
+                 patch.object(agent_server, "schedule_windows_update_self_exit") as self_exit, \
+                 patch.object(agent_server, "run_tmux") as run_tmux:
+                with self.assertRaises(HTTPException) as raised:
+                    await agent_server.start_server_update(
+                        agent_server.ServerUpdateRequest(version="1.1.0")
+                    )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertIn("Install tmux", str(raised.exception.detail))
+        self.assertIn("native Windows", str(raised.exception.detail))
+        popen.assert_not_called()
+        run_tmux.assert_not_called()
+        self_exit.assert_not_called()
+
+    async def test_start_prefers_tmux_when_it_works_even_on_windows(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner, key = self._install_fixtures(root, real_key=True)
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", root / "status.json"), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server.subprocess, "Popen") as popen, \
+                 patch.object(agent_server, "schedule_windows_update_self_exit") as self_exit, \
+                 patch.object(agent_server, "run_tmux", return_value=None) as run_tmux:
+                status = await agent_server.start_server_update(
+                    agent_server.ServerUpdateRequest(version="1.1.0")
+                )
+
+        self.assertEqual(status["phase"], "starting")
+        run_tmux.assert_called_once()
+        popen.assert_not_called()
+        self_exit.assert_not_called()
+
+    async def test_start_native_failure_reopens_admission_and_removes_credential(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner, key = self._install_fixtures(root, real_key=True)
+            log_file = root / "server-update.log"
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", root / "status.json"), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server, "SERVER_UPDATE_LOG_FILE", log_file), \
+                 patch.object(agent_server, "working_tmux_bin", return_value=None), \
+                 patch.object(agent_server, "AGENT_TOKEN", "synthetic-token"), \
+                 patch.object(agent_server, "BUSY_SESSIONS", set()), \
+                 patch.object(agent_server, "QUEUED_TURNS", {}), \
+                 patch.object(agent_server, "RUN_NOW_TURNS", {}), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(
+                     agent_server.subprocess,
+                     "Popen",
+                     side_effect=RuntimeError("spawn denied"),
+                 ), \
+                 patch.object(agent_server, "schedule_windows_update_self_exit") as self_exit:
+                with self.assertRaises(HTTPException) as raised:
+                    await agent_server.start_server_update(
+                        agent_server.ServerUpdateRequest(version="1.1.0")
+                    )
+                status = agent_server.read_server_update_status()
+                credentials = list(root.glob(".server-update-*.auth.json"))
+
+        self.assertEqual(raised.exception.status_code, 500)
+        self.assertEqual(status["phase"], "failed")
+        self.assertEqual(credentials, [])
+        self_exit.assert_not_called()
+
+    def test_self_exit_closes_terminal_manager_before_exiting(self):
+        manager = Mock()
+        with patch.object(agent_server, "TERMINAL_MANAGER", manager), \
+             patch.object(agent_server.os, "_exit") as exit_mock:
+            agent_server._windows_update_self_exit_now()
+
+        manager.close_all.assert_called_once_with()
+        exit_mock.assert_called_once_with(0)
+
+    def test_self_exit_tolerates_a_missing_terminal_manager(self):
+        with patch.object(agent_server, "TERMINAL_MANAGER", None), \
+             patch.object(agent_server.os, "_exit") as exit_mock:
+            agent_server._windows_update_self_exit_now()
+
+        exit_mock.assert_called_once_with(0)
+
+    def test_self_exit_still_exits_when_terminal_close_fails(self):
+        manager = Mock()
+        manager.close_all.side_effect = RuntimeError("pty stuck")
+        with patch.object(agent_server, "TERMINAL_MANAGER", manager), \
+             patch.object(agent_server.os, "_exit") as exit_mock:
+            agent_server._windows_update_self_exit_now()
+
+        manager.close_all.assert_called_once_with()
+        exit_mock.assert_called_once_with(0)
 
 
 if __name__ == "__main__":

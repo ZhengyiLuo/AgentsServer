@@ -14,7 +14,6 @@ import argparse
 import asyncio
 import ctypes
 import errno
-import fcntl
 import glob
 import hashlib
 import hmac
@@ -25,8 +24,7 @@ import logging
 import math
 import mmap
 import os
-import pwd
-import pty
+import platform
 import re
 import secrets
 import shlex
@@ -37,11 +35,45 @@ import stat
 import struct
 import subprocess
 import sys
-import termios
 import tempfile
 import threading
 import time
 import uuid
+
+try:  # Unix-only; None on Windows. Terminal/workspace features gate themselves.
+    import fcntl
+except ImportError:  # pragma: no cover - platform dependent
+    fcntl = None  # type: ignore[assignment]
+
+try:
+    import pwd
+except ImportError:  # pragma: no cover - platform dependent
+    pwd = None  # type: ignore[assignment]
+
+try:
+    import pty
+except ImportError:  # pragma: no cover - platform dependent
+    pty = None  # type: ignore[assignment]
+
+try:
+    import termios
+except ImportError:  # pragma: no cover - platform dependent
+    termios = None  # type: ignore[assignment]
+
+try:  # Windows-only handle-traversal workspace filesystem; SUPPORTED is False elsewhere.
+    import winfs
+except ImportError:  # pragma: no cover - platform dependent
+    winfs = None  # type: ignore[assignment]
+
+try:  # Windows-only job-object process ownership; SUPPORTED is False elsewhere.
+    import winproc
+except ImportError:  # pragma: no cover - platform dependent
+    winproc = None  # type: ignore[assignment]
+
+try:  # Windows-only ConPTY persistent-terminal backend; SUPPORTED is False elsewhere.
+    import winterminal
+except ImportError:  # pragma: no cover - platform dependent
+    winterminal = None  # type: ignore[assignment]
 from collections import OrderedDict, deque
 from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import datetime, timezone
@@ -81,7 +113,15 @@ logger = logging.getLogger("agents-server")
 
 BACKEND_CLAUDE = "claude"
 BACKEND_CODEX = "codex"
-VALID_BACKENDS = {BACKEND_CLAUDE, BACKEND_CODEX}
+BACKEND_KIMI = "kimi"
+BACKEND_REASONIX = "reasonix"
+VALID_BACKENDS = {BACKEND_CLAUDE, BACKEND_CODEX, BACKEND_KIMI, BACKEND_REASONIX}
+PROVIDER_IDENTITY_KEYS = {
+    BACKEND_CLAUDE: "claude_session_id",
+    BACKEND_CODEX: "codex_thread_id",
+    BACKEND_KIMI: "kimi_session_id",
+    BACKEND_REASONIX: "reasonix_session_id",
+}
 CODEX_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 CODEX_EFFORT_ALIASES = {
     "extra high": "xhigh",
@@ -151,6 +191,14 @@ CLAUDE_PROJECTS_ROOT = Path(os.environ.get("CLAUDE_PROJECTS_ROOT", Path.home() /
 CODEX_SESSIONS_ROOT = Path(os.environ.get("CODEX_SESSIONS_ROOT", Path.home() / ".codex" / "sessions"))
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CODEX_BIN = os.environ.get("CODEX_BIN", "codex")
+KIMI_BIN = os.environ.get("KIMI_BIN", "kimi")
+# Windows does not resolve extensionless npm shims (e.g. claude.cmd) at spawn
+# time, so resolve each CLI through PATHEXT-aware lookup once at startup.
+CLAUDE_BIN = shutil.which(CLAUDE_BIN) or CLAUDE_BIN
+CODEX_BIN = shutil.which(CODEX_BIN) or CODEX_BIN
+KIMI_BIN = shutil.which(KIMI_BIN) or KIMI_BIN
+REASONIX_BIN = os.environ.get("REASONIX_BIN", "reasonix")
+REASONIX_BIN = shutil.which(REASONIX_BIN) or REASONIX_BIN
 CODEX_DEFAULT_MODEL = agentsdock_setting("CODEX_MODEL", "gpt-5.5").strip() or "gpt-5.5"
 _configured_codex_effort = agentsdock_setting("CODEX_EFFORT", "xhigh").strip().lower() or "xhigh"
 CODEX_DEFAULT_EFFORT = CODEX_EFFORT_ALIASES.get(_configured_codex_effort, _configured_codex_effort)
@@ -237,6 +285,17 @@ CODEX_FALLBACK_SERVICE_TIERS = {
     "gpt-5.6-terra": "priority",
     "gpt-5.6-luna": "priority",
 }
+
+KIMI_FALLBACK_MODELS = (
+    ("kimi-for-coding", "Kimi for Coding"),
+    ("kimi-for-coding-highspeed", "Kimi for Coding (Highspeed)"),
+    ("k3", "K3"),
+    ("k3-256k", "K3 256K"),
+)
+# NOTE: only aliases that exist in the kimi CLI config (or its built-ins) may be
+# advertised here — `kimi -m <alias>` fails hard for unknown models (verified:
+# "kimi-k3" is not configured). Reasonix is a separate runtime/backend, not a
+# kimi model; see BACKEND_REASONIX.
 
 REQUEST_TIMEOUT_SECONDS = int(agentsdock_setting("REQUEST_TIMEOUT_SECONDS", "86400"))
 CODEX_APP_SERVER_TIMEOUT_SECONDS = int(agentsdock_setting("CODEX_APP_SERVER_TIMEOUT_SECONDS", "30"))
@@ -390,12 +449,18 @@ MAX_WORKSPACE_PREVIEW_BYTES = max(
     int(agentsdock_setting("WORKSPACE_PREVIEW_MAX_BYTES", str(100 * 1024 * 1024))),
 )
 MAX_WORKSPACE_PATH_CHARS = int(agentsdock_setting("WORKSPACE_PATH_MAX_CHARS", "4096"))
+MAX_WORKING_DIRECTORY_COMPLETIONS = 50
+MAX_WORKING_DIRECTORY_SCAN_ENTRIES = 5_000
 MAX_WORKSPACE_SEARCH_SCAN = int(agentsdock_setting("WORKSPACE_SEARCH_MAX_ENTRIES", "20000"))
 MAX_WORKSPACE_SEARCH_SECONDS = max(
     0.1, float(agentsdock_setting("WORKSPACE_SEARCH_MAX_SECONDS", "2.0"))
 )
 MAX_WORKSPACE_GIT_SEARCH_BYTES = int(agentsdock_setting("WORKSPACE_GIT_SEARCH_MAX_BYTES", str(8 * 1024 * 1024)))
-WORKSPACE_SECURE_OPEN_AVAILABLE = all(hasattr(os, flag) for flag in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK"))
+WORKSPACE_WINFS = winfs is not None and winfs.SUPPORTED
+WORKSPACE_SECURE_OPEN_AVAILABLE = (
+    WORKSPACE_WINFS
+    or all(hasattr(os, flag) for flag in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK"))
+)
 WORKSPACE_WRITE_LOCKS = tuple(threading.Lock() for _ in range(256))
 WORKSPACE_PREVIEW_MEDIA_TYPES = {
     ".avif": "image/avif",
@@ -420,7 +485,7 @@ def configure_atomic_workspace_rename() -> tuple[Any | None, int]:
     """Return a descriptor-relative, atomic no-replace rename function and flag."""
     try:
         libc = ctypes.CDLL(None, use_errno=True)
-    except OSError:
+    except (OSError, TypeError):  # CDLL(None) raises TypeError on Windows
         return None, 0
     if sys.platform.startswith("linux"):
         function = getattr(libc, "renameat2", None)
@@ -438,7 +503,11 @@ def configure_atomic_workspace_rename() -> tuple[Any | None, int]:
 
 
 WORKSPACE_ATOMIC_RENAME, WORKSPACE_ATOMIC_RENAME_FLAG = configure_atomic_workspace_rename()
-WORKSPACE_MUTATIONS_AVAILABLE = WORKSPACE_SECURE_OPEN_AVAILABLE and WORKSPACE_ATOMIC_RENAME is not None
+# Mutations need an atomic same-directory replace.  POSIX uses renameat2/renameatx_np;
+# Windows uses the winfs handle-based temp+rename-over, so both report mutations.
+WORKSPACE_MUTATIONS_AVAILABLE = WORKSPACE_SECURE_OPEN_AVAILABLE and (
+    WORKSPACE_ATOMIC_RENAME is not None or WORKSPACE_WINFS
+)
 AGENT_TOKEN = env_setting(
     "AGENTSDOCK_AGENT_TOKEN",
     "",
@@ -451,7 +520,7 @@ AGENT_TOKEN = env_setting(
 ARTIFACT_PUBLISH_TOKEN = secrets.token_urlsafe(32)
 SERVER_BIND_ADDRESS = agentsdock_setting("AGENT_BIND", "0.0.0.0")
 SERVER_PORT = int(agentsdock_setting("AGENT_PORT", "7850"))
-API_CONTRACT_VERSION = 10
+API_CONTRACT_VERSION = 11
 SESSION_ORDER_STEP = 1000.0
 FORK_INTERNAL_PURPOSES = {"handoff_digest", "handoff_digest_delivery"}
 CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS = int(agentsdock_setting("CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS", "120"))
@@ -959,14 +1028,87 @@ def code_diffs_dir(session_id: str) -> Path:
 
 
 def existing_cwd(requested: str | None) -> str:
-    candidates = [requested, DEFAULT_CWD, str(Path.home()), "/tmp"]
+    fallback = os.environ.get("TEMP", str(Path.home())) if os.name == "nt" else "/tmp"
+    candidates = [requested, DEFAULT_CWD, str(Path.home()), fallback]
     for candidate in candidates:
         if not candidate:
             continue
         path = Path(str(candidate)).expanduser()
         if path.is_dir():
             return str(path)
-    return "/tmp"
+    return fallback
+
+
+def complete_working_directory_sync(requested: str | None, limit: int = 24) -> dict[str, Any]:
+    """Return bounded directory-only completions from the AgentsServer host.
+
+    Clients may be connected to a remote server, so resolving this field on the
+    client host would offer paths the agent cannot use. This helper performs one
+    shallow scan and returns no file names.
+    """
+    raw = str(requested or "").strip()
+    if "\x00" in raw:
+        raise HTTPException(status_code=400, detail="working directory paths cannot contain NUL bytes")
+    if len(raw) > MAX_WORKSPACE_PATH_CHARS:
+        raise HTTPException(status_code=400, detail="working directory path is too long")
+    bounded_limit = max(1, min(int(limit), MAX_WORKING_DIRECTORY_COMPLETIONS))
+    source = raw or existing_cwd(DEFAULT_CWD)
+    expanded = os.path.expanduser(source)
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(existing_cwd(DEFAULT_CWD), expanded)
+    normalized = os.path.normpath(expanded)
+    exact = os.path.isdir(normalized)
+    scan_path = normalized if exact else os.path.dirname(normalized)
+    prefix = "" if exact else os.path.basename(normalized)
+    if not scan_path:
+        scan_path = os.path.abspath(os.sep)
+
+    suggestions: list[dict[str, Any]] = []
+    truncated = False
+    scan_error: str | None = None
+    try:
+        with os.scandir(scan_path) as entries:
+            candidates: list[tuple[str, bool]] = []
+            for scanned, entry in enumerate(entries):
+                if scanned >= MAX_WORKING_DIRECTORY_SCAN_ENTRIES:
+                    truncated = True
+                    break
+                name = entry.name
+                if not prefix.startswith(".") and name.startswith("."):
+                    continue
+                if prefix and not name.casefold().startswith(prefix.casefold()):
+                    continue
+                try:
+                    if not entry.is_dir(follow_symlinks=True):
+                        continue
+                    candidates.append((name, entry.is_symlink()))
+                except OSError:
+                    continue
+        candidates.sort(key=lambda item: (item[0].casefold(), item[0]))
+        truncated = truncated or len(candidates) > bounded_limit
+        for name, is_symlink in candidates[:bounded_limit]:
+            completed = os.path.join(scan_path, name)
+            if not completed.endswith(os.sep):
+                completed += os.sep
+            suggestions.append({"name": name, "path": completed, "symlink": is_symlink})
+    except FileNotFoundError:
+        scan_error = "Parent directory not found."
+    except NotADirectoryError:
+        scan_error = "Parent path is not a directory."
+    except PermissionError:
+        scan_error = "Permission denied while reading this directory."
+    except OSError:
+        scan_error = "This directory could not be read."
+
+    return {
+        "input": raw,
+        "resolved_path": normalized,
+        "exists": exact,
+        "base_path": scan_path,
+        "suggestions": suggestions,
+        "truncated": truncated,
+        "message": scan_error,
+    }
 
 
 def validated_fork_cwd(session: dict[str, Any]) -> str:
@@ -999,6 +1141,59 @@ def workspace_http_error(status_code: int, code: str, message: str, action: str 
     return HTTPException(status_code=status_code, detail=detail)
 
 
+def _open_winfs_workspace_root(configured: str) -> Any:
+    """Open the session cwd as a pinned winfs root with accurate error mapping."""
+    try:
+        resolved = Path(configured).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise workspace_http_error(
+            409,
+            "workspace_unavailable",
+            f"The chat working directory is unavailable: {configured}",
+            "Update the working directory in the inspector.",
+        ) from exc
+    try:
+        return winfs.open_root(str(resolved))
+    except winfs.WinFSError as exc:
+        if exc.errno == errno.ENOTDIR:
+            raise workspace_http_error(
+                409,
+                "workspace_unavailable",
+                f"The chat working directory is not a directory: {configured}",
+                "Update the working directory in the inspector.",
+            ) from exc
+        if exc.errno == errno.ENOENT:
+            raise workspace_http_error(
+                409,
+                "workspace_unavailable",
+                f"The chat working directory no longer exists: {configured}",
+                "Update the working directory in the inspector.",
+            ) from exc
+        if exc.errno in (errno.EACCES, errno.EPERM):
+            if getattr(exc, "win32_error", None) == 32:  # ERROR_SHARING_VIOLATION
+                raise workspace_http_error(
+                    403,
+                    "workspace_access_denied",
+                    "The working directory is open with conflicting access by "
+                    f"another process (sharing violation): {configured}",
+                    "Close programs browsing this folder, or choose a different "
+                    "working directory.",
+                ) from exc
+            raise workspace_http_error(
+                403,
+                "workspace_permission_denied",
+                f"Permission denied opening the working directory: {configured}",
+                "Grant the agent server user read access, or choose a different "
+                "working directory.",
+            ) from exc
+        raise workspace_http_error(
+            409,
+            "workspace_unavailable",
+            f"The chat working directory is unavailable: {configured} ({exc})",
+            "Update the working directory in the inspector.",
+        ) from exc
+
+
 def session_workspace_root(session_id: str, *, for_write: bool = False) -> tuple[dict[str, Any], Path]:
     if not WORKSPACE_SECURE_OPEN_AVAILABLE:
         raise workspace_http_error(
@@ -1019,6 +1214,8 @@ def session_workspace_root(session_id: str, *, for_write: bool = False) -> tuple
             "This chat does not have a working directory.",
             "Set its working directory in the inspector.",
         )
+    if WORKSPACE_WINFS:
+        return sess, _open_winfs_workspace_root(configured)
     try:
         root = Path(configured).expanduser().resolve(strict=True)
     except (OSError, RuntimeError) as exc:
@@ -1179,6 +1376,8 @@ def workspace_entry(relative_path: str, name: str, item_stat: os.stat_result) ->
 
 
 def workspace_info_sync(session_id: str) -> dict[str, Any]:
+    if WORKSPACE_WINFS:
+        return _workspace_info_winfs(session_id)
     sess, root = session_workspace_root(session_id)
     return {
         "root": str(root),
@@ -1197,6 +1396,8 @@ def list_workspace_entries_sync(
     offset: int,
     limit: int,
 ) -> dict[str, Any]:
+    if WORKSPACE_WINFS:
+        return _list_workspace_entries_winfs(session_id, relative_path, offset, limit)
     sess, root = session_workspace_root(session_id)
     normalized = normalize_workspace_path(relative_path, allow_root=True)
     directory_fd = open_workspace_directory_fd(root, normalized)
@@ -1233,6 +1434,8 @@ def list_workspace_entries_sync(
 
 
 def read_workspace_file_sync(session_id: str, relative_path: str) -> dict[str, Any]:
+    if WORKSPACE_WINFS:
+        return _read_workspace_file_winfs(session_id, relative_path)
     sess, root = session_workspace_root(session_id)
     normalized = normalize_workspace_path(relative_path)
     parent_fd, name = open_workspace_parent_fd(root, normalized)
@@ -1317,6 +1520,8 @@ def normalize_absolute_file_path(value: str | None) -> tuple[Path, str, str]:
 
 
 def read_absolute_file_sync(session_id: str, absolute_path: str) -> dict[str, Any]:
+    if WORKSPACE_WINFS:
+        return _read_absolute_file_winfs(session_id, absolute_path)
     """Read one explicitly named absolute UTF-8 file without enumerating its parent."""
     if not WORKSPACE_SECURE_OPEN_AVAILABLE:
         raise workspace_http_error(
@@ -1398,6 +1603,8 @@ def workspace_preview_media_type(relative_path: str) -> str:
 
 
 def open_workspace_preview_sync(session_id: str, relative_path: str) -> dict[str, Any]:
+    if WORKSPACE_WINFS:
+        return _open_workspace_stream_winfs(session_id, relative_path, preview=True)
     """Securely open one preview resource and transfer ownership of its file descriptor."""
     _, root = session_workspace_root(session_id)
     normalized = normalize_workspace_path(relative_path)
@@ -1444,6 +1651,8 @@ def open_workspace_preview_sync(session_id: str, relative_path: str) -> dict[str
 
 
 def open_workspace_download_sync(session_id: str, relative_path: str) -> dict[str, Any]:
+    if WORKSPACE_WINFS:
+        return _open_workspace_stream_winfs(session_id, relative_path, preview=False)
     """Securely open one workspace file for an explicit user download."""
     _, root = session_workspace_root(session_id)
     normalized = normalize_workspace_path(relative_path)
@@ -1549,7 +1758,9 @@ def workspace_write_lock(root: Path, relative_path: str) -> threading.Lock:
     # Key by the lexical destination rather than the API's root/relative
     # representation. The same file can be addressed through the workspace
     # route or the explicit absolute route and must share one process lock.
-    destination = os.path.normcase(os.path.normpath(str(root.joinpath(*relative_path.split("/")))))
+    # A winfs WinRoot carries its pinned final path; a POSIX root is a Path.
+    root_path = getattr(root, "final_path", None) or str(root)
+    destination = os.path.normcase(os.path.normpath(str(Path(root_path).joinpath(*relative_path.split("/")))))
     key = hashlib.sha256(destination.encode("utf-8", errors="surrogatepass")).digest()
     return WORKSPACE_WRITE_LOCKS[int.from_bytes(key[:2], "big") % len(WORKSPACE_WRITE_LOCKS)]
 
@@ -1572,7 +1783,7 @@ def workspace_write_locks(root: Path, *relative_paths: str):
 
 def preserve_workspace_metadata(source_fd: int, destination_fd: int, source_stat: os.stat_result) -> None:
     os.fchmod(destination_fd, stat.S_IMODE(source_stat.st_mode))
-    with suppress(PermissionError):
+    with suppress(PermissionError, AttributeError):
         os.fchown(destination_fd, source_stat.st_uid, source_stat.st_gid)
     if not all(hasattr(os, name) for name in ("listxattr", "getxattr", "setxattr")):
         return
@@ -1593,6 +1804,8 @@ def write_workspace_file_sync(
     content: str,
     expected_revision: str,
 ) -> dict[str, Any]:
+    if WORKSPACE_WINFS:
+        return _write_workspace_file_winfs(session_id, relative_path, content, expected_revision)
     _, root = session_workspace_root(session_id, for_write=True)
     normalized = normalize_workspace_path(relative_path)
     with workspace_write_lock(root, normalized):
@@ -1605,6 +1818,8 @@ def write_absolute_file_sync(
     content: str,
     expected_revision: str,
 ) -> dict[str, Any]:
+    if WORKSPACE_WINFS:
+        return _write_absolute_file_winfs(session_id, absolute_path, content, expected_revision)
     """Revision-check and atomically replace one explicitly named absolute file.
 
     This grants no directory enumeration or create/rename/delete authority. The
@@ -1825,6 +2040,8 @@ def create_workspace_entry_sync(
     relative_path: str,
     kind: Literal["file", "directory"],
 ) -> dict[str, Any]:
+    if WORKSPACE_WINFS:
+        return _create_workspace_entry_winfs(session_id, relative_path, kind)
     _, root = session_workspace_root(session_id, for_write=True)
     normalized = normalize_workspace_path(relative_path)
     if kind not in {"file", "directory"}:
@@ -2029,6 +2246,8 @@ def rename_workspace_entry_sync(
     new_name: str,
     expected_revision: str,
 ) -> dict[str, Any]:
+    if WORKSPACE_WINFS:
+        return _rename_workspace_entry_winfs(session_id, relative_path, new_name, expected_revision)
     _, root = session_workspace_root(session_id, for_write=True)
     normalized = normalize_workspace_path(relative_path)
     old_name = normalized.rsplit("/", 1)[-1]
@@ -2221,6 +2440,8 @@ def remove_workspace_entry_sync(
     expected_revision: str,
     recursive: bool,
 ) -> dict[str, Any]:
+    if WORKSPACE_WINFS:
+        return _remove_workspace_entry_winfs(session_id, relative_path, expected_revision, recursive)
     _, root = session_workspace_root(session_id, for_write=True)
     normalized = normalize_workspace_path(relative_path)
     with workspace_write_lock(root, normalized):
@@ -2412,6 +2633,8 @@ def search_git_workspace_files(
 
 
 def search_workspace_files_sync(session_id: str, query: str, limit: int) -> dict[str, Any]:
+    if WORKSPACE_WINFS:
+        return _search_workspace_files_winfs(session_id, query, limit)
     sess, root = session_workspace_root(session_id)
     clean_query = str(query or "").strip().casefold()
     if clean_query:
@@ -2487,6 +2710,632 @@ def search_workspace_files_sync(session_id: str, query: str, limit: int) -> dict
     }
 
 
+# ---------------------------------------------------------------------------
+# Windows (winfs) workspace backends.
+#
+# These mirror the POSIX dir_fd implementations above with identical externally
+# observable semantics (HTTP codes, error codes, revision/identity tuples,
+# pagination, conflict responses).  They run only when WORKSPACE_WINFS is true
+# (native Windows with the winfs handle-traversal backend).  The POSIX bodies
+# are left untouched; each public sync function branches here at the top.
+# ---------------------------------------------------------------------------
+
+
+def _winfs_root_path(root: Any) -> str:
+    return root.final_path
+
+
+def _winfs_open_dir(root: Any, normalized: str, error_path: str) -> Any:
+    try:
+        return root.open_dir(normalized.split("/") if normalized else [])
+    except winfs.WinFSError as exc:
+        raise translate_workspace_os_error(exc, error_path, directory=True) from exc
+
+
+def _winfs_open_parent(root: Any, normalized: str) -> tuple[Any, str]:
+    try:
+        return root.open_parent(normalized.split("/"))
+    except winfs.WinFSError as exc:
+        raise translate_workspace_os_error(exc, normalized, directory=True) from exc
+
+
+def _winfs_translate_rename_error(exc: OSError, new_name: str, path: str) -> HTTPException:
+    """Map a no-replace rename failure like atomic_rename_workspace_entry does."""
+    error = exc.errno
+    if error in {errno.EEXIST, errno.ENOTEMPTY}:
+        return workspace_http_error(409, "workspace_entry_exists", f"Workspace entry already exists: {new_name}")
+    if error == errno.ENOENT:
+        return workspace_http_error(404, "workspace_entry_not_found", f"Workspace entry not found: {path}")
+    if error in {errno.EACCES, errno.EPERM, errno.EROFS}:
+        return workspace_http_error(403, "workspace_permission_denied", f"Permission denied: {path}")
+    if error == errno.ENAMETOOLONG:
+        return workspace_http_error(400, "invalid_workspace_name", "Workspace entry name is too long.")
+    if error == errno.EXDEV:
+        return workspace_http_error(409, "workspace_cross_device_move", "Workspace entries cannot be moved across filesystems.")
+    if error == errno.EBUSY:
+        return workspace_http_error(409, "workspace_entry_busy", f"Workspace entry is busy: {path}")
+    return translate_workspace_os_error(exc, path)
+
+
+def _workspace_info_winfs(session_id: str) -> dict[str, Any]:
+    sess, root = session_workspace_root(session_id)
+    root_path = _winfs_root_path(root)
+    return {
+        "root": root_path,
+        "name": Path(root_path).name or root_path,
+        "read_only": bool(sess.get("archived")),
+        "capability_version": 6 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
+        "max_text_file_bytes": MAX_WORKSPACE_TEXT_BYTES,
+        "max_preview_file_bytes": MAX_WORKSPACE_PREVIEW_BYTES,
+        "preview_media_types": sorted(set(WORKSPACE_PREVIEW_MEDIA_TYPES.values())),
+    }
+
+
+def _list_workspace_entries_winfs(
+    session_id: str,
+    relative_path: str,
+    offset: int,
+    limit: int,
+) -> dict[str, Any]:
+    sess, root = session_workspace_root(session_id)
+    normalized = normalize_workspace_path(relative_path, allow_root=True)
+    directory = _winfs_open_dir(root, normalized, normalized)
+    try:
+        records: list[dict[str, Any]] = []
+        try:
+            entries = directory.list()
+        except winfs.WinFSError as exc:
+            raise translate_workspace_os_error(exc, normalized, directory=True) from exc
+        for name, item_stat in entries:
+            record = workspace_entry(normalized, name, item_stat)
+            if record:
+                if bool(sess.get("archived")):
+                    record["writable"] = False
+                records.append(record)
+    finally:
+        directory.close()
+    records.sort(key=lambda item: (item["kind"] != "directory", str(item["name"]).casefold(), str(item["name"])))
+    total = len(records)
+    page = records[offset:offset + limit]
+    return {
+        "root": _winfs_root_path(root),
+        "path": normalized,
+        "entries": page,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "has_more": offset + len(page) < total,
+    }
+
+
+def _winfs_read_regular(parent: Any, name: str, normalized: str, size_limit: int, too_large_code: str, too_large_message: str) -> tuple[bytes, os.stat_result]:
+    """Open + read one regular file, mapping winfs errors like the POSIX read path."""
+    try:
+        fobj, item_stat = parent.open_read(name)
+    except winfs.WinFSError as exc:
+        if exc.errno == errno.EISDIR:
+            raise workspace_http_error(400, "workspace_not_regular_file", f"Not a regular workspace file: {normalized}") from exc
+        raise translate_workspace_os_error(exc, normalized) from exc
+    with fobj:
+        if not stat.S_ISREG(item_stat.st_mode):
+            raise workspace_http_error(400, "workspace_not_regular_file", f"Not a regular workspace file: {normalized}")
+        if item_stat.st_size > size_limit:
+            raise workspace_http_error(413, too_large_code, too_large_message)
+        data = fobj.read(size_limit + 1)
+    if len(data) > size_limit:
+        raise workspace_http_error(413, too_large_code, too_large_message)
+    return data, item_stat
+
+
+def _read_workspace_file_winfs(session_id: str, relative_path: str) -> dict[str, Any]:
+    sess, root = session_workspace_root(session_id)
+    normalized = normalize_workspace_path(relative_path)
+    parent, name = _winfs_open_parent(root, normalized)
+    try:
+        data, item_stat = _winfs_read_regular(
+            parent,
+            name,
+            normalized,
+            MAX_WORKSPACE_TEXT_BYTES,
+            "workspace_file_too_large",
+            f"{normalized} is larger than the {MAX_WORKSPACE_TEXT_BYTES // (1024 * 1024)} MiB editor limit.",
+        )
+        if b"\x00" in data:
+            raise workspace_http_error(415, "workspace_binary_file", f"{normalized} is binary and cannot be opened in the text editor.")
+        try:
+            content = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise workspace_http_error(415, "workspace_encoding_unsupported", f"{normalized} is not UTF-8 text.") from exc
+        return {
+            "root": _winfs_root_path(root),
+            "path": normalized,
+            "name": name,
+            "content": content,
+            "revision": workspace_revision(data),
+            "size": len(data),
+            "mtime_ns": int(item_stat.st_mtime_ns),
+            "writable": not bool(sess.get("archived")) and bool(item_stat.st_mode & 0o222),
+        }
+    finally:
+        parent.close()
+
+
+def _read_absolute_file_winfs(session_id: str, absolute_path: str) -> dict[str, Any]:
+    sess = STORE.sessions.get(session_id)
+    if not sess:
+        raise workspace_http_error(404, "session_not_found", "Chat not found.")
+    anchor, relative, normalized = normalize_absolute_file_path(absolute_path)
+    try:
+        root = winfs.open_root(str(anchor))
+    except winfs.WinFSError as exc:
+        raise translate_workspace_os_error(exc, normalized) from exc
+    try:
+        parent, name = _winfs_open_parent(root, relative)
+        try:
+            data, item_stat = _winfs_read_regular(
+                parent,
+                name,
+                normalized,
+                MAX_WORKSPACE_TEXT_BYTES,
+                "absolute_file_too_large",
+                f"{normalized} is larger than the {MAX_WORKSPACE_TEXT_BYTES // (1024 * 1024)} MiB editor limit.",
+            )
+            if b"\x00" in data:
+                raise workspace_http_error(415, "absolute_binary_file", f"{normalized} is binary and cannot be opened in the text editor.")
+            try:
+                content = data.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise workspace_http_error(415, "absolute_encoding_unsupported", f"{normalized} is not UTF-8 text.") from exc
+            return {
+                "root": _winfs_root_path(root),
+                "path": normalized,
+                "name": name,
+                "content": content,
+                "revision": workspace_revision(data),
+                "size": len(data),
+                "mtime_ns": int(item_stat.st_mtime_ns),
+                "writable": (
+                    WORKSPACE_MUTATIONS_AVAILABLE
+                    and not bool(sess.get("archived"))
+                    and bool(item_stat.st_mode & 0o222)
+                    and item_stat.st_nlink == 1
+                ),
+                "scope": "absolute",
+            }
+        finally:
+            parent.close()
+    finally:
+        root.close()
+
+
+def _open_workspace_stream_winfs(session_id: str, relative_path: str, *, preview: bool) -> dict[str, Any]:
+    """Shared preview/download opener returning a raw int fd plus metadata."""
+    _, root = session_workspace_root(session_id)
+    normalized = normalize_workspace_path(relative_path)
+    parent, name = _winfs_open_parent(root, normalized)
+    fd = -1
+    try:
+        try:
+            fd, item_stat = parent.open_read_fd(name)
+        except winfs.WinFSError as exc:
+            if exc.errno == errno.EISDIR:
+                raise workspace_http_error(400, "workspace_not_regular_file", f"Not a regular workspace file: {normalized}") from exc
+            raise translate_workspace_os_error(exc, normalized) from exc
+        if not stat.S_ISREG(item_stat.st_mode):
+            raise workspace_http_error(400, "workspace_not_regular_file", f"Not a regular workspace file: {normalized}")
+        if preview and item_stat.st_size > MAX_WORKSPACE_PREVIEW_BYTES:
+            raise workspace_http_error(
+                413,
+                "workspace_preview_too_large",
+                f"{normalized} is larger than the {MAX_WORKSPACE_PREVIEW_BYTES // (1024 * 1024)} MiB preview limit.",
+            )
+        result: dict[str, Any] = {
+            "file_fd": fd,
+            "root": _winfs_root_path(root),
+            "path": normalized,
+            "name": name,
+            "revision": workspace_entry_revision(item_stat),
+            "size": int(item_stat.st_size),
+            "mtime_ns": int(item_stat.st_mtime_ns),
+        }
+        if preview:
+            result["media_type"] = workspace_preview_media_type(normalized)
+        fd = -1  # ownership transferred to the caller
+        return result
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        parent.close()
+
+
+def _write_workspace_file_winfs(session_id: str, relative_path: str, content: str, expected_revision: str) -> dict[str, Any]:
+    _, root = session_workspace_root(session_id, for_write=True)
+    normalized = normalize_workspace_path(relative_path)
+    with workspace_write_lock(root, normalized):
+        return _write_workspace_file_locked_winfs(root, normalized, content, expected_revision)
+
+
+def _write_absolute_file_winfs(session_id: str, absolute_path: str, content: str, expected_revision: str) -> dict[str, Any]:
+    if not WORKSPACE_MUTATIONS_AVAILABLE:
+        raise workspace_http_error(501, "workspace_mutations_unavailable", "Secure absolute file editing is unavailable on this host.")
+    sess = STORE.sessions.get(session_id)
+    if not sess:
+        raise workspace_http_error(404, "session_not_found", "Chat not found.")
+    if bool(sess.get("archived")):
+        raise workspace_http_error(409, "workspace_read_only", "Archived chats cannot edit files.")
+    anchor, relative, normalized = normalize_absolute_file_path(absolute_path)
+    with workspace_write_lock(anchor, relative):
+        try:
+            root = winfs.open_root(str(anchor))
+        except winfs.WinFSError as exc:
+            raise translate_workspace_os_error(exc, normalized) from exc
+        try:
+            result = _write_workspace_file_locked_winfs(root, relative, content, expected_revision)
+        finally:
+            root.close()
+    return {
+        **result,
+        "path": normalized,
+        "scope": "absolute",
+    }
+
+
+def _write_workspace_file_locked_winfs(root: Any, relative_path: str, content: str, expected_revision: str) -> dict[str, Any]:
+    normalized = normalize_workspace_path(relative_path)
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_revision or ""):
+        raise workspace_http_error(400, "invalid_workspace_revision", "A valid workspace file revision is required.")
+    data = content.encode("utf-8")
+    if b"\x00" in data:
+        raise workspace_http_error(415, "workspace_binary_file", "Edited content cannot contain NUL bytes.")
+    if len(data) > MAX_WORKSPACE_TEXT_BYTES:
+        raise workspace_http_error(413, "workspace_file_too_large", "Edited content exceeds the workspace editor size limit.")
+    parent, name = _winfs_open_parent(root, normalized)
+    try:
+        try:
+            fobj, current_stat = parent.open_read(name)
+        except winfs.WinFSError as exc:
+            raise translate_workspace_os_error(exc, normalized) from exc
+        with fobj:
+            if not stat.S_ISREG(current_stat.st_mode):
+                raise workspace_http_error(400, "workspace_not_regular_file", f"Not a regular workspace file: {normalized}")
+            if current_stat.st_nlink > 1:
+                raise workspace_http_error(409, "workspace_hard_link_blocked", f"{normalized} has multiple hard links and cannot be replaced safely.")
+            if not bool(current_stat.st_mode & 0o222):
+                raise workspace_http_error(403, "workspace_permission_denied", f"Workspace file is read-only: {normalized}")
+            if current_stat.st_size > MAX_WORKSPACE_TEXT_BYTES:
+                raise workspace_http_error(413, "workspace_file_too_large", f"{normalized} exceeds the editor size limit.")
+            current_data = fobj.read(MAX_WORKSPACE_TEXT_BYTES + 1)
+        if len(current_data) > MAX_WORKSPACE_TEXT_BYTES:
+            raise workspace_http_error(413, "workspace_file_too_large", f"{normalized} exceeds the editor size limit.")
+        actual_revision = workspace_revision(current_data)
+        if not hmac.compare_digest(actual_revision, expected_revision.lower()):
+            raise workspace_http_error(409, "workspace_file_conflict", f"{normalized} changed on disk. Reload it before saving your edits.")
+        # Metadata note: POSIX preserve_workspace_metadata() copies mode bits/xattrs
+        # with fchmod.  Windows has no POSIX mode bits, so winfs.replace_file
+        # honestly preserves only the read-only attribute (FILE_ATTRIBUTE_READONLY)
+        # and performs the atomic temp+rename-over, providing the same
+        # never-mutate-in-place / conflict-on-race guarantee.
+        identity = (current_stat.st_dev, current_stat.st_ino, current_stat.st_mtime_ns, current_stat.st_size)
+        try:
+            updated_stat = parent.replace_file(name, data, expected_identity=identity)
+        except winfs.WinFSError as exc:
+            if exc.errno == errno.EBUSY:
+                raise workspace_http_error(409, "workspace_file_conflict", f"{normalized} changed while it was being saved. Reload it and try again.") from exc
+            raise translate_workspace_os_error(exc, normalized) from exc
+        return {
+            "root": _winfs_root_path(root),
+            "path": normalized,
+            "name": name,
+            "content": content,
+            "revision": workspace_revision(data),
+            "size": len(data),
+            "mtime_ns": int(updated_stat.st_mtime_ns),
+            "writable": bool(updated_stat.st_mode & 0o222),
+        }
+    finally:
+        parent.close()
+
+
+def _create_workspace_entry_winfs(session_id: str, relative_path: str, kind: str) -> dict[str, Any]:
+    _, root = session_workspace_root(session_id, for_write=True)
+    normalized = normalize_workspace_path(relative_path)
+    if kind not in {"file", "directory"}:
+        raise workspace_http_error(400, "invalid_workspace_entry_kind", "Workspace entry kind must be file or directory.")
+    parent_path = normalized.rsplit("/", 1)[0] if "/" in normalized else ""
+    with workspace_write_lock(root, normalized):
+        parent, name = _winfs_open_parent(root, normalized)
+        created = False
+        try:
+            try:
+                if kind == "file":
+                    created_stat = parent.create_file(name, b"")
+                    created = True
+                else:
+                    created_stat = parent.mkdir(name)
+                    created = True
+            except HTTPException:
+                raise
+            except OSError as exc:
+                raise translate_workspace_create_error(exc, normalized, kind) from exc
+            entry = workspace_entry(parent_path, name, created_stat)
+            if entry is None:
+                raise workspace_http_error(400, "workspace_entry_type_unsupported", f"Workspace entry type cannot be created: {normalized}")
+            result: dict[str, Any] = {
+                "root": _winfs_root_path(root),
+                "entry": entry,
+            }
+            if kind == "file":
+                result["file"] = {
+                    "root": _winfs_root_path(root),
+                    "path": normalized,
+                    "name": name,
+                    "content": "",
+                    "revision": workspace_revision(b""),
+                    "size": 0,
+                    "mtime_ns": int(created_stat.st_mtime_ns),
+                    "writable": bool(created_stat.st_mode & 0o222),
+                }
+            return result
+        except Exception as exc:
+            if created:
+                logger.error("workspace create may have partially succeeded for %s: %s", normalized, exc)
+                raise workspace_create_partial_success_error(normalized) from exc
+            raise
+        finally:
+            parent.close()
+
+
+def _rename_workspace_entry_winfs(session_id: str, relative_path: str, new_name: str, expected_revision: str) -> dict[str, Any]:
+    _, root = session_workspace_root(session_id, for_write=True)
+    normalized = normalize_workspace_path(relative_path)
+    old_name = normalized.rsplit("/", 1)[-1]
+    clean_name = normalize_workspace_entry_name(new_name, normalized)
+    if clean_name == old_name:
+        raise workspace_http_error(400, "workspace_entry_unchanged", "The workspace entry already has that name.")
+    parent_path = normalized.rsplit("/", 1)[0] if "/" in normalized else ""
+    destination_path = f"{parent_path}/{clean_name}" if parent_path else clean_name
+    with workspace_write_locks(root, normalized, destination_path):
+        parent, _final_old = _winfs_open_parent(root, normalized)
+        try:
+            try:
+                source_stat = parent.stat(old_name)
+            except winfs.WinFSError as exc:
+                if exc.errno == errno.ENOENT:
+                    raise workspace_http_error(404, "workspace_entry_not_found", f"Workspace entry not found: {normalized}") from exc
+                raise translate_workspace_os_error(exc, normalized) from exc
+            workspace_entry_kind(source_stat, normalized)
+            validate_workspace_entry_revision(expected_revision, source_stat, normalized)
+            try:
+                parent.rename(old_name, clean_name, replace=False)
+            except winfs.WinFSError as exc:
+                raise _winfs_translate_rename_error(exc, clean_name, normalized) from exc
+            try:
+                updated_stat = parent.stat(clean_name)
+            except winfs.WinFSError as exc:
+                raise translate_workspace_os_error(exc, destination_path) from exc
+            if workspace_rename_identity(updated_stat) != workspace_rename_identity(source_stat):
+                try:
+                    parent.rename(clean_name, old_name, replace=False)
+                except winfs.WinFSError as rollback_exc:
+                    logger.critical("workspace rename rollback failed for %s -> %s: %s", normalized, destination_path, rollback_exc)
+                    raise workspace_http_error(500, "workspace_rename_rollback_failed", (
+                        f"{normalized} changed while it was being renamed, and the server could not safely restore its original path. "
+                        "Refresh the file explorer and inspect both paths before trying again."
+                    )) from rollback_exc
+                raise workspace_http_error(409, "workspace_entry_conflict", f"{normalized} changed while it was being renamed.")
+            entry = workspace_entry(parent_path, clean_name, updated_stat)
+            if entry is None:
+                raise workspace_http_error(400, "workspace_entry_type_unsupported", f"Workspace entry type cannot be changed: {destination_path}")
+            return {
+                "root": _winfs_root_path(root),
+                "previous_path": normalized,
+                "entry": entry,
+            }
+        finally:
+            parent.close()
+
+
+def _remove_workspace_entry_winfs(session_id: str, relative_path: str, expected_revision: str, recursive: bool) -> dict[str, Any]:
+    _, root = session_workspace_root(session_id, for_write=True)
+    normalized = normalize_workspace_path(relative_path)
+    with workspace_write_lock(root, normalized):
+        parent, name = _winfs_open_parent(root, normalized)
+        try:
+            try:
+                item_stat = parent.stat(name)
+            except winfs.WinFSError as exc:
+                if exc.errno == errno.ENOENT:
+                    raise workspace_http_error(404, "workspace_entry_not_found", f"Workspace entry not found: {normalized}") from exc
+                raise translate_workspace_os_error(exc, normalized) from exc
+            kind = workspace_entry_kind(item_stat, normalized)
+            validate_workspace_entry_revision(expected_revision, item_stat, normalized)
+            ensure_workspace_device(item_stat, root.device, normalized)
+            try:
+                if kind == "directory":
+                    if recursive:
+                        parent.delete_tree(name)
+                    else:
+                        parent.rmdir(name)
+                else:
+                    parent.unlink(name)
+            except winfs.WinFSError as exc:
+                raise translate_workspace_delete_error(exc, normalized, directory=(kind == "directory")) from exc
+            parent.flush()
+            return {
+                "root": _winfs_root_path(root),
+                "path": normalized,
+                "kind": kind,
+                "removed": True,
+            }
+        finally:
+            parent.close()
+
+
+def _search_git_workspace_files_winfs(sess: dict[str, Any], root: Any, query: str, limit: int) -> dict[str, Any] | None:
+    escaped_query = glob.escape(query.replace("\\", "/"))
+    pathspecs = [
+        f":(icase,glob)*{escaped_query}*",
+        f":(icase,glob)**/*{escaped_query}*",
+    ]
+    try:
+        with tempfile.TemporaryFile() as output:
+            listed = subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-C",
+                    _winfs_root_path(root),
+                    "ls-files",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                    "-z",
+                    "--",
+                    *pathspecs,
+                ],
+                stdout=output,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=3,
+                env={
+                    **os.environ,
+                    "GIT_OPTIONAL_LOCKS": "0",
+                    "GIT_TERMINAL_PROMPT": "0",
+                },
+            )
+            output_size = output.tell()
+            output.seek(0)
+            raw_paths = output.read(max(1024, MAX_WORKSPACE_GIT_SEARCH_BYTES))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if listed.returncode != 0:
+        return None
+    output_truncated = output_size > len(raw_paths)
+    if output_truncated and raw_paths and not raw_paths.endswith(b"\0"):
+        raw_paths = raw_paths.rsplit(b"\0", 1)[0] + b"\0"
+
+    clean_query = query.casefold()
+    results: list[dict[str, Any]] = []
+    scanned = 0
+    seen: set[str] = set()
+    scan_truncated = False
+    for encoded_path in raw_paths.split(b"\0"):
+        if not encoded_path:
+            continue
+        if scanned >= MAX_WORKSPACE_SEARCH_SCAN:
+            scan_truncated = True
+            break
+        try:
+            path = normalize_workspace_path(encoded_path.decode("utf-8"))
+        except (UnicodeDecodeError, HTTPException):
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        scanned += 1
+        if clean_query not in path.casefold():
+            continue
+        parent = None
+        try:
+            parent, name = _winfs_open_parent(root, path)
+            item_stat = parent.stat(name)
+        except (HTTPException, OSError):
+            continue
+        finally:
+            if parent is not None:
+                parent.close()
+        if not stat.S_ISREG(item_stat.st_mode):
+            continue
+        record = workspace_entry(path.rsplit("/", 1)[0] if "/" in path else "", name, item_stat)
+        if not record:
+            continue
+        record["writable"] = not bool(sess.get("archived")) and bool(item_stat.st_mode & 0o222)
+        results.append(record)
+
+    results.sort(key=lambda item: workspace_search_rank(str(item["path"]), clean_query))
+    return {
+        "root": _winfs_root_path(root),
+        "query": query,
+        "entries": results[:limit],
+        "scanned": scanned,
+        "truncated": output_truncated or scan_truncated or len(results) > limit,
+        "limit": limit,
+    }
+
+
+def _search_workspace_files_winfs(session_id: str, query: str, limit: int) -> dict[str, Any]:
+    sess, root = session_workspace_root(session_id)
+    clean_query = str(query or "").strip().casefold()
+    if clean_query:
+        indexed = _search_git_workspace_files_winfs(sess, root, clean_query, limit)
+        if indexed is not None:
+            indexed["query"] = str(query or "")
+            return indexed
+    queue: deque[str] = deque([""])
+    results: list[dict[str, Any]] = []
+    scanned = 0
+    truncated = False
+    deadline = time.monotonic() + MAX_WORKSPACE_SEARCH_SECONDS
+    while queue:
+        if time.monotonic() >= deadline:
+            truncated = True
+            break
+        directory = queue.popleft()
+        try:
+            directory_dir = _winfs_open_dir(root, directory, directory)
+        except HTTPException:
+            if not directory:
+                raise
+            continue
+        try:
+            names = sorted(directory_dir.list(), key=lambda item: (item[0].casefold(), item[0]))
+            for name, item_stat in names:
+                scanned += 1
+                if scanned > MAX_WORKSPACE_SEARCH_SCAN:
+                    truncated = True
+                    queue.clear()
+                    break
+                if scanned % 128 == 0 and time.monotonic() >= deadline:
+                    truncated = True
+                    queue.clear()
+                    break
+                path = f"{directory}/{name}" if directory else name
+                if stat.S_ISDIR(item_stat.st_mode):
+                    if name not in WORKSPACE_SEARCH_IGNORED_DIRECTORIES and not stat.S_ISLNK(item_stat.st_mode):
+                        queue.append(path)
+                    continue
+                if not stat.S_ISREG(item_stat.st_mode):
+                    continue
+                if clean_query and clean_query not in path.casefold():
+                    continue
+                results.append({
+                    "name": name,
+                    "path": path,
+                    "kind": "file",
+                    "size": int(item_stat.st_size),
+                    "mtime_ns": int(item_stat.st_mtime_ns),
+                    "hidden": name.startswith("."),
+                    "writable": not bool(sess.get("archived")) and bool(item_stat.st_mode & 0o222),
+                    "revision": workspace_entry_revision(item_stat),
+                })
+                if not clean_query and len(results) > limit:
+                    truncated = True
+                    queue.clear()
+                    break
+        finally:
+            directory_dir.close()
+    results.sort(key=lambda item: workspace_search_rank(str(item["path"]), clean_query))
+    return {
+        "root": _winfs_root_path(root),
+        "query": str(query or ""),
+        "entries": results[:limit],
+        "scanned": min(scanned, MAX_WORKSPACE_SEARCH_SCAN),
+        "truncated": truncated or len(results) > limit,
+        "limit": limit,
+    }
+
+
 def server_identity() -> str:
     machine = ""
     for path in (Path("/etc/machine-id"), Path("/var/lib/dbus/machine-id")):
@@ -2495,7 +3344,7 @@ def server_identity() -> str:
             if machine:
                 break
     if not machine:
-        machine = os.uname().nodename
+        machine = platform.node() if os.name == "nt" else os.uname().nodename
     payload = f"{machine}|{STATE_DIR.resolve()}".encode("utf-8", errors="ignore")
     return hashlib.sha256(payload).hexdigest()[:24]
 
@@ -2525,6 +3374,8 @@ def _git_command(
         stdout=stdout,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         env=env,
         timeout=CODE_DIFF_SNAPSHOT_TIMEOUT_SECONDS,
         check=False,
@@ -2539,6 +3390,8 @@ def _capture_git_tree(session_id: str, run_id: str, cwd: str) -> dict[str, str] 
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
             check=False,
         )
@@ -2954,6 +3807,8 @@ class CreateSessionRequest(BaseModel):
     session_id: str | None = None
     claude_session_id: str | None = None
     codex_thread_id: str | None = None
+    kimi_session_id: str | None = None
+    reasonix_session_id: str | None = None
     codex_approval_policy: Literal["never", "on-request", "untrusted"] | None = None
     codex_sandbox_mode: Literal["read-only", "workspace-write", "danger-full-access"] | None = None
     codex_permission_profile: str | None = Field(default=None, max_length=240)
@@ -3273,9 +4128,7 @@ def preview_session_runtime_update(
     preview["effort"] = normalized_effort
     if backend_changed:
         preview["session_id"] = sess.get(
-            "claude_session_id"
-            if prospective_backend == BACKEND_CLAUDE
-            else "codex_thread_id"
+            PROVIDER_IDENTITY_KEYS.get(prospective_backend, "claude_session_id")
         )
     return preview
 
@@ -3669,7 +4522,14 @@ class SessionStore:
         provider_id = req.provider_session_id or req.session_id
         claude_session_id = req.claude_session_id or (provider_id if backend == BACKEND_CLAUDE else None)
         codex_thread_id = req.codex_thread_id or (provider_id if backend == BACKEND_CODEX else None)
-        active_provider_id = claude_session_id if backend == BACKEND_CLAUDE else codex_thread_id
+        kimi_session_id = req.kimi_session_id or (provider_id if backend == BACKEND_KIMI else None)
+        reasonix_session_id = req.reasonix_session_id or (provider_id if backend == BACKEND_REASONIX else None)
+        active_provider_id = {
+            BACKEND_CLAUDE: claude_session_id,
+            BACKEND_CODEX: codex_thread_id,
+            BACKEND_KIMI: kimi_session_id,
+            BACKEND_REASONIX: reasonix_session_id,
+        }.get(backend)
         # A Claude chat can park an inactive Codex identity for later backend
         # switching, so validate every supplied Codex thread, not only the
         # currently active provider identity.
@@ -3694,6 +4554,8 @@ class SessionStore:
             "session_id": active_provider_id,
             "claude_session_id": claude_session_id,
             "codex_thread_id": codex_thread_id,
+            "kimi_session_id": kimi_session_id,
+            "reasonix_session_id": reasonix_session_id,
             "codex_approval_policy": (
                 req.codex_approval_policy or CODEX_DEFAULT_APPROVAL_POLICY
             ),
@@ -3797,8 +4659,8 @@ class SessionStore:
                             detail="backend is locked after the chat starts; fork or create a new chat to use another backend",
                         )
                     if sess.get("session_id"):
-                        sess["claude_session_id" if old == BACKEND_CLAUDE else "codex_thread_id"] = sess["session_id"]
-                    sess["session_id"] = sess.get("claude_session_id" if backend == BACKEND_CLAUDE else "codex_thread_id")
+                        sess[PROVIDER_IDENTITY_KEYS.get(old, "claude_session_id")] = sess["session_id"]
+                    sess["session_id"] = sess.get(PROVIDER_IDENTITY_KEYS.get(backend, "claude_session_id"))
                     sess["backend"] = backend
                     if "model" not in patch:
                         sess["model"] = None
@@ -4028,7 +4890,7 @@ class SessionStore:
             )
             sess["session_id"] = provider_id
             sess["backend"] = sess.get("backend") or backend
-            sess["claude_session_id" if backend == BACKEND_CLAUDE else "codex_thread_id"] = provider_id
+            sess[PROVIDER_IDENTITY_KEYS.get(backend, "claude_session_id")] = provider_id
             if backend == BACKEND_CLAUDE and cwd:
                 sess["claude_session_cwd"] = cwd
             if backend == BACKEND_CODEX and codex_instruction_hash is not None:
@@ -6835,9 +7697,14 @@ async def recover_abandoned_codex_compactions_after_start() -> int:
     return recovered
 
 
-async def terminate_process_tree(proc: asyncio.subprocess.Process, *, grace: float = STOP_GRACE_SECONDS) -> bool:
+async def terminate_process_tree(proc: Any, *, grace: float = STOP_GRACE_SECONDS) -> bool:
     if proc.returncode is not None:
         return False
+
+    if winproc is not None and isinstance(proc, winproc.OwnedProc):
+        # Windows job-owned spawn: graceful console stop for the root's
+        # process group, then TerminateJobObject reaps the whole tree.
+        return await proc.terminate_tree(grace=grace)
 
     sent = False
     if os.name != "nt":
@@ -6872,7 +7739,73 @@ async def terminate_process_tree(proc: asyncio.subprocess.Process, *, grace: flo
     return sent or killed
 
 
+def close_agent_process(proc: Any) -> None:
+    """Release an OwnedProc's job handle and pipes (no-op for asyncio procs)."""
+    if winproc is not None and isinstance(proc, winproc.OwnedProc):
+        proc.close()
+
+
+def resolve_exec_argv(cmd: list[str]) -> list[str]:
+    """Resolve argv[0] through winproc on Windows so npm .cmd shims spawn directly.
+
+    Without this, CreateProcess refuses .cmd/.bat targets ("not a valid Win32
+    application") and every provider probe/spawn 500s.  The shim is replaced
+    by its underlying ``node <cli.js>`` argv; native binaries pass through.
+    No-op on non-Windows.
+    """
+    if winproc is None or not cmd:
+        return list(cmd)
+    return [*winproc.resolve_cli_argv(str(cmd[0])), *[str(part) for part in cmd[1:]]]
+
+
+async def spawn_agent_process(
+    cmd: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+    stdin_mode: str,
+) -> Any:
+    """Spawn a turn-owning agent process, job-owned on native Windows.
+
+    The returned object duck-types ``asyncio.subprocess.Process`` for the
+    surface the run loops use (stdout.readline/stderr.read/stdin.write+drain+
+    close/wait/returncode/pid).  With winproc support the child is created
+    suspended, assigned to a kill-on-close job, then resumed — stop/cancel
+    kills the whole process tree.  Note: asyncio's ``limit=`` stream
+    backpressure does not apply on the winproc path; pipes are OS-buffered
+    and drained continuously by pump threads.
+    """
+    if winproc is not None and winproc.SUPPORTED:
+        # winproc has no inheritable-stdio mode; the owned spawn never shares
+        # the server's console std streams.  Callers that would inherit get
+        # DEVNULL, which matches their actual stdin usage.
+        return winproc.spawn_owned(
+            resolve_exec_argv(cmd),
+            cwd=cwd,
+            env=env,
+            stdin_mode="pipe" if stdin_mode == "pipe" else "devnull",
+        )
+    if stdin_mode == "pipe":
+        stdin = asyncio.subprocess.PIPE
+    elif stdin_mode == "devnull":
+        stdin = asyncio.subprocess.DEVNULL
+    else:
+        stdin = None  # "inherit": historical default for codex exec
+    return await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=stdin,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+        env=env,
+        limit=PROCESS_STREAM_LIMIT,
+        start_new_session=(os.name != "nt"),
+    )
+
+
 def process_group_for_pid(pid: int) -> int | None:
+    if os.name == "nt":
+        return None
     with suppress(ProcessLookupError, PermissionError, OSError):
         return os.getpgid(pid)
     return None
@@ -6944,6 +7877,10 @@ def procfs_process_rows() -> list[dict[str, Any]]:
 
 
 def ps_process_rows() -> list[dict[str, Any]]:
+    if os.name == "nt":
+        if winproc is not None:
+            return winproc.process_rows(limit=0)
+        return []
     proc_rows = procfs_process_rows()
     if proc_rows:
         return proc_rows
@@ -7024,6 +7961,10 @@ def parse_ps_rows(stdout: str) -> list[dict[str, Any]]:
 
 
 def top_process_rows(limit: int = 20) -> list[dict[str, Any]]:
+    if os.name == "nt":
+        if winproc is not None:
+            return winproc.process_rows(limit=max(1, min(limit, 50)))
+        return []
     command = ["ps", "-eo", "pid=,ppid=,pgid=,sid=,stat=,etimes=,pcpu=,pmem=,rss=,comm=,args=", "--sort=-pcpu"]
     try:
         result = subprocess.run(command, text=True, capture_output=True, timeout=3, check=False)
@@ -7160,7 +8101,63 @@ def tmux_bin() -> str:
     return found
 
 
+#: True only on native Windows with a working ConPTY backend (pywinpty).
+WINDOWS_TERMINAL_BACKEND = (
+    os.name == "nt" and winterminal is not None and bool(winterminal.SUPPORTED)
+)
+
+#: Process-wide ConPTY terminal registry, created on Windows only.  The
+#: manager registers an atexit close_all, so creating it is side-effect safe.
+TERMINAL_MANAGER = winterminal.TerminalManager() if WINDOWS_TERMINAL_BACKEND else None
+
+
+def windows_terminal_manager() -> Any:
+    """Return the ConPTY terminal manager or raise a truthful 503."""
+    if TERMINAL_MANAGER is None:
+        reason = (
+            winterminal.unavailable_reason()
+            if winterminal is not None
+            else "the winterminal module is not importable"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"persistent terminal is unavailable on this host: {reason}",
+        )
+    return TERMINAL_MANAGER
+
+
+def windows_terminal_unavailable_reason() -> str:
+    if winterminal is not None:
+        return str(winterminal.unavailable_reason() or "unknown reason")
+    return "the winterminal module is not importable"
+
+
 def tmux_capability(*, use_cache: bool = False) -> dict[str, Any]:
+    if os.name == "nt":
+        # There is no tmux on native Windows; the persistent chat terminal is
+        # served by the winterminal ConPTY backend instead.  Keep the payload
+        # shape identical so clients can keep reading this one capability key.
+        if WINDOWS_TERMINAL_BACKEND:
+            return {
+                "available": True,
+                "required": False,
+                "message": (
+                    "The persistent chat terminal is available through the native "
+                    "Windows ConPTY backend (pywinpty); tmux is not required or used."
+                ),
+                "action": None,
+            }
+        reason = (
+            winterminal.unavailable_reason()
+            if winterminal is not None
+            else "the winterminal module is not importable"
+        )
+        return {
+            "available": False,
+            "required": False,
+            "message": f"The persistent chat terminal is unavailable on this Windows host: {reason}.",
+            "action": "Install pywinpty into the AgentsServer virtualenv (pip install pywinpty) and restart the server.",
+        }
     available = working_tmux_bin(use_cache=use_cache) is not None
     if available:
         return {
@@ -7330,6 +8327,10 @@ def ensure_terminal_session(
         raise HTTPException(status_code=404, detail="session not found")
     if bool(sess.get("archived")):
         raise HTTPException(status_code=409, detail="unarchive this chat before opening its terminal")
+    if WINDOWS_TERMINAL_BACKEND:
+        return ensure_windows_terminal_session(
+            session_id, cwd, columns=columns, rows=rows
+        )
     name = terminal_session_name(session_id)
     shell = resolve_terminal_login_shell()
     path = terminal_session_path()
@@ -7405,7 +8406,7 @@ def spawn_terminal_client(
             cwd=workdir,
             env=env,
             close_fds=True,
-            start_new_session=True,
+            start_new_session=(os.name != "nt"),
         )
     except Exception:
         os.close(master_fd)
@@ -7462,6 +8463,8 @@ def stop_terminal_client(process: subprocess.Popen[bytes], master_fd: int) -> No
 def terminal_snapshot(session_id: str, *, lines: int = 240, created: bool = False) -> dict[str, Any]:
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
+    if WINDOWS_TERMINAL_BACKEND:
+        return windows_terminal_snapshot(session_id, lines=lines, created=created)
     name = terminal_session_name(session_id)
     exists = tmux_session_exists(name)
     line_count = max(20, min(int(lines or 240), TMUX_CAPTURE_MAX_LINES))
@@ -7510,6 +8513,8 @@ def terminal_snapshot(session_id: str, *, lines: int = 240, created: bool = Fals
 
 
 def send_terminal_input(session_id: str, text: str | None = None, *, enter: bool = True, key: str | None = None) -> dict[str, Any]:
+    if WINDOWS_TERMINAL_BACKEND:
+        return windows_send_terminal_input(session_id, text, enter=enter, key=key)
     name = terminal_session_name(session_id)
     if not tmux_session_exists(name):
         ensure_terminal_session(session_id)
@@ -7523,6 +8528,8 @@ def send_terminal_input(session_id: str, text: str | None = None, *, enter: bool
 
 
 def resize_terminal_pane(session_id: str, columns: int, rows: int) -> dict[str, Any]:
+    if WINDOWS_TERMINAL_BACKEND:
+        return windows_resize_terminal_pane(session_id, columns, rows)
     name = terminal_session_name(session_id)
     if not tmux_session_exists(name):
         ensure_terminal_session(session_id)
@@ -7532,6 +8539,12 @@ def resize_terminal_pane(session_id: str, columns: int, rows: int) -> dict[str, 
 
 def scroll_terminal_history(session_id: str, delta: int) -> bool:
     """Scroll the active tmux pane's persistent history without enabling mouse capture."""
+    if WINDOWS_TERMINAL_BACKEND:
+        # ConPTY output streams straight into the client's xterm.js, which
+        # keeps its own local scrollback; there is no server-side copy-mode
+        # to enter, so scrolling is intentionally a no-op (auto_scroll stays
+        # False) rather than a crash.
+        return False
     if session_id not in STORE.sessions:
         return False
     name = terminal_session_name(session_id)
@@ -7557,6 +8570,9 @@ def scroll_terminal_history(session_id: str, delta: int) -> bool:
 
 
 def exit_terminal_auto_scroll(session_id: str) -> None:
+    if WINDOWS_TERMINAL_BACKEND:
+        # No server-side scroll mode exists on the ConPTY backend.
+        return
     if shutil.which("tmux") is None:
         return
     name = terminal_session_name(session_id)
@@ -7568,6 +8584,16 @@ def kill_terminal_session(session_id: str) -> dict[str, Any]:
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
     name = terminal_session_name(session_id)
+    if WINDOWS_TERMINAL_BACKEND:
+        existed = TERMINAL_MANAGER is not None and TERMINAL_MANAGER.close(session_id)
+        return {
+            "session_id": session_id,
+            "name": name,
+            "exists": False,
+            "killed": bool(existed),
+            "text": "",
+            "updated_at": now_iso(),
+        }
     existed = False
     if shutil.which("tmux") is not None:
         existed = tmux_session_exists(name)
@@ -7583,9 +8609,167 @@ def kill_terminal_session(session_id: str) -> dict[str, Any]:
     }
 
 
+# tmux send-keys style control-key names mapped to ConPTY input sequences.
+WINDOWS_TERMINAL_KEYS = {
+    "Enter": "\r",
+    "Tab": "\t",
+    "Escape": "\x1b",
+    "BSpace": "\x7f",
+    "Up": "\x1b[A",
+    "Down": "\x1b[B",
+    "Right": "\x1b[C",
+    "Left": "\x1b[D",
+    "Home": "\x1b[H",
+    "End": "\x1b[F",
+    "PageUp": "\x1b[5~",
+    "PageDown": "\x1b[6~",
+    "DC": "\x1b[3~",
+}
+
+
+def windows_terminal_key_sequence(key: str) -> str | None:
+    clean = str(key or "").strip()
+    if clean in WINDOWS_TERMINAL_KEYS:
+        return WINDOWS_TERMINAL_KEYS[clean]
+    match = re.fullmatch(r"C-([A-Za-z])", clean)
+    if match:
+        return chr(ord(match.group(1).upper()) - ord("A") + 1)
+    return None
+
+
+def ensure_windows_terminal_session(
+    session_id: str,
+    cwd: str | None = None,
+    *,
+    columns: int | None = None,
+    rows: int | None = None,
+) -> dict[str, Any]:
+    """Windows ConPTY counterpart of the tmux ensure path (same response shape)."""
+    mgr = windows_terminal_manager()
+    sess = STORE.sessions.get(session_id) or {}
+    cols, lines = terminal_dimensions(columns, rows)
+    workdir = existing_cwd(cwd or sess.get("cwd") or DEFAULT_CWD)
+    created = mgr.get(session_id) is None
+    try:
+        mgr.get_or_create(session_id, cwd=workdir, columns=cols, rows=lines)
+    except winterminal.WinTerminalError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return windows_terminal_snapshot(session_id, created=created)
+
+
+def windows_terminal_snapshot(
+    session_id: str,
+    *,
+    lines: int = 240,
+    created: bool = False,
+) -> dict[str, Any]:
+    """Snapshot-shaped dict matching the tmux capture-pane contract."""
+    name = terminal_session_name(session_id)
+    session = TERMINAL_MANAGER.get(session_id) if TERMINAL_MANAGER is not None else None
+    exists = session is not None
+    line_count = max(20, min(int(lines or 240), TMUX_CAPTURE_MAX_LINES))
+    capture = ""
+    cwd = None
+    command = None
+    pane_pid = None
+    attached = None
+    columns = None
+    rows = None
+    if session is not None:
+        capture = session.snapshot(line_count)
+        cwd = session.cwd
+        command = Path(session.shell).name if session.shell else None
+        pane_pid = session.pid
+        attached = 0 if session.detached else 1
+        columns = session.columns
+        rows = session.rows
+    return {
+        "session_id": session_id,
+        "name": name,
+        "exists": exists,
+        "created": created,
+        "cwd": cwd,
+        "command": command,
+        "pane_pid": pane_pid,
+        "attached": attached,
+        "columns": columns,
+        "rows": rows,
+        "lines": line_count,
+        "text": capture,
+        "updated_at": now_iso(),
+    }
+
+
+def windows_send_terminal_input(
+    session_id: str,
+    text: str | None = None,
+    *,
+    enter: bool = True,
+    key: str | None = None,
+) -> dict[str, Any]:
+    mgr = windows_terminal_manager()
+    session = mgr.get(session_id)
+    if session is None:
+        ensure_windows_terminal_session(session_id)
+        session = mgr.get(session_id)
+    if session is None:  # pragma: no cover - defensive
+        raise HTTPException(status_code=503, detail="terminal session could not be started")
+    if key:
+        sequence = windows_terminal_key_sequence(key)
+        if sequence is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unsupported terminal key on this host: {key}",
+            )
+        try:
+            session.write(sequence)
+        except winterminal.WinTerminalError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if text:
+        payload = str(text) + ("\r" if enter else "")
+        try:
+            session.write(payload)
+        except winterminal.WinTerminalError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return windows_terminal_snapshot(session_id)
+
+
+def windows_resize_terminal_pane(session_id: str, columns: int, rows: int) -> dict[str, Any]:
+    mgr = windows_terminal_manager()
+    session = mgr.get(session_id)
+    if session is None:
+        ensure_windows_terminal_session(session_id, columns=columns, rows=rows)
+        session = mgr.get(session_id)
+    if session is None:  # pragma: no cover - defensive
+        raise HTTPException(status_code=503, detail="terminal session could not be started")
+    cols, line_count = terminal_dimensions(columns, rows)
+    try:
+        session.resize(cols, line_count)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except winterminal.WinTerminalError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return windows_terminal_snapshot(session_id, lines=line_count)
+
+
 def terminal_windows_snapshot(session_id: str) -> dict[str, Any]:
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
+    if WINDOWS_TERMINAL_BACKEND:
+        name = terminal_session_name(session_id)
+        exists = TERMINAL_MANAGER is not None and TERMINAL_MANAGER.get(session_id) is not None
+        return {
+            "session_id": session_id,
+            "name": name,
+            "exists": exists,
+            # Mouse capture is a tmux concept; the ConPTY stream client keeps
+            # its own selection/scrolling.
+            "mouse_enabled": False,
+            "windows": (
+                [{"id": "@0", "index": 0, "name": "shell", "active": True, "panes": 1}]
+                if exists else []
+            ),
+        }
     name = terminal_session_name(session_id)
     if not tmux_session_exists(name):
         return {"session_id": session_id, "name": name, "exists": False, "mouse_enabled": False, "windows": []}
@@ -7621,6 +8805,16 @@ def terminal_windows_snapshot(session_id: str) -> dict[str, Any]:
 def terminal_action(session_id: str, action: str, target: str | None = None) -> dict[str, Any]:
     if session_id not in STORE.sessions:
         raise HTTPException(status_code=404, detail="session not found")
+    if WINDOWS_TERMINAL_BACKEND:
+        # Window/pane management and tmux mouse capture are tmux-only
+        # concepts; the ConPTY backend hosts exactly one window per chat.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "multi-window terminal actions require tmux and are unavailable "
+                "on Windows (single-window ConPTY terminal)"
+            ),
+        )
     name = terminal_session_name(session_id)
     if not tmux_session_exists(name):
         ensure_terminal_session(session_id)
@@ -7683,7 +8877,7 @@ TMUX_TARGET_RE = re.compile(
     r"['\"]?([A-Za-z0-9_.:@+-]{4,})"
 )
 TMUX_NOISE_TOKENS = {
-    "bash", "chat", "codex", "claude", "default", "false", "general",
+    "bash", "chat", "codex", "claude", "kimi", "reasonix", "default", "false", "general",
     "home", "launch", "local", "login", "none", "null", "osmo", "python",
     "python3", "script", "scripts", "server", "sleep", "submit", "submitter",
     "tail", "this", "true", "wandb", "agentsdock", "agentsserver",
@@ -12726,7 +13920,7 @@ async def run_claude_handoff_summarizer(prompt: str, *, model: str | None, effor
     if effort:
         cmd.extend(["--effort", effort])
     proc = await asyncio.create_subprocess_exec(
-        *cmd,
+        *resolve_exec_argv(cmd),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -12802,7 +13996,7 @@ async def run_codex_handoff_summarizer(prompt: str, *, model: str | None, effort
     if codex_dir and codex_dir not in env.get("PATH", "").split(os.pathsep):
         env["PATH"] = codex_dir + os.pathsep + env.get("PATH", "")
     proc = await asyncio.create_subprocess_exec(
-        *cmd,
+        *resolve_exec_argv(cmd),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=existing_cwd(DEFAULT_CWD),
@@ -12839,7 +14033,7 @@ async def build_handoff_digest(
     source = build_handoff_source_pack(session_id, detail=detail, user_prompt=user_prompt)
     source_pack = str(source["source_pack"])
     backend = str(summarizer_backend or HANDOFF_DIGEST_BACKEND or BACKEND_CLAUDE).strip().lower()
-    if backend not in VALID_BACKENDS:
+    if backend not in (BACKEND_CLAUDE, BACKEND_CODEX):
         backend = HANDOFF_DIGEST_BACKEND
     model = (summarizer_model if summarizer_model is not None else HANDOFF_DIGEST_MODEL).strip() or None
     effort = (summarizer_effort if summarizer_effort is not None else HANDOFF_DIGEST_EFFORT).strip() or None
@@ -13749,10 +14943,9 @@ def parse_codex_history(path: Path, limit: int | None) -> list[dict[str, str]]:
 
 def session_provider_id(sess: dict[str, Any]) -> str | None:
     backend = (sess.get("backend") or DEFAULT_BACKEND).lower()
-    if backend == BACKEND_CLAUDE:
-        return sess.get("claude_session_id") or sess.get("session_id")
-    if backend == BACKEND_CODEX:
-        return sess.get("codex_thread_id") or sess.get("session_id")
+    identity_key = PROVIDER_IDENTITY_KEYS.get(backend)
+    if identity_key:
+        return sess.get(identity_key) or sess.get("session_id")
     return sess.get("session_id")
 
 
@@ -13768,6 +14961,8 @@ def standalone_provider_session(sess: dict[str, Any]) -> dict[str, Any]:
     isolated["session_id"] = None
     isolated["claude_session_id"] = None
     isolated["codex_thread_id"] = None
+    isolated["kimi_session_id"] = None
+    isolated["reasonix_session_id"] = None
     isolated["fork_from"] = None
     isolated["memory_seed"] = None
     isolated["memory_seed_used"] = False
@@ -14514,6 +15709,8 @@ async def rollover_codex_provider_session(
 def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, Any]:
     detail_fields = () if summary else (
         "system_prompt", "session_id", "claude_session_id", "codex_thread_id",
+        "kimi_session_id",
+        "reasonix_session_id",
         "codex_approval_policy", "codex_sandbox_mode",
         "codex_permission_profile", "codex_approvals_reviewer",
         "codex_goal", "codex_goal_time_budget_seconds",
@@ -14682,6 +15879,10 @@ async def turn_start_blocker(*, ignore_session_id: str | None = None) -> str | N
 
 def runner_env() -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDECODE")}
+    if os.name == "nt":
+        # Windows resolves CLI shims (claude.cmd, codex.cmd, kimi.exe) from the
+        # inherited PATH; Unix-style ":" joins would corrupt it.
+        return env
     home = env.get("HOME", str(Path.home()))
     extra = [
         f"{home}/.local/bin",
@@ -14702,7 +15903,7 @@ def agent_runner_env(session_id: str) -> dict[str, str]:
     env = runner_env()
     env["AGENTSDOCK_CHAT_ID"] = session_id
     env["AGENTSDOCK_TMUX_SESSION"] = terminal_session_name(session_id)
-    env["AGENTSDOCK_MANIFEST_PATH"] = str(codex_manifest_path(session_id))
+    env["AGENTSDOCK_MANIFEST_PATH"] = codex_manifest_path(session_id).as_posix()
     env["AGENTSDOCK_SERVER_URL"] = f"http://127.0.0.1:{SERVER_PORT}"
     env["AGENTSDOCK_JOBS_CLI"] = str(SERVER_ROOT / "agentsdock_jobs.py")
     env["AGENTSDOCK_PUBLISH_CLI"] = str(SERVER_ROOT / "agentsdock_publish.py")
@@ -16979,10 +18180,12 @@ def unique_runtime_options(options: list[dict[str, Any]], default_label: str | N
 
 def run_catalog_command(cmd: list[str]) -> str:
     result = subprocess.run(
-        cmd,
+        resolve_exec_argv(cmd),
         cwd=DEFAULT_CWD if Path(DEFAULT_CWD).exists() else str(Path.home()),
         env=runner_env(),
         text=True,
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
         timeout=RUNTIME_CATALOG_TIMEOUT_SECONDS,
         check=False,
@@ -16999,10 +18202,12 @@ def claude_supports_effort(effort: str) -> bool:
         return False
     try:
         result = subprocess.run(
-            [CLAUDE_BIN, "--effort", clean, "--version"],
+            resolve_exec_argv([CLAUDE_BIN, "--effort", clean, "--version"]),
             cwd=DEFAULT_CWD if Path(DEFAULT_CWD).exists() else str(Path.home()),
             env=runner_env(),
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=RUNTIME_CATALOG_TIMEOUT_SECONDS,
             check=False,
@@ -17031,11 +18236,21 @@ def claude_supports_no_session_persistence() -> bool:
 
 
 def runtime_executable(backend: str) -> str:
-    return CLAUDE_BIN if backend == BACKEND_CLAUDE else CODEX_BIN
+    return {
+        BACKEND_CLAUDE: CLAUDE_BIN,
+        BACKEND_CODEX: CODEX_BIN,
+        BACKEND_KIMI: KIMI_BIN,
+        BACKEND_REASONIX: REASONIX_BIN,
+    }.get(backend, CLAUDE_BIN)
 
 
 def runtime_display_name(backend: str) -> str:
-    return "Claude Code" if backend == BACKEND_CLAUDE else "Codex"
+    return {
+        BACKEND_CLAUDE: "Claude Code",
+        BACKEND_CODEX: "Codex",
+        BACKEND_KIMI: "Kimi Code",
+        BACKEND_REASONIX: "Reasonix",
+    }.get(backend, str(backend or "agent").title())
 
 
 def runtime_action(backend: str, status: str) -> str | None:
@@ -17043,10 +18258,20 @@ def runtime_action(backend: str, status: str) -> str | None:
     if status == "missing":
         return f"Install {runtime_display_name(backend)} for the server user, make `{executable}` available on PATH, then restart the agent server."
     if status == "unauthenticated":
-        command = "claude auth login" if backend == BACKEND_CLAUDE else "codex login"
+        command = {
+            BACKEND_CLAUDE: "claude auth login",
+            BACKEND_CODEX: "codex login",
+            BACKEND_KIMI: "kimi login",
+            BACKEND_REASONIX: "reasonix setup",
+        }.get(backend, f"{executable} login")
         return f"Run `{command}` as the server user, then refresh runtime status."
     if status == "error":
-        command = "claude auth status" if backend == BACKEND_CLAUDE else "codex login status"
+        command = {
+            BACKEND_CLAUDE: "claude auth status",
+            BACKEND_CODEX: "codex login status",
+            BACKEND_KIMI: "kimi provider list",
+            BACKEND_REASONIX: "reasonix doctor --json",
+        }.get(backend, f"{executable} --version")
         return f"Run `{executable} --version` and `{command}` as the server user, then refresh runtime status."
     return None
 
@@ -17094,10 +18319,12 @@ def safe_runtime_version(output: str) -> str | None:
 
 def runtime_command(cmd: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        cmd,
+        resolve_exec_argv(cmd),
         cwd=DEFAULT_CWD if Path(DEFAULT_CWD).exists() else str(Path.home()),
         env=runner_env(),
         text=True,
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
         timeout=RUNTIME_CATALOG_TIMEOUT_SECONDS,
         check=False,
@@ -17109,7 +18336,7 @@ def auth_failure_text(value: str) -> bool:
     return any(marker in text for marker in (
         "authorizationrequired", "authentication required", "not authenticated",
         "not logged in", "login required", "unauthorized", "invalid api key",
-        "missing api key", "please log in", "please login",
+        "missing api key", "please log in", "please login", "access token is invalid",
     ))
 
 
@@ -17128,7 +18355,12 @@ def probe_runtime(backend: str) -> dict[str, Any]:
     if version_result.returncode != 0:
         return runtime_diagnostic_payload(backend, "error", installed=True, authenticated=None, version=version)
 
-    auth_cmd = [resolved, "auth", "status", "--json"] if backend == BACKEND_CLAUDE else [resolved, "login", "status"]
+    if backend == BACKEND_KIMI:
+        auth_cmd = [resolved, "provider", "list"]
+    elif backend == BACKEND_REASONIX:
+        auth_cmd = [resolved, "doctor", "--json"]
+    else:
+        auth_cmd = [resolved, "auth", "status", "--json"] if backend == BACKEND_CLAUDE else [resolved, "login", "status"]
     try:
         auth_result = runtime_command(auth_cmd)
     except (OSError, subprocess.SubprocessError) as exc:
@@ -17136,6 +18368,35 @@ def probe_runtime(backend: str) -> dict[str, Any]:
         return runtime_diagnostic_payload(backend, "error", installed=True, authenticated=None, version=version)
 
     combined = f"{auth_result.stdout}\n{auth_result.stderr}"
+    if backend == BACKEND_KIMI:
+        # `kimi provider list` prints one provider line per configured provider
+        # (e.g. "managed:kimi-code  type=kimi  models=4  source=oauth"); an
+        # authenticated install has at least one provider serving models.
+        if auth_result.returncode == 0 and re.search(r"\bmodels=[1-9]\d*", auth_result.stdout or ""):
+            return runtime_diagnostic_payload(backend, "ready", installed=True, authenticated=True, version=version)
+        if auth_result.returncode == 0 or auth_failure_text(combined):
+            return runtime_diagnostic_payload(backend, "unauthenticated", installed=True, authenticated=False, version=version)
+        return runtime_diagnostic_payload(backend, "error", installed=True, authenticated=None, version=version)
+    if backend == BACKEND_REASONIX:
+        # `reasonix doctor --json` enumerates configured providers and whether
+        # each provider's API key is present (key_present). At least one
+        # key-backed provider means the runtime can serve turns.
+        if auth_result.returncode == 0 and (auth_result.stdout or "").strip():
+            try:
+                doctor = json.loads(auth_result.stdout)
+            except (TypeError, ValueError):
+                doctor = None
+            if isinstance(doctor, dict):
+                providers = doctor.get("providers")
+                if isinstance(providers, list) and any(
+                    isinstance(item, dict) and item.get("key_present")
+                    for item in providers
+                ):
+                    return runtime_diagnostic_payload(backend, "ready", installed=True, authenticated=True, version=version)
+                return runtime_diagnostic_payload(backend, "unauthenticated", installed=True, authenticated=False, version=version)
+        if auth_result.returncode == 0 or auth_failure_text(combined):
+            return runtime_diagnostic_payload(backend, "unauthenticated", installed=True, authenticated=False, version=version)
+        return runtime_diagnostic_payload(backend, "error", installed=True, authenticated=None, version=version)
     if backend == BACKEND_CLAUDE and auth_result.stdout.strip():
         try:
             auth_payload = json.loads(auth_result.stdout)
@@ -17251,7 +18512,7 @@ def runtime_priority(model: dict[str, Any]) -> int:
 
 
 def session_backend_locked(sess: dict[str, Any]) -> bool:
-    return any(str(sess.get(key) or "").strip() for key in ("session_id", "claude_session_id", "codex_thread_id"))
+    return any(str(sess.get(key) or "").strip() for key in ("session_id", "claude_session_id", "codex_thread_id", "kimi_session_id", "reasonix_session_id"))
 
 
 def codex_user_config_path() -> Path:
@@ -17518,6 +18779,84 @@ def parse_claude_help_catalog() -> dict[str, Any]:
     }
 
 
+def discover_kimi_catalog() -> dict[str, Any]:
+    default_model = (
+        os.environ.get("KIMI_MODEL")
+        or agentsdock_setting("KIMI_MODEL", "")
+    ).strip()
+    model_options: list[dict[str, str]] = []
+    model_source = "kimi config.toml"
+    config_path = Path(os.environ.get("KIMI_CONFIG", str(Path.home() / ".kimi-code" / "config.toml"))).expanduser()
+    try:
+        text = config_path.read_text(encoding="utf-8", errors="replace")
+        for match in re.finditer(r'^\s*model\s*=\s*"([^"]+)"', text, re.MULTILINE):
+            alias = match.group(1).strip()
+            if alias:
+                model_options.append(runtime_option(alias, title_model_label(alias)))
+        if not default_model:
+            default_match = re.search(r'^\s*default_model\s*=\s*"([^"]+)"', text, re.MULTILINE)
+            if default_match:
+                default_model = default_match.group(1).strip()
+    except OSError as exc:
+        logger.debug("kimi config discovery skipped path=%s: %s", config_path, exc)
+        model_source = f"{model_source} unavailable"
+    existing_aliases = {option.get("value") for option in model_options}
+    for alias, label in KIMI_FALLBACK_MODELS:
+        if alias not in existing_aliases:
+            model_options.append(runtime_option(alias, label))
+    if default_model.startswith("kimi-code/"):
+        # CLI -m takes the alias; strip the provider prefix from config values.
+        default_model = default_model.split("/", 1)[1]
+    if default_model and not any(option.get("value") == default_model for option in model_options):
+        model_options.insert(0, runtime_option(default_model, title_model_label(default_model)))
+    return {
+        "models": unique_runtime_options(model_options, title_model_label(default_model) if default_model else None),
+        "efforts": unique_runtime_options([], ""),
+        "model_source": model_source,
+        "effort_source": "kimi-cli has no effort setting",
+        "default_model": default_model or None,
+        "default_effort": None,
+    }
+
+
+def discover_reasonix_catalog() -> dict[str, Any]:
+    """Catalog from ``reasonix doctor --json`` (providers are the --model values)."""
+    default_model = (
+        os.environ.get("REASONIX_MODEL")
+        or agentsdock_setting("REASONIX_MODEL", "")
+    ).strip()
+    model_options: list[dict[str, str]] = []
+    model_source = "reasonix doctor --json"
+    try:
+        result = runtime_command([REASONIX_BIN, "doctor", "--json"])
+        if result.returncode == 0 and (result.stdout or "").strip():
+            payload = json.loads(result.stdout)
+            if not default_model:
+                default_model = str(payload.get("default_model") or "").strip()
+            for provider in payload.get("providers") or []:
+                if not isinstance(provider, dict):
+                    continue
+                name = str(provider.get("name") or "").strip()
+                if not name:
+                    continue
+                models = provider.get("models")
+                if not isinstance(models, list) or not models:
+                    models = [provider["model"]] if provider.get("model") else []
+                label = f"{name} ({models[0]})" if models else name
+                model_options.append(runtime_option(name, label))
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError) as exc:
+        logger.debug("reasonix catalog discovery skipped: %s", exc)
+        model_source = f"{model_source} unavailable"
+    return {
+        "models": unique_runtime_options(model_options, default_model or None),
+        "efforts": unique_runtime_options([], ""),
+        "model_source": model_source,
+        "effort_source": "reasonix supports --effort but levels are provider-defined",
+        "default_model": default_model or None,
+        "default_effort": None,
+    }
+
+
 def discover_runtime_catalog(*, force_runtime_probe: bool = False) -> dict[str, Any]:
     diagnostics = refresh_runtime_diagnostics(force=force_runtime_probe)
     catalog = {
@@ -17525,6 +18864,8 @@ def discover_runtime_catalog(*, force_runtime_probe: bool = False) -> dict[str, 
         "backends": {
             BACKEND_CLAUDE: parse_claude_help_catalog(),
             BACKEND_CODEX: discover_codex_catalog(),
+            BACKEND_KIMI: discover_kimi_catalog(),
+            BACKEND_REASONIX: discover_reasonix_catalog(),
         },
     }
     for backend, diagnostic in diagnostics.items():
@@ -17546,7 +18887,9 @@ def session_prompt_addendum(sess: dict[str, Any]) -> str:
 def codex_thread_instructions(session_id: str, sess: dict[str, Any]) -> str:
     """Return stable thread-level Codex instructions, never turn/user content."""
     provider_context = CODEX_PROMPT_PRELUDE.format(
-        manifest_path=str(codex_manifest_path(session_id)),
+        # Agent CLIs understand POSIX separators on every platform; keep the
+        # injected path stable instead of platform-native backslashes.
+        manifest_path=codex_manifest_path(session_id).as_posix(),
         terminal_session=terminal_session_name(session_id),
         chat_id=session_id,
     )
@@ -18203,6 +19546,44 @@ def build_claude_cmd(
     return cmd
 
 
+def build_kimi_cmd(
+    session_id: str,
+    sess: dict[str, Any],
+    prompt: str,
+    *,
+    provider_id: str | None = None,
+) -> list[str]:
+    del session_id
+    cmd = [KIMI_BIN, "-p", prompt, "--output-format", "stream-json"]
+    if sess.get("model"):
+        cmd.extend(["--model", str(sess["model"])])
+    if provider_id:
+        cmd.extend(["--session", provider_id])
+    return cmd
+
+
+def build_reasonix_cmd(
+    session_id: str,
+    sess: dict[str, Any],
+    prompt: str,
+    *,
+    provider_id: str | None = None,
+) -> list[str]:
+    del session_id
+    cmd = [
+        REASONIX_BIN, "run", "-p", "--output-format", "stream-json",
+        "--permission-mode", "bypassPermissions",
+    ]
+    if sess.get("model"):
+        cmd.extend(["--model", str(sess["model"])])
+    if provider_id:
+        # reasonix resumes by machine session id (see `run --resume`); this is
+        # the session_id reported in the stream-json result event.
+        cmd.extend(["--resume", provider_id])
+    cmd.append(prompt)
+    return cmd
+
+
 def redacted_provider_argv(cmd: list[str], backend: str) -> list[str]:
     """Keep generated provider context and user prompts out of stored diagnostics."""
     redacted = list(cmd)
@@ -18210,6 +19591,16 @@ def redacted_provider_argv(cmd: list[str], backend: str) -> list[str]:
         with suppress(ValueError, IndexError):
             prompt_index = redacted.index("--append-system-prompt") + 1
             redacted[prompt_index] = "<system-prompt>"
+        return redacted
+    if backend == BACKEND_KIMI:
+        with suppress(ValueError, IndexError):
+            prompt_index = redacted.index("-p") + 1
+            redacted[prompt_index] = "<prompt>"
+        return redacted
+    if backend == BACKEND_REASONIX:
+        # build_reasonix_cmd always appends the task as the final argument.
+        if redacted:
+            redacted[-1] = "<prompt>"
         return redacted
     if backend == BACKEND_CODEX:
         redacted = [
@@ -20052,15 +21443,11 @@ async def run_claude(
     public_cmd = redacted_provider_argv(cmd, BACKEND_CLAUDE)
     await append_event(session_id, "process_started", {"run_id": run_id, "backend": BACKEND_CLAUDE, "argv": public_cmd, "cwd": cwd})
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        proc = await spawn_agent_process(
+            cmd,
             cwd=cwd,
             env=agent_runner_env(session_id),
-            limit=PROCESS_STREAM_LIMIT,
-            start_new_session=True,
+            stdin_mode="pipe",
         )
     except Exception as e:
         record_runtime_failure(BACKEND_CLAUDE, e, spawn_failure=True)
@@ -20202,6 +21589,7 @@ async def run_claude(
         with suppress(asyncio.CancelledError):
             await manifest_watch_task
         await terminate_process_tree(proc, grace=0.5)
+        close_agent_process(proc)
         await clear_active_process(session_id)
 
     stderr = ""
@@ -20234,6 +21622,433 @@ async def run_claude(
     await append_turn_finished_event(session_id, {
         "run_id": run_id,
         "backend": BACKEND_CLAUDE,
+        "exit_code": proc.returncode,
+        "result_text": result_text,
+        "stopped": stopped,
+        **run_event_metadata(run_id),
+    })
+    RUN_METADATA.pop(run_id, None)
+    await release_turn_slot(session_id, expected_run_id=run_id)
+    drain_queue = should_schedule_queue_after_finish(session_id, stopped)
+    STOPPED_RUNS.discard(run_id)
+    if drain_queue:
+        schedule_next_queued_turn(session_id)
+
+
+async def run_kimi(
+    session_id: str,
+    run_id: str,
+    prompt: str,
+    sess: dict[str, Any],
+    manifest_path: Path,
+    *,
+    standalone_provider_context: bool = False,
+) -> None:
+    if standalone_provider_context:
+        sess = standalone_provider_session(sess)
+    requested_cwd = str(sess.get("cwd") or DEFAULT_CWD)
+    cwd = existing_cwd(requested_cwd)
+    diff_baseline = await capture_git_baseline(session_id, run_id, cwd)
+    provider_id = sess.get("kimi_session_id") or (
+        sess.get("session_id") if sess.get("backend") == BACKEND_KIMI else None
+    )
+    cmd = build_kimi_cmd(session_id, sess, prompt, provider_id=provider_id)
+    if str(Path(requested_cwd).expanduser()) != cwd:
+        await append_event(session_id, "cwd_fallback", {"run_id": run_id, "requested_cwd": requested_cwd, "cwd": cwd})
+    public_cmd = redacted_provider_argv(cmd, BACKEND_KIMI)
+    await append_event(session_id, "process_started", {"run_id": run_id, "backend": BACKEND_KIMI, "argv": public_cmd, "cwd": cwd})
+    try:
+        proc = await spawn_agent_process(
+            cmd,
+            cwd=cwd,
+            env=agent_runner_env(session_id),
+            stdin_mode="devnull",
+        )
+    except Exception as e:
+        record_runtime_failure(BACKEND_KIMI, e, spawn_failure=True)
+        await append_event(session_id, "error", {"run_id": run_id, "backend": BACKEND_KIMI, "message": f"failed to start Kimi: {e}", **run_event_metadata(run_id)})
+        await append_turn_finished_event(session_id, {
+            "run_id": run_id,
+            "backend": BACKEND_KIMI,
+            "exit_code": None,
+            "result_text": "",
+            **run_event_metadata(run_id),
+        })
+        RUN_METADATA.pop(run_id, None)
+        await release_turn_slot(session_id, expected_run_id=run_id)
+        schedule_next_queued_turn(session_id)
+        return
+    async with ACTIVE_LOCK:
+        BUSY_SESSIONS.add(session_id)
+        stop_requested = (
+            session_id in STOP_REQUESTS or run_id in STOPPED_RUNS
+        )
+        if stop_requested:
+            STOP_REQUESTS.discard(session_id)
+            STOPPED_RUNS.add(run_id)
+        pgid = process_group_for_pid(proc.pid)
+        ACTIVE[session_id] = {
+            "proc": proc,
+            "run_id": run_id,
+            "backend": BACKEND_KIMI,
+            "pid": proc.pid,
+            "pgid": pgid,
+            "cwd": cwd,
+            "argv": public_cmd,
+            "started_at": time.time(),
+            "started_at_iso": now_iso(),
+            "stop_requested": stop_requested,
+            "provider_turn_ready": False,
+            "stdout_tail": deque(maxlen=LIVE_STDOUT_MAX_LINES),
+            "stdout_total_lines": 0,
+            "stdout_updated_at": None,
+        }
+    if stop_requested:
+        await terminate_process_tree(proc)
+
+    final_text = ""
+    text_parts: list[str] = []
+    current_tools: dict[str, dict[str, Any]] = {}
+    changed_paths: set[str] = set()
+    last_event = time.time()
+    idle_killed = False
+    stream_error: str | None = None
+    seen_artifacts: set[str] = set()
+    manifest_watch_task = asyncio.create_task(watch_manifest_artifacts(session_id, run_id, manifest_path, seen_artifacts))
+
+    try:
+        while True:
+            try:
+                raw = await asyncio.wait_for(proc.stdout.readline(), timeout=5)  # type: ignore[union-attr]
+            except asyncio.TimeoutError:
+                idle = time.time() - last_event
+                if idle >= IDLE_WARN_SECONDS:
+                    await append_event(session_id, "idle_warning", {"run_id": run_id, "idle_seconds": int(idle)})
+                if idle >= IDLE_KILL_SECONDS:
+                    idle_killed = True
+                    await terminate_process_tree(proc)
+                    break
+                continue
+            if not raw:
+                break
+            last_event = time.time()
+            decoded = raw.decode("utf-8", "replace").rstrip("\r\n")
+            await append_active_stdout(session_id, decoded)
+            line = decoded.strip()
+            if not line:
+                continue
+            await append_event(session_id, "raw_event", {"run_id": run_id, "backend": BACKEND_KIMI, "raw": line})
+            try:
+                event = json.loads(line)
+            except Exception:
+                # kimi may echo non-JSON lines (e.g. tool stdout); skip them.
+                continue
+            if not isinstance(event, dict):
+                continue
+            role = event.get("role")
+            etype = event.get("type")
+            if role == "meta":
+                if etype == "session.resume_hint":
+                    hinted = str(event.get("session_id") or "").strip()
+                    if hinted:
+                        provider_id = hinted
+                        await mark_provider_turn_ready(session_id, run_id, hinted)
+                elif etype in ("error", "system.error"):
+                    stream_error = str(event.get("content") or event.get("message") or "kimi reported an error")
+                continue
+            if role == "assistant":
+                tool_calls = event.get("tool_calls")
+                if isinstance(tool_calls, list):
+                    for call in tool_calls:
+                        if not isinstance(call, dict):
+                            continue
+                        function = call.get("function") if isinstance(call.get("function"), dict) else {}
+                        name = str(function.get("name") or call.get("name") or "tool")
+                        raw_input = function.get("arguments") if function.get("arguments") is not None else call.get("arguments")
+                        tid = str(call.get("id") or f"tool_{uuid.uuid4().hex[:8]}")
+                        if isinstance(raw_input, str):
+                            try:
+                                parsed_input: Any = json.loads(raw_input) if raw_input.strip() else {}
+                            except Exception:
+                                parsed_input = {"arguments": raw_input}
+                        else:
+                            parsed_input = raw_input if isinstance(raw_input, dict) else {}
+                        tool = {"id": tid, "name": name, "input": parsed_input}
+                        current_tools[tid] = tool
+                        changed_paths.update(tool_changed_paths(tool))
+                        await append_event(session_id, "tool_started", {"run_id": run_id, "tool": tool})
+                content = event.get("content")
+                if isinstance(content, str) and content.strip():
+                    text = clean_assistant_text(content)
+                    if text:
+                        text_parts.append(text)
+                        await append_event(session_id, "assistant_text", {"run_id": run_id, "text": text, **run_event_metadata(run_id)})
+            elif role == "tool":
+                tid = event.get("tool_call_id")
+                output = event_output_text(event.get("content", ""))
+                await append_event(session_id, "tool_finished", {
+                    "run_id": run_id,
+                    "tool_id": tid,
+                    "tool": current_tools.pop(tid, None),
+                    "output": output,
+                    "is_error": False,
+                })
+    except Exception as e:
+        stream_error = f"{type(e).__name__}: {e}"
+        logger.exception("Kimi run failed session=%s run=%s", session_id, run_id)
+    finally:
+        manifest_watch_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await manifest_watch_task
+        await terminate_process_tree(proc, grace=0.5)
+        close_agent_process(proc)
+        await clear_active_process(session_id)
+
+    stderr = ""
+    if proc.stderr:
+        stderr = (await proc.stderr.read()).decode("utf-8", "replace").strip()
+    stopped = run_id in STOPPED_RUNS
+    if stream_error and not stopped:
+        await append_event(session_id, "error", {"run_id": run_id, "message": f"Kimi stream failed: {stream_error}", **run_event_metadata(run_id)})
+    if idle_killed:
+        await append_event(session_id, "error", {"run_id": run_id, "message": "killed after idle timeout", **run_event_metadata(run_id)})
+    if not stopped and proc.returncode not in (0, None) and stderr:
+        await append_event(session_id, "error", {"run_id": run_id, "message": stderr[:4000], "exit_code": proc.returncode, **run_event_metadata(run_id)})
+    if not stopped and (stream_error or proc.returncode not in (0, None)):
+        record_runtime_failure(BACKEND_KIMI, stream_error or stderr or f"exit {proc.returncode}")
+    elif not stopped:
+        record_runtime_success(BACKEND_KIMI)
+    if provider_id and not stream_error:
+        await persist_run_provider_session(
+            session_id,
+            run_id,
+            BACKEND_KIMI,
+            provider_id,
+            cwd=cwd,
+            standalone_provider_context=standalone_provider_context,
+        )
+    result_text = clean_assistant_text(final_text or "\n\n".join(text_parts).strip())
+    await collect_manifest(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts, final=True)
+    await collect_recent_leftover_manifests(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts)
+    await publish_turn_code_diff(session_id, run_id, BACKEND_KIMI, cwd, diff_baseline, changed_paths)
+    await append_turn_finished_event(session_id, {
+        "run_id": run_id,
+        "backend": BACKEND_KIMI,
+        "exit_code": proc.returncode,
+        "result_text": result_text,
+        "stopped": stopped,
+        **run_event_metadata(run_id),
+    })
+    RUN_METADATA.pop(run_id, None)
+    await release_turn_slot(session_id, expected_run_id=run_id)
+    drain_queue = should_schedule_queue_after_finish(session_id, stopped)
+    STOPPED_RUNS.discard(run_id)
+    if drain_queue:
+        schedule_next_queued_turn(session_id)
+
+
+async def run_reasonix(
+    session_id: str,
+    run_id: str,
+    prompt: str,
+    sess: dict[str, Any],
+    manifest_path: Path,
+    *,
+    standalone_provider_context: bool = False,
+) -> None:
+    if standalone_provider_context:
+        sess = standalone_provider_session(sess)
+    requested_cwd = str(sess.get("cwd") or DEFAULT_CWD)
+    cwd = existing_cwd(requested_cwd)
+    diff_baseline = await capture_git_baseline(session_id, run_id, cwd)
+    provider_id = sess.get("reasonix_session_id") or (
+        sess.get("session_id") if sess.get("backend") == BACKEND_REASONIX else None
+    )
+    cmd = build_reasonix_cmd(session_id, sess, prompt, provider_id=provider_id)
+    if str(Path(requested_cwd).expanduser()) != cwd:
+        await append_event(session_id, "cwd_fallback", {"run_id": run_id, "requested_cwd": requested_cwd, "cwd": cwd})
+    public_cmd = redacted_provider_argv(cmd, BACKEND_REASONIX)
+    await append_event(session_id, "process_started", {"run_id": run_id, "backend": BACKEND_REASONIX, "argv": public_cmd, "cwd": cwd})
+    try:
+        proc = await spawn_agent_process(
+            cmd,
+            cwd=cwd,
+            env=agent_runner_env(session_id),
+            stdin_mode="devnull",
+        )
+    except Exception as e:
+        record_runtime_failure(BACKEND_REASONIX, e, spawn_failure=True)
+        await append_event(session_id, "error", {"run_id": run_id, "backend": BACKEND_REASONIX, "message": f"failed to start Reasonix: {e}", **run_event_metadata(run_id)})
+        await append_turn_finished_event(session_id, {
+            "run_id": run_id,
+            "backend": BACKEND_REASONIX,
+            "exit_code": None,
+            "result_text": "",
+            **run_event_metadata(run_id),
+        })
+        RUN_METADATA.pop(run_id, None)
+        await release_turn_slot(session_id, expected_run_id=run_id)
+        schedule_next_queued_turn(session_id)
+        return
+    async with ACTIVE_LOCK:
+        BUSY_SESSIONS.add(session_id)
+        stop_requested = (
+            session_id in STOP_REQUESTS or run_id in STOPPED_RUNS
+        )
+        if stop_requested:
+            STOP_REQUESTS.discard(session_id)
+            STOPPED_RUNS.add(run_id)
+        pgid = process_group_for_pid(proc.pid)
+        ACTIVE[session_id] = {
+            "proc": proc,
+            "run_id": run_id,
+            "backend": BACKEND_REASONIX,
+            "pid": proc.pid,
+            "pgid": pgid,
+            "cwd": cwd,
+            "argv": public_cmd,
+            "started_at": time.time(),
+            "started_at_iso": now_iso(),
+            "stop_requested": stop_requested,
+            "provider_turn_ready": False,
+            "stdout_tail": deque(maxlen=LIVE_STDOUT_MAX_LINES),
+            "stdout_total_lines": 0,
+            "stdout_updated_at": None,
+        }
+    if stop_requested:
+        await terminate_process_tree(proc)
+
+    final_text = ""
+    text_parts: list[str] = []
+    current_tools: dict[str, dict[str, Any]] = {}
+    changed_paths: set[str] = set()
+    last_event = time.time()
+    idle_killed = False
+    stream_error: str | None = None
+    seen_artifacts: set[str] = set()
+    manifest_watch_task = asyncio.create_task(watch_manifest_artifacts(session_id, run_id, manifest_path, seen_artifacts))
+
+    try:
+        while True:
+            try:
+                raw = await asyncio.wait_for(proc.stdout.readline(), timeout=5)  # type: ignore[union-attr]
+            except asyncio.TimeoutError:
+                idle = time.time() - last_event
+                if idle >= IDLE_WARN_SECONDS:
+                    await append_event(session_id, "idle_warning", {"run_id": run_id, "idle_seconds": int(idle)})
+                if idle >= IDLE_KILL_SECONDS:
+                    idle_killed = True
+                    await terminate_process_tree(proc)
+                    break
+                continue
+            if not raw:
+                break
+            last_event = time.time()
+            decoded = raw.decode("utf-8", "replace").rstrip("\r\n")
+            await append_active_stdout(session_id, decoded)
+            line = decoded.strip()
+            if not line:
+                continue
+            await append_event(session_id, "raw_event", {"run_id": run_id, "backend": BACKEND_REASONIX, "raw": line})
+            try:
+                event = json.loads(line)
+            except Exception:
+                # reasonix may print non-JSON lines on stdout; skip them.
+                continue
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") == "result":
+                result_value = str(event.get("result") or "")
+                hinted = str(event.get("session_id") or "").strip()
+                if hinted:
+                    provider_id = hinted
+                    await mark_provider_turn_ready(session_id, run_id, hinted)
+                if event.get("is_error") or (event.get("subtype") not in (None, "success")):
+                    stream_error = result_value or f"reasonix run failed: {event.get('subtype')}"
+                elif result_value:
+                    final_text = result_value
+                continue
+            kind = event.get("kind")
+            if kind == "message":
+                content = str(event.get("text") or "")
+                if content.strip():
+                    text = clean_assistant_text(content)
+                    if text:
+                        text_parts.append(text)
+                        await append_event(session_id, "assistant_text", {"run_id": run_id, "text": text, **run_event_metadata(run_id)})
+            elif kind == "tool_dispatch":
+                tool_info = event.get("tool")
+                if not isinstance(tool_info, dict):
+                    continue
+                raw_args = tool_info.get("args")
+                if not raw_args:
+                    # Partial dispatch carries no arguments yet; the full
+                    # dispatch with args follows immediately.
+                    continue
+                name = str(tool_info.get("name") or "tool")
+                tid = str(tool_info.get("id") or f"tool_{uuid.uuid4().hex[:8]}")
+                try:
+                    parsed_input: Any = json.loads(raw_args) if str(raw_args).strip() else {}
+                except Exception:
+                    parsed_input = {"arguments": raw_args}
+                tool = {"id": tid, "name": name, "input": parsed_input}
+                current_tools[tid] = tool
+                changed_paths.update(tool_changed_paths(tool))
+                await append_event(session_id, "tool_started", {"run_id": run_id, "tool": tool})
+            elif kind == "tool_result":
+                tool_info = event.get("tool")
+                if not isinstance(tool_info, dict):
+                    continue
+                tid = str(tool_info.get("id") or "")
+                output = str(tool_info.get("output") or "")
+                await append_event(session_id, "tool_finished", {
+                    "run_id": run_id,
+                    "tool_id": tid,
+                    "tool": current_tools.pop(tid, None),
+                    "output": output,
+                    "is_error": False,
+                })
+    except Exception as e:
+        stream_error = f"{type(e).__name__}: {e}"
+        logger.exception("Reasonix run failed session=%s run=%s", session_id, run_id)
+    finally:
+        manifest_watch_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await manifest_watch_task
+        await terminate_process_tree(proc, grace=0.5)
+        close_agent_process(proc)
+        await clear_active_process(session_id)
+
+    stderr = ""
+    if proc.stderr:
+        stderr = (await proc.stderr.read()).decode("utf-8", "replace").strip()
+    stopped = run_id in STOPPED_RUNS
+    if stream_error and not stopped:
+        await append_event(session_id, "error", {"run_id": run_id, "message": f"Reasonix stream failed: {stream_error}", **run_event_metadata(run_id)})
+    if idle_killed:
+        await append_event(session_id, "error", {"run_id": run_id, "message": "killed after idle timeout", **run_event_metadata(run_id)})
+    if not stopped and proc.returncode not in (0, None) and stderr:
+        await append_event(session_id, "error", {"run_id": run_id, "message": stderr[:4000], "exit_code": proc.returncode, **run_event_metadata(run_id)})
+    if not stopped and (stream_error or proc.returncode not in (0, None)):
+        record_runtime_failure(BACKEND_REASONIX, stream_error or stderr or f"exit {proc.returncode}")
+    elif not stopped:
+        record_runtime_success(BACKEND_REASONIX)
+    if provider_id and not stream_error:
+        await persist_run_provider_session(
+            session_id,
+            run_id,
+            BACKEND_REASONIX,
+            provider_id,
+            cwd=cwd,
+            standalone_provider_context=standalone_provider_context,
+        )
+    result_text = clean_assistant_text(final_text or "\n\n".join(text_parts).strip())
+    await collect_manifest(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts, final=True)
+    await collect_recent_leftover_manifests(session_id, run_id, manifest_path, seen_artifacts=seen_artifacts)
+    await publish_turn_code_diff(session_id, run_id, BACKEND_REASONIX, cwd, diff_baseline, changed_paths)
+    await append_turn_finished_event(session_id, {
+        "run_id": run_id,
+        "backend": BACKEND_REASONIX,
         "exit_code": proc.returncode,
         "result_text": result_text,
         "stopped": stopped,
@@ -20417,14 +22232,14 @@ async def run_codex_exec(
     if codex_dir and codex_dir not in env.get("PATH", "").split(os.pathsep):
         env["PATH"] = codex_dir + os.pathsep + env.get("PATH", "")
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        # codex exec takes its prompt from argv and never reads stdin: POSIX
+        # historically inherits the server stdio; the Windows owned spawn
+        # uses DEVNULL since there may be no inheritable console std stream.
+        proc = await spawn_agent_process(
+            cmd,
             cwd=cwd,
             env=env,
-            limit=PROCESS_STREAM_LIMIT,
-            start_new_session=True,
+            stdin_mode="devnull" if os.name == "nt" else "inherit",
         )
     except Exception as e:
         record_runtime_failure(BACKEND_CODEX, e, spawn_failure=True)
@@ -20742,6 +22557,7 @@ async def run_codex_exec(
         with suppress(asyncio.CancelledError):
             await manifest_watch_task
         await terminate_process_tree(proc, grace=0.5)
+        close_agent_process(proc)
         await clear_active_process(session_id)
 
     stderr = ""
@@ -22740,34 +24556,48 @@ async def _start_turn_locked(
             RUN_METADATA[run_id] = run_metadata
             started_payload.update(run_metadata)
         started_event = await append_event(session_id, "turn_started", started_payload)
-        task = (
-            run_codex(
+        standalone_kwargs = (
+            {"standalone_provider_context": True}
+            if provider_context_mode == "standalone"
+            else {}
+        )
+        if backend == BACKEND_CODEX:
+            task = run_codex(
                 session_id,
                 run_id,
                 prompt,
                 dict(sess),
                 manifest_path,
                 interactive_app_server=interactive_app_server,
-                **(
-                    {"standalone_provider_context": True}
-                    if provider_context_mode == "standalone"
-                    else {}
-                ),
+                **standalone_kwargs,
             )
-            if backend == BACKEND_CODEX
-            else run_claude(
+        elif backend == BACKEND_KIMI:
+            task = run_kimi(
                 session_id,
                 run_id,
                 prompt,
                 dict(sess),
                 manifest_path,
-                **(
-                    {"standalone_provider_context": True}
-                    if provider_context_mode == "standalone"
-                    else {}
-                ),
+                **standalone_kwargs,
             )
-        )
+        elif backend == BACKEND_REASONIX:
+            task = run_reasonix(
+                session_id,
+                run_id,
+                prompt,
+                dict(sess),
+                manifest_path,
+                **standalone_kwargs,
+            )
+        else:
+            task = run_claude(
+                session_id,
+                run_id,
+                prompt,
+                dict(sess),
+                manifest_path,
+                **standalone_kwargs,
+            )
         turn_task = asyncio.create_task(task)
         register_session_task(SESSION_TURN_TASKS, session_id, turn_task)
         current_title = str(sess.get("title") or "").strip()
@@ -22783,7 +24613,27 @@ async def _start_turn_locked(
         raise
 
 
-SERVER_UPDATE_ACTIVE_PHASES = {"starting", "checking", "downloading", "verifying", "installing", "restarting"}
+# Phases the detached updater (POSIX update_runner or native winupdate
+# drive/finish stages) writes while it owns the update. Terminal phases are
+# everything else: idle/available/current/unavailable/complete/rolled_back/
+# failed.
+SERVER_UPDATE_ACTIVE_PHASES = {
+    "starting",
+    "checking",
+    "downloading",
+    "verifying",
+    "staging",
+    "staged",
+    "installing",
+    "awaiting_server_exit",
+    "preparing",
+    "recovering",
+    "stopping",
+    "switching",
+    "health_check",
+    "rolling_back",
+    "restarting",
+}
 SERVER_UPDATE_OPERATION_LOCK = asyncio.Lock()
 SERVER_UPDATE_START_GRACE_SECONDS = 45.0
 
@@ -22883,11 +24733,157 @@ def server_update_tmux_name(update_id: str) -> str:
     return f"agents_server_update_{clean or 'current'}"
 
 
+def windows_update_helper_path() -> Path:
+    return SERVER_ROOT / "winupdate.py"
+
+
+def windows_native_updates_available() -> bool:
+    """Truthful native-update gate for Windows.
+
+    Requires the winupdate helper, the updater module, a parseable ed25519
+    release key (a corrupt key means releases cannot be verified), and a base
+    interpreter outside the live tree — the detached finish stage runs under
+    that interpreter so it holds no locks inside the tree it moves.
+    """
+
+    if os.name != "nt":
+        return False
+    if not windows_update_helper_path().is_file() or not SERVER_UPDATE_RUNNER.is_file():
+        return False
+    if not SERVER_UPDATE_PUBLIC_KEY.is_file():
+        return False
+    base = str(getattr(sys, "_base_executable", "") or "").strip()
+    if not base:
+        return False
+    try:
+        if Path(base).resolve().is_relative_to(SERVER_ROOT.resolve()):
+            return False
+    except OSError:
+        return False
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+        key = serialization.load_pem_public_key(SERVER_UPDATE_PUBLIC_KEY.read_bytes())
+        return isinstance(key, Ed25519PublicKey)
+    except Exception:
+        return False
+
+
+def update_process_id_alive(pid: Any) -> bool:
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid_int <= 0:
+        return False
+    if os.name == "nt":
+        # OpenProcess-based check: os.kill(pid, 0) is unreliable from
+        # processes created with CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+        # on current CPython builds (WinError 87 for live pids). The status
+        # pid belongs to a helper created with exactly those flags.
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.GetExitCodeProcess.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_ulong),
+            ]
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            handle = kernel32.OpenProcess(0x00100000 | 0x1000, False, pid_int)
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return False
+                return code.value == 259  # STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return False
+    try:
+        os.kill(pid_int, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+WINDOWS_UPDATE_SELF_EXIT_DELAY_SECONDS = 2.5
+
+
+def schedule_windows_update_self_exit() -> None:
+    """Exit this process shortly after the start response reaches the client.
+
+    The detached winupdate helper and (optionally) the user-level supervisor
+    own the restart. Exiting releases every handle inside the live tree so
+    the helper can move it aside. ``os._exit(0)`` intentionally skips ASGI
+    shutdown hooks: a graceful uvicorn stop would wait on in-flight requests
+    and keep the tree locked. The short delay lets the response flush first.
+    """
+
+    if os.name != "nt":
+        return
+    asyncio.get_running_loop().call_later(
+        WINDOWS_UPDATE_SELF_EXIT_DELAY_SECONDS, _windows_update_self_exit_now
+    )
+
+
+def _windows_update_self_exit_now() -> None:
+    try:
+        logger.info("agents server self-exit: handing off to the detached update helper")
+        # os._exit(0) below bypasses atexit hooks, and winterminal registers
+        # TerminalManager.close_all with atexit -- without this, every open
+        # ConPTY shell (cmd.exe + conhost) would outlive the server, one
+        # leaked process tree per open terminal per update.
+        manager = TERMINAL_MANAGER
+        if manager is not None:
+            with suppress(Exception):
+                manager.close_all()
+        for stream in (sys.stdout, sys.stderr):
+            with suppress(Exception):
+                stream.flush()
+    finally:
+        os._exit(0)
+
+
+def spawn_windows_update_helper(command: list[str]) -> subprocess.Popen:
+    """Launch the detached winupdate helper; its output lands in server-update.log."""
+
+    SERVER_UPDATE_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    log_handle = open(SERVER_UPDATE_LOG_FILE, "ab")
+    try:
+        return subprocess.Popen(
+            command,
+            cwd=str(STATE_DIR),
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW,
+            close_fds=True,
+        )
+    finally:
+        log_handle.close()
+
+
 def server_update_is_active(status: dict[str, Any]) -> bool:
     if str(status.get("phase") or "") not in SERVER_UPDATE_ACTIVE_PHASES:
         return False
     update_id = str(status.get("update_id") or "")
-    if not update_id or working_tmux_bin(use_cache=True) is None:
+    if not update_id:
+        return False
+    if os.name == "nt":
+        # The native Windows helper records its pid in the status file; a live
+        # pid means the detached updater still owns the update. (PID reuse can
+        # theoretically extend one helper lifetime; the stale grace bounds it.)
+        return update_process_id_alive(status.get("update_pid"))
+    if working_tmux_bin(use_cache=True) is None:
         return False
     return run_tmux(["has-session", "-t", server_update_tmux_name(update_id)], check=False).returncode == 0
 
@@ -23056,6 +25052,26 @@ async def health() -> dict[str, Any]:
         queued = {sid: len(queue) for sid, queue in QUEUED_TURNS.items() if queue}
     pressure = host_pressure_snapshot()
     tmux = tmux_capability(use_cache=True)
+    # Managed updates still launch through a detached tmux session, so their
+    # availability is tied to a working tmux -- never to the ConPTY terminal
+    # capability that tmux_capability reports on Windows. On Windows without
+    # tmux the native winupdate helper takes over when it is fully usable.
+    windows_native_updates = False
+    if os.name == "nt" and working_tmux_bin(use_cache=True) is None:
+        updates_capable = windows_native_updates_available()
+        windows_native_updates = updates_capable
+    else:
+        updates_capable = (
+            SERVER_UPDATE_RUNNER.is_file()
+            and SERVER_UPDATE_PUBLIC_KEY.is_file()
+            and working_tmux_bin(use_cache=True) is not None
+        )
+    server_updates_action = None
+    if windows_native_updates:
+        server_updates_action = (
+            "Auto-restart across updates: run scripts/agents_server_supervise.py "
+            "or register it at logon via /api/admin/update autostart."
+        )
     return {
         "ok": True,
         "server_version": SERVER_VERSION,
@@ -23065,21 +25081,13 @@ async def health() -> dict[str, Any]:
         "default_backend": DEFAULT_BACKEND,
         "default_cwd": existing_cwd(DEFAULT_CWD),
         "auth_required": bool(AGENT_TOKEN),
-        "managed_updates": (
-            SERVER_UPDATE_RUNNER.is_file()
-            and SERVER_UPDATE_PUBLIC_KEY.is_file()
-            and bool(tmux["available"])
-        ),
+        "managed_updates": updates_capable,
         "capabilities": {
             "server_updates": {
-                "available": (
-                    SERVER_UPDATE_RUNNER.is_file()
-                    and SERVER_UPDATE_PUBLIC_KEY.is_file()
-                    and bool(tmux["available"])
-                ),
+                "available": updates_capable,
                 "required": False,
                 "message": "Signed Stable and Beta AgentsServer channels are available.",
-                "action": None,
+                "action": server_updates_action,
                 "version": 2,
                 "tracks": ["stable", "beta"],
             },
@@ -23480,9 +25488,31 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                 ),
                 checked_at=update_utc_now(),
             )
-        tmux = tmux_capability()
-        if not tmux["available"]:
-            raise HTTPException(status_code=503, detail=f"{tmux['message']} {tmux['action']}")
+        # The detached updater launches through tmux.  On Windows the
+        # terminal capability is ConPTY-based, so gate on the tmux probe
+        # itself rather than tmux_capability() (which reports terminal
+        # truth).  Without tmux, Windows falls back to the native winupdate
+        # helper when it is fully usable; the POSIX branch keeps the original
+        # message contract.
+        use_native_windows_updater = False
+        if os.name == "nt":
+            if working_tmux_bin() is None:
+                if not windows_native_updates_available():
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "managed server updates are unavailable: the tmux-based "
+                            "detached updater is not present (Install tmux to use it) "
+                            "and the native Windows updater is not ready (winupdate.py, "
+                            "update_runner.py, or a valid ed25519 release-public-key.pem "
+                            "is missing)"
+                        ),
+                    )
+                use_native_windows_updater = True
+        else:
+            tmux = tmux_capability()
+            if not tmux["available"]:
+                raise HTTPException(status_code=503, detail=f"{tmux['message']} {tmux['action']}")
         if not SERVER_UPDATE_RUNNER.is_file() or not SERVER_UPDATE_PUBLIC_KEY.is_file():
             raise HTTPException(status_code=503, detail="this server installation predates managed updates; run the installer once")
 
@@ -23499,12 +25529,30 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
             "--current-version", SERVER_VERSION,
             "--track", track,
         ]
+        native_command: list[str] | None = None
+        if use_native_windows_updater:
+            native_command = [
+                sys.executable,
+                str(windows_update_helper_path()),
+                "--status-file", str(SERVER_UPDATE_STATUS_FILE),
+                "--public-key", str(SERVER_UPDATE_PUBLIC_KEY),
+                "--port", str(SERVER_PORT),
+                "--bind", SERVER_BIND_ADDRESS,
+                "--live-dir", str(SERVER_ROOT),
+                "--staging-root", str(STATE_DIR / "updates" / "staging"),
+                "--state-dir", str(STATE_DIR),
+                "--expected-version", requested,
+                "--current-version", SERVER_VERSION,
+                "--track", track,
+            ]
         auth_token_file: Path | None = None
         if AGENT_TOKEN:
             auth_token_file = SERVER_UPDATE_STATUS_FILE.with_name(
                 f".server-update-{update_id}.auth.json"
             )
             command.extend(["--auth-token-file", str(auth_token_file)])
+            if native_command is not None:
+                native_command.extend(["--auth-token-file", str(auth_token_file)])
         runner_environment = server_update_runner_environment()
         if runner_environment:
             command = [
@@ -23554,6 +25602,23 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
                     started_at=update_utc_now(),
                     finished_at=None,
                 )
+        if native_command is not None:
+            try:
+                if auth_token_file is not None:
+                    atomic_update_json(auth_token_file, {"token": AGENT_TOKEN})
+                process = await asyncio.to_thread(spawn_windows_update_helper, native_command)
+                write_server_update_status(update_pid=process.pid)
+            except Exception as exc:
+                if auth_token_file is not None:
+                    with suppress(FileNotFoundError):
+                        auth_token_file.unlink()
+                write_server_update_status(phase="failed", message=f"Could not start detached updater: {exc}", finished_at=update_utc_now())
+                raise HTTPException(status_code=500, detail="could not start detached updater") from exc
+            # The response must reach the client before this process exits and
+            # releases the live tree to the helper; the delayed self-exit
+            # above the return gives the ASGI stack time to flush.
+            schedule_windows_update_self_exit()
+            return status
         try:
             if auth_token_file is not None:
                 atomic_update_json(auth_token_file, {"token": AGENT_TOKEN})
@@ -23576,6 +25641,14 @@ async def host_diagnostics(limit: int = 40) -> dict[str, Any]:
         "records": records,
         "log_path": str(HOST_HEALTH_FILE),
     }
+
+
+@app.get("/api/working-directories/complete")
+async def complete_working_directory(
+    path: str = Query(default="", max_length=MAX_WORKSPACE_PATH_CHARS),
+    limit: int = Query(default=24, ge=1, le=MAX_WORKING_DIRECTORY_COMPLETIONS),
+) -> dict[str, Any]:
+    return await asyncio.to_thread(complete_working_directory_sync, path, limit)
 
 
 @app.get("/api/runtime/catalog")
@@ -26340,6 +28413,98 @@ async def run_job(job_id: str) -> dict[str, Any]:
     return await JOBS.run_job(job_id)
 
 
+async def run_windows_terminal_websocket(
+    session_id: str,
+    ws: WebSocket,
+    cols: int,
+    lines: int,
+    cwd: str | None,
+) -> None:
+    """ConPTY terminal WS session: stream output, accept input, survive disconnect.
+
+    The WebSocket is already accepted.  On disconnect the shell is detached
+    (kept running by the manager) rather than killed; the tmux attach-client
+    equivalent would also leave the server-side session alive.
+    """
+    mgr = windows_terminal_manager()
+    snapshot = await asyncio.to_thread(
+        ensure_windows_terminal_session,
+        session_id,
+        cwd,
+        columns=cols,
+        rows=lines,
+    )
+    session = mgr.get(session_id)
+    if session is None:  # pragma: no cover - defensive
+        raise RuntimeError("terminal session was not created")
+    name = str(snapshot["name"])
+    await ws.send_json({
+        "type": "ready",
+        "session_id": session_id,
+        "name": name,
+        "columns": cols,
+        "rows": lines,
+    })
+
+    async def pump_output() -> None:
+        while True:
+            data = await session.read(timeout=None)
+            if data is None:
+                # EOF: shell exited (or session terminated); stop pumping.
+                return
+            await ws.send_bytes(data)
+
+    async def receive_input() -> None:
+        while True:
+            message = await ws.receive()
+            if message["type"] == "websocket.disconnect":
+                return
+            data = message.get("bytes")
+            if data:
+                try:
+                    session.write(data)
+                except winterminal.WinTerminalError:
+                    return
+                continue
+            text = message.get("text")
+            if not text:
+                continue
+            try:
+                control = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if control.get("type") == "resize":
+                next_cols, next_rows = terminal_dimensions(control.get("columns"), control.get("rows"))
+                try:
+                    session.resize(next_cols, next_rows)
+                except (winterminal.WinTerminalError, ValueError):
+                    continue
+            elif control.get("type") == "scroll":
+                # Documented no-op on ConPTY (see scroll_terminal_history):
+                # scrolling never enters a server-side mode here.
+                continue
+
+    try:
+        output_task = asyncio.create_task(pump_output())
+        input_task = asyncio.create_task(receive_input())
+        done, pending = await asyncio.wait(
+            {output_task, input_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            with suppress(WebSocketDisconnect, RuntimeError, OSError):
+                task.result()
+    finally:
+        # Disconnect (or pump end) must NOT kill the shell: detach so a later
+        # attach resumes the same persistent session.
+        mgr.detach(session_id)
+        with suppress(RuntimeError):
+            await ws.close()
+
+
 @app.websocket("/api/sessions/{session_id}/terminal/ws")
 async def session_terminal(
     session_id: str,
@@ -26362,10 +28527,25 @@ async def session_terminal(
         return
 
     cols, lines = terminal_dimensions(columns, rows)
+    if os.name == "nt" and not WINDOWS_TERMINAL_BACKEND:
+        await ws.accept()
+        with suppress(RuntimeError):
+            await ws.send_json({
+                "type": "error",
+                "message": (
+                    "persistent terminal unavailable on this host: "
+                    + windows_terminal_unavailable_reason()
+                ),
+            })
+        await ws.close(code=1011)
+        return
     await ws.accept()
     process: subprocess.Popen[bytes] | None = None
     master_fd: int | None = None
     try:
+        if WINDOWS_TERMINAL_BACKEND:
+            await run_windows_terminal_websocket(session_id, ws, cols, lines, cwd)
+            return
         process, master_fd, name = await asyncio.to_thread(
             spawn_terminal_client,
             session_id,

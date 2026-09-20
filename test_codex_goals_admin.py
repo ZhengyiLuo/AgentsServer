@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from collections import deque
@@ -345,10 +346,13 @@ class CodexGoalsAdminTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result, "Summary")
-        self.assertEqual(
-            create_process.await_args.args[:4],
-            (agent_server.CODEX_BIN, "exec", "--disable", "goals"),
+        # On Windows the codex npm shim resolves to the underlying node CLI argv.
+        expected = (
+            agent_server.resolve_exec_argv([agent_server.CODEX_BIN, "exec", "--disable", "goals"])
+            if os.name == "nt"
+            else [agent_server.CODEX_BIN, "exec", "--disable", "goals"]
         )
+        self.assertEqual(create_process.await_args.args[: len(expected)], tuple(expected))
 
     async def test_manager_creation_waits_for_goal_reconfiguration(self) -> None:
         entered_close = asyncio.Event()

@@ -51,6 +51,7 @@ class InstallerContractTests(unittest.TestCase):
         self.assertIn("python-dateutil>=2.9,<3", source)
         self.assertIn("'$REMOTE_SERVER_DIR/codex_app_server.py'", source)
 
+    @unittest.skipIf(os.name == "nt", "POSIX installer contract (systemd/launchd/install.sh); the Windows lifecycle is covered by test_winupdate and test_server_update_endpoints")
     def test_installer_and_release_archive_include_runtime_tools_and_uninstaller(self):
         installer_source = INSTALLER.read_text()
         packager_source = PACKAGER.read_text()
@@ -132,6 +133,7 @@ class InstallerContractTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Installs or updates AgentsServer", result.stdout)
 
+    @unittest.skipIf(os.name == "nt", "POSIX installer contract (systemd/launchd/install.sh); the Windows lifecycle is covered by test_winupdate and test_server_update_endpoints")
     def test_same_version_reinstall_keeps_the_replaced_runtime_for_rollback(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -237,6 +239,7 @@ chmod 755 "$target/bin/python"
             self.assertEqual(sync_target.parent.parent, install_root / "releases")
             self.assertTrue((install_root / "current" / ".venv" / "bin" / "python").is_file())
 
+    @unittest.skipIf(os.name == "nt", "POSIX installer contract (systemd/launchd/install.sh); the Windows lifecycle is covered by test_winupdate and test_server_update_endpoints")
     def test_dependency_sync_rejects_a_missing_staged_runtime(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -256,6 +259,7 @@ chmod 755 "$target/bin/python"
             self.assertIn("did not create the isolated release runtime", result.stderr)
             self.assertTrue((install_root / "current" / "runtime-marker").is_file())
 
+    @unittest.skipIf(os.name == "nt", "POSIX installer contract (systemd/launchd/install.sh); the Windows lifecycle is covered by test_winupdate and test_server_update_endpoints")
     def test_default_legacy_state_is_moved_and_linked(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -322,6 +326,7 @@ chmod 755 "$project/.venv/bin/python"
             self.assertNotIn("ZENITHDOCK_AGENT_TOKEN=", installed_env)
             self.assertIn(f'"access_token":"{preserved_token}"', result.stdout)
 
+    @unittest.skipIf(os.name == "nt", "POSIX installer contract (systemd/launchd/install.sh); the Windows lifecycle is covered by test_winupdate and test_server_update_endpoints")
     def test_broken_tmux_is_optional_and_installation_still_succeeds(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -360,6 +365,7 @@ chmod 755 "$project/.venv/bin/python"
             self.assertNotIn("Access token", result.stdout)
             self.assertEqual(result.stdout.count(token), 1)
 
+    @unittest.skipIf(os.name == "nt", "POSIX installer contract (systemd/launchd/install.sh); the Windows lifecycle is covered by test_winupdate and test_server_update_endpoints")
     def test_preflight_reports_every_missing_platform_prerequisite(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -398,6 +404,7 @@ chmod 755 "$project/.venv/bin/python"
             self.assertFalse((root / "config").exists())
             self.assertFalse((root / "state").exists())
 
+    @unittest.skipIf(os.name == "nt", "POSIX installer contract (systemd/launchd/install.sh); the Windows lifecycle is covered by test_winupdate and test_server_update_endpoints")
     def test_explicit_port_is_pinned_without_allow_port_fallback(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -431,6 +438,7 @@ chmod 755 "$project/.venv/bin/python"
             self.assertNotIn("AGENTSDOCK_SETUP_RESULT=", result.stdout)
             self.assertTrue((install_root / "current" / "runtime-marker").is_file())
 
+    @unittest.skipIf(os.name == "nt", "POSIX installer contract (systemd/launchd/install.sh); the Windows lifecycle is covered by test_winupdate and test_server_update_endpoints")
     def test_explicit_port_fallback_is_opt_in_and_persists_selected_port(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -492,6 +500,7 @@ chmod 755 "$project/.venv/bin/python"
             self.assertNotIn(token, human_output)
             self.assertNotIn("Access token", result.stdout)
 
+    @unittest.skipIf(os.name == "nt", "POSIX installer contract (systemd/launchd/install.sh); the Windows lifecycle is covered by test_winupdate and test_server_update_endpoints")
     def test_newly_started_unhealthy_server_rolls_back_without_fallback(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -516,6 +525,7 @@ chmod 755 "$project/.venv/bin/python"
             self.assertNotIn("Selecting port", result.stderr)
             self.assertTrue((install_root / "current" / "runtime-marker").is_file())
 
+    @unittest.skipIf(os.name == "nt", "POSIX installer contract (systemd/launchd/install.sh); the Windows lifecycle is covered by test_winupdate and test_server_update_endpoints")
     def test_uv_bootstrap_curl_is_bounded_and_reports_recovery_steps(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -555,6 +565,7 @@ exit 28
             self.assertIn("Check DNS, proxy, firewall, and outbound HTTPS access", result.stderr)
             self.assertTrue((install_root / "current" / "runtime-marker").is_file())
 
+    @unittest.skipIf(os.name == "nt", "POSIX installer contract (systemd/launchd/install.sh); the Windows lifecycle is covered by test_winupdate and test_server_update_endpoints")
     def test_uv_bootstrap_wget_fallback_is_bounded_and_retried(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -591,6 +602,7 @@ exit 4
             self.assertIn("Could not download uv", result.stderr)
             self.assertTrue((install_root / "current" / "runtime-marker").is_file())
 
+    @unittest.skipIf(os.name == "nt", "POSIX installer contract (systemd/launchd/install.sh); the Windows lifecycle is covered by test_winupdate and test_server_update_endpoints")
     def test_dependency_sync_streams_progress_and_times_out_before_activation(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -638,6 +650,7 @@ wait
             self.assertFalse(descendant_marker.exists())
             self.assertFalse((install_root / ".install-lock").exists())
 
+    @unittest.skipIf(os.name == "nt", "POSIX installer contract (systemd/launchd/install.sh); the Windows lifecycle is covered by test_winupdate and test_server_update_endpoints")
     def test_active_install_lock_rejects_a_second_installer_without_mutation(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -661,6 +674,7 @@ wait
             self.assertIn("cancel it from AgentsDock before retrying", result.stderr)
             self.assertEqual(self.snapshot_trees(install_root), before)
 
+    @unittest.skipIf(os.name == "nt", "POSIX installer contract (systemd/launchd/install.sh); the Windows lifecycle is covered by test_winupdate and test_server_update_endpoints")
     def test_unavailable_systemd_user_domain_fails_without_mutation(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -712,6 +726,7 @@ exit 97
             self.assertIn("no state, release, configuration, or service changes were made.", final_error)
             self.assertEqual(self.snapshot_trees(install_root, config_root, state_root), before)
 
+    @unittest.skipIf(os.name == "nt", "POSIX installer contract (systemd/launchd/install.sh); the Windows lifecycle is covered by test_winupdate and test_server_update_endpoints")
     def test_saved_custom_path_is_used_for_prerequisite_discovery(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -774,6 +789,7 @@ chmod 755 "$project/.venv/bin/python"
             self.assertEqual(installed_path.split(":", 1)[0], str(custom_bin))
             self.assertIn("--user show-environment", systemctl_log.read_text().splitlines())
 
+    @unittest.skipIf(os.name == "nt", "POSIX installer contract (systemd/launchd/install.sh); the Windows lifecycle is covered by test_winupdate and test_server_update_endpoints")
     def test_uninstall_removes_runtime_and_config_but_preserves_state(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -796,6 +812,7 @@ chmod 755 "$project/.venv/bin/python"
             self.assertTrue((state_root / "sessions.json").is_file())
             self.assertIn("Preserved chat history", result.stdout)
 
+    @unittest.skipIf(os.name == "nt", "POSIX installer contract (systemd/launchd/install.sh); the Windows lifecycle is covered by test_winupdate and test_server_update_endpoints")
     def test_uninstall_purge_state_requires_interactive_exact_confirmation(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -820,6 +837,7 @@ chmod 755 "$project/.venv/bin/python"
                 before,
             )
 
+    @unittest.skipIf(os.name == "nt", "POSIX installer contract (systemd/launchd/install.sh); the Windows lifecycle is covered by test_winupdate and test_server_update_endpoints")
     def test_uninstall_refuses_broad_and_overlapping_managed_roots(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -872,6 +890,7 @@ chmod 755 "$project/.venv/bin/python"
             self.assertIn("Refusing overlapping install, configuration, and state roots", overlap_result.stderr)
             self.assertEqual(overlap_sentinel.read_text(), "preserved\n")
 
+    @unittest.skipIf(os.name == "nt", "POSIX installer contract (systemd/launchd/install.sh); the Windows lifecycle is covered by test_winupdate and test_server_update_endpoints")
     def test_uninstall_refuses_active_install_lock_without_mutation(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -898,6 +917,7 @@ chmod 755 "$project/.venv/bin/python"
                 before,
             )
 
+    @unittest.skipIf(os.name == "nt", "POSIX installer contract (systemd/launchd/install.sh); the Windows lifecycle is covered by test_winupdate and test_server_update_endpoints")
     def test_uninstall_stop_failure_preserves_all_files(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -990,6 +1010,7 @@ exit 2
             self.assertEqual(launchctl_state.read_text().strip(), "loaded")
             self.assertTrue((install_root / "current" / "agent_server.py").is_file())
 
+    @unittest.skipIf(os.name == "nt", "POSIX installer contract (systemd/launchd/install.sh); the Windows lifecycle is covered by test_winupdate and test_server_update_endpoints")
     def test_darwin_nontransient_bootstrap_failure_restores_previous_service(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

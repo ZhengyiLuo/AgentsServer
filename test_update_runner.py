@@ -267,7 +267,10 @@ class UpdateRunnerTests(unittest.TestCase):
             )
 
             self.assertEqual(log_path.read_text().splitlines(), ["started", "finished"])
-            self.assertEqual(os.stat(log_path).st_mode & 0o777, 0o600)
+            if os.name != "nt":
+                # Windows chmod expresses only the read-only bit; POSIX mode
+                # bits like 0o600 have no meaning there.
+                self.assertEqual(os.stat(log_path).st_mode & 0o777, 0o600)
             status = json.loads(status_path.read_text())
             self.assertEqual(status["phase"], "installing")
             self.assertGreaterEqual(status["elapsed_seconds"], 1)

@@ -151,7 +151,9 @@ def run_installer(
             cwd=cwd,
             stdout=log,
             stderr=subprocess.STDOUT,
-            start_new_session=True,
+            # start_new_session maps to POSIX setsid(); the Windows-native
+            # updater (winupdate.py) never reaches run_installer.
+            start_new_session=(os.name != "nt"),
             env=installer_environment(),
         )
         while True:

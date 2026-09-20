@@ -11,11 +11,17 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import time
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Sequence
+
+try:  # Windows-only job-object process ownership; SUPPORTED is False elsewhere.
+    import winproc
+except ImportError:  # pragma: no cover - platform dependent
+    winproc = None  # type: ignore[assignment]
 
 
 class CodexAppServerError(RuntimeError):
@@ -566,20 +572,38 @@ class CodexAppServerClient:
                 await self._discard_process()
             self._closing = False
             try:
-                proc = await self._process_factory(
-                    self.codex_bin,
-                    "app-server",
-                    *self.app_server_args,
-                    "--listen",
-                    "stdio://",
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=self.cwd,
-                    env=self.env_factory(),
-                    limit=self.process_stream_limit,
-                    start_new_session=True,
-                )
+                if (
+                    winproc is not None
+                    and winproc.SUPPORTED
+                    and self._process_factory is asyncio.create_subprocess_exec
+                ):
+                    # Job-owned spawn (suspended -> assign -> resume): the
+                    # app-server and any children it forks are terminated as a
+                    # tree when the client discards the process, and the
+                    # kill-on-close job reaps stragglers even if we crash.
+                    # A custom process_factory (tests, embedders) always wins.
+                    argv = winproc.resolve_cli_argv(self.codex_bin)
+                    proc: Any = winproc.spawn_owned(
+                        [*argv, "app-server", *self.app_server_args, "--listen", "stdio://"],
+                        cwd=self.cwd,
+                        env=self.env_factory(),
+                        stdin_mode="pipe",
+                    )
+                else:
+                    proc = await self._process_factory(
+                        self.codex_bin,
+                        "app-server",
+                        *self.app_server_args,
+                        "--listen",
+                        "stdio://",
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=self.cwd,
+                        env=self.env_factory(),
+                        limit=self.process_stream_limit,
+                        start_new_session=(os.name != "nt"),
+                    )
             except Exception as exc:
                 raise CodexAppServerDisconnected(
                     f"failed to start codex app-server: {exc}",
@@ -700,15 +724,27 @@ class CodexAppServerClient:
         self._stderr_task = None
 
         if proc and proc.returncode is None:
-            with suppress(ProcessLookupError):
-                proc.terminate()
-            with suppress(Exception):
-                await asyncio.wait_for(proc.wait(), timeout=2)
-            if proc.returncode is None:
-                with suppress(ProcessLookupError):
-                    proc.kill()
+            if winproc is not None and isinstance(proc, winproc.OwnedProc):
+                # Job-owned: one hard kill tears down the whole tree
+                # immediately (Windows has no SIGTERM for a clean per-process
+                # stop, and the app-server must not linger past discard).
+                proc.kill()
                 with suppress(Exception):
                     await proc.wait()
+            else:
+                with suppress(ProcessLookupError):
+                    proc.terminate()
+                with suppress(Exception):
+                    await asyncio.wait_for(proc.wait(), timeout=2)
+                if proc.returncode is None:
+                    with suppress(ProcessLookupError):
+                        proc.kill()
+                    with suppress(Exception):
+                        await proc.wait()
+        if winproc is not None and isinstance(proc, winproc.OwnedProc):
+            # Release the job handle (kill-on-close) and pipes.  The reader
+            # and stderr tasks observe EOF and unwind on their own.
+            proc.close()
 
         for task in (reader_task, stderr_task):
             if task and task is not current:

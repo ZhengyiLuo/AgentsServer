@@ -1,3 +1,4 @@
+import os
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -59,6 +60,10 @@ class TerminalArchiveTests(unittest.IsolatedAsyncioTestCase):
         warning.assert_called_once()
         self.assertIn(session_id, warning.call_args.args)
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "POSIX-only: asserts tmux error propagation, and the Windows ConPTY backend never calls tmux",
+    )
     def test_terminal_kill_does_not_mask_other_tmux_errors(self) -> None:
         session_id = "archive-tmux-error"
         session = {"id": session_id, "title": "Archive test", "backend": "codex"}

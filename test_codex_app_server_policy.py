@@ -73,7 +73,7 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("User prompt follows", instructions)
         self.assertNotIn("Scheduled jobs", instructions)
         self.assertNotIn("Current jobs for this chat", instructions)
-        self.assertIn(str(agent_server.codex_manifest_path("chat-1")), instructions)
+        self.assertIn(agent_server.codex_manifest_path("chat-1").as_posix(), instructions)
         self.assertIn("--chat-id chat-1", instructions)
         self.assertIn(agent_server.terminal_session_name("chat-1"), instructions)
         self.assertIn("immediately retry the still-safe requested operation", instructions)

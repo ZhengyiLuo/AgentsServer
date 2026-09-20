@@ -1,0 +1,25 @@
+name: Windows CI
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Lock check and test (native Windows)
+        shell: pwsh
+        run: |
+          uv lock --check
+          uv run python -m unittest discover -p 'test_*.py' -v
+        env:
+          # Tests must never touch a real state directory.
+          AGENTSDOCK_STATE_DIR: ${{ runner.temp }}\agentsdock-ci-state

@@ -56,10 +56,14 @@ To remove **only the new test service**, preserving its history:
 ```
 
 The preview must name only `local-test`; type `uninstall local-test` only if it does.
-Immediately after confirming uninstall, answer **No/Enter** to the release-name question to
-keep its history. Answer **Yes** only if you want to permanently delete that
-instance's saved AgentsDock data and free its name. The default instance, original
-provider chats, project files and earlier backups must remain untouched.
+Immediately after confirming uninstall, answer **No/Enter** to the release-name
+question to keep its name and history in place. Answer **Yes** to move the
+instance's complete saved state to the printed private backup and free its name.
+No chat history is deleted by name release, including AgentsDock-only content.
+A new server using the released name starts with an empty chat list. The default
+instance, original provider chats, project files and earlier backups must remain
+untouched. Only the separate, explicitly confirmed `--purge-state` operation
+permanently deletes saved state.
 Do not approve the bare `./uninstall.sh` or `--all` preview during this trial:
 those intentionally include the default instance. For bulk management without
 the original server, use `--all --exclude default`.
@@ -88,6 +92,8 @@ Normal Python bytecode caches in this checkout no longer block installation.
 - Named install and uninstall preserving a synthetic default-on-7850 fixture.
 - Separate terminal names/sockets and exclusive state-directory ownership.
 - Exact-name confirmation, color warning, cancellation and guarded history purge.
+- Optional name release preserves saved state in a private backup before freeing
+  the name; failed archival does not claim success or free the name.
 - Refusal to update a named server with an old default-only release.
 
 The existing activation, service-state, health-security, stage-cleanup, update,
@@ -98,6 +104,10 @@ passing the focused tests is not a claim that the entire repository suite ran.
 `tests/test_cross_instance_import.py` covers ownership filtering, stale/manual
 imports, parked IDs, stopped/removed instances, unsafe indexes and cancellation
 using synthetic homes only.
+
+`tests/test_instance_connection_output.py` checks labeled connection URLs, local
+Tailscale-status/bind checks, and blue service names. Redirected output,
+`NO_COLOR`, and dumb terminals remain plain; remote reachability is not asserted.
 
 An opt-in real-process smoke test starts two servers with temporary HOME/config/
 state and ephemeral loopback ports. It verifies distinct identities, token

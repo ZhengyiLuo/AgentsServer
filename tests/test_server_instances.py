@@ -54,6 +54,7 @@ class InstanceTests(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.object(instances, "Registry", return_value=self.registry))
             stack.enter_context(patch.object(instances, "service_status", return_value="stopped"))
+            stack.enter_context(patch.object(instances, "tailscale_status", return_value={"status": "unavailable", "ipv4": ""}))
             output, errors = io.StringIO(), io.StringIO()
             stack.enter_context(contextlib.redirect_stdout(output))
             stack.enter_context(contextlib.redirect_stderr(errors))
@@ -480,7 +481,11 @@ class InstanceTests(unittest.TestCase):
         for answer, expected in (("y", True), ("YES", True), (" Yes ", True), ("", False), ("n", False), ("no", False), ("yep", False), (EOFError(), False)):
             with self.subTest(answer=answer), contextlib.redirect_stdout(io.StringIO()) as output, patch("sys.stdin.isatty", return_value=True), patch("builtins.input", **({"side_effect": answer} if isinstance(answer, EOFError) else {"return_value": answer})):
                 self.assertEqual(instances.confirm_uninstall_name_release(self.work), expected)
-                self.assertIn("cannot be undone", output.getvalue())
+                self.assertIn("No chat history is deleted", output.getvalue())
+                self.assertIn("Original provider chats stay on your computer", output.getvalue())
+                self.assertIn("private local backup", output.getvalue())
+                self.assertIn("starts with an empty chat list", output.getvalue())
+                self.assertNotIn("permanently deletes", output.getvalue())
                 self.assertIn(str(self.work.state), output.getvalue())
                 self.assertIn("earlier backups", output.getvalue())
         with patch("sys.stdin.isatty", return_value=False), patch("builtins.input") as prompt:
@@ -490,29 +495,29 @@ class InstanceTests(unittest.TestCase):
     def test_uninstall_yes_automation_does_not_authorize_name_release(self):
         self.configured(self.work)
         with patch("sys.stdin.isatty", return_value=True):
-            code, _, errors, mocks = self.cli("remove", "work", "--yes", run={}, confirm_uninstall_name_release={}, purge_uninstalled_name={})
+            code, _, errors, mocks = self.cli("remove", "work", "--yes", run={}, confirm_uninstall_name_release={}, release_uninstalled_name={})
         self.assertEqual(code, 0, errors)
         mocks["confirm_uninstall_name_release"].assert_not_called()
-        mocks["purge_uninstalled_name"].assert_not_called()
+        mocks["release_uninstalled_name"].assert_not_called()
 
-    def test_failed_uninstall_never_deletes_data_even_after_release_consent(self):
+    def test_failed_uninstall_never_moves_data_even_after_release_consent(self):
         self.configured(self.work)
         with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="uninstall work"):
-            code, output, _, mocks = self.cli("remove", "work", run={"side_effect": ValueError("cannot stop")}, confirm_uninstall_name_release={"return_value": True}, purge_uninstalled_name={})
+            code, output, _, mocks = self.cli("remove", "work", run={"side_effect": ValueError("cannot stop")}, confirm_uninstall_name_release={"return_value": True}, release_uninstalled_name={})
         self.assertEqual(code, 1)
         mocks["confirm_uninstall_name_release"].assert_called_once_with(self.work)
-        mocks["purge_uninstalled_name"].assert_not_called()
+        mocks["release_uninstalled_name"].assert_not_called()
         self.assertNotIn("Successful!", output)
 
     def test_cancelled_uninstall_never_asks_about_release_or_changes_data(self):
         self.configured(self.work)
         before = self.snapshot(self.work)
         with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value=""):
-            code, _, _, mocks = self.cli("remove", "work", run={}, confirm_uninstall_name_release={}, purge_uninstalled_name={})
+            code, _, _, mocks = self.cli("remove", "work", run={}, confirm_uninstall_name_release={}, release_uninstalled_name={})
         self.assertEqual(code, 1)
         mocks["run"].assert_not_called()
         mocks["confirm_uninstall_name_release"].assert_not_called()
-        mocks["purge_uninstalled_name"].assert_not_called()
+        mocks["release_uninstalled_name"].assert_not_called()
         self.assertEqual(self.snapshot(self.work), before)
 
     def test_bulk_uninstall_release_is_per_name_and_never_offered_for_default(self):
@@ -521,16 +526,16 @@ class InstanceTests(unittest.TestCase):
         other = instances.Instance("other", self.home)
         self.configured(other, 7853)
         with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="uninstall default other work"):
-            code, _, errors, mocks = self.cli("remove", "--all", run={}, confirm_uninstall_name_release={"side_effect": [True, False]}, purge_uninstalled_name={})
+            code, _, errors, mocks = self.cli("remove", "--all", run={}, confirm_uninstall_name_release={"side_effect": [True, False]}, release_uninstalled_name={})
         self.assertEqual(code, 0, errors)
         self.assertEqual([call.args[0].name for call in mocks["confirm_uninstall_name_release"].call_args_list], ["other", "work"])
-        mocks["purge_uninstalled_name"].assert_called_once_with(other, self.registry)
+        mocks["release_uninstalled_name"].assert_called_once_with(other, self.registry)
 
     def test_name_release_refuses_active_state_and_keeps_registry(self):
         self.removed_history()
         with self.registry.locked(), instances.exclusive_lock(self.work.state / ".server-process.lock"), patch.object(instances, "service_status", return_value="stopped"):
             with self.assertRaisesRegex(ValueError, "Another process owns"):
-                instances.purge_uninstalled_name(self.work, self.registry)
+                instances.release_uninstalled_name(self.work, self.registry)
         self.assertEqual((self.work.state / "sessions.json").read_text(), "old imported chat index")
         self.assertEqual(self.registry.records()["work"]["status"], "removed")
 
@@ -541,20 +546,52 @@ class InstanceTests(unittest.TestCase):
         with self.registry.locked(), patch.object(instances, "service_status", return_value="stopped"):
             for item in (self.default, self.work):
                 with self.subTest(name=item.name), self.assertRaises(ValueError):
-                    instances.purge_uninstalled_name(item, self.registry)
+                    instances.release_uninstalled_name(item, self.registry)
             unsafe = instances.Instance("unsafe", self.home)
             unsafe.state.symlink_to(self.default.state)
             with self.assertRaisesRegex(ValueError, "Unsafe managed path"):
-                instances.purge_uninstalled_name(unsafe, self.registry)
+                instances.release_uninstalled_name(unsafe, self.registry)
         self.assertEqual(self.snapshot(self.default), before)
 
-    def test_name_release_delete_failure_keeps_name_reserved(self):
+    def test_name_release_archive_failure_keeps_name_reserved_and_history_in_place(self):
         self.removed_history()
-        with self.registry.locked(), patch.object(instances, "service_status", return_value="stopped"), patch.object(instances.shutil, "rmtree", side_effect=OSError("fixture failure")):
+        with self.registry.locked(), patch.object(instances, "service_status", return_value="stopped"), patch.object(Path, "rename", side_effect=OSError("fixture failure")):
             with self.assertRaises(OSError):
-                instances.purge_uninstalled_name(self.work, self.registry)
+                instances.release_uninstalled_name(self.work, self.registry)
         self.assertIn("work", self.registry.records())
-        self.assertTrue((self.work.state / "sessions.json").exists())
+        self.assertEqual((self.work.state / "sessions.json").read_text(), "old imported chat index")
+        self.assertEqual((self.work.state / "upload.png").read_bytes(), b"AgentsDock-only upload")
+
+    def test_name_release_registry_failure_keeps_history_in_printed_backup(self):
+        self.removed_history()
+        with self.registry.locked(), patch.object(instances, "service_status", return_value="stopped"), patch.object(self.registry, "forget", side_effect=OSError("fixture failure")), contextlib.redirect_stdout(io.StringIO()) as output:
+            with self.assertRaises(OSError):
+                instances.release_uninstalled_name(self.work, self.registry)
+        backup, = (self.registry.root / "history-backups").glob("work-*/state")
+        self.assertEqual((backup / "sessions.json").read_text(), "old imported chat index")
+        self.assertEqual((backup / "upload.png").read_bytes(), b"AgentsDock-only upload")
+        self.assertIn(str(backup), output.getvalue())
+        self.assertIn("work", self.registry.records())
+        self.assertNotIn("Released name", output.getvalue())
+
+    def test_name_release_without_saved_state_frees_name_without_creating_backup(self):
+        with self.registry.locked(), patch.object(instances, "service_status", return_value="stopped"), contextlib.redirect_stdout(io.StringIO()):
+            self.registry.save(self.work, "removed", 7851)
+            instances.release_uninstalled_name(self.work, self.registry)
+        self.assertNotIn("work", self.registry.records())
+        self.assertFalse((self.registry.root / "history-backups").exists())
+
+    def test_failed_name_archive_does_not_report_success_or_free_name(self):
+        self.configured(self.work)
+        before = self.snapshot(self.work)
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="uninstall work"):
+            code, output, errors, _ = self.cli("remove", "work", run={}, confirm_uninstall_name_release={"return_value": True}, release_instance_name={"side_effect": OSError("backup failed")})
+        self.assertEqual(code, 1)
+        self.assertIn("backup failed", errors)
+        self.assertNotIn("Successful!", output)
+        self.assertNotIn("Released name", output)
+        self.assertEqual(self.registry.records()["work"]["status"], "removed")
+        self.assertEqual(self.snapshot(self.work), before)
 
     def test_bulk_remove_requires_interactive_confirmation(self):
         self.configured(self.work)
@@ -670,7 +707,7 @@ class InstanceTests(unittest.TestCase):
         self.assertNotIn("\033[", output)
         self.assertTrue(output.endswith("\n\nSuccessful!\n"))
 
-    def test_uninstall_release_yes_deletes_only_named_state_and_frees_name(self):
+    def test_uninstall_release_yes_archives_named_history_and_frees_name(self):
         output = self.check_named_uninstaller_output(release_answer="y")
         self.assertIn("Released name 'work'", output)
         self.assertFalse(self.work.state.exists())
@@ -720,6 +757,12 @@ class InstanceTests(unittest.TestCase):
         native.parent.mkdir(parents=True)
         native.write_text("keep provider transcript")
         (self.work.state / "native-link").symlink_to(native)
+        (self.work.state / "upload.png").write_bytes(b"AgentsDock-only upload")
+        (self.work.state / "transcript.jsonl").write_text("AgentsDock-only chat history")
+        events = self.work.state / "sessions/session-1/events.jsonl"
+        events.parent.mkdir(parents=True)
+        events.write_text("AgentsDock-only nested timeline")
+        saved_state = {path.relative_to(self.work.state): path.read_bytes() for path in self.work.state.rglob("*") if path.is_file() and not path.is_symlink()}
         backup = self.registry.root / "history-backups/work-earlier/state/upload.txt"
         backup.parent.mkdir(parents=True)
         backup.write_text("keep earlier backup")
@@ -788,6 +831,16 @@ class InstanceTests(unittest.TestCase):
         self.assertFalse(self.work.service_file("darwin").exists())
         self.assertTrue(all("com.agentsdock.server.work" in line for line in calls.read_text().splitlines()))
         if release_answer == "y":
+            current_backups = [path for path in (self.registry.root / "history-backups").glob("work-*/state") if path != backup.parent]
+            self.assertEqual(len(current_backups), 1)
+            saved = current_backups[0]
+            for name, data in saved_state.items():
+                self.assertEqual((saved / name).read_bytes(), data)
+            self.assertTrue((saved / "native-link").is_symlink())
+            self.assertEqual((saved / "native-link").readlink(), native)
+            self.assertEqual(saved.parent.stat().st_mode & 0o777, 0o700)
+            self.assertIn(str(saved), output)
+            self.assertIn("No chat history is deleted", output)
             self.assertNotIn("./install.sh --instance work --port PORT", output)
             self.assertNotIn("Preserved chat history", output)
         else:

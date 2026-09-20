@@ -171,7 +171,7 @@ while (($#)); do
   esac
 done
 
-# This flag only controls progress text. The manager separately deletes state
+# This flag only controls progress text. The manager separately archives state
 # after a successful service removal, using the user's affirmative choice.
 if [[ "$MANAGED_RELEASE_NAME" == "true" \
   && ( "$MANAGED_REMOVAL" != "true" || "$INSTANCE_NAME" == "default" \

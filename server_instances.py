@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from urllib.parse import urlsplit
 
 INSTANCE_PROTOCOL = 1
 ROOT = Path(__file__).resolve().parent
@@ -545,9 +546,69 @@ def describe(instance: Instance) -> dict:
     }
 
 
-def show(instance: Instance):
+def connection_choices(bind: str, port: int, addresses: list[str], network: dict[str, str]) -> dict:
+    """Label candidates, never infer Tailscale connectivity from an IP range."""
+    choices = {"local": [], "lan": [], "other": [], "tailscale": "", "tailscale_note": ""}
+    state, tail_ip = network["status"], network["ipv4"]
+    try:
+        binding = ipaddress.ip_address("127.0.0.1" if bind == "localhost" else bind.strip("[]"))
+    except ValueError:
+        binding = None
+    if state != "connected":
+        choices["tailscale_note"] = {
+            "disconnected": "Unavailable: Tailscale is disconnected.",
+            "not-installed": "Unavailable: Tailscale was not found.",
+        }.get(state, "Not verified: could not read Tailscale status.")
+    elif not tail_ip:
+        choices["tailscale_note"] = "Not verified: Tailscale has no usable IPv4 address."
+    elif binding is not None and binding.is_loopback:
+        choices["tailscale_note"] = "Unavailable: this server is bound to this machine only."
+    elif binding is not None and (str(binding) == "0.0.0.0" or str(binding) == tail_ip):
+        choices["tailscale"] = f"http://{tail_ip}:{port}"
+    else:
+        choices["tailscale_note"] = f"Not verified: server binding {bind!r} does not confirm access via the Tailscale IPv4 address."
+
+    lan_ranges = tuple(ipaddress.ip_network(value) for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+    for candidate in addresses:
+        url = candidate.split(" ", 1)[0]
+        if url == choices["tailscale"]:
+            continue
+        host = urlsplit(url).hostname
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            group = "local" if host == "localhost" else "other"
+        else:
+            if address.is_unspecified or address.is_multicast or address.is_link_local:
+                continue
+            # An unverified/stale VPN IP must not be presented as ordinary LAN.
+            group = "local" if address.is_loopback else "lan" if host != tail_ip and any(address in subnet for subnet in lan_ranges) else "other"
+        if url not in choices[group]:
+            choices[group].append(url)
+    return choices
+
+
+def show(instance: Instance, *, network: dict[str, str] | None = None):
     item = describe(instance)
-    print(f"{item['name']:<20} {item['status']:<10} {str(item['port'] or '—'):<6} " + "  ".join(item["addresses"]))
+    name = terminal_color(f"{item['name']:<20}", "34")
+    summary = f"{name} {item['status']:<10} {str(item['port'] or '—'):<6}"
+    if network is None:
+        print(summary + " " + "  ".join(item["addresses"]))
+        return
+    print(summary.rstrip())
+    if not item["port"]:
+        print("  No saved network configuration.\n")
+        return
+    choices = connection_choices(read_config(instance).get("AGENTSDOCK_AGENT_BIND", "0.0.0.0"), item["port"], item["addresses"], network)
+    tail = choices["tailscale"]
+    if tail:
+        tail += " (recommended)" if item["status"] == "running" else f" (server status: {item['status']})"
+    print(f"  Tailscale / other networks: {tail or choices['tailscale_note']}")
+    print("  Same Wi-Fi / LAN:          " + (", ".join(choices["lan"]) or "No address detected for this binding."))
+    print("  This machine only:         " + (", ".join(choices["local"]) or "No loopback address for this binding."))
+    if choices["other"]:
+        print("  Other / unverified:        " + ", ".join(choices["other"]))
+    print()
 
 
 def terminal_color(text: str, code: str) -> str:
@@ -568,7 +629,7 @@ def confirm_removal(instances: list[Instance], purge: bool, yes: bool) -> None:
     else:
         print("Chat history and files are preserved. Service removal is reinstallable; deleted configuration is not restored automatically.")
         if not yes and any(instance.name != "default" for instance in instances):
-            print("After this confirmation, you can also release each name and delete its saved data during uninstall.")
+            print("After this confirmation, you can also release each name while keeping its chat history in a local backup.")
     target_names = " ".join(instance.name for instance in instances)
     expected = f"{'delete history' if purge else 'uninstall'} {target_names}"
     if purge or not yes:
@@ -590,7 +651,7 @@ def install_instance(instance: Instance, port: int, bind: str):
 def validate_released_instance(instance: Instance) -> None:
     """Never reset default, an installed service, or a running state owner."""
     if instance.name == "default":
-        raise ValueError("The default instance cannot be released by new.")
+        raise ValueError("The default instance cannot be released.")
     validate_binding(instance)
     if any(path.exists() or path.is_symlink() for path in (instance.runtime, instance.config, instance.service_file())):
         raise ValueError(f"{instance.name}: still installed or has a partial installation. Remove it before reusing its name.")
@@ -636,24 +697,22 @@ def confirm_uninstall_name_release(instance: Instance) -> bool:
     if not sys.stdin.isatty():
         return False
     print(f"\nOptional name release: {instance.name}")
-    print(terminal_color(f"This permanently deletes this instance's AgentsDock history, uploads, jobs and credentials at {instance.state}, and frees its name.", "31"))
-    print("Original provider chats, project files, earlier backups and independent terminal sessions are kept.")
-    print(terminal_color("This deletion cannot be undone. Enter keeps the name and saved data.", "1;31"))
+    print("Releasing the name clears this server's saved chat list from active use and makes the name available again.")
+    print(terminal_color("No chat history is deleted. Original provider chats stay on your computer.", "32"))
+    print(f"This server's saved AgentsDock history, uploads, jobs and credentials at {instance.state} will be moved to a private local backup; its location will be printed.")
+    print("A new server using this name starts with an empty chat list; the old AgentsDock-only content remains in the backup.")
+    print("Project files, earlier backups and independent terminal sessions are kept. Enter keeps the name and saved data in place.")
     try:
         return input("Do you want to release this name as well? [y/N] ").strip().lower() in {"y", "yes"}
     except EOFError:
         return False
 
 
-def purge_uninstalled_name(instance: Instance, registry: Registry) -> None:
+def release_uninstalled_name(instance: Instance, registry: Registry) -> None:
     # Called only after a successful uninstall and separate affirmative answer.
-    # Derive the exact root from the validated name, never a registry path.
-    validate_released_instance(instance)
-    if instance.state.exists():
-        with exclusive_lock(instance.state / ".server-process.lock"):
-            validate_released_instance(instance)
-            shutil.rmtree(instance.state)  # Does not follow child symlinks.
-        print(terminal_color(f"Deleted {instance.state}", "31"), flush=True)
+    # Preserve even AgentsDock-only content before freeing the name. Reuse the
+    # guarded archive path used by `new`, not the explicit --purge-state action.
+    release_instance_name(instance, registry)
     registry.forget(instance)
     print(terminal_color(f"Released name {instance.name!r}; it can be used for a new instance.", "32"), flush=True)
 
@@ -734,9 +793,10 @@ def main(argv: list[str] | None = None) -> int:
                     raise ValueError("Unknown instance.")
                 print(json.dumps(describe(items[0]), indent=2))
             else:
-                print("NAME                 STATUS     PORT   CONNECTION URLS (reachability depends on network/firewall)")
+                network = tailscale_status() if items else None
+                print("NAME                 STATUS     PORT")
                 for item in items:
-                    show(item)
+                    show(item, network=network)
                 if not items:
                     print("No installations found. Run ./install.sh for default, or ./instances.sh new.")
             return 0
@@ -837,15 +897,15 @@ def main(argv: list[str] | None = None) -> int:
                         if args.purge_state:
                             command.append("--purge-state")  # Still asks for each exact state path.
                         elif item.name in release_names:
-                            # Do not print preserved-history/reinstall advice
-                            # when the confirmed plan includes deleting state.
+                            # The manager will print the backup location; direct
+                            # reinstall advice would incorrectly imply reuse.
                             command.append("--managed-release-name")
                         run(command, env=clean_environment(item), cwd=ROOT)
                         registry.save(item, "removed", int(old_port) if old_port else None)
                         if args.purge_state and item.name != "default" and not item.state.exists():
                             registry.forget(item)
                         elif item.name in release_names:
-                            purge_uninstalled_name(item, registry)
+                            release_uninstalled_name(item, registry)
                         elif not args.purge_state and not args.yes and item.name != "default":
                             print(f"Kept name {item.name!r} and its saved data.", flush=True)
                     elif args.command == "update":

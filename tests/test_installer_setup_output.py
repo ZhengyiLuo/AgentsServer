@@ -137,6 +137,89 @@ class SetupOutputTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
 
+    def checklist(self, *, bind="0.0.0.0", state="connected", tmux=True, claude=True, codex=False, platform="Darwin"):
+        values = {
+            "CHECK_MARK": "✓", "DOT_MARK": "○", "PORT": "7851",
+            "COLOR_GREEN": "", "COLOR_BOLD": "", "COLOR_RESET": "",
+            "TMUX_WARNING": "" if tmux else "synthetic tmux warning",
+            "CLAUDE_READY": "true" if claude else "false",
+            "CODEX_READY": "true" if codex else "false", "OS_NAME": platform,
+        }
+        script = "set -eu\n" + "\n".join(f"{key}={shlex.quote(value)}" for key, value in values.items()) + "\n"
+        script += self.summary_functions + "\n" + self.bindings(bind, state, "100.97.237.26" if state == "connected" else "") + "\nprint_setup_checklist\n"
+        result = subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_all_green_shows_all_set_two_checks_and_no_next_steps(self):
+        output = self.checklist()
+        self.assertIn("You are all set", output)
+        self.assertEqual(output.count("✓"), 2)
+        self.assertIn("✓ tmux available", output)
+        self.assertIn("✓ Tailscale already connected: http://100.97.237.26:7851", output)
+        self.assertNotIn("next steps", output.lower())
+        self.assertNotIn("install", output)
+
+    def test_either_supported_cli_is_enough_for_summary(self):
+        self.assertIn("You are all set", self.checklist(claude=False, codex=True))
+
+    def test_missing_tmux_is_optional_with_short_mac_command(self):
+        output = self.checklist(tmux=False)
+        self.assertIn("You already have", output)
+        self.assertIn("✓ AgentsServer running", output)
+        self.assertIn("✓ Tailscale already connected", output)
+        self.assertIn("Optional next steps", output)
+        self.assertIn("You can skip", output)
+        self.assertIn("brew install tmux", output)
+        self.assertNotIn("✓ tmux", output)
+        self.assertNotIn("You are all set", output)
+
+    def test_missing_tmux_on_linux_uses_package_manager_hint(self):
+        output = self.checklist(tmux=False, platform="Linux")
+        self.assertIn("sudo apt install tmux", output)
+        self.assertNotIn("brew install", output)
+
+    def test_missing_tailscale_is_optional_with_link_and_lan_alternative(self):
+        output = self.checklist(state="not-installed")
+        self.assertIn("✓ tmux available", output)
+        self.assertIn("Optional next steps", output)
+        self.assertIn("https://tailscale.com/download", output)
+        self.assertIn("LAN address", output)
+        self.assertNotIn("✓ Tailscale", output)
+        self.assertNotIn("You are all set", output)
+
+    def test_installed_disconnected_tailscale_gets_connection_not_install_hint(self):
+        output = self.checklist(state="disconnected")
+        self.assertIn("✓ Tailscale installed", output)
+        self.assertIn("open Tailscale and sign in/connect", output)
+        self.assertNotIn("download", output)
+        self.assertNotIn("You are all set", output)
+
+    def test_unknown_network_status_gets_check_hint_without_claiming_ready(self):
+        for state in ("unknown", "unavailable"):
+            with self.subTest(state=state):
+                output = self.checklist(state=state)
+                self.assertIn("tailscale status", output)
+                self.assertIn("Optional next steps", output)
+                self.assertNotIn("You are all set", output)
+                self.assertNotIn("download", output)
+
+    def test_loopback_binding_is_not_mislabeled_all_set_for_phones(self):
+        output = self.checklist(bind="127.0.0.1")
+        self.assertIn("✓ Tailscale installed", output)
+        self.assertIn("phones cannot connect directly", output)
+        self.assertIn("https://github.com/ZhengyiLuo/AgentsServer", output)
+        self.assertNotIn("You are all set", output)
+
+    def test_missing_agent_cli_is_separate_from_optional_features(self):
+        output = self.checklist(claude=False, codex=False)
+        self.assertIn("You already have", output)
+        self.assertIn("To start chats", output)
+        self.assertIn("npm install -g @anthropic-ai/claude-code", output)
+        self.assertIn("npm install -g @openai/codex", output)
+        self.assertNotIn("Optional next steps", output)  # tmux and network are ready.
+        self.assertNotIn("You are all set", output)
+
     def test_connected_summary_uses_reachable_bind_and_existing_port(self):
         bindings = self.bindings()
         values = dict(value.split("=", 1) for value in shlex.split(bindings))

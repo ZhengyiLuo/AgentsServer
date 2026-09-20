@@ -6325,23 +6325,75 @@ print_tailscale_summary() {
         echo "  $CHECK_MARK Tailscale already connected: http://$TAILSCALE_IP:$PORT (tailnet access rules still apply)"
       elif [[ "$SERVER_LOCAL_ONLY" == "true" ]]; then
         echo "  $DOT_MARK Tailscale already connected; this server is bound to localhost only, so phones cannot connect directly."
+        echo "    For phone access, choose a reachable server bind: https://github.com/ZhengyiLuo/AgentsServer"
       else
         echo "  $DOT_MARK Tailscale already connected; its IPv4 address is not available on this server's configured bind."
+        echo "    For tailnet access, review the server bind: https://github.com/ZhengyiLuo/AgentsServer"
       fi
       ;;
     disconnected)
       echo "  $DOT_MARK Tailscale already installed but not connected; no installation or configuration changes made."
+      echo "    To connect from other networks, open Tailscale and sign in/connect."
       ;;
     not-installed)
       echo "  $DOT_MARK optional: Tailscale was not found; use your LAN address on the same network, or see https://tailscale.com/download"
       ;;
     unavailable)
       echo "  $DOT_MARK Tailscale already installed; connection status could not be checked. No setup changes made."
+      echo "    Open Tailscale to check the connection, or try: tailscale status"
       ;;
     *)
       echo "  $DOT_MARK Tailscale connection status could not be checked; no installation or configuration changes made."
+      echo "    If you use Tailscale, check its app or try: tailscale status"
       ;;
   esac
+}
+
+print_setup_checklist() {
+  local network_ready="false"
+  [[ "$TAILSCALE_STATUS" != "connected" || "$TAILSCALE_BIND_MATCH" != "true" ]] || network_ready="true"
+  if [[ -z "$TMUX_WARNING" && "$network_ready" == "true" \
+    && ( "$CLAUDE_READY" == "true" || "$CODEX_READY" == "true" ) ]]; then
+    echo "  ${COLOR_GREEN}${COLOR_BOLD}You are all set${COLOR_RESET}"
+    echo "  $CHECK_MARK tmux available"
+    print_tailscale_summary
+    return
+  fi
+
+  echo "  ${COLOR_BOLD}You already have${COLOR_RESET}"
+  echo "  $CHECK_MARK AgentsServer running"
+  if [[ -z "$TMUX_WARNING" ]]; then
+    echo "  $CHECK_MARK tmux available"
+  fi
+  if [[ "$network_ready" == "true" ]]; then
+    print_tailscale_summary
+  elif [[ "$TAILSCALE_STATUS" == "connected" || "$TAILSCALE_STATUS" == "disconnected" || "$TAILSCALE_STATUS" == "unavailable" ]]; then
+    echo "  $CHECK_MARK Tailscale installed"
+  fi
+
+  if [[ "$CLAUDE_READY" == "false" && "$CODEX_READY" == "false" ]]; then
+    echo
+    echo "  ${COLOR_BOLD}To start chats${COLOR_RESET}"
+    echo "  $DOT_MARK Choose one agent CLI and sign in:"
+    echo "    Claude Code: npm install -g @anthropic-ai/claude-code, then run: claude"
+    echo "    Codex: npm install -g @openai/codex, then run: codex login"
+  fi
+  if [[ -n "$TMUX_WARNING" || "$network_ready" != "true" ]]; then
+    echo
+    echo "  ${COLOR_BOLD}Optional next steps${COLOR_RESET}"
+    echo "  You can skip these unless you need the features below."
+    if [[ -n "$TMUX_WARNING" ]]; then
+      echo "  $DOT_MARK For persistent terminals, pane inspection and in-app updates, install tmux:"
+      if [[ "$OS_NAME" == "Darwin" ]]; then
+        echo "    With Homebrew: brew install tmux"
+      else
+        echo "    Use your package manager, for example: sudo apt install tmux"
+      fi
+    fi
+    if [[ "$network_ready" != "true" ]]; then
+      print_tailscale_summary
+    fi
+  fi
 }
 
 setup_network_summary
@@ -6362,19 +6414,11 @@ if [[ -n "$NETWORK_URLS" ]]; then
   done <<< "$NETWORK_URLS"
 fi
 echo
-echo "  ${COLOR_BOLD}Next steps${COLOR_RESET}"
+print_setup_checklist
 if [[ "$PORT_AUTO_SELECTED" == "true" ]]; then
+  echo
   echo "  $DOT_MARK port $ORIGINAL_PORT was already in use, installed on $PORT instead (--port pins an exact port unless --allow-port-fallback is supplied)"
 fi
-if [[ "$CLAUDE_READY" == "false" && "$CODEX_READY" == "false" ]]; then
-  echo "  $CROSS_MARK install and sign in to Claude Code or Codex (see [6/7] above) before starting a chat"
-fi
-if [[ -n "$TMUX_WARNING" ]]; then
-  echo "  $CROSS_MARK tmux unavailable: persistent terminal, pane inspection, and in-app updates won't work - $TMUX_WARNING"
-else
-  echo "  $CHECK_MARK tmux available"
-fi
-print_tailscale_summary
 if [[ "$TEAM_HUB_MODE" == "host" ]]; then
   echo
   if [[ "$TEAM_HUB_TRANSPORT" == "tailscale_serve" ]]; then

@@ -727,6 +727,11 @@ Installing from a working checkout automatically ignores Python bytecode caches
 (`__pycache__`, `.pyc`, `.pyo`); only explicitly listed source files are copied.
 Links, special files, missing required files and unexpected source files are
 still rejected. You do not need to clean normal Python caches yourself.
+The final summary shows **You are all set** when its checks pass. Otherwise,
+**You already have** lists working features, followed by short **Optional next
+steps** for tmux or network access. A missing agent CLI is listed separately
+under **To start chats**, with install/sign-in commands. The checks detect CLI
+availability, not whether provider sign-in is complete.
 
 | Item | Default | Named `work` |
 | --- | --- | --- |

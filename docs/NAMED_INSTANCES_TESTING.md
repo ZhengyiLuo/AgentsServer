@@ -55,7 +55,7 @@ To remove **only the new test service**, preserving its history:
 ./uninstall.sh --instance local-test
 ```
 
-The preview must name only `local-test`; type `UNINSTALL 1` only if it does.
+The preview must name only `local-test`; type `uninstall local-test` only if it does.
 Do not approve the bare `./uninstall.sh` or `--all` preview during this trial:
 those intentionally include the default instance. For bulk management without
 the original server, use `--all --exclude default`.
@@ -70,7 +70,7 @@ the original server, use `--all --exclude default`.
 - Instance-bound launchd/systemd operations, runtime config and update context.
 - Named install and uninstall preserving a synthetic default-on-7850 fixture.
 - Separate terminal names/sockets and exclusive state-directory ownership.
-- Exact-count confirmation, color warning, cancellation and guarded history purge.
+- Exact-name confirmation, color warning, cancellation and guarded history purge.
 - Refusal to update a named server with an old default-only release.
 
 The existing activation, service-state, health-security, stage-cleanup, update,

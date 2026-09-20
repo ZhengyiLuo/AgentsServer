@@ -288,14 +288,48 @@ class InstanceTests(unittest.TestCase):
         mocks["run"].assert_not_called()
         self.assertIn("CANNOT BE UNDONE", output)
 
-    def test_exact_count_confirmation_is_required_and_warning_is_colored(self):
-        with contextlib.redirect_stdout(io.StringIO()), patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="UNINSTALL 2"), patch.object(instances, "show"):
-            with self.assertRaises(ValueError):
-                instances.confirm_removal([self.work], False, False)
+    def test_exact_name_confirmation_is_required_and_warning_is_colored(self):
+        for answer in ("UNINSTALL 1", "uninstall 1", "uninstall", "uninstall default", "uninstall work extra", ""):
+            with self.subTest(answer=answer), contextlib.redirect_stdout(io.StringIO()), patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value=answer), patch.object(instances, "show"):
+                with self.assertRaises(ValueError):
+                    instances.confirm_removal([self.work], False, False)
         output = io.StringIO()
-        with contextlib.redirect_stdout(output), patch.object(output, "isatty", return_value=True), patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="UNINSTALL 1"), patch.object(instances, "show"), patch.dict(os.environ, {"TERM": "xterm"}, clear=True):
+        with contextlib.redirect_stdout(output), patch.object(output, "isatty", return_value=True), patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="uninstall work") as prompt, patch.object(instances, "show"), patch.dict(os.environ, {"TERM": "xterm"}, clear=True):
             instances.confirm_removal([self.work], False, False)
         self.assertIn("\033[1;31mWARNING", output.getvalue())
+        prompt.assert_called_once_with("Type 'uninstall work' to confirm: ")
+
+    def test_bulk_confirmation_requires_every_exact_selected_name(self):
+        for answer in ("UNINSTALL 2", "uninstall 2", "uninstall all", "uninstall work", "uninstall work default"):
+            with self.subTest(answer=answer), contextlib.redirect_stdout(io.StringIO()), patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value=answer), patch.object(instances, "show"):
+                with self.assertRaises(ValueError):
+                    instances.confirm_removal([self.default, self.work], False, False)
+        with contextlib.redirect_stdout(io.StringIO()), patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="uninstall default work") as prompt, patch.object(instances, "show"):
+            instances.confirm_removal([self.default, self.work], False, False)
+        prompt.assert_called_once_with("Type 'uninstall default work' to confirm: ")
+
+    def test_wrong_name_or_count_does_not_invoke_uninstaller(self):
+        self.configured(self.default, 7850)
+        self.configured(self.work)
+        for answer in ("UNINSTALL 1", "uninstall default", "uninstall work default"):
+            with self.subTest(answer=answer), patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value=answer):
+                code, _, errors, mocks = self.cli("remove", "work", run={})
+            self.assertEqual(code, 1)
+            self.assertIn("Not confirmed", errors)
+            mocks["run"].assert_not_called()
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="uninstall work"):
+            code, _, errors, mocks = self.cli("remove", "work", run={})
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(mocks["run"].call_args.args[0][-3:], ["--managed-instance", "work", "--yes"])
+
+    def test_history_purge_requires_explicit_action_and_names_even_with_yes(self):
+        for answer in ("DELETE HISTORY 1", "delete history 1", "uninstall work", "delete history default"):
+            with self.subTest(answer=answer), contextlib.redirect_stdout(io.StringIO()), patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value=answer), patch.object(instances, "show"):
+                with self.assertRaises(ValueError):
+                    instances.confirm_removal([self.work], True, True)
+        with contextlib.redirect_stdout(io.StringIO()), patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="delete history work") as prompt, patch.object(instances, "show"):
+            instances.confirm_removal([self.work], True, True)
+        prompt.assert_called_once_with("Type 'delete history work' to confirm: ")
 
     def test_loopback_binding_never_advertises_lan(self):
         with patch.object(instances.socket, "getaddrinfo") as resolve:
@@ -351,6 +385,10 @@ class InstanceTests(unittest.TestCase):
         self.assertFalse(self.work.config.exists())
         self.assertFalse(self.work.service_file("darwin").exists())
         self.assertTrue(all("com.agentsdock.server.work" in line for line in calls.read_text().splitlines()))
+        self.assertIn("./install.sh --instance work --port PORT", result.stdout)
+        self.assertIn("tmux -L agents-server-work ls", result.stdout)
+        self.assertNotIn("Re-running ./install.sh will pick", result.stdout)
+        self.assertNotIn("tmux sessions named zd_*", result.stdout)
 
     def test_bare_uninstall_never_proceeds_without_confirmation(self):
         self.configured(self.default, 7850)

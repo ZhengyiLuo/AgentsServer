@@ -787,8 +787,11 @@ additional automatically enabled peer listener.
 
 With no arguments, uninstall previews **all** current-user instances: their
 count, names, ports and exact paths. A red warning (on color-capable terminals)
-requires typing `UNINSTALL N` with the matching count before any service is
-removed. Cancellation or non-interactive input makes no service changes.
+requires typing `uninstall` followed by the exact selected instance names before
+any service is removed: for example, `uninstall work` for one instance, or
+`uninstall default work` for both, in the displayed order. Counts, missing names,
+and different names are rejected. Cancellation or non-interactive input makes
+no service changes.
 `--yes` can skip this service-removal confirmation only when explicitly supplied.
 For compatibility, legacy `./uninstall.sh --yes` remains default-only; bulk
 automation must explicitly use `--all --yes`.
@@ -810,7 +813,8 @@ terminal tmux sessions are left running; list default sessions with `tmux ls`
 or named sessions with `tmux -L agents-server-work ls`. Reinstall a preserved
 named history explicitly with `./install.sh --instance work --port 7851`.
 For bulk permanent deletion use `./uninstall.sh --all --purge-state`; it shows
-an irreversible-deletion warning, requires `DELETE HISTORY N`, and then requires
+an irreversible-deletion warning, requires `delete history` followed by every
+selected instance name (for example, `delete history default work`), and then requires
 each exact state path. **There is no undo for purged history.** `--yes` never
 bypasses these checks.
 

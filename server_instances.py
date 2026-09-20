@@ -547,7 +547,8 @@ def confirm_removal(instances: list[Instance], purge: bool, yes: bool) -> None:
         print(f"{red}PERMANENT HISTORY DELETION CANNOT BE UNDONE. --yes cannot bypass confirmation.{reset}")
     else:
         print("Chat history and files are preserved. Service removal is reinstallable; deleted configuration is not restored automatically.")
-    expected = f"{'DELETE HISTORY' if purge else 'UNINSTALL'} {len(instances)}"
+    target_names = " ".join(instance.name for instance in instances)
+    expected = f"{'delete history' if purge else 'uninstall'} {target_names}"
     if purge or not yes:
         if not sys.stdin.isatty() or input(f"Type {expected!r} to confirm: ") != expected:
             raise ValueError("Not confirmed; nothing was uninstalled.")

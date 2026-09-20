@@ -2,7 +2,7 @@
 set -euo pipefail
 
 UNINSTALL_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-# Bare uninstall now previews ALL instances and requires an exact count. Keep
+# Bare uninstall previews ALL instances and requires their exact names. Keep
 # legacy explicit --yes automation default-scoped; --all opts into bulk removal.
 if (($# == 0)); then
   exec bash "$UNINSTALL_SCRIPT_DIR/instances.sh" remove --all
@@ -124,7 +124,7 @@ usage() {
   cat <<USAGE
 Usage: ./uninstall.sh [--yes] [--purge-state]
 
-With no arguments: show all current-user instances and confirm their count.
+With no arguments: show all current-user instances and confirm their exact names.
   --instance NAME   Remove only NAME (preview + confirmation).
   --all             Remove all instances (preview + confirmation).
   --all --exclude default   Keep the original/default server untouched.
@@ -341,7 +341,12 @@ if [[ "$PURGE_STATE" == "true" ]]; then
   fi
 elif [[ -e "$STATE_ROOT" ]]; then
   echo "Preserved chat history, jobs, files, tokens, and secure-peer credentials at $STATE_ROOT."
-  echo "Re-running ./install.sh will pick ordinary AgentsServer state back up. Pass --purge-state to also delete it."
+  if [[ "$INSTANCE_NAME" == "default" ]]; then
+    echo "Re-running ./install.sh will pick ordinary AgentsServer state back up. Pass --purge-state to also delete it."
+  else
+    echo "To reuse this named history, run ./install.sh --instance $INSTANCE_NAME --port PORT (choose an available port)."
+    echo "Do not use bare ./install.sh for this instance; it targets the default server. Pass --purge-state to also delete history."
+  fi
   if [[ -e "$STATE_ROOT/team-hub/team-hub.sqlite3" || -L "$STATE_ROOT/team-hub/team-hub.sqlite3" ]]; then
     echo "Preserved Team Hub state is not auto-reactivated in this beta; use a signed managed recovery or support-assisted restoration."
   fi
@@ -357,5 +362,10 @@ if [[ -d "$INSTALL_ROOT" ]] && ! rmdir "$INSTALL_ROOT"; then
 fi
 
 echo "AgentsServer service, release runtime, and configuration removed."
-echo "Note: any persistent chat terminals (tmux sessions named zd_*) keep running"
-echo "independently and are not touched by this script. List them with: tmux ls"
+if [[ "$INSTANCE_NAME" == "default" ]]; then
+  echo "Note: any persistent chat terminals (tmux sessions named zd_*) keep running"
+  echo "independently and are not touched by this script. List them with: tmux ls"
+else
+  echo "Note: persistent chat terminals for $INSTANCE_NAME keep running independently and are not touched by this script."
+  echo "List only this instance's terminals with: tmux -L agents-server-$INSTANCE_NAME ls"
+fi

@@ -48,6 +48,7 @@ unset AGENTS_SERVER_NATIVE_ARCH_REEXEC
 PORT="7850"
 BIND_ADDRESS="0.0.0.0"
 RELEASE_VERSION=""
+EXPECTED_API_CONTRACT=""
 DEPENDENCY_SYNC_TIMEOUT_SECONDS="${AGENTS_SERVER_DEPENDENCY_TIMEOUT_SECONDS:-1200}"
 INSTALL_HEARTBEAT_SECONDS="${AGENTS_SERVER_INSTALL_HEARTBEAT_SECONDS:-15}"
 HEALTH_CHECK_ATTEMPTS="${AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS:-45}"
@@ -79,6 +80,7 @@ LAUNCHCTL_STOP_ATTEMPTS=1850
 LAUNCHCTL_STOP_DELAY=0.1
 LAUNCHCTL_BOOTSTRAP_ATTEMPTS=3
 NON_INTERACTIVE="false"
+FRESH_INSTALL_ONLY="false"
 PORT_EXPLICIT="false"
 BIND_EXPLICIT="false"
 SERVER_NAME=""
@@ -150,6 +152,13 @@ are required.
 --non-interactive skips the optional tmux install prompt on macOS instead of
 asking; use it for unattended/SSH-driven runs.
 
+--fresh-install-only refuses an existing installation, state, configuration or
+service. The npm fresh-install command uses it; existing servers update through
+the authenticated managed updater. The check repeats under the install lock.
+
+--expected-api-contract pins candidate health to the signed release descriptor.
+It is used by the coordinated updater before committing activation.
+
 --port pins the exact requested port unless --allow-port-fallback is also set.
 Without --port, setup may select one of the next 5 ports when the default is
 already occupied by a service that does not authenticate as AgentsServer.
@@ -188,7 +197,9 @@ while (($#)); do
     --port) PORT="${2:-}"; PORT_EXPLICIT="true"; shift 2 ;;
     --bind) BIND_ADDRESS="${2:-}"; BIND_EXPLICIT="true"; shift 2 ;;
     --release-version) RELEASE_VERSION="${2:-}"; shift 2 ;;
+    --expected-api-contract) EXPECTED_API_CONTRACT="${2:-}"; shift 2 ;;
     --non-interactive) NON_INTERACTIVE="true"; shift ;;
+    --fresh-install-only) FRESH_INSTALL_ONLY="true"; shift ;;
     --allow-port-fallback) PORT_FALLBACK="true"; shift ;;
     --no-port-fallback) PORT_FALLBACK="false"; shift ;;
     --team-hub-host)
@@ -514,6 +525,9 @@ validate_positive_integer() {
 validate_positive_integer "AGENTS_SERVER_DEPENDENCY_TIMEOUT_SECONDS" "$DEPENDENCY_SYNC_TIMEOUT_SECONDS"
 validate_positive_integer "AGENTS_SERVER_INSTALL_HEARTBEAT_SECONDS" "$INSTALL_HEARTBEAT_SECONDS"
 validate_positive_integer "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS" "$HEALTH_CHECK_ATTEMPTS"
+if [[ -n "$EXPECTED_API_CONTRACT" ]]; then
+  validate_positive_integer "--expected-api-contract" "$EXPECTED_API_CONTRACT"
+fi
 
 RELEASES_ROOT="$INSTALL_ROOT/releases"
 RELEASE_DIR="$RELEASES_ROOT/$RELEASE_VERSION"
@@ -1226,6 +1240,61 @@ OS_NAME="$(uname -s)"
 SYSTEMD_SERVICE_FILE="$HOME/.config/systemd/user/$SERVICE_NAME.service"
 LABEL="com.agentsdock.server"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+
+validate_fresh_install_state() {
+  [[ "$FRESH_INSTALL_ONLY" == "true" ]] || return 0
+  local candidate=""
+  local load_state=""
+  local registration=""
+  local stage_identity=""
+  for candidate in "$CURRENT_LINK" "$PREVIOUS_LINK" "$CONFIG_ROOT" \
+    "$STATE_ROOT" "$LEGACY_STATE_ROOT" "$SYSTEMD_SERVICE_FILE" \
+    "$LEGACY_SERVICE_FILE" "$PLIST"; do
+    if [[ -e "$candidate" || -L "$candidate" ]]; then
+      echo "Fresh install refused: existing AgentsServer state or service at $candidate. Use the managed update or migration flow." >&2
+      return 1
+    fi
+  done
+  # Only this installer's lock and staging directory may appear between the
+  # early check and the repeated check under exclusive ownership.
+  for candidate in "$INSTALL_ROOT"/* "$INSTALL_ROOT"/.[!.]* "$INSTALL_ROOT"/..?*; do
+    [[ -e "$candidate" || -L "$candidate" ]] || continue
+    [[ "$candidate" == "$INSTALL_ROOT/.install-lock" || "$candidate" == "$RELEASES_ROOT" ]] && continue
+    echo "Fresh install refused: an existing installation occupies $INSTALL_ROOT." >&2
+    return 1
+  done
+  for candidate in "$RELEASES_ROOT"/* "$RELEASES_ROOT"/.[!.]* "$RELEASES_ROOT"/..?*; do
+    [[ -e "$candidate" || -L "$candidate" ]] || continue
+    if [[ "$candidate" == "$STAGE_DIR" && -d "$candidate" && ! -L "$candidate" \
+      && -n "$STAGE_DIR_DEVICE" && -n "$STAGE_DIR_INODE" ]]; then
+      stage_identity="$(stat -c $'%d\n%i' "$candidate" 2>/dev/null \
+        || stat -f $'%d\n%i' "$candidate" 2>/dev/null)" || return 1
+      if [[ "$stage_identity" == "$STAGE_DIR_DEVICE"$'\n'"$STAGE_DIR_INODE" ]]; then
+        continue
+      fi
+    fi
+    echo "Fresh install refused: an existing server release occupies $RELEASES_ROOT." >&2
+    return 1
+  done
+  if [[ "$OS_NAME" == "Darwin" ]]; then
+    if registration="$(launchctl print "gui/$(id -u)/$LABEL" 2>&1)"; then
+      echo "Fresh install refused: the AgentsServer service is already registered." >&2
+      return 1
+    fi
+    if [[ "$registration" != *"Could not find service"* && "$registration" != *"service not found"* ]]; then
+      echo "Fresh install refused: service absence could not be verified." >&2
+      return 1
+    fi
+  elif [[ "$OS_NAME" == "Linux" ]]; then
+    load_state="$(systemctl --user show "$SERVICE_NAME.service" --property=LoadState --value 2>/dev/null || true)"
+    if [[ "$load_state" != "not-found" ]]; then
+      echo "Fresh install refused: the AgentsServer service exists or its absence could not be verified." >&2
+      return 1
+    fi
+  fi
+}
+
+validate_fresh_install_state || exit 1
 SERVER_PATH=""
 append_server_path() {
   local candidate="$1"
@@ -2944,6 +3013,7 @@ acquire_install_lock() {
 }
 
 validate_exclusive_install_state() {
+  validate_fresh_install_state || return 1
   if [[ -d "$ACTIVATION_TRANSACTION_DIR" \
     && ! -L "$ACTIVATION_TRANSACTION_DIR" ]]; then
     ACTIVATION_TRANSACTION_RESUMED="true"
@@ -5016,6 +5086,7 @@ release_health_check_once() {
   local allow_legacy_transport="${9:-false}"
   local selected_bind="${10:-$BIND_ADDRESS}"
   local expected_direct_ip_url="${11:-$TEAM_HUB_DIRECT_IP_URL}"
+  local expected_api_contract="${12:-}"
   local response_file=""
   local status_file=""
   local observed_binding_file=""
@@ -5053,7 +5124,8 @@ release_health_check_once() {
     "$expected_hub_url" \
     "$expected_direct_ip_url" \
     "$allow_legacy_transport" \
-    "$EXPECTED_TEAM_HUB_CLIENT_BINDING" <<'PY'
+    "$EXPECTED_TEAM_HUB_CLIENT_BINDING" \
+    "$expected_api_contract" <<'PY'
 import json
 import re
 import sys
@@ -5069,6 +5141,7 @@ import sys
     expected_direct_ip_url,
     allow_legacy_transport,
     expected_client_binding_json,
+    expected_api_contract,
 ) = sys.argv[1:]
 try:
     with open(path, "rb") as stream:
@@ -5078,6 +5151,11 @@ except (OSError, UnicodeError, json.JSONDecodeError):
 if not isinstance(health, dict) or health.get("ok") is not True:
     raise SystemExit(1)
 if health.get("server_version") != expected_version:
+    raise SystemExit(1)
+if expected_api_contract and (
+    type(health.get("api_contract_version")) is not int
+    or health["api_contract_version"] != int(expected_api_contract)
+):
     raise SystemExit(1)
 server_identity = health.get("server_identity")
 if not isinstance(server_identity, str) or re.fullmatch(r"[A-Za-z0-9_.:-]{8,240}", server_identity) is None:
@@ -5363,6 +5441,7 @@ wait_for_exact_release_health() {
   local health_port="${11:-$PORT}"
   local health_bind="${12:-$BIND_ADDRESS}"
   local expected_direct_ip_url="${13:-$TEAM_HUB_DIRECT_IP_URL}"
+  local expected_api_contract="${14:-}"
   local attempt
   for ((attempt = 1; attempt <= attempt_limit; attempt++)); do
     if release_health_check_once \
@@ -5376,7 +5455,8 @@ wait_for_exact_release_health() {
       "$expected_hub_url" \
       "$allow_legacy_transport" \
       "$health_bind" \
-      "$expected_direct_ip_url"; then
+      "$expected_direct_ip_url" \
+      "$expected_api_contract"; then
       return 0
     fi
     if ((attempt < attempt_limit)) && ((attempt % HEALTH_CHECK_HEARTBEAT_ATTEMPTS == 0)); then
@@ -5388,6 +5468,10 @@ wait_for_exact_release_health() {
 }
 
 wait_for_release_health() {
+  local candidate_api_contract=""
+  if [[ "$RELEASE_VERSION" == "${REQUESTED_RELEASE_VERSION:-$RELEASE_VERSION}" ]]; then
+    candidate_api_contract="${EXPECTED_API_CONTRACT:-}"
+  fi
   wait_for_exact_release_health \
     "$RELEASE_DIR" \
     "$RELEASE_VERSION" \
@@ -5396,7 +5480,13 @@ wait_for_release_health() {
     "${EXPECTED_TEAM_HUB_ID:-$TEAM_HUB_REACTIVATION_HUB_ID}" \
     "$TEAM_HUB_TRANSPORT" \
     "$TEAM_HUB_URL" \
-    "candidate release"
+    "candidate release" \
+    "$HEALTH_CHECK_ATTEMPTS" \
+    false \
+    "$PORT" \
+    "$BIND_ADDRESS" \
+    "$TEAM_HUB_DIRECT_IP_URL" \
+    "$candidate_api_contract"
 }
 
 secure_peer_host_attachment_check_once() {
@@ -5487,6 +5577,10 @@ PY
 
 wait_for_final_release_health() {
   local attempt
+  local candidate_api_contract=""
+  if [[ "$RELEASE_VERSION" == "${REQUESTED_RELEASE_VERSION:-$RELEASE_VERSION}" ]]; then
+    candidate_api_contract="${EXPECTED_API_CONTRACT:-}"
+  fi
   for ((attempt = 1; attempt <= HEALTH_CHECK_ATTEMPTS; attempt++)); do
     if release_health_check_once \
         "$PORT" \
@@ -5498,6 +5592,9 @@ wait_for_final_release_health() {
         "$TEAM_HUB_TRANSPORT" \
         "$TEAM_HUB_URL" \
         false \
+        "$BIND_ADDRESS" \
+        "$TEAM_HUB_DIRECT_IP_URL" \
+        "$candidate_api_contract" \
       && secure_peer_host_attachment_check_once "$RELEASE_DIR"; then
       return 0
     fi

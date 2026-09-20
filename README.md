@@ -25,9 +25,12 @@ AgentsServer (your workstation or server)
         +-- local workspaces, files, jobs, and tmux sessions
 ```
 
-This repository is intentionally server-only. It should not contain local chat
-state, uploaded files, tokens, compiled caches, private hostnames, or personal
-machine paths.
+This directory is the maintained server inside the AgentsDock repository. It
+remains independently installable: run server commands from this directory;
+building the desktop or mobile app is unnecessary. The standalone AgentsServer
+repository and its signed downloads remain available during the update migration.
+Keep local chat state, uploaded files, tokens, compiled caches, private hostnames,
+and personal machine paths outside tracked source.
 
 ## What It Gives AgentsDock
 

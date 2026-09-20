@@ -1,8 +1,9 @@
 name: Server release
 
 on:
-  push:
-    tags: ["v*"]
+  # This compatibility workflow becomes active when server/ is exported to the
+  # standalone repository. Only explicit dispatch may publish the legacy bridge;
+  # a subtree export or a unified app release tag must not publish it twice.
   workflow_dispatch:
     inputs:
       tag:

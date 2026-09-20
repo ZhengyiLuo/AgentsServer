@@ -120,6 +120,7 @@ from update_runner import (
     server_update_status_lock,
     utc_now as update_utc_now,
     version_key,
+    verify_npm_release_envelope,
 )
 from team_hub_host import (
     TEAM_HUB_MODE_HOST,
@@ -8727,6 +8728,13 @@ class ServerUpdateCancelRequest(ServerUpdateTargetExpectation):
 
 class ServerUpdateCheckRequest(ServerUpdateTargetExpectation):
     track: Literal["stable", "beta"] | None = None
+
+
+class ServerUpdateEnsureRequest(ServerUpdateTargetExpectation):
+    model_config = {"extra": "forbid"}
+
+    manifest_base64: str = Field(min_length=1, max_length=10_924)
+    signature_base64: str = Field(min_length=88, max_length=88)
 
 
 class ServerRestartRequest(BaseModel):
@@ -69746,6 +69754,7 @@ SERVER_UPDATE_PER_RUN_STATUS_FIELDS = (
     "retryable",
 )
 SERVER_UPDATE_PRIVATE_PER_RUN_STATUS_FIELDS = (
+    "_npm_release",
     "_force_restart_request_id",
     "_force_restart_requested_at",
 )
@@ -71614,12 +71623,22 @@ def public_server_update_status(status: dict[str, Any]) -> dict[str, Any]:
             key: value
             for key, value in status.items()
             if key not in {
+                "_npm_release",
                 "_force_restart_request_id",
                 "_force_restart_requested_at",
             }
         },
         "server_identity": server_identity(),
         "server_instance_id": SERVER_INSTANCE_ID,
+    }
+
+
+def server_update_health_projection() -> dict[str, str | None]:
+    """Expose bounded receipt changes through the existing health refresh."""
+    status = read_server_update_status()
+    return {
+        name: value if isinstance(value := status.get(name), str) and len(value) <= 160 else None
+        for name in ("phase", "update_id", "schedule_id", "target_version", "updated_at")
     }
 
 
@@ -72090,6 +72109,14 @@ def reconcile_pending_server_update_after_startup(
                 valid = False
         if valid and server_release_track(target) != track:
             valid = False
+        if valid and current.get("_npm_release") is not None:
+            try:
+                npm_manifest = verify_npm_release_envelope(
+                    current["_npm_release"], SERVER_UPDATE_PUBLIC_KEY, expected_version=target,
+                )
+                valid = npm_manifest["track"] == track == server_release_track(SERVER_VERSION)
+            except Exception:
+                valid = False
         if not valid:
             return _write_fresh_server_update_status_unlocked(
                 phase="failed",
@@ -72394,6 +72421,7 @@ def restore_pending_server_update_after_provider_quiesce_timeout(
             cancelable=reservation.get("cancelable") is True,
             pending_at=reservation.get("pending_at"),
             blocker_counts=counts,
+            _npm_release=reservation.get("_npm_release"),
             _force_restart_request_id=reservation.get(
                 "_force_restart_request_id"
             ),
@@ -74600,9 +74628,13 @@ async def require_agent_token(request: Request, call_next):
                 status_code, detail = body_error
                 return JSONResponse({"detail": detail}, status_code=status_code)
         elif server_update_admin_route and request.method.upper() == "POST":
+            update_body_limit = (
+                16_384 if request.url.path == "/api/admin/update/ensure"
+                else PRIVILEGED_NATIVE_UPDATE_MAX_BODY_BYTES
+            )
             declared_size, transport_error = privileged_native_json_transport(
                 request,
-                max_body_bytes=PRIVILEGED_NATIVE_UPDATE_MAX_BODY_BYTES,
+                max_body_bytes=update_body_limit,
                 label="server update",
                 require_content_length=False,
             )
@@ -74611,7 +74643,7 @@ async def require_agent_token(request: Request, call_next):
                 return JSONResponse({"detail": detail}, status_code=status_code)
             body_error = await prebuffer_bounded_request_body(
                 request,
-                max_body_bytes=PRIVILEGED_NATIVE_UPDATE_MAX_BODY_BYTES,
+                max_body_bytes=update_body_limit,
                 declared_size=declared_size,
             )
             if body_error is not None:
@@ -74847,6 +74879,7 @@ async def require_agent_token(request: Request, call_next):
             "/api/admin/update/cancel",
             "/api/admin/update/check",
             "/api/admin/update/start",
+            "/api/admin/update/ensure",
         }
     )
     if not unsafe_mutation:
@@ -76951,6 +76984,7 @@ async def health() -> dict[str, Any]:
         "server_identity": server_identity(),
         "server_instance_id": SERVER_INSTANCE_ID,
         "server_name": AGENTSDOCK_SERVER_DISPLAY_NAME,
+        "server_update": server_update_health_projection(),
         "state_dir": str(STATE_DIR),
         "default_backend": DEFAULT_BACKEND,
         "default_cwd": existing_cwd(DEFAULT_CWD),
@@ -77171,6 +77205,18 @@ async def health() -> dict[str, Any]:
                 # defer autonomous scheduled-job admission.
                 "version": 11,
                 "tracks": ["stable", "beta"],
+            },
+            "server_update_ensure_v1": {
+                "available": (
+                    SERVER_UPDATE_RUNNER.is_file()
+                    and SERVER_UPDATE_PUBLIC_KEY.is_file()
+                    and bool(tmux["available"])
+                    and bool(AGENT_TOKEN)
+                ),
+                "version": 1,
+                "transports": ["npm"],
+                "package": "@agentsdock/server",
+                "api_contract_policy": "exact",
             },
             "tmux": tmux,
             "workspace_files": {
@@ -80057,18 +80103,75 @@ async def _start_server_update(
     body: ServerUpdateRequest,
     *,
     expected_schedule_id: str | None = None,
+    npm_release: dict[str, str] | None = None,
+    ensure: bool = False,
 ) -> dict[str, Any]:
     async with SERVER_UPDATE_OPERATION_LOCK:
         require_server_update_target(
             body.expected_server_identity,
             body.expected_server_instance_id,
         )
+        npm_manifest: dict[str, Any] | None = None
+        if npm_release is not None:
+            try:
+                npm_manifest = await asyncio.to_thread(
+                    verify_npm_release_envelope, npm_release, SERVER_UPDATE_PUBLIC_KEY,
+                    expected_version=body.version,
+                )
+            except Exception as exc:
+                raise HTTPException(400, server_update_error_detail(
+                    "server_update_descriptor_invalid", "The signed server release descriptor is invalid.",
+                    action="Download the application release again.", retryable=False,
+                )) from exc
+            body = ServerUpdateRequest(
+                version=npm_manifest["version"], track=npm_manifest["track"], when_idle=True,
+                expected_server_identity=body.expected_server_identity,
+                expected_server_instance_id=body.expected_server_instance_id,
+            )
         if managed_server_restart_blocks_work():
             raise HTTPException(
                 status_code=409,
                 detail="AgentsServer is restarting",
             )
         status = read_server_update_status()
+        if ensure:
+            if npm_manifest is None:
+                raise HTTPException(400, "a signed npm release descriptor is required")
+            if version_key(SERVER_VERSION) >= version_key(npm_manifest["version"]):
+                if API_CONTRACT_VERSION != npm_manifest["api_contract_version"]:
+                    raise HTTPException(409, server_update_error_detail(
+                        "server_update_incompatible", "The installed server uses a different API contract.",
+                        action="Use a compatible application release.", retryable=False,
+                    ))
+                return {
+                    **status, "phase": "current", "reconciliation": "current",
+                    "update_available": False, "message": f"AgentsServer {SERVER_VERSION} satisfies this application release.",
+                }
+        if npm_manifest is not None and npm_manifest["track"] != server_release_track(SERVER_VERSION):
+            raise HTTPException(409, server_update_error_detail(
+                "server_update_channel_conflict", "Automatic updates cannot change this server's release channel.",
+                action="Choose the server release channel explicitly in Settings.", retryable=False,
+            ))
+        if ensure:
+            if (status.get("phase") in SERVER_UPDATE_ACTIVE_PHASES
+                    or managed_server_update_is_pending(status)):
+                target = str(status.get("target_version") or "")
+                try:
+                    joins = status.get("track") == body.track and version_key(target) >= version_key(body.version or "")
+                except ValueError:
+                    joins = False
+                active = (managed_server_update_is_pending(status)
+                          or await asyncio.to_thread(server_update_is_active, status)
+                          or server_update_status_age_seconds(status) < SERVER_UPDATE_START_GRACE_SECONDS)
+                if active:
+                    if joins:
+                        return {**status, "reconciliation": "pending" if managed_server_update_is_pending(status) else "started"}
+                    raise HTTPException(409, server_update_error_detail(
+                        "server_update_pending", "Another server update must finish before this release can be reconciled.",
+                        action="Observe the existing update, then retry automatically.", retryable=True,
+                        schedule_id=status.get("schedule_id"), target_version=status.get("target_version"),
+                        update_id=status.get("update_id"), track=status.get("track"), phase=status.get("phase"),
+                    ))
         if managed_update_provider_quiesce_failed():
             ensure_managed_update_provider_quiesce_failure_status(status)
             raise HTTPException(
@@ -80126,6 +80229,17 @@ async def _start_server_update(
         requested = str(body.version or status.get("latest_version") or "").strip()
         if not requested:
             raise HTTPException(status_code=409, detail="check for a signed server update before installing")
+        if (npm_release is None and pending_schedule_id and status.get("_npm_release") is not None
+                and requested == status.get("target_version") and track == status.get("track")):
+            npm_release = status["_npm_release"]
+            try:
+                npm_manifest = verify_npm_release_envelope(
+                    npm_release, SERVER_UPDATE_PUBLIC_KEY, expected_version=requested,
+                )
+                if npm_manifest["track"] != track or track != server_release_track(SERVER_VERSION):
+                    raise ValueError("release channel changed")
+            except Exception as exc:
+                raise HTTPException(400, "the saved signed npm release descriptor is invalid") from exc
         try:
             version_key(requested)
         except ValueError as exc:
@@ -80270,6 +80384,7 @@ async def _start_server_update(
                                 and managed_server_force_update_is_pending(status)
                             )
                             pending_status = write_fresh_server_update_status(
+                                _npm_release=npm_release,
                                 schedule_id=schedule_id,
                                 phase=SERVER_UPDATE_PENDING_PHASE,
                                 track=track,
@@ -80329,6 +80444,8 @@ async def _start_server_update(
                         "--track", track,
                         "--update-id", update_id,
                     ]
+                    if npm_release is not None:
+                        command.append("--npm-descriptor")
                     if service_cgroup is not None:
                         command.extend(
                             ["--expected-service-cgroup", service_cgroup]
@@ -80508,6 +80625,7 @@ async def _start_server_update(
                         )
                     try:
                         status = write_fresh_server_update_status(
+                            _npm_release=npm_release,
                             schedule_id=(pending_schedule_id or None),
                             update_id=update_id,
                             phase="starting",
@@ -80731,6 +80849,21 @@ async def start_server_update(body: ServerUpdateRequest) -> dict[str, Any]:
     return public_server_update_status(await _start_server_update(body))
 
 
+async def ensure_server_update(body: ServerUpdateEnsureRequest) -> dict[str, Any]:
+    status = await _start_server_update(
+        ServerUpdateRequest(
+            expected_server_identity=body.expected_server_identity,
+            expected_server_instance_id=body.expected_server_instance_id,
+            when_idle=True,
+        ),
+        npm_release={"manifest_base64": body.manifest_base64, "signature_base64": body.signature_base64},
+        ensure=True,
+    )
+    result = public_server_update_status(status)
+    result.setdefault("reconciliation", "pending" if managed_server_update_is_pending(status) else "started")
+    return result
+
+
 async def cancel_server_update(
     body: ServerUpdateCancelRequest,
 ) -> dict[str, Any]:
@@ -80865,6 +80998,13 @@ async def cancel_server_update_endpoint(
 ) -> dict[str, Any]:
     require_native_admin_control(request)
     return await cancel_server_update(body)
+
+
+@app.post("/api/admin/update/ensure")
+async def ensure_server_update_endpoint(body: ServerUpdateEnsureRequest, request: Request) -> dict[str, Any]:
+    require_native_admin_control(request)
+    require_exact_server_update_target(body.expected_server_identity, body.expected_server_instance_id)
+    return await ensure_server_update(body)
 
 
 async def advance_pending_server_update_once() -> dict[str, Any]:

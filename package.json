@@ -1,0 +1,17 @@
+{
+  "name": "@agentsdock/server",
+  "version": "0.0.0-development",
+  "private": true,
+  "description": "AgentsDock's self-hosted Python server and explicit installation CLI",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ZhengyiLuo/AgentsDock.git",
+    "directory": "server"
+  },
+  "bin": { "agentsdock-server": "npm/cli.cjs" },
+  "engines": { "node": ">=22.14.0" },
+  "os": ["darwin", "linux"],
+  "files": ["npm/cli.cjs", "server/", "README.md", "LICENSE", "NOTICE"],
+  "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org/" }
+}

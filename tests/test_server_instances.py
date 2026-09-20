@@ -263,7 +263,30 @@ class InstanceTests(unittest.TestCase):
         self.assertNotIn("default", command)
         self.assertIn("1 AgentsServer", output)
         self.assertIn("PRESERVE history", output)
+        self.assertTrue(output.endswith("\n\nSuccessful!\n"))
+        self.assertEqual(output.count("Successful!"), 1)
+        self.assertNotIn("remove completed", output)
         self.assertEqual(self.registry.records()["work"]["status"], "removed")
+
+    def test_failed_or_partial_removal_never_reports_success(self):
+        self.configured(self.default, 7850)
+        self.configured(self.work)
+        for results in ([ValueError("mock failure"), None], [None, ValueError("mock failure")]):
+            with self.subTest(results=results):
+                code, output, errors, mocks = self.cli("remove", "--all", "--yes", run={"side_effect": results})
+                self.assertEqual(code, 1)
+                self.assertEqual(mocks["run"].call_count, 2)
+                self.assertIn("failed", errors)
+                self.assertNotIn("Successful!", output)
+
+    def test_bulk_removal_reports_success_once(self):
+        self.configured(self.default, 7850)
+        self.configured(self.work)
+        code, output, errors, mocks = self.cli("remove", "--all", "--yes", run={})
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(mocks["run"].call_count, 2)
+        self.assertEqual(output.count("Successful!"), 1)
+        self.assertTrue(output.endswith("\n\nSuccessful!\n"))
 
     def test_bulk_remove_requires_interactive_confirmation(self):
         self.configured(self.work)
@@ -297,6 +320,8 @@ class InstanceTests(unittest.TestCase):
         with contextlib.redirect_stdout(output), patch.object(output, "isatty", return_value=True), patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="uninstall work") as prompt, patch.object(instances, "show"), patch.dict(os.environ, {"TERM": "xterm"}, clear=True):
             instances.confirm_removal([self.work], False, False)
         self.assertIn("\033[1;31mWARNING", output.getvalue())
+        self.assertIn(f"\033[31m  Remove runtime: {self.work.runtime}\033[0m\n", output.getvalue())
+        self.assertIn(f"\033[32m  PRESERVE history: {self.work.state}\033[0m\n", output.getvalue())
         prompt.assert_called_once_with("Type 'uninstall work' to confirm: ")
 
     def test_bulk_confirmation_requires_every_exact_selected_name(self):
@@ -355,6 +380,32 @@ class InstanceTests(unittest.TestCase):
         return {str(path.relative_to(self.home)): path.read_bytes() for root in (instance.runtime, instance.config, instance.state) if root.exists() for path in root.rglob("*") if path.is_file()}
 
     def test_real_uninstaller_with_mocked_launchd_preserves_7850_fixture(self):
+        output = self.check_named_uninstaller_output()
+        self.assertNotIn("\033[", output)
+
+    def test_named_uninstall_terminal_colors_spacing_and_single_success(self):
+        output = self.check_named_uninstaller_output(terminal=True)
+        self.assertIn(f"\033[31mRemoving release runtime at {self.work.runtime}\033[0m\n", output)
+        self.assertIn(f"\033[31mRemoving configuration at {self.work.config}\033[0m\n", output)
+        self.assertIn("\n\n\033[32mPreserved chat history", output)
+        self.assertIn(f"{self.work.state}.\033[0m\n\nTo reuse this named history", output)
+        self.assertIn("\n\nNote: persistent chat terminals", output)
+        self.assertTrue(output.endswith("\n\n\033[32mSuccessful!\033[0m\n"), output)
+
+    def test_named_uninstall_no_color_remains_plain_in_terminal(self):
+        output = self.check_named_uninstaller_output(terminal=True, extra_env={"NO_COLOR": ""})
+        self.assertNotIn("\033[", output)
+        self.assertTrue(output.endswith("\n\nSuccessful!\n"))
+
+    def test_named_uninstall_dumb_terminal_remains_plain(self):
+        output = self.check_named_uninstaller_output(terminal=True, extra_env={"TERM": "dumb"})
+        self.assertNotIn("\033[", output)
+        self.assertTrue(output.endswith("\n\nSuccessful!\n"))
+
+    def check_named_uninstaller_output(self, *, terminal=False, extra_env=None):
+        # All destructive commands target this test's temporary home; launchd
+        # is stubbed. Run the actual manager + child to check color propagation
+        # and ensure they do not both emit a success footer.
         self.configured(self.default, 7850, "darwin")
         self.configured(self.work, 7851, "darwin")
         self.default.logs.mkdir(parents=True)
@@ -373,9 +424,17 @@ class InstanceTests(unittest.TestCase):
         (fake_bin / "python3").symlink_to(sys.executable)
         before = self.snapshot(self.default)
         service_before = self.default.service_file("darwin").read_bytes()
-        env = {**instances.clean_environment(self.work), "HOME": str(self.home), "PATH": f"{fake_bin}:/usr/bin:/bin", "TEST_SERVICE_LOG": str(calls)}
-        result = subprocess.run(["/bin/bash", str(ROOT / "uninstall.sh"), "--managed-instance", "work", "--yes"], env=env, capture_output=True, text=True, timeout=30)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        env = {**instances.clean_environment(self.work), "HOME": str(self.home), "PATH": f"{fake_bin}:/usr/bin:/bin", "TEST_SERVICE_LOG": str(calls), "TERM": "xterm"}
+        env.pop("NO_COLOR", None)
+        env.update(extra_env or {})
+        command = ["/bin/bash", str(ROOT / "uninstall.sh"), "--instance", "work", "--yes"]
+        if terminal:
+            from tests.test_installer_token_output import TokenOutputTests
+            output = TokenOutputTests().run_terminal("exec " + shlex.join(command), environment=env)
+        else:
+            result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = result.stdout
         self.assertEqual(self.snapshot(self.default), before)
         self.assertEqual(self.default.service_file("darwin").read_bytes(), service_before)
         self.assertEqual((self.default.logs / "server.log").read_text(), "default log stays")
@@ -385,10 +444,13 @@ class InstanceTests(unittest.TestCase):
         self.assertFalse(self.work.config.exists())
         self.assertFalse(self.work.service_file("darwin").exists())
         self.assertTrue(all("com.agentsdock.server.work" in line for line in calls.read_text().splitlines()))
-        self.assertIn("./install.sh --instance work --port PORT", result.stdout)
-        self.assertIn("tmux -L agents-server-work ls", result.stdout)
-        self.assertNotIn("Re-running ./install.sh will pick", result.stdout)
-        self.assertNotIn("tmux sessions named zd_*", result.stdout)
+        self.assertIn("./install.sh --instance work --port PORT", output)
+        self.assertIn("tmux -L agents-server-work ls", output)
+        self.assertNotIn("Re-running ./install.sh will pick", output)
+        self.assertNotIn("tmux sessions named zd_*", output)
+        self.assertNotIn("remove completed", output)
+        self.assertEqual(output.count("Successful!"), 1)
+        return output
 
     def test_bare_uninstall_never_proceeds_without_confirmation(self):
         self.configured(self.default, 7850)

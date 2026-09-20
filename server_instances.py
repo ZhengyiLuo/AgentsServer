@@ -535,16 +535,21 @@ def show(instance: Instance):
     print(f"{item['name']:<20} {item['status']:<10} {str(item['port'] or '—'):<6} " + "  ".join(item["addresses"]))
 
 
-def confirm_removal(instances: list[Instance], purge: bool, yes: bool) -> None:
+def terminal_color(text: str, code: str) -> str:
     color = sys.stdout.isatty() and os.environ.get("TERM") != "dumb" and "NO_COLOR" not in os.environ
-    red, reset = ("\033[1;31m", "\033[0m") if color else ("", "")
-    print(f"{red}WARNING: uninstall {len(instances)} AgentsServer instance(s){reset}")
+    return f"\033[{code}m{text}\033[0m" if color else text
+
+
+def confirm_removal(instances: list[Instance], purge: bool, yes: bool) -> None:
+    print(terminal_color(f"WARNING: uninstall {len(instances)} AgentsServer instance(s)", "1;31"))
     for instance in instances:
         show(instance)
-        print(f"  Remove runtime: {instance.runtime}\n  Remove configuration/token: {instance.config}\n  {'PERMANENTLY DELETE' if purge else 'PRESERVE'} history: {instance.state}")
+        print(terminal_color(f"  Remove runtime: {instance.runtime}", "31"))
+        print(terminal_color(f"  Remove configuration/token: {instance.config}", "31"))
+        print(terminal_color(f"  {'PERMANENTLY DELETE' if purge else 'PRESERVE'} history: {instance.state}", "31" if purge else "32"))
     print("Services and tokens will be removed; reinstalling creates a new access token.")
     if purge:
-        print(f"{red}PERMANENT HISTORY DELETION CANNOT BE UNDONE. --yes cannot bypass confirmation.{reset}")
+        print(terminal_color("PERMANENT HISTORY DELETION CANNOT BE UNDONE. --yes cannot bypass confirmation.", "1;31"))
     else:
         print("Chat history and files are preserved. Service removal is reinstallable; deleted configuration is not restored automatically.")
     target_names = " ".join(instance.name for instance in instances)
@@ -717,10 +722,13 @@ def main(argv: list[str] | None = None) -> int:
                         registry.save(item, "installed")
                     else:
                         control(item, args.command)
-                    print(f"{item.name}: {args.command} completed", flush=True)
+                    if args.command != "remove":
+                        print(f"{item.name}: {args.command} completed", flush=True)
                 except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as exc:
                     print(f"{item.name}: failed ({exc})", file=sys.stderr)
                     failures += 1
+            if args.command == "remove" and not failures:
+                print("\n" + terminal_color("Successful!", "32"), flush=True)
             return int(bool(failures))
     except (OSError, ValueError, KeyError) as exc:
         print(f"Instance manager: {exc}", file=sys.stderr)

@@ -792,6 +792,10 @@ any service is removed: for example, `uninstall work` for one instance, or
 `uninstall default work` for both, in the displayed order. Counts, missing names,
 and different names are rejected. Cancellation or non-interactive input makes
 no service changes.
+On color-capable terminals, removal lines are red and preserved-data lines are
+green. Guidance stays plain, with blank lines separating sections; a green
+`Successful!` appears only after the entire requested removal succeeds. Redirected
+output, `TERM=dumb`, and `NO_COLOR` remain color-free.
 `--yes` can skip this service-removal confirmation only when explicitly supplied.
 For compatibility, legacy `./uninstall.sh --yes` remains default-only; bulk
 automation must explicitly use `--all --yes`.

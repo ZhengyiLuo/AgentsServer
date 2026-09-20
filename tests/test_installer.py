@@ -5926,6 +5926,9 @@ chmod 755 "$project/.venv/bin/python"
             self.assertEqual(peer_identity.read_text(), "preserve-secure-peer-identity\n")
             self.assertIn("Preserved chat history", result.stdout)
             self.assertIn("secure-peer credentials", result.stdout)
+            self.assertNotIn("\033[", result.stdout)
+            self.assertTrue(result.stdout.endswith("\n\nSuccessful!\n"))
+            self.assertEqual(result.stdout.count("Successful!"), 1)
 
     def test_uninstall_purge_state_requires_interactive_exact_confirmation(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -6047,6 +6050,7 @@ chmod 755 "$project/.venv/bin/python"
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Could not stop agents-server.service; no files were removed", result.stderr)
+            self.assertNotIn("Successful!", result.stdout)
             self.assertEqual(
                 self.snapshot_trees(install_root, config_root, state_root, service_file),
                 before,

@@ -10,6 +10,40 @@ the main provider conversation, and no client changes are needed. Manual
 renames always win. Old chats without explicit title-ownership metadata,
 explicitly named imports, forks, and child agents are not retroactively renamed.
 
+## Resume and import labels
+
+- Claude import candidates prefer the last exact-session `custom-title`, then
+  the last `ai-title`, then the existing project/first-message fallback. Metadata
+  from another session or a sidechain is never used as the parent title.
+- Codex import candidates prefer a valid `session_index.jsonl` `thread_name`;
+  missing, malformed, oversized, or placeholder names keep the existing fallback.
+- Resume by session ID reads existing titles for Claude, Codex, and Cursor before
+  returning the new chat. Explicit custom names win. For compatibility with
+  existing clients, the exact generated `Resumed <Provider> <first 8 ID chars>`
+  label is treated as a placeholder **only at creation**. A later manual rename,
+  including that same text, always remains manual.
+- These are bounded local metadata reads, not title-generation requests. Busy,
+  missing, or changed stores do not prevent resume. Discovery does not modify
+  provider conversations, rename existing AgentsDock chats, or spend model usage.
+
+Cursor's existing path is **resume by ID**, not bulk history import. The import
+candidate API and bulk importer still support Claude/Codex only; this change does
+not advertise Cursor transcript import to clients that cannot handle it.
+
+### Cursor metadata compatibility
+
+The CLI 2026.09.18 local format was verified read-only: configuration directory
+`chats/<md5(absolute working directory)>/<session ID>/store.db`, `meta` key `0`,
+hex-encoded UTF-8 JSON containing `agentId` and `name`. Configuration root
+precedence matches the CLI: `CURSOR_CONFIG_DIR`, `XDG_CONFIG_HOME/cursor`, then
+`~/.cursor`. `CURSOR_DATA_DIR` is not the chat metadata root in this version.
+
+The reader checks the exact workspace and ID, excludes subagent metadata,
+rejects symlinked chat paths and unknown schemas, bounds the metadata row and SQL
+work, and opens SQLite read-only. It never reads/decrypts conversation blobs or
+returns other metadata. This is a best-effort private-format adapter, not a
+guarantee for all future Cursor versions or the separate Cursor IDE history.
+
 ## Background generation: Cursor and Codex
 
 - Uses the chat's provider/model and existing login. Custom Codex provider
@@ -68,7 +102,7 @@ mobile push of title-only updates would be a separate client improvement.
 | --- | --- |
 | Claude | Bounded exact-session transcript head/tail reads of `custom-title` / `ai-title` records. No additional generation request. SDK sessions may not produce these records. |
 | Codex | App-server start/resume/read names, `thread/name/updated`, and existing `session_index.jsonl`. Custom providers use their own manager cache. Native names take precedence over generated fallback names. |
-| Cursor | Stream-json exposes no supported title event. Private serialized history is not decoded; the independent request above supplies summarized titles. |
+| Cursor | Exact-workspace, exact-ID read-only CLI naming metadata (see above). Stream-json exposes no supported title event. Conversation blobs are not decoded; the independent request above remains the fallback when no usable native name exists. |
 | OpenCode | Fixture-tested read-only exact-ID SQLite metadata reader only. This beta.9 runtime does not expose OpenCode as a provider. |
 
 Native metadata is checked before normal terminal events and when idle history
@@ -77,7 +111,19 @@ the parent title. Unknown or manually owned titles are never inferred from their
 wording. Persistence failures roll back title fields without losing unrelated
 live metadata.
 
-## Verification
+## Resume/import verification
+
+Focused tests cover provider-specific title precedence, exact session/workspace
+matching, original prompt fallback, malformed/oversized/deeply nested metadata,
+Cursor read-only SQLite and WAL visibility, symlink rejection, missing/busy stores,
+manual-name preservation, the resume deadline, and cancellation before creation.
+Each provider's synthetic metadata is also exercised through session creation.
+Tests use isolated temporary state and do not need model calls or a live server.
+The focused 384-test run passed across import labels, native/generated naming,
+Cursor parsing/execution, provider-history synchronization, Codex history repair,
+and the Codex app-server adapter. This is not a full-suite or client UI test.
+
+## Earlier background-generation rollout verification
 
 The change targets the `release/1.0` runtime. Existing provider, side-question,
 and child-continuation behavior is retained. Development validation used a

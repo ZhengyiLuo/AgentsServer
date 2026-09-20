@@ -10252,11 +10252,30 @@ class SessionStore:
         ensure_codex_thread_not_pending_fork_cleanup(codex_thread_id)
         if backend == BACKEND_CODEX:
             CODEX_PROVIDER_STORE.require_thread(codex_thread_id, CODEX_PROVIDER_STORE.for_session(runtime))
+        resume_placeholder = f"Resumed {backend.title()} {str(active_provider_id)[:8]}"
+        # Older clients explicitly send this generated resume label. Recognize
+        # it only at creation; PATCH renames (even identical wording) stay manual.
+        automatic_title = not req.title or req.title == "New chat" or (
+            bool(active_provider_id) and req.title == resume_placeholder
+        )
+        provider_title = None
+        if active_provider_id and automatic_title and not (
+            parent_id or initializing_fork or initializing_import
+        ):
+            try:
+                provider_title = await asyncio.wait_for(asyncio.to_thread(
+                    read_native_session_title,
+                    {"backend": backend, "session_id": active_provider_id,
+                     "cwd": req.cwd or DEFAULT_CWD},
+                ), timeout=1.0)
+            except Exception as exc:
+                # A missing/busy/changed native store must not prevent resume.
+                logger.debug("resume title lookup skipped error=%s", type(exc).__name__)
         sid = f"sess_{uuid.uuid4().hex[:16]}"
         ensure_dirs(sid)
         now = now_iso()
-        title = req.title or (
-            f"Resumed {backend.title()} {str(active_provider_id)[:8]}" if active_provider_id else "New chat"
+        title = provider_title or req.title or (
+            resume_placeholder if active_provider_id else "New chat"
         )
         archived = bool(req.archived)
         pinned = bool(req.pinned) and not archived
@@ -10267,10 +10286,10 @@ class SessionStore:
             # Clients send "New chat" explicitly for an unnamed creation.
             # Older persisted titles without provenance are left alone.
             "_title_source": (
-                "placeholder" if not req.title or req.title == "New chat" else "manual"
+                "provider" if provider_title else "placeholder" if automatic_title else "manual"
             ),
             "_title_auto_value": (
-                title if not req.title or req.title == "New chat" else None
+                title if automatic_title else None
             ),
             "folder": req.folder or "General",
             "cwd": req.cwd or DEFAULT_CWD,
@@ -46955,12 +46974,91 @@ def native_session_title(value: Any) -> str | None:
     return clean
 
 
+def claude_transcript_title(path: Path, provider_id: str) -> str | None:
+    """Prefer an exact-session custom name over its latest AI-generated title.
+
+    Share the bounded reader between import discovery and existing sessions;
+    never perform another whole-project scan for each import candidate.
+    """
+    custom_title = ai_title = None
+    for region in bounded_claude_transcript_regions(path):
+        for line in region.splitlines():
+            if len(line) > CLAUDE_TRANSCRIPT_CWD_LINE_BYTES:
+                continue
+            try:
+                event = json.loads(line)
+            except (ValueError, UnicodeDecodeError, RecursionError):
+                continue
+            if not isinstance(event, dict) or event.get("sessionId") != provider_id:
+                continue
+            if event.get("isSidechain") is True:
+                continue
+            if event.get("type") == "custom-title":
+                custom_title = native_session_title(event.get("customTitle"))
+            elif event.get("type") == "ai-title":
+                ai_title = native_session_title(event.get("aiTitle"))
+    return custom_title or ai_title
+
+
+def cursor_native_session_title(provider_id: str, cwd: Any) -> str | None:
+    """Read only Cursor CLI's small metadata row, not its conversation blobs.
+
+    Verified against CLI 2026.09.18: config/chats/md5(absolute cwd)/id/store.db,
+    meta['0'] contains hex-encoded UTF-8 JSON with agentId and name. This is an
+    optional private-format adapter: identity/schema/path drift keeps fallback.
+    No recursive scanning, CLI invocation, deserialization of executable data,
+    database migration, or conversation-blob decryption is needed. No metadata
+    other than the sanitized name leaves this function.
+    """
+    provider_id = provider_session_identifier(provider_id)
+    cwd = normalized_local_session_cwd(cwd)
+    if not provider_id or not cwd:
+        return None
+    config = os.environ.get("CURSOR_CONFIG_DIR", "").strip()
+    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    config_root = Path(config) if config else Path(xdg) / "cursor" if xdg else Path.home() / ".cursor"
+    if not config_root.is_absolute():
+        config_root = Path(cwd) / config_root
+    bucket = hashlib.md5(cwd.encode("utf-8"), usedforsecurity=False).hexdigest()
+    root = config_root / "chats"
+    workspace = root / bucket
+    directory = workspace / provider_id
+    database = directory / "store.db"
+    try:
+        if any(path.is_symlink() for path in (root, workspace, directory, database)):
+            return None
+        if not database.is_file():
+            return None
+        connection = sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.05)
+        try:
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("PRAGMA trusted_schema = OFF")
+            connection.set_progress_handler(lambda: 1, 10000)
+            row = connection.execute(
+                "SELECT substr(value, 1, 32769) FROM meta "
+                "WHERE key = '0' AND typeof(value) = 'text'",
+            ).fetchone()
+        finally:
+            connection.close()
+        if not row or len(row[0]) > 32768:
+            return None
+        metadata = json.loads(bytes.fromhex(row[0]))
+        if not isinstance(metadata, dict) or metadata.get("agentId") != provider_id:
+            return None
+        if metadata.get("subagentInfo") is not None:
+            return None
+        title = native_session_title(metadata.get("name"))
+        return title if title and title.casefold() != "new agent" else None
+    except (OSError, ValueError, RecursionError, sqlite3.Error):
+        return None
+
+
 def read_native_session_title(sess: dict[str, Any]) -> str | None:
     """Read existing native metadata only; never launch a CLI or model request.
 
     Missing/changed provider formats intentionally leave the prompt fallback.
-    Cursor stream-json has no title event; its private serialized store is not
-    decoded here. Claude and Codex use the same roots as history discovery.
+    Claude and Codex use the same roots as history discovery. Cursor reads only
+    exact-workspace, exact-session naming metadata, never conversation blobs.
     """
     backend = str(sess.get("backend") or DEFAULT_BACKEND)
     provider_id = provider_session_identifier(session_provider_id(sess))
@@ -46970,26 +47068,11 @@ def read_native_session_title(sess: dict[str, Any]) -> str | None:
         candidates = claude_history_candidates(provider_id)
         if len(candidates) != 1:
             return None
-        custom_title = ai_title = None
-        for region in bounded_claude_transcript_regions(candidates[0]):
-            for line in region.splitlines():
-                if len(line) > CLAUDE_TRANSCRIPT_CWD_LINE_BYTES:
-                    continue
-                try:
-                    event = json.loads(line)
-                except (ValueError, UnicodeDecodeError):
-                    continue
-                if not isinstance(event, dict) or event.get("sessionId") != provider_id:
-                    continue
-                if event.get("isSidechain") is True:
-                    continue
-                if event.get("type") == "custom-title":
-                    custom_title = native_session_title(event.get("customTitle"))
-                elif event.get("type") == "ai-title":
-                    ai_title = native_session_title(event.get("aiTitle"))
-        return custom_title or ai_title
+        return claude_transcript_title(candidates[0], provider_id)
     if backend == BACKEND_CODEX:
         return native_session_title(codex_session_index_thread_names().get(provider_id))
+    if backend == BACKEND_CURSOR:
+        return cursor_native_session_title(provider_id, sess.get("cwd"))
     if backend == "opencode":
         # Current native storage. A schema change, missing store, or busy DB
         # fails closed. mode=ro must never create or migrate a provider DB.
@@ -47186,11 +47269,12 @@ def local_claude_session_candidates(known_provider_ids: set[str]) -> list[dict[s
                 newest_paths[provider_id] = (mtime, path)
     for provider_id, (mtime, path) in newest_paths.items():
         cwd = normalized_local_session_cwd(claude_transcript_cwd(path))
-        preview = claude_transcript_preview(path)
         folder_display = Path(cwd).name if cwd else path.parent.name
         fallback = folder_display or f"Claude chat {provider_id[:8]}"
+        title = claude_transcript_title(path, provider_id)
+        preview = None if title else claude_transcript_preview(path)
         label = local_session_label(
-            f"{folder_display}: {preview}" if preview else fallback,
+            title or (f"{folder_display}: {preview}" if preview else fallback),
             fallback,
         )
         candidates.append({
@@ -47259,12 +47343,12 @@ def codex_session_index_thread_names() -> dict[str, str]:
                     continue
                 try:
                     entry = json.loads(raw_line)
-                except (json.JSONDecodeError, UnicodeDecodeError):
+                except (ValueError, UnicodeDecodeError, RecursionError):
                     continue
                 if not isinstance(entry, dict):
                     continue
                 provider_id = provider_session_identifier(entry.get("id"))
-                thread_name = local_session_label(entry.get("thread_name"), "")
+                thread_name = native_session_title(entry.get("thread_name"))
                 if provider_id and thread_name:
                     names[provider_id] = thread_name
     return names

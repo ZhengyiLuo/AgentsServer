@@ -811,13 +811,16 @@ output, `TERM=dumb`, and `NO_COLOR` remain color-free.
 For compatibility, legacy `./uninstall.sh --yes` remains default-only; bulk
 automation must explicitly use `--all --yes`.
 
-After each named service is successfully uninstalled, interactive removal asks:
-`Release 'work' and delete its saved data? [y/N]`. A short warning lists the exact
+Immediately after the exact-name uninstall confirmation, before any service is
+stopped or files are removed, interactive removal asks for each named instance:
+`Do you want to release this name as well? [y/N]`. A short warning lists the exact
 state directory and explains that deletion is permanent. `y` or `yes` deletes
-that instance's AgentsDock history, uploads, jobs and credentials, and frees its
-name for a new instance. Enter, `n`, `no`, or EOF keeps its data and reserves the
-name for later reuse. Original provider chats, project files, earlier backups and
-independent terminal sessions are not deleted. Each named instance gets its own
+that instance's AgentsDock history, uploads, jobs and credentials as part of the
+uninstall, and frees its name for a new instance. Enter, `n`, `no`, or EOF keeps
+its data and reserves the
+name for later reuse. Data deletion runs only after service removal succeeds.
+Original provider chats, project files, earlier backups and independent terminal
+sessions are not deleted. Each named instance gets its own
 choice in bulk removal; the fixed `default` name does not offer this shortcut.
 `--yes` automation never authorizes this extra deletion or asks this question.
 

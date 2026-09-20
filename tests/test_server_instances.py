@@ -479,30 +479,41 @@ class InstanceTests(unittest.TestCase):
     def test_uninstall_release_question_defaults_to_keep_and_accepts_only_yes(self):
         for answer, expected in (("y", True), ("YES", True), (" Yes ", True), ("", False), ("n", False), ("no", False), ("yep", False), (EOFError(), False)):
             with self.subTest(answer=answer), contextlib.redirect_stdout(io.StringIO()) as output, patch("sys.stdin.isatty", return_value=True), patch("builtins.input", **({"side_effect": answer} if isinstance(answer, EOFError) else {"return_value": answer})):
-                self.assertEqual(instances.confirm_uninstalled_name_release(self.work), expected)
+                self.assertEqual(instances.confirm_uninstall_name_release(self.work), expected)
                 self.assertIn("cannot be undone", output.getvalue())
                 self.assertIn(str(self.work.state), output.getvalue())
                 self.assertIn("earlier backups", output.getvalue())
         with patch("sys.stdin.isatty", return_value=False), patch("builtins.input") as prompt:
-            self.assertFalse(instances.confirm_uninstalled_name_release(self.work))
+            self.assertFalse(instances.confirm_uninstall_name_release(self.work))
         prompt.assert_not_called()
 
     def test_uninstall_yes_automation_does_not_authorize_name_release(self):
         self.configured(self.work)
         with patch("sys.stdin.isatty", return_value=True):
-            code, _, errors, mocks = self.cli("remove", "work", "--yes", run={}, confirm_uninstalled_name_release={}, purge_uninstalled_name={})
+            code, _, errors, mocks = self.cli("remove", "work", "--yes", run={}, confirm_uninstall_name_release={}, purge_uninstalled_name={})
         self.assertEqual(code, 0, errors)
-        mocks["confirm_uninstalled_name_release"].assert_not_called()
+        mocks["confirm_uninstall_name_release"].assert_not_called()
         mocks["purge_uninstalled_name"].assert_not_called()
 
-    def test_failed_uninstall_never_offers_name_release(self):
+    def test_failed_uninstall_never_deletes_data_even_after_release_consent(self):
         self.configured(self.work)
         with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="uninstall work"):
-            code, output, _, mocks = self.cli("remove", "work", run={"side_effect": ValueError("cannot stop")}, confirm_uninstalled_name_release={}, purge_uninstalled_name={})
+            code, output, _, mocks = self.cli("remove", "work", run={"side_effect": ValueError("cannot stop")}, confirm_uninstall_name_release={"return_value": True}, purge_uninstalled_name={})
         self.assertEqual(code, 1)
-        mocks["confirm_uninstalled_name_release"].assert_not_called()
+        mocks["confirm_uninstall_name_release"].assert_called_once_with(self.work)
         mocks["purge_uninstalled_name"].assert_not_called()
         self.assertNotIn("Successful!", output)
+
+    def test_cancelled_uninstall_never_asks_about_release_or_changes_data(self):
+        self.configured(self.work)
+        before = self.snapshot(self.work)
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value=""):
+            code, _, _, mocks = self.cli("remove", "work", run={}, confirm_uninstall_name_release={}, purge_uninstalled_name={})
+        self.assertEqual(code, 1)
+        mocks["run"].assert_not_called()
+        mocks["confirm_uninstall_name_release"].assert_not_called()
+        mocks["purge_uninstalled_name"].assert_not_called()
+        self.assertEqual(self.snapshot(self.work), before)
 
     def test_bulk_uninstall_release_is_per_name_and_never_offered_for_default(self):
         self.configured(self.default)
@@ -510,9 +521,9 @@ class InstanceTests(unittest.TestCase):
         other = instances.Instance("other", self.home)
         self.configured(other, 7853)
         with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="uninstall default other work"):
-            code, _, errors, mocks = self.cli("remove", "--all", run={}, confirm_uninstalled_name_release={"side_effect": [True, False]}, purge_uninstalled_name={})
+            code, _, errors, mocks = self.cli("remove", "--all", run={}, confirm_uninstall_name_release={"side_effect": [True, False]}, purge_uninstalled_name={})
         self.assertEqual(code, 0, errors)
-        self.assertEqual([call.args[0].name for call in mocks["confirm_uninstalled_name_release"].call_args_list], ["other", "work"])
+        self.assertEqual([call.args[0].name for call in mocks["confirm_uninstall_name_release"].call_args_list], ["other", "work"])
         mocks["purge_uninstalled_name"].assert_called_once_with(other, self.registry)
 
     def test_name_release_refuses_active_state_and_keeps_registry(self):
@@ -680,6 +691,21 @@ class InstanceTests(unittest.TestCase):
         self.assertIn("Kept name 'work' and its saved data.", output)
         self.assertTrue((self.work.state / "sessions.json").exists())
 
+    def test_real_terminal_asks_release_before_any_removal_and_yes_releases(self):
+        output = self.check_named_uninstaller_output(terminal=True, release_answer="y")
+        question = "Do you want to release this name as well? [y/N] "
+        self.assertLess(output.index("Type 'uninstall work' to confirm:"), output.index(question))
+        self.assertLess(output.index(question), output.index("Removing "))
+        self.assertNotIn("Preserved chat history", output)
+        self.assertIn("Released name 'work'", output)
+        self.assertNotIn("work", self.registry.records())
+
+    def test_real_terminal_release_no_preserves_data(self):
+        output = self.check_named_uninstaller_output(terminal=True, release_answer="n")
+        self.assertIn("Preserved chat history", output)
+        self.assertIn("Kept name 'work'", output)
+        self.assertEqual(self.registry.records()["work"]["status"], "removed")
+
     def check_named_uninstaller_output(self, *, terminal=False, extra_env=None, release_answer=None):
         # All destructive commands target this test's temporary home; launchd
         # is stubbed. Run the actual manager + child to check color propagation
@@ -702,7 +728,7 @@ class InstanceTests(unittest.TestCase):
         fake_bin = self.home / "bin"
         fake_bin.mkdir()
         calls = self.home / "launchctl-calls"
-        for name, content in {"uname": "#!/bin/sh\necho Darwin\n", "launchctl": '#!/bin/sh\nprintf "%s\\n" "$*" >> "$TEST_SERVICE_LOG"\nexit 1\n'}.items():
+        for name, content in {"uname": "#!/bin/sh\necho Darwin\n", "launchctl": '#!/bin/sh\nprintf "%s\\n" "$*" >> "$TEST_SERVICE_LOG"\necho "Could not find service" >&2\nexit 3\n'}.items():
             target = fake_bin / name
             target.write_text(content)
             target.chmod(0o755)
@@ -713,30 +739,39 @@ class InstanceTests(unittest.TestCase):
         env.pop("NO_COLOR", None)
         env.update(extra_env or {})
         command = ["/bin/bash", str(ROOT / "uninstall.sh"), "--instance", "work", "--yes"]
-        if release_answer is not None:
+        if terminal:
+            from tests.test_installer_token_output import TokenOutputTests
+            prompt_answers = None
+            if release_answer is not None:
+                command = command[:-1]  # Interactive removal, no --yes.
+                prompt_answers = [(b"Type 'uninstall work' to confirm:", "uninstall work\n"), (b"Do you want to release this name as well? [y/N]", release_answer + "\n")]
+            output = TokenOutputTests().run_terminal("exec " + shlex.join(command), environment=env, prompt_answers=prompt_answers)
+        elif release_answer is not None:
             child_output = []
+            answers = []
 
             def run_child(command, **kwargs):
+                self.assertEqual(answers, ["uninstall work", release_answer])
+                self.assertEqual("--managed-release-name" in command, release_answer == "y")
                 result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=30, **kwargs)
                 child_output.append(result.stdout)
                 return result
 
             def answer(prompt):
                 if prompt.startswith("Type "):
+                    answers.append("uninstall work")
                     return "uninstall work"
-                self.assertFalse(self.work.service_file("darwin").exists())
-                self.assertFalse(self.work.runtime.exists())
-                self.assertFalse(self.work.config.exists())
-                self.assertEqual(prompt, "Release 'work' and delete its saved data? [y/N] ")
+                self.assertTrue(self.work.service_file("darwin").exists())
+                self.assertTrue(self.work.runtime.exists())
+                self.assertTrue(self.work.config.exists())
+                self.assertEqual(prompt, "Do you want to release this name as well? [y/N] ")
+                answers.append(release_answer)
                 return release_answer
 
             with patch.dict(os.environ, env, clear=True), patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=answer):
                 code, output, errors, _ = self.cli("remove", "work", run={"side_effect": run_child})
             self.assertEqual(code, 0, errors)
             output = "".join(child_output) + output
-        elif terminal:
-            from tests.test_installer_token_output import TokenOutputTests
-            output = TokenOutputTests().run_terminal("exec " + shlex.join(command), environment=env)
         else:
             result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -752,7 +787,11 @@ class InstanceTests(unittest.TestCase):
         self.assertFalse(self.work.config.exists())
         self.assertFalse(self.work.service_file("darwin").exists())
         self.assertTrue(all("com.agentsdock.server.work" in line for line in calls.read_text().splitlines()))
-        self.assertIn("./install.sh --instance work --port PORT", output)
+        if release_answer == "y":
+            self.assertNotIn("./install.sh --instance work --port PORT", output)
+            self.assertNotIn("Preserved chat history", output)
+        else:
+            self.assertIn("./install.sh --instance work --port PORT", output)
         self.assertIn("tmux -L agents-server-work ls", output)
         self.assertNotIn("Re-running ./install.sh will pick", output)
         self.assertNotIn("tmux sessions named zd_*", output)

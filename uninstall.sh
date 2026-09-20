@@ -47,6 +47,7 @@ OS_NAME="$(uname -s)"
 
 ASSUME_YES="false"
 PURGE_STATE="false"
+MANAGED_RELEASE_NAME="false"
 UNINSTALL_RED=""
 UNINSTALL_GREEN=""
 UNINSTALL_RESET=""
@@ -164,10 +165,20 @@ while (($#)); do
   case "$1" in
     --yes) ASSUME_YES="true"; shift ;;
     --purge-state) PURGE_STATE="true"; shift ;;
+    --managed-release-name) MANAGED_RELEASE_NAME="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+# This flag only controls progress text. The manager separately deletes state
+# after a successful service removal, using the user's affirmative choice.
+if [[ "$MANAGED_RELEASE_NAME" == "true" \
+  && ( "$MANAGED_REMOVAL" != "true" || "$INSTANCE_NAME" == "default" \
+    || "$ASSUME_YES" != "true" || "$PURGE_STATE" == "true" ) ]]; then
+  echo "--managed-release-name is only for a confirmed named-instance manager removal." >&2
+  exit 2
+fi
 
 INSTALL_LOCK_DIR="$INSTALL_ROOT/.install-lock"
 UNINSTALL_LOCK_HELD="false"
@@ -354,7 +365,7 @@ if [[ "$PURGE_STATE" == "true" ]]; then
     [[ ! -e "$STATE_ROOT" ]] || rm -rf "$STATE_ROOT"
     uninstall_status "$UNINSTALL_RED" "Deleted $STATE_ROOT"
   fi
-elif [[ -e "$STATE_ROOT" ]]; then
+elif [[ -e "$STATE_ROOT" && "$MANAGED_RELEASE_NAME" != "true" ]]; then
   echo
   uninstall_status "$UNINSTALL_GREEN" "Preserved chat history, jobs, files, tokens, and secure-peer credentials at $STATE_ROOT."
   echo

@@ -54,7 +54,7 @@ if [[ -z "$EXPECTED_SERVER_IDENTITY" ]]; then
 fi
 '''
 
-    def run_terminal(self, script, answer="yes\n", environment=None):
+    def run_terminal(self, script, answer="yes\n", environment=None, prompt_answers=None):
         master, slave = pty.openpty()
         process = None
         output = b""
@@ -63,7 +63,7 @@ fi
             os.close(slave)
             slave = None
             deadline = time.monotonic() + 5
-            answered = False
+            pending = list(prompt_answers) if prompt_answers is not None else [(b"[y/N]", answer)]
             while time.monotonic() < deadline:
                 if select.select([master], [], [], 0.05)[0]:
                     try:
@@ -73,9 +73,9 @@ fi
                     if not chunk:
                         break
                     output += chunk
-                    if b"[y/N]" in output and not answered:
-                        os.write(master, answer.encode())
-                        answered = True
+                    if pending and pending[0][0] in output:
+                        _, reply = pending.pop(0)
+                        os.write(master, reply.encode())
                 elif process.poll() is not None:
                     break
             # PTY EOF can arrive just before waitpid observes process exit.

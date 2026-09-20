@@ -5955,6 +5955,18 @@ chmod 755 "$project/.venv/bin/python"
                 before,
             )
 
+    def test_internal_name_release_flag_cannot_target_default_or_standalone(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            _, _, install_root, config_root, state_root, service_file, environment = self.fake_linux_uninstall_environment(root)
+            before = self.snapshot_trees(install_root, config_root, state_root, service_file)
+            for args in (["--yes", "--managed-release-name"], ["--managed-instance", "default", "--yes", "--managed-release-name"]):
+                with self.subTest(args=args):
+                    result = subprocess.run(["/bin/bash", str(UNINSTALLER), *args], env=environment, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("only for a confirmed named-instance", result.stderr)
+                    self.assertEqual(self.snapshot_trees(install_root, config_root, state_root, service_file), before)
+
     def test_uninstall_refuses_broad_and_overlapping_managed_roots(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

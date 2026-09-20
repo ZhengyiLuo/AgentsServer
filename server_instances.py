@@ -568,7 +568,7 @@ def confirm_removal(instances: list[Instance], purge: bool, yes: bool) -> None:
     else:
         print("Chat history and files are preserved. Service removal is reinstallable; deleted configuration is not restored automatically.")
         if not yes and any(instance.name != "default" for instance in instances):
-            print("After uninstall, each named instance offers a separate choice to release its name and delete its saved data.")
+            print("After this confirmation, you can also release each name and delete its saved data during uninstall.")
     target_names = " ".join(instance.name for instance in instances)
     expected = f"{'delete history' if purge else 'uninstall'} {target_names}"
     if purge or not yes:
@@ -632,15 +632,15 @@ def release_instance_name(instance: Instance, registry: Registry) -> Path | None
     return destination
 
 
-def confirm_uninstalled_name_release(instance: Instance) -> bool:
+def confirm_uninstall_name_release(instance: Instance) -> bool:
     if not sys.stdin.isatty():
         return False
-    print(f"\nService {instance.name!r} has been uninstalled. Do you want to release the name as well?")
+    print(f"\nOptional name release: {instance.name}")
     print(terminal_color(f"This permanently deletes this instance's AgentsDock history, uploads, jobs and credentials at {instance.state}, and frees its name.", "31"))
     print("Original provider chats, project files, earlier backups and independent terminal sessions are kept.")
     print(terminal_color("This deletion cannot be undone. Enter keeps the name and saved data.", "1;31"))
     try:
-        return input(f"Release {instance.name!r} and delete its saved data? [y/N] ").strip().lower() in {"y", "yes"}
+        return input("Do you want to release this name as well? [y/N] ").strip().lower() in {"y", "yes"}
     except EOFError:
         return False
 
@@ -821,8 +821,13 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("No matching instances; nothing changed.")
             for item in selected:
                 validate_binding(item)
+            release_names = set()
             if args.command == "remove":
                 confirm_removal(selected, args.purge_state, args.yes)
+                if not args.purge_state and not args.yes:
+                    for item in selected:
+                        if item.name != "default" and confirm_uninstall_name_release(item):
+                            release_names.add(item.name)
             failures = 0
             for item in selected:
                 try:
@@ -831,15 +836,18 @@ def main(argv: list[str] | None = None) -> int:
                         command = ["/bin/bash", str(ROOT / "uninstall.sh"), "--managed-instance", item.name, "--yes"]
                         if args.purge_state:
                             command.append("--purge-state")  # Still asks for each exact state path.
+                        elif item.name in release_names:
+                            # Do not print preserved-history/reinstall advice
+                            # when the confirmed plan includes deleting state.
+                            command.append("--managed-release-name")
                         run(command, env=clean_environment(item), cwd=ROOT)
                         registry.save(item, "removed", int(old_port) if old_port else None)
                         if args.purge_state and item.name != "default" and not item.state.exists():
                             registry.forget(item)
+                        elif item.name in release_names:
+                            purge_uninstalled_name(item, registry)
                         elif not args.purge_state and not args.yes and item.name != "default":
-                            if confirm_uninstalled_name_release(item):
-                                purge_uninstalled_name(item, registry)
-                            else:
-                                print(f"Kept name {item.name!r} and its saved data.", flush=True)
+                            print(f"Kept name {item.name!r} and its saved data.", flush=True)
                     elif args.command == "update":
                         env = read_config(item)
                         install_instance(item, int(env["AGENTSDOCK_AGENT_PORT"]), env["AGENTSDOCK_AGENT_BIND"])

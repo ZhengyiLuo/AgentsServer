@@ -37,6 +37,7 @@ FILES = (
     "codex_auth.py",
     "codex_provider.py",
     "side_questions.py",
+    "title_generation.py",
     "codex_side_question.py",
     "claude_side_question.py",
     "cursor_agent_client.py",

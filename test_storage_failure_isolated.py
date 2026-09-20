@@ -44,6 +44,8 @@ def storage_source():
               TransientAdmissionWait=AdmissionWait, ACTIVE_LOCK=asyncio.Lock(), ACTIVE={}, CURRENT_TURNS={},
               STORE=SimpleNamespace(sessions={"chat": {"active_run": {"run_id": "finished-run"}}}),
               append_event=AsyncMock(), revoke_cross_chat_capability=AsyncMock(),
+              refresh_native_session_title=AsyncMock(),
+              schedule_generated_session_title=Mock(),
               finalize_cross_chat_terminal=AsyncMock(), finalize_handoff_digest_turn=AsyncMock(),
               finish_handoff_digest_delivery=AsyncMock(), concise_error_message=str)
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), "<isolated-storage>", "exec"), ns)
@@ -51,6 +53,15 @@ def storage_source():
 
 
 class StorageFailureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_optional_title_lookup_still_retires_exact_run(self):
+        ns = storage_source()
+        ns["refresh_native_session_title"].side_effect = asyncio.CancelledError()
+        with self.assertRaises(asyncio.CancelledError):
+            await ns["append_turn_finished_event"]("chat", {"run_id": "finished-run"})
+        ns["append_event"].assert_not_awaited()
+        ns["revoke_cross_chat_capability"].assert_awaited_once_with("finished-run")
+        self.assertNotIn("active_run", ns["STORE"].sessions["chat"])
+
     async def test_terminal_enospc_cleans_exact_run_without_fake_event_or_forwarding(self):
         ns = storage_source()
         failure = OSError(errno.ENOSPC, "Synthetic storage full")

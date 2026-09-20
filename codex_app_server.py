@@ -632,6 +632,7 @@ class CodexAppServerClient:
         # process. Fork cleanup uses this to distinguish a newly-created child
         # from an existing child that another operation merely resumed.
         self._known_thread_ids: set[str] = set()
+        self._thread_names: dict[str, str] = {}
         self._subscriptions: set[CodexAppServerSubscription] = set()
         self._notification_handlers: set[NotificationHandler] = set()
         self._callback_tasks: set[asyncio.Task[Any]] = set()
@@ -690,6 +691,23 @@ class CodexAppServerClient:
 
     def is_thread_loaded(self, thread_id: str) -> bool:
         return thread_id in self._loaded_threads
+
+    def cached_thread_name(self, thread_id: str) -> str | None:
+        """Metadata already received from Codex; never starts a request."""
+        return self._thread_names.get(thread_id)
+
+    def _cache_thread_name(self, thread: Any) -> None:
+        if not isinstance(thread, dict):
+            return
+        thread_id, name = thread.get("id"), thread.get("name")
+        if not isinstance(thread_id, str) or not thread_id or len(thread_id) > 512:
+            return
+        if not isinstance(name, str) or not name.strip() or len(name) > 4096:
+            return
+        self._thread_names.pop(thread_id, None)
+        self._thread_names[thread_id] = name
+        if len(self._thread_names) > 1024:
+            self._thread_names.pop(next(iter(self._thread_names)))
 
     async def start(self) -> None:
         """Start and initialize the process once, or reuse the live process."""
@@ -998,6 +1016,7 @@ class CodexAppServerClient:
         self._turns_by_thread.clear()
         self._loaded_threads.clear()
         self._known_thread_ids.clear()
+        self._thread_names.clear()
         for subscription in tuple(self._subscriptions):
             subscription._finish(error)
 
@@ -1394,6 +1413,11 @@ class CodexAppServerClient:
                 task.cancel()
 
         thread_id, turn_id = _notification_scope(notification)
+        if method == "thread/name/updated":
+            self._thread_names.pop(thread_id, None)
+            self._cache_thread_name({"id": thread_id, "name": params.get("threadName")})
+        elif method == "thread/started":
+            self._cache_thread_name(params.get("thread"))
         if method == "thread/started" and thread_id:
             self._loaded_threads.add(thread_id)
         elif method == "thread/closed" and thread_id:
@@ -1601,6 +1625,7 @@ class CodexAppServerClient:
             timeout=self.lifecycle_timeout,
         )
         thread_id = self._thread_id_from_result("thread/start", result)
+        self._cache_thread_name(result.get("thread"))
         self._known_thread_ids.add(thread_id)
         self._loaded_threads.add(thread_id)
         return thread_id
@@ -1630,6 +1655,7 @@ class CodexAppServerClient:
                 request_sent=True,
                 safe_to_retry=False,
             )
+        self._cache_thread_name(result.get("thread"))
         self._loaded_threads.add(resolved)
         return resolved
 
@@ -1931,6 +1957,7 @@ class CodexAppServerClient:
                 request_sent=True,
                 safe_to_retry=False,
             )
+        self._cache_thread_name(thread)
         return thread
 
     async def delete_thread(self, thread_id: str) -> None:
@@ -2709,6 +2736,9 @@ class CodexAppServerManager:
 
     def is_thread_loaded(self, thread_id: str) -> bool:
         return self.client.is_thread_loaded(thread_id)
+
+    def cached_thread_name(self, thread_id: str) -> str | None:
+        return self.client.cached_thread_name(thread_id)
 
     async def start(self) -> None:
         await self.client.start()

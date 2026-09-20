@@ -53,6 +53,9 @@ class CodexSubagentIdentityTests(unittest.IsolatedAsyncioTestCase):
             "CODEX_SUBAGENT_LIVE_GENERATIONS": {}, "CODEX_SUBAGENT_LIVE_MANAGERS": {}, "CODEX_QUARANTINED_GOAL_THREADS": {},
             "CODEX_APP_SERVER_MANAGER": SimpleNamespace(ready=True, generation=9),
             "now_iso": lambda: self.now, "append_event": AsyncMock(side_effect=append),
+            # Optional root naming is covered by test_native_session_titles;
+            # this fixture only supplies child identity/lifecycle state.
+            "native_session_title": Mock(return_value=None),
             "session_codex_thread_id": lambda session: session.get("codex_thread_id", ""),
             "logger": Mock(), "concise_error_message": str,
             "codex_session_has_active_run": AsyncMock(side_effect=AssertionError("identity must not inspect/wake execution")),

@@ -823,7 +823,8 @@ terminal tmux sessions are left running; list default sessions with `tmux ls`
 or named sessions with `tmux -L agents-server-work ls`. Reinstall a preserved
 named history explicitly with `./install.sh --instance work --port 7851`.
 To start fresh under a removed name, use `./instances.sh new --name work --port 7851`.
-The manager asks whether to release the name and requires typing `release work`.
+The manager asks whether to release the name with a `[y/N]` prompt. Type `y` or
+`yes` to confirm (case-insensitive); Enter, `n`, or `no` cancels.
 It moves the old instance's complete state to a private backup under
 `~/.config/agents-server-manager/history-backups/`, prints its exact location,
 and creates a fresh instance. Old AgentsDock history, uploads, jobs and credentials

@@ -591,15 +591,14 @@ def validate_released_instance(instance: Instance) -> None:
 
 
 def confirm_name_release(instance: Instance, port: int) -> None:
-    print(f"This name was used before: {instance.name}. Do you want to release this name?")
+    print(f"This name was used before: {instance.name}.")
     print(terminal_color(f"The new instance will start with an empty AgentsDock chat list on port {port}.", "31"))
     print(f"Old AgentsDock history, uploads, jobs and credentials at {instance.state} will be moved to a private backup, not erased.")
     print("Original provider chats stored on this machine and project files are not deleted. AgentsDock-only content remains in the backup.")
     print("To keep using the existing history instead, cancel and run:")
     print(f"  ./install.sh --instance {instance.name} --port {port}")
-    expected = f"release {instance.name}"
     try:
-        confirmed = sys.stdin.isatty() and input(f"Type {expected!r} to confirm (Enter cancels): ") == expected
+        confirmed = sys.stdin.isatty() and input(f"Release {instance.name!r} and create a fresh instance? [y/N] ").strip().lower() in {"y", "yes"}
     except EOFError:
         confirmed = False
     if not confirmed:

@@ -261,10 +261,10 @@ class InstanceTests(unittest.TestCase):
         provider = self.home / ".claude/projects/native.jsonl"
         provider.parent.mkdir(parents=True)
         provider.write_text("original provider transcript")
-        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="release work") as prompt:
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="y") as prompt:
             code, output, errors, mocks = self.cli("new", "--name", "work", install_instance={}, port_available={"return_value": True})
         self.assertEqual(code, 0, errors)
-        prompt.assert_called_once_with("Type 'release work' to confirm (Enter cancels): ")
+        prompt.assert_called_once_with("Release 'work' and create a fresh instance? [y/N] ")
         self.assertEqual(mocks["install_instance"].call_args.args, (self.work, 7852, "0.0.0.0"))
         backup, = (self.registry.root / "history-backups").glob("work-*/state")
         self.assertEqual((backup / "sessions.json").read_text(), "old imported chat index")
@@ -277,10 +277,16 @@ class InstanceTests(unittest.TestCase):
         self.assertIn("AgentsDock-only content remains in the backup", output)
         self.assertEqual(self.registry.records()["work"], {"status": "installed", "port": 7852})
 
-    def test_reuse_cancel_wrong_name_noninteractive_and_eof_leave_history_unchanged(self):
+    def test_name_release_accepts_y_and_yes_case_insensitively(self):
+        for answer in ("y", "Y", "yes", "YES", " Yes "):
+            with self.subTest(answer=answer), contextlib.redirect_stdout(io.StringIO()), patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value=answer) as prompt:
+                instances.confirm_name_release(self.work, 7852)
+                prompt.assert_called_once_with("Release 'work' and create a fresh instance? [y/N] ")
+
+    def test_reuse_cancel_invalid_reply_noninteractive_and_eof_leave_history_unchanged(self):
         self.removed_history()
         before = self.snapshot(self.work)
-        for tty, answer in ((True, ""), (True, "yes"), (True, "release default"), (False, "release work"), (True, EOFError())):
+        for tty, answer in ((True, ""), (True, "n"), (True, "no"), (True, "N"), (True, "yep"), (True, "release work"), (False, "y"), (False, "yes"), (True, EOFError())):
             with self.subTest(tty=tty, answer=answer), patch("sys.stdin.isatty", return_value=tty), patch("builtins.input", **({"side_effect": answer} if isinstance(answer, EOFError) else {"return_value": answer})):
                 code, _, errors, mocks = self.cli("new", "--name", "work", install_instance={}, port_available={"return_value": True})
             self.assertEqual(code, 1)
@@ -292,7 +298,7 @@ class InstanceTests(unittest.TestCase):
 
     def test_reuse_explicit_port_overrides_saved_port(self):
         self.removed_history()
-        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="release work"):
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="y"):
             code, _, errors, mocks = self.cli("new", "--name", "work", "--port", "7952", install_instance={}, port_available={"return_value": True})
         self.assertEqual(code, 0, errors)
         self.assertEqual(mocks["install_instance"].call_args.args[1], 7952)
@@ -320,7 +326,7 @@ class InstanceTests(unittest.TestCase):
     def test_reuse_port_becoming_busy_during_prompt_keeps_history(self):
         self.removed_history()
         before = self.snapshot(self.work)
-        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="release work"):
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="y"):
             code, _, errors, mocks = self.cli("new", "--name", "work", install_instance={}, port_available={"side_effect": [True, False]})
         self.assertEqual(code, 1)
         self.assertIn("became occupied", errors)
@@ -343,7 +349,7 @@ class InstanceTests(unittest.TestCase):
         self.work.state.unlink()  # Only this test-created symlink.
         original_state.rename(self.work.state)
         (self.registry.root / "history-backups").symlink_to(self.default.state)
-        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="release work"):
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="y"):
             code, _, _, mocks = self.cli("new", "--name", "work", install_instance={}, port_available={"return_value": True})
         self.assertEqual(code, 1)
         mocks["install_instance"].assert_not_called()
@@ -353,7 +359,7 @@ class InstanceTests(unittest.TestCase):
     def test_reuse_rejects_live_state_lock(self):
         self.removed_history()
         with instances.exclusive_lock(self.work.state / ".server-process.lock"):
-            with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="release work"):
+            with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="y"):
                 code, _, errors, mocks = self.cli("new", "--name", "work", install_instance={}, port_available={"return_value": True})
         self.assertEqual(code, 1)
         self.assertIn("Another process owns", errors)
@@ -391,7 +397,7 @@ class InstanceTests(unittest.TestCase):
 
     def test_reuse_failed_install_leaves_old_data_in_reported_backup(self):
         self.removed_history()
-        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="release work"):
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="y"):
             code, _, errors, _ = self.cli("new", "--name", "work", install_instance={"side_effect": ValueError("mock installer failure")}, port_available={"return_value": True})
         self.assertEqual(code, 1)
         backup, = (self.registry.root / "history-backups").glob("work-*/state")
@@ -742,7 +748,7 @@ exit 2
                "FAKE_TEAM_HUB_MODE": "disabled", "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1"}
         if release:
             self.removed_history(port=17851)
-            with patch.dict(os.environ, env, clear=True), patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="release work"):
+            with patch.dict(os.environ, env, clear=True), patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="y"):
                 code, output, errors, _ = self.cli(
                     "new", "--name", "work",
                     run={"side_effect": lambda command, **kwargs: subprocess.run(command, check=True, capture_output=True, text=True, **kwargs)},

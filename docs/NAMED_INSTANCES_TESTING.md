@@ -66,7 +66,7 @@ To start fresh using that removed test name, run:
 ./instances.sh new --name local-test --port 7851
 ```
 
-Type `release local-test` only if you want an empty AgentsDock instance. The old
+Answer `y` or `yes` only if you want an empty AgentsDock instance. The old
 instance's data is moved to a private backup whose path is printed; original
 provider chats/project files are untouched. Enter cancels without moving history.
 To retain the existing AgentsDock history instead, use

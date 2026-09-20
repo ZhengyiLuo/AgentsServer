@@ -60,6 +60,19 @@ Do not approve the bare `./uninstall.sh` or `--all` preview during this trial:
 those intentionally include the default instance. For bulk management without
 the original server, use `--all --exclude default`.
 
+To start fresh using that removed test name, run:
+
+```bash
+./instances.sh new --name local-test --port 7851
+```
+
+Type `release local-test` only if you want an empty AgentsDock instance. The old
+instance's data is moved to a private backup whose path is printed; original
+provider chats/project files are untouched. Enter cancels without moving history.
+To retain the existing AgentsDock history instead, use
+`./install.sh --instance local-test --port 7851`. Never use `default` for this test.
+Normal Python bytecode caches in this checkout no longer block installation.
+
 ## Automated coverage
 
 `tests/test_server_instances.py` uses temporary homes and fake services for:

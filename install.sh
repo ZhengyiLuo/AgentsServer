@@ -1650,8 +1650,11 @@ for name in "${RELEASE_DIRECTORIES[@]}"; do
     echo "$name is missing beside install.sh or is not a real directory." >&2
     exit 1
   fi
-  if find "$SOURCE_DIR/$name" \( -type l -o -type f \( -name '*.pyc' -o -name '*.pyo' \) -o -type d -name '__pycache__' -o \( ! -type d ! -type f \) \) -print -quit | grep -q .; then
-    echo "$name contains linked or generated entries and cannot be installed." >&2
+  # Local Python runs create bytecode caches. Never copy those (staging uses
+  # the explicit manifest below), but still reject links/special files anywhere,
+  # including inside a cache directory.
+  if find "$SOURCE_DIR/$name" \( -type l -o \( ! -type d ! -type f \) \) -print -quit | grep -q .; then
+    echo "$name contains linked or special entries and cannot be installed." >&2
     exit 1
   fi
 done
@@ -1661,13 +1664,13 @@ for name in "${TEAM_HUB_RELEASE_FILES[@]}"; do
     exit 1
   fi
 done
-TEAM_HUB_RELEASE_FILE_COUNT="$(find "$SOURCE_DIR/agentsdock_team_hub" -type f | wc -l)"
+TEAM_HUB_RELEASE_FILE_COUNT="$(find "$SOURCE_DIR/agentsdock_team_hub" -type d -name '__pycache__' -prune -o -type f ! -name '*.pyc' ! -name '*.pyo' -print | wc -l)"
 TEAM_HUB_RELEASE_FILE_COUNT="${TEAM_HUB_RELEASE_FILE_COUNT//[[:space:]]/}"
 if [[ "$TEAM_HUB_RELEASE_FILE_COUNT" != "${#TEAM_HUB_RELEASE_FILES[@]}" ]]; then
   echo "agentsdock_team_hub contains unexpected release files." >&2
   exit 1
 fi
-TEAM_HUB_RELEASE_DIRECTORY_COUNT="$(find "$SOURCE_DIR/agentsdock_team_hub" -type d | wc -l)"
+TEAM_HUB_RELEASE_DIRECTORY_COUNT="$(find "$SOURCE_DIR/agentsdock_team_hub" -type d -name '__pycache__' -prune -o -type d -print | wc -l)"
 TEAM_HUB_RELEASE_DIRECTORY_COUNT="${TEAM_HUB_RELEASE_DIRECTORY_COUNT//[[:space:]]/}"
 if [[ "$TEAM_HUB_RELEASE_DIRECTORY_COUNT" != "2" ]]; then
   echo "agentsdock_team_hub contains unexpected release directories." >&2

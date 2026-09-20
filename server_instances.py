@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Current-user instance bindings and manager. No server import or discovery writes.
 
-The registry contains names, not caller-controlled deletion paths or credentials.
+The registry contains names, statuses and optional ports, not deletion paths or credentials.
 Named roots are siblings of the legacy roots: removing default cannot remove them.
 Services are independently configured, but are NOT a same-user security sandbox.
 """
@@ -181,8 +181,10 @@ class Registry:
             raise ValueError("Invalid instance registry; refusing to guess removal targets.")
         for name, record in value["instances"].items():
             instance_name(name)
-            if not isinstance(record, dict) or set(record) != {"status"} or record["status"] not in {"pending", "installed", "removed", "failed"}:
+            if not isinstance(record, dict) or not {"status"} <= set(record) <= {"status", "port"} or record["status"] not in {"pending", "installed", "removed", "failed"}:
                 raise ValueError("Invalid instance record.")
+            if "port" in record and (type(record["port"]) is not int or not 1 <= record["port"] <= 65535):
+                raise ValueError("Invalid saved instance port.")
         return value["instances"]
 
     def instances(self, include_removed: bool = False) -> list[Instance]:
@@ -209,11 +211,16 @@ class Registry:
         with exclusive_lock(self.root / "operation.lock"):
             yield
 
-    def save(self, instance: Instance, status: str):
+    def save(self, instance: Instance, status: str, port: int | None = None):
         if status not in {"pending", "installed", "removed", "failed"}:
             raise ValueError("Invalid lifecycle status.")
         records = self.records()
-        records[instance.name] = {"status": status}
+        record = {**records.get(instance.name, {}), "status": status}
+        if port is not None:
+            if type(port) is not int or not 1 <= port <= 65535:
+                raise ValueError("Invalid saved instance port.")
+            record["port"] = port
+        records[instance.name] = record
         fd, name = tempfile.mkstemp(prefix=".instances-", dir=self.root)
         try:
             with os.fdopen(fd, "w") as handle:
@@ -570,6 +577,52 @@ def install_instance(instance: Instance, port: int, bind: str):
     run(command, env=clean_environment(instance), cwd=ROOT)
 
 
+def validate_released_instance(instance: Instance) -> None:
+    """Never reset default, an installed service, or a running state owner."""
+    if instance.name == "default":
+        raise ValueError("The default instance cannot be released by new.")
+    validate_binding(instance)
+    if any(path.exists() or path.is_symlink() for path in (instance.runtime, instance.config, instance.service_file())):
+        raise ValueError(f"{instance.name}: still installed or has a partial installation. Remove it before reusing its name.")
+    if service_status(instance) != "stopped":
+        raise ValueError(f"{instance.name}: cannot confirm the old service is stopped; nothing released.")
+    if instance.state.exists() and not instance.state.is_dir():
+        raise ValueError(f"{instance.name}: preserved state is not a directory.")
+
+
+def confirm_name_release(instance: Instance, port: int) -> None:
+    print(f"This name was used before: {instance.name}. Do you want to release this name?")
+    print(terminal_color(f"The new instance will start with an empty AgentsDock chat list on port {port}.", "31"))
+    print(f"Old AgentsDock history, uploads, jobs and credentials at {instance.state} will be moved to a private backup, not erased.")
+    print("Original provider chats stored on this machine and project files are not deleted. AgentsDock-only content remains in the backup.")
+    print("To keep using the existing history instead, cancel and run:")
+    print(f"  ./install.sh --instance {instance.name} --port {port}")
+    expected = f"release {instance.name}"
+    try:
+        confirmed = sys.stdin.isatty() and input(f"Type {expected!r} to confirm (Enter cancels): ") == expected
+    except EOFError:
+        confirmed = False
+    if not confirmed:
+        raise ValueError("Name release not confirmed; existing history was not changed.")
+
+
+def release_instance_name(instance: Instance, registry: Registry) -> Path | None:
+    validate_released_instance(instance)  # Recheck after the user prompt.
+    if not instance.state.exists():
+        return None
+    backups = registry.root / "history-backups"
+    check_path(backups, registry.home)
+    # Holding the old state's lock prevents archiving a running server. Rename
+    # the directory itself; never traverse/delete its contents or follow links.
+    with exclusive_lock(instance.state / ".server-process.lock"):
+        validate_released_instance(instance)
+        backups.mkdir(mode=0o700, exist_ok=True)
+        destination = Path(tempfile.mkdtemp(prefix=f"{instance.name}-", dir=backups)) / "state"
+        instance.state.rename(destination)
+    print(terminal_color(f"Preserved old instance data in: {destination}", "32"), flush=True)
+    return destination
+
+
 def control(instance: Instance, action: str, platform: str = sys.platform):
     validate_binding(instance, platform)
     if not instance.service_file(platform).exists():
@@ -659,7 +712,8 @@ def main(argv: list[str] | None = None) -> int:
                 if not isinstance(entries, list) or not entries:
                     raise ValueError("Manifest must be a nonempty JSON array of {name, port?, bind?} objects.")
                 plan = []
-                names, ports = set(existing), set()
+                records = registry.records()
+                names, ports, planned_names = set(existing), set(), set()
                 for entry in entries:
                     if not isinstance(entry, dict) or set(entry) - {"name", "port", "bind"}:
                         raise ValueError("Invalid manifest entry.")
@@ -669,28 +723,55 @@ def main(argv: list[str] | None = None) -> int:
                         while f"instance-{index}" in names:
                             index += 1
                         name = f"instance-{index}"
-                    if name == "default" or name in names:
-                        raise ValueError(f"Instance {name!r} already exists/reserved. Use update; names with preserved history cannot be reused by new.")
+                    if name == "default" or name in planned_names:
+                        raise ValueError(f"Instance {name!r} already exists/reserved.")
                     instance = Instance(instance_name(name), registry.home)
-                    if any(item.exists() or item.is_symlink() for item in (instance.runtime, instance.config, instance.state, instance.service_file())):
+                    record = records.get(name)
+                    reuse = record is not None and record["status"] in {"removed", "failed"}
+                    if name in names and not reuse:
+                        raise ValueError(f"Instance {name!r} already exists/reserved. Use update.")
+                    if reuse:
+                        validate_released_instance(instance)
+                    elif any(item.exists() or item.is_symlink() for item in (instance.runtime, instance.config, instance.state, instance.service_file())):
                         raise ValueError(f"{name}: existing unmanaged files; refusing to adopt or overwrite.")
                     validate_binding(instance)
-                    port = select_port(registry, entry.get("port"), ports)
+                    requested_port = entry.get("port")
+                    if reuse and requested_port is None:
+                        requested_port = record.get("port")
+                        if requested_port is None and instance.state.exists():
+                            raise ValueError(f"{name}: the previous port was not recorded. Specify --port to reuse this name.")
+                    port = select_port(registry, requested_port, ports)
                     bind = entry.get("bind", "0.0.0.0")
                     ipaddress.ip_address(bind)  # Literal bind addresses only; no shell/XML injection.
                     names.add(name)
+                    planned_names.add(name)
                     ports.add(port)
-                    plan.append((instance, port, bind))
-                print("Create: " + ", ".join(f"{item.name}:{port}" for item, port, _ in plan), flush=True)
+                    # A failed preflight with no state has nothing to release;
+                    # retry it directly. Removed names always require consent.
+                    release = reuse and (record["status"] == "removed" or instance.state.exists())
+                    plan.append((instance, port, bind, release))
+                # Validate the entire manifest and collect all confirmations
+                # before moving any history or installing any instance.
+                for item, port, _, release in plan:
+                    if release:
+                        confirm_name_release(item, port)
+                print("Create: " + ", ".join(f"{item.name}:{port}" for item, port, _, _ in plan), flush=True)
                 failures = 0
-                for item, port, bind in plan:
-                    registry.save(item, "pending")
+                for item, port, bind, release in plan:
+                    backup = None
                     try:
+                        if not port_available(port):
+                            raise ValueError(f"Port {port} became occupied; no instance history was moved.")
+                        if release:
+                            backup = release_instance_name(item, registry)
+                        registry.save(item, "pending", port)
                         install_instance(item, port, bind)
-                        registry.save(item, "installed")
+                        registry.save(item, "installed", port)
                     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
-                        registry.save(item, "failed")
+                        registry.save(item, "failed", port)
                         print(f"{item.name}: failed ({exc}); other instances were not rolled back.", file=sys.stderr)
+                        if backup is not None:
+                            print(f"Original instance data is safe in {backup}; it was not deleted.", file=sys.stderr)
                         failures += 1
                 return int(bool(failures))
             name = args.name or args.named
@@ -711,11 +792,12 @@ def main(argv: list[str] | None = None) -> int:
             for item in selected:
                 try:
                     if args.command == "remove":
+                        old_port = read_config(item).get("AGENTSDOCK_AGENT_PORT")
                         command = ["/bin/bash", str(ROOT / "uninstall.sh"), "--managed-instance", item.name, "--yes"]
                         if args.purge_state:
                             command.append("--purge-state")  # Still asks for each exact state path.
                         run(command, env=clean_environment(item), cwd=ROOT)
-                        registry.save(item, "removed")
+                        registry.save(item, "removed", int(old_port) if old_port else None)
                     elif args.command == "update":
                         env = read_config(item)
                         install_instance(item, int(env["AGENTSDOCK_AGENT_PORT"]), env["AGENTSDOCK_AGENT_BIND"])

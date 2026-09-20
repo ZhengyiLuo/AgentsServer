@@ -715,13 +715,18 @@ that instance's token explicitly. No client changes are required.
 Each named instance has its own access token, server identity, chats, jobs,
 mailboxes, files, configuration, logs, releases/rollback and tmux socket. A
 registered but stopped server keeps its port reserved. An occupied explicit
-port fails instead of stopping another process. New names cannot overwrite
-existing files or reuse preserved history. Creation failures remain visible
+port fails instead of stopping another process. Existing files are never silently
+overwritten. Reusing a removed name requires confirmation and a backup of its old
+state (see Uninstalling below). Creation failures remain visible
 in the registry so they can be diagnosed or explicitly removed.
 
 Each release prepares a private Python environment, reusing uv's package cache
 where available. The installer hides the per-package list but still reports
 errors. It does not reinstall the existing Claude Code, Codex, or tmux programs.
+Installing from a working checkout automatically ignores Python bytecode caches
+(`__pycache__`, `.pyc`, `.pyo`); only explicitly listed source files are copied.
+Links, special files, missing required files and unexpected source files are
+still rejected. You do not need to clean normal Python caches yourself.
 
 | Item | Default | Named `work` |
 | --- | --- | --- |
@@ -733,7 +738,8 @@ errors. It does not reinstall the existing Claude Code, Codex, or tmux programs.
 | tmux socket | `default` | `agents-server-work` |
 
 The private registry is `~/.config/agents-server-manager/instances.json`. It
-contains only names and lifecycle status, never credentials or deletion paths.
+contains only names, lifecycle status and optional last-used ports, never
+credentials or deletion paths.
 Existing standard installations are discovered without moving their files.
 Nonstandard/custom-root default installations remain supported by the original
 installer; the manager refuses mismatched bindings instead of guessing paths.
@@ -816,6 +822,23 @@ path traversal, and overlapping install/configuration/state roots. Like
 terminal tmux sessions are left running; list default sessions with `tmux ls`
 or named sessions with `tmux -L agents-server-work ls`. Reinstall a preserved
 named history explicitly with `./install.sh --instance work --port 7851`.
+To start fresh under a removed name, use `./instances.sh new --name work --port 7851`.
+The manager asks whether to release the name and requires typing `release work`.
+It moves the old instance's complete state to a private backup under
+`~/.config/agents-server-manager/history-backups/`, prints its exact location,
+and creates a fresh instance. Old AgentsDock history, uploads, jobs and credentials
+remain in that backup; they are not active in the new instance. Original provider
+transcripts and project files are untouched. Declining or non-interactive input
+does not release the name. An installed/running instance or the default instance
+cannot be released this way.
+
+An explicit `--port` takes precedence; otherwise, the last recorded port is reused
+only if available. Older records without a saved port require `--port` when
+history exists. If the fresh install fails, the old data stays safe at the printed
+backup location. Failed preflights that created no instance data can be retried
+with `new` without a release prompt. Names with partial installations must first
+be removed; the manager will not overwrite them.
+
 For bulk permanent deletion use `./uninstall.sh --all --purge-state`; it shows
 an irreversible-deletion warning, requires `delete history` followed by every
 selected instance name (for example, `delete history default work`), and then requires

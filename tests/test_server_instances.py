@@ -112,6 +112,15 @@ class InstanceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.registry.records()
 
+    def test_registry_remembers_valid_port_without_paths_or_credentials(self):
+        with self.registry.locked():
+            self.registry.save(self.work, "installed", 7852)
+            self.registry.save(self.work, "removed")
+        self.assertEqual(self.registry.records()["work"], {"status": "removed", "port": 7852})
+        for port in (0, 65536, True, "7852"):
+            with self.subTest(port=port), self.registry.locked(), self.assertRaises(ValueError):
+                self.registry.save(self.work, "removed", port)
+
     def test_symlink_and_writable_parents_are_rejected(self):
         self.work.config.parent.mkdir(parents=True)
         self.work.config.symlink_to(self.home)
@@ -238,6 +247,178 @@ class InstanceTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(self.registry.records()["work"]["status"], "failed")
 
+    def removed_history(self, *, port=7852):
+        self.work.state.mkdir(parents=True)
+        (self.work.state / "sessions.json").write_text("old imported chat index")
+        (self.work.state / "upload.png").write_bytes(b"AgentsDock-only upload")
+        with self.registry.locked():
+            self.registry.save(self.work, "removed", port)
+
+    def test_reuse_removed_name_backs_up_state_and_preserves_provider_and_default(self):
+        self.configured(self.default, 7850)
+        before = self.snapshot(self.default)
+        self.removed_history()
+        provider = self.home / ".claude/projects/native.jsonl"
+        provider.parent.mkdir(parents=True)
+        provider.write_text("original provider transcript")
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="release work") as prompt:
+            code, output, errors, mocks = self.cli("new", "--name", "work", install_instance={}, port_available={"return_value": True})
+        self.assertEqual(code, 0, errors)
+        prompt.assert_called_once_with("Type 'release work' to confirm (Enter cancels): ")
+        self.assertEqual(mocks["install_instance"].call_args.args, (self.work, 7852, "0.0.0.0"))
+        backup, = (self.registry.root / "history-backups").glob("work-*/state")
+        self.assertEqual((backup / "sessions.json").read_text(), "old imported chat index")
+        self.assertEqual((backup / "upload.png").read_bytes(), b"AgentsDock-only upload")
+        self.assertEqual(backup.parent.stat().st_mode & 0o777, 0o700)
+        self.assertFalse(self.work.state.exists())  # Mock installer has not created the fresh state.
+        self.assertEqual(provider.read_text(), "original provider transcript")
+        self.assertEqual(self.snapshot(self.default), before)
+        self.assertIn(str(backup), output)
+        self.assertIn("AgentsDock-only content remains in the backup", output)
+        self.assertEqual(self.registry.records()["work"], {"status": "installed", "port": 7852})
+
+    def test_reuse_cancel_wrong_name_noninteractive_and_eof_leave_history_unchanged(self):
+        self.removed_history()
+        before = self.snapshot(self.work)
+        for tty, answer in ((True, ""), (True, "yes"), (True, "release default"), (False, "release work"), (True, EOFError())):
+            with self.subTest(tty=tty, answer=answer), patch("sys.stdin.isatty", return_value=tty), patch("builtins.input", **({"side_effect": answer} if isinstance(answer, EOFError) else {"return_value": answer})):
+                code, _, errors, mocks = self.cli("new", "--name", "work", install_instance={}, port_available={"return_value": True})
+            self.assertEqual(code, 1)
+            self.assertIn("not confirmed", errors)
+            mocks["install_instance"].assert_not_called()
+            self.assertEqual(self.snapshot(self.work), before)
+            self.assertFalse((self.registry.root / "history-backups").exists())
+            self.assertEqual(self.registry.records()["work"]["status"], "removed")
+
+    def test_reuse_explicit_port_overrides_saved_port(self):
+        self.removed_history()
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="release work"):
+            code, _, errors, mocks = self.cli("new", "--name", "work", "--port", "7952", install_instance={}, port_available={"return_value": True})
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(mocks["install_instance"].call_args.args[1], 7952)
+
+    def test_reuse_occupied_port_never_prompts_or_moves_history(self):
+        self.removed_history()
+        before = self.snapshot(self.work)
+        with patch("builtins.input") as prompt:
+            code, _, errors, mocks = self.cli("new", "--name", "work", install_instance={}, port_available={"return_value": False})
+        self.assertEqual(code, 1)
+        self.assertIn("port is occupied", errors)
+        prompt.assert_not_called()
+        mocks["install_instance"].assert_not_called()
+        self.assertEqual(self.snapshot(self.work), before)
+
+    def test_reuse_legacy_record_requires_explicit_port(self):
+        self.removed_history(port=None)
+        with patch("builtins.input") as prompt:
+            code, _, errors, mocks = self.cli("new", "--name", "work", install_instance={})
+        self.assertEqual(code, 1)
+        self.assertIn("Specify --port", errors)
+        prompt.assert_not_called()
+        mocks["install_instance"].assert_not_called()
+
+    def test_reuse_port_becoming_busy_during_prompt_keeps_history(self):
+        self.removed_history()
+        before = self.snapshot(self.work)
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="release work"):
+            code, _, errors, mocks = self.cli("new", "--name", "work", install_instance={}, port_available={"side_effect": [True, False]})
+        self.assertEqual(code, 1)
+        self.assertIn("became occupied", errors)
+        mocks["install_instance"].assert_not_called()
+        self.assertEqual(self.snapshot(self.work), before)
+        self.assertFalse((self.registry.root / "history-backups").exists())
+
+    def test_reuse_rejects_state_or_backup_symlink_without_touching_target(self):
+        self.removed_history()
+        self.configured(self.default, 7850)
+        before = self.snapshot(self.default)
+        original_state = self.work.state.with_name("saved-work-test-fixture")
+        self.work.state.rename(original_state)
+        self.work.state.symlink_to(self.default.state)
+        with patch("builtins.input") as prompt:
+            code, _, _, mocks = self.cli("new", "--name", "work", install_instance={})
+        self.assertEqual(code, 1)
+        prompt.assert_not_called()
+        mocks["install_instance"].assert_not_called()
+        self.work.state.unlink()  # Only this test-created symlink.
+        original_state.rename(self.work.state)
+        (self.registry.root / "history-backups").symlink_to(self.default.state)
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="release work"):
+            code, _, _, mocks = self.cli("new", "--name", "work", install_instance={}, port_available={"return_value": True})
+        self.assertEqual(code, 1)
+        mocks["install_instance"].assert_not_called()
+        self.assertEqual(self.snapshot(self.default), before)
+        self.assertEqual((self.work.state / "sessions.json").read_text(), "old imported chat index")
+
+    def test_reuse_rejects_live_state_lock(self):
+        self.removed_history()
+        with instances.exclusive_lock(self.work.state / ".server-process.lock"):
+            with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="release work"):
+                code, _, errors, mocks = self.cli("new", "--name", "work", install_instance={}, port_available={"return_value": True})
+        self.assertEqual(code, 1)
+        self.assertIn("Another process owns", errors)
+        mocks["install_instance"].assert_not_called()
+        self.assertTrue((self.work.state / "sessions.json").exists())
+        self.assertFalse((self.registry.root / "history-backups").exists())
+
+    def test_reuse_installed_default_or_running_service_is_never_allowed(self):
+        self.configured(self.default, 7850)
+        self.configured(self.work)
+        for name in ("default", "work"):
+            with self.subTest(name=name), patch("builtins.input") as prompt:
+                code, _, _, mocks = self.cli("new", "--name", name, install_instance={})
+            self.assertEqual(code, 1)
+            prompt.assert_not_called()
+            mocks["install_instance"].assert_not_called()
+        with self.registry.locked():
+            self.registry.save(self.work, "removed", 7852)
+        with patch("builtins.input") as prompt:
+            code, _, errors, mocks = self.cli("new", "--name", "work", install_instance={})
+        self.assertEqual(code, 1)
+        self.assertIn("still installed", errors)
+        prompt.assert_not_called()
+        mocks["install_instance"].assert_not_called()
+
+    def test_reuse_missing_plist_but_running_or_unknown_service_is_refused(self):
+        self.removed_history()
+        for status in ("running", "unknown"):
+            with self.subTest(status=status), patch("builtins.input") as prompt:
+                code, _, errors, mocks = self.cli("new", "--name", "work", install_instance={}, service_status={"return_value": status})
+            self.assertEqual(code, 1)
+            self.assertIn("cannot confirm", errors)
+            prompt.assert_not_called()
+            mocks["install_instance"].assert_not_called()
+
+    def test_reuse_failed_install_leaves_old_data_in_reported_backup(self):
+        self.removed_history()
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="release work"):
+            code, _, errors, _ = self.cli("new", "--name", "work", install_instance={"side_effect": ValueError("mock installer failure")}, port_available={"return_value": True})
+        self.assertEqual(code, 1)
+        backup, = (self.registry.root / "history-backups").glob("work-*/state")
+        self.assertIn(str(backup), errors)
+        self.assertEqual((backup / "sessions.json").read_text(), "old imported chat index")
+        self.assertEqual(self.registry.records()["work"]["status"], "failed")
+
+    def test_retry_failed_preflight_with_no_state_needs_no_release(self):
+        with self.registry.locked():
+            self.registry.save(self.work, "failed")  # Legacy failed record, like test2-somi.
+        with patch("builtins.input") as prompt:
+            code, _, errors, mocks = self.cli("new", "--name", "work", "--port", "7852", install_instance={}, port_available={"return_value": True})
+        self.assertEqual(code, 0, errors)
+        prompt.assert_not_called()
+        self.assertEqual(mocks["install_instance"].call_args.args[1], 7852)
+
+    def test_reuse_manifest_rejects_duplicate_names_before_confirmation(self):
+        self.removed_history()
+        manifest = self.home / "manifest.json"
+        manifest.write_text(json.dumps([{"name": "work", "port": 7852}, {"name": "work", "port": 7853}]))
+        with patch("builtins.input") as prompt:
+            code, _, _, mocks = self.cli("install", "--manifest", str(manifest), install_instance={}, port_available={"return_value": True})
+        self.assertEqual(code, 1)
+        prompt.assert_not_called()
+        mocks["install_instance"].assert_not_called()
+        self.assertTrue((self.work.state / "sessions.json").exists())
+
     def test_manifest_validates_entire_plan_before_install(self):
         manifest = self.home / "manifest.json"
         manifest.write_text(json.dumps([{"name": "one", "port": 7851}, {"name": "two", "port": 7851}]))
@@ -267,6 +448,7 @@ class InstanceTests(unittest.TestCase):
         self.assertEqual(output.count("Successful!"), 1)
         self.assertNotIn("remove completed", output)
         self.assertEqual(self.registry.records()["work"]["status"], "removed")
+        self.assertEqual(self.registry.records()["work"]["port"], 7851)
 
     def test_failed_or_partial_removal_never_reports_success(self):
         self.configured(self.default, 7850)
@@ -516,6 +698,12 @@ systemctl() { printf '%s\\n' "$*"; }
         self.assertNotIn(" agents-server.service", result.stdout)
 
     def test_complete_named_installer_with_fake_services_preserves_default(self):
+        self.check_complete_named_install()
+
+    def test_complete_release_and_fresh_install_with_fake_services_preserves_default(self):
+        self.check_complete_named_install(release=True)
+
+    def check_complete_named_install(self, *, release=False):
         # Reuse the established installer's fake dependency/health layer. All
         # service commands are stubbed; no uv downloads or OS jobs are started.
         from tests.test_installer import InstallerContractTests
@@ -552,7 +740,21 @@ exit 2
                "FAKE_HEALTH_VERSION": fixture.release_version(),
                "FAKE_SERVER_IDENTITY": "named_instance_test_12345678", "FAKE_TEAM_HUB_ID": "",
                "FAKE_TEAM_HUB_MODE": "disabled", "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1"}
-        result = subprocess.run(["/bin/bash", str(ROOT / "install.sh"), "--instance", "work", "--port", "17851", "--non-interactive"], env=env, capture_output=True, text=True, timeout=180)
+        if release:
+            self.removed_history(port=17851)
+            with patch.dict(os.environ, env, clear=True), patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="release work"):
+                code, output, errors, _ = self.cli(
+                    "new", "--name", "work",
+                    run={"side_effect": lambda command, **kwargs: subprocess.run(command, check=True, capture_output=True, text=True, **kwargs)},
+                )
+            result = subprocess.CompletedProcess([], code, output, errors)
+            backup, = (self.registry.root / "history-backups").glob("work-*/state")
+            self.assertEqual((backup / "sessions.json").read_text(), "old imported chat index")
+            self.assertEqual((backup / "upload.png").read_bytes(), b"AgentsDock-only upload")
+            self.assertFalse((self.work.state / "upload.png").exists())
+            self.assertEqual(self.registry.records()["work"], {"status": "installed", "port": 17851})
+        else:
+            result = subprocess.run(["/bin/bash", str(ROOT / "install.sh"), "--instance", "work", "--port", "17851", "--non-interactive"], env=env, capture_output=True, text=True, timeout=180)
         self.assertEqual(result.returncode, 0, result.stderr[-6000:])
         self.assertEqual(self.snapshot(self.default), before)
         self.assertEqual(self.default.service_file("darwin").read_bytes(), default_service)

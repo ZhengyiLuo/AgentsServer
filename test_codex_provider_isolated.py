@@ -275,7 +275,9 @@ class StoreTests(unittest.TestCase):
         native = config["model_providers"][provider.PROVIDER_ID]
         self.assertFalse(native["requires_openai_auth"])
         self.assertEqual(native["wire_api"], "responses")
-        self.assertEqual(native["request_max_retries"], 0)
+        self.assertNotIn("request_max_retries", native)
+        self.assertNotIn("stream_max_retries", native)
+        self.assertFalse(any("max_retries=" in value for value in provider.registration_args(SELECTION)))
         env = provider.native_environment({"OPENAI_API_KEY": "old", "CODEX_API_KEY": "old", "https_proxy": "old", "PATH": "safe"}, SELECTION)
         self.assertEqual(env, {"PATH": "safe", provider.ENV_KEY: KEY, "RUST_LOG": "off"})
         client = CodexAppServerClient("unused", cwd="/", env_factory=dict, sensitive_values=(KEY,))
@@ -782,11 +784,16 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
             turn.close.assert_awaited_once()
         verify.assert_awaited_once()
         self.assertNotIn(KEY, str(captured["app_server_args"]))
+        startup = tomllib.loads("\n".join(captured["app_server_args"][1::2]))
+        self.assertEqual(startup["model_providers"][provider.PROVIDER_ID]["request_max_retries"], 0)
+        self.assertEqual(startup["model_providers"][provider.PROVIDER_ID]["stream_max_retries"], 0)
         self.assertEqual(captured["environment"][provider.ENV_KEY], KEY)
         self.assertNotIn("OPENAI_API_KEY", captured["environment"])
         self.assertEqual((captured["environment"]["HOME"], captured["environment"]["CODEX_HOME"]),
             ("/synthetic-home", captured["cwd"]))
         params = native.start_thread.call_args.args[0]
+        self.assertEqual(params["config"]["model_providers"][provider.PROVIDER_ID]["request_max_retries"], 0)
+        self.assertEqual(params["config"]["model_providers"][provider.PROVIDER_ID]["stream_max_retries"], 0)
         self.prepare_catalog.assert_awaited_once()
         self.assertEqual(params["config"]["model_catalog_json"], str(Path(captured["cwd"]) / "models.json"))
         self.assertEqual(params["environments"], [])

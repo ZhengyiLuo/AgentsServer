@@ -598,7 +598,7 @@ def native_config(selected: dict) -> dict:
         "model_reasoning_summary": "auto" if selected.get("reasoning_summary") == "auto" else "none",
         "model_providers": {PROVIDER_ID: {"name": "AgentsDock custom endpoint",
             "base_url": selected["base_url"], "env_key": ENV_KEY, "requires_openai_auth": False,
-            "wire_api": "responses", "request_max_retries": 0, "stream_max_retries": 0,
+            "wire_api": "responses",
             "supports_websockets": False}},
         "shell_environment_policy.exclude": [ENV_KEY, "OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_AUTH_TOKEN"]}
 
@@ -847,6 +847,9 @@ async def test_connection(selected: dict, *, executable: str, environment: dict,
             "log_dir": str(Path(temporary) / "logs"), "sqlite_home": str(Path(temporary) / "db"),
             "history.persistence": "none", "check_for_update_on_startup": False,
             "analytics.enabled": False, "otel.exporter": "none", "otel.trace_exporter": "none"}
+        # Connection checks are one explicit attempt; normal chats retain
+        # native bounded HTTP/stream recovery for transient failures.
+        config["model_providers"][PROVIDER_ID].update(request_max_retries=0, stream_max_retries=0)
         env = native_environment(isolated_environment(environment), selected)
         # A fresh SQLite database paired with the user's Codex home triggers
         # a full history reindex before native initialization can complete.

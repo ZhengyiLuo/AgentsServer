@@ -33,4 +33,10 @@ After the basic checks succeed, the same operator-requested operation makes one 
 
 The total check budget is 45 seconds, followed by owned-process cleanup. Results use fixed, secret-safe messages and never expose raw provider errors. Checks do not save credentials or change a chat's provider. There are no automatic probe retries. Configured readiness means only that a local key exists; unknown models remain available for deliberate selection.
 
+Ordinary custom-endpoint chats retain the installed Codex runtime's bounded HTTP
+and stream retries. The no-retry overrides apply only to explicit connection
+checks and offline catalog inspection. Recovery stays inside the native turn;
+AgentsServer does not replay the entire user task or synthesize a successful
+completion when the endpoint closes an incomplete stream.
+
 Use pure-module or AST-isolated tests and controlled localhost Responses fixtures. Do not import the server monolith or use production credentials to test this feature.

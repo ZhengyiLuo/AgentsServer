@@ -1525,7 +1525,7 @@ if [[ "$TEAM_HUB_MODE" == "host" && "$TEAM_HUB_OPERATION_PENDING" != "true" ]]; 
   fi
 fi
 
-RELEASE_FILES=(activation_transaction.py agent_server.py local_session_ownership.py workspace_git.py team_hub_host.py secure_peer_runtime.py team_mail_runtime.py team_mail_websocket.py team_mail_grants.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py chat_mailbox.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py claude_sdk_client.py claude_background_reconciliation.py codex_app_server.py codex_auth.py codex_provider.py side_questions.py title_generation.py codex_side_question.py claude_side_question.py cursor_agent_client.py cursor_process_guard.py claude_history_repair.py claude_history_provenance.py codex_history_repair.py public_chat_shares.py public_chat_transcript.py public_chat_share_routes.py interactive_chat_shares.py interactive_chat_share_routes.py interactive_chat_share_web.py interactive_chat_projection.py interactive_chat_runtime.py interactive_chat_native.py shared_chat_videos.py shared_chat_video_stream.py interactive_chat_controls.py install.sh uninstall.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem)
+RELEASE_FILES=(activation_transaction.py agent_server.py local_session_ownership.py cursor_history.py workspace_git.py team_hub_host.py secure_peer_runtime.py team_mail_runtime.py team_mail_websocket.py team_mail_grants.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py chat_mailbox.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py provider_commands.py claude_sdk_client.py claude_background_reconciliation.py codex_app_server.py codex_auth.py codex_provider.py side_questions.py title_generation.py codex_side_question.py claude_side_question.py cursor_agent_client.py cursor_process_guard.py claude_history_repair.py claude_history_provenance.py codex_history_repair.py public_chat_shares.py public_chat_transcript.py public_chat_share_routes.py interactive_chat_shares.py interactive_chat_share_routes.py interactive_chat_share_web.py interactive_chat_projection.py interactive_chat_runtime.py interactive_chat_native.py shared_chat_videos.py shared_chat_video_stream.py interactive_chat_controls.py install.sh uninstall.sh update_runner.py pyproject.toml uv.lock VERSION release-public-key.pem)
 RELEASE_DIRECTORIES=(agentsdock_team_hub)
 TEAM_HUB_RELEASE_FILES=(
   __init__.py
@@ -3044,6 +3044,7 @@ validate_staged_release_runtime() (
     "$STAGE_DIR/activation_transaction.py" \
     "$STAGE_DIR/agent_server.py" \
     "$STAGE_DIR/local_session_ownership.py" \
+    "$STAGE_DIR/cursor_history.py" \
     "$STAGE_DIR/team_hub_host.py" \
     "$STAGE_DIR/secure_peer_runtime.py" \
     "$STAGE_DIR/team_mail_runtime.py" \
@@ -3087,7 +3088,7 @@ validate_staged_release_runtime() (
     "$STAGE_DIR/interactive_chat_controls.py" \
     "$STAGE_DIR/update_runner.py"
   "$STAGE_DIR/.venv/bin/python" -m compileall -q "$STAGE_DIR/agentsdock_team_hub"
-  PYTHONPATH="$STAGE_DIR" "$STAGE_DIR/.venv/bin/python" -c 'import local_session_ownership, workspace_git; import codex_auth, codex_provider, side_questions, title_generation, codex_side_question, claude_side_question, agentsdock_team_hub, cursor_agent_client, cursor_process_guard, secure_peer_delivery, secure_peer_runtime, team_mail_runtime, team_mail_websocket, team_mail_grants, team_hub_host, agentsdock_mail, agentsdock_team, claude_history_repair, claude_history_provenance, claude_background_reconciliation, codex_history_repair, public_chat_shares, public_chat_transcript, public_chat_share_routes, interactive_chat_shares, interactive_chat_share_routes, interactive_chat_share_web, interactive_chat_projection, interactive_chat_runtime, interactive_chat_native, shared_chat_videos, shared_chat_video_stream, interactive_chat_controls, chat_mailbox, provider_commands; from agentsdock_team_hub import secure_peer, secure_peer_hub' >/dev/null
+  PYTHONPATH="$STAGE_DIR" "$STAGE_DIR/.venv/bin/python" -c 'import cursor_history, local_session_ownership, workspace_git; import codex_auth, codex_provider, side_questions, title_generation, codex_side_question, claude_side_question, agentsdock_team_hub, cursor_agent_client, cursor_process_guard, secure_peer_delivery, secure_peer_runtime, team_mail_runtime, team_mail_websocket, team_mail_grants, team_hub_host, agentsdock_mail, agentsdock_team, claude_history_repair, claude_history_provenance, claude_background_reconciliation, codex_history_repair, public_chat_shares, public_chat_transcript, public_chat_share_routes, interactive_chat_shares, interactive_chat_share_routes, interactive_chat_share_web, interactive_chat_projection, interactive_chat_runtime, interactive_chat_native, shared_chat_videos, shared_chat_video_stream, interactive_chat_controls, chat_mailbox, provider_commands; from agentsdock_team_hub import secure_peer, secure_peer_hub' >/dev/null
 )
 
 abort_unclaimed_team_hub_reactivation() {
@@ -3374,7 +3375,6 @@ for name in "${TEAM_HUB_RELEASE_FILES[@]}"; do
     "$STAGE_DIR/agentsdock_team_hub/$name"
 done
 chmod 755 "$STAGE_DIR/agent_server.py" "$STAGE_DIR/agentsdock_jobs.py" "$STAGE_DIR/agentsdock_chats.py" "$STAGE_DIR/agentsdock_emergency.py" "$STAGE_DIR/agentsdock_publish.py" "$STAGE_DIR/agentsdock_mail.py" "$STAGE_DIR/agentsdock_team.py" "$STAGE_DIR/install.sh" "$STAGE_DIR/uninstall.sh" "$STAGE_DIR/update_runner.py"
-    "$STAGE_DIR/local_session_ownership.py" \
 
 echo "[2/7] Resolving the release dependencies with uv"
 if run_timed_stage \

@@ -75,6 +75,7 @@ import workspace_git
 import codex_auth
 import codex_provider
 import local_session_ownership
+import cursor_history
 
 from codex_app_server import (
     CodexAppServerDisconnected,
@@ -6135,7 +6136,7 @@ PROVIDER_SESSION_IDENTIFIER_RE = re.compile(
 
 class BulkImportSessionItem(BaseModel):
     provider_session_id: str = Field(min_length=1, max_length=256)
-    backend: Literal["claude", "codex"]
+    backend: Literal["claude", "codex", "cursor"]
     cwd: str | None = Field(default=None, max_length=MAX_WORKSPACE_PATH_CHARS)
     title: str | None = Field(default=None, max_length=MAX_LOCAL_SESSION_LABEL_CHARS)
 
@@ -47441,9 +47442,92 @@ def local_codex_session_candidates(known_provider_ids: set[str]) -> list[dict[st
     return candidates
 
 
+def cursor_history_event_item(event: dict[str, Any]) -> dict[str, Any] | None:
+    """Project only Cursor CLI's public text export, never internal blobs/tools."""
+    role = event.get("role")
+    if role not in {"user", "assistant"}:
+        return None
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return None
+    parts = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "text" or not isinstance(block.get("text"), str):
+            continue
+        text = block["text"]
+        if role == "user":
+            # Cursor's native export wraps human prompts. Raw user-role tool
+            # results, image reinjections and system context are not user turns.
+            match = re.fullmatch(
+                r"(?:<timestamp>[^<>\r\n]{1,128}</timestamp>\s*)?<user_query>(.*)</user_query>\s*",
+                text, flags=re.DOTALL,
+            )
+            if match is None:
+                continue
+            text = strip_agentsdock_generated_user_text(match[1], provider_history=True)
+        parts.append(text)
+    return normalized_history_item(role, "\n".join(parts), allow_user_boilerplate=True)
+
+
+def cursor_initial_history(provider_id: str, cwd: str, limit: int | None = None) -> tuple[Path | None, list[dict[str, Any]]]:
+    session = cursor_history.find_session(provider_id, cwd)
+    if session is None:
+        return None, []
+    snapshot, _continued = provider_history_source_snapshot(session.transcript, None)
+    items: deque[dict[str, Any]] = deque(maxlen=normalized_history_import_limit(limit))
+    for event in bounded_jsonl_events_range(
+        session.transcript, 0, snapshot["source_offset"], expected_stat=snapshot["expected_stat"],
+    ):
+        item = cursor_history_event_item(event)
+        if item is not None:
+            # The export has no immutable message IDs. Identical consecutive
+            # public messages can be legitimate; never deduplicate by text here.
+            items.append(item)
+    return session.transcript, list(items)
+
+
+def local_cursor_session_candidates(known_provider_ids: set[str]) -> list[dict[str, Any]]:
+    candidates: dict[str, dict[str, Any]] = {}
+    ambiguous: set[str] = set()
+    for session in cursor_history.local_sessions():
+        provider_id = session.provider_id
+        if provider_id in known_provider_ids or provider_id in ambiguous:
+            continue
+        title = native_session_title(session.title)
+        if title and title.casefold() == "new agent":
+            title = None
+        preview = None
+        try:
+            for index, event in enumerate(bounded_jsonl_events(session.transcript)):
+                if index >= 200:
+                    break
+                item = cursor_history_event_item(event)
+                if item is not None and item["kind"] == "user":
+                    preview = item["text"][:160]
+                    break
+        except (OSError, ValueError, RecursionError):
+            continue
+        folder = Path(session.cwd).name
+        label = title or (f"{folder}: {preview}" if preview else f"{folder}: Cursor chat {provider_id[:8]}")
+        # Do not choose arbitrarily if a copied ID exists in multiple workspaces.
+        if provider_id in candidates:
+            candidates.pop(provider_id)
+            ambiguous.add(provider_id)
+            continue
+        candidates[provider_id] = {
+            "provider_session_id": provider_id, "backend": BACKEND_CURSOR,
+            "label": native_session_title(label) or f"Cursor chat {provider_id[:8]}",
+            "updated_at": iso_from_timestamp(session.updated_at), "cwd": session.cwd,
+        }
+    return list(candidates.values())
+
+
 def local_session_candidates(
     limit: int,
     known_provider_keys: set[tuple[str, str]] | None = None,
+    *,
+    include_cursor: bool = False,
 ) -> list[dict[str, Any]]:
     """Enumerate sessions not already used by this or another local instance."""
 
@@ -47468,6 +47552,10 @@ def local_session_candidates(
         *local_claude_session_candidates(claude_known),
         *local_codex_session_candidates(codex_known),
     ]
+    if include_cursor:
+        candidates.extend(local_cursor_session_candidates({
+            provider_id for backend, provider_id in known_provider_keys if backend == BACKEND_CURSOR
+        }))
     candidates.sort(key=lambda c: c["updated_at"], reverse=True)
     return candidates[:max(1, min(limit, MAX_LOCAL_SESSION_LIST_ITEMS))]
 
@@ -49330,6 +49418,22 @@ async def import_session_history(sess: dict[str, Any], *, force: bool = False, l
     backend = (sess.get("backend") or DEFAULT_BACKEND).lower()
     if not provider_id:
         return {"imported": 0, "source_path": None, "message": "No provider session ID set."}
+    if backend == BACKEND_CURSOR:
+        # Initial public-text snapshot only. The private native store, not these
+        # display messages, supplies resume context. Cursor exports are rewritable
+        # and lack stable event IDs; do not enable automatic history reconciliation
+        # or force replay through the append-only Claude/Codex cursor machinery.
+        if await asyncio.to_thread(lambda: any(
+            event.get("type") == "history_imported" for event in iter_session_events(session_id)
+        )):
+            return {"imported": 0, "source_path": None, "message": "Cursor initial history already imported."}
+        try:
+            source, items = await asyncio.to_thread(cursor_initial_history, provider_id, str(sess.get("cwd") or ""), limit)
+        except (OSError, ValueError, RecursionError):
+            return {"imported": 0, "source_path": None, "message": "Cursor local history is unavailable; native resume is unchanged."}
+        if source is None or not items:
+            return {"imported": 0, "source_path": None, "message": "No readable Cursor CLI history was found for this ID and workspace."}
+        return await append_imported_history(sess, source, items)
     if not force and any(event.get("type") == "history_imported" for event in read_events(session_id, limit=10000)):
         return {"imported": 0, "source_path": None, "message": "History already imported."}
 
@@ -77580,6 +77684,14 @@ async def health() -> dict[str, Any]:
                 "max_batch_items": MAX_BULK_IMPORT_ITEMS,
                 "max_list_items": MAX_LOCAL_SESSION_LIST_ITEMS,
             },
+            "local_session_import_cursor_v1": {
+                "available": True,
+                "required": False,
+                "message": "Cursor CLI discovery and native resume with an initial public-text history snapshot are available; request include_cursor=true.",
+                "action": None,
+                "version": 1,
+                "history_mode": "initial_text_snapshot",
+            },
             "session_fork_completed_prefix_v1": {
                 "available": True,
                 "version": 1,
@@ -81758,6 +81870,7 @@ async def create_session_with_history(req: CreateSessionRequest) -> dict[str, An
 @app.get("/api/local-sessions")
 async def get_local_sessions(
     limit: int = Query(default=200, ge=1, le=MAX_LOCAL_SESSION_LIST_ITEMS),
+    include_cursor: bool = False,
 ) -> dict[str, Any]:
     """List main conversations unused by any installed same-user local instance."""
 
@@ -81767,11 +81880,8 @@ async def get_local_sessions(
             for session in STORE.sessions.values()
             for key in local_session_ownership.provider_session_keys(session, DEFAULT_BACKEND)
         }
-    sessions = await asyncio.to_thread(
-        local_session_candidates,
-        limit,
-        known_provider_keys,
-    )
+    options = {"include_cursor": True} if include_cursor else {}
+    sessions = await asyncio.to_thread(local_session_candidates, limit, known_provider_keys, **options)
     return {"sessions": sessions}
 
 
@@ -81843,6 +81953,7 @@ async def bulk_import_sessions_guarded(
             local_session_candidates,
             MAX_LOCAL_SESSION_LIST_ITEMS,
             set(),
+            **({"include_cursor": True} if any(item.backend == BACKEND_CURSOR for item in req.items) else {}),
         )
         candidate_by_key = {
             (str(candidate["backend"]), str(candidate["provider_session_id"])): candidate
@@ -81892,24 +82003,29 @@ async def bulk_import_sessions_guarded(
 
             staged_session: dict[str, Any] | None = None
             try:
-                source_path, history_items = await asyncio.to_thread(
-                    provider_history,
-                    {
-                        "backend": item.backend,
-                        "session_id": item.provider_session_id,
-                        "claude_session_id": (
-                            item.provider_session_id
-                            if item.backend == BACKEND_CLAUDE
-                            else None
-                        ),
-                        "codex_thread_id": (
-                            item.provider_session_id
-                            if item.backend == BACKEND_CODEX
-                            else None
-                        ),
-                    },
-                    None,
-                )
+                if item.backend == BACKEND_CURSOR:
+                    source_path, history_items = await asyncio.to_thread(
+                        cursor_initial_history, item.provider_session_id, candidate_cwd or "",
+                    )
+                else:
+                    source_path, history_items = await asyncio.to_thread(
+                        provider_history,
+                        {
+                            "backend": item.backend,
+                            "session_id": item.provider_session_id,
+                            "claude_session_id": (
+                                item.provider_session_id
+                                if item.backend == BACKEND_CLAUDE
+                                else None
+                            ),
+                            "codex_thread_id": (
+                                item.provider_session_id
+                                if item.backend == BACKEND_CODEX
+                                else None
+                            ),
+                        },
+                        None,
+                    )
                 if source_path is None:
                     results.append(bulk_import_result(
                         item,

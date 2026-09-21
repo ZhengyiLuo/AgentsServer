@@ -72,6 +72,39 @@ Describe differences and extra provider usage for server-provided equivalents.
 
 ## 6. History, import and cross-device synchronization
 
+- [ ] Record support **separately** for resume by ID, local discovery, initial
+  history import, later native-history reconciliation and fork. Resume working
+  does not prove the other four work. Distinguish CLI, IDE and cloud histories;
+  never assume they share a format. Apply this checklist to Claude, Codex,
+  Cursor, OpenCode and each future adapter, including explicitly unsupported items.
+- [ ] Keep the original provider ID and exact workspace when resuming; test a
+  contextual follow-up against the same native conversation. A missing workspace
+  or unreadable store must not silently create a fresh thread or replay history
+  as new instructions. Do not reverse lossy folder slugs to guess a workspace.
+- [ ] Prefer verified native titles over first-message previews. Test custom
+  versus generated titles, placeholder/missing titles, duplicate labels, manual
+  AgentsDock names and malicious/control-character metadata. Listing/renaming
+  must not spend model usage or mutate native stores.
+- [ ] Exclude child/subagent, confirmed archived, empty and unavailable native
+  sessions as supported by each provider's metadata. Do not hide stopped main
+  chats or ordinary user forks. Define what "deleted" means: deleting an
+  AgentsDock entry is not deletion of its native transcript.
+- [ ] Exclude identities held by this and other installed same-user instances,
+  including parked IDs, before the response limit. Recheck at import/resume;
+  cover stale pickers, simultaneous imports and unreadable ownership indexes.
+  State clearly whether older servers participate in the coordination protocol.
+- [ ] Test metadata-to-transcript ID/workspace binding, read-only access,
+  symlinks, corrupt/oversized files, partial writes and scan limits. Unknown
+  private formats fail closed per entry. Never decrypt internal conversation
+  blobs to claim native history parity.
+- [ ] Negotiate provider additions end-to-end: server capability, opt-in list
+  parameter, client backend validation, bulk results and UI copy. Test old
+  client/new server and new client/old server; one new backend must not break
+  all existing import results. Verify desktop and mobile independently.
+- [ ] Import atomically with truthful per-item failures; preserve native files
+  on cancellation/rollback. Test repeated import, restart, changed candidates,
+  identical legitimate messages and terminal imported-run boundaries. Disclose
+  text-only snapshots, missing tools/images/reasoning and unavailable catch-up.
 - [ ] Reconcile live output with native history using stable identity where
   available. Test formatting differences and legitimate repeated replies.
   Tool/image reinjections and internal wake prompts must not become user bubbles.
@@ -133,6 +166,7 @@ Run this minimum smoke flow with disposable chats/workspaces:
 ## Repository starting points
 
 - [Native-parity rules](../AGENTS.md); [runtime diagnostics tests](../test_runtime_diagnostics.py).
+- [Cursor CLI import contract](CURSOR_LOCAL_IMPORT.md); [Cursor import tests](../test_cursor_local_import.py), [cross-instance import tests](../test_cross_instance_import.py).
 - [Titles](NATIVE_SESSION_TITLES.md); [title lifecycle tests](../test_generated_title_lifecycle.py).
 - [Chat authorization](ASYNC_CHAT_ROUTES.md), [mailbox](CHAT_MAILBOX.md); [authority tests](../test_provider_authority_lifecycle.py).
 - [Reasoning tests](../test_reasoning_stream_isolated.py), [WebSocket catch-up tests](../test_event_websocket_catchup.py), [history reconciliation tests](../test_provider_history_sync.py).

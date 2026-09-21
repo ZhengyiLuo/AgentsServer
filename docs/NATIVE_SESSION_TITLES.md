@@ -26,9 +26,12 @@ explicitly named imports, forks, and child agents are not retroactively renamed.
   missing, or changed stores do not prevent resume. Discovery does not modify
   provider conversations, rename existing AgentsDock chats, or spend model usage.
 
-Cursor's existing path is **resume by ID**, not bulk history import. The import
-candidate API and bulk importer still support Claude/Codex only; this change does
-not advertise Cursor transcript import to clients that cannot handle it.
+Cursor additionally supports opt-in **CLI local discovery and bulk import of an
+initial public-text snapshot**. Existing clients still receive Claude/Codex only;
+compatible clients request `include_cursor=true` after checking the separate
+capability. Native resume retains the original ID/workspace. This is not Cursor
+IDE/cloud import or automatic external-history synchronization. See the
+[Cursor import contract](CURSOR_LOCAL_IMPORT.md) for requirements and limits.
 
 ### Import discovery safeguards on the 1.0 release line
 

@@ -13,6 +13,7 @@ import unittest
 ROOT = Path(__file__).parent
 NEW_MODULES = {
     "local_session_ownership.py",
+    "cursor_history.py",
     "workspace_git.py",
     "codex_auth.py",
     "codex_provider.py",
@@ -118,6 +119,11 @@ class ReleaseFileManifestTests(unittest.TestCase):
                 self.assertIn(f'"$STAGE_DIR/{name}"', self.installer)
                 self.assertIn(f"'$REMOTE_SERVER_DIR/{name}'", self.deployer)
                 self.assertIn(name.removesuffix(".py"), self.installer.split("PYTHONPATH=\"$STAGE_DIR\"")[-1])
+
+    def test_staging_does_not_execute_library_modules_after_chmod(self):
+        staging = self.installer.split('chmod 755 "$STAGE_DIR/agent_server.py"', 1)[1]
+        before_dependencies = staging.split('echo "[2/7]', 1)[0]
+        self.assertEqual(len(before_dependencies.strip().splitlines()), 1)
 
     def test_frozen_hub_manifest_includes_new_migration_and_current_hashes(self):
         tree = ast.parse((ROOT / "test_team_hub_host.py").read_text())

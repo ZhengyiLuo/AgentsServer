@@ -93,8 +93,9 @@ class NativeTitleReaders(unittest.TestCase):
             self.assertIsNone(server.read_native_session_title(session("opencode")))
         self.assertEqual(list(self.root.iterdir()), [])
 
-    def test_cursor_keeps_fallback_without_decoding_private_store(self):
-        self.assertIsNone(server.read_native_session_title(session("cursor")))
+    def test_cursor_missing_metadata_keeps_fallback(self):
+        with patch.dict(os.environ, {"CURSOR_CONFIG_DIR": str(self.root / "missing")}):
+            self.assertIsNone(server.read_native_session_title(session("cursor")))
 
     def test_invalid_titles_and_provider_placeholders_are_not_used(self):
         for value in (None, {}, 17, "", "  ", "New chat", "Untitled", "New session", "New session - 2026-09-20T00:00:00Z", "x" * 4097):

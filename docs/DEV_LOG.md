@@ -1,5 +1,25 @@
 # Development and release log
 
+## 2026-09-21 — Native import titles and Cursor CLI discovery
+
+- Prefer existing Claude, Codex and Cursor CLI titles in import/resume. When a
+  native title is unavailable, show the first user message without a repeated
+  project prefix. Recognize complete server-generated prompt envelopes for
+  previews without rewriting stored history or reconciliation identities.
+- Restore main-conversation and same-user cross-instance ownership filters on
+  the release line, including stale-picker/manual-resume rejection. Preserve
+  stopped main conversations and normal user-created forks.
+- Add capability-gated Cursor CLI discovery and atomic initial text import.
+  Continue through the original native session/workspace. Existing clients keep
+  their Claude/Codex list; Cursor IDE/cloud history and later external-edit
+  synchronization are not included.
+- Verify isolated import, naming, ownership, history and packaging regressions;
+  verify real native Cursor continuation through an isolated offscreen Electron
+  app and authenticated server. Recheck live import labels against read-only
+  native sources after the preview correction. See the detailed scope and
+  acceptance notes in [CURSOR_LOCAL_IMPORT.md](CURSOR_LOCAL_IMPORT.md).
+- Source change only: no release publication or production-service update.
+
 ## 2026-09-19 — Completed Codex plaintext preservation — source only
 
 - Read native completed reasoning `content` arrays of strings, while retaining

@@ -19,13 +19,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, Field
 import codex_provider
+import local_session_ownership
 import test_codex_subagent_config_isolated as config_fixture
 
 SOURCE = Path(__file__).with_name("agent_server.py")
 FUNCTIONS = {"preview_session_runtime_update", "session_backend_locked", "public_session",
     "session_subagent_limit_control", "validate_session_subagent_limit",
     "record_codex_subagent_limit_application",
-    "create_session", "update_session", "ensure_backend_update_allowed", "codex_runtime_settings", "_fork_session_locked"}
+    "create_session", "create_session_with_history", "update_session", "ensure_backend_update_allowed", "codex_runtime_settings", "_fork_session_locked"}
 MODELS = {"CreateSessionRequest", "UpdateSessionRequest"}
 tree = ast.parse(SOURCE.read_text())
 nodes = []
@@ -46,8 +47,13 @@ CODE = compile(ast.fix_missing_locations(ast.Module(body=[ast.ImportFrom(module=
 def make_namespace(root: Path):
     """Reusable native UI fixture: real routes/store methods, synthetic helpers."""
     locks = {}
+    registry = local_session_ownership.Registry(root)
     ns = {"Any": Any, "Literal": Literal, "BaseModel": BaseModel, "Field": Field,
         "cancel_generated_session_title": Mock(),
+        "local_session_ownership": local_session_ownership,
+        "local_history_import_guard": lambda: local_session_ownership.history_import_lock(registry=registry),
+        "other_local_instance_provider_keys": lambda: local_session_ownership.other_instance_provider_keys(root, registry=registry),
+        "read_native_session_title": Mock(return_value=None),
         "Path": Path, "asyncio": asyncio, "suppress": suppress, "uuid": uuid, "json": json, "re": re,
         "RUNTIME_DIAGNOSTICS": {"claude": {"version": "2.1.277"}},
         "RUNTIME_DIAGNOSTICS_LOCK": threading.RLock(),
@@ -138,6 +144,24 @@ class PerChatTests(unittest.IsolatedAsyncioTestCase):
         persisted = json.loads((self.root / "sessions.json").read_text())
         self.assertEqual(persisted[custom["id"]]["codex_provider"], "custom")
         self.assertEqual(self.ns["public_session"](persisted[custom["id"]], summary=True)["codex_provider"], "custom")
+
+    async def test_resume_uses_isolated_ownership_guard_and_releases_it_after_rejection(self):
+        peer = local_session_ownership.Instance("peer", self.root)
+        peer.config.mkdir(parents=True)
+        (peer.config / "env").write_text("")
+        peer.state.mkdir(parents=True)
+        (peer.state / "sessions.json").write_text(json.dumps({
+            "peer-chat": {"backend": "codex", "codex_thread_id": "owned-thread"},
+        }))
+        with self.assertRaises(HTTPException) as caught:
+            await self.create(codex_thread_id="owned-thread", import_history=False)
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertEqual(self.ns["STORE"].sessions, {})
+        self.ns["STORE"].save.assert_not_awaited()
+        resumed = await self.create(codex_thread_id="available-thread", import_history=False)
+        self.assertEqual(resumed["codex_thread_id"], "available-thread")
+        self.ns["read_native_session_title"].assert_called_once()
+        self.ns["import_session_history"].assert_not_awaited()
 
     async def test_changes_empty_chat_provider_with_implicit_model_reset_and_freezes_started_chat(self):
         normal = await self.create(model="normal-model", effort="high")

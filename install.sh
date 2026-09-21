@@ -1241,14 +1241,41 @@ SYSTEMD_SERVICE_FILE="$HOME/.config/systemd/user/$SERVICE_NAME.service"
 LABEL="com.agentsdock.server"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
+fresh_install_scaffold_is_empty() {
+  local root="$1"
+  local allowed_child="${2:-}"
+  local candidate=""
+  local directory_mode=""
+  [[ -e "$root" || -L "$root" ]] || return 0
+  [[ -d "$root" && ! -L "$root" && -O "$root" ]] || return 1
+  directory_mode="$(stat -c '%a' "$root" 2>/dev/null \
+    || stat -f '%Lp' "$root" 2>/dev/null)" || return 1
+  [[ "$directory_mode" =~ ^[0-7]{3,4}$ \
+    && $((8#$directory_mode & 8#022)) -eq 0 \
+    && $((8#$directory_mode & 8#500)) -eq $((8#500)) ]] || return 1
+  for candidate in "$root"/* "$root"/.[!.]* "$root"/..?*; do
+    [[ -e "$candidate" || -L "$candidate" ]] || continue
+    # Only the state root may contain its known, equally safe empty admin dir.
+    [[ -n "$allowed_child" && "$candidate" == "$root/$allowed_child" ]] || return 1
+    fresh_install_scaffold_is_empty "$candidate" || return 1
+  done
+}
+
 validate_fresh_install_state() {
   [[ "$FRESH_INSTALL_ONLY" == "true" ]] || return 0
   local candidate=""
   local load_state=""
   local registration=""
   local stage_identity=""
-  for candidate in "$CURRENT_LINK" "$PREVIOUS_LINK" "$CONFIG_ROOT" \
-    "$STATE_ROOT" "$LEGACY_STATE_ROOT" "$SYSTEMD_SERVICE_FILE" \
+  # Preactivation failure can leave empty config and state/admin directories.
+  # Admit only that safe scaffold, both before and after acquiring the lock.
+  if ! fresh_install_scaffold_is_empty "$CONFIG_ROOT" \
+    || ! fresh_install_scaffold_is_empty "$STATE_ROOT" admin; then
+    echo "Fresh install refused: existing or unsafe AgentsServer state or configuration. Use the managed update or migration flow." >&2
+    return 1
+  fi
+  for candidate in "$CURRENT_LINK" "$PREVIOUS_LINK" \
+    "$LEGACY_STATE_ROOT" "$SYSTEMD_SERVICE_FILE" \
     "$LEGACY_SERVICE_FILE" "$PLIST"; do
     if [[ -e "$candidate" || -L "$candidate" ]]; then
       echo "Fresh install refused: existing AgentsServer state or service at $candidate. Use the managed update or migration flow." >&2
@@ -1286,11 +1313,13 @@ validate_fresh_install_state() {
       return 1
     fi
   elif [[ "$OS_NAME" == "Linux" ]]; then
-    load_state="$(systemctl --user show "$SERVICE_NAME.service" --property=LoadState --value 2>/dev/null || true)"
-    if [[ "$load_state" != "not-found" ]]; then
-      echo "Fresh install refused: the AgentsServer service exists or its absence could not be verified." >&2
-      return 1
-    fi
+    for candidate in "$SERVICE_NAME.service" "$LEGACY_SERVICE_NAME.service"; do
+      load_state="$(systemctl --user show "$candidate" --property=LoadState --value 2>/dev/null || true)"
+      if [[ "$load_state" != "not-found" ]]; then
+        echo "Fresh install refused: the AgentsServer service exists or its absence could not be verified." >&2
+        return 1
+      fi
+    done
   fi
 }
 
@@ -3383,6 +3412,9 @@ prepare_team_hub_reactivation() {
 }
 
 migrate_legacy_state() {
+  # A fresh retry can retain empty state scaffolding; it is not a migration and
+  # must not create a legacy alias before activation has succeeded.
+  [[ "$FRESH_INSTALL_ONLY" == "true" ]] && return 0
   [[ "$STATE_ROOT" == "$DEFAULT_STATE_GUARD" ]] || return 0
   if [[ -L "$LEGACY_STATE_ROOT" ]]; then
     return 0

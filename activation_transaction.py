@@ -127,10 +127,20 @@ def _volume_anchor(path: Path) -> os.stat_result:
     return identity
 
 
-def _capture_volume(value: dict[str, Any], path: Path) -> None:
+def _capture_volume(value: dict[str, Any], path: Path, *, allow_missing: bool = False) -> None:
     if sys.platform != "darwin" or value["format"] == 1:
         return
-    identity = _volume_anchor(path)
+    while True:
+        try:
+            identity = _volume_anchor(path)
+            break
+        except FileNotFoundError:
+            if not allow_missing or path.parent == path:
+                raise
+            # Fresh installs create configuration directories after begin().
+            # Bind their existing ancestor now; publication verifies the actual
+            # destination parent before adding any file identity to the journal.
+            path = path.parent
     identifier = _volume_uuid(path, identity)
     key = str(identity.st_dev)
     bindings = value["volume_bindings"]
@@ -1336,8 +1346,10 @@ def begin(args: argparse.Namespace) -> None:
             "observed_env_sha256": [env["sha256"]],
             "observed_service_sha256": [service["sha256"]],
         }
-        for anchor in (root, releases, env_path.parent, service_path.parent):
+        for anchor in (root, releases):
             _capture_volume(value, anchor)
+        for anchor in (env_path.parent, service_path.parent):
+            _capture_volume(value, anchor, allow_missing=True)
         _write_new_private(temporary / "manifest.json", _canonical(value))
         _fsync_directory(temporary)
         _verified_directory, verified_value = _read_manifest(

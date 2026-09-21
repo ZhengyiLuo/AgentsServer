@@ -65,24 +65,28 @@ function ensureFreshInstall(context) {
   if (!['darwin', 'linux'].includes(context.platform)) throw new Error('Server installation requires Linux or Apple silicon macOS.')
   for (const name of ROOT_SELECTORS) if (context.env[name]) throw new Error(`Custom installation selector ${name} is unsupported by the fresh-install CLI. Use the existing server's managed updater.`)
   const existingInstall = () => new Error('An existing server installation or state was found. Use AgentsDock or agentsdock-server update; no installer was started.')
-  const installRoot = path.join(context.home, '.local/share/agents-server')
-  let rootInfo
-  try { rootInfo = fs.lstatSync(installRoot) } catch (error) { if (error.code !== 'ENOENT') throw error }
-  if (rootInfo) {
-    // A failed dependency/bootstrap stage can leave only these empty directories.
-    // Do not remove them or relax admission for state, locks, links, or releases.
-    // install.sh repeats its layout and fresh-state checks under the install lock.
-    const safeDirectory = info => info.isDirectory() && !info.isSymbolicLink() && info.uid === context.uid && (info.mode & 0o022) === 0
+  const safeDirectory = info => info.isDirectory() && !info.isSymbolicLink() && info.uid === context.uid && (info.mode & 0o022) === 0 && (info.mode & 0o500) === 0o500
+  const allowEmptyScaffold = (relative, child) => {
+    const root = path.join(context.home, relative)
+    let rootInfo
+    try { rootInfo = fs.lstatSync(root) } catch (error) { if (error.code !== 'ENOENT') throw error }
+    if (!rootInfo) return
+    // Failed bootstrap or preactivation can leave these exact empty directories.
+    // Never delete them or admit files, credentials, histories, links or locks.
+    // install.sh repeats this check under exclusive installation ownership.
     if (!safeDirectory(rootInfo)) throw existingInstall()
-    const entries = fs.readdirSync(installRoot)
-    if (entries.length > 1 || (entries.length === 1 && entries[0] !== 'releases')) throw existingInstall()
+    const entries = fs.readdirSync(root)
+    if (entries.length > 1 || (entries.length === 1 && entries[0] !== child)) throw existingInstall()
     if (entries.length === 1) {
-      const releases = path.join(installRoot, 'releases')
-      if (!safeDirectory(fs.lstatSync(releases)) || fs.readdirSync(releases).length !== 0) throw existingInstall()
+      const nested = path.join(root, child)
+      if (!safeDirectory(fs.lstatSync(nested)) || fs.readdirSync(nested).length !== 0) throw existingInstall()
     }
   }
+  allowEmptyScaffold('.local/share/agents-server', 'releases')
+  allowEmptyScaffold('.config/agents-server')
+  allowEmptyScaffold('.agentsdock', 'admin')
   const targets = [
-    '.config/agents-server', '.agentsdock', '.zenithbot-agent',
+    '.zenithbot-agent',
     '.config/systemd/user/agents-server.service', '.config/systemd/user/zenithbot-agent.service',
     'Library/LaunchAgents/com.agentsdock.server.plist',
   ]

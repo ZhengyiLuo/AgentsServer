@@ -62,6 +62,36 @@ class ActivationVolumeIdentityTests(unittest.TestCase):
         self.assertEqual(item.service.read_bytes(), item.original_service)
         self.assertFalse(self.driver.manifest_path(item).exists())
 
+    def test_fresh_install_binds_existing_ancestor_before_config_directories_exist(self):
+        item = self.layout(fresh_install=True, previous=False, env_exists=False, service_exists=False)
+        item.config_root.rmdir()
+        item.service_root.rmdir()
+        transaction = self.driver.begin(item)
+        self.driver.load(item)
+        self.driver.activate_to_linked(item, transaction)
+        item.config_root.mkdir()
+        item.service_root.mkdir()
+        self.driver.replace_both_configs(item, transaction)
+        self.renumber_journal(item)
+        self.rollback(item, transaction)
+        self.assertFalse(item.current.exists())
+        self.assertFalse(item.env.exists())
+        self.assertFalse(item.service.exists())
+
+    def test_missing_directory_capture_still_rejects_unsafe_existing_ancestors(self):
+        ancestor = self.base / "owned"
+        ancestor.mkdir()
+        alias = self.base / "alias"
+        alias.symlink_to(ancestor, target_is_directory=True)
+        with self.assertRaisesRegex(PermissionError, "volume anchor is unsafe"):
+            activation._capture_volume({"format": 2, "volume_bindings": {}}, alias / "missing", allow_missing=True)
+        with mock.patch.object(activation.os, "getuid", return_value=os.getuid() + 1):
+            with self.assertRaisesRegex(PermissionError, "volume anchor is unsafe"):
+                activation._capture_volume({"format": 2, "volume_bindings": {}}, ancestor / "missing", allow_missing=True)
+        ancestor.chmod(0o777)
+        with self.assertRaisesRegex(PermissionError, "volume anchor is unsafe"):
+            activation._capture_volume({"format": 2, "volume_bindings": {}}, ancestor / "missing", allow_missing=True)
+
     def test_interrupted_config_publication_recovers_after_device_change(self):
         item = self.layout()
         transaction = self.driver.begin(item)

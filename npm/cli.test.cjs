@@ -54,13 +54,15 @@ test('fresh install only delegates validated arguments to the bundled installer'
 test('fresh guard refuses an existing install or state without spawning anything', async t => {
   const f = fixture(t)
   fs.mkdirSync(path.join(f.home, '.agentsdock'))
-  await assert.rejects(run(['install'], { ...f.context, uid: 501 }), /existing server installation or state/)
+  fs.writeFileSync(path.join(f.home, '.agentsdock/server-identity'), 'existing-server')
+  await assert.rejects(run(['install'], f.context), /existing server installation or state/)
   assert.equal(f.calls.length, 0)
 })
 
-test('fresh install retries after a real installer subprocess fails leaving only empty scaffolding', async t => {
+test('fresh install retries real bootstrap and preactivation subprocess failures without deleting empty scaffolding', async t => {
   const f = fixture(t)
   const attempt = path.join(f.root, 'attempt')
+  const preactivationAttempt = path.join(f.root, 'preactivation-attempt')
   const completed = path.join(f.root, 'completed')
   fs.writeFileSync(path.join(f.packageRoot, 'server/install.sh'), `#!/bin/bash
 set -eu
@@ -69,12 +71,18 @@ if [[ ! -e "$QA_INSTALL_ATTEMPT" ]]; then
   touch "$QA_INSTALL_ATTEMPT"
   exit 73
 fi
+mkdir -p "$QA_FRESH_HOME/.config/agents-server" "$QA_FRESH_HOME/.agentsdock/admin"
+chmod 700 "$QA_FRESH_HOME/.config/agents-server" "$QA_FRESH_HOME/.agentsdock" "$QA_FRESH_HOME/.agentsdock/admin"
+if [[ ! -e "$QA_PREACTIVATION_ATTEMPT" ]]; then
+  touch "$QA_PREACTIVATION_ATTEMPT"
+  exit 74
+fi
 touch "$QA_INSTALL_COMPLETED"
 `)
   let installs = 0
   const context = {
     ...f.context,
-    env: { ...process.env, QA_FRESH_HOME: f.home, QA_INSTALL_ATTEMPT: attempt, QA_INSTALL_COMPLETED: completed },
+    env: { ...process.env, QA_FRESH_HOME: f.home, QA_INSTALL_ATTEMPT: attempt, QA_PREACTIVATION_ATTEMPT: preactivationAttempt, QA_INSTALL_COMPLETED: completed },
     spawn: (command, args, options) => {
       if (command !== '/bin/bash') return { status: 0, stdout: 'not-found\n' }
       installs++
@@ -88,12 +96,19 @@ touch "$QA_INSTALL_COMPLETED"
   assert.deepEqual(fs.readdirSync(path.join(installRoot, 'releases')), [])
   assert.equal(fs.existsSync(path.join(f.home, '.agentsdock')), false)
   assert.equal(fs.existsSync(path.join(f.home, '.config/agents-server')), false)
+  assert.equal(await run(['install', '--non-interactive'], context), 74)
+  const config = path.join(f.home, '.config/agents-server'), state = path.join(f.home, '.agentsdock'), admin = path.join(state, 'admin')
+  assert.deepEqual(fs.readdirSync(config), [])
+  assert.deepEqual(fs.readdirSync(state), ['admin'])
+  assert.deepEqual(fs.readdirSync(admin), [])
+  const identities = [installRoot, config, state, admin].map(name => fs.statSync(name).ino)
   assert.equal(await run(['install', '--non-interactive'], context), 0)
-  assert.equal(installs, 2)
+  assert.equal(installs, 3)
+  assert.deepEqual([installRoot, config, state, admin].map(name => fs.statSync(name).ino), identities)
   assert.equal(fs.existsSync(completed), true)
   fs.mkdirSync(path.join(installRoot, '.install-lock'))
   await assert.rejects(run(['install'], context), /existing server installation or state/)
-  assert.equal(installs, 2)
+  assert.equal(installs, 3)
 })
 
 test('empty scaffolding admission still refuses files, links, releases, unsafe ownership and state', async t => {
@@ -108,8 +123,8 @@ test('empty scaffolding admission still refuses files, links, releases, unsafe o
     (root) => { fs.mkdirSync(root); fs.chmodSync(root, 0o777) },
     (root) => { fs.mkdirSync(path.join(root, 'releases'), { recursive: true }); fs.chmodSync(path.join(root, 'releases'), 0o777) },
     (root, f) => { fs.mkdirSync(root); f.context.uid++ },
-    (root, f) => { fs.mkdirSync(root); fs.mkdirSync(path.join(f.home, '.agentsdock')) },
-    (root, f) => { fs.mkdirSync(root); fs.mkdirSync(path.join(f.home, '.config/agents-server'), { recursive: true }) },
+    (root, f) => { fs.mkdirSync(root); fs.mkdirSync(path.join(f.home, '.agentsdock')); fs.writeFileSync(path.join(f.home, '.agentsdock/server-identity'), 'existing') },
+    (root, f) => { fs.mkdirSync(root); fs.mkdirSync(path.join(f.home, '.config/agents-server'), { recursive: true }); fs.writeFileSync(path.join(f.home, '.config/agents-server/env'), 'existing') },
   ]
   for (const setup of cases) {
     const f = fixture(t)
@@ -119,6 +134,39 @@ test('empty scaffolding admission still refuses files, links, releases, unsafe o
     await assert.rejects(run(['install'], f.context), /existing server installation or state/)
     assert.equal(f.calls.length, 0)
     assert.equal(fs.lstatSync(root).isSymbolicLink() || fs.existsSync(root), true)
+  }
+})
+
+test('empty config and state admission rejects credentials, histories, unknown directories, locks and unsafe entries', async t => {
+  const cases = [
+    ['.config/agents-server', (root) => fs.writeFileSync(root, 'existing')],
+    ['.config/agents-server', (root, f) => fs.symlinkSync(f.home, root)],
+    ['.config/agents-server', (root) => { fs.mkdirSync(root); fs.writeFileSync(path.join(root, 'env'), 'existing-token') }],
+    ['.config/agents-server', (root) => fs.mkdirSync(path.join(root, 'admin'), { recursive: true })],
+    ['.agentsdock', (root) => fs.writeFileSync(root, 'existing')],
+    ['.agentsdock', (root, f) => fs.symlinkSync(f.home, root)],
+    ['.agentsdock', (root) => { fs.mkdirSync(root); fs.writeFileSync(path.join(root, 'server-identity'), 'existing') }],
+    ['.agentsdock', (root) => fs.mkdirSync(path.join(root, 'chats'), { recursive: true })],
+    ['.agentsdock', (root) => fs.mkdirSync(path.join(root, '.lock'), { recursive: true })],
+    ['.agentsdock', (root) => { fs.mkdirSync(root); fs.writeFileSync(path.join(root, 'admin'), 'existing') }],
+    ['.agentsdock', (root, f) => { fs.mkdirSync(root); fs.symlinkSync(f.home, path.join(root, 'admin')) }],
+    ['.agentsdock', (root) => { fs.mkdirSync(path.join(root, 'admin'), { recursive: true }); fs.writeFileSync(path.join(root, 'admin', 'pending-update'), 'existing') }],
+    ['.agentsdock', (root) => fs.mkdirSync(path.join(root, 'admin', '.lock'), { recursive: true })],
+    ['.zenithbot-agent', (root) => fs.mkdirSync(root)],
+  ]
+  for (const relative of ['.config/agents-server', '.agentsdock', '.agentsdock/admin']) {
+    for (const mode of [0o770, 0o707, 0o300]) cases.push([relative, root => { fs.mkdirSync(root, { recursive: true }); fs.chmodSync(root, mode) }])
+    cases.push([relative, (root, f) => { fs.mkdirSync(root, { recursive: true }); f.context.uid++ }])
+  }
+  for (const [relative, setup] of cases) {
+    const f = fixture(t), root = path.join(f.home, relative)
+    fs.mkdirSync(path.dirname(root), { recursive: true })
+    setup(root, f)
+    const before = fs.lstatSync(root)
+    await assert.rejects(run(['install'], f.context), /existing server installation or state/)
+    assert.equal(f.calls.length, 0)
+    assert.equal(fs.lstatSync(root).ino, before.ino)
+    if (before.isDirectory()) fs.chmodSync(root, 0o700)
   }
 })
 
